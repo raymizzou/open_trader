@@ -949,8 +949,46 @@ class PolymarketLPService:
             return tuple(condition_ids)
         return self.store.lp_candidate_conditions(tuple(condition_ids), now=now or self._now())
 
-    def _exclude_candidate(self, condition_id, token_id, reason, *, checked_at, market=None, exclusion_revision=None):
+    @staticmethod
+    def _candidate_global_generation(value: object) -> int:
+        return value if type(value) is int and value >= 0 else 0
+
+    def _current_candidate_global_generation(self) -> int | None:
+        reader = getattr(self.store, "lp_preparation", None)
+        if not callable(reader):
+            return 0
+        try:
+            preparation = reader()
+        except Exception:
+            return None
+        return (
+            self._candidate_global_generation(preparation.get("global_recovery_generation"))
+            if isinstance(preparation, Mapping)
+            else 0
+        )
+
+    def _candidate_generation_allowed(self, expected: int | None) -> bool:
+        current = self._current_candidate_global_generation()
+        if current is None:
+            return False
+        if type(expected) is not int or expected < 0:
+            return True
+        return current <= expected
+
+    def _exclude_candidate(
+        self,
+        condition_id,
+        token_id,
+        reason,
+        *,
+        checked_at,
+        market=None,
+        exclusion_revision=None,
+        global_recovery_generation=None,
+    ):
         if not self.exclusions_enabled:
+            return False
+        if not self._candidate_generation_allowed(global_recovery_generation):
             return False
         seconds = {
             "reward_inactive": 1800, "reward_pool_empty": 1800,
@@ -970,11 +1008,14 @@ class PolymarketLPService:
         else:
             return False
         with self._candidate_state_lock:
+            if not self._candidate_generation_allowed(global_recovery_generation):
+                return False
             if exclusion_revision is not None and exclusion_revision != self._candidate_exclusion_revision:
                 return False
             inserted = self.store.lp_record_market_exclusion(
                 condition_id, token_id, reason, checked_at=checked_at,
                 cooldown_until=until, now=self._now(),
+                global_recovery_generation=global_recovery_generation,
             )
             if inserted:
                 self._candidate_exclusion_revision += 1
@@ -1018,10 +1059,25 @@ class PolymarketLPService:
             "event_starting_soon", "event_in_progress", "event_recovery_pending"
         } else None
 
-    def _observe_ended_candidate_market(self, condition_id, market, *, checked_at):
+    def _observe_ended_candidate_market(
+        self,
+        condition_id,
+        market,
+        *,
+        checked_at,
+        global_recovery_generation=None,
+    ):
+        if not self._candidate_generation_allowed(global_recovery_generation):
+            return False
         if self.exclusions_enabled and (market.get("closed") is True or market.get("resolved") is True):
             with self._candidate_state_lock:
-                if self.store.lp_clear_ended_market_exclusions(condition_id, checked_at=checked_at):
+                if not self._candidate_generation_allowed(global_recovery_generation):
+                    return False
+                if self.store.lp_clear_ended_market_exclusions(
+                    condition_id,
+                    checked_at=checked_at,
+                    global_recovery_generation=global_recovery_generation,
+                ):
                     self._candidate_exclusion_revision += 1
             return True
         return False
@@ -2539,7 +2595,17 @@ class PolymarketLPService:
         """
 
         with self._candidate_state_lock:
-            qualification_facts = deepcopy(self._candidate_qualification_facts)
+            global_recovery_generation = self._current_candidate_global_generation()
+            qualification_facts = {
+                condition_id: deepcopy(facts)
+                for condition_id, facts in self._candidate_qualification_facts.items()
+                if isinstance(facts, Mapping)
+                and global_recovery_generation is not None
+                and self._candidate_global_generation(
+                    facts.get("global_recovery_generation")
+                )
+                == global_recovery_generation
+            }
             failures = self._candidate_maintenance_failures
             last_finished_at = self._candidate_maintenance_last_finished_at
             pool = deepcopy(self._candidate_pool)
@@ -4734,6 +4800,14 @@ class PolymarketLPService:
                 return
         if not isinstance(saved, Mapping):
             return
+        current_global_generation = self._current_candidate_global_generation()
+        if current_global_generation is None:
+            return
+        saved_global_generation = self._candidate_global_generation(
+            saved.get("global_recovery_generation")
+        )
+        if current_global_generation > saved_global_generation:
+            return
         pool = saved.get("pool")
         if not isinstance(pool, Mapping) or not pool:
             # Pre-pool snapshots carry whole-round rows without per-row
@@ -4760,6 +4834,9 @@ class PolymarketLPService:
             key = str(condition_id or "").strip()
             if key and isinstance(row, Mapping):
                 restored_pool[key] = dict(row)
+                restored_pool[key].setdefault(
+                    "global_recovery_generation", saved_global_generation
+                )
                 if row.get('estimate_basis') != 'minimum_scoring_order':
                     # Do not relabel a prior release's 5% estimate. Keep its
                     # original validity times; refresh supplies the new basis.
@@ -4794,7 +4871,10 @@ class PolymarketLPService:
                 self._candidate_attempted_at = None
 
     def _candidate_queue_state_build(
-        self, *, stop_event: threading.Event | None = None
+        self,
+        *,
+        stop_event: threading.Event | None = None,
+        global_recovery_generation: int | None = None,
     ) -> dict[str, object] | None:
         """Build (or reuse) the exploration queues from prepared inputs.
 
@@ -4805,6 +4885,13 @@ class PolymarketLPService:
         while preparation is pending or the catalog is unusable.
         """
 
+        expected_global_generation = (
+            self._candidate_global_generation(global_recovery_generation)
+            if type(global_recovery_generation) is int and global_recovery_generation >= 0
+            else self._current_candidate_global_generation()
+        )
+        if not self._candidate_generation_allowed(expected_global_generation):
+            return None
         # The available budget feeds the over-available exclusion, so the
         # reservation signature joins the cache key: a new active
         # reservation invalidates the cached queues.
@@ -4823,6 +4910,10 @@ class PolymarketLPService:
             and cached.get("version") == version
             and cached.get("history_version") == history_version
             and cached.get("reservation_signature") == reservation_signature
+            and self._candidate_global_generation(
+                cached.get("global_recovery_generation")
+            )
+            == expected_global_generation
         ):
             return cached
         prepared = self._prepared_input_snapshot()
@@ -4934,12 +5025,18 @@ class PolymarketLPService:
             condition_id = str(reward_market.get("condition_id") or "").strip()
             market_meta = metadata_by_condition.get(condition_id)
             if self.exclusions_enabled and isinstance(market_meta, Mapping):
-                if self._observe_ended_candidate_market(condition_id, market_meta, checked_at=checked_at):
+                if self._observe_ended_candidate_market(
+                    condition_id,
+                    market_meta,
+                    checked_at=checked_at,
+                    global_recovery_generation=expected_global_generation,
+                ):
                     build_revision = self._candidate_exclusion_revision
                 reason = self._candidate_market_rejection(reward_market, market_meta, now=checked_at)
                 if reason:
                     if self._exclude_candidate(condition_id, "", reason, checked_at=checked_at, market=market_meta,
-                            exclusion_revision=build_revision):
+                            exclusion_revision=build_revision,
+                            global_recovery_generation=expected_global_generation):
                         build_revision = self._candidate_exclusion_revision
                     continue
             if not isinstance(market_meta, Mapping):
@@ -4988,7 +5085,8 @@ class PolymarketLPService:
                     if lp_history_eligibility(summary, now=checked_at, condition_id=condition_id, token_id=token_id) == "history_amplitude_exceeded":
                         if self._exclude_candidate(condition_id, token_id, "history_amplitude_exceeded",
                                 checked_at=_timestamp(summary["checked_at"], name="history_checked_at"),
-                                exclusion_revision=build_revision):
+                                exclusion_revision=build_revision,
+                                global_recovery_generation=expected_global_generation):
                             build_revision = self._candidate_exclusion_revision
                         if not self._candidate_allowed(((condition_id, token_id),), now=checked_at):
                             continue
@@ -5125,9 +5223,12 @@ class PolymarketLPService:
             if isinstance(account, Mapping)
             else None,
             "built_at": checked_at,
+            "global_recovery_generation": expected_global_generation,
         }
         with self._candidate_state_lock:
             if version != self._prepared_inputs_version:
+                return None
+            if not self._candidate_generation_allowed(expected_global_generation):
                 return None
             if self.exclusions_enabled and build_revision != self._candidate_exclusion_revision:
                 return None
@@ -5235,6 +5336,7 @@ class PolymarketLPService:
         condition_ids: tuple[str, ...],
         *,
         stop_event: threading.Event | None,
+        global_recovery_generation: int | None = None,
     ) -> Mapping[str, object] | None:
         """Renew expired shared facts for one batch (issue #143 repair 2).
 
@@ -5245,6 +5347,9 @@ class PolymarketLPService:
         conditions only.  A failed renewal keeps the previous facts and is
         not retried within the batch.
         """
+
+        if not self._candidate_generation_allowed(global_recovery_generation):
+            return None
 
         directions_by_condition = cast(
             dict[str, list[Mapping[str, object]]],
@@ -5368,7 +5473,13 @@ class PolymarketLPService:
 
             if self.exclusions_enabled:
                 reward_market_by_condition.update(fresh_rewards)
-                renewal_revision = self._screen_candidate_batch(queue_state, condition_ids, checked_at=now, exclusion_revision=stage_revision)
+                renewal_revision = self._screen_candidate_batch(
+                    queue_state,
+                    condition_ids,
+                    checked_at=now,
+                    exclusion_revision=stage_revision,
+                    global_recovery_generation=global_recovery_generation,
+                )
                 condition_ids = self._candidate_conditions(condition_ids)
 
         account_reader = getattr(
@@ -5453,7 +5564,16 @@ class PolymarketLPService:
                 directions_by_condition[condition_id] = rebuilt
         return evaluation_account
 
-    def _screen_candidate_histories(self, directions, *, checked_at, exclusion_revision):
+    def _screen_candidate_histories(
+        self,
+        directions,
+        *,
+        checked_at,
+        exclusion_revision,
+        global_recovery_generation=None,
+    ):
+        if not self._candidate_generation_allowed(global_recovery_generation):
+            return exclusion_revision
         for direction in tuple(directions):
             market = direction.get("market", {})
             cid, token = str(market.get("condition_id") or ""), str(market.get("token_id") or "")
@@ -5463,29 +5583,49 @@ class PolymarketLPService:
             if reason == "history_amplitude_exceeded" and isinstance(summary, Mapping):
                 if self._exclude_candidate(cid, token, reason,
                         checked_at=_timestamp(summary["checked_at"], name="history_checked_at"),
-                        exclusion_revision=exclusion_revision):
+                        exclusion_revision=exclusion_revision,
+                        global_recovery_generation=global_recovery_generation):
                     exclusion_revision = self._candidate_exclusion_revision
         return exclusion_revision
 
-    def _screen_candidate_batch(self, queue_state, condition_ids, *, checked_at, exclusion_revision=None):
+    def _screen_candidate_batch(
+        self,
+        queue_state,
+        condition_ids,
+        *,
+        checked_at,
+        exclusion_revision=None,
+        global_recovery_generation=None,
+    ):
         if not self.exclusions_enabled:
             return
+        if not self._candidate_generation_allowed(global_recovery_generation):
+            return exclusion_revision
         for cid in condition_ids:
             market = queue_state.get("metadata_by_condition", {}).get(cid, {})
             reward = queue_state.get("reward_market_by_condition", {}).get(cid, {})
             if not self._candidate_conditions((cid,)):
                 continue
-            if self._observe_ended_candidate_market(cid, market, checked_at=checked_at):
+            if self._observe_ended_candidate_market(
+                cid,
+                market,
+                checked_at=checked_at,
+                global_recovery_generation=global_recovery_generation,
+            ):
                 continue
             reason = self._candidate_market_rejection(reward, market, now=checked_at)
             if reason:
                 if self._exclude_candidate(cid, "", reason, checked_at=checked_at, market=market,
-                        exclusion_revision=exclusion_revision):
+                        exclusion_revision=exclusion_revision,
+                        global_recovery_generation=global_recovery_generation):
                     exclusion_revision = self._candidate_exclusion_revision
             else:
                 exclusion_revision = self._screen_candidate_histories(
                     queue_state.get("directions_by_condition", {}).get(cid, ()),
-                    checked_at=checked_at, exclusion_revision=exclusion_revision)
+                    checked_at=checked_at,
+                    exclusion_revision=exclusion_revision,
+                    global_recovery_generation=global_recovery_generation,
+                )
         return exclusion_revision
 
     def _candidate_pool_record_success(
@@ -5496,6 +5636,7 @@ class PolymarketLPService:
         judged_at: datetime,
         facts: Mapping[str, object] | None = None,
         exclusion_revision: int | None = None,
+        global_recovery_generation: int | None = None,
     ) -> bool:
         """Store one successful estimate in the pool (issue #157).
 
@@ -5513,6 +5654,15 @@ class PolymarketLPService:
         )
         stored["refresh_failed"] = False
         with self._candidate_state_lock:
+            expected_global_generation = (
+                self._candidate_global_generation(global_recovery_generation)
+                if type(global_recovery_generation) is int
+                and global_recovery_generation >= 0
+                else self._current_candidate_global_generation()
+            )
+            if not self._candidate_generation_allowed(expected_global_generation):
+                return False
+            stored["global_recovery_generation"] = expected_global_generation
             selected = row.get("selected_direction") or {}
             if self.exclusions_enabled and (
                 (exclusion_revision is not None and exclusion_revision != self._candidate_exclusion_revision)
@@ -5526,9 +5676,9 @@ class PolymarketLPService:
                     return False
             self._candidate_pool[condition_id] = stored
             if facts is not None:
-                self._candidate_qualification_facts[condition_id] = deepcopy(
-                    dict(facts)
-                )
+                stored_facts = deepcopy(dict(facts))
+                stored_facts["global_recovery_generation"] = expected_global_generation
+                self._candidate_qualification_facts[condition_id] = stored_facts
             entry = self._candidate_rotation.get(condition_id)
             rotation = dict(entry) if isinstance(entry, Mapping) else {}
             rotation["last_attempt_at"] = _iso(judged_at)
@@ -5537,7 +5687,11 @@ class PolymarketLPService:
         return True
 
     def _candidate_pool_record_failure(
-        self, condition_id: str, *, attempted_at: datetime
+        self,
+        condition_id: str,
+        *,
+        attempted_at: datetime,
+        global_recovery_generation: int | None = None,
     ) -> None:
         """Keep the stored row on a failed re-estimate (issue #157).
 
@@ -5550,6 +5704,14 @@ class PolymarketLPService:
         """
 
         with self._candidate_state_lock:
+            expected_global_generation = (
+                self._candidate_global_generation(global_recovery_generation)
+                if type(global_recovery_generation) is int
+                and global_recovery_generation >= 0
+                else self._current_candidate_global_generation()
+            )
+            if not self._candidate_generation_allowed(expected_global_generation):
+                return
             if not self._candidate_conditions((condition_id,)):
                 return
             existing = self._candidate_pool.get(condition_id)
@@ -5571,7 +5733,11 @@ class PolymarketLPService:
             self._candidate_rotation[condition_id] = rotation
 
     def _candidate_pool_record_rejection(
-        self, condition_id: str, *, judged_at: datetime
+        self,
+        condition_id: str,
+        *,
+        judged_at: datetime,
+        global_recovery_generation: int | None = None,
     ) -> None:
         """Remove a deterministically rejected market from the pool and put
         it back at the rotation tail (issue #157).
@@ -5581,6 +5747,14 @@ class PolymarketLPService:
         review R4)."""
 
         with self._candidate_state_lock:
+            expected_global_generation = (
+                self._candidate_global_generation(global_recovery_generation)
+                if type(global_recovery_generation) is int
+                and global_recovery_generation >= 0
+                else self._current_candidate_global_generation()
+            )
+            if not self._candidate_generation_allowed(expected_global_generation):
+                return
             if not self._candidate_conditions((condition_id,)):
                 return
             existing = self._candidate_pool.get(condition_id)
@@ -5620,7 +5794,12 @@ class PolymarketLPService:
             self._candidate_qualification_facts.pop(condition_id, None)
         return expired
 
-    def _save_candidate_pool(self, *, force: bool = False) -> None:
+    def _save_candidate_pool(
+        self,
+        *,
+        force: bool = False,
+        global_recovery_generation: int | None = None,
+    ) -> None:
         """Persist the pool with the five-second save throttle (issue #157).
 
         The payload carries the pool rows with their original timestamps,
@@ -5632,8 +5811,18 @@ class PolymarketLPService:
         writer = getattr(self.store, "lp_save_screening_snapshot", None)
         if not callable(writer):
             return
+        expected_global_generation = (
+            self._candidate_global_generation(global_recovery_generation)
+            if type(global_recovery_generation) is int
+            and global_recovery_generation >= 0
+            else self._current_candidate_global_generation()
+        )
+        if not self._candidate_generation_allowed(expected_global_generation):
+            return
         now = self._now()
         with self._candidate_state_lock:
+            if not self._candidate_generation_allowed(expected_global_generation):
+                return
             last = self._candidate_pool_last_saved_at
             if not force and last is not None and Decimal(
                 str((now - last).total_seconds())
@@ -5655,10 +5844,14 @@ class PolymarketLPService:
                 "last_attempt_at": snapshot.get("last_attempt_at"),
                 "checked_at": snapshot.get("checked_at"),
                 "last_success_at": snapshot.get("last_success_at"),
+                "global_recovery_generation": expected_global_generation,
             }
             self._candidate_pool_last_saved_at = now
         try:
-            writer(payload)
+            saved = writer(payload)
+            if saved is None:
+                with self._candidate_state_lock:
+                    self._candidate_pool_last_saved_at = None
         except Exception:
             with self._candidate_state_lock:
                 self._candidate_pool_last_saved_at = None
@@ -5674,6 +5867,7 @@ class PolymarketLPService:
         state: str | None = None,
         notes: Mapping[str, object] | None = None,
         missing_book_token_ids: Sequence[str] | None = None,
+        global_recovery_generation: int | None = None,
     ) -> dict[str, object]:
         """Publish the rolling pool incrementally and persist it (issue #157).
 
@@ -5686,11 +5880,15 @@ class PolymarketLPService:
         now = self._now()
         attempted = attempted_at or now
         with self._candidate_state_lock:
+            if not self._candidate_generation_allowed(global_recovery_generation):
+                return self.candidate_snapshot()
             # Issue #157 review R5: a publication first evicts every row the
             # current clock has expired, together with its qualification
             # facts, before the refreshed metadata is published and saved.
             self._candidate_pool_prune_expired_locked(now)
             snapshot = deepcopy(self._candidate_snapshot)
+            if type(global_recovery_generation) is int and global_recovery_generation >= 0:
+                snapshot["global_recovery_generation"] = global_recovery_generation
             snapshot["scanning"] = scanning
             snapshot["last_attempt_at"] = attempted
             if checked_at is not None:
@@ -5719,7 +5917,9 @@ class PolymarketLPService:
                 )
             self._candidate_snapshot = snapshot
         projection = self.candidate_snapshot()
-        self._save_candidate_pool()
+        self._save_candidate_pool(
+            global_recovery_generation=global_recovery_generation
+        )
         return projection
 
     def refresh_candidates(
@@ -5745,8 +5945,16 @@ class PolymarketLPService:
             snapshot = self.candidate_snapshot()
             snapshot["scanning"] = True
             return snapshot
+        global_recovery_generation: int | None = None
         try:
             attempted_at = self._now()
+            global_recovery_generation = self._current_candidate_global_generation()
+            if global_recovery_generation is None:
+                return self._finish_candidate_scan(
+                    attempted_at=attempted_at,
+                    global_recovery_generation=global_recovery_generation,
+                    notes={"retention_reason": "recovery_generation_unknown"},
+                )
             if self.exclusions_enabled:
                 self.store.lp_prune_market_exclusions(now=attempted_at)
             with self._candidate_state_lock:
@@ -5759,14 +5967,17 @@ class PolymarketLPService:
             if stop_event is not None and stop_event.is_set():
                 return self._finish_candidate_scan(
                     attempted_at=attempted_at,
+                    global_recovery_generation=global_recovery_generation,
                     notes={"stop_reason": "scan_cancelled"},
                 )
             queue_state = self._candidate_queue_state_build(
-                stop_event=stop_event
+                stop_event=stop_event,
+                global_recovery_generation=global_recovery_generation,
             )
             if queue_state is None:
                 return self._finish_candidate_scan(
                     attempted_at=attempted_at,
+                    global_recovery_generation=global_recovery_generation,
                     notes={
                         "stop_reason": "preparation_pending",
                         "retention_reason": "catalog_preparation_pending",
@@ -5784,6 +5995,7 @@ class PolymarketLPService:
                     # a valid, honestly empty pool.
                     return self._finish_candidate_scan(
                         attempted_at=attempted_at,
+                        global_recovery_generation=global_recovery_generation,
                         complete=queue_state.get("complete") is True,
                         state=(
                             "ready"
@@ -5791,7 +6003,10 @@ class PolymarketLPService:
                             else "incomplete"
                         ),
                     )
-                return self._finish_candidate_scan(attempted_at=attempted_at)
+                return self._finish_candidate_scan(
+                    attempted_at=attempted_at,
+                    global_recovery_generation=global_recovery_generation,
+                )
             books_reader = getattr(self.exchange, "lp_order_books", None)
             batch_tokens: list[str] = []
             directions_by_condition = cast(
@@ -5850,6 +6065,7 @@ class PolymarketLPService:
                     evaluation_account = None
                     return self._finish_candidate_scan(
                         attempted_at=attempted_at,
+                        global_recovery_generation=global_recovery_generation,
                         notes={
                             "stop_reason": "account_unavailable",
                             "retention_reason": "account_unavailable",
@@ -5858,7 +6074,11 @@ class PolymarketLPService:
             exclusion_revision = self._candidate_exclusion_revision
             if self.exclusions_enabled:
                 evaluation_account = self._renew_batch_shared_facts(
-                    queue_state, tuple(cid for _c, cid in batch), stop_event=stop_event)
+                    queue_state,
+                    tuple(cid for _c, cid in batch),
+                    stop_event=stop_event,
+                    global_recovery_generation=global_recovery_generation,
+                )
                 batch = [(c, cid) for c, cid in batch if self._candidate_conditions((cid,))]
                 batch_tokens = [str(d["market"].get("token_id") or "") for _c, cid in batch
                     for d in directions_by_condition.get(cid, ()) if self._candidate_allowed(((cid, str(d["market"].get("token_id") or "")),))]
@@ -5873,7 +6093,10 @@ class PolymarketLPService:
                 candidate_books = {}
             if not self.exclusions_enabled:
                 evaluation_account = self._renew_batch_shared_facts(
-                    queue_state, tuple(dict.fromkeys(cid for _c, cid in batch)), stop_event=stop_event,
+                    queue_state,
+                    tuple(dict.fromkeys(cid for _c, cid in batch)),
+                    stop_event=stop_event,
+                    global_recovery_generation=global_recovery_generation,
                 )
             # Issue #157: the batch judgment time is captured before the
             # reservations read — the last read between the renewed facts
@@ -6035,12 +6258,16 @@ class PolymarketLPService:
                     )
                 if row_state == "rejected":
                     self._candidate_pool_record_rejection(
-                        condition_id, judged_at=evaluation_now
+                        condition_id,
+                        judged_at=evaluation_now,
+                        global_recovery_generation=global_recovery_generation,
                     )
                     continue
                 if row_state == "unknown":
                     self._candidate_pool_record_failure(
-                        condition_id, attempted_at=evaluation_now
+                        condition_id,
+                        attempted_at=evaluation_now,
+                        global_recovery_generation=global_recovery_generation,
                     )
                     continue
                 row = dict(candidate)
@@ -6096,41 +6323,45 @@ class PolymarketLPService:
                         "checked_at": queue_state.get("built_at"),
                     },
                     exclusion_revision=exclusion_revision,
+                    global_recovery_generation=global_recovery_generation,
                 )
             with self._candidate_state_lock:
-                funnel_totals = deepcopy(self._candidate_funnel_totals)
-                funnel_totals["checked"] = (
-                    int(funnel_totals.get("checked") or 0) + checked
-                )
-                funnel_totals["passed"] = (
-                    int(funnel_totals.get("passed") or 0) + passed
-                )
-                funnel_totals["rejected"] = (
-                    int(funnel_totals.get("rejected") or 0) + rejected
-                )
-                funnel_totals["unknown"] = (
-                    int(funnel_totals.get("unknown") or 0) + unknown
-                )
-                funnel_totals["batches"] = (
-                    int(funnel_totals.get("batches") or 0) + 1
-                )
-                funnel_totals["backup_read"] = (
-                    int(funnel_totals.get("backup_read") or 0) + backup_read
-                )
-                self._candidate_funnel_totals = funnel_totals
-                queue_funnel_state = deepcopy(self._candidate_queue_funnel)
-                if unknown_reasons:
-                    reasons = queue_funnel_state.get("reasons")
-                    if (
-                        isinstance(reasons, Mapping)
-                        and isinstance(reasons.get("trial"), list)
-                    ):
-                        reasons["trial"].extend(deepcopy(unknown_reasons))
-                    self._candidate_queue_funnel = queue_funnel_state
-            self._publish_sample_targets(())
+                if self._candidate_generation_allowed(global_recovery_generation):
+                    funnel_totals = deepcopy(self._candidate_funnel_totals)
+                    funnel_totals["checked"] = (
+                        int(funnel_totals.get("checked") or 0) + checked
+                    )
+                    funnel_totals["passed"] = (
+                        int(funnel_totals.get("passed") or 0) + passed
+                    )
+                    funnel_totals["rejected"] = (
+                        int(funnel_totals.get("rejected") or 0) + rejected
+                    )
+                    funnel_totals["unknown"] = (
+                        int(funnel_totals.get("unknown") or 0) + unknown
+                    )
+                    funnel_totals["batches"] = (
+                        int(funnel_totals.get("batches") or 0) + 1
+                    )
+                    funnel_totals["backup_read"] = (
+                        int(funnel_totals.get("backup_read") or 0) + backup_read
+                    )
+                    self._candidate_funnel_totals = funnel_totals
+                    queue_funnel_state = deepcopy(self._candidate_queue_funnel)
+                    if unknown_reasons:
+                        reasons = queue_funnel_state.get("reasons")
+                        if (
+                            isinstance(reasons, Mapping)
+                            and isinstance(reasons.get("trial"), list)
+                        ):
+                            reasons["trial"].extend(deepcopy(unknown_reasons))
+                        self._candidate_queue_funnel = queue_funnel_state
+            if self._candidate_generation_allowed(global_recovery_generation):
+                self._publish_sample_targets(())
             return self._finish_candidate_scan(
                 attempted_at=attempted_at,
                 checked_at=evaluation_now,
+                global_recovery_generation=global_recovery_generation,
                 success=passed > 0,
                 complete=queue_state.get("complete") is True,
                 state="ready" if queue_state.get("complete") is True else "incomplete",
@@ -6153,9 +6384,21 @@ class PolymarketLPService:
             # retries from the unchanged rotation.
             logger.exception("candidate_refresh_failed")
             return self._finish_candidate_scan(
+                global_recovery_generation=global_recovery_generation,
                 notes={"retention_reason": "candidate_refresh_failed"},
             )
         finally:
+            with self._candidate_state_lock:
+                if (
+                    self._candidate_snapshot.get("scanning") is True
+                    and not self._candidate_generation_allowed(
+                        global_recovery_generation
+                    )
+                ):
+                    self._candidate_snapshot = {
+                        **self._candidate_snapshot,
+                        "scanning": False,
+                    }
             self._candidate_scan_lock.release()
 
     def refresh_candidate_recommendations(
@@ -6181,12 +6424,31 @@ class PolymarketLPService:
             return snapshot
         try:
             now = self._now()
+            global_recovery_generation = self._current_candidate_global_generation()
+            if global_recovery_generation is None:
+                return self.candidate_snapshot()
             exclusion_revision = self._candidate_exclusion_revision
             with self._candidate_state_lock:
                 failures = self._candidate_maintenance_failures
                 last_finished_at = self._candidate_maintenance_last_finished_at
-                cached_facts = deepcopy(self._candidate_qualification_facts)
-                pool = deepcopy(self._candidate_pool)
+                cached_facts = {
+                    condition_id: deepcopy(facts)
+                    for condition_id, facts in self._candidate_qualification_facts.items()
+                    if isinstance(facts, Mapping)
+                    and self._candidate_global_generation(
+                        facts.get("global_recovery_generation")
+                    )
+                    == global_recovery_generation
+                }
+                pool = {
+                    condition_id: deepcopy(row)
+                    for condition_id, row in self._candidate_pool.items()
+                    if isinstance(row, Mapping)
+                    and self._candidate_global_generation(
+                        row.get("global_recovery_generation")
+                    )
+                    == global_recovery_generation
+                }
             # Issue #157: maintenance renews the currently displayed top ten
             # valid pool rows (whole-table framework, pool publication).
             valid_rows = [
@@ -6514,15 +6776,25 @@ class PolymarketLPService:
                     directions = live_directions(cached)
                     market = refreshed_metadata.get(cid, {}) if metadata_due else (directions[0]["market"] if directions else {})
                     reward = refreshed_rewards.get(cid, {}) if reward_due else ({**directions[0], "condition_id": cid} if directions else {})
-                    ended = self._observe_ended_candidate_market(cid, market, checked_at=now)
+                    ended = self._observe_ended_candidate_market(
+                        cid,
+                        market,
+                        checked_at=now,
+                        global_recovery_generation=global_recovery_generation,
+                    )
                     reason = None if ended else self._candidate_market_rejection(reward, market, now=self._now())
                     if reason:
                         if self._exclude_candidate(cid, "", reason, checked_at=now, market=market,
-                                exclusion_revision=exclusion_revision):
+                                exclusion_revision=exclusion_revision,
+                                global_recovery_generation=global_recovery_generation):
                             exclusion_revision = self._candidate_exclusion_revision
                 for row, cached in refreshable:
                     exclusion_revision = self._screen_candidate_histories(
-                        live_directions(cached), checked_at=self._now(), exclusion_revision=exclusion_revision)
+                        live_directions(cached),
+                        checked_at=self._now(),
+                        exclusion_revision=exclusion_revision,
+                        global_recovery_generation=global_recovery_generation,
+                    )
                 token_ids = tuple(token for token in token_ids if any(
                     self._candidate_allowed(((str(row.get("condition_id") or ""), token),))
                     for row, cached in refreshable
@@ -6898,12 +7170,16 @@ class PolymarketLPService:
                     # stored values until their original expiry and mark
                     # the row refresh_failed.
                     self._candidate_pool_record_failure(
-                        condition_id, attempted_at=evaluation_now
+                        condition_id,
+                        attempted_at=evaluation_now,
+                        global_recovery_generation=global_recovery_generation,
                     )
                     continue
                 if new_row.get("state") == "rejected":
                     self._candidate_pool_record_rejection(
-                        condition_id, judged_at=evaluation_now
+                        condition_id,
+                        judged_at=evaluation_now,
+                        global_recovery_generation=global_recovery_generation,
                     )
                     continue
                 # Issue #157 review R4: the write protection may reject this
@@ -6917,11 +7193,14 @@ class PolymarketLPService:
                     judged_at=evaluation_now,
                     facts=facts,
                     exclusion_revision=exclusion_revision,
+                    global_recovery_generation=global_recovery_generation,
                 )
                 refreshed_any = True
             # Issue #146: the maintenance attempt's backoff bookkeeping is
             # applied together with its publication.
             with self._candidate_state_lock:
+                if not self._candidate_generation_allowed(global_recovery_generation):
+                    return self.candidate_snapshot()
                 maintenance_finished_at = self._now()
                 self._candidate_maintenance_last_finished_at = (
                     maintenance_finished_at
@@ -6952,6 +7231,7 @@ class PolymarketLPService:
             return self._finish_candidate_scan(
                 attempted_at=now,
                 checked_at=evaluation_now,
+                global_recovery_generation=global_recovery_generation,
                 success=refreshed_any,
                 notes=notes,
                 missing_book_token_ids=missing_book_token_ids,
