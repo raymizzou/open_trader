@@ -23,6 +23,7 @@ import threading
 import time
 from copy import deepcopy
 from contextlib import contextmanager
+from collections import deque
 from collections.abc import Mapping, MutableMapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import Future
@@ -1446,25 +1447,30 @@ def _iter_reward_items(value: object, stop_event: threading.Event | None):
 
 def _collect_lp_market_pages(
     value: object, requested: set[str]
-) -> tuple[object, ...]:
+) -> tuple[Mapping[str, object], ...]:
+    def project(items: object) -> tuple[Mapping[str, object], ...]:
+        return tuple(
+            facts for item in _collect(items)
+            if (facts := _lp_market_facts(item)) is not None
+        )
+
     first_page = getattr(value, "first_page", None)
     from_cursor = getattr(value, "from_cursor", None)
     if not callable(first_page) or not callable(from_cursor):
         page_items = _field(value, "items", None)
         if page_items is not None:
-            return _collect(page_items)
-        return _collect(value)
+            return project(page_items)
+        return project(value)
 
-    rows: list[object] = []
+    rows: list[Mapping[str, object]] = []
     observed: set[str] = set()
     page = first_page()
     while True:
-        page_rows = _collect(_field(page, "items", ()))
+        page_rows = project(_field(page, "items", ()))
         rows.extend(page_rows)
         observed.update(
             condition_id
-            for item in page_rows
-            if (row := _model_dict(item)) is not None
+            for row in page_rows
             for condition_id in (row.get("condition_id", row.get("conditionId")),)
             if isinstance(condition_id, str) and condition_id in requested
         )
@@ -1518,6 +1524,26 @@ def _lp_event_facts(value: object) -> Mapping[str, object] | None:
     if callable(model_dump):
         facts = model_dump(include=fields)
         return facts if isinstance(facts, Mapping) else None
+    return None
+
+
+def _lp_market_facts(value: object) -> Mapping[str, object] | None:
+    """Project LP inputs before a completed worker can retain the SDK tree."""
+    fields = {
+        "id", "market_id", "condition_id", "conditionId", "slug", "question",
+        "title", "market_url", "url", "state", "trading", "rewards", "sports",
+        "prices", "outcomes", "events", "rewards_max_spread", "rewards_min_size",
+        "taker_fee_rate",
+    }
+    if isinstance(value, Mapping):
+        return {key: value[key] for key in fields if key in value}
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            facts = model_dump(include=fields, exclude={"rewards": {"clob_rewards"}})
+        except Exception:
+            return None
+        return dict(facts) if isinstance(facts, Mapping) else None
     return None
 
 
@@ -3512,11 +3538,12 @@ class PolymarketTradingClient:
         )
         try:
             with ThreadPoolExecutor(max_workers=min(8, len(market_batches))) as pool:
-                futures = [
+                futures = deque(
                     (batch, pool.submit(read_market_batch, batch))
                     for batch in market_batches
-                ]
-                for batch, future in futures:
+                )
+                while futures:
+                    batch, future = futures.popleft()
                     try:
                         batch_rows, completed = future.result()
                     except Exception as exc:
@@ -3527,15 +3554,29 @@ class PolymarketTradingClient:
                         )
                         failed_ids.update((condition_id, reason) for condition_id in batch)
                         continue
+                    finally:
+                        del future
                     if completed:
                         completed_market_ids.update(batch)
                         rows.extend(batch_rows)
+                    del batch_rows
         finally:
             if remove_response_hook is not None:
                 remove_response_hook()
 
         numeric_event_keys: dict[int, list[str]] = {}
         direct_event_ids: list[str] = []
+        missing = object()
+
+        def project(raw: object, keys: set[str]) -> dict[str, object] | None:
+            nested = _model_dict(raw)
+            if nested is None:
+                return None
+            return {
+                key: value for key in keys
+                if (value := nested.get(key, missing)) is not missing
+            }
+
         for value in rows:
             row = _model_dict(value)
             if row is None:
@@ -3543,11 +3584,40 @@ class PolymarketTradingClient:
             condition_id = row.get("condition_id", row.get("conditionId"))
             if not isinstance(condition_id, str) or condition_id not in requested:
                 continue
+            # Nested Mapping reads belong to the whole-call parse boundary,
+            # not the HTTP worker's per-batch failure boundary. SDK Market
+            # models have already been projected inside the worker.
+            facts = cast(dict[str, object], row)
+            for name, keys in (
+                ("state", {"accepting_orders", "closed", "resolved"}),
+                ("trading", {"minimum_tick_size", "minimum_order_size", "fees_enabled", "fee_schedule"}),
+                ("rewards", {"rewards_min_size", "rewards_max_spread"}),
+                ("sports", {"game_id", "game_start_time"}),
+                ("prices", {"one_day_price_change"}),
+            ):
+                facts[name] = project(facts.get(name), keys)
+            trading = facts["trading"]
+            if isinstance(trading, dict):
+                trading["fee_schedule"] = project(
+                    trading.get("fee_schedule"), {"rate", "exponent", "taker_only"}
+                )
+            outcomes = _model_dict(facts.get("outcomes"))
+            facts["outcomes"] = {
+                key: project(outcome, {"label", "token_id", "tokenId"})
+                for key, outcome in outcomes.items()
+            } if outcomes is not None else None
+            del trading, outcomes
+            raw_events = row.get("events")
             references = tuple(
-                reference
-                for raw_reference in _collect(row.get("events"))
-                if (reference := _model_dict(raw_reference)) is not None
+                {key: reference[key] for key in ("id", "slug") if key in reference}
+                for reference in map(_model_dict, _collect(raw_events))
+                if reference is not None
             )
+            # Canonical containers are repeatable. Keep other iterators' existing
+            # consumption and failure semantics at this original read boundary.
+            if raw_events is None or isinstance(raw_events, (tuple, list, Mapping, str, bytes)):
+                cast(dict[str, object], row)["events"] = references
+            del raw_events
             if len(references) != 1:
                 continue
             raw_event_id = references[0].get("id")
@@ -3625,13 +3695,15 @@ class PolymarketTradingClient:
 
             resolved: set[int] = set()
             with ThreadPoolExecutor(max_workers=min(8, len(event_batches))) as pool:
-                futures = [
+                futures = deque(
                     (batch, pool.submit(read_event_batch, query))
                     for query in event_batches
                     for batch in (query[0],)
-                ]
-                for batch, future in futures:
+                )
+                while futures:
+                    batch, future = futures.popleft()
                     event_rows, _error = future.result()
+                    del future
                     for value in event_rows:
                         event = _model_dict(value)
                         if event is None:
@@ -3652,6 +3724,7 @@ class PolymarketTradingClient:
                             with event_failures_lock:
                                 event_failures.pop(key, None)
                         resolved.add(numeric_id)
+                    del event_rows
             unresolved_numeric_ids = tuple(
                 event_id
                 for event_id in unresolved_numeric_ids

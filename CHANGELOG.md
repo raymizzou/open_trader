@@ -22,6 +22,19 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - #262 后续修复候选扫描的全局恢复代次竞态：旧队列的成功、失败、拒绝和完成状态不能覆盖恢复后的状态；旧 worker 收尾会清理遗留扫描标志，维护两阶段 reward/metadata/history screening 都跳过旧资格事实和旧 exclusion，自动池同样受保护，SQLite 快照写入在同一事务内复核代次。公共候选 projection 隐藏内部代次标签，保留现有 pool、轮换和审计；恢复后新一代重新读取后可正常发布。真实适配器、临时 SQLite、受控时钟及 fresh/cached 队列、ranking hash 和 stale reward rejection 回归通过；未部署或操作真实交易。
 
+- #263 PR A 在 market 分页读取线程内投影 LP 必需字段，消费后释放 Future；
+  metadata 写入 SQLite scratch 后释放原始批次，避免最后一批跨入 history。
+  保留全部 27 个返回字段、50-ID 请求、100 条分页、8 路并发与完整供数。
+  真实 SDK/MockTransport、离线 service 与 SQLite 定向回归验证生命周期、分页失败、
+  取消、closed fallback、重试、正常/备用遍历及恢复代次；同输入业务与请求 hash 一致。
+  审查修复：canonical Mapping 同样裁剪无用 rewards/fee/outcome 明细及事件子树；
+  公开 batch API 回归验证嵌套对象释放，并按原 base 对照别名、事件数量和读取异常。
+  复审修复：Mapping 嵌套集合/字段访问在调用级消费边界投影，解析异常仍使整次 UNKNOWN；
+  SDK worker 投影、HTTP 逐批隔离、SQLite cause/错误码与取消政策均保留。
+  本机小规模 RSS/tracemalloc 对照分开记录，不代表 Linux cgroup 或生产容量验收；
+  证据见 `docs/operations/issue-263-metadata-lifetime-validation.md`。未部署。
+  2026-10-07 同步 main 的 #264/#262，保留双方 CHANGELOG；生产补丁不变，定向 120 项及恢复代次/历史发布联动 9 项通过。
+
 - #257 将重复保护撤单—补位回归纳入主线：真实适配器与隔离 SQLite 验证两次 5→3→5，
   完整账户 API 确认仅剩三笔后恢复目标，并校验每笔必要账户读取。
   覆盖账户超时、余额不足、无合格候选和并发新发布/旧读取迟到失效；保留拒绝新增及资源清理断言。
