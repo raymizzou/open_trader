@@ -242,7 +242,8 @@ Use four explicit stages with exact-SHA evidence:
    requests before navigation, and checks the selected Prediction N_LEG/LP
    contract according to `N_LEG_PAUSED`. It only reads health, process/listener,
    log, selected Prediction N_LEG/LP evidence, and deployed UI evidence
-   and ends with `HEALTHY` or `ROLLBACK`; a browser failure sets `ROLLBACK`.
+   and ends with `HEALTHY` or `SMOKE_FAILED`. Failures identify the check and
+   explicitly report `rollback_executed=false`; rollback needs a separate decision.
    It never starts the fixture server, downloads a browser, deploys, restarts,
    rolls back, or submits.
 

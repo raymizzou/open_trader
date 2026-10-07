@@ -1371,7 +1371,7 @@ def test_production_smoke_validates_paused_n_leg_without_state_request(tmp_path:
     unavailable_rg = run_smoke("1", "paused", "N_LEG_PAUSED", unavailable_rg=True)
     assert unavailable_rg.returncode != 0
     assert "log checker unavailable" in unavailable_rg.stdout
-    assert "ROLLBACK" in unavailable_rg.stdout
+    assert "SMOKE_FAILED" in unavailable_rg.stdout
     assert not any(
         path.endswith("/api/prediction-arbitrage/state")
         for path in calls.read_text(encoding="utf-8").splitlines()

@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-07
 
+- Production Smoke 失败改为明确的 `SMOKE_FAILED`，区分输入、版本身份、健康/进程、
+  N-leg/LP 契约、日志工具/日志检查、浏览器失败；云端 Smoke 同时标注失败阶段。
+  明示 `rollback_recommendation=review_required rollback_executed=false`，避免把验收失败误读为已回滚。
+  原失败条件、非零退出、真实日志拒绝和只读边界保持；定向离线回归覆盖失败原因及未执行回滚的输出。
+
 - #270 后台核对不再把本进程尚未 POST 的自动 BUY 准备意图误改为 UNKNOWN，避免补位被自身发送前校验拒绝。
   仅在同一事务确认 reserved、活动入场 lane 与精确 pending/preparing entry action 时保留原预留及名额；
   同时检查 session 的 POST 标志，已发送、无本进程 lane、身份冲突和独立未决动作仍按原 UNKNOWN 规则处理。

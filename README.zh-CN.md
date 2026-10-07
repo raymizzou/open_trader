@@ -254,8 +254,9 @@ watchlist 使用市场、标的和 Trend Animals 业务标识：
    checkout 和已存在的绝对路径 shared runtime root；host 测试和 Playwright spec 都从已验证的
    release root 运行，prediction 错误日志从 shared runtime root 读取；浏览器导航前阻断写请求，
    并检查 N_LEG 状态契约。它读取 health、进程/监听器、日志、N_LEG 状态和已部署 UI 证据，最后
-   输出 `HEALTHY` 或 `ROLLBACK`；浏览器失败即为 `ROLLBACK`。它不会启动 fixture server、下载
-   浏览器、部署、重启、回滚或下单。
+   输出 `HEALTHY` 或 `SMOKE_FAILED`。失败时报告检查原因，并明确标注
+   `rollback_recommendation=review_required rollback_executed=false`：需要审查是否回滚，
+   尚未执行回滚。它不会启动 fixture server、下载浏览器、部署、重启、回滚或下单。
 
 首次部署前，生产必须由人工一次性迁移到 clean、immutable 的 detached release
 checkout（例如在 accepted SHA 创建的 checkout）。这项一次性迁移是必需的，但不由
@@ -652,7 +653,8 @@ Production Smoke 只检查 `RELEASE_SERVICES` 选定服务的 health、进程/�
 release root 运行，prediction 错误日志从 shared runtime root 读取，浏览器写请求会在导航前被阻断；选中
 `prediction` 且 `N_LEG_PAUSED=0` 时检查 N_LEG 状态契约，`N_LEG_PAUSED=1` 时检查暂停 health
 和可读的 LP dashboard 并跳过 state 请求。它只读取 health、进程/监听器、日志和已部署 UI 证据，最后
-输出 `HEALTHY` 或 `ROLLBACK`；它不会部署、重启、回滚或下单。
+输出 `HEALTHY` 或 `SMOKE_FAILED`，失败时报告检查原因和 `rollback_executed=false`；
+它不会部署、重启、回滚或下单。
 
 也可以用结构化检查确认 API 和 SOXX 决策事实是否存在：
 
