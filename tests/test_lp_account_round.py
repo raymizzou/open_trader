@@ -22,7 +22,11 @@ from open_trader.prediction_arbitrage_store import (
     PredictionArbitrageStore,
 )
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService
-from tests.test_polymarket_lp import _SDKAccountClient
+from tests.test_polymarket_lp import (
+    _SDKAccountClient,
+    _cancel_notice_completion,
+    _observe_cancel_jobs,
+)
 
 
 NOW = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
@@ -1085,7 +1089,7 @@ class _FailingPublicClient:
 
 
 def test_successful_cancel_retry_receipt_survives_its_own_generation_fence(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
     from tests.test_polymarket_lp import _first_seen_episode
 
@@ -1118,6 +1122,7 @@ def test_successful_cancel_retry_receipt_survives_its_own_generation_fence(
 
     adapter.cancel_order = cancel_order
     service.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    completed = _cancel_notice_completion(service, monkeypatch)
     token = adapter.lp_account_round_begin(store.lp_trade_generation)
 
     service._apply_first_seen_protection(before, token)
@@ -1128,14 +1133,30 @@ def test_successful_cancel_retry_receipt_survives_its_own_generation_fence(
     assert after["cancel_failed"] == []
     assert after["canceled_order_ids"] == ["order-open"]
     assert after["cancel_requested_at"] is not None
-    assert after["notification_sent"] is True
+    assert after["notification_sent"] is False
     assert cancels == ["order-open"]
-    assert notifications
+    assert completed()
+    assert notifications == [1]
     assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID)
+
+    monkeypatch.setattr(account, "list_open_orders", lambda **_kwargs: [])
+    adapter._lp_account_shared_cache = None
+    service.tick()
+    assert store.lp_first_seen_episode("ep-retry")["state"] == "canceled"
+    assert completed()
+    assert notifications == [1]
+    assert cancels == ["order-open"]
+    restarted = PolymarketLPService(store, adapter, clock=lambda: datetime.now(UTC))
+    restarted.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    jobs = _observe_cancel_jobs(restarted, monkeypatch)
+    restarted.tick()
+    assert jobs == []
+    assert notifications == [1]
+    assert cancels == ["order-open"]
 
 
 def test_conservative_cancel_receipt_survives_its_own_generation_fence(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
     from tests.test_polymarket_lp import _first_seen_episode
 
@@ -1162,6 +1183,7 @@ def test_conservative_cancel_receipt_survives_its_own_generation_fence(
 
     adapter.cancel_order = cancel_order
     service.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    completed = _cancel_notice_completion(service, monkeypatch)
     token = adapter.lp_account_round_begin(store.lp_trade_generation)
 
     service._apply_first_seen_protection(before, token)
@@ -1173,10 +1195,26 @@ def test_conservative_cancel_receipt_survives_its_own_generation_fence(
     assert after["cancel_failed"] == []
     assert after["canceled_order_ids"] == ["order-open"]
     assert after["cancel_requested_at"] is not None
-    assert after["notification_sent"] is True
+    assert after["notification_sent"] is False
     assert cancels == ["order-open"]
-    assert notifications
+    assert completed()
+    assert notifications == [1]
     assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID)
+
+    monkeypatch.setattr(account, "list_open_orders", lambda **_kwargs: [])
+    adapter._lp_account_shared_cache = None
+    service.tick()
+    assert store.lp_first_seen_episode("ep-conservative")["state"] == "canceled"
+    assert completed()
+    assert notifications == [1]
+    assert cancels == ["order-open"]
+    restarted = PolymarketLPService(store, adapter, clock=lambda: datetime.now(UTC))
+    restarted.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    jobs = _observe_cancel_jobs(restarted, monkeypatch)
+    restarted.tick()
+    assert jobs == []
+    assert notifications == [1]
+    assert cancels == ["order-open"]
 
 
 def test_post_read_invalidation_cannot_relabel_returned_rows(
@@ -1215,6 +1253,7 @@ def test_post_read_invalidation_cannot_relabel_returned_rows(
     adapter.lp_open_orders_for_round = read_then_invalidate
     adapter.cancel_order = lambda order_id: cancels.append(order_id) or True
     service.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    jobs = _observe_cancel_jobs(service, monkeypatch)
     token = adapter.lp_account_round_begin(store.lp_trade_generation)
 
     service._apply_first_seen_protection(before, token)
@@ -1223,6 +1262,7 @@ def test_post_read_invalidation_cannot_relabel_returned_rows(
     assert unchanged == before
     assert cancels == []
     assert notifications == []
+    assert jobs == []
     assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID) == []
 
 
@@ -1255,6 +1295,7 @@ def test_invalid_round_after_external_read_failure_waits_without_unscoped_retry(
     cancels: list[str] = []
     adapter.cancel_order = lambda order_id: cancels.append(order_id) or True
     service.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    jobs = _observe_cancel_jobs(service, monkeypatch)
     token = adapter.lp_account_round_begin(store.lp_trade_generation)
     original_failure = service._first_seen_data_failure
 
@@ -1274,6 +1315,7 @@ def test_invalid_round_after_external_read_failure_waits_without_unscoped_retry(
     assert account.calls["balance"] == 1
     assert cancels == []
     assert notifications == []
+    assert jobs == []
     assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID) == []
 
     account.fail_reads = False
@@ -1321,6 +1363,7 @@ def test_register_fence_rejection_waits_without_touching_first_seen_episode(
     cancels: list[str] = []
     adapter.cancel_order = lambda order_id: cancels.append(order_id) or True
     service.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    jobs = _observe_cancel_jobs(service, monkeypatch)
     original_register = store.lp_register_fenced_actions
     register_injections = 0
 
@@ -1351,6 +1394,7 @@ def test_register_fence_rejection_waits_without_touching_first_seen_episode(
     unchanged = store.lp_first_seen_episode("ep-register-fence")
     assert unchanged == episode
     assert notifications == []
+    assert jobs == []
     assert cancels == []
     assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID) == []
 
@@ -1392,6 +1436,7 @@ def test_book_read_invalidation_waits_then_next_real_round_can_cancel(
 
     adapter.cancel_order = cancel_order
     service.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    jobs = _observe_cancel_jobs(service, monkeypatch)
     token = adapter.lp_account_round_begin(store.lp_trade_generation)
 
     result_container: list[BaseException | None] = []
@@ -1417,6 +1462,7 @@ def test_book_read_invalidation_waits_then_next_real_round_can_cancel(
     unchanged = store.lp_first_seen_episode("ep-book-fence")
     assert unchanged == original
     assert notifications == []
+    assert jobs == []
     assert cancels == []
     assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID) == []
 
@@ -1429,6 +1475,8 @@ def test_book_read_invalidation_waits_then_next_real_round_can_cancel(
     assert updated["cancel_targets"] == ["order-open"]
     assert cancels == ["order-open"]
     assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID)
+
+    assert len(jobs) == 1
 
 
 def test_incomplete_shared_orders_block_first_seen_until_complete(tmp_path) -> None:

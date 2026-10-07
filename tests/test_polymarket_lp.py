@@ -11556,7 +11556,7 @@ def test_protection_notice_does_not_report_filled_targets_as_canceled(
     exchange.cancel_responses = [
         {"not_canceled": {order_id: "venue_busy"}},
     ]
-    completed = _cancel_notice_completion(service, monkeypatch)
+    jobs = _observe_cancel_jobs(service, monkeypatch)
     first = service.tick()
     if path == "first_seen":
         episode = store.lp_first_seen_episode(episode_id)
@@ -11569,6 +11569,7 @@ def test_protection_notice_does_not_report_filled_targets_as_canceled(
         assert protection["canceled_order_ids"] == []
     assert exchange.cancels == [order_id]
     assert notes == []
+    assert jobs == []
 
     filled = _queue_receipt(order_id, status="FILLED", matched="2000")
     if path == "first_seen":
@@ -11612,10 +11613,12 @@ def test_protection_notice_does_not_report_filled_targets_as_canceled(
         assert Decimal(str(protection["partially_filled_quantity"])) == Decimal("2000")
         assert protection["canceled_order_ids"] == []
     assert notes == []
+    assert jobs == []
 
     service.tick()
     assert exchange.cancels == [order_id]
     assert notes == []
+    assert jobs == []
 
 
 @pytest.mark.parametrize("path", ("first_seen", "submit"))

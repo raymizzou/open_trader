@@ -22,6 +22,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   排队/尝试仍不写此字段。真实两价位收敛回归先 2 failed，最小 guard 修复后直接相关检查 76 passed；
   受控并发三次各 5 passed，先前六项负向故障注入记录保留；两 worker 检查因指定环境缺 pytest-xdist 为 BLOCKED。
   未部署或真实发送。
+  CI/评审后续：迁移三处跨文件通知消费者，保留撤单、回执与代次断言，等待实际任务并验证收敛/重启不重发；
+  FILLED 与账户栅栏静默路径直接断言零入队，受控错误入队和重复消费均被回归拒绝。
+  使用已有隔离 Python 环境补齐 xdist，相关串行与双 worker 各 98 项通过；保留原 CI 三项失败及诊断脚本路径错误记录。
 
 ## 2026-10-06
 
