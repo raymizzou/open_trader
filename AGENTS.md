@@ -1,10 +1,14 @@
 # Project Instructions
 
-This is the always-read entry point. Global agent instructions still govern
-approval, worker delegation, TDD, and independent review. Read
+This is the always-read entry point. This repository and its linked runbooks
+define OpenTrader's workflow on every workstation, including Air and Mini.
+Apply compatible global guidance alongside these project rules, subject to
+higher-priority instructions. Skills and plugins, including Ponytail, support
+implementation; they do not waive the project's approval, TDD, verification,
+independent-review, or delivery requirements. Read
 [agent-verification.md](docs/operations/agent-verification.md) before selecting
-or running development gates, acceptance, merge, or deployment; documentation
-and configuration-only tasks may use the stated exemption.
+an implementation workflow or running development gates, acceptance, merge, or
+deployment; documentation and configuration-only tasks may use the stated exemption.
 
 ## Session bootstrap
 
@@ -28,7 +32,14 @@ Start every implementation or repository-change task from freshly fetched
 `origin/main` in an isolated branch and worktree. Local `main` only synchronizes
 GitHub `main`; never integrate task branches or create delivery commits there.
 Do not use an unrelated or dirty checkout. Code and behavior changes require a concrete plan and explicit user
-approval; follow the global worker and TDD contract after approval.
+approval; follow the implementation and TDD workflow in the linked runbook after
+approval. Existing authorization remains valid within its approved scope.
+
+For workstation setup, dependency drift, or Air/Mini comparisons, read
+[dependency-reproducibility.md](docs/operations/dependency-reproducibility.md#workstation-setup-and-comparison).
+Use the checked-out project's rules and an explicitly selected development
+interpreter. Verify each machine before claiming that their environments match;
+pulling this file alone does not synchronize global configuration or dependencies.
 
 ## Plans and handoffs
 

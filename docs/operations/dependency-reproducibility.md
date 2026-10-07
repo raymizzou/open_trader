@@ -41,6 +41,95 @@ state as informational build arguments; the manifest records those, Python,
 platform, lock hash, pinned image references, and installed dependency versions.
 Direct Docker builds default to unknown provenance unless arguments are given.
 
+## Workstation setup and comparison
+
+Use this procedure when setting up Air or Mini, repairing development dependency
+drift, or comparing the machines. Keep the same selected Git commit, Python/uv
+baseline, and dependency extras on both machines. Compare like-for-like platforms;
+machine-specific paths and credentials remain local.
+
+1. Fetch GitHub and identify the exact commit to use. An unmerged reviewed branch
+   can be fetched into an isolated worktree; adding it to GitHub `main` requires
+   separate merge approval. Local `main` may fast-forward to already merged GitHub
+   commits after checking its worktree and runtime consumers. Record the worktree,
+   branch, SHA, and status. Use all project instructions and their linked runbooks
+   from that checkout together.
+   A stale worktree keeps its old rules until it is updated; copying a newer
+   `AGENTS.md` into an older checkout does not synchronize the workflow.
+2. Install or locate the exact uv version in the Contract above. If that Python
+   version is absent, provision it with `uv python install 3.12.14 --no-bin` before
+   running the locked installation commands. Keep the existing Python/lock
+   versions when an installation fails; report the error rather than substituting
+   a newer or older version.
+3. Select a fresh development environment in the isolated worktree:
+
+   ```sh
+   test ! -e .venv && test ! -L .venv || {
+     printf '%s\n' 'Use a new worktree: .venv already exists or is a symlink.' >&2
+     exit 1
+   }
+   export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+   ```
+
+   Then run the Contract's locked installation commands in that shell. Preserve
+   any existing environment until its consumers
+   are known. In particular, a main-checkout `.venv` referenced by launchd is a
+   runtime dependency, not an environment to upgrade for development. Virtual
+   environments are rebuilt from the lock on each machine, not copied between them.
+4. Validate the new environment and capture evidence outside the repository:
+
+   ```sh
+   (
+   set -eu
+   export PYTHONDONTWRITEBYTECODE=1
+   test -z "$(git status --porcelain)" || exit 1
+   source_sha=$(git rev-parse HEAD)
+   evidence_dir=$(mktemp -d)
+   uv --version > "$evidence_dir/uv-version.txt"
+   .venv/bin/python --version
+   uv sync --check --locked --python 3.12.14 --no-python-downloads --offline \
+     --no-default-groups --group build --extra dev --extra cloud-ssm --no-build-isolation
+   uv pip check --python .venv/bin/python
+   PYTHONPATH=src .venv/bin/python -c 'import open_trader; print(open_trader.__file__)'
+   OPEN_TRADER_TEST_SOURCE_SHA="$source_sha" \
+     OPEN_TRADER_TEST_SOURCE_STATE=clean \
+     .venv/bin/python scripts/dev_dependency_manifest.py > "$evidence_dir/dependencies.json"
+   test "$(git rev-parse HEAD)" = "$source_sha"
+   test -z "$(git status --porcelain)" || exit 1
+   printf '%s\n' "$evidence_dir"
+   )
+   ```
+
+   Check the reported Python and uv versions against the Contract, and confirm
+   that the import path belongs to this worktree. The manifest reuses the existing
+   test-only evidence format; it is not release or deployment evidence. Compare
+   `source_sha`, `source_state`, `python`, `platform`, `lock_sha256`, `base_images`,
+   and the complete sorted `dependencies` list between Air and Mini. Both states
+   must be `clean`, and both uv versions must match the Contract. Dependency
+   installation and consistency checks do not replace directly affected tests
+   when application code changes.
+
+Agent configuration is a separate comparison. Record Codex CLI/app versions,
+the effective model and reasoning setting for each task role, the loaded global
+and project instruction files, enabled plugin/skill versions, custom hooks, and
+required MCP tools on both machines. The Herdr implementation role follows
+[the project workflow](agent-verification.md#implementation-and-tdd); other roles
+retain their selected models. New sessions must load the updated project rules.
+Use the same selected plugin/skill versions where the workflow depends on them;
+an installed plugin or matching configuration file alone does not prove it loaded.
+
+Synchronize only reviewed non-secret global settings and portable instruction
+files. Keep login state, tokens, private keys, local paths, sessions, runtime data,
+and machine-generated hook trust state on their owning machine. Configure and
+verify path-dependent hooks/MCP tools locally instead of copying the entire
+`~/.codex` directory. Shared project requirements remain in this repository, so
+their behavior does not depend on one machine's optional skills or plugins.
+
+Report project, agent configuration, and dependency comparisons separately.
+Claim workstation parity only after all three are verified on both machines.
+An inaccessible machine, an unverified loaded setting, or an unexplained
+platform/package difference remains UNKNOWN or a recorded difference, not PASS.
+
 ## Acceptance on a Docker-capable machine
 
 First commit the reviewed patch on its isolated branch. No merge or deployment

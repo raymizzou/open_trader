@@ -1,9 +1,39 @@
 # Agent Verification and Delivery
 
-This runbook is binding with `AGENTS.md` and the global agent instructions.
+This runbook defines the project workflow with `AGENTS.md`; compatible global
+guidance also applies, subject to higher-priority instructions.
 Read it before selecting or running development gates, Deployment Preflight,
 merge, or deployment. Documentation and configuration-only work does not run
 `make test`; other exemptions below remain scope-specific.
+
+## Implementation and TDD
+
+After plan approval, implement within the approved scope in the isolated task
+worktree. For new or changed behavior, including bug fixes, first add a focused
+test that fails for the intended missing or incorrect behavior. Record the RED
+result, make the smallest implementation change, then run that test and the
+directly affected consumers. A failure caused only by missing dependencies does
+not establish RED. For behavior-preserving refactors, run the existing focused
+contract tests before and after the change. Documentation and configuration
+exemptions below remain valid; a skill does not add another approval requirement
+when the project already grants an exemption.
+
+Delegate implementation only when the user or applicable instructions authorize
+it. Give the worker the approved scope, worktree, and verification contract.
+The required independent review remains separate from implementation: the author
+does not serve as their own reviewer. Follow the staged-review and repair rules
+in `AGENTS.md` before publication.
+
+When the user selects Herdr for implementation, start new Codex implementation
+workers with `gpt-6.1-sol` and `high` reasoning unless the user chooses otherwise:
+
+```sh
+herdr agent start <worker-name> --kind codex --pane <available-pane-id> -- -m gpt-6.1-sol -c 'model_reasoning_effort="high"'
+```
+
+Before assigning work, use `herdr agent read <worker-name>` to verify the selected
+model. Planning, independent review, and existing sessions retain their separately
+selected models. Herdr is not required for work the user has not assigned to it.
 
 ## Development verification
 
