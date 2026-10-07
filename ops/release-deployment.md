@@ -31,7 +31,8 @@ Acceptance。PR CI 不能代替该 SHA 的 Candidate `PASS`，合并不自动运
 验收失败时先审计全部错误及下游影响，修复走独立分支、检查、审查、PR、CI、用户
 批准合并，再对新的最终 main SHA 验收；不直接修补 main 或生产。发布/tag 创建、
 生产变更、owner 切换、回滚各按其授权范围执行。保留不可变目录、精确 SHA/
-`code_root`、单一 owner、备份与回滚证据；`ROLLBACK` 结果本身不授权执行回滚。
+`code_root`、单一 owner、备份与回滚证据；`SMOKE_FAILED` 只表示验收失败，不表示已回滚，
+也不授权执行回滚。旧版本输出的 `ROLLBACK` 同样只是验收结论。
 [仓库保护设计](../docs/operations/repository-protection.md)尚未启用，另行审批。
 
 ## 四步发布流程
@@ -200,8 +201,12 @@ N-Leg state 契约。除既有的
 位于 `EXPECTED_ROOT` 之下——这是防止"服务加载旧发布代码"的关键断言
 (#110/#113)。未选定服务可以保持较旧版本；应独立确认其 PID/版本未变化，但不把它们
 标记为本次已更新或 exact-SHA 已验收。Prediction 选中时保留 N_LEG 状态契约和浏览器
-只读写入护栏；浏览器集成检查在所有 scope 中都保留。任何 `BLOCKED`/`ROLLBACK` 都按
-失败处理，先做只读审计，再决定 fix-forward 或回滚；不要在未通过时宣称部署完成。
+只读写入护栏；浏览器集成检查在所有 scope 中都保留。任何 `BLOCKED`/`SMOKE_FAILED` 都按
+失败处理。Smoke 用 `smoke_failure reason=<code>` 标注失败检查，日志检查还会报告
+`log_error_signal`、`log_not_regular_file` 等具体原因；
+`rollback_recommendation=review_required rollback_executed=false` 表示需要审查回滚建议，
+尚未执行回滚。先做只读审计，再决定 fix-forward 或回滚；安装完成但 Smoke 失败时，
+报告“已部署，运行验收失败”，不能声称 HEALTHY 或已回滚。
 
 `RELEASE_SERVICES` 只改变检查和部署范围，不改变交易语义或任何业务规则。
 

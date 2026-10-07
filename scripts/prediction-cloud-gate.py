@@ -59,7 +59,8 @@ def main():
     parser.add_argument('--operator-evidence', type=Path, required=True)
     parser.add_argument('--browser-runtime', type=Path, required=True, help='local root containing node_modules')
     args = parser.parse_args()
-    end = 'BLOCKED' if args.action == 'readiness' else 'ROLLBACK'
+    end = 'BLOCKED' if args.action == 'readiness' else 'SMOKE_FAILED'
+    failure_reason = 'configuration_or_operator_evidence'
     try:
         local = json.loads(args.client_config.read_text())
         validate(local)
@@ -83,6 +84,7 @@ def main():
                 raise ValueError('operator handoff/isolation/resource evidence missing')
         if not Path(args.remote_config).is_absolute():
             raise ValueError('absolute remote config required')
+        failure_reason = 'local_source_identity'
         release = Path(local['release_root'])
         identity = inspect_prediction_release_checkout(release)
         if identity['git_sha'] != local['expected_sha'] or checked(['git','-C',str(release),'rev-parse','--abbrev-ref','HEAD']).strip() != 'HEAD':
@@ -91,6 +93,7 @@ def main():
         remote = ('cd '+shlex.quote(str(cloud.release_root))+' && '+shlex.join([
             'env', 'PYTHONPATH='+str(cloud.release_root/'src'), 'PYTHONDONTWRITEBYTECODE=1', str(cloud.python),
             '-m','open_trader.prediction_cloud',action,'--config',args.remote_config]))
+        failure_reason = 'remote_backend_check'
         output = checked(['ssh','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ForwardAgent=no',
                           '-o','ConnectTimeout=10',local['ssh_alias'],remote])
         result = json.loads(output)
@@ -106,30 +109,40 @@ def main():
             client_release(local)
             print('READY')
         else:
+            failure_reason = 'local_client_status'
             before = client_operation(local,'status')
             if 'execution_port' in local and (before.get('execution_status') != 'ok'
                 or before.get('execution_git_sha') != local['execution_expected_sha']):
                 raise ValueError('Air execution unavailable or identity mismatch')
             if before['status'] != 'CONNECTED':
                 raise ValueError('local client not connected')
+            failure_reason = 'local_gateway_log'
             log = Path(local['runtime_root'])/'gateway.log'
             text = log.read_text()
             if 'frontend_gateway_runtime:' not in text or any(word in text.lower() for word in ('traceback','fatal','exception','error')):
                 raise ValueError('local Gateway log missing or contains errors')
+            failure_reason = 'python_browser_check'
             checked([local['python'],'-m','pytest','-q','-m','browser'],cwd=release,env=env)
+            failure_reason = 'browser_check'
             checked([str(runner),'test','tests/e2e/production-smoke.spec.ts','--config=playwright.config.ts','--project=chromium'],cwd=release,env=env)
+            failure_reason = 'local_client_changed'
             if client_operation(local,'status') != before:
                 raise ValueError('client changed during browser smoke')
+            failure_reason = 'remote_backend_changed_or_unavailable'
             after = json.loads(checked(['ssh','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',
                 '-o','ForwardAgent=no','-o','ConnectTimeout=10',local['ssh_alias'],remote]))
             if remote_identity(after, cloud, action) != identity_before:
                 raise ValueError('backend changed during browser smoke')
+            failure_reason = 'local_client_release'
             client_release(local)
             print('HEALTHY')
         return 0
     except Exception as exc:
         # Exception messages from this coordinator contain no SDK payloads.
         print(f'cloud gate: {type(exc).__name__}')
+        if args.action == 'smoke':
+            print(f'smoke_failure reason={failure_reason}')
+            print('rollback_recommendation=review_required rollback_executed=false')
         print(end)
         return 2
 

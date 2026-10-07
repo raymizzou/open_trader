@@ -710,7 +710,9 @@ remote systemd/process/lock/log/business
 identity, the owned local Gateway/tunnel, the existing five marked Python browser
 regressions and the read-only browser scenario, adapting its Prediction-only entry point
 without changing ordinary production smoke. Missing evidence ends
-BLOCKED or ROLLBACK. Client, service and remote evidence modes must match; a
+`BLOCKED` or `SMOKE_FAILED`. Smoke failures identify the failed stage and report
+`rollback_recommendation=review_required rollback_executed=false`; the gate never
+performs rollback. Client, service and remote evidence modes must match; a
 Shadow guard violation or unavailable backend cannot pass.
 In split mode the browser checks cloud `/venues` and a fresh read-only LP
 snapshot, while `/execution/identity` supplies Air's production identity and

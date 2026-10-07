@@ -649,7 +649,12 @@ def test_two_host_smoke_revalidates_refresh_and_stable_identity(tmp_path, monkey
         '--service-config',str(tmp_path/'unused'), '--remote-config','/etc/cloud.json',
         '--operator-evidence',str(operator), '--browser-runtime',str(tmp_path)])
     assert gate.main() == (0 if change == 'refresh' else 2)
-    assert capsys.readouterr().out.endswith('HEALTHY\n' if change == 'refresh' else 'ROLLBACK\n')
+    output = capsys.readouterr().out
+    assert output.endswith('HEALTHY\n' if change == 'refresh' else 'SMOKE_FAILED\n')
+    if change != 'refresh':
+        assert 'rollback_recommendation=review_required rollback_executed=false' in output
+        assert 'smoke_failure reason=remote_' in output
+        assert 'ROLLBACK' not in output
     early_rejection = observation == 'before' and change not in {
         'refresh', 'pid', 'started_at', 'systemd_started_at', 'changed_extra_identity'}
     assert len(ssh_calls) == (1 if early_rejection else 2)

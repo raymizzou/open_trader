@@ -175,7 +175,7 @@ forward-deployment wrapper, trust checks, environment limits and rollback path.
   keeps the normal state contract check for selected Prediction; a missing or
   contradictory pause status blocks the gate.
 
-  It must end with `HEALTHY` or `ROLLBACK`. `make production-smoke` first runs
+  It must end with `HEALTHY` or `SMOKE_FAILED`. `make production-smoke` first runs
   the five marked Python browser regressions, then uses the direct cached JS
   runner against `tests/e2e/production-smoke.spec.ts` from the validated
   release root; both runs use that validated release root. The prediction
@@ -257,7 +257,16 @@ never perform that migration. After explicit deployment authorization, deploy
 only the exact CI-verified SHA through `scripts/deploy_release.py` and the existing
 release runbook, then run Smoke against that detached checkout. Smoke reads selected-service health,
 process/listener, logs, the selected Prediction N_LEG/LP contract, and browser evidence; it never deploys,
-restarts, rolls back, or submits. `ROLLBACK` is evidence only.
+restarts, rolls back, or submits. A failure prints `smoke_failure reason=<code>`,
+`rollback_recommendation=review_required rollback_executed=false`, and ends with
+`SMOKE_FAILED`. The reason identifies the failed check, not an inferred root
+cause. Log failures retain the separate checker reason (for example
+`log_error_signal`, `log_not_regular_file`, or `log_read_failed`). Missing tools,
+invalid inputs, identity mismatches, contract failures and browser failures have
+separate reason codes. Review this evidence before deciding whether to use the
+separately authorized rollback procedure. The gate never records a completed
+rollback. Older releases print `ROLLBACK`; that legacy verdict also does not
+prove a rollback occurred.
 
 Failed Deployment Preflight or Host `BLOCKED` blocks forward deployment. Missing,
 expired, cancelled or mismatched CI evidence is not a reason to rerun local full

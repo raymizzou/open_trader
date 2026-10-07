@@ -156,30 +156,32 @@ host-readiness:
 # mutation set; state assertions below pin the N_LEG contract generation.
 production-smoke:
 	@set -u; \
+	status=0; \
+	fail() { printf 'smoke_failure reason=%s\n' "$$1"; status=1; }; \
+	report_failure() { echo "rollback_recommendation=review_required rollback_executed=false"; echo SMOKE_FAILED; }; \
 	services='$(strip $(RELEASE_SERVICES))'; \
 	set -f; \
-	if [ -z "$$services" ]; then echo "RELEASE_SERVICES must name one or more of: gateway legacy account prediction" >&2; echo ROLLBACK; exit 2; fi; \
+	if [ -z "$$services" ]; then echo "RELEASE_SERVICES must name one or more of: gateway legacy account prediction" >&2; fail invalid_release_services; report_failure; exit 2; fi; \
 	set -- $$services; \
 	gateway_selected=0; legacy_selected=0; account_selected=0; prediction_selected=0; \
-	for service in "$$@"; do case "$$service" in gateway) gateway_selected=1 ;; legacy) legacy_selected=1 ;; account) account_selected=1 ;; prediction) prediction_selected=1 ;; *) echo "unknown RELEASE_SERVICES entry: $$service" >&2; echo ROLLBACK; exit 2 ;; esac; done; \
-	status=0; \
+	for service in "$$@"; do case "$$service" in gateway) gateway_selected=1 ;; legacy) legacy_selected=1 ;; account) account_selected=1 ;; prediction) prediction_selected=1 ;; *) echo "unknown RELEASE_SERVICES entry: $$service" >&2; fail invalid_release_services; report_failure; exit 2 ;; esac; done; \
 	prediction_n_leg_status=""; prediction_n_leg_code=""; \
 	expected_sha='$(EXPECTED_SHA)'; expected_root='$(EXPECTED_ROOT)'; expected_runtime_root='$(EXPECTED_RUNTIME_ROOT)'; expected_n_leg_paused='$(N_LEG_PAUSED)'; \
-	if [ "$$expected_n_leg_paused" != 0 ] && [ "$$expected_n_leg_paused" != 1 ]; then echo "N_LEG_PAUSED must be 0 or 1"; echo ROLLBACK; exit 2; fi; \
-	if ! printf '%s' "$$expected_sha" | grep -Eq '^[0-9a-fA-F]{40}$$'; then echo "EXPECTED_SHA must be a 40-hex Git SHA"; echo ROLLBACK; exit 2; fi; \
-	case "$$expected_root" in /*) ;; *) echo "EXPECTED_ROOT must be an absolute immutable checkout"; echo ROLLBACK; exit 2;; esac; \
-	if [ ! -d "$$expected_root" ]; then echo "EXPECTED_ROOT does not exist"; echo ROLLBACK; exit 2; fi; \
+	if [ "$$expected_n_leg_paused" != 0 ] && [ "$$expected_n_leg_paused" != 1 ]; then echo "N_LEG_PAUSED must be 0 or 1"; fail invalid_n_leg_pause; report_failure; exit 2; fi; \
+	if ! printf '%s' "$$expected_sha" | grep -Eq '^[0-9a-fA-F]{40}$$'; then echo "EXPECTED_SHA must be a 40-hex Git SHA"; fail invalid_expected_sha; report_failure; exit 2; fi; \
+	case "$$expected_root" in /*) ;; *) echo "EXPECTED_ROOT must be an absolute immutable checkout"; fail invalid_expected_root; report_failure; exit 2;; esac; \
+	if [ ! -d "$$expected_root" ]; then echo "EXPECTED_ROOT does not exist"; fail missing_expected_root; report_failure; exit 2; fi; \
 	expected_root="$$(cd "$$expected_root" && pwd -P)"; \
-	case "$$expected_runtime_root" in /*) ;; *) echo "EXPECTED_RUNTIME_ROOT must be an absolute shared runtime root"; echo ROLLBACK; exit 2;; esac; \
-	if [ ! -d "$$expected_runtime_root" ]; then echo "EXPECTED_RUNTIME_ROOT does not exist"; echo ROLLBACK; exit 2; fi; \
+	case "$$expected_runtime_root" in /*) ;; *) echo "EXPECTED_RUNTIME_ROOT must be an absolute shared runtime root"; fail invalid_runtime_root; report_failure; exit 2;; esac; \
+	if [ ! -d "$$expected_runtime_root" ]; then echo "EXPECTED_RUNTIME_ROOT does not exist"; fail missing_runtime_root; report_failure; exit 2; fi; \
 	expected_runtime_root="$$(cd "$$expected_runtime_root" && pwd -P)"; \
-	if [ "$$(git -C "$$expected_root" rev-parse HEAD 2>/dev/null || true)" != "$$expected_sha" ] || [ -n "$$(git -C "$$expected_root" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" ] || [ -n "$$(git -C "$$expected_root" status --porcelain --untracked-files=all 2>/dev/null || true)" ]; then echo "immutable checkout identity or cleanliness mismatch"; status=1; else echo "checkout: PASS"; fi; \
-	check_health() { name="$$1"; kind="$$2"; url="$$3"; payload="$$(curl -fsS --max-time 5 "$$url/healthz" 2>/dev/null || true)"; if [ -z "$$payload" ]; then echo "$$name: BLOCKED"; status=1; health_pid=""; return; fi; if [ "$$kind" = prediction ]; then prediction_n_leg_status="$$(printf '%s' "$$payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); n=p.get("n_leg") or {}; print(n.get("status", ""), end="")' 2>/dev/null || true)"; prediction_n_leg_code="$$(printf '%s' "$$payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); n=p.get("n_leg") or {}; print(n.get("code", ""), end="")' 2>/dev/null || true)"; fi; health_pid="$$(printf '%s' "$$payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); kind,sha,root=sys.argv[1:]; under_root=(lambda value: isinstance(value,str) and (value==root or value.startswith(root+"/"))); common=((kind=="account" and p.get("api_git_sha")==sha and p.get("worker_git_sha")==sha and under_root(p.get("code_root")) and under_root(p.get("worker_code_root"))) or (kind!="account" and p.get("cwd")==root and p.get("source_state")=="clean" and p.get("git_sha")==sha and under_root(p.get("code_root")))); ok=(common and ((kind=="gateway" and p.get("schema_version")=="open_trader.frontend_gateway.health.v1" and p.get("module")=="frontend_gateway" and p.get("legacy_upstream_status")=="ok" and p.get("account_upstream_status")=="ok" and p.get("prediction_upstream_status")=="ok" and p.get("prediction_route_mode")=="service") or (kind=="legacy" and p.get("schema_version")=="open_trader.legacy_dashboard.health.v1" and p.get("module")=="legacy_dashboard") or (kind=="prediction" and p.get("schema_version")=="open_trader.prediction_service.health.v1" and p.get("module")=="prediction_service" and p.get("status")=="running" and p.get("mode")=="production" and p.get("production_owner") is True and p.get("mutations")=="enabled") or (kind=="account" and p.get("schema_version")=="open_trader.account_api.health.v1" and p.get("module")=="account_api" and p.get("status")=="ok" and p.get("mode")=="production" and p.get("release_match") is True))); print(p.get("pid", ""), end="") if ok else None; raise SystemExit(0 if ok else 1)' "$$kind" "$$expected_sha" "$$expected_root" 2>/dev/null || true)"; if [ -n "$$health_pid" ]; then echo "$$name: PASS pid=$$health_pid"; else echo "$$name: BLOCKED"; status=1; fi; }; \
+	if [ "$$(git -C "$$expected_root" rev-parse HEAD 2>/dev/null || true)" != "$$expected_sha" ] || [ -n "$$(git -C "$$expected_root" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" ] || [ -n "$$(git -C "$$expected_root" status --porcelain --untracked-files=all 2>/dev/null || true)" ]; then echo "immutable checkout identity or cleanliness mismatch"; fail source_identity_mismatch; else echo "checkout: PASS"; fi; \
+	check_health() { name="$$1"; kind="$$2"; url="$$3"; payload="$$(curl -fsS --max-time 5 "$$url/healthz" 2>/dev/null || true)"; if [ -z "$$payload" ]; then echo "$$name: BLOCKED"; fail "$${kind}_health_unavailable"; health_pid=""; return; fi; if [ "$$kind" = prediction ]; then prediction_n_leg_status="$$(printf '%s' "$$payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); n=p.get("n_leg") or {}; print(n.get("status", ""), end="")' 2>/dev/null || true)"; prediction_n_leg_code="$$(printf '%s' "$$payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); n=p.get("n_leg") or {}; print(n.get("code", ""), end="")' 2>/dev/null || true)"; fi; health_pid="$$(printf '%s' "$$payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); kind,sha,root=sys.argv[1:]; under_root=(lambda value: isinstance(value,str) and (value==root or value.startswith(root+"/"))); common=((kind=="account" and p.get("api_git_sha")==sha and p.get("worker_git_sha")==sha and under_root(p.get("code_root")) and under_root(p.get("worker_code_root"))) or (kind!="account" and p.get("cwd")==root and p.get("source_state")=="clean" and p.get("git_sha")==sha and under_root(p.get("code_root")))); ok=(common and ((kind=="gateway" and p.get("schema_version")=="open_trader.frontend_gateway.health.v1" and p.get("module")=="frontend_gateway" and p.get("legacy_upstream_status")=="ok" and p.get("account_upstream_status")=="ok" and p.get("prediction_upstream_status")=="ok" and p.get("prediction_route_mode")=="service") or (kind=="legacy" and p.get("schema_version")=="open_trader.legacy_dashboard.health.v1" and p.get("module")=="legacy_dashboard") or (kind=="prediction" and p.get("schema_version")=="open_trader.prediction_service.health.v1" and p.get("module")=="prediction_service" and p.get("status")=="running" and p.get("mode")=="production" and p.get("production_owner") is True and p.get("mutations")=="enabled") or (kind=="account" and p.get("schema_version")=="open_trader.account_api.health.v1" and p.get("module")=="account_api" and p.get("status")=="ok" and p.get("mode")=="production" and p.get("release_match") is True))); print(p.get("pid", ""), end="") if ok else None; raise SystemExit(0 if ok else 1)' "$$kind" "$$expected_sha" "$$expected_root" 2>/dev/null || true)"; if [ -n "$$health_pid" ]; then echo "$$name: PASS pid=$$health_pid"; else echo "$$name: BLOCKED"; fail "$${kind}_health_identity_or_contract"; fi; }; \
 	if [ $$status -eq 0 ]; then \
 		if (cd "$$expected_root" && PYTHONSAFEPATH=1 PYTHONPATH="$$expected_root:$$expected_root/src" "$(PYTHON_BIN)" -m pytest -q -m browser); then \
 			echo "Python browser prerequisite: PASS"; \
 		else \
-			echo "Python browser prerequisite: BLOCKED"; echo ROLLBACK; exit 1; \
+			echo "Python browser prerequisite: BLOCKED"; fail python_browser_check_failed; report_failure; exit 1; \
 		fi; \
 	fi; \
 	gateway_pid=""; legacy_pid=""; account_pid=""; prediction_pid=""; \
@@ -187,31 +189,31 @@ production-smoke:
 	if [ $$legacy_selected -eq 1 ]; then check_health "legacy health" legacy "$(LEGACY_DASHBOARD_URL)"; legacy_pid="$$health_pid"; fi; \
 	if [ $$account_selected -eq 1 ]; then check_health "account health" account "$(ACCOUNT_API_URL)"; account_pid="$$health_pid"; fi; \
 	if [ $$prediction_selected -eq 1 ]; then check_health "prediction health" prediction "http://127.0.0.1:8769"; prediction_pid="$$health_pid"; fi; \
-	check_process() { name="$$1"; port="$$2"; pid="$$3"; listener="$$(lsof -nP -tiTCP:"$$port" -sTCP:LISTEN 2>/dev/null | awk 'NF {print; count++} END {if (count != 1) exit 1}')" || listener=""; cwd="$$(lsof -a -p "$$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ {print substr($$0,2); exit}')"; if [ -n "$$pid" ] && [ "$$listener" = "$$pid" ] && [ "$$cwd" = "$$expected_root" ] && ps -p "$$pid" -o pid=,lstart=,command= >/dev/null 2>&1; then echo "$$name: PASS pid=$$pid"; else echo "$$name: BLOCKED"; status=1; fi; }; \
+	check_process() { name="$$1"; port="$$2"; pid="$$3"; listener="$$(lsof -nP -tiTCP:"$$port" -sTCP:LISTEN 2>/dev/null | awk 'NF {print; count++} END {if (count != 1) exit 1}')" || listener=""; cwd="$$(lsof -a -p "$$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ {print substr($$0,2); exit}')"; if [ -n "$$pid" ] && [ "$$listener" = "$$pid" ] && [ "$$cwd" = "$$expected_root" ] && ps -p "$$pid" -o pid=,lstart=,command= >/dev/null 2>&1; then echo "$$name: PASS pid=$$pid"; else echo "$$name: BLOCKED"; fail "$${name%% *}_process_identity"; fi; }; \
 	if [ $$gateway_selected -eq 1 ]; then check_process "gateway process/listener" 8766 "$$gateway_pid"; fi; \
 	if [ $$legacy_selected -eq 1 ]; then check_process "legacy process/listener" 8767 "$$legacy_pid"; fi; \
 	if [ $$account_selected -eq 1 ]; then check_process "account process/listener" 8768 "$$account_pid"; fi; \
 	if [ $$prediction_selected -eq 1 ]; then check_process "prediction process/listener" 8769 "$$prediction_pid"; fi; \
 	if [ $$prediction_selected -eq 1 ]; then \
 		if [ "$$expected_n_leg_paused" = 1 ]; then \
-			if [ "$$prediction_n_leg_status" = paused ] && [ "$$prediction_n_leg_code" = N_LEG_PAUSED ]; then echo "n-leg state: PAUSED"; else echo "n-leg state: BLOCKED"; status=1; fi; \
+			if [ "$$prediction_n_leg_status" = paused ] && [ "$$prediction_n_leg_code" = N_LEG_PAUSED ]; then echo "n-leg state: PAUSED"; else echo "n-leg state: BLOCKED"; fail n_leg_contract_mismatch; fi; \
 			lp_payload="$$(curl -fsS --max-time 10 "http://127.0.0.1:8769/api/prediction-arbitrage/lp/dashboard" 2>/dev/null || true)"; \
-			if printf '%s' "$$lp_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); ok=(isinstance(p,dict) and p.get("state")=="ready" and isinstance(p.get("orders"),list) and isinstance(p.get("positions"),list) and isinstance(p.get("recommendations"),list)); raise SystemExit(0 if ok else 1)' >/dev/null 2>&1; then echo "lp dashboard: PASS"; else echo "lp dashboard: BLOCKED"; status=1; fi; \
+			if printf '%s' "$$lp_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); ok=(isinstance(p,dict) and p.get("state")=="ready" and isinstance(p.get("orders"),list) and isinstance(p.get("positions"),list) and isinstance(p.get("recommendations"),list)); raise SystemExit(0 if ok else 1)' >/dev/null 2>&1; then echo "lp dashboard: PASS"; else echo "lp dashboard: BLOCKED"; fail lp_dashboard_contract_mismatch; fi; \
 		else \
-			if [ "$$prediction_n_leg_status" = running ] && [ "$$prediction_n_leg_code" = N_LEG_RUNNING ]; then echo "n-leg state: RUNNING"; else echo "n-leg state: BLOCKED"; status=1; fi; \
+			if [ "$$prediction_n_leg_status" = running ] && [ "$$prediction_n_leg_code" = N_LEG_RUNNING ]; then echo "n-leg state: RUNNING"; else echo "n-leg state: BLOCKED"; fail n_leg_contract_mismatch; fi; \
 			state_payload="$$(curl -fsS --max-time 10 "http://127.0.0.1:8769/api/prediction-arbitrage/state" 2>/dev/null || true)"; \
-			if printf '%s' "$$state_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); n_leg=p.get("n_leg") or {}; scopes=n_leg.get("execution_scopes") or {}; scope=scopes.get("SAME_EVENT_SAME_VENUE") or {}; rows=p.get("opportunities") or []; ok=(n_leg.get("contract_generation")==2 and n_leg.get("mode")=="MANUAL" and scope.get("capability")=="OBSERVE_ONLY" and all(row.get("engine_owner")=="N_LEG" for row in rows if isinstance(row,dict))); raise SystemExit(0 if ok else 1)' >/dev/null 2>&1; then echo "n-leg state: PASS"; else echo "n-leg state: BLOCKED"; status=1; fi; \
+			if printf '%s' "$$state_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); n_leg=p.get("n_leg") or {}; scopes=n_leg.get("execution_scopes") or {}; scope=scopes.get("SAME_EVENT_SAME_VENUE") or {}; rows=p.get("opportunities") or []; ok=(n_leg.get("contract_generation")==2 and n_leg.get("mode")=="MANUAL" and scope.get("capability")=="OBSERVE_ONLY" and all(row.get("engine_owner")=="N_LEG" for row in rows if isinstance(row,dict))); raise SystemExit(0 if ok else 1)' >/dev/null 2>&1; then echo "n-leg state: PASS"; else echo "n-leg state: BLOCKED"; fail n_leg_contract_mismatch; fi; \
 		fi; \
 	fi; \
-	check_log() { log="$$1"; if ! command -v rg >/dev/null 2>&1 || ! rg --version >/dev/null 2>&1; then echo "log checker unavailable"; status=1; elif "$(PYTHON_BIN)" "$$expected_root/scripts/check_production_log.py" "$$log"; then echo "log clean: $$log"; else echo "log check blocked: $$log"; status=1; fi; }; \
+	check_log() { log="$$1"; if ! command -v rg >/dev/null 2>&1 || ! rg --version >/dev/null 2>&1; then echo "log checker unavailable"; fail log_checker_unavailable; elif "$(PYTHON_BIN)" "$$expected_root/scripts/check_production_log.py" "$$log"; then echo "log clean: $$log"; else echo "log check blocked: $$log"; fail log_check_failed; fi; }; \
 	if [ $$gateway_selected -eq 1 ]; then check_log "$$expected_root/logs/frontend_gateway/launchd.err.log"; fi; \
 	if [ $$legacy_selected -eq 1 ]; then check_log "$$expected_root/logs/legacy_dashboard/launchd.err.log"; fi; \
 	if [ $$account_selected -eq 1 ]; then check_log "$$expected_root/logs/account_api/launchd.err.log"; fi; \
 	if [ $$prediction_selected -eq 1 ]; then check_log "$$expected_runtime_root/logs/prediction_service/launchd.err.log"; fi; \
 	if [ $$status -eq 0 ]; then \
-		if (cd "$$expected_root" && NODE_PATH="$(PLAYWRIGHT_NODE_PATH)" OPEN_TRADER_SMOKE_URL="$(DASHBOARD_URL)" "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" test tests/e2e/production-smoke.spec.ts --config=playwright.config.ts --project=chromium); then echo "browser smoke: PASS"; else echo "browser smoke: BLOCKED"; status=1; fi; \
+		if (cd "$$expected_root" && NODE_PATH="$(PLAYWRIGHT_NODE_PATH)" OPEN_TRADER_SMOKE_URL="$(DASHBOARD_URL)" "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" test tests/e2e/production-smoke.spec.ts --config=playwright.config.ts --project=chromium); then echo "browser smoke: PASS"; else echo "browser smoke: BLOCKED"; fail browser_check_failed; fi; \
 	fi; \
-	if [ $$status -eq 0 ]; then echo HEALTHY; else echo ROLLBACK; exit 1; fi
+	if [ $$status -eq 0 ]; then echo HEALTHY; else report_failure; exit 1; fi
 
 .PHONY: prediction-cloud-host-readiness prediction-cloud-smoke
 prediction-cloud-host-readiness:
