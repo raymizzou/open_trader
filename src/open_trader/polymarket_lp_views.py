@@ -7,8 +7,6 @@ from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
-from .polymarket_lp_scratch import LPReadScratch
-
 from .polymarket_lp_risk import (
     _account_after_reservations,
     _event_window_check,
@@ -934,9 +932,23 @@ def lp_trial_candidates(
         if isinstance(key, str)
     } if isinstance(competition, Mapping) else {}
 
-    directions_by_condition = LPReadScratch()
+    # Both ABC and builtin values views retain their mapping. Keep only keys
+    # (or sequence positions), not another serialized direction-detail copy.
+    direction_source = direction_facts
+    if isinstance(direction_facts, ValuesView):
+        direction_source = (
+            direction_facts._mapping
+            if hasattr(direction_facts, "_mapping")
+            else direction_facts.mapping
+        )
+    indexed_directions = (
+        direction_source.items()
+        if isinstance(direction_source, Mapping)
+        else enumerate(direction_source)
+    )
+    directions_by_condition: dict[str, list[object]] = {}
     read_conditions: set[str] = set()
-    for direction in direction_facts:
+    for direction_key, direction in indexed_directions:
         if not isinstance(direction, Mapping):
             continue
         market = direction.get("market")
@@ -946,9 +958,7 @@ def lp_trial_candidates(
         if not condition_id:
             continue
         read_conditions.add(condition_id)
-        directions = directions_by_condition.get(condition_id, [])
-        directions.append(dict(direction))
-        directions_by_condition[condition_id] = directions
+        directions_by_condition.setdefault(condition_id, []).append(direction_key)
 
     funnel_reasons: dict[str, list[dict[str, object]]] = {
         "read": [],
@@ -984,7 +994,8 @@ def lp_trial_candidates(
             continue
         parsed: list[dict[str, object]] = []
         rules_known = True
-        for direction in directions_by_condition.get(condition_id, ()):
+        for direction_key in directions_by_condition.get(condition_id, ()):
+            direction = direction_source[direction_key]
             candidate = _lp_trial_direction_row(
                 direction, daily_pool_usd=pool, now=checked_at
             )
@@ -1031,7 +1042,8 @@ def lp_trial_candidates(
     for condition_id in sorted(read_conditions - base_condition_ids):
         if condition_id in window_rejections:
             continue
-        for direction in directions_by_condition.get(condition_id, ()):
+        for direction_key in directions_by_condition.get(condition_id, ()):
+            direction = direction_source[direction_key]
             code = _lp_base_rejection_code(direction, now=checked_at)
             if code is None:
                 continue
