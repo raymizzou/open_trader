@@ -12,6 +12,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
   文档链接、命令语法、已有环境/符号链接及脏工作树拒绝验证通过；验证后复核源码身份。
   Mini SSH 不可达，跨机一致性仍未验证。
 
+- #276 LP 候选筛选只保存市场到方向键/位置的索引，复用当前代方向详情，移除第二份完整临时详情库。
+  保留列表、元组、ValuesView 输入、完整正常/备用遍历、YES/NO、UNKNOWN、新鲜度、冷却和代次栅栏。
+  两个真实调用入口的复制回归先 4 failed；兼容性初审另检出内建 dict.values() 两项 RED；最终定向串行 68 passed、双 worker 19 passed，
+  局部类保留源的负向实验仍被拒绝；完整六步排名、三步补位及公开缓存筛选 hash 均与基线一致。
+  Linux 正反两轮同输入对照：筛选相位新增文件缓存减少 31.88 MiB，新增 cgroup 占用减少约 32.13 MiB；
+  返回后临时库及时释放，筛选与队列构建耗时均已记录，不新增速度上限。
+  详见 [验证记录](docs/operations/issue-276-direction-index-validation.md)。未部署，整体云端容量仍由 #263 跟踪。
+
 - #270 后台核对不再把本进程尚未 POST 的自动 BUY 准备意图误改为 UNKNOWN，避免补位被自身发送前校验拒绝。
   仅在同一事务确认 reserved、活动入场 lane 与精确 pending/preparing entry action 时保留原预留及名额；
   同时检查 session 的 POST 标志，已发送、无本进程 lane、身份冲突和独立未决动作仍按原 UNKNOWN 规则处理。
