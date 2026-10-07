@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import hashlib
 import logging
 import math
 import os
@@ -837,6 +838,11 @@ class PolymarketLPService:
         self._account_registration_attempt = 0
         self._account_order_sync_error: str | None = None
         self._deferred_protection_notices = threading.local()
+        self._protection_cancel_lock = threading.Lock()
+        # Retain consumed action IDs until this instance exits; cache eviction
+        # must never rearm an old notice.
+        self._protection_cancel_events: set[str] = set()
+        self._protection_cancel_enabled = True
         self._facts_inflight: dict[str, dict] = {}
         self._pending_facts: dict[
             str, tuple[Mapping[str, object], int, Mapping[str, object], int]
@@ -921,6 +927,11 @@ class PolymarketLPService:
             "stale": False,
         }
         self._preparation: dict[str, object] | None = None
+        try:
+            self._restore_protection_cancel_events()
+        except Exception as exc:
+            self._protection_cancel_enabled = False
+            logger.warning("lp_protection_cancel_restore_failed notifications_disabled error_type=%s", type(exc).__name__)
         self._restore_preparation()
         self._restore_candidate_snapshot()
         self._evict_excluded_candidates()
@@ -11136,9 +11147,11 @@ class PolymarketLPService:
             "data_failures": _queue_group_failures_int(failures.get("data_failures")),
             "levels": new_levels,
         }
-        return self.store.lp_update_session(
+        updated = self.store.lp_update_session(
             str(session["session_id"]), patch=session_patch
         )
+        self._notify_committed_protection_cancels(updated)
+        return updated
 
     def tick(self) -> dict[str, object]:
         """Run one deterministic monitoring/reconciliation iteration."""
@@ -11740,8 +11753,15 @@ class PolymarketLPService:
         # Their reads and protection sends never own the common publication or
         # execution locks; unrelated sessions can continue reconciling.
         # they must not own the common publication mutex or execution lock.
-        with self._first_seen_apply_lock:
-            self._apply_first_seen_protections()
+        cancel_notices = []
+        self._deferred_protection_notices.cancels = cancel_notices
+        try:
+            with self._first_seen_apply_lock:
+                self._apply_first_seen_protections()
+        finally:
+            self._deferred_protection_notices.cancels = None
+            for notice in cancel_notices:
+                self._start_protection_cancel_notice(*notice)
 
         verifier = self._facts_attention_verifier
         if callable(verifier):
@@ -11969,6 +11989,8 @@ class PolymarketLPService:
                 production_reconcile = False
                 return reconcile(current)
 
+        cancel_notices = []
+        self._deferred_protection_notices.cancels = cancel_notices
         self._deferred_protection_notices.notices = deferred_notices
         self._facts_apply_lock.acquire()
         try:
@@ -11987,6 +12009,9 @@ class PolymarketLPService:
             finally:
                 self._deferred_protection_notices.notices = None
                 self._facts_apply_lock.release()
+                self._deferred_protection_notices.cancels = None
+        for notice in cancel_notices:
+            self._start_protection_cancel_notice(*notice)
         for title, message, xiaoai, mark_delivered in deferred_notices:
             if self._notify_protection(title, message, xiaoai):
                 mark_delivered()
@@ -12081,6 +12106,7 @@ class PolymarketLPService:
                 current = self.store.lp_merge_queue_protection_bucket(
                     session_id, level_key=key, bucket=converged
                 )
+                self._notify_committed_protection_cancels(current)
         protection = current.get("queue_protection")
         canceling = any(
             str(bucket.get("state")) == "canceling"
@@ -12527,14 +12553,14 @@ class PolymarketLPService:
             }:
                 continue
             if hasattr(self.store, "lp_merge_queue_protection_bucket"):
-                merger(
+                committed = merger(
                     session_id,
                     level_key=key,
                     bucket=next_bucket,
                     patch=patch,
                 )
             else:
-                merger(
+                committed = merger(
                     session_id,
                     queue_protection={
                         "version": 2,
@@ -12542,6 +12568,7 @@ class PolymarketLPService:
                     },
                     patch=patch,
                 )
+            self._notify_committed_protection_cancels(committed)
             protected_levels.add(key)
             writes += 1
         return protected_levels, writes
@@ -13650,6 +13677,96 @@ class PolymarketLPService:
         )
         return updated
 
+    @staticmethod
+    def _protection_cancel_event(session, bucket, *, first_seen=False) -> str:
+        if first_seen:
+            return f"{session['episode_id']}:first-seen-protection-cancel"
+        anchor = str(bucket.get("order_id") or "") or format(
+            _decimal(bucket["baseline_price"], "baseline_price"), "f"
+        )
+        return f"{session['session_id']}:entry-protection-cancel:{anchor}"
+
+    def _restore_protection_cancel_events(self) -> None:
+        """Restore business only: pre-existing cancel actions can never notify."""
+        sessions = self.store.lp_sessions()
+        for session in sessions:
+            actions = self.store.lp_actions(str(session["session_id"]))
+            for action in actions:
+                if action.get("role") == "entry-protection-cancel":
+                    self._protection_cancel_events.add(str(action["action_key"]))
+                elif action.get("role") == "first-seen-protection-cancel":
+                    self._protection_cancel_events.add(
+                        f"{action['episode_id']}:first-seen-protection-cancel"
+                    )
+            # Legacy business images may lack the cancel action audit.
+            for bucket in self._queue_protection_levels(session).values():
+                if bucket.get("cancel_targets") or bucket.get("state") in {"canceling", "canceled", "partially_filled"}:
+                    self._protection_cancel_events.add(self._protection_cancel_event(session, bucket))
+        for episode in self.store.lp_active_first_seen_episodes():
+            if episode.get("cancel_targets") or episode.get("state") == "canceling":
+                self._protection_cancel_events.add(
+                    self._protection_cancel_event(episode, episode, first_seen=True)
+                )
+
+    def _notify_committed_protection_cancels(self, session, *, first_seen=False) -> None:
+        """Consume each real cancel episode once, after its business commit."""
+        if not self._protection_cancel_enabled:
+            return
+        buckets = {"": session} if first_seen else self._queue_protection_levels(session)
+        for bucket in buckets.values():
+            # Non-protection sweeps preset this flag to suppress alerts.
+            if bucket.get("notification_sent") is True:
+                continue
+            canceled = self._merge_order_id_lists(bucket.get("canceled_order_ids"))
+            targets = self._merge_order_id_lists(bucket.get("cancel_targets"))
+            if not canceled or not (
+                bucket.get("state") in {"canceled", "partially_filled"}
+                or (targets and set(targets) <= set(canceled))
+            ):
+                continue
+            event = self._protection_cancel_event(session, bucket, first_seen=first_seen)
+            with self._protection_cancel_lock:
+                if event in self._protection_cancel_events:
+                    continue
+                self._protection_cancel_events.add(event)
+            title = ("LP 位置保护撤单（首见基线）" if first_seen else
+                     self._queue_protection_price_title(session, bucket, "位置保护已触发撤单"))
+            notice = self._queue_protection_success_notification(
+                bucket, session, canceled_count=len(canceled),
+                manual_count=(len(canceled) if first_seen else
+                              sum(order != session.get("entry_order_id") for order in canceled)),
+                canceled_remaining=self._episode_canceled_remaining(
+                    bucket.get("cancel_target_remaining"), canceled
+                ),
+                title=title, trigger_prefix="首见基线 · " if first_seen else "",
+            )
+            # Only volatile work exists after commit; a crash/drop is final.
+            pending = getattr(self._deferred_protection_notices, "cancels", None)
+            if pending is not None:
+                pending.append((event, *notice))
+            else:
+                self._start_protection_cancel_notice(event, *notice)
+
+    def _start_protection_cancel_notice(self, event, title, message, voice) -> threading.Thread | None:
+        # A daemon task owns only this message. Runtime stop does not
+        # wait for it; process exit may drop it, and startup never replays it.
+        event_id = hashlib.sha256(event.encode()).hexdigest()[:16]
+
+        def deliver():
+            results = self._deliver_protection_details(title, message, voice, one_shot=True)
+            for channel, success in results.items():
+                logger.log(logging.INFO if success else logging.WARNING,
+                           "lp_protection_cancel_notice event=%s channel=%s at=%s outcome=%s error_type=%s",
+                           event_id, channel, _iso(self._now()), "success" if success else "unconfirmed",
+                           "none" if success else "delivery_unconfirmed")
+
+        try:
+            worker = threading.Thread(target=deliver, name="lp-protection-cancel-notice", daemon=True)
+            worker.start()
+            return worker
+        except Exception as exc:
+            logger.warning("lp_protection_cancel_enqueue_failed event=%s error_type=%s", event_id, type(exc).__name__)
+
     def _deliver_protection_details(
         self,
         title: str,
@@ -13657,10 +13774,13 @@ class PolymarketLPService:
         xiaoai_text: str,
         *,
         channels: set[str] | None = None,
+        one_shot: bool = False,
     ) -> dict[str, bool]:
         """Return per-channel delivery facts without turning partial success true."""
         callback = self._protection_notifier
         if callback is None:
+            if one_shot:
+                return {}
             if channels is None:
                 return {"feishu": False, "xiaoai": False}
             return {name: False for name in channels}
@@ -13674,16 +13794,27 @@ class PolymarketLPService:
                 pass
             else:
                 kwargs["channels"] = channels
+        if one_shot:
+            try:
+                inspect.signature(callback).bind(
+                    title, message, xiaoai_text, **kwargs, one_shot=True
+                )
+            except (TypeError, ValueError):
+                pass
+            else:
+                kwargs["one_shot"] = True
         try:
             result = callback(title, message, xiaoai_text, **kwargs)
-        except Exception:
+        except Exception as exc:
+            if one_shot:
+                logger.warning("lp_protection_cancel_callback_failed error_type=%s", type(exc).__name__)
             if channels is None:
                 return {"feishu": False, "xiaoai": False}
             return {name: False for name in channels}
         if isinstance(result, Mapping):
             return {
                 str(key): bool(result.get(key))
-                for key in (channels if channels is not None else {"feishu", "xiaoai"})
+                for key in (result if one_shot else channels if channels is not None else {"feishu", "xiaoai"})
             }
         delivered = result is True
         if channels is None:
@@ -14837,34 +14968,6 @@ class PolymarketLPService:
         updated["cancel_requested_at"] = _iso(self._now())
         if failed:
             updated["cancel_failure"] = failure_error or "cancel_not_acknowledged"
-        canceled_set = set(episode_canceled)
-        episode_complete = bool(episode_targets) and all(
-            order_id in canceled_set for order_id in episode_targets
-        )
-        if episode_complete:
-            manual_count = sum(
-                1 for order_id in episode_canceled if order_id != entry_order_id
-            )
-            title, message, xiaoai = self._queue_protection_success_notification(
-                updated,
-                session,
-                canceled_count=len(episode_canceled),
-                manual_count=manual_count,
-                canceled_remaining=episode_remaining,
-                title=self._queue_protection_price_title(
-                    session, updated, "位置保护已触发撤单"
-                ),
-            )
-            if self._notify_bucket_protection(
-                session,
-                updated,
-                bucket_key or str(bucket.get("order_id") or ""),
-                "notification_sent",
-                title,
-                message,
-                xiaoai,
-            ):
-                updated["notification_sent"] = True
 
         session_patch: dict[str, object] = {}
         if entry_order_id in targets and not bool(session.get("entry_cancel_requested")):
@@ -15051,40 +15154,10 @@ class PolymarketLPService:
             updated.get("canceled_order_ids"), receipt_canceled
         )
         updated["canceled_order_ids"] = canceled
-        if updated.get("notification_sent") is not True and canceled:
-            entry_order_id = str(session.get("entry_order_id") or "")
-            # Issue 152 review fix: report the total from the per-target
-            # cancel-time remaining persisted at request time, so orders the
-            # venue canceled without our acknowledgment keep their share
-            # instead of fabricating 0.
+        if canceled:
             updated["canceled_remaining"] = self._episode_canceled_remaining(
                 updated.get("cancel_target_remaining"), canceled
             )
-            manual_count = sum(
-                1 for order_id in canceled if order_id != entry_order_id
-            )
-            title, message, xiaoai = self._queue_protection_success_notification(
-                updated,
-                session,
-                canceled_count=len(canceled),
-                manual_count=manual_count,
-                canceled_remaining=_maybe_decimal(
-                    updated.get("canceled_remaining")
-                ),
-                title=self._queue_protection_price_title(
-                    session, updated, "位置保护已触发撤单"
-                ),
-            )
-            if self._notify_bucket_protection(
-                session,
-                updated,
-                bucket_key or str(bucket.get("order_id") or ""),
-                "notification_sent",
-                title,
-                message,
-                xiaoai,
-            ):
-                updated["notification_sent"] = True
         return updated
 
     def _apply_queue_protection(
@@ -15207,6 +15280,7 @@ class PolymarketLPService:
                 session_id,
                 patch={**session_patch, "queue_protection": queue_payload},
             )
+        self._notify_committed_protection_cancels(updated)
         return updated
 
     # ---- Issue 159: first-seen baseline fallback protections ----
@@ -15465,12 +15539,14 @@ class PolymarketLPService:
         """Persist one account-derived observation or reject it as stale."""
 
         try:
-            return self.store.lp_update_first_seen_episode(
+            updated = self.store.lp_update_first_seen_episode(
                 episode_id,
                 state=state,
                 patch=patch,
                 expected_generation=expected_generation,
             )
+            self._notify_committed_protection_cancels(updated, first_seen=True)
+            return updated
         except ValueError as exc:
             if str(exc) == "account_round_invalid":
                 return None
@@ -15837,25 +15913,10 @@ class PolymarketLPService:
             updated.get("canceled_order_ids"), receipt_canceled
         )
         updated["canceled_order_ids"] = canceled
-        if updated.get("notification_sent") is not True and canceled:
+        if canceled:
             updated["canceled_remaining"] = self._episode_canceled_remaining(
                 updated.get("cancel_target_remaining"), canceled
             )
-            # Every first-seen target is a manual web order.
-            manual_count = len(canceled)
-            title, message, xiaoai = self._queue_protection_success_notification(
-                updated,
-                episode,
-                canceled_count=len(canceled),
-                manual_count=manual_count,
-                canceled_remaining=_maybe_decimal(
-                    updated.get("canceled_remaining")
-                ),
-                title="LP 位置保护撤单（首见基线）",
-                trigger_prefix="首见基线 · ",
-            )
-            self._notify_protection(title, message, xiaoai)
-            updated["notification_sent"] = True
         return updated
 
     def _request_first_seen_protection_cancel(
@@ -16144,23 +16205,6 @@ class PolymarketLPService:
         updated["cancel_requested_at"] = _iso(self._now())
         if failed:
             updated["cancel_failure"] = failure_error or "cancel_not_acknowledged"
-        canceled_set = set(episode_canceled)
-        episode_complete = bool(episode_targets) and all(
-            order_id in canceled_set for order_id in episode_targets
-        )
-        if episode_complete:
-            manual_count = len(episode_canceled)
-            title, message, xiaoai = self._queue_protection_success_notification(
-                updated,
-                episode,
-                canceled_count=len(episode_canceled),
-                manual_count=manual_count,
-                canceled_remaining=episode_remaining,
-                title="LP 位置保护撤单（首见基线）",
-                trigger_prefix="首见基线 · ",
-            )
-            self._notify_protection(title, message, xiaoai)
-            updated["notification_sent"] = True
         return updated
 
     @staticmethod

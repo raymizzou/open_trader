@@ -15185,6 +15185,8 @@ def test_lp_first_seen_protection_end_to_end(
     """S: 网页手动单出现 → 首见登记 → 盘口变化 → 触发 → 撤单 →
     /lp/orders/today 投影含 summary / baseline_source=first_observation / anchor。"""
 
+    from tests.test_polymarket_lp import _cancel_notice_completion, _observe_cancel_jobs
+
     class RewardTransport:
         def get_json(self, path: str, *, params: dict[str, object]) -> object:
             del path, params
@@ -15311,6 +15313,7 @@ def test_lp_first_seen_protection_end_to_end(
         return True
 
     service._lp.set_protection_notifier(record_protection_note)
+    completed = _cancel_notice_completion(service._lp, monkeypatch)
 
     manual_buy: dict[str, object] = {
         "id": "m-web-1",
@@ -15365,7 +15368,9 @@ def test_lp_first_seen_protection_end_to_end(
     queue_bucket = next(iter(session["queue_protection"]["levels"].values()))
     assert queue_bucket["state"] == "canceling", session["queue_protection"]
     assert sdk.cancellation_calls == [("m-web-1",)]
-    assert queue_bucket["notification_sent"] is True
+    assert queue_bucket["notification_sent"] is False
+    assert completed()
+    assert len(notes) == 1
 
     # /lp/orders/today 投影：锚行带 summary / baseline_source / anchor。
     trading._lp_account_shared_cache = None
@@ -15392,8 +15397,19 @@ def test_lp_first_seen_protection_end_to_end(
     queue_bucket = next(iter(session["queue_protection"]["levels"].values()))
     assert queue_bucket["state"] == "canceled"
 
+    assert completed()
     assert len(notes) == 1
     assert "位置保护已触发撤单" in notes[0][0]
+    service._lp.tick()
+    assert completed()
+    assert len(notes) == 1
+    restarted = PolymarketLPService(store, trading)
+    restarted.set_protection_notifier(record_protection_note)
+    jobs = _observe_cancel_jobs(restarted, monkeypatch)
+    restarted.tick()
+    assert jobs == []
+    assert len(notes) == 1
+    assert sdk.cancellation_calls == [("m-web-1",)]
 
 
 # ---- Issue 163: LP 单次确认提交路由（/lp/orders、/lp/augment） ----
