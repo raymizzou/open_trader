@@ -751,6 +751,11 @@ class PredictionRuntime:
             if not self._n_leg_paused:
                 self.solver_server = self._solver_server_factory()
             self.store = PredictionArbitrageStore(self._data_dir)
+            # Exclusive ownership proves the preceding sender has exited.
+            # Run before constructing LP/execution or starting any send lane.
+            recover_preparations = getattr(self.store, 'lp_recover_interrupted_preparations', None)
+            if callable(recover_preparations):
+                recover_preparations()
             # #104: idempotent startup seed; failures are logged inside and
             # never block startup.
             if not self._n_leg_paused and ensure_same_event_same_venue_scope(self.store):

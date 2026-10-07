@@ -347,10 +347,40 @@ def build_account_financial_facts(
     return result
 
 
+def interrupted_preparation_entry(intent, session, actions):
+    """Exact pre-POST registration, without deriving anything from missing IDs."""
+    if (intent.get('state') not in {'reserved', 'sending', 'unknown'}
+            or intent.get('order_id') or intent.get('order_identity_conflict')
+            or session.get('idempotency_key') != 'lp-auto:' + str(intent.get('intent_id') or '')
+            or session.get('session_id') != intent.get('session_id')
+            or any(session.get(key) != intent.get(key) or not intent.get(key)
+                   for key in ('token_id', 'condition_id', 'market_id', 'outcome'))
+            or session.get('entry_order_id') or session.get('owned_order_ids') or session.get('order_history')
+            or session.get('order_identity_conflict') or len(actions) != 1):
+        return None
+    entry = actions[0]
+    if (entry.get('action_key') != str(session['session_id']) + ':entry-submit'
+            or entry.get('state') != 'pending' or entry.get('role') != 'entry'
+            or entry.get('side') != 'BUY' or entry.get('token_id') != intent['token_id']
+            or entry.get('order_id') or entry.get('submit_stage') != 'preparing'
+            or entry.get('post_started') is not False or not entry.get('submit_requested_at')
+            or has_independent_unresolved_action(session, actions)):
+        return None
+    for row in (session, entry):
+        if (row.get('post_started') is not None and row.get('post_started') is not False
+                or row.get('submit_stage') not in {None, 'preparing'}
+                or any(row.get(key) for key in ('submit_post_started_at', 'submit_finished_at', 'submit_receipt_at'))
+                or row.get('submit_status') not in {None, 'pending', 'unknown'}):
+            return None
+    return entry
+
+
+def preparation_action_fingerprint(action):
+    return hashlib.sha256(json.dumps(action, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
 def ended_reservation_evidence(intent, session, actions, *, account_id, pool_account_id, read_started_at):
     """Return durable ended-send evidence; missing timing never means absent."""
-    if intent.get('state') == 'reserved':
-        return None
     explicit_account = str(session.get('account_id') or '').strip().casefold()
     if explicit_account:
         if explicit_account != account_id:
@@ -361,6 +391,35 @@ def ended_reservation_evidence(intent, session, actions, *, account_id, pool_acc
     if session_wallet and session_wallet != account_id:
         return None
     if pool_account_id != hashlib.sha256(account_id.encode()).hexdigest():
+        return None
+    recovery = session.get('interrupted_preparation')
+    if isinstance(recovery, Mapping) and recovery.get('basis') == 'runtime_owner_handoff_pre_post':
+        entries = [a for a in actions if a.get('action_key') == str(session.get('session_id')) + ':entry-submit']
+        if (recovery.get('intent_id') == intent.get('intent_id')
+                and not intent.get('order_id') and not intent.get('order_identity_conflict')
+                and session.get('idempotency_key') == 'lp-auto:' + str(intent.get('intent_id') or '')
+                and session.get('session_id') == intent.get('session_id')
+                and all(session.get(key) == intent.get(key) and intent.get(key)
+                        for key in ('token_id', 'condition_id', 'market_id', 'outcome'))
+                and len(entries) == 1 and entries[0].get('token_id') == intent.get('token_id')
+                and preparation_action_fingerprint(entries[0]) == recovery.get('action_fingerprint')
+                and not session.get('order_identity_conflict')
+                and not session.get('entry_order_id')
+                and not session.get('owned_order_ids') and not session.get('order_history')
+                and session.get('post_started') in (None, False)
+                and session.get('submit_stage') in (None, 'preparing')
+                and not session.get('submit_post_started_at')
+                and not session.get('submit_finished_at') and not session.get('submit_receipt_at')
+                and session.get('submit_status') in {None, 'pending', 'unknown'}
+                and not has_independent_unresolved_action(session, actions)):
+            try:
+                stamp = _timestamp(recovery.get('recovered_at'), name='recovered_at')
+                requested = _timestamp(entries[0].get('submit_requested_at'), name='submit_requested_at')
+            except ValueError:
+                return None
+            if requested <= stamp < read_started_at:
+                return {'request_finished_at': stamp.isoformat(), 'basis': 'interrupted_preparation'}
+    if intent.get('state') == 'reserved':
         return None
     entries = [action for action in actions if action.get('role') == 'entry'
                or str(action.get('action_key') or '').endswith('entry-submit')]

@@ -20,6 +20,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
   返回后临时库及时释放，筛选与队列构建耗时均已记录，不新增速度上限。
   详见 [验证记录](docs/operations/issue-276-direction-index-validation.md)。未部署，整体云端容量仍由 #263 跟踪。
 
+- #270 重启后仅在 Runtime 取得独占 owner、尚未构造发送器时，对精确匹配且未跨持久 POST 边界的自动 BUY 准备残留记录本地中断证据。
+  保留原 intent/action 审计，不伪造交易所拒单；覆盖仍要求更晚的完整账户 API 发布及原有身份、新鲜度、generation/revision 栅栏。
+  已核对为 review/UNKNOWN 的旧记录和 POST 前本地 sending 窗口均可恢复；活跃旧 owner、POST 后 pending action 滞后、变化身份及迟到 action 仍保守保留。
+  真实隔离子进程、SQLite 与离线 SDK adapter 验证 17.80 残留覆盖后自动 4→5、重复核对/重启不重放、迟到 API BUY 按真实 ID 计数和停止/配置校验。
+  初版直接相关串行及 n2/loadgroup 各 102 项通过；保留原缺陷、sending 窗口及 intent 身份漏检共 4 项 RED，以及初次 legacy 测试替身缺口和缓存/测试生命周期误设 5 项失败记录。
+  独立复审修复覆盖时漏检新 session 身份：新增 entry ID、owned IDs 或 history 即失效该中断证据，即使原 pending action 未变。
+  真实订单注册和三个独立身份形状先获得 4 项 RED；保留一次测试误读注册返回结构的失败。修复后串行/n2 各 103 项通过，API 实际 BUY 计数及原审计保持。
+  未部署、操作真实服务或交易；此项不通用释放所有 post-started/UNKNOWN。
+
 - #270 后台核对不再把本进程尚未 POST 的自动 BUY 准备意图误改为 UNKNOWN，避免补位被自身发送前校验拒绝。
   仅在同一事务确认 reserved、活动入场 lane 与精确 pending/preparing entry action 时保留原预留及名额；
   同时检查 session 的 POST 标志，已发送、无本进程 lane、身份冲突和独立未决动作仍按原 UNKNOWN 规则处理。

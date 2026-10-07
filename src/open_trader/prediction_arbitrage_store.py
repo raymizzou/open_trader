@@ -6652,6 +6652,47 @@ class PredictionArbitrageStore:
             return
         listener(session_id)
 
+    def lp_recover_interrupted_preparations(self) -> None:
+        """Called once by startup under the newly acquired exclusive runtime owner.
+
+        Preserve the request/action audit. Only a later complete account round
+        can replace the temporary hold; this is not a venue rejection receipt.
+        """
+        from .polymarket_lp_accounting import interrupted_preparation_entry, preparation_action_fingerprint
+        now = _utc_now()
+        with self._transaction() as tx:
+            row = tx.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+            if row is None:
+                return
+            intents = _load_payload(str(row['payload'])).get('intents') or {}
+            bindings = {}
+            for intent in intents.values():
+                bindings.setdefault(str(intent.get('session_id') or ''), []).append(intent)
+            for sid, bound in bindings.items():
+                if len(bound) != 1:
+                    continue
+                row = tx.execute('SELECT * FROM lp_sessions WHERE session_id=?', (sid,)).fetchone()
+                if row is None:
+                    continue
+                session = self._lp_row_result(row)
+                if session.get('interrupted_preparation') or session.get('reservation_coverage'):
+                    continue
+                entry = interrupted_preparation_entry(bound[0], session, self.lp_actions(sid, connection=tx))
+                if entry is None:
+                    continue
+                try:
+                    if _parse_timestamp(entry['submit_requested_at']) > _parse_timestamp(now):
+                        continue
+                except ValueError:
+                    continue
+                payload = _load_payload(str(row['payload']))
+                payload['interrupted_preparation'] = dict(basis='runtime_owner_handoff_pre_post',
+                    recovered_at=now, intent_id=bound[0]['intent_id'],
+                    action_fingerprint=preparation_action_fingerprint(entry))
+                payload['_lp_revision'] = self._lp_payload_revision(payload) + 1
+                tx.execute('UPDATE lp_sessions SET payload=? WHERE session_id=?', (_dump_execution_payload(payload), sid))
+                self._lp_register_trade_change(tx, sid)
+
     def lp_publish_account_financial_facts(
         self, facts: Mapping[str, object], *, connection: sqlite3.Connection | None = None,
         expected_generation: int | None = None,
