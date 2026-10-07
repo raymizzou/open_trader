@@ -912,13 +912,18 @@ def test_stop_of_same_inflight_session_survives_late_receipt(tmp_path,stage):
         assert canceled==['o1']
 
 
-def test_late_live_receipt_preserves_already_verified_fill(tmp_path):
+@pytest.mark.parametrize('sell_receipt_unknown', [False, True])
+def test_late_live_receipt_preserves_already_verified_fill(tmp_path, sell_receipt_unknown):
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
     post=x.lp_post_order
     def delayed_receipt(signed):
         response=dict(post(signed))
+        if signed['side'] == 'SELL':
+            if sell_receipt_unknown:
+                raise TimeoutError('offline SELL receipt unknown')
+            return response
         x.orders[0].update(status='FILLED',size_matched='20')
         x.positions=[dict(token_id='m00',condition_id='m00',size='20')]
         assert lp.register_account_snapshot(_fresh_registration_bundle(x,lp))['state']=='registered'
@@ -951,10 +956,36 @@ def test_late_live_receipt_preserves_already_verified_fill(tmp_path):
             snapshot['trade_generation'] = trade_generation_provider()
         return snapshot
     x.lp_account_snapshot_shared = complete_account_round
+    audit = s.lp_actions(session['session_id'])
     recovered=e.lp_auto_reconcile_unknown()
-    assert recovered['funds']['status']=='known'
+    facts = e._auto_pool._read()['account_financial_facts']
+    assert facts['financial_status'] == 'known' and facts['reason_codes'] == []
+    assert facts['buys'] == []
+    assert facts['positions'] == [dict(token_id='m00', quantity='20', inventory_cost_usd='8.00')]
+    assert facts['independent_sell_unknown'] is sell_receipt_unknown
+    assert recovered['funds']['status'] == ('unknown' if sell_receipt_unknown else 'known')
+    if sell_receipt_unknown:
+        assert recovered['funds']['available_usd'] is None
+        assert 'unbounded_financial_uncertainty' in recovered['admission_block_reasons']
+        assert any(a['side'] == 'SELL' and a['state'] == 'unknown' and not a.get('order_id') for a in audit)
+    else:
+        assert not recovered['admission_block_reasons']
+        assert any(a['side'] == 'SELL' and a['state'] == 'accepted' and a.get('order_id') == 'o2' for a in audit)
     assert recovered['slots']['occupied']==0
     assert Decimal(recovered['funds']['inventory_cost_usd'])==8
+    current = s.lp_session(session['session_id'])
+    assert Decimal(current['buy_filled_quantity']) == Decimal(current['residual_quantity']) == 20
+    assert current['order_history']['o1']['status'] == 'FILLED'
+    assert Decimal(current['verified_order_fills']['o1']['quantity']) == 20
+    assert current['reservation_coverage']['state'] == 'covered'
+    assert s.lp_actions(session['session_id']) == audit
+    repeated = e.lp_auto_reconcile_unknown()
+    assert {k: v for k, v in repeated['funds'].items() if k != 'as_of'} == {
+        k: v for k, v in recovered['funds'].items() if k != 'as_of'}
+    assert repeated['funds']['as_of'] > recovered['funds']['as_of']
+    assert repeated['slots'] == recovered['slots']
+    assert s.lp_actions(session['session_id']) == audit
+    assert len(x.posts) == 2 and [p['side'] for p in x.posts] == ['BUY', 'SELL']
 
 
 @pytest.mark.parametrize('signed_id',[False,True])

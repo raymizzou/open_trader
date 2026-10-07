@@ -23,7 +23,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - #270 自动入场、手动入场及独立增仓 BUY 的临时占资，在本地发送结束或独占 runtime owner 交接后，由更晚的完整新鲜账户 API 覆盖。
   旧 pending/preparing/sending 与 UNKNOWN 审计保留，不伪造交易所结果；关闭先阻止新发送，五秒内未排空的 HTTP 入场/增仓保留 owner 与资源并报告 STOPPING，完成后可再次关闭。空会话可补位，真实 API 敞口恢复纳管。
   精确相同订单身份只计一次，包含部分成交的剩余买单占资及当前持仓成本；独立在途 BUY（含无 ID 的 accepted）继续保护自动与手动准入，SELL 不确定性及身份/时点/代次/停止/配置栅栏保持；动作类型按持久角色和操作身份区分，用户幂等键不改变类型，真实撤单不增加 BUY 占位；预留豁免、退役、轮换与审计共用类型判断。
-  真实隔离进程、SQLite 与离线 adapter 定向验证自动 4→5、手动/增仓 POST 前后中断、重复重启不重放、迟到敞口、部分成交及新请求隔离；串行与 n2/loadgroup 各 296 项通过。
+  真实隔离进程、SQLite 与离线 adapter 定向验证自动 4→5、手动/增仓 POST 前后中断、重复重启不重放、迟到敞口、部分成交及新请求隔离；串行与 n2/loadgroup 各 320 项通过。迟到 BUY 保留已核实成交与 API 成本，独立 UNKNOWN SELL 仍阻止准入；坏交易/MINED 在有效空账户覆盖前保留未知，退役不改写动作审计。
   未部署或操作真实服务、账户与交易。
 
 - #270 后台核对不再把本进程尚未 POST 的自动 BUY 准备意图误改为 UNKNOWN，避免补位被自身发送前校验拒绝。
