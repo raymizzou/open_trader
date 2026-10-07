@@ -96,6 +96,37 @@ class LPReadScratch(MutableMapping):
         return clone
 
 
+class LPDirectionScratch(Mapping):
+    """Direction overrides over one immutable published metadata generation.
+
+    The metadata mapping owns its private scratch snapshot. Retaining it keeps
+    old readers valid across publication without copying or closing that source.
+    Each lookup decodes fresh base and override values for caller isolation.
+    """
+
+    def __init__(self, metadata):
+        self._metadata = metadata
+        self._values = LPReadScratch()
+
+    def __setitem__(self, key, direction):
+        self._values[key] = direction
+
+    def __getitem__(self, key):
+        direction = self._values[key]
+        overrides = direction["market"]
+        direction["market"] = {
+            **self._metadata[overrides["condition_id"]],
+            **overrides,
+        }
+        return direction
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+
 class LPReadRows(Sequence):
     """Immutable, repeatable rows; iteration decodes one row at a time."""
 
