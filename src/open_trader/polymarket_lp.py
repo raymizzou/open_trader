@@ -3009,6 +3009,11 @@ class PolymarketLPService:
                         reason="retry_not_due",
                         display_state="unknown",
                     )
+            # Recovery decisions are complete; none of these rows is needed
+            # by catalog, metadata, or history preparation.
+            existing_preparation_items = ()
+            waiting_items = ()
+            item = None
             preparation = self._begin_preparation(now, generation=generation)
             global_fence = preparation.get("global_recovery_generation")
             if type(global_fence) is int and global_fence > generation:
@@ -3569,6 +3574,9 @@ class PolymarketLPService:
                         continue
                 active_targets.append(identity)
             targets = active_targets
+            # Retain identities and decisions, not the consumed retry snapshot.
+            preparation_items.clear()
+            item = None
             current_items = (
                 preparation_item_reader()
                 if callable(preparation_item_reader)
@@ -3760,6 +3768,8 @@ class PolymarketLPService:
                 )
                 return result
 
+            current_items = ()
+            item = None
             if not self._publish_prepared_inputs(
                 catalog, metadata_value, state="preparing",
                 exclusion_revision=preparation_exclusion_revision, generation=generation,
@@ -4222,40 +4232,10 @@ class PolymarketLPService:
                     break
                 if callable(preparation_retry_claimer):
                     retry_now = self._now()
-                    retryable_items = (
-                        preparation_item_reader()
-                        if callable(preparation_item_reader)
-                        else ()
-                    )
-                    claimable_conditions = tuple(
-                        dict.fromkeys(
-                            str(item.get("condition_id") or "")
-                            for item in retryable_items
-                            if isinstance(item, Mapping)
-                            and str(item.get("condition_id") or "").strip()
-                            and item.get("state") == "waiting_retry"
-                            and item.get("next_retry_at") is not None
-                            and (
-                                str(item.get("condition_id") or "")
-                                in target_identities_by_condition
-                                or (
-                                    item.get("stage") == "metadata"
-                                    and str(item.get("condition_id") or "")
-                                    in condition_ids
-                                )
-                            )
-                            and (
-                                _timestamp(
-                                    item.get("next_retry_at"),
-                                    name="next_retry_at",
-                                )
-                                <= retry_now
-                            )
-                        )
-                    )
                     due_retries = preparation_retry_claimer(
                         now=retry_now,
-                        condition_ids=claimable_conditions,
+                        condition_ids=target_identities_by_condition,
+                        metadata_condition_ids=condition_ids,
                     )
                     due_metadata_ids = tuple(
                         str(item.get("condition_id") or "")
