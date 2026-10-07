@@ -19,6 +19,21 @@ operator-facing: what changed, which workflow is affected, and what was verified
   已发布元数据占用不变，每次构建增加 400 次临时库 SELECT。完整队列仍保存完整详情，Python 最终分配略增，
   不将临时库节省等同 RSS 节省；单次计时不构成速度保证，cgroup 和云端容量未验证。未部署。
 
+- #279 澄清任务工作树规则：保留本地 `main` 的分叉提交及改动，从新抓取的
+  `origin/main` 创建任务；任务 checkout 的 `AGENTS.md` 与其链接的运行手册一起读取，
+  不把单独复制 `AGENTS.md` 当作迁移源码或工作流。已核对文档差异、Markdown 链接目标
+  和 `git diff --check`；未进行运行时、测试、CI、部署或机器一致性验证。
+
+- #279 将 N-leg 视为永久停用：默认 CI 仍要求四个后端服务和 non-LIVE portable，
+  仅把显式审定的 29 个专属文件记为未执行；三份共享文件、LP、暂停及 paused-shadow 护栏保持活动。
+  Make、CI 和部署证据共用严格选择策略；完整收集必须等于活动执行与退役集合的不相交并集。
+  新增 nodeid、阶段耗时、结果及 JUnit 记录，保留失败退出码；预检拒绝遗漏 LP/暂停执行、策略/哈希篡改、旧 attempt 与 false-full 证明。
+  Python 3.12.14 锁环境下修复后定向 103 项及 78 个 subtest 通过；此前 9 个暂停护栏通过；串行/双 worker 的真实 pytest 记录验证通过，保留 nodeid 中的 `@` 参数；
+  CPU 型号与架构分列并记录来源，原生读取及不可用时显式 unknown 的回归通过。
+  成功证据必须含完整阶段、环境与 CPU 状态；生产者和预检共用 JUnit 解析校验，拒绝空/重复/遗漏 testcase、
+  不一致的身份/结果及非有限耗时；失败仍保留部分记录和原始退出码。
+  历史失败证据保留，未运行全后端、GitHub CI 或部署；同源双 worker 耗时对照待稳定评审后进行，尚不宣称节省。
+
 - 开发规则随项目统一：明确 TDD、任务委派、Herdr 实施模型和 Ponytail 的适用边界，
   不再依赖某台机器未定义的全局约定。新增 Air/Mini 独立开发环境设置与逐项比对步骤，
   复用锁文件及依赖清单，保留服务使用的 Python 环境和各机凭据；两机均验证后才报告一致。

@@ -29,6 +29,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow.count('timeout-minutes:'), 8)
         self.assertIn('github.event.pull_request.base.sha', workflow)
         self.assertIn('github.event.before', workflow)
+        self.assertIn('Plan active backend checks', workflow)
 
     def test_fixed_required_check_and_all_service_results(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
@@ -43,6 +44,8 @@ class WorkflowTests(unittest.TestCase):
         for scope in ['gateway', 'legacy', 'account', 'prediction', 'portable', 'trend-curve']:
             self.assertIn(f'"{scope}"', workflow)
         self.assertIn('test_ci_*.py', workflow)
+        self.assertEqual(workflow.count('including phase metrics and JUnit'), 6)
+        self.assertEqual(workflow.count('if: always()'), 7)
         self.assertIn('ci-portable-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}', workflow)
         self.assertEqual(workflow.count('retention-days: 3'), 6)
 
@@ -64,6 +67,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('git status --porcelain', script)
         self.assertNotIn('candidate-acceptance', script)
         self.assertNotIn('production-smoke', script)
+        self.assertIn('case "$nleg" in 0)', script)
+        self.assertIn('CI_TEST_ARTIFACTS=1', script)
+        self.assertIn('docker cp', script)
+        self.assertIn('failed $?', script)
+        self.assertNotIn('--mount', script)
+        self.assertNotIn('--volume', script)
 
     def test_serial_and_shared_session_contracts_are_preserved(self):
         makefile = (ROOT / 'Makefile').read_text()
@@ -71,6 +80,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('workers=1', script)
         self.assertIn('[[ "$scope" != prediction ]] || workers=2', script)
         self.assertIn('--dist=loadgroup', makefile)
+        self.assertIn('scripts.ci_test_metrics', makefile)
+        self.assertIn('--junitxml=/tmp/open-trader-ci-evidence/junit.xml', makefile)
+        self.assertIn('CI_TEST_SOURCE_SHA=$(SOURCE_SHA)', makefile)
+        self.assertIn('scripts/ci_nleg_retired.json', makefile)
+        self.assertNotIn('N_LEG_TESTS := $(wildcard', makefile)
         portable = makefile.split('test-ci-portable:\n', 1)[1].split('\n\n', 1)[0]
         self.assertIn('acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"', portable)
         self.assertNotIn(' -n ', portable)

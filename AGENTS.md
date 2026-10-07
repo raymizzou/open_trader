@@ -35,6 +35,15 @@ Do not use an unrelated or dirty checkout. Code and behavior changes require a c
 approval; follow the implementation and TDD workflow in the linked runbook after
 approval. Existing authorization remains valid within its approved scope.
 
+If local `main` has divergent local commits, preserve that branch, its worktree,
+and its local changes. Create the task from freshly fetched `origin/main`; do not
+reset, force-update, or merge divergent `main` during task setup. Reconciliation
+is a separate scoped action.
+
+Read the task checkout's `AGENTS.md` together with its linked runbooks. Copying
+`AGENTS.md` alone into an older checkout does not migrate source or workflow;
+use the checkout's own files and do not duplicate the existing workstation guide.
+
 For workstation setup, dependency drift, or Air/Mini comparisons, read
 [dependency-reproducibility.md](docs/operations/dependency-reproducibility.md#workstation-setup-and-comparison).
 Use the checked-out project's rules and an explicitly selected development
@@ -82,17 +91,20 @@ or blocked focused checks rather than claiming success. Docker is optional for
 focused diagnosis and is not a prerequisite to pushing a reviewed branch.
 
 GitHub CI runs all four backend services (`gateway`, `legacy`, `account`,
-`prediction`) with `TEST_N_LEG=1` on every branch push and every PR targeting
+`prediction`) with `TEST_N_LEG=0` and the explicit permanent N-leg retirement
+manifest on every branch push and every PR targeting
 `main`, including the final merged-main push. Documentation-only, LP-only,
-trend-only, and missing-diff cases have the same full backend coverage, excluding
+trend-only, and missing-diff cases have the same active backend coverage, excluding
 `pressure` and `browser`. Push-head and PR-merge runs intentionally test distinct
 SHA identities. Before authorized publication, complete focused local checks
 and independent review; inspect exact-SHA CI before requesting merge approval.
 Deployment Preflight runs only for a selected final GitHub `main` SHA during an
 explicitly authorized deployment. It reuses trusted exact-SHA main-push CI and
 checks immutable source/lock/runtime identity; it never reruns backend tests.
-CI also runs the non-LIVE portable prediction scenarios and proves backend
-collection coverage. `candidate-acceptance` and `acceptance` are compatibility
+CI also runs the non-LIVE portable prediction scenarios and proves that executed
+active nodeids plus declared retired nodeids cover the complete backend collection
+without overlap. Retired tests are recorded as not executed, never passed. See
+[the retirement policy](docs/operations/ci-nleg-retirement.md). `candidate-acceptance` and `acceptance` are compatibility
 aliases for this lightweight check, not another test stage. Use the supported
 forward wrapper in [deployment-preflight.md](docs/operations/deployment-preflight.md),
 with fresh Host Readiness before installation and Production Smoke afterward.

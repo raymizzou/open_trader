@@ -58,10 +58,11 @@ not passing evidence. Keep TDD, relevant stability checks and independent review
 
 Docker is not a prerequisite to push a reviewed branch. Optional focused Docker
 diagnosis can use `make test TEST='tests/path.py::test_name'`; local development
-does not require whole-service or full-backend suites. GitHub CI owns the full
-existing backend test suite on every branch push and every PR targeting `main`,
+does not require whole-service or full-backend suites. GitHub CI owns the complete active
+backend test suite on every branch push and every PR targeting `main`,
 including the final merged-main push: `gateway`, `legacy`, `account`, and
-`prediction`, always with `TEST_N_LEG=1`, excluding `pressure` and `browser`.
+`prediction`, with `TEST_N_LEG=0` and the permanent retirement manifest, excluding
+`pressure` and `browser`.
 Documentation-only, LP-only, trend-only and unavailable/empty diff cases all run
 that same coverage. Push CI tests the branch head; PR CI tests the synthetic merge
 candidate. These intentionally separate runs cover distinct SHA identities.
@@ -74,14 +75,21 @@ CI reuses `make test SERVICE=<service>` and the worktree-specific `Dockerfile.de
 image. Valid service names are `gateway`, `legacy`, `account`, and `prediction`;
 unscoped `make test` fails before building. Gateway contains `frontend_gateway`
 tests; Legacy contains Dashboard and remaining shared backend test files,
-including standalone trend-curve tests. Keep Makefile prefixes current when
+including standalone trend-curve tests. Keep selection prefixes current when
 adding service-specific test families. The retained standalone trend-curve CI
 job is not selected because legacy already includes its tests.
 
-Makefile's service-scoped default `TEST_N_LEG=0` omits the dedicated N-leg files
-listed in `N_LEG_TESTS`; CI explicitly overrides it with `TEST_N_LEG=1` for every
-service. Explicit `TEST=...` always runs the requested tests, including N-leg
-nodeids. Test selection never changes production `N_LEG_PAUSED`.
+Makefile and CI use `TEST_N_LEG=0`: only the 29 reviewed files in
+`scripts/ci_nleg_retired.json` are omitted from execution because N-leg is
+permanently retired. The three mixed/shared files remain active, as do LP,
+service/runtime and pause guards. Unknown/new files default to active coverage.
+The shared validation fixture file stays importable. `TEST_N_LEG=1` and explicit
+`TEST=...` remain manual diagnostic entries; no scheduled full N-leg regression
+is required. Selection never changes production `N_LEG_PAUSED`.
+See [the retirement classification and evidence](ci-nleg-retirement.md).
+Service routing now lives in `scripts/ci_evidence.py`, shared by Make, the
+collection proof and deployment evidence; update its prefixes for new service
+families. Invalid manifests and empty partitions fail before the test build.
 The Makefile's Prediction service default remains six pytest-xdist workers with
 `--dist=loadgroup`, distributing individual tests across workers; solver benchmark
 tests share one worker to reuse their full-handoff fixture cache. CI overrides
@@ -90,7 +98,9 @@ this to two workers for Prediction. `TEST_WORKERS=4` can reduce busy-host load a
 `TEST=...` selections default to serial, and also accept `TEST_WORKERS`.
 Portable scenarios run serially in CI. Known Prediction shared-port and cached
 fixture groups retain their xdist grouping; global cross-service serial ordering
-is not a separate deployment requirement. CI proves backend collection coverage.
+is not a separate deployment requirement. CI proves complete backend collection equals executed active nodeids plus
+declared retired nodeids, with no gaps or overlap. Each job retains selected
+nodeids, phase durations, outcomes, JUnit and wall time, including failed runs.
 The development image includes Node and `procps`, but excludes npm, Python/JS
 Playwright and Chromium/browser assets. Test containers have no host mounts,
 network, published ports, Docker socket, home directory or credentials.

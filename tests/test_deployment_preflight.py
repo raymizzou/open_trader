@@ -7,7 +7,9 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import shutil
 import zipfile
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -24,6 +26,17 @@ def pack(files):
         for name, value in files.items():
             archive.writestr(name, value if isinstance(value, bytes) else json.dumps(value))
     return stream.getvalue()
+
+
+def literal_junit(metrics):
+    root=ET.Element('testsuites')
+    suite=ET.SubElement(root,'testsuite',name='pytest',tests=str(len(metrics['results'])),failures='0',errors='0',
+                        skipped=str(sum(item['outcome']=='skipped' for item in metrics['results'])),time='0.3')
+    for item in metrics['results']:
+        file, name=item['execution_nodeid'].split('::',1)
+        case=ET.SubElement(suite,'testcase',classname=file[:-3].replace('/','.'),name=name,time='0.3')
+        if item['outcome']=='skipped': ET.SubElement(case,'skipped',type='pytest.skip',message='literal fixture skip')
+    return ET.tostring(root)
 
 
 def fixture_evidence():
@@ -69,15 +82,48 @@ class FakeAPI:
 
 
 @pytest.fixture
-def evidence(tmp_path, monkeypatch):
+def evidence(tmp_path):
     (tmp_path / 'uv.lock').write_text('locked bytes')
     (tmp_path / 'Dockerfile.dev').write_text('FROM python:3.12.14@sha256:' + 'c'*64 + '\n')
     run, jobs, checks = fixture_evidence()
     api = FakeAPI(run, jobs, checks)
-    selection = {'roots':['tests/test_one.py'], 'marker':'not pressure and not browser', 'keyword':''}
-    monkeypatch.setattr(preflight, 'expected_selection', lambda scope, root: selection)
+    project = Path(__file__).resolve().parents[1]
+    (tmp_path/'scripts').mkdir()
+    for name in ('ci_evidence.py','ci_partition.py','ci_nleg_retired.json'):
+        shutil.copy(project/'scripts'/name,tmp_path/'scripts'/name)
+    (tmp_path/'tests').mkdir()
+    retired=json.loads((tmp_path/'scripts/ci_nleg_retired.json').read_text())['retired']
+    for path in [item['path'] for item in retired] + [
+            'tests/test_frontend_gateway.py', 'tests/test_dashboard_web.py','tests/test_account_api.py',
+            'tests/test_lp_example.py', 'tests/test_prediction_runtime.py','tests/test_prediction_service.py',
+            'tests/test_prediction_monitor_selection_driver.py','tests/test_prediction_n_leg_cutover.py',
+            'tests/test_run_nleg_cutover.py']:
+        (tmp_path/path).write_text('def test_ok(): pass\n')
+    runtime=['test_n_leg_pause_keeps_lp_running_without_n_leg_requests',
+             'test_n_leg_pause_suppresses_shadow_background_requests']
+    service=['test_paused_n_leg_routes_reject_before_business_work',
+             'test_paused_n_leg_requests_do_not_hold_lp_or_health_responses',
+             'test_paused_state_and_lp_remain_responsive_during_preparation',
+             'test_shadow_paused_n_leg_posts_report_pause_before_read_only']
+    for name, guards in [('runtime',runtime),('service',service)]:
+        (tmp_path/f'tests/test_prediction_{name}.py').write_text(''.join('def '+guard+'(): pass\n' for guard in guards))
+    spec=importlib.util.spec_from_file_location('fixture_ci',tmp_path/'scripts/ci_evidence.py')
+    ci=importlib.util.module_from_spec(spec); spec.loader.exec_module(ci)
+    spec=importlib.util.spec_from_file_location('fixture_partition',tmp_path/'scripts/ci_partition.py')
+    partition=importlib.util.module_from_spec(spec); spec.loader.exec_module(partition)
+    parts={scope:[path+'::test_ok' for path in paths] for scope,paths in ci.service_partitions(tmp_path).items()}
+    parts['prediction']=[node for node in parts['prediction'] if node.split('::')[0] not in (
+        'tests/test_prediction_runtime.py','tests/test_prediction_service.py')]+[
+        'tests/test_prediction_runtime.py::'+guard for guard in runtime]+[
+        'tests/test_prediction_service.py::'+guard for guard in service]
+    plain='tests/test_prediction_monitor_selection_driver.py::test_ok'
+    parts['prediction'][parts['prediction'].index(plain)] = plain+'[literal@parameter]'
+    retired_nodes=[item['path']+'::test_ok' for item in retired]
+    proof=partition.verify_partition(sum(parts.values(),[])+retired_nodes,parts,retired_nodes,tmp_path)
     lock = hashlib.sha256((tmp_path/'uv.lock').read_bytes()).hexdigest()
     for i, scope in enumerate(preflight.SCOPES):
+        selection=ci.expected_selection(scope,tmp_path)
+        nodes=sorted(parts[scope]) if scope != "portable" else ["acceptance/test_prediction_arbitrage_scenarios.py::test_ok"]
         manifest = dict(role='test-only; synthetic Git snapshot is not a release SHA', source_sha=SHA,
                         source_state='clean', python='3.12.14', platform='Linux/x86_64', lock_sha256=lock,
                         base_images=['python:3.12.14@sha256:'+'c'*64], dependencies=[['pytest','8.0']])
@@ -86,17 +132,32 @@ def evidence(tmp_path, monkeypatch):
         files = {'dependency-manifest.json':json.dumps(manifest).encode(), 'image.json':json.dumps(image).encode()}
         env = dict(runner_os='Linux', runner_arch='X64', dependency_manifest_sha256=hashlib.sha256(files['dependency-manifest.json']).hexdigest(),
                    image_inspect_sha256=hashlib.sha256(files['image.json']).hexdigest())
+        workers=2 if scope=='prediction' else 1
+        results=[]
+        for node in nodes:
+            skipped=node=='tests/test_lp_example.py::test_ok'
+            phases={phase:dict(duration=0.1,outcome='skipped' if skipped and phase=='setup' else 'passed',
+                               worker='gw0' if workers==2 else 'serial')
+                    for phase in (('setup','teardown') if skipped else ('setup','call','teardown'))}
+            results.append(dict(nodeid=node,execution_nodeid=node+'@fixture_group' if '[literal@parameter]' in node else node,
+                                outcome='skipped' if skipped else 'passed',phases=phases))
+        metrics=dict(schema_version=1,source_sha=SHA,workers=workers,python='3.12.14',platform='Linux/x86_64',
+                     architecture='x86_64',cpu_model='Example CPU',cpu_model_source='/proc/cpuinfo',
+                     cpu_model_unavailable=None,cpu_count=2,selected_nodeids=nodes,results=results,
+                     collection_errors=[],exit_status=0,complete=True,wall_seconds=1.0)
+        files.update({'metrics.json':json.dumps(metrics).encode(),'selected-nodeids.json':json.dumps(nodes).encode(),
+                      'junit.xml':literal_junit(metrics)})
+        for field,name in [('metrics_sha256','metrics.json'),('selected_nodeids_sha256','selected-nodeids.json'),('junit_sha256','junit.xml')]:
+            env[field]=hashlib.sha256(files[name]).hexdigest()
         if scope == 'portable':
-            partition = dict(schema_version=1, marker=selection['marker'], complete_count=4, partition_count=4,
-                             counts={name:1 for name in preflight.SCOPES if name!='portable'},
-                             complete_sha256='e'*64, partition_sha256='e'*64, status='success')
-            files['partition.json'] = json.dumps(partition).encode()
+            files['partition.json'] = json.dumps(proof).encode()
             env['partition_sha256'] = hashlib.sha256(files['partition.json']).hexdigest()
-        files['evidence.json'] = dict(schema_version=1, source_sha=SHA, repository=preflight.REPOSITORY,
+        files['evidence.json'] = dict(schema_version=2, source_sha=SHA, repository=preflight.REPOSITORY,
             workflow_ref=f'{preflight.REPOSITORY}/{preflight.WORKFLOW}@refs/heads/main', event_name='push',
-            ref='refs/heads/main', run_id='22', run_attempt='2', scope=scope, test_n_leg='1',
+            ref='refs/heads/main', run_id='22', run_attempt='2', scope=scope, test_n_leg='0',
             workers=2 if scope=='prediction' else 1, lock_sha256=lock, status='success', exit_status=0,
-            selection=selection, environment=env, evidence_role='test-only')
+            selection=selection,selection_sha256=ci.selection_sha256(selection),policy=ci.retirement_policy(tmp_path),
+            selected_nodeids=nodes,environment=env,evidence_role='test-only')
         archive = pack(files)
         artifact = dict(id=i+1, name=f'ci-{scope}-{SHA}-22-2', expired=False,
                         created_at='2026-10-01T12:00:00Z', expires_at='2026-10-04T12:00:00Z',
@@ -105,6 +166,20 @@ def evidence(tmp_path, monkeypatch):
         api.artifacts.append(artifact)
         api.downloads[i+1] = archive
     return tmp_path, api
+
+
+def test_trusted_main_active_coverage_is_accepted(evidence):
+    root,api=evidence
+    report=preflight.verify_ci(api,SHA,root,NOW)
+    assert report['run_id']==22
+    assert report['run_attempt']==2
+    assert len(report['artifacts'])==5
+    with zipfile.ZipFile(io.BytesIO(api.downloads[5])) as archive:
+        proof=json.loads(archive.read('partition.json'))
+    assert proof['retired_status']=='not-executed-permanent-retirement'
+    assert proof['retired_count']==29
+    assert proof['executed_count']+29==proof['complete_count']
+    assert proof['retired'] and not set(proof['retired']) & set(sum(proof['partitions'].values(),[]))
 
 
 def test_valid_trusted_main_push_and_current_attempt(evidence):
@@ -174,7 +249,7 @@ def mutate_metadata(api, modify):
     api.artifacts[0]['digest']='sha256:'+hashlib.sha256(api.downloads[1]).hexdigest()
 
 
-@pytest.mark.parametrize('field,value', [('run_attempt','1'), ('source_sha','b'*40), ('test_n_leg','0'),
+@pytest.mark.parametrize('field,value', [('run_attempt','1'), ('source_sha','b'*40), ('test_n_leg','1'),
     ('workers',2), ('lock_sha256','0'*64), ('evidence_role','deployment'), ('exit_status',1),
     ('selection',{'roots':[]}), ('environment',{})])
 def test_trusted_archive_metadata_must_match_full_contract(evidence, field, value):
@@ -388,3 +463,86 @@ def test_forward_launchd_imports_preserve_release_for_successive_services(tmp_pa
         preflight.verify_checkout(release, sha)
         assert git('status', '--porcelain', '--untracked-files=all') == ''
     assert environment['PYTHONDONTWRITEBYTECODE'] == '1'
+
+
+@pytest.mark.parametrize('mutation', ['missing_lp','missing_pause','manifest_hash','selection_hash','cross_sha',
+    'old_attempt','expired','unknown_policy','false_full'])
+def test_active_coverage_tampering_is_rejected(evidence, mutation):
+    root,api=evidence
+    if mutation=='old_attempt': api.artifacts[0]['name']=api.artifacts[0]['name'][:-1]+'1'
+    elif mutation=='expired': api.artifacts[0]['expired']=True
+    else:
+        target=4 if mutation in ('missing_lp','missing_pause') else 5
+        with zipfile.ZipFile(io.BytesIO(api.downloads[target])) as archive:
+            files={name:archive.read(name) for name in archive.namelist()}
+        metadata=json.loads(files['evidence.json'])
+        if mutation in ('missing_lp','missing_pause'):
+            prefix='tests/test_lp_example.py::' if mutation=='missing_lp' else 'tests/test_prediction_runtime.py::test_n_leg_pause_keeps_lp_running'
+            metrics=json.loads(files['metrics.json'])
+            metrics['selected_nodeids']=[node for node in metrics['selected_nodeids'] if not node.startswith(prefix)]
+            metrics['results']=[result for result in metrics['results'] if not result['nodeid'].startswith(prefix)]
+            files['metrics.json']=json.dumps(metrics).encode()
+            files['selected-nodeids.json']=json.dumps(metrics['selected_nodeids']).encode()
+            files['junit.xml']=literal_junit(metrics)
+            metadata['selected_nodeids']=metrics['selected_nodeids']
+            for name,field in [('metrics.json','metrics_sha256'),('selected-nodeids.json','selected_nodeids_sha256'),('junit.xml','junit_sha256')]:
+                metadata['environment'][field]=hashlib.sha256(files[name]).hexdigest()
+        elif mutation=='manifest_hash': metadata['policy']['manifest_sha256']='0'*64
+        elif mutation=='selection_hash': metadata['selection_sha256']='0'*64
+        elif mutation=='cross_sha': metadata['source_sha']='b'*40
+        elif mutation=='unknown_policy': metadata['policy']['policy']='unknown'
+        elif mutation=='false_full':
+            proof=json.loads(files['partition.json']);proof['retired_status']='passed';proof['complete_count']=proof['executed_count']
+            files['partition.json']=json.dumps(proof).encode()
+            metadata['environment']['partition_sha256']=hashlib.sha256(files['partition.json']).hexdigest()
+        files['evidence.json']=metadata
+        api.downloads[target]=pack(files)
+        api.artifacts[target-1]['digest']='sha256:'+hashlib.sha256(api.downloads[target]).hexdigest()
+    with pytest.raises(preflight.PreflightError):
+        preflight.verify_ci(api,SHA,root,NOW)
+
+
+@pytest.mark.parametrize('mutation', ['phases','cpu','malformed_xml','empty_junit','missing_case','extra_case',
+    'duplicate_case','wrong_outcome','wrong_group_mapping','wrong_parameter_text','negative_time','nonfinite_time'])
+def test_measurement_artifact_tampering_is_rejected(evidence, mutation):
+    root,api=evidence
+    assert preflight.verify_ci(api,SHA,root,NOW)['run_attempt']==2
+    target=4
+    def read_files():
+        with zipfile.ZipFile(io.BytesIO(api.downloads[target])) as archive:
+            return {name:archive.read(name) for name in archive.namelist()}
+    def publish(files):
+        metadata=json.loads(files['evidence.json'])
+        for name,field in [('metrics.json','metrics_sha256'),('junit.xml','junit_sha256')]:
+            metadata['environment'][field]=hashlib.sha256(files[name]).hexdigest()
+        files['evidence.json']=metadata
+        api.downloads[target]=pack(files)
+        api.artifacts[target-1]['digest']='sha256:'+hashlib.sha256(api.downloads[target]).hexdigest()
+    # Unknown CPU is a valid measured result, not a fake native model.
+    files=read_files();metrics=json.loads(files['metrics.json'])
+    metrics.update(cpu_model=None,cpu_model_source='unavailable',cpu_model_unavailable='native-read-failed',cpu_count=None)
+    files['metrics.json']=json.dumps(metrics).encode();publish(files)
+    assert preflight.verify_ci(api,SHA,root,NOW)['run_attempt']==2
+    files=read_files();metrics=json.loads(files['metrics.json'])
+    xml=ET.fromstring(files['junit.xml']);suite=xml.find('testsuite');cases=suite.findall('testcase')
+    if mutation=='phases': metrics['results'][0]['phases']={}
+    elif mutation=='cpu': del metrics['cpu_model_source']
+    elif mutation=='malformed_xml': files['junit.xml']=b'<testsuites'
+    elif mutation=='empty_junit': files['junit.xml']=b'<testsuites/>'
+    elif mutation=='missing_case': suite.remove(cases[0])
+    elif mutation=='extra_case': ET.SubElement(suite,'testcase',classname='tests.test_extra',name='test_extra',time='0.1')
+    elif mutation=='duplicate_case': suite.append(copy.deepcopy(cases[0]))
+    elif mutation=='wrong_outcome':
+        ordinary=next(case for case in cases if case.find('skipped') is None)
+        ET.SubElement(ordinary,'skipped',message='forged outcome')
+    elif mutation=='wrong_group_mapping':
+        grouped=next(case for case in cases if '@fixture_group' in case.attrib['name'])
+        grouped.set('name',grouped.attrib['name'].replace('@fixture_group','@forged_group'))
+    elif mutation=='wrong_parameter_text':
+        grouped=next(case for case in cases if 'literal@parameter' in case.attrib['name'])
+        grouped.set('name',grouped.attrib['name'].replace('literal@parameter','literal'))
+    elif mutation=='negative_time': cases[0].set('time','-1')
+    elif mutation=='nonfinite_time': cases[0].set('time','nan')
+    if mutation not in ('malformed_xml','empty_junit'): files['junit.xml']=ET.tostring(xml)
+    files['metrics.json']=json.dumps(metrics).encode();publish(files)
+    with pytest.raises(preflight.PreflightError): preflight.verify_ci(api,SHA,root,NOW)
