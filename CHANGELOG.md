@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-07
 
+- 开发规则随项目统一：明确 TDD、任务委派、Herdr 实施模型和 Ponytail 的适用边界，
+  不再依赖某台机器未定义的全局约定。新增 Air/Mini 独立开发环境设置与逐项比对步骤，
+  复用锁文件及依赖清单，保留服务使用的 Python 环境和各机凭据；两机均验证后才报告一致。
+  Air 独立 Python 3.12.14 环境按锁安装 98 个包，版本及依赖检查通过，4 项定向检查通过；
+  文档链接、命令语法、已有环境/符号链接及脏工作树拒绝验证通过；验证后复核源码身份。
+  Mini SSH 不可达，跨机一致性仍未验证。
+
 - #270 后台核对不再把本进程尚未 POST 的自动 BUY 准备意图误改为 UNKNOWN，避免补位被自身发送前校验拒绝。
   仅在同一事务确认 reserved、活动入场 lane 与精确 pending/preparing entry action 时保留原预留及名额；
   同时检查 session 的 POST 标志，已发送、无本进程 lane、身份冲突和独立未决动作仍按原 UNKNOWN 规则处理。
