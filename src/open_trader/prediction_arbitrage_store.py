@@ -5090,7 +5090,7 @@ class PredictionArbitrageStore:
 
     def _lp_manual_retirement_state(self, connection, session_id, payload, state):
         """A late local callback cannot reopen a waived empty request container."""
-        from .polymarket_lp_accounting import reservation_is_manually_released
+        from .polymarket_lp_accounting import reservation_is_manually_released, has_independent_unresolved_action
         retired = payload.get("manual_release_retired")
         account_retired = payload.get("account_coverage_retired")
         api_retired = (isinstance(account_retired, Mapping)
@@ -5107,11 +5107,8 @@ class PredictionArbitrageStore:
                 or any(payload.get(key) in {"pending", "unknown", "accepted_without_order_id"}
                        for key in ("passive_exit_attempt_state", "protected_exit_attempt_state"))):
             return state
-        if any(action.get("state") in {"pending", "unknown", "accepted_without_order_id"}
-               and ("cancel" in str(action.get("action_key") or "")
-                    or action.get("role") != "entry"
-                    and not str(action.get("action_key") or "").endswith("entry-submit"))
-               for action in self.lp_actions(str(session_id), connection=connection)):
+        if has_independent_unresolved_action({**payload, "session_id": str(session_id)},
+                self.lp_actions(str(session_id), connection=connection)):
             return state
         return "complete"
 
@@ -6652,43 +6649,48 @@ class PredictionArbitrageStore:
             return
         listener(session_id)
 
-    def lp_recover_interrupted_preparations(self) -> None:
+    def lp_recover_interrupted_submissions(self) -> None:
         """Called once by startup under the newly acquired exclusive runtime owner.
 
         Preserve the request/action audit. Only a later complete account round
         can replace the temporary hold; this is not a venue rejection receipt.
         """
-        from .polymarket_lp_accounting import interrupted_preparation_entry, preparation_action_fingerprint
+        from .polymarket_lp_accounting import (
+            submission_action_fingerprint, submission_owner_identity,
+        )
         now = _utc_now()
         with self._transaction() as tx:
-            row = tx.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
-            if row is None:
-                return
-            intents = _load_payload(str(row['payload'])).get('intents') or {}
-            bindings = {}
-            for intent in intents.values():
-                bindings.setdefault(str(intent.get('session_id') or ''), []).append(intent)
-            for sid, bound in bindings.items():
-                if len(bound) != 1:
-                    continue
-                row = tx.execute('SELECT * FROM lp_sessions WHERE session_id=?', (sid,)).fetchone()
-                if row is None:
-                    continue
+            for row in tx.execute('SELECT * FROM lp_sessions').fetchall():
+                sid = str(row['session_id'])
                 session = self._lp_row_result(row)
-                if session.get('interrupted_preparation') or session.get('reservation_coverage'):
-                    continue
-                entry = interrupted_preparation_entry(bound[0], session, self.lp_actions(sid, connection=tx))
-                if entry is None:
-                    continue
-                try:
-                    if _parse_timestamp(entry['submit_requested_at']) > _parse_timestamp(now):
-                        continue
-                except ValueError:
-                    continue
                 payload = _load_payload(str(row['payload']))
-                payload['interrupted_preparation'] = dict(basis='runtime_owner_handoff_pre_post',
-                    recovered_at=now, intent_id=bound[0]['intent_id'],
-                    action_fingerprint=preparation_action_fingerprint(entry))
+                actions = self.lp_actions(sid, connection=tx)
+                changed = False
+                certificates = payload.setdefault('submission_owner_exit', {})
+                for action in actions:
+                    role, key = action.get('role'), str(action.get('action_key') or '')
+                    if (session.get('order_identity_conflict') or action.get('side') != 'BUY'
+                            or action.get('token_id') != session.get('token_id')
+                            or role not in {'entry', 'augment'}
+                            or (key != sid+':entry-submit' if role == 'entry' else not key.startswith(sid+':augment-submit:'))
+                            or action.get('state') not in {'pending', 'unknown', 'accepted_without_order_id'}
+                                and not (action.get('state') == 'accepted' and not action.get('order_id'))):
+                        continue
+                    try:
+                        if any(_parse_timestamp(action.get(field)) > _parse_timestamp(now)
+                               for field in ('created_at', 'updated_at')):
+                            continue
+                    except ValueError:
+                        continue
+                    fingerprint = submission_action_fingerprint(action)
+                    previous = certificates.get(str(action['action_id'])) or {}
+                    if previous.get('action_fingerprint') == fingerprint and previous.get('session_identity') == submission_owner_identity(session):
+                        continue
+                    certificates[str(action['action_id'])] = dict(ended_at=now,
+                        action_fingerprint=fingerprint, session_identity=submission_owner_identity(session))
+                    changed = True
+                if not changed:
+                    continue
                 payload['_lp_revision'] = self._lp_payload_revision(payload) + 1
                 tx.execute('UPDATE lp_sessions SET payload=? WHERE session_id=?', (_dump_execution_payload(payload), sid))
                 self._lp_register_trade_change(tx, sid)
@@ -6708,6 +6710,8 @@ class PredictionArbitrageStore:
             account_cancel_is_pending, account_position_quantity,
             can_resume_covered_management, default_account_pool_document,
             ended_reservation_evidence, reservation_is_covered, reservation_is_released,
+            buy_action_is_covered, buy_attempt_identity, ended_buy_action_evidence,
+            has_independent_unresolved_action, unresolved_buy_action, submission_action_kind,
         )
         prepared_at = monotonic()
         diagnostics = {} if diagnostics is None else diagnostics
@@ -6832,6 +6836,10 @@ class PredictionArbitrageStore:
             # A round begun during a separate BUY submission cannot price
             # its future exposure. Keep account admission blocked even when
             # this session's original entry reservation was already covered.
+            value['pending_buy_actions'] = []
+            value['independent_sell_unknown'] = False
+            source_known = value['financial_status'] == 'known'
+            current_buys = {(b['order_id'], b['token_id'], b['side']) for b in buys}
             for sid, (row, payload) in sessions.items():
                 explicit = str(payload.get("account_id") or "").strip().casefold()
                 bindings = session_bindings.get(sid, ())
@@ -6840,12 +6848,39 @@ class PredictionArbitrageStore:
                 if explicit != account and not legacy_owned:
                     continue
                 actions = session_actions(sid)
+                value['independent_sell_unknown'] |= has_independent_unresolved_action(payload,
+                    [a for a in actions if a.get('side') == 'SELL'])
                 for action in actions:
-                    is_entry = action.get("role") == "entry" or str(action.get("action_key") or "").endswith("entry-submit")
-                    if (action.get("side") != "BUY" or (is_entry and bindings)
-                            or "cancel" in str(action.get("action_key") or "")
-                            or action.get("state") not in {"pending", "unknown"}):
+                    is_entry = submission_action_kind(action) == 'entry'
+                    if not unresolved_buy_action(action):
                         continue
+                    session = {**payload, 'session_id': sid, 'idempotency_key': row['idempotency_key']}
+                    evidence = ended_buy_action_evidence(session, action, read_started_at=started)
+                    if source_known and evidence and not buy_action_is_covered(session, action):
+                        marker = dict(version=1, state='covered', account_id=account, pool_account_id=pool_account,
+                            snapshot_id=value['snapshot_id'], session_id=sid, read_started_at=value['read_started_at'],
+                            checked_at=value['checked_at'], attempt_identity=buy_attempt_identity(action), **evidence)
+                        payload.setdefault('account_action_coverage', {})[str(action['action_id'])] = marker
+                        if is_entry and not bindings:
+                            payload['reservation_coverage'] = marker
+                        payload['_lp_revision'] = self._lp_payload_revision(payload) + 1
+                        tx.execute('UPDATE lp_sessions SET payload=? WHERE session_id=?', (_dump_execution_payload(payload), sid))
+                        session.update(payload)
+                    if buy_action_is_covered(session, action):
+                        continue
+                    if (action.get('order_id'), action.get('token_id'), action.get('side')) in current_buys:
+                        continue
+                    if is_entry and bindings:
+                        continue
+                    price = _maybe_decimal(action.get('price', payload.get('price') if is_entry else None))
+                    quantity = _maybe_decimal(action.get('quantity', payload.get('quantity') if is_entry else None))
+                    value['pending_buy_actions'].append(dict(intent_id='action:'+str(action['action_id']),
+                        session_id=sid, order_id=action.get('order_id'), token_id=action.get('token_id'), side='BUY',
+                        condition_id=payload.get('condition_id'), state='unknown', financial_status='unknown',
+                        inventory_cost_usd='0', reserved_usd=str(price*quantity)
+                            if price is not None and quantity is not None and price > 0 and quantity > 0 else None,
+                        checked_at=value['checked_at'], price=str(price) if price is not None else None,
+                        quantity=str(quantity) if quantity is not None else None))
                     end = action.get("submit_finished_at") or action.get("submit_receipt_at") or action.get("updated_at")
                     try:
                         ended_before = _parse_timestamp(end) < started
@@ -6856,7 +6891,7 @@ class PredictionArbitrageStore:
                         value["financial_status"] = "unknown"
                         value["reason_codes"] = sorted(set(value.get("reason_codes") or ()) | {"account_send_inflight"})
             retained = []
-            if value["financial_status"] == "known":
+            if source_known:
                 for intent_id, intent in intents.items():
                     if reservation_is_released(intent, pool_account):
                         continue
@@ -6886,14 +6921,9 @@ class PredictionArbitrageStore:
                 retained = [key for key, intent in intents.items() if not reservation_is_released(intent, pool_account)]
             value["retained_reservation_ids"] = sorted(retained)
             if value["financial_status"] == "known":
-                for intent in intents.values():
-                    if not reservation_is_released(intent, pool_account):
+                for sid, (row, payload) in sessions.items():
+                    if not reservation_is_released({**payload, 'session_id': sid}, pool_account):
                         continue
-                    sid = str(intent.get("session_id") or "")
-                    entry = sessions.get(sid)
-                    if entry is None:
-                        continue
-                    row, payload = entry
                     actions = session_actions(sid)
                     managed = {**payload, "session_id": sid, "state": row["state"]}
                     if can_resume_covered_management(managed, actions, value):
@@ -6905,15 +6935,11 @@ class PredictionArbitrageStore:
                             (_dump_execution_payload(payload), sid))
                         continue
                     token = str(payload.get("token_id") or "")
-                    if (not token or self._lp_owned_session_ids(payload)
-                            or token in value.get("open_order_tokens", ())
+                    if (not token or token in value.get("open_order_tokens", ())
                             or account_position_quantity(value, token) != 0):
                         continue
                     actions = session_actions(sid)
-                    if any(a.get("state") in {"pending", "unknown"}
-                           and a.get("role") != "entry"
-                           and not str(a.get("action_key") or "").endswith("entry-submit")
-                           for a in actions):
+                    if has_independent_unresolved_action(managed, actions):
                         continue
                     if row["state"] == "complete":
                         continue

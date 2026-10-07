@@ -1,5 +1,6 @@
 """A dead pre-POST owner must yield its temporary hold to fresh account facts."""
 import multiprocessing
+import faulthandler
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import timedelta
@@ -26,6 +27,8 @@ def _four_buys():
 
 def _old_preparing_owner(path, ready, release, phase):
     # Spawn has no inherited file descriptors, SQLite connections or clock patches.
+    diagnostic = (Path(path) / 'preparation-watchdog.log').open('w')
+    faulthandler.dump_traceback_later(9, file=diagnostic)
     patch = pytest.MonkeyPatch()
     fixture = runtime.__wrapped__(Path(path), patch)
     build = next(fixture)
@@ -40,6 +43,7 @@ def _old_preparing_owner(path, ready, release, phase):
 
         def checkpoint():
             intent = execution.lp_auto_state()['intents'][0]
+            faulthandler.cancel_dump_traceback_later()
             ready.send((intent, build.clock[0]))
             assert release.wait(10), 'Independent old-process signing watchdog'
 
@@ -64,6 +68,8 @@ def _old_preparing_owner(path, ready, release, phase):
             account.post_order = awaiting_receipt
         execution.lp_auto_run_once(round_id='old-preparing-request')
     finally:
+        faulthandler.cancel_dump_traceback_later()
+        diagnostic.close()
         lock.release()
         fixture.close()
         patch.undo()
@@ -79,7 +85,10 @@ def dead_preparation(tmp_path, runtime, request):
     child.start()
     write.close()
     try:
-        assert read.poll(10), 'Independent preparation registration watchdog'
+        diagnostic = tmp_path / 'preparation-watchdog.log'
+        assert read.poll(10), ('Independent preparation registration watchdog; '
+            f'alive={child.is_alive()} exitcode={child.exitcode}; '
+            + (diagnostic.read_text() if diagnostic.exists() else 'child did not enter preparation'))
         intent, boundary = read.recv()
         runtime.clock[0] = boundary + timedelta(seconds=1)
         yield child, intent, release
@@ -124,8 +133,8 @@ def _terminate_old(child):
     assert not child.is_alive() and child.exitcode != 0
 
 
-def _arm_refill(runtime, owner, account):
-    market, condition, token = _refill_identity(5)
+def _arm_refill(runtime, owner, account, *, index=5):
+    market, condition, token = _refill_identity(index)
     lp = owner.lp
     facts = lp._read_candidate_facts(dict(market_id=market, condition_id=condition, token_id=token, outcome='YES'))
     lp._candidate_pool_record_success(condition, {'condition_id': condition}, judged_at=lp._now(),
@@ -196,7 +205,7 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         assert store.lp_actions(sid) == audit
         assert state['intents'][0]['intent_id'] == original['intent_id']
         assert not state['intents'][0]['order_id']
-        marker = deepcopy(store.lp_session(sid)['interrupted_preparation'])
+        marker = deepcopy(store.lp_session(sid)['submission_owner_exit'])
         _arm_refill(runtime, owner, account)
         reads = account.position_reads
         state = owner.execution.lp_auto_run_once(round_id='new-owner-refill')
@@ -220,7 +229,7 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         _advance(runtime)
         owner.execution.refresh_lp_dashboard_snapshot()
         assert owner.execution.lp_auto_state()['slots']['occupied'] == 5
-        assert store.lp_session(sid)['interrupted_preparation'] == marker
+        assert store.lp_session(sid)['submission_owner_exit'] == marker
         owner.execution.lp_auto_run_once(round_id='after-second-restart')
         assert account.posts == account.cancels == account.market_orders == []
         assert store.lp_actions(sid) == audit
@@ -244,7 +253,7 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
 @pytest.mark.parametrize('invalid', ['session-post', 'session-post-time', 'action-unknown',
     'action-token', 'action-key', 'action-no-stage', 'independent-action', 'binding', 'duplicate-binding',
     'intent-order', 'intent-conflict'])
-def test_restart_does_not_certify_ambiguous_or_post_started_preparations(
+def test_restart_covers_dead_buy_only_with_consistent_identity(
         runtime, dead_preparation, monkeypatch, tmp_path, invalid):
     child, original, _ = dead_preparation
     _terminate_old(child)
@@ -278,12 +287,20 @@ def test_restart_does_not_certify_ambiguous_or_post_started_preparations(
     audit = deepcopy(store.lp_actions(sid))
     owner.start()
     try:
-        assert not store.lp_session(sid).get('interrupted_preparation')
         _advance(runtime)
         owner.execution.refresh_lp_dashboard_snapshot()
         current = owner.execution.lp_auto_state()
-        assert current['slots']['occupied'] >= 5
-        assert not store.lp_session(sid).get('reservation_coverage')
+        covered = invalid in {'session-post', 'session-post-time', 'action-unknown', 'action-no-stage', 'independent-action'}
+        # POST/pending labels after confirmed owner exit now use API authority;
+        # conflicting identities and independent unproven actions still block.
+        assert bool(store.lp_session(sid).get('reservation_coverage')) is covered
+        assert current['slots']['occupied'] == 4 if covered else current['slots']['occupied'] >= 5
+        if invalid == 'independent-action':
+            # API covers the original entry; independent SELL uncertainty
+            # still prevents admission without inventing another BUY slot.
+            assert current['funds']['status'] == 'unknown'
+            assert current['funds']['spendable_usd'] is None
+            assert current['admission_block_reasons']
         assert store.lp_actions(sid) == audit
         assert account.posts == account.cancels == []
     finally:
@@ -302,7 +319,7 @@ def test_recovered_preparation_still_requires_valid_unchanged_fresh_account_publ
     owner.start()
     sid = original['session_id']
     try:
-        marker = store.lp_session(sid)['interrupted_preparation']
+        marker = next(iter(store.lp_session(sid)['submission_owner_exit'].values()))
         # Match the observed review/UNKNOWN residue before invalid publication.
         session = store.lp_update_session(sid, state='review')
         owner.execution._auto_pool._record_session(original['intent_id'], session)
@@ -314,7 +331,7 @@ def test_recovered_preparation_still_requires_valid_unchanged_fresh_account_publ
         elif invalid == 'stale':
             _advance(runtime, 61)
         elif invalid == 'pre-recovery':
-            snapshot['read_started_at'] = marker['recovered_at']
+            snapshot['read_started_at'] = marker['ended_at']
         elif invalid == 'generation':
             store.lp_advance_trade_generation(store.lp_trade_generation())
         elif invalid == 'account':
@@ -351,7 +368,7 @@ def test_recovered_preparation_still_requires_valid_unchanged_fresh_account_publ
 
 
 @pytest.mark.parametrize('identity', ['registered-order', 'entry-id', 'owned-ids', 'history'])
-def test_late_durable_session_identity_invalidates_prepost_recovery_without_action_change(
+def test_api_added_session_identity_does_not_defeat_owner_ended_coverage(
         runtime, dead_preparation, monkeypatch, tmp_path, identity):
     from open_trader.polymarket_lp_accounting import ended_reservation_evidence
     child, original, _ = dead_preparation
@@ -360,7 +377,7 @@ def test_late_durable_session_identity_invalidates_prepost_recovery_without_acti
     owner.start()
     sid = original['session_id']
     try:
-        assert store.lp_session(sid)['interrupted_preparation']
+        assert store.lp_session(sid)['submission_owner_exit']
         session = store.lp_update_session(sid, state='review')
         owner.execution._auto_pool._record_session(original['intent_id'], session)
         audit = deepcopy(store.lp_actions(sid))
@@ -388,19 +405,21 @@ def test_late_durable_session_identity_invalidates_prepost_recovery_without_acti
         evidence = ended_reservation_evidence(current['intents'][original['intent_id']],
             store.lp_session(sid), audit, account_id=WALLET,
             pool_account_id=current['account_id'], read_started_at=runtime.clock[0])
-        assert evidence is None, evidence
+        # API registration may add IDs without changing the original pending
+        # action. Owner exit supplies ended-send proof independently of IDs.
+        assert evidence['basis'] == 'runtime_owner_exit', evidence
         snapshot = adapter.lp_account_snapshot_shared(max_age_seconds=0,
             trade_generation_provider=store.lp_trade_generation)
         owner.lp.register_account_snapshot(snapshot)
         state = owner.execution.lp_auto_state()
-        assert not store.lp_session(sid).get('reservation_coverage')
+        assert store.lp_session(sid).get('reservation_coverage')
         facts = owner.execution._auto_pool._read()['account_financial_facts']
         assert facts['financial_status'] == 'known'
         assert len(facts['buys']) == len(account.orders), 'Current API exposure still counts by actual ID'
         intent = next(i for i in state['intents'] if i['intent_id'] == original['intent_id'])
         assert intent['reserved_usd'] == original['reserved_usd']
         assert intent['order_id'] is None
-        assert state['funds']['status'] == 'unknown'
+        assert state['funds']['status'] == 'known'
         assert store.lp_actions(sid) == audit
         assert account.posts == account.cancels == []
     finally:
@@ -408,7 +427,7 @@ def test_late_durable_session_identity_invalidates_prepost_recovery_without_acti
 
 
 @pytest.mark.parametrize('dead_preparation', ['awaiting-receipt'], indirect=True)
-def test_dead_post_started_sender_with_lagging_preparing_action_keeps_its_hold(
+def test_dead_post_started_sender_with_lagging_preparing_action_is_covered_after_owner_exit(
         runtime, dead_preparation, monkeypatch, tmp_path):
     child, original, _ = dead_preparation
     _terminate_old(child)
@@ -423,12 +442,18 @@ def test_dead_post_started_sender_with_lagging_preparing_action_keeps_its_hold(
         _advance(runtime)
         owner.execution.refresh_lp_dashboard_snapshot()
         state = owner.execution.lp_auto_state()
-        assert state['slots']['occupied'] == 5
-        assert state['funds']['status'] == 'unknown'
-        assert not store.lp_session(sid).get('interrupted_preparation')
-        assert not store.lp_session(sid).get('reservation_coverage')
+        # Approved API-authority follow-up: dead local sender is no longer in
+        # flight. Its unknown historical venue receipt is not a permanent hold.
+        assert state['slots']['occupied'] == 4
+        assert state['funds']['status'] == 'known'
+        assert store.lp_session(sid).get('reservation_coverage')
         assert store.lp_actions(sid) == audit
         assert account.posts == account.cancels == []
+        _arm_refill(runtime, owner, account)
+        state = owner.execution.lp_auto_run_once(round_id='post-owner-exit-refill')
+        assert state['slots']['occupied'] == 5
+        assert len(account.posts) == 1
+        assert store.lp_actions(sid) == audit
     finally:
         owner.stop()
 
@@ -465,7 +490,7 @@ def test_recovery_preserves_new_submission_pause_and_configuration_fences(
             state = pending.result(timeout=5)
         assert state['last_round']['actions'][0]['reason'] == reason
         assert state['slots']['occupied'] == 4
-        assert store.lp_session(original['session_id'])['reservation_coverage']['basis'] == 'interrupted_preparation'
+        assert store.lp_session(original['session_id'])['reservation_coverage']['basis'] == 'runtime_owner_exit'
         assert account.posts == account.cancels == []
     finally:
         release.set()

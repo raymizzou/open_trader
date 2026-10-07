@@ -347,36 +347,87 @@ def build_account_financial_facts(
     return result
 
 
-def interrupted_preparation_entry(intent, session, actions):
-    """Exact pre-POST registration, without deriving anything from missing IDs."""
-    if (intent.get('state') not in {'reserved', 'sending', 'unknown'}
-            or intent.get('order_id') or intent.get('order_identity_conflict')
-            or session.get('idempotency_key') != 'lp-auto:' + str(intent.get('intent_id') or '')
-            or session.get('session_id') != intent.get('session_id')
-            or any(session.get(key) != intent.get(key) or not intent.get(key)
-                   for key in ('token_id', 'condition_id', 'market_id', 'outcome'))
-            or session.get('entry_order_id') or session.get('owned_order_ids') or session.get('order_history')
-            or session.get('order_identity_conflict') or len(actions) != 1):
-        return None
-    entry = actions[0]
-    if (entry.get('action_key') != str(session['session_id']) + ':entry-submit'
-            or entry.get('state') != 'pending' or entry.get('role') != 'entry'
-            or entry.get('side') != 'BUY' or entry.get('token_id') != intent['token_id']
-            or entry.get('order_id') or entry.get('submit_stage') != 'preparing'
-            or entry.get('post_started') is not False or not entry.get('submit_requested_at')
-            or has_independent_unresolved_action(session, actions)):
-        return None
-    for row in (session, entry):
-        if (row.get('post_started') is not None and row.get('post_started') is not False
-                or row.get('submit_stage') not in {None, 'preparing'}
-                or any(row.get(key) for key in ('submit_post_started_at', 'submit_finished_at', 'submit_receipt_at'))
-                or row.get('submit_status') not in {None, 'pending', 'unknown'}):
-            return None
-    return entry
-
-
-def preparation_action_fingerprint(action):
+def submission_action_fingerprint(action):
     return hashlib.sha256(json.dumps(action, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def buy_attempt_identity(action):
+    return [action.get(key) for key in ('action_id', 'action_key', 'role', 'side', 'token_id',
+                                      'created_at', 'submit_requested_at')]
+
+
+_CANCEL_OPERATIONS = frozenset({'cancel', 'entry-cancel', 'passive-cancel', 'passive_exit-cancel',
+    'augment-cancel', 'owned-cancel', 'owned-sell-cancel-cancel', 'reconciliation-cancel',
+    'entry-protection-cancel', 'first-seen-protection-cancel'})
+_CANCEL_ROLES = _CANCEL_OPERATIONS | {'owned-sell-cancel', 'reconciliation_cancel', 'passive_exit_cancel', 'owned_sell_cancel'}
+
+
+def submission_action_kind(action):
+    """Producer role/operation; user idempotency suffixes are never operation tags."""
+    role = str(action.get('role') or '')
+    prefix = str(action.get('session_id') or '') + ':'
+    key = str(action.get('action_key') or '')
+    operation = key[len(prefix):].partition(':')[0] if key.startswith(prefix) else ''
+    if key in _CANCEL_OPERATIONS:  # Legacy bare operation, never a user suffix.
+        operation = key
+    if role in _CANCEL_ROLES:
+        return 'cancel'
+    # Owned-cancel producers reuse entry/passive_exit as the target's role.
+    if role in {'', 'entry', 'passive_exit'} and operation in _CANCEL_OPERATIONS:
+        return 'cancel'
+    if role:
+        return role
+    return {'entry-submit': 'entry', 'augment-submit': 'augment'}.get(operation, '')
+
+
+def unresolved_buy_action(action):
+    return (action.get('side') == 'BUY' and submission_action_kind(action) != 'cancel'
+        and (action.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
+             or action.get('state') == 'accepted' and not action.get('order_id')))
+
+
+def submission_owner_identity(session):
+    return [session.get(key) for key in ('session_id', 'idempotency_key', 'account_id',
+        'wallet_address', 'token_id', 'condition_id', 'market_id', 'outcome',
+        'submit_requested_at', 'post_started', 'submit_post_started_at')]
+
+
+def ended_buy_action_evidence(session, action, *, read_started_at):
+    """Local completion or owner exit; neither is a venue outcome."""
+    if (session.get('order_identity_conflict') or action.get('side') != 'BUY'
+            or not action.get('token_id') or action.get('token_id') != session.get('token_id')):
+        return None
+    marker = (session.get('submission_owner_exit') or {}).get(str(action.get('action_id')))
+    if (isinstance(marker, Mapping) and marker.get('session_identity') == submission_owner_identity(session)
+            and marker.get('action_fingerprint') == submission_action_fingerprint(action)):
+        try:
+            stamp = _timestamp(marker.get('ended_at'), name='owner_ended_at')
+        except ValueError:
+            return None
+        if stamp < read_started_at:
+            return {'request_finished_at': stamp.isoformat(), 'basis': 'runtime_owner_exit'}
+    if (action.get('state') not in {'unknown', 'rejected', 'accepted', 'accepted_without_order_id'}
+            or action.get('submit_stage') in {'preparing', 'sending'}):
+        return None
+    try:
+        raw = action.get('submit_finished_at') or action.get('submit_receipt_at')
+        stamp = _timestamp(raw or action.get('updated_at'), name='submit_finished_at')
+        requested = (_timestamp(action['submit_requested_at'], name='submit_requested_at')
+                     if action.get('submit_requested_at') else stamp)
+        if action.get('submit_post_started_at') and _timestamp(action['submit_post_started_at'], name='post_started_at') > stamp:
+            return None
+    except ValueError:
+        return None
+    if requested <= stamp < read_started_at:
+        return {'request_finished_at': stamp.isoformat(), 'basis': 'ended_send' if raw else 'legacy_finished_action'}
+    return None
+
+
+def buy_action_is_covered(session, action):
+    marker = (session.get('account_action_coverage') or {}).get(str(action.get('action_id')))
+    return (isinstance(marker, Mapping) and action.get('side') == 'BUY'
+        and marker.get('attempt_identity') == buy_attempt_identity(action)
+        and reservation_is_covered({**session, 'reservation_coverage': marker}))
 
 
 def ended_reservation_evidence(intent, session, actions, *, account_id, pool_account_id, read_started_at):
@@ -392,37 +443,20 @@ def ended_reservation_evidence(intent, session, actions, *, account_id, pool_acc
         return None
     if pool_account_id != hashlib.sha256(account_id.encode()).hexdigest():
         return None
-    recovery = session.get('interrupted_preparation')
-    if isinstance(recovery, Mapping) and recovery.get('basis') == 'runtime_owner_handoff_pre_post':
-        entries = [a for a in actions if a.get('action_key') == str(session.get('session_id')) + ':entry-submit']
-        if (recovery.get('intent_id') == intent.get('intent_id')
-                and not intent.get('order_id') and not intent.get('order_identity_conflict')
-                and session.get('idempotency_key') == 'lp-auto:' + str(intent.get('intent_id') or '')
-                and session.get('session_id') == intent.get('session_id')
-                and all(session.get(key) == intent.get(key) and intent.get(key)
-                        for key in ('token_id', 'condition_id', 'market_id', 'outcome'))
-                and len(entries) == 1 and entries[0].get('token_id') == intent.get('token_id')
-                and preparation_action_fingerprint(entries[0]) == recovery.get('action_fingerprint')
-                and not session.get('order_identity_conflict')
-                and not session.get('entry_order_id')
-                and not session.get('owned_order_ids') and not session.get('order_history')
-                and session.get('post_started') in (None, False)
-                and session.get('submit_stage') in (None, 'preparing')
-                and not session.get('submit_post_started_at')
-                and not session.get('submit_finished_at') and not session.get('submit_receipt_at')
-                and session.get('submit_status') in {None, 'pending', 'unknown'}
-                and not has_independent_unresolved_action(session, actions)):
-            try:
-                stamp = _timestamp(recovery.get('recovered_at'), name='recovered_at')
-                requested = _timestamp(entries[0].get('submit_requested_at'), name='submit_requested_at')
-            except ValueError:
-                return None
-            if requested <= stamp < read_started_at:
-                return {'request_finished_at': stamp.isoformat(), 'basis': 'interrupted_preparation'}
+    entry = next((a for a in actions if submission_action_kind(a) == 'entry'
+                  and a.get('action_key') == str(session.get('session_id')) + ':entry-submit'), None)
+    if (entry and not intent.get('order_identity_conflict')
+            and (not intent.get('order_id') or intent['order_id'] in
+                 set(session.get('owned_order_ids') or ()) | set(session.get('order_history') or ()) | {session.get('entry_order_id')})
+            and session.get('idempotency_key') == 'lp-auto:' + str(intent.get('intent_id') or '')
+            and all(session.get(key) == intent.get(key) and intent.get(key)
+                    for key in ('token_id', 'condition_id', 'market_id', 'outcome'))):
+        evidence = ended_buy_action_evidence(session, entry, read_started_at=read_started_at)
+        if evidence:
+            return evidence
     if intent.get('state') == 'reserved':
         return None
-    entries = [action for action in actions if action.get('role') == 'entry'
-               or str(action.get('action_key') or '').endswith('entry-submit')]
+    entries = [action for action in actions if submission_action_kind(action) == 'entry']
     if any(action.get('state') == 'pending' for action in entries):
         return None
     if session.get('submit_stage') in {'preparing', 'sending'}:
@@ -483,11 +517,14 @@ def has_independent_unresolved_action(session, actions) -> bool:
            for key in ('passive_exit_attempt_state', 'protected_exit_attempt_state')):
         return True
     for action in actions:
-        if action.get('role') == 'entry' or str(action.get('action_key') or '').endswith('entry-submit'):
+        if buy_action_is_covered(session, action):
+            continue
+        kind = submission_action_kind(action)
+        if kind == 'entry':
             continue
         if (action.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
                 or action.get('state') == 'accepted' and action.get('side') in {'BUY', 'SELL'}
-                and not action.get('order_id') and 'cancel' not in str(action.get('action_key') or '')):
+                and not action.get('order_id') and kind != 'cancel'):
             return True
     return False
 
@@ -498,10 +535,13 @@ def can_resume_covered_management(session, actions, facts) -> bool:
     Account ownership can prove exposure without resolving which request made
     it. Stop decisions, exit uncertainty and unrelated attention remain intact.
     """
+    owner_ended = (session.get('reservation_coverage') or {}).get('basis') == 'runtime_owner_exit'
     if (not reservation_is_released(session, facts.get('account_id'))
             or facts.get('financial_status') != 'known'
-            or session.get('state') not in {'needs_attention', 'entry_submit_pending'}
-            or session.get('submit_status') not in {'unknown', 'accepted_without_order_id'}
+            or session.get('state') not in ({'needs_attention', 'entry_submit_pending', 'review'} if owner_ended
+                                           else {'needs_attention', 'entry_submit_pending'})
+            or session.get('submit_status') not in ({None, 'pending', 'unknown', 'accepted_without_order_id'} if owner_ended
+                                                  else {'unknown', 'accepted_without_order_id'})
             or session.get('resume_state') not in {None, '', 'entry_submit_pending'}):
         return False
     if any(session.get(key) for key in ('stop_requested', 'stop_loss_latched',
@@ -519,12 +559,13 @@ def can_resume_covered_management(session, actions, facts) -> bool:
            for row in history.values()):
         return False
     own_ids = set(history) | set(session.get('owned_order_ids') or ())
-    if not own_ids:
+    token = str(session.get('token_id') or '')
+    inventory = account_position_quantity(facts, token) > ZERO
+    if not own_ids and not (owner_ended and inventory):
         return False
     active_buy = any(buy.get('session_id') == session.get('session_id')
         and buy.get('order_id') in own_ids and buy.get('state') == 'active' for buy in facts.get('buys', ()))
-    token = str(session.get('token_id') or '')
-    return active_buy or account_position_quantity(facts, token) > ZERO
+    return active_buy or inventory
 
 
 def account_cancel_is_pending(session, actions, order_id: str) -> bool:
@@ -535,7 +576,7 @@ def account_cancel_is_pending(session, actions, order_id: str) -> bool:
            for key in ('augment_cancel_requested', 'owned_cancel_requested')):
         return True
     return any(action.get('state') in {'pending', 'unknown', 'accepted'}
-        and ('cancel' in str(action.get('action_key') or '') or 'cancel' in str(action.get('role') or ''))
+        and submission_action_kind(action) == 'cancel'
         and (str(action.get('order_id') or '') == order_id
              or order_id in {str(value) for value in _items(action.get('targets'))})
         for action in actions)

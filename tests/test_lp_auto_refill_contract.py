@@ -658,7 +658,7 @@ def test_invalid_api_facts_do_not_replace_unknown_exact_id_holds(runtime, invali
     assert account.posts == account.cancels == []
 
 
-@pytest.mark.parametrize('mismatch', ['order', 'token', 'side', 'missing-order', 'missing-token', 'submission-unknown', 'sending'])
+@pytest.mark.parametrize('mismatch', ['order', 'token', 'side', 'missing-order', 'missing-token'])
 def test_unmatched_unknown_receipt_keeps_full_budget_and_slot(runtime, mismatch):
     _, _, _, _, execution, _, originals = _historical_api_buy_intents(runtime)
     def mismatch_one(d):
@@ -669,17 +669,37 @@ def test_unmatched_unknown_receipt_keeps_full_budget_and_slot(runtime, mismatch)
             intent['token_id'] = _refill_identity(2)[2]
         elif mismatch == 'side':
             intent['side'] = 'SELL'
-        elif mismatch in ('submission-unknown', 'sending'):
-            intent.update(state='unknown' if mismatch == 'submission-unknown' else 'sending', submission_unknown=True)
         else:
             intent['order_id' if mismatch == 'missing-order' else 'token_id'] = None
     execution._auto_pool._update(mismatch_one)
     state = execution.lp_auto_state()
     assert state['slots']['occupied'] == 4
     assert Decimal(state['funds']['buy_reserved_usd']) == 32
-    assert Decimal(state['funds']['spendable_usd']) == 8
+    if mismatch == 'missing-token':
+        assert state['funds']['spendable_usd'] is None
+        assert 'unbounded_financial_uncertainty' in state['admission_block_reasons']
+    else:
+        assert Decimal(state['funds']['spendable_usd']) == 8
     assert state['funds']['status'] == 'unknown'
     assert next(i for i in state['intents'] if i['intent_id'] == originals[0]['intent_id'])['financial_status'] == 'unknown'
+
+
+@pytest.mark.parametrize('lifecycle', ['unknown', 'sending'])
+def test_matching_api_buy_deduplicates_unknown_submission_lifecycle(runtime, lifecycle):
+    store, _, account, _, execution, _, originals = _historical_api_buy_intents(runtime)
+    execution._auto_pool._update(lambda d: d['intents'][originals[0]['intent_id']].update(
+        state=lifecycle, submission_unknown=True))
+    audit = execution.lp_auto_state()['intents']
+    actions = store.lp_actions(originals[0]['session_id'])
+    state = execution.lp_auto_state()
+    assert state['slots']['occupied'] == 3
+    assert Decimal(state['funds']['buy_reserved_usd']) == 24
+    assert Decimal(state['funds']['spendable_usd']) == 16
+    assert state['funds']['status'] == 'known'
+    assert not state['admission_block_reasons']
+    assert state['intents'] == audit
+    assert store.lp_actions(originals[0]['session_id']) == actions
+    assert account.posts == account.cancels == []
 
 
 @pytest.mark.parametrize('side, action_state', [('BUY', 'unknown'), ('BUY', 'pending'),
@@ -689,15 +709,16 @@ def test_matching_api_buy_keeps_independent_unresolved_action_risk(runtime, side
     original = originals[0]
     store.lp_upsert_action(original['session_id'], f"{original['session_id']}:extra-submit",
         state=action_state, payload={'role': 'augment' if side == 'BUY' else 'passive_exit',
-            'side': side, 'token_id': original['token_id'], 'quantity': '20'})
+            'side': side, 'token_id': original['token_id'], 'quantity': '20', 'price': '.40',
+            'submit_stage': 'sending' if side == 'BUY' else None})
     audit_intents = execution.lp_auto_state()['intents']
     audit_actions = store.lp_actions(original['session_id'])
     _advance(runtime)
     assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
     state = execution.lp_auto_state()
-    # A pending extra BUY invalidates account admission itself, retaining both
-    # historical holds. Ended/SELL uncertainty still retains its entire hold.
-    expected = 5 if side == 'BUY' and action_state == 'pending' else 4
+    # Count the represented original BUY once; separate the genuinely
+    # unfinished BUY risk, or preserve SELL admission uncertainty alone.
+    expected = 4 if side == 'BUY' else 3
     assert state['slots']['occupied'] == expected
     assert Decimal(state['funds']['buy_reserved_usd']) == 8 * expected
     assert state['funds']['status'] == 'unknown'
@@ -784,20 +805,25 @@ def test_known_matching_intent_with_accepted_idless_extra_action_blocks_new_buys
     original = originals[0]
     store.lp_upsert_action(original['session_id'], f"{original['session_id']}:accepted-extra-submit",
         state='accepted', payload={'role': 'augment' if side == 'BUY' else 'passive_exit',
-            'side': side, 'token_id': original['token_id'], 'quantity': '200'})
+            'side': side, 'token_id': original['token_id'], 'quantity': '200',
+            'submit_stage': 'sending' if side == 'BUY' else None})
     _advance(runtime)
     assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
     execution._auto_pool._update(lambda d: d['intents'][original['intent_id']].update(financial_status='known'))
     audit_intents = execution.lp_auto_state()['intents']
     audit_actions = store.lp_actions(original['session_id'])
     facts, _, reasons = execution._auto_pool._account_projection_facts(execution._auto_pool._read())
-    assert facts['financial_status'] == 'known' and not reasons
+    if side == 'BUY':
+        assert facts['financial_status'] == 'unknown'
+        assert 'account_send_inflight' in reasons
+    else:
+        assert facts['financial_status'] == 'known' and not reasons
     assert facts['trade_generation'] == store.lp_trade_generation()
     state = execution.lp_auto_state()
     assert state['funds']['status'] == 'unknown'
     assert state['funds']['spendable_usd'] is None
     assert 'unbounded_financial_uncertainty' in state['admission_block_reasons']
-    assert state['slots']['occupied'] == 4
+    assert state['slots']['occupied'] == (4 if side == 'BUY' else 3)
     assert state['intents'] == audit_intents
     state = execution.lp_auto_run_once(round_id=f'known-idless-extra-{side}')
     assert 'unbounded_financial_uncertainty' in state['admission_block_reasons']

@@ -751,11 +751,11 @@ class PredictionRuntime:
             if not self._n_leg_paused:
                 self.solver_server = self._solver_server_factory()
             self.store = PredictionArbitrageStore(self._data_dir)
-            # Exclusive ownership proves the preceding sender has exited.
+            # Prior ownership ends only after local senders drain or process exit.
             # Run before constructing LP/execution or starting any send lane.
-            recover_preparations = getattr(self.store, 'lp_recover_interrupted_preparations', None)
-            if callable(recover_preparations):
-                recover_preparations()
+            recover_submissions = getattr(self.store, 'lp_recover_interrupted_submissions', None)
+            if callable(recover_submissions):
+                recover_submissions()
             # #104: idempotent startup seed; failures are logged inside and
             # never block startup.
             if not self._n_leg_paused and ensure_same_event_same_venue_scope(self.store):
@@ -2011,6 +2011,11 @@ class PredictionRuntime:
     def _cleanup_resources(self) -> list[BaseException]:
         errors: list[BaseException] = []
         uncertain_thread = False
+        # An HTTP handler can retain execution/LP references during STOPPING.
+        # Close admission before checking lanes, including queued manual sends.
+        set_mutation_guard = getattr(self.lp, 'set_mutation_guard', None)
+        if callable(set_mutation_guard):
+            set_mutation_guard(lambda *args: False)
         self._reward_stop_event.set()
         self._lp_share_stop_event.set()
         self._history_stop_event.set()
@@ -2192,6 +2197,13 @@ class PredictionRuntime:
         if self._lp_auto_scheduler is not None:
             # A pending exchange read/send still owns these collaborators.
             return errors
+        drain_submissions = getattr(self.lp, 'drain_submissions', None)
+        if callable(drain_submissions):
+            try:
+                drain_submissions(timeout=5)
+            except RuntimeError as exc:
+                errors.append(exc)
+                return errors  # Keep collaborators and owner for a later stop.
         for resource in (
             ("n_leg_shadow", self.n_leg_shadow),
             ("solver_server", self.solver_server),
