@@ -285,24 +285,16 @@ local verification, known limits, unverified work and pending remote CI in the P
 If push or Draft PR authorization is absent, report the exact pending boundary
 and retain the prepared result; implementation approval does not imply publication.
 
-### Parallel post-publication reviews
+### Parallel post-publication review and CI
 
-Immediately after publication, start DoTs and a distinct independent Herdr
+Immediately after publication, start a distinct independent Herdr
 GLM-5.3/max reviewer pane alongside remote CI. Keep the pre-push independent review.
-Give each reviewer the issue requirements, repository/worktree, PR URL, immutable
+Give the reviewer the issue requirements, repository/worktree, PR URL, immutable
 published head/base SHAs, applicable checks and verification limits. Review
 `git diff <base>...<head>` against that scope. Record actual startup evidence;
 opening the PR or issuing a launch command does not prove review started.
-Track DoTs, GLM and CI separately. A changed head or base requires refreshed
+Track GLM review and CI separately. A changed head or base requires refreshed
 applicable reviews and CI; an old review comment is not evidence for a new SHA.
-
-**DoTs prerequisite:** verify its concrete identity and review entrypoint from
-authoritative configuration or documentation, including Draft PR support and
-automatic trigger conditions. If Draft PRs do not trigger it automatically, use
-only a verified, explicitly authorized trigger. Record the trigger, PR/head/base
-and observed review start. If the identity, Draft support, trigger authority or
-startup is unavailable, report DoTs as blocked with the missing prerequisite and
-owner; do not invent a command or treat GLM as its replacement.
 
 **GLM prerequisite:** verify the local Herdr installation/help, an available pane
 at its shell prompt, and a Codex `glm-review` profile configured for the verified
@@ -341,26 +333,36 @@ failure or incomplete handoff is blocked, not a completed review. After verified
 comment delivery and accepted handoff, a reviewer with no exclusive pending task
 can finish without waiting for merge.
 
-**Operational evidence limit (2026-10-09):** the available issue/repository
-configuration has no verified DoTs identity or entrypoint; owner clarification is
-pending. Main's separate machine-local CLI smoke check reached `glm-5.3` through
-the `glm-review` profile/provider with max reasoning. That proves CLI connection
-only, not a Herdr reviewer pane or a PR review. Actual authorized first-PR timing,
-DoTs startup and GLM PR-comment/handoff evidence remain pending. These rules do
-not claim that those delivery steps have occurred.
+Keep per-head delivery evidence in the PR and durable handoff record. A CLI
+connection check alone does not prove a reviewer pane started or a PR review was
+delivered. Old-head review and CI evidence does not transfer to an updated head;
+refresh applicable evidence when the head or base changes.
 
 ### Feedback, CI and conflict repair
 
-After every PR update push, and before requesting or executing an authorized
-merge, Main fetches the latest PR head/base, review submissions, inline review
-threads, conversation comments, CI and mergeability. Paginate every response
+After every PR update (including pushes), and before requesting or executing an
+authorized merge, Main freshly fetches the latest PR/head/base, all review
+submissions, inline review threads, conversation comments, and relevant CI and
+mergeability. This feedback check covers every source of review feedback.
+Paginate every response
 collection, including nested thread comments; incomplete reads are not a complete
 feedback check. Record the retrieval time and identities. Assess historical
 comments against current code rather than relying on an earlier summary.
 
-For each finding, record its URL, severity or blocking status, disposition and
-owner. Outdated lines, changed code, green CI and old summaries do not establish
-resolution. For valid in-scope blockers: diagnose, repair with the assigned worker,
+Record each thread's current resolved/unresolved state explicitly. Comments and
+review submissions without a resolved flag need an explicit disposition and owner.
+Assess the actual outstanding feedback on the latest head. List still-unresolved
+threads and comments with URL, current status, blocking decision and owner; include
+severity and repair evidence where applicable. Report a repaired thread as still
+open unless a fresh read confirms it is resolved. Outdated markers, changed code,
+green CI and old summaries cannot establish resolution or the absence of unresolved
+feedback. Do not automatically resolve or dismiss feedback to manufacture
+completion; this procedure grants no resolution or dismissal authority. Report
+advisory items with their nonblocking decision and owner at handoff; they need not
+disappear for review-ready status. Valid unresolved blockers prevent claiming
+review-ready.
+
+For valid in-scope blockers: diagnose, repair with the assigned worker,
 run affected checks, obtain independent review, publish the reviewed update when
 authorized, and refresh applicable review/CI evidence. Follow the existing rebase
 rules when the base advances; preserve other workers' commits and test intent.
@@ -379,7 +381,7 @@ publication for polish.
 
 A review-ready handoff requires successful current applicable push-head and
 PR-merge `required` checks from GitHub Actions (app ID 15368), completed required
-pre-push/DoTs/GLM reviews, no known unresolved blockers, and fresh feedback and
+pre-push and GLM reviews, no known unresolved blockers, and fresh feedback and
 mergeability checks. Record the PR head/base, synthetic merge SHA and Actions
 run/check identities; see [CI identity](ci.md). Unknown, pending, cancelled, failed
 or mismatched evidence is not success. A base/head change invalidates applicable
@@ -397,13 +399,13 @@ evidence. Existing deployment and cleanup rules remain unchanged.
 
 ### Worker lifecycle
 
-After DoTs review, assess each development worker's remaining duties. End only a
-worker whose work is saved and committed or durably handed off, whose exclusive
-fixes, CI problems, conflicts and monitoring are complete or accepted by a named
-new owner, and whose handoff is recorded. Preserve all workers' saved work and
-commits. Retain Main's delivery ownership until the stopping condition above.
-If DoTs is blocked, record the blocker rather than claiming this review milestone
-has occurred. A worker ending does not mean the PR is complete.
+Assess each development worker's assigned review/repair work and remaining duties.
+End only a worker whose work is saved and committed or durably handed off, whose
+assigned review/repair work and exclusive fixes, CI problems, conflicts and
+monitoring are complete or accepted by a named new owner, and whose handoff is
+recorded. Preserve all workers' saved work and commits. Retain Main's delivery
+ownership until the stopping condition above. A worker ending does not mean the
+PR is complete.
 
 Ending a session is separate from deleting a worktree or branch. Deletion still
 requires GitHub merge, user confirmation and a clean worktree under
@@ -420,10 +422,10 @@ Task/approved scope; delivery owner; publication/reply authority:
 PR URL; immutable head/base; synthetic merge SHA; Actions run/check IDs/URLs:
 Local focused/security checks: command, environment, identity, result, limits:
 Independent pre-push review: staged tree/identity, reviewer, result/evidence:
-DoTs: verified identity/trigger authority, trigger, status, PR/head/base, evidence:
 GLM: pane, actual model/reasoning/profile/provider, status, PR/head/base:
 GLM comment: URL, verified author/body/identities, Main's accepted handoff:
-Feedback: retrieval time, paginated collections, URL, severity/blocking, status/owner:
+Feedback: retrieval time, latest PR/head/base, complete paginated collections:
+Threads/comments: URL, resolved/unresolved state or disposition, blocking decision/owner:
 Repairs: fix commits, checks, independent review, update/reply evidence:
 CI: push-head and PR-merge required/app 15368 results; mergeability check/time:
 Pending decisions/blockers; next action and owner; monitoring stop reason:
@@ -435,7 +437,7 @@ Workers: saved work, exclusive duties/new owner, accepted handoff, lifecycle sta
 The delivery path is isolated branch/worktree from freshly fetched
 `origin/main` → focused local development checks → staged independent review
 (including a dated `CHANGELOG.md` entry) → prompt authorized branch push/Draft PR
-→ parallel DoTs, GLM review and CI → feedback/repair loop → review-ready handoff
+→ parallel GLM review and CI → feedback/repair loop → review-ready handoff
 → explicit user approval → GitHub merge. Follow the
 [delivery procedure](#authorized-pr-delivery-loop). Local `main` is
 only a synchronized copy of GitHub `main`, never an integration or repair path.

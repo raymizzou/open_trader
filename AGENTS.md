@@ -150,15 +150,19 @@ passes applicable focused/security checks and independent staged review, with
 first-publication blockers repaired. Do not delay it for nonblocking polish,
 unneeded local full suites, or remote CI completion. Report missing publication
 authorization and record unverified work in the PR when publication is authorized.
-Immediately start DoTs and a separate Herdr GLM-5.3/max reviewer pane alongside
-CI; verify actual startup and keep their status separate. Pin issue scope, PR
+Immediately start a separate Herdr GLM-5.3/max reviewer pane alongside
+CI; verify actual startup and keep review and CI status separate. Pin issue scope, PR
 URL, head/base SHAs and verification; unavailable prerequisites are blockers,
 not completed reviews. Follow the
 [authorized PR delivery loop](docs/operations/agent-verification.md#authorized-pr-delivery-loop)
 for reviewer comment authority, feedback repairs and worker handoff.
-Main remains the delivery owner, refreshes all feedback after update pushes and
-before merge requests/actions, and retains ownership until the defined handoff
-or recorded stopping condition. Review-ready handoff requires completed required
+Main remains the delivery owner. After every PR update (including pushes) and
+before requesting or executing an authorized merge, freshly fetch all reviews,
+inline threads and conversation comments against the latest PR/head/base, with
+complete pagination and fresh CI/mergeability. Record thread resolved/unresolved
+state and comment dispositions; report outstanding feedback with URL, blocking
+decision and owner. Keep ownership until the defined handoff or recorded stopping
+condition. Review-ready handoff requires completed required
 reviews, no known unresolved blockers, fresh feedback/mergeability checks and
 successful applicable push-head and PR-merge `required` checks from GitHub Actions
 (app ID 15368). Then obtain explicit user approval
@@ -176,9 +180,9 @@ merge SHA substitute for trusted main-push CI evidence on the selected final Git
 
 Screenshots are optional unless requested. Clean up only after GitHub merge,
 user confirmation, and a clean worktree; never delete a dirty worktree.
-Ending a worker session is separate from deleting its worktree or branch. After
-DoTs review, end development workers only with saved work, no exclusive pending
-responsibilities or an accepted handoff, and a recorded owner for remaining work;
+Ending a worker session is separate from deleting its worktree or branch. End
+development workers only with saved work, completed assigned review/repair work
+or an accepted handoff, and a recorded owner for remaining responsibilities;
 see [worker lifecycle](docs/operations/agent-verification.md#worker-lifecycle).
 
 ## Agent skills
