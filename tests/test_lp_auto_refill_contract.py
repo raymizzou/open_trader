@@ -716,19 +716,38 @@ def test_matching_api_buy_keeps_independent_unresolved_action_risk(runtime, side
     _advance(runtime)
     assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
     state = execution.lp_auto_state()
-    # Count the represented original BUY once; separate the genuinely
-    # unfinished BUY risk, or preserve SELL admission uncertainty alone.
+    # Count the represented original BUY once. An independent BUY blocks;
+    # SELL retains its audit without reserving BUY capital or quota.
     expected = 4 if side == 'BUY' else 3
     assert state['slots']['occupied'] == expected
     assert Decimal(state['funds']['buy_reserved_usd']) == 8 * expected
-    assert state['funds']['status'] == 'unknown'
     assert state['intents'] == audit_intents
     assert store.lp_actions(original['session_id']) == audit_actions
-    assert state['admission_block_reasons']
-    assert state['funds']['spendable_usd'] is None
-    execution.lp_auto_run_once(round_id=f'independent-{side}-{action_state}')
-    assert account.posts == account.cancels == []
+    if side == 'BUY':
+        assert state['funds']['status'] == 'unknown'
+        assert state['admission_block_reasons']
+        assert state['funds']['spendable_usd'] is None
+    else:
+        assert state['funds']['status'] == 'known'
+        assert Decimal(state['funds']['spendable_usd']) == 16
+        assert Decimal(state['funds']['inventory_cost_usd']) == 0
+        assert not state['admission_block_reasons']
     assert not next(i for i in state['intents'] if i['intent_id'] == original['intent_id']).get('reservation_coverage')
+    state = execution.lp_auto_run_once(round_id=f'independent-{side}-{action_state}')
+    if side == 'BUY':
+        assert account.posts == account.cancels == []
+    else:
+        assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (4, 5)], state['last_round']
+        assert all(p.side == 'BUY' for p in account.posts)
+        assert account.cancels == []
+        assert state['slots']['occupied'] == 5
+        assert Decimal(state['funds']['buy_reserved_usd']) == 40
+        assert Decimal(state['funds']['spendable_usd']) == 0
+        assert state['funds']['status'] == 'known'
+        assert not state['admission_block_reasons']
+    original_ids = {i['intent_id'] for i in audit_intents}
+    assert [i for i in state['intents'] if i['intent_id'] in original_ids] == audit_intents
+    assert store.lp_actions(original['session_id']) == audit_actions
 
 
 @pytest.mark.parametrize('invalid', ['incomplete', 'failed'])
@@ -820,16 +839,34 @@ def test_known_matching_intent_with_accepted_idless_extra_action_blocks_new_buys
         assert facts['financial_status'] == 'known' and not reasons
     assert facts['trade_generation'] == store.lp_trade_generation()
     state = execution.lp_auto_state()
-    assert state['funds']['status'] == 'unknown'
-    assert state['funds']['spendable_usd'] is None
-    assert 'unbounded_financial_uncertainty' in state['admission_block_reasons']
+    if side == 'BUY':
+        assert state['funds']['status'] == 'unknown'
+        assert state['funds']['spendable_usd'] is None
+        assert 'unbounded_financial_uncertainty' in state['admission_block_reasons']
+    else:
+        assert state['funds']['status'] == 'known'
+        assert Decimal(state['funds']['buy_reserved_usd']) == 24
+        assert Decimal(state['funds']['spendable_usd']) == 16
+        assert Decimal(state['funds']['inventory_cost_usd']) == 0
+        assert not state['admission_block_reasons']
     assert state['slots']['occupied'] == (4 if side == 'BUY' else 3)
     assert state['intents'] == audit_intents
     state = execution.lp_auto_run_once(round_id=f'known-idless-extra-{side}')
-    assert 'unbounded_financial_uncertainty' in state['admission_block_reasons']
-    assert state['funds']['spendable_usd'] is None
-    assert account.posts == account.cancels == []
-    assert state['intents'] == audit_intents
+    if side == 'BUY':
+        assert 'unbounded_financial_uncertainty' in state['admission_block_reasons']
+        assert state['funds']['spendable_usd'] is None
+        assert account.posts == account.cancels == []
+    else:
+        assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (4, 5)], state['last_round']
+        assert all(p.side == 'BUY' for p in account.posts)
+        assert account.cancels == []
+        assert state['slots']['occupied'] == 5
+        assert Decimal(state['funds']['buy_reserved_usd']) == 40
+        assert Decimal(state['funds']['spendable_usd']) == 0
+        assert state['funds']['status'] == 'known'
+        assert not state['admission_block_reasons']
+    original_ids = {i['intent_id'] for i in audit_intents}
+    assert [i for i in state['intents'] if i['intent_id'] in original_ids] == audit_intents
     assert store.lp_actions(original['session_id']) == audit_actions
 
 

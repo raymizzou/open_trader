@@ -21,7 +21,11 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Mapping
 
-from .polymarket_lp_accounting import account_position_quantity, default_account_pool_document, has_independent_unresolved_action, reservation_is_covered, reservation_is_manually_released, reservation_is_released, submission_action_kind
+from .polymarket_lp_accounting import (account_position_quantity,
+    default_account_pool_document, has_independent_unresolved_action,
+    has_independent_unresolved_buy_action, reservation_is_covered,
+    reservation_is_manually_released, reservation_is_released,
+    submission_action_kind)
 from .polymarket_lp_risk import (
     TERMINAL_ORDER_STATES, _account_after_reservations, _decimal as _money, _freshness, _levels,
     _maybe_decimal, _timestamp, evaluate_lp_entry, minimum_order_estimate,
@@ -51,7 +55,8 @@ history_identity_mismatch event_in_progress event_recovery_pending event_start_t
 event_end_time_in_future post_event_screening_unknown market_read_capacity market_read_timeout market_read_cooling_down
 market_read_in_progress event_timing_unknown event_starting_soon event_status_unknown
 book_freshness_invalid account_freshness_invalid stress_loss_exceeded history_latest_refresh_failed
-history_time_unknown history_amplitude_unknown ranking_freshness_invalid ranking_freshness_stale'''.split())
+history_time_unknown history_amplitude_unknown ranking_freshness_invalid ranking_freshness_stale
+bid_level_invalid second_bid_insufficient candidate_bid_level_changed'''.split())
 
 
 def _candidate_filter_reasons(diagnostics, codes, *, field='reasons'):
@@ -194,7 +199,9 @@ class LPAutoPool:
     def _read(self):
         with self.store._read_connection() as c:
             row=c.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
-            return json.loads(row[0]) if row else self._default()
+            document = json.loads(row[0]) if row else self._default()
+            document.setdefault('buy_price_level', 1)
+            return document
 
     def _update(self, fn, *, connection=None):
         # ponytail: one SQLite document serializes this single-account MVP;
@@ -202,6 +209,7 @@ class LPAutoPool:
         with (self.store._transaction() if connection is None else nullcontext(connection)) as c:
             row = c.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
             d = json.loads(row[0]) if row else self._default()
+            d.setdefault('buy_price_level', 1)
             result = fn(d)
             c.execute('INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?) '
                       'ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload',
@@ -356,7 +364,7 @@ class LPAutoPool:
             if represented and intent.get('side', 'BUY') == 'BUY':
                 session = self.store.lp_session(intent['session_id'])
                 actions = self.store.lp_actions(intent['session_id'])
-                independent = session is not None and has_independent_unresolved_action(session, actions)
+                independent = session is not None and has_independent_unresolved_buy_action(session, actions)
                 independent_unknown = independent_unknown or independent
                 represented = (session is not None and not session.get('order_identity_conflict')
                     and not intent.get('order_identity_conflict')
@@ -379,7 +387,6 @@ class LPAutoPool:
             account_valid=account is not None and not set(account_reasons)-{'account_send_inflight'})
         if account is not None:
             intents += account.get('pending_buy_actions') or []
-            independent_unknown |= bool(account.get('independent_sell_unknown'))
         occupied = [i for i in intents if i['state'] not in ('terminal','rejected','aborted')]
         occupied += account_buys
         pending = [i for i in occupied if i['state'] in ('reserved','sending','unknown')]
@@ -456,7 +463,8 @@ class LPAutoPool:
                      source='account_verified_facts' if account is not None else 'lp_session_verified_trades',
                      as_of=account.get('checked_at') if account is not None else d['last_reconciled_at'])
         return dict(**{k:deepcopy(d[k]) for k in ('run_id','account_id','config_version','desired_running',
-                    'ever_enabled','enabled_at','target_buy_count','budget_usd','last_round','last_reconciled_at','updated_at')},
+                    'ever_enabled','enabled_at','target_buy_count','budget_usd','buy_price_level',
+                    'last_round','last_reconciled_at','updated_at')},
                     auto_run_id=d['run_id'], budget_configured=d['budget_usd'] is not None,
                     pause_confirmed=not d['desired_running'], block_reasons=reasons,
                     admission_block_reasons=admission_reasons,
@@ -626,12 +634,16 @@ class LPAutoPool:
                         else str(sum((Decimal(row['amount_usd']) for row in released), ZERO))), state=self.state())
 
     def configure(self, payload, *, audit=None):
-        if not isinstance(payload, dict) or set(payload)-{'budget_usd','target_buy_count','expected_config_version'}:
+        if not isinstance(payload, dict) or set(payload)-{'budget_usd','target_buy_count','buy_price_level','expected_config_version'}:
             raise ValueError('auto_config_invalid')
         budget = _decimal(payload.get('budget_usd'), 'budget_usd')
         target = payload.get('target_buy_count')
         if budget<0 or isinstance(target,bool) or not isinstance(target,int) or not 0<=target:
             raise ValueError('auto_config_invalid')
+        level = payload.get('buy_price_level', 1)
+        if type(level) is not int or level not in (1, 2):
+            raise ValueError('auto_config_invalid')
+        level_supplied = 'buy_price_level' in payload
         def apply(d):
             state=self._projection(d)
             if not d['account_id'] or d['account_id']!=self.execution._lp_account_id():
@@ -649,7 +661,9 @@ class LPAutoPool:
             d['config_version']+=1
             d['allocations'].append(dict(source_id=f"config:{d['config_version']}",
                 amount_usd=str(budget-_decimal(state['funds']['total_usd'])), occurred_at=self._stamp(),audit=audit))
-            d.update(budget_usd=str(budget),target_buy_count=target,updated_at=self._stamp())
+            d.update(budget_usd=str(budget),target_buy_count=target,
+                     buy_price_level=level if level_supplied else d.get('buy_price_level', 1),
+                     updated_at=self._stamp())
         with self._send_barrier():
             self._update(apply)
         return self.state()
@@ -695,9 +709,11 @@ class LPAutoPool:
                 return True
         return False
 
-    def candidates(self, *, releasing=(), diagnostics=None):
+    def candidates(self, *, releasing=(), diagnostics=None, bid_level=None):
         """Consume the entire qualified pool before exclusion, never the UI top ten."""
         from .polymarket_lp import _candidate_pool_row_expired, _candidate_yield_sort_key
+        if bid_level is None:
+            bid_level = self._read().get('buy_price_level', 1)
         self.lp._evict_excluded_candidates()
         with self.lp._candidate_state_lock:
             facts={}
@@ -771,7 +787,7 @@ class LPAutoPool:
                 now = self._now()
                 reservations = self._ranking_reservations(releasing)
                 evaluated=evaluate_lp_entry(direction,account=ranking_account,
-                    now=now,reservations=reservations,candidate=True)
+                    now=now,reservations=reservations,candidate=True,bid_level=bid_level)
                 if diagnostics is not None:
                     counts['evaluated_directions'] += 1
                     diagnostics['account_sources'][source] += 1
@@ -857,8 +873,9 @@ class LPAutoPool:
         active = [i for i in intents if not reservation_is_released(i, state['account_id'])
                   and i['state'] not in ('terminal', 'rejected', 'aborted')]
         active += state.get('account_buys', [])
+        bid_level = state.get('buy_price_level', 1)
         if len(active) < state['target_buy_count']:
-            candidates = self.candidates(diagnostics=diagnostics)
+            candidates = self.candidates(diagnostics=diagnostics, bid_level=bid_level)
             return candidates, [], candidates, []
         occupied_count = len(active)
         blocked = []
@@ -900,7 +917,8 @@ class LPAutoPool:
                         or self.lp._queue_row_remaining(current[0]) != _decimal(intent['quantity'])):
                     raise ValueError('rotation_order_changed')
                 evaluated = evaluate_lp_entry(direction, account=self._ranking_account(account, active),
-                    now=self._now(), reservations=self._ranking_reservations(active), candidate=True)
+                    now=self._now(), reservations=self._ranking_reservations(active), candidate=True,
+                    bid_level=bid_level)
                 if evaluated.get('state') != 'eligible':
                     raise ValueError('rotation_yield_unknown')
                 estimate = minimum_order_estimate(direction, intent, self._now(), resting_quantity=_decimal(intent['quantity']))
@@ -926,7 +944,7 @@ class LPAutoPool:
                 # exact-ID rotation lane even with no replacement capacity.
                 return [], rows, [], blocked
             return [], [], [], blocked
-        candidates = self.candidates(releasing=active, diagnostics=diagnostics)
+        candidates = self.candidates(releasing=active, diagnostics=diagnostics, bid_level=bid_level)
         rows.extend(candidates)
         refreshed = {(r['condition_id'], r['token_id']) for r in rows if self._resting_buy(r)}
         while True:
@@ -946,7 +964,8 @@ class LPAutoPool:
                 facts = self.lp._read_candidate_facts(pending, wait_for_capacity=True)
                 account, direction = facts['account'], facts['direction']
                 evaluated = evaluate_lp_entry(direction, account=self._ranking_account(account, active),
-                    now=self._now(), reservations=self._ranking_reservations(active), candidate=True)
+                    now=self._now(), reservations=self._ranking_reservations(active), candidate=True,
+                    bid_level=bid_level)
                 if evaluated.get('state') != 'eligible':
                     if evaluated.get('state') == 'rejected':
                         rows.remove(pending)
@@ -2081,7 +2100,10 @@ class LPAutoPool:
             raise ValueError('target_filled')
         account = self._current_account
         _lp_causal_event("auto_presend_account_use", account=account, used_at=self._now())
-        snapshot=self.lp._read_candidate_snapshot(row,now=self._now(),account=account)
+        snapshot=self.lp._read_candidate_snapshot(
+            row, now=self._now(), account=account,
+            bid_level=row.get('bid_level', state.get('buy_price_level', 1)),
+        )
         lock=self.execution._acquire_global_lock()
         if lock is None:
             raise ValueError('execution_lock')
@@ -2105,7 +2127,12 @@ class LPAutoPool:
             raise ValueError('active_execution')
         self._check_candidate_rank(row, snapshot, peers)
         fresh=self.lp._fresh_candidate_row(row,snapshot,now=self._now())
-        request=self.lp._normalize_request({**fresh,'candidate_policy':'best_bid_minimum','review_at':_next_review_at(self._now())})
+        request=self.lp._normalize_request({
+            **fresh,
+            'candidate_policy':'best_bid_minimum',
+            'candidate_bid_level': fresh.get('bid_level', row.get('bid_level', 1)),
+            'review_at':_next_review_at(self._now()),
+        })
         facts=self.lp._validate_snapshot(request,snapshot,now=self._now(),reservations=self.lp._candidate_reservations())
         self.lp._require_lp_history(request, now=self._now())
         if self._excluded(str(row['condition_id'])):

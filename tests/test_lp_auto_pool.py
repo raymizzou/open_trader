@@ -963,10 +963,12 @@ def test_late_live_receipt_preserves_already_verified_fill(tmp_path, sell_receip
     assert facts['buys'] == []
     assert facts['positions'] == [dict(token_id='m00', quantity='20', inventory_cost_usd='8.00')]
     assert facts['independent_sell_unknown'] is sell_receipt_unknown
-    assert recovered['funds']['status'] == ('unknown' if sell_receipt_unknown else 'known')
+    # An UNKNOWN SELL remains an audit fact and cannot credit proceeds, but it
+    # does not make otherwise complete BUY funding unavailable.
+    assert recovered['funds']['status'] == 'known'
     if sell_receipt_unknown:
-        assert recovered['funds']['available_usd'] is None
-        assert 'unbounded_financial_uncertainty' in recovered['admission_block_reasons']
+        assert Decimal(recovered['funds']['available_usd']) == 92
+        assert recovered['admission_block_reasons'] == []
         assert any(a['side'] == 'SELL' and a['state'] == 'unknown' and not a.get('order_id') for a in audit)
     else:
         assert not recovered['admission_block_reasons']

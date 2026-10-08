@@ -979,6 +979,8 @@ def create_prediction_server(
                         result = execution.lp_auto_release_reservations(payload, audit=audit)
                     elif path == lp_auto_prefix + "config":
                         expected = {"budget_usd", "target_buy_count"}
+                        if "buy_price_level" in payload:
+                            expected.add("buy_price_level")
                         if "expected_config_version" in payload:
                             expected.add("expected_config_version")
                         self._require_schema(payload, expected)
