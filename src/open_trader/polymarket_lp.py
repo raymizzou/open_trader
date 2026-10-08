@@ -55,7 +55,7 @@ from .polymarket_lp_notification_batches import (
     matching_batch_channels,
     plan_notification_batches,
 )
-from .polymarket_lp_scratch import LPReadRows, LPReadScratch
+from .polymarket_lp_scratch import LPDirectionScratch, LPReadRows, LPReadScratch
 from .prediction_arbitrage_store import (
     LP_RESERVED_MANUAL_SESSION_ID,
     PredictionArbitrageStore,
@@ -390,6 +390,7 @@ def _lp_direction_fact(
     event_end_confirmation: object,
     history_summary: object,
     account: Mapping[str, object] | None,
+    compact_market: bool = False,
 ) -> dict[str, object]:
     """Build one YES/NO direction fact from market and reward rows.
 
@@ -397,11 +398,12 @@ def _lp_direction_fact(
     round-start build and the issue-143 batch renewal, so both produce
     identical market fields (including the ``_lp_reward_terms`` minimum and
     spread resolution and the reward-catalog overlays) from the same code.
+    ``compact_market`` retains just overrides for a candidate scratch reader
+    which reconstructs the rest from its published metadata generation.
     """
 
     reward_minimum, reward_spread = _lp_reward_terms(market_meta, reward_market)
     market: dict[str, object] = {
-        **dict(market_meta),
         "condition_id": condition_id,
         "token_id": token_id,
         "outcome": outcome,
@@ -416,8 +418,11 @@ def _lp_direction_fact(
         market["_metadata_reward_min_size"] = market_meta.get("reward_min_size")
     if market_meta.get("reward_max_spread") is not None:
         market["_metadata_reward_max_spread"] = market_meta.get("reward_max_spread")
+    # Candidate scratch stores just these overrides. Other callers still get
+    # the complete market, and participation sees that same complete value.
+    full_market = {**dict(market_meta), **market}
     direction: dict[str, object] = {
-        "market": market,
+        "market": market if compact_market else full_market,
         "reward_active": (
             reward_market.get("reward_active")
             if isinstance(reward_market.get("reward_active"), bool)
@@ -430,7 +435,7 @@ def _lp_direction_fact(
     }
     if isinstance(history_summary, Mapping):
         direction["history_summary"] = dict(history_summary)
-    if account is not None and _has_market_order(account, market):
+    if account is not None and _has_market_order(account, full_market):
         direction["known_participation"] = True
     return direction
 
@@ -4969,7 +4974,7 @@ class PolymarketLPService:
             if isinstance(saved_confirmations, Mapping)
             else {}
         )
-        direction_facts = LPReadScratch()
+        direction_facts = LPDirectionScratch(metadata_by_condition)
         direction_index = 0
         complete = (
             isinstance(catalog, Mapping)
@@ -5084,6 +5089,7 @@ class PolymarketLPService:
                     event_end_confirmation=confirmation,
                     history_summary=summary,
                     account=account,
+                    compact_market=True,
                 )
                 direction_index += 1
 
