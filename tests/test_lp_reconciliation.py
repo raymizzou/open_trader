@@ -915,7 +915,9 @@ def test_production_trade_structure_preserves_funds_until_reconciled(tmp_path, m
         Decimal(1000), Decimal(1000), [], [], current[0], (trade,), True
     )
     lp.exchange = adapter
+    accepted_audit = store.lp_actions(sid)
     result = execution.lp_auto_reconcile_unknown()
+    assert store.lp_actions(sid) == accepted_audit
     if trade_kind != 'failed':
         assert store.lp_session(sid)['state'] != 'complete'
         assert result['funds']['status'] == 'unknown'
@@ -925,23 +927,47 @@ def test_production_trade_structure_preserves_funds_until_reconciled(tmp_path, m
             assert store.lp_session(sid)['facts_error'] == 'trade_not_confirmed'
     # A reliable failed trade and zero-fill terminal receipt can settle safely.
     audit_before = store.lp_actions(sid)
+    session_before = store.lp_session(sid)
     current[0] += timedelta(seconds=1)
     trade.clear()
     trade.update(id='t1', token_id='m00', taker_order_id='o1', status='FAILED')
     result = execution.lp_auto_reconcile_unknown()
     assert result['funds']['status'] == 'known'
-    assert store.lp_session(sid)['reservation_coverage']['state'] == 'covered'
-    if trade_kind == 'mined':
-        assert store.lp_session(sid)['state'] == 'entry_open'
-        assert store.lp_session(sid)['facts_error'] == 'trade_not_confirmed'
-    # Account-wide coverage releases funds; the independent LP lane still
-    # owns the accepted session's terminal recovery (as in the normal tick).
+    covered = store.lp_session(sid)
+    facts = execution._auto_pool._read()['account_financial_facts']
+    assert facts['financial_status'] == 'known' and facts['reason_codes'] == []
+    assert facts['buys'] == facts['positions'] == facts['pending_buy_actions'] == []
+    assert facts['read_started_at'] == current[0].isoformat()
+    assert facts['trade_generation'] == store.lp_trade_generation()
+    assert facts['report_status'] == 'known' and facts['confirmed_fill_facts'] == []
+    assert covered['reservation_coverage']['state'] == 'covered'
+    assert covered['reservation_coverage']['snapshot_id'] == facts['snapshot_id']
+    assert covered['reservation_coverage']['request_finished_at'] < facts['read_started_at']
+    if trade_kind == 'failed':
+        assert session_before['state'] == 'complete'
+        assert covered.get('account_coverage_retired') is None
+        assert covered['order_history']['o1']['status'] == 'CANCELED'
+    else:
+        assert covered['account_coverage_retired']['reason'] == 'account_observation_no_exposure'
+        assert covered['account_coverage_retired']['snapshot_id'] == facts['snapshot_id']
+    assert covered['state'] == 'complete'
+    assert covered['facts_error'] == session_before['facts_error']
+    assert covered['order_history'] == session_before['order_history']
+    for key in ('buy_filled_quantity', 'buy_cost', 'residual_quantity'):
+        assert covered[key] == session_before[key]
+        assert Decimal(covered[key]) == 0
+    assert store.lp_actions(sid) == audit_before
+    assert result['slots']['occupied'] == 0
+    # API coverage retires empty management without rewriting old trade audit.
+    # An explicit report read can settle that audit; the active monitor skips it.
     if recovery_lane == 'explicit':
         lp.reconcile_facts(sid)
+        assert store.lp_session(sid)['facts_error'] is None
     else:
-        execution.lp_tick()
+        assert execution.lp_tick()['state'] == 'none'
+        assert store.lp_session(sid)['facts_error'] == session_before['facts_error']
+        assert store.lp_session(sid)['order_history'] == session_before['order_history']
     assert store.lp_session(sid)['state'] == 'complete'
-    assert store.lp_session(sid)['facts_error'] is None
     assert not execution._auto_pool._excluded('m00')
     assert store.lp_session(sid)['submit_status'] == 'accepted'
     assert store.lp_actions(sid) == audit_before

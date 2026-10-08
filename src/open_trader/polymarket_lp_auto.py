@@ -21,7 +21,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Mapping
 
-from .polymarket_lp_accounting import account_position_quantity, default_account_pool_document, has_independent_unresolved_action, reservation_is_covered, reservation_is_manually_released, reservation_is_released
+from .polymarket_lp_accounting import account_position_quantity, default_account_pool_document, has_independent_unresolved_action, reservation_is_covered, reservation_is_manually_released, reservation_is_released, submission_action_kind
 from .polymarket_lp_risk import (
     TERMINAL_ORDER_STATES, _account_after_reservations, _decimal as _money, _freshness, _levels,
     _maybe_decimal, _timestamp, evaluate_lp_entry, minimum_order_estimate,
@@ -254,7 +254,8 @@ class LPAutoPool:
         # Only the original bounded BUY belongs to this automatic allocation.
         # Additional BUY actions or identity conflicts need account-wide review.
         session = self.store.lp_session(intent['session_id'])
-        if (_maybe_decimal(intent.get('inventory_cost_usd', 0)) is None
+        if (not intent.get('condition_id') or not intent.get('token_id')
+                or _maybe_decimal(intent.get('inventory_cost_usd', 0)) is None
                 or _maybe_decimal(intent.get('reserved_usd')) is None
                 or not session or session.get('order_identity_conflict')
                 or intent.get('order_identity_conflict')
@@ -357,15 +358,11 @@ class LPAutoPool:
                 actions = self.store.lp_actions(intent['session_id'])
                 independent = session is not None and has_independent_unresolved_action(session, actions)
                 independent_unknown = independent_unknown or independent
-                represented = (intent['state'] in ('active', 'canceling')
-                    and not intent.get('submission_unknown')
-                    and session is not None and not session.get('order_identity_conflict')
+                represented = (session is not None and not session.get('order_identity_conflict')
                     and not intent.get('order_identity_conflict')
                     and 'identity' not in str(intent.get('reconcile_reason') or '')
                     and intent.get('reconcile_reason') not in {'owned_order_token_mismatch', 'owned_order_side_mismatch'}
-                    and not self.lp.entry_send_inflight(intent['session_id'])
-                    and not self.lp._has_unresolved_submission(session)
-                    and not independent)
+                    and not self.lp.entry_send_inflight(intent['session_id']))
             else:
                 represented = False
             if not represented:
@@ -379,7 +376,10 @@ class LPAutoPool:
         intents = [i for i in audit_intents if not reservation_is_released(i, d['account_id'])]
         account, account_buys, account_reasons = self._account_projection_facts(d)
         intents, independent_unknown = self._unrepresented_intents(intents, account_buys,
-            account_valid=account is not None and account.get('financial_status') == 'known' and not account_reasons)
+            account_valid=account is not None and not set(account_reasons)-{'account_send_inflight'})
+        if account is not None:
+            intents += account.get('pending_buy_actions') or []
+            independent_unknown |= bool(account.get('independent_sell_unknown'))
         occupied = [i for i in intents if i['state'] not in ('terminal','rejected','aborted')]
         occupied += account_buys
         pending = [i for i in occupied if i['state'] in ('reserved','sending','unknown')]
@@ -514,12 +514,7 @@ class LPAutoPool:
             elif (intent.get('order_id') or self.store._lp_owned_session_ids(session)
                   or any(action.get('order_id') for action in actions if action.get('role') == 'entry')):
                 reason = 'order_identity_known'
-            elif (any(session.get(key) in {'pending', 'unknown', 'accepted_without_order_id'}
-                      for key in ('passive_exit_attempt_state', 'protected_exit_attempt_state'))
-                  or any(action.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
-                     and ('cancel' in str(action.get('action_key') or '')
-                          or action.get('role') != 'entry'
-                          and not str(action.get('action_key') or '').endswith('entry-submit')) for action in actions)):
+            elif has_independent_unresolved_action(session, actions):
                 reason = 'independent_action_unresolved'
             amount = _maybe_decimal(intent.get('reserved_usd'))
             if reason is None and intent.get('reserved_usd') is not None and (amount is None or amount < ZERO):
@@ -602,7 +597,7 @@ class LPAutoPool:
                             marker['original_session_state'] = raw['state']
                             marker['original_submit_status'] = session.get('submit_status')
                             marker['original_entry_actions'] = [a for a in self.store.lp_actions(row['session_id'], connection=connection)
-                                if a.get('role') == 'entry' or str(a.get('action_key') or '').endswith('entry-submit')]
+                                if submission_action_kind(a) == 'entry']
                             session['manual_reservation_release'] = marker
                             session['_lp_revision'] = int(session.get('_lp_revision', 0)) + 1
                             session['_lp_trade_revision'] = int(session.get('_lp_trade_revision', 0)) + 1
@@ -677,19 +672,16 @@ class LPAutoPool:
         for session in self.store.lp_sessions():
             if session.get('session_id')==ignore or session.get('condition_id')!=condition_id:
                 continue
-            if (reservation_is_manually_released(session, self.execution._lp_account_id())
-                    and not self.lp._session_order_ids(session)
+            if (reservation_is_released(session, self.execution._lp_account_id())
                     and not self.lp._has_unresolved_submission(session)):
-                local_empty = session.get('manual_release_retired') and not any(
+                local_empty = session.get('manual_release_retired') and not self.lp._session_order_ids(session) and not any(
                     (_maybe_decimal(session.get(key)) or ZERO) > ZERO
                     for key in ('residual_quantity', 'buy_filled_quantity'))
                 account_empty = False
                 if session.get('state') == 'complete' and session.get('account_coverage_retired'):
                     account_empty = self._manual_current_account_empty(self._read(), session)
-                independent = any(a.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
-                    and ('cancel' in str(a.get('action_key') or '') or a.get('role') != 'entry'
-                         and not str(a.get('action_key') or '').endswith('entry-submit'))
-                    for a in self.store.lp_actions(str(session['session_id'])))
+                independent = has_independent_unresolved_action(session,
+                    self.store.lp_actions(str(session['session_id'])))
                 if (local_empty or account_empty) and not independent:
                     continue
             if session.get('state') not in ('complete','entry_rejected'):
@@ -1079,7 +1071,7 @@ class LPAutoPool:
             cancel_ids = {row['order_id']}
             for action in self.store.lp_actions(row['session_id']):
                 if (action.get('state') in ('pending', 'unknown', 'accepted')
-                        and ('cancel' in str(action.get('role')) or 'cancel' in str(action.get('action_key')))):
+                        and submission_action_kind(action) == 'cancel'):
                     if action.get('order_id'):
                         cancel_ids.add(str(action['order_id']))
                     targets = action.get('targets') or ()
@@ -1700,7 +1692,7 @@ class LPAutoPool:
                 known=True
             actions=self.store.lp_actions(str(session['session_id']), connection=connection)
             pending_cancel = any(a.get('state') in ('pending', 'unknown')
-                                 and 'cancel' in str(a.get('action_key')) for a in actions)
+                                 and submission_action_kind(a) == 'cancel' for a in actions)
             i['submission_unknown']=pending_cancel or self.lp._has_unresolved_submission(session) or any(
                 str(owned.get('status') or 'UNKNOWN').upper()=='UNKNOWN' for owned in history.values())
             known=known and not i['submission_unknown'] and not session.get('facts_error')
@@ -1742,8 +1734,7 @@ class LPAutoPool:
             bindings={order_id:i}
             for action in actions:
                 oid=action.get('order_id')
-                role=str(action.get('role') or '')
-                if role=='entry' or 'cancel' in role or 'cancel' in str(action.get('action_key') or ''):
+                if submission_action_kind(action) in {'entry', 'cancel'}:
                     continue
                 owned=history.get(oid,{})
                 child={**i,'intent_id':f"action:{action['action_key']}",
@@ -1767,7 +1758,7 @@ class LPAutoPool:
                 bound=bindings[oid]
                 self._receipt_uncertainty(d,bound,str(owned.get('status') or 'UNKNOWN').upper()=='UNKNOWN')
                 accepted=next((a for a in actions if a.get('order_id')==oid and a.get('state')=='accepted'
-                    and 'cancel' not in str(a.get('action_key') or '')), {})
+                    and submission_action_kind(a) != 'cancel'), {})
                 if str(owned.get('status') or '').upper() not in ('','UNKNOWN','REJECTED'):
                     self._event(d,bound,'accepted',identity=f'accepted:{oid}',
                         occurred_at=accepted.get('submit_receipt_at') or accepted.get('updated_at'),
@@ -1778,7 +1769,7 @@ class LPAutoPool:
                 self._event(d,i,'cancel_requested',identity=f'cancel_requested:{order_id}')
             for action in actions:
                 oid=action.get('order_id')
-                if oid in bindings and ('cancel' in str(action.get('role') or '') or 'cancel' in str(action.get('action_key') or '')):
+                if oid in bindings and submission_action_kind(action) == 'cancel':
                     self._event(d,bindings[oid],'cancel_requested',identity=f'cancel_requested:{oid}',
                         occurred_at=action.get('submit_requested_at') or action.get('created_at'))
             # Official trade identities retain true event time. Receipt-only

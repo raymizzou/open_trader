@@ -47,6 +47,7 @@ from .polymarket_lp_risk import (
 )
 from .polymarket_lp_accounting import (
     build_account_financial_facts, reservation_is_manually_released, reservation_is_released,
+    buy_action_is_covered, unresolved_buy_action, submission_action_kind,
 )
 from .polymarket_lp_errors import LpObservationWait
 from .polymarket_lp_notification_batches import (
@@ -7424,10 +7425,8 @@ class PolymarketLPService:
                 # Candidate account snapshots already count actual open IDs.
                 # A later independent BUY must never inherit entry coverage.
                 for action in self.store.lp_actions(str(session["session_id"])):
-                    if (str(action.get("side") or "").upper() == "BUY"
-                            and action.get("role") != "entry"
-                            and action.get("state") in {"pending", "unknown"}
-                            and "cancel" not in str(action.get("action_key") or "")):
+                    if (unresolved_buy_action(action) and submission_action_kind(action) != 'entry'
+                            and not buy_action_is_covered(session, action)):
                         reservations.append({
                             "order_id": str(action.get("order_id") or f"lp-action:{action['action_id']}"),
                             "amount": None,
@@ -9727,6 +9726,19 @@ class PolymarketLPService:
         with self._entry_sends_lock:
             return session_id in self._entry_sends
 
+    def drain_submissions(self, *, timeout: float = 5) -> None:
+        """Shutdown closes the mutation guard before draining local senders."""
+        # Manual entry/augment retain this mutex through receipt application.
+        # Automatic entry can release it, so also check its existing live lanes.
+        if not self._mutex.acquire(timeout=timeout):
+            raise RuntimeError('prediction LP BUY sender did not stop')
+        try:
+            with self._entry_sends_lock:
+                if self._entry_sends:
+                    raise RuntimeError('prediction LP BUY sender did not stop')
+        finally:
+            self._mutex.release()
+
     def _entry_execute(self, **kwargs) -> dict[str, object]:
         # A durable legacy "sending" field is not proof of a live process.
         # Track the real lane through receipt application and clean up on error.
@@ -11691,7 +11703,7 @@ class PolymarketLPService:
                     statuses.update({oid: str(row.get('status', '')).upper()
                                      for oid, row in self._order_history(current).items()})
                     for action in self.store.lp_actions(session_id):
-                        if action.get('state') not in {'pending', 'unknown'} or 'cancel' not in str(action.get('action_key')):
+                        if action.get('state') not in {'pending', 'unknown'} or submission_action_kind(action) != 'cancel':
                             continue
                         targets = action.get('targets') or [action.get('order_id')]
                         if targets and all(statuses.get(oid) in TERMINAL_ORDER_STATES for oid in targets):
@@ -12431,7 +12443,7 @@ class PolymarketLPService:
         now = self._now()
         blocked: set[str] = set()
         for action in self.store.lp_actions(session_id):
-            if "cancel" not in str(action.get("role")) and "cancel" not in str(action.get("action_key")):
+            if submission_action_kind(action) != 'cancel':
                 continue
             if str(action.get("state")) != "pending":
                 continue
@@ -17568,7 +17580,8 @@ class PolymarketLPService:
         # and must not prevent management of actual orders/inventory.
         covered = reservation_is_released(session)
         if (covered and not reservation_is_manually_released(session)
-                and str(session.get("submit_stage") or "") in {"preparing", "sending"}):
+                and str(session.get("submit_stage") or "") in {"preparing", "sending"}
+                and (session.get('reservation_coverage') or {}).get('basis') != 'runtime_owner_exit'):
             return True
         if not covered:
             if str(session.get("state") or "") == "entry_submit_pending":
