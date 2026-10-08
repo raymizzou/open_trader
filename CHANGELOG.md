@@ -24,6 +24,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
   不复制竞争 map，也不新增嵌套锁。校正回归在归档基线 19 项 RED；87 项定向检查串行与双 worker 通过，
   另 8 项 snapshot 消费者回归通过。未运行本地全套或部署；独立全规模测量另行提供，
   本票不宣称云端容量问题已解决，历史 SQLite 文件缓存与 metadata/Smoke 问题仍另行处理。
+  PR #298 发布阻断修复仅同步提交测试：终态先落库、通知随后执行，helper 现等待仍登记的
+  提交 worker 完成，兼容已移除 worker，保留原 5 秒 watchdog、通知内容、恰好一次及负向断言。
+  通知前/后 barrier 在旧 helper 上确定性 RED；18 项直接消费者检查按 3 轮串行、3 轮双 worker 通过，
+  漏通知、重复通知与错误文本注入均被原断言拒绝。原 CI 及首版 helper 的 KeyError 失败记录保留；
+  未改生产行为，未运行服务全套、CI 重试或部署，更新后的远端 CI 待验证。
 
 ## 2026-10-08
 

@@ -6909,13 +6909,13 @@ SELF_CLEAR_WAIT_STATES = {
 
 
 def wait_for_submit_outcome(service: object, execution_id: str, timeout: float = 5.0):
-    deadline = time.monotonic() + timeout
+    # Terminal state is persisted before notification and worker cleanup.
+    worker = service._threads.get(execution_id)  # type: ignore[attr-defined]
+    if worker is not None:
+        worker.join(timeout=timeout)
+        assert not worker.is_alive(), "submit worker did not finish"
     payload = service.execution(execution_id)  # type: ignore[attr-defined]
-    while time.monotonic() < deadline:
-        payload = service.execution(execution_id)  # type: ignore[attr-defined]
-        if payload.get("state") in SELF_CLEAR_WAIT_STATES:
-            return payload
-        time.sleep(0.01)
+    assert payload.get("state") in SELF_CLEAR_WAIT_STATES, payload
     return payload
 
 
@@ -6941,6 +6941,103 @@ def submit_failure_threshold_fixture(
     service._clock = iter(float(index) for index in range(200)).__next__  # type: ignore[attr-defined]
     service.test_notifiers = (macos, feishu)  # type: ignore[attr-defined]
     return service, trading, store
+
+
+@pytest.mark.parametrize("path", ["threshold_error", "threshold_no_detail", "pair_error"])
+@pytest.mark.parametrize("pause", ["before_notification", "after_notification"])
+def test_wait_for_submit_outcome_waits_for_worker_after_terminal_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, pause: str
+) -> None:
+    if path == "pair_error":
+        service, _trading, store = pair_submit_failure_fixture(
+            tmp_path, SubmitFailurePairTrading(submit_error=RuntimeError("connection reset by peer"))
+        )
+    else:
+        trading_type = (AmbiguousNoDetailThresholdTrading if path == "threshold_no_detail"
+                        else SubmitFailureThresholdTrading)
+        service, _trading, store = submit_failure_threshold_fixture(
+            tmp_path, trading_type(submit_error=RuntimeError("connection reset by peer"))
+        )
+    entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+    notify = service._notify_submit_failed_self_cleared
+
+    def paused_notification(*args: object) -> None:
+        if pause == "after_notification":
+            notify(*args)
+        entered.set()
+        assert release.wait(5), "notification barrier was not released"
+        if pause == "before_notification":
+            notify(*args)
+
+    monkeypatch.setattr(service, "_notify_submit_failed_self_cleared", paused_notification)
+    worker = None
+    try:
+        if path == "pair_error":
+            preview = service.preview("opp-1")
+            result = service.confirm(str(preview["id"]), "pair-self-clear-barrier")
+        else:
+            store.set_validation_mode("auto")
+            result = service.auto_eat_threshold("threshold-opp-1", _notification_signal(store))
+        execution_id = str(result["execution_id"])
+        worker = service._threads[execution_id]
+        assert entered.wait(5), "worker did not reach notification barrier"
+        assert service.execution(execution_id)["state"] == "submit_failed_cleared"
+        feishu = service.test_notifiers[1]
+        title = "预测套利单提交失败（已自证零落地）"
+        assert sum(name == title for name, _ in feishu.messages) == (pause == "after_notification")
+        join = worker.join
+
+        def observed_join(timeout: float | None = None) -> None:
+            waiting.set()
+            join(timeout)
+
+        monkeypatch.setattr(worker, "join", observed_join)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            outcome = pool.submit(wait_for_submit_outcome, service, execution_id)
+            outcome.add_done_callback(lambda _: waiting.set())
+            try:
+                assert waiting.wait(5), "outcome waiter did not start"
+                assert not outcome.done(), (
+                    f"helper returned at submit_failed_cleared before worker completion; "
+                    f"self-clear notifications={sum(name == title for name, _ in feishu.messages)}"
+                )
+            finally:
+                release.set()
+            final = outcome.result(timeout=5)
+        assert final["state"] == "submit_failed_cleared"
+        assert not worker.is_alive()
+        assert execution_id not in service._threads
+        assert wait_for_submit_outcome(service, execution_id) == final
+        notified = [message for name, message in feishu.messages if name == title]
+        assert len(notified) == 1
+        assert "挂单空" in notified[0] and "两腿无持仓" in notified[0]
+        assert "余额未变" in notified[0] and "60.402411" in notified[0]
+        assert ("原因：" not in notified[0]) is (path == "threshold_no_detail")
+        assert "｜：" not in notified[0]
+        assert not any(name == title for name, _ in service.test_notifiers[0].messages)
+        assert store.histories("incidents") == []
+        assert store.active_execution() is None
+        assert service._breaker_is_open() is False
+    finally:
+        release.set()
+        if worker is not None:
+            worker.join(timeout=5)
+            assert not worker.is_alive(), "submit worker was not reclaimed"
+
+
+def test_wait_for_submit_outcome_preserves_worker_watchdog() -> None:
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait)
+    service = SimpleNamespace(_threads={"execution": worker},
+                              execution=lambda _: {"state": "submit_failed_cleared"})
+    worker.start()
+    try:
+        with pytest.raises(AssertionError, match="submit worker did not finish"):
+            wait_for_submit_outcome(service, "execution", timeout=0)
+    finally:
+        release.set()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
 
 
 def test_threshold_submit_failure_self_clears_when_zero_landing(tmp_path: Path) -> None:
