@@ -144,8 +144,24 @@ worktree checks and review. A rebase or conflict resolution that changes behavio
 scope, risk, or architecture requires a new approved plan. Mechanical resolutions
 that preserve these may proceed within approved scope, with required checks and
 independent review. Publish only the reviewed tree to the authorized task branch,
-open a Draft PR targeting `main`, and inspect the latest exact-SHA CI evidence. Require
-the `required` check from GitHub Actions, then obtain explicit user approval
+open a Draft PR targeting `main` promptly once the
+[first reviewable implementation](docs/operations/agent-verification.md#first-reviewable-implementation)
+passes applicable focused/security checks and independent staged review, with
+first-publication blockers repaired. Do not delay it for nonblocking polish,
+unneeded local full suites, or remote CI completion. Report missing publication
+authorization and record unverified work in the PR when publication is authorized.
+Immediately start DoTs and a separate Herdr GLM-5.3/max reviewer pane alongside
+CI; verify actual startup and keep their status separate. Pin issue scope, PR
+URL, head/base SHAs and verification; unavailable prerequisites are blockers,
+not completed reviews. Follow the
+[authorized PR delivery loop](docs/operations/agent-verification.md#authorized-pr-delivery-loop)
+for reviewer comment authority, feedback repairs and worker handoff.
+Main remains the delivery owner, refreshes all feedback after update pushes and
+before merge requests/actions, and retains ownership until the defined handoff
+or recorded stopping condition. Review-ready handoff requires completed required
+reviews, no known unresolved blockers, fresh feedback/mergeability checks and
+successful applicable push-head and PR-merge `required` checks from GitHub Actions
+(app ID 15368). Then obtain explicit user approval
 before merging on GitHub. Do not integrate through local `main` or direct push.
 See [CI identity](docs/operations/ci.md) and the
 [proposed repository protections](docs/operations/repository-protection.md);
@@ -160,6 +176,10 @@ merge SHA substitute for trusted main-push CI evidence on the selected final Git
 
 Screenshots are optional unless requested. Clean up only after GitHub merge,
 user confirmation, and a clean worktree; never delete a dirty worktree.
+Ending a worker session is separate from deleting its worktree or branch. After
+DoTs review, end development workers only with saved work, no exclusive pending
+responsibilities or an accepted handoff, and a recorded owner for remaining work;
+see [worker lifecycle](docs/operations/agent-verification.md#worker-lifecycle).
 
 ## Agent skills
 

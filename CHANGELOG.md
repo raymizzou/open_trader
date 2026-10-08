@@ -3,6 +3,14 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-09
+
+- #293 协调 #271/#214 的 PR 交付规范：首版完成必要检查和独立评审后及时授权发布，
+  DoTs、独立 GLM-5.3/max 评审与 CI 并行；Main 负责最新反馈、阻断修复、评论证据与交接。
+  明确 reviewer 结果评论的单 PR 授权、精确 SHA 门禁及 worker 收尾条件，保留独立合并和部署授权。
+  文档静态检查与本机 CLI help 核对完成；未运行后端或部署。
+  DoTs 具体入口仍待确认，实际首 PR、DoTs 启动及 GLM PR 评论交接证据待授权交付验证。
+
 ## 2026-10-08
 
 - #292 新增 LP Auto CLI 的 `status`、`config`、`on`、`off`，保留同义 `pause`；
