@@ -16,6 +16,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
   该单项测试本地 Python 3.12.12 定向 1 项通过（CI 为 3.12.14），保留既有依赖弃用警告；
   未运行本地全套或部署，修复后的远端 CI 待验证。
 
+- #297 减少 LP 竞争数据刷新、落库与候选投影的全量副本：原生 reader 移交新 map，
+  monitor 不再构造被丢弃的 snapshot；自定义 reader 与需要 snapshot 的调用者保留隔离。
+  SQLite 逐条校验、编码并在同一事务写入，后段校验、输入或写入失败整轮回滚。
+  按完整方向集合投影，仅补查缺失/过期 identity；保留零值、精度、全池排名、来源/更新时间、
+  UNKNOWN、分页重试/取消及旧轮到新轮的原子发布。候选 snapshot 只在竞争锁内复制所需轮次字段，
+  不复制竞争 map，也不新增嵌套锁。校正回归在归档基线 19 项 RED；87 项定向检查串行与双 worker 通过，
+  另 8 项 snapshot 消费者回归通过。未运行本地全套或部署；独立全规模测量另行提供，
+  本票不宣称云端容量问题已解决，历史 SQLite 文件缓存与 metadata/Smoke 问题仍另行处理。
+
 ## 2026-10-08
 
 - #292 新增 LP Auto CLI 的 `status`、`config`、`on`、`off`，保留同义 `pause`；

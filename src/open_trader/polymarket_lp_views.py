@@ -926,11 +926,7 @@ def lp_trial_candidates(
         else {}
     )
     available_capital = _maybe_decimal(budget.get("available_capital"))
-    competition_map: dict[str, object] = {
-        str(key): value
-        for key, value in competition.items()
-        if isinstance(key, str)
-    } if isinstance(competition, Mapping) else {}
+    competition_map = competition if isinstance(competition, Mapping) else {}
 
     # Both ABC and builtin values views retain their mapping. Keep only keys
     # (or sequence positions), not another serialized direction-detail copy.

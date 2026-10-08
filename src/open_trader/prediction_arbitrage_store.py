@@ -16,6 +16,7 @@ import zlib
 from contextlib import contextmanager, nullcontext
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from itertools import chain
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping
@@ -4943,35 +4944,41 @@ class PredictionArbitrageStore:
 
         Rows are keyed by condition_id; a re-read of the same market replaces
         its previous value and checked_at instead of stacking a second row.
+        SQLite consumes one encoded row at a time; later failures roll back all rows.
         """
 
         prepared_at = monotonic()
-        encoded: list[tuple[str, str, str]] = []
-        for condition_id, value, checked_at in entries:
-            condition = str(condition_id).strip()
-            if not condition:
-                raise ValueError("lp_competitiveness_identity_invalid")
-            if not isinstance(value, Decimal):
-                raise ValueError("lp_competitiveness_value_invalid")
-            encoded.append(
-                (
+        diagnostics = {"input_rows": 0}
+
+        def encode():
+            for condition_id, value, checked_at in entries:
+                condition = str(condition_id).strip()
+                if not condition:
+                    raise ValueError("lp_competitiveness_identity_invalid")
+                if not isinstance(value, Decimal):
+                    raise ValueError("lp_competitiveness_value_invalid")
+                row = (
                     condition,
                     _decimal_string(value),
                     _canonical_timestamp(checked_at),
                 )
-            )
-        if not encoded:
+                diagnostics["input_rows"] += 1
+                yield row
+
+        encoded = encode()
+        first = next(encoded, None)
+        if first is None:
             return 0
-        with self._transaction(prepared_at=prepared_at, diagnostics={"input_rows": len(encoded)}) as connection:
+        with self._transaction(prepared_at=prepared_at, diagnostics=diagnostics) as connection:
             connection.executemany(
                 """
                 INSERT OR REPLACE INTO lp_market_competitiveness
                 (condition_id, value, checked_at)
                 VALUES (?, ?, ?)
                 """,
-                encoded,
+                chain((first,), encoded),
             )
-        return len(encoded)
+        return diagnostics["input_rows"]
 
     def lp_competitiveness_entry(self, condition_id: str):
         with self._read_connection() as connection:
@@ -4981,24 +4988,32 @@ class PredictionArbitrageStore:
             ).fetchone()
         return (Decimal(str(row[0])), _parse_timestamp(row[1])) if row else None
 
-    def lp_competitiveness_map(self) -> dict[str, tuple[Decimal, datetime]]:
-        """Read every persisted competition value back keyed by condition_id."""
+    def lp_competitiveness_map(
+        self, *, condition_ids: Iterable[str] | None = None
+    ) -> dict[str, tuple[Decimal, datetime]]:
+        """Read all values, or all requested identities in one read snapshot."""
 
-        with self._read_connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT condition_id, value, checked_at
-                FROM lp_market_competitiveness
-                """
-            ).fetchall()
+        identities = None if condition_ids is None else tuple(dict.fromkeys(condition_ids))
+        if identities == ():
+            return {}
         result: dict[str, tuple[Decimal, datetime]] = {}
-        for row in rows:
-            try:
-                value = Decimal(str(row["value"]))
-                checked_at = _parse_timestamp(row["checked_at"])
-            except (ArithmeticError, TypeError, ValueError):
-                continue
-            result[str(row["condition_id"])] = (value, checked_at)
+        with self._read_connection() as connection:
+            connection.execute("BEGIN")
+            batches = (None,) if identities is None else (
+                identities[offset:offset + 400] for offset in range(0, len(identities), 400)
+            )
+            for batch in batches:
+                query = "SELECT condition_id, value, checked_at FROM lp_market_competitiveness"
+                params = () if batch is None else batch
+                if batch is not None:
+                    query += " WHERE condition_id IN (" + ",".join("?" for _ in batch) + ")"
+                for row in connection.execute(query, params):
+                    try:
+                        value = Decimal(str(row["value"]))
+                        checked_at = _parse_timestamp(row["checked_at"])
+                    except (ArithmeticError, TypeError, ValueError):
+                        continue
+                    result[str(row["condition_id"])] = (value, checked_at)
         return result
 
     def lp_competitiveness_count(self) -> int:

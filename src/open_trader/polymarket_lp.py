@@ -66,6 +66,7 @@ from .prediction_arbitrage_store import (
 )
 from .notifications import beijing_clock, notification_delivery_episode
 from .polymarket_trading import (
+    PolymarketTradingClient,
     LpAccountReadError,
     LpAccountRoundInvalid,
     LpNewerAccountFacts,
@@ -2433,7 +2434,11 @@ class PolymarketLPService:
             queue_funnel = deepcopy(self._candidate_queue_funnel)
             queue_condition_ids = self._candidate_queue_condition_ids
             rotation = deepcopy(self._candidate_rotation)
-            competition_state = deepcopy(self._competition_state)
+        with self._competition_lock:
+            competition_state = {
+                "state": self._competition_state.get("state"),
+                "not_updated": list(self._competition_state.get("not_updated") or ()),
+            }
         from .polymarket_lp_views import LP_TRIAL_CANDIDATE_LIMIT
 
         now = self._now()
@@ -5132,13 +5137,15 @@ class PolymarketLPService:
                     available_facts["available_capital"] = min(
                         adjusted_balance, adjusted_allowance
                     )
+        with self._competition_lock:
+            competition_state = self._competition_state
         trial = lp_trial_candidates(
             direction_facts.values(),
-            competition=self._competition_entries(),
+            competition=self._competition_entries(direction_keys, state=competition_state),
             account_budget_facts=available_facts,
             now=checked_at,
             competition_round_checked_at=(
-                self._competition_state.get("round_checked_at")
+                competition_state.get("round_checked_at")
             ),
         )
         queue_normal = [
@@ -7243,21 +7250,22 @@ class PolymarketLPService:
             self._candidate_maintenance_lock.release()
 
     def refresh_competition_cache(
-        self, stop_event: threading.Event | None = None
-    ) -> dict[str, object]:
+        self, stop_event: threading.Event | None = None, *, snapshot: bool = True
+    ) -> dict[str, object] | None:
         """Refresh the in-memory competition cache (issue #157).
 
         Public entry point for the dedicated competition thread: candidate
         batch paths only read the cache and never block on this read.  The
         optional ``stop_event`` flows into the underlying read so a stopping
         runtime cancels an in-flight page pull cooperatively.
+        The monitor passes ``snapshot=False`` because it discards the result.
         """
 
-        return self._refresh_competition(stop_event)
+        return self._refresh_competition(stop_event, snapshot=snapshot)
 
     def _refresh_competition(
-        self, stop_event: threading.Event | None
-    ) -> dict[str, object]:
+        self, stop_event: threading.Event | None, *, snapshot: bool = True
+    ) -> dict[str, object] | None:
         """Pull official competitiveness into the in-process cache.
 
         #181: every full round is also persisted to the store (explicit
@@ -7270,11 +7278,11 @@ class PolymarketLPService:
         reader = getattr(self.exchange, "lp_market_competitiveness", None)
         if callable(reader):
             with self._competition_lock:
-                previous = dict(self._competition_state)
+                previous = self._competition_state
             try:
                 result = reader(
                     stop_event=stop_event,
-                    previous=previous.get("competitiveness", {}),
+                    previous=MappingProxyType(previous.get("competitiveness") or {}),
                     # Issue #177: resume the walk where the last round
                     # stopped instead of restarting from page one.
                     start_cursor=previous.get("next_start_cursor"),
@@ -7287,19 +7295,22 @@ class PolymarketLPService:
                     if isinstance(observed_at, datetime):
                         for cid in result.get("ended_condition_ids", ()):
                             self._observe_ended_candidate_market(str(cid), {"closed": True}, checked_at=observed_at)
+                raw_map = result.get("competitiveness") or {}
+                # The native reader transfers its new map; legacy readers may retain theirs.
+                owned = getattr(reader, "__func__", None) is PolymarketTradingClient.lp_market_competitiveness
                 stored = {
                     "state": result.get("state", "unknown"),
                     "complete": result.get("complete") is True,
                     "round_checked_at": result.get("round_checked_at"),
-                    "competitiveness": dict(
-                        result.get("competitiveness") or {}
-                    ),
+                    "competitiveness": raw_map if owned else dict(raw_map),
                     "not_updated": list(result.get("not_updated") or []),
                     "next_start_cursor": result.get("resume_cursor"),
                 }
                 with self._competition_lock:
                     self._competition_state = stored
                 self._persist_competition(stored)
+        if not snapshot:
+            return None
         with self._competition_lock:
             return deepcopy(self._competition_state)
 
@@ -7312,53 +7323,61 @@ class PolymarketLPService:
         raw_map = stored.get("competitiveness")
         if not isinstance(raw_map, Mapping):
             return
-        entries: list[tuple[str, Decimal, datetime]] = []
-        for condition_id, value in raw_map.items():
-            if not isinstance(condition_id, str) or not condition_id.strip():
-                continue
-            if isinstance(value, tuple) and len(value) == 2:
-                entry_value, checked_at = value
-            elif isinstance(value, Mapping):
-                entry_value = value.get("value")
-                checked_at = value.get("checked_at")
-            else:
-                continue
-            if not isinstance(entry_value, Decimal):
-                continue
-            if not isinstance(checked_at, datetime) or checked_at.tzinfo is None:
-                continue
-            entries.append((condition_id, entry_value, checked_at))
-        if not entries:
-            return
+        count = 0
+
+        def entries():
+            nonlocal count
+            for condition_id, value in raw_map.items():
+                if not isinstance(condition_id, str) or not condition_id.strip():
+                    continue
+                if isinstance(value, tuple) and len(value) == 2:
+                    entry_value, checked_at = value
+                elif isinstance(value, Mapping):
+                    entry_value = value.get("value")
+                    checked_at = value.get("checked_at")
+                else:
+                    continue
+                if not isinstance(entry_value, Decimal):
+                    continue
+                if not isinstance(checked_at, datetime) or checked_at.tzinfo is None:
+                    continue
+                count += 1
+                yield condition_id, entry_value, checked_at
         try:
-            upsert(entries)
+            upsert(entries())
         except Exception:
             logger.warning(
-                "lp competition persistence failed: rows=%d", len(entries)
+                "lp competition persistence failed: attempted_rows=%d", count
             )
 
-    def _competition_entries(self) -> dict[str, object]:
+    def _competition_entries(
+        self, condition_ids: Collection[str] | None = None, *, state: Mapping[str, object] | None = None
+    ) -> dict[str, object]:
         """Project the competition map for the trial-candidate view (#181).
 
-        Fresh cache entries (inside the one-hour competition freshness gate)
+        Fresh cache entries (inside the competition freshness gate)
         win with ``source="fresh"``; everything else — a missing cache or an
         entry older than the gate — falls back to the last persisted round
         with ``source="store"`` and the store's own checked_at.  Conditions
         present in neither source are left out entirely: the view owns the
         missing-data exclusion and there is no cold-start exemption.
+        A caller can scope this projection to its complete required identity set.
         """
 
         # Lazy import: polymarket_lp_views imports this module at load time.
         from .polymarket_lp_views import LP_COMPETITION_MAX_AGE
 
-        state = self._competition_state
+        if state is None:
+            with self._competition_lock:
+                state = self._competition_state
         round_checked_at = state.get("round_checked_at")
         now = self.clock()
         entries: dict[str, object] = {}
-        fresh_conditions: set[str] = set()
         raw_map = state.get("competitiveness")
         if isinstance(raw_map, Mapping):
-            for condition_id, value in raw_map.items():
+            requested = (raw_map.items() if condition_ids is None else
+                         ((cid, raw_map.get(cid)) for cid in condition_ids))
+            for condition_id, value in requested:
                 if not isinstance(condition_id, str):
                     continue
                 if isinstance(value, tuple) and len(value) == 2:
@@ -7374,7 +7393,6 @@ class PolymarketLPService:
                     fresh = 0 <= age < LP_COMPETITION_MAX_AGE.total_seconds()
                 if not fresh:
                     continue
-                fresh_conditions.add(condition_id)
                 entries[condition_id] = {
                     "value": entry_value,
                     "checked_at": checked_at,
@@ -7386,10 +7404,11 @@ class PolymarketLPService:
                     ),
                     "source": "fresh",
                 }
-        store_map = self._competition_store_map()
+        missing = None if condition_ids is None else tuple(cid for cid in condition_ids if cid not in entries)
+        store_map = self._competition_store_map(missing) if missing is None or missing else {}
         if store_map:
             for condition_id, (value, checked_at) in store_map.items():
-                if condition_id in fresh_conditions:
+                if condition_id in entries:
                     continue
                 entries[condition_id] = {
                     "value": value,
@@ -7399,18 +7418,32 @@ class PolymarketLPService:
                 }
         return entries
 
-    def _competition_store_map(self) -> dict[str, tuple[Decimal, datetime]]:
+    def _competition_store_map(
+        self, condition_ids: Collection[str] | None = None
+    ) -> dict[str, tuple[Decimal, datetime]]:
         """Read the persisted competition map, tolerating store failures."""
 
         reader = getattr(self.store, "lp_competitiveness_map", None)
         if not callable(reader):
             return {}
         try:
-            store_map = reader()
+            if condition_ids is None:
+                store_map = reader()
+            else:
+                try:
+                    inspect.signature(reader).bind(condition_ids=condition_ids)
+                except (TypeError, ValueError):
+                    store_map = reader()
+                else:
+                    store_map = reader(condition_ids=condition_ids)
         except Exception:
             logger.warning("lp competition store read failed")
             return {}
-        return store_map if isinstance(store_map, dict) else {}
+        if not isinstance(store_map, dict):
+            return {}
+        return store_map if condition_ids is None else {
+            cid: store_map[cid] for cid in condition_ids if cid in store_map
+        }
 
     def _candidate_reservations(self, *, ignore_session_id=None) -> tuple[dict[str, object], ...]:
         reservations: list[dict[str, object]] = []

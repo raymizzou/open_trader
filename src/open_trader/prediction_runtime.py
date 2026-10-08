@@ -1433,7 +1433,7 @@ class PredictionRuntime:
                     return
                 try:
                     refresh_competition(
-                        stop_event=self._reward_stop_event
+                        stop_event=self._reward_stop_event, snapshot=False
                     )
                 except Exception:
                     # A failed competition read keeps the previous cache on
