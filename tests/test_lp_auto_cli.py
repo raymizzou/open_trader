@@ -361,3 +361,30 @@ def test_transport_failures_do_not_retry_or_expose_credentials(service, capsys, 
         assert service.state['desired_running'] is True  # Accepted write was not rolled back.
     if fault in ('nonloopback', 'credentials', 'empty-credentials', 'path', 'https') or fault.startswith('timeout-'):
         assert service.requests == []
+
+
+def test_non_lp_unknown_arguments_keep_argparse_errors(service, capsys):
+    with pytest.raises(SystemExit) as failure:
+        cli.main(['account-sync-status', '--account-url', service.url, '--json', '--unknown-option'])
+    assert failure.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ''
+    assert 'unrecognized arguments' in captured.err
+    assert '--unknown-option' in captured.err
+    assert service.requests == []
+
+
+@pytest.mark.parametrize('action', ['status', 'config', 'on', 'off', 'pause'])
+def test_unknown_lp_arguments_use_json_error_contract(service, capsys, action):
+    before, orders = deepcopy(service.state), deepcopy(service.orders)
+    arguments = ('--budget', '100', '--target-buys', '5') if action == 'config' else ()
+    assert invoke(service, action, *arguments, '--json', '--unknown-option') == 2
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)
+    assert document['result'] == 'UNKNOWN'
+    assert document['reason']
+    assert document['state'] is None
+    assert 'status' in document['next_action']
+    assert 'usage:' not in captured.err and 'Traceback' not in captured.err
+    assert service.requests == []
+    assert service.state == before and service.orders == orders

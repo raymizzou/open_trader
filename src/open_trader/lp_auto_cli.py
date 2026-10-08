@@ -142,7 +142,10 @@ class LPArgumentParser(argparse.ArgumentParser):
 
     def parse_known_args(self, args=None, namespace=None):
         self._json_output = '--json' in (args or [])
-        return super().parse_known_args(args, namespace)
+        parsed, unknown = super().parse_known_args(args, namespace)
+        if unknown:
+            self.error('unrecognized arguments')
+        return parsed, unknown
 
     def error(self, message):
         _emit('UNKNOWN', None, f'Invalid LP Auto arguments; use {self.prog} --help.',

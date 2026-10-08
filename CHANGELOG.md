@@ -11,6 +11,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   各命令支持单文档 JSON、HTTP loopback 限制和有限超时；不确定回执返回 UNKNOWN/2，
   提示只读核对，不重发写请求或伪称回滚，输出遮蔽认证值。新增公开 CLI/HTTP 合同和原暂停回归定向验证；
   本地完整后端、CI 与部署未运行，未在生产启用或修改 Auto。
+  PR 评审修复未知选项的错误边界：各 LP Auto 命令的 `--json` 仍返回单个 UNKNOWN/2 文档，
+  不发送请求；其他 CLI 保留原 argparse 错误。补充五个 LP 动作及非 LP 边界的公开回归。
 
 - #290 LP 候选队列保留固定元数据代次、条件到方向键索引及 SQLite 覆盖行，
   不再在队列返回或逐批续读、排除时保留全量展开的方向/元数据字典。
