@@ -3,6 +3,16 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-08
+
+- PR #285 对齐容器解释器安全回归：用 `make -n test` 展开的真实 Docker run 命令替代旧 Makefile 赋值文本断言，
+  在普通及 CI 记录两种模式中严格核对容器 Python 路径、字面 `pytest`、宿主解释器隔离及 metrics/JUnit 参数。
+  保留其余宿主解释器门禁断言；修复 nodeid 两种模式、104 项定向检查及 78 个 subtest 本地通过，不执行真实 Docker。
+  保留暂停护栏首次 8 通过、1 个准备期间响应耗时断言失败（1.596 秒，要求小于 1 秒）的证据。
+  同一护栏的受控环境对照支持原生 urllib 系统代理路径为延迟贡献因素；仅在检查命令中设置
+  `no_proxy=127.0.0.1,localhost,::1` 后，未插桩的 9 项暂停护栏单次通过；未改测试、阈值、源码或系统代理配置。
+  原 push/PR 的 legacy 失败证据保留；未宣称新远端 CI 通过，未部署或改变业务代码。
+
 ## 2026-10-07
 
 - #282 LP 历史准备在阶段结束时释放已消费的重试快照；历史批次由 SQLite 按标的及 metadata 阶段范围筛选到期重试，
