@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-08
 
+- #292 新增 LP Auto CLI 的 `status`、`config`、`on`、`off`，保留同义 `pause`；
+  通过运行中的 Prediction 服务与 Dashboard 共用状态。配置使用当前版本栅栏且不启用，
+  开启保留已保存参数并显示实际阻塞状态；关闭只暂停新增 BUY，保留订单和退出保护。
+  各命令支持单文档 JSON、HTTP loopback 限制和有限超时；不确定回执返回 UNKNOWN/2，
+  提示只读核对，不重发写请求或伪称回滚，输出遮蔽认证值。新增公开 CLI/HTTP 合同和原暂停回归定向验证；
+  本地完整后端、CI 与部署未运行，未在生产启用或修改 Auto。
+
 - #290 LP 候选队列保留固定元数据代次、条件到方向键索引及 SQLite 覆盖行，
   不再在队列返回或逐批续读、排除时保留全量展开的方向/元数据字典。
   同路径协调 #284：历史摘要按最多 400 个方向在同一 SQLite 读快照中消费，

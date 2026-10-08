@@ -253,6 +253,7 @@ def test_pause_can_persist_when_scheduler_is_unavailable(tmp_path):
 
 def test_cli_uses_one_deadline_for_bootstrap_and_pause(monkeypatch, capsys):
     from io import BytesIO
+    from open_trader import lp_auto_cli
 
     clock = [100.0]
     calls = []
@@ -268,8 +269,8 @@ def test_cli_uses_one_deadline_for_bootstrap_and_pause(monkeypatch, capsys):
             assert timeout == pytest.approx(0.15)
             raise TimeoutError("pause exceeded the remaining shared deadline")
 
-    monkeypatch.setattr(cli, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    monkeypatch.setattr(cli, "build_opener", lambda *args: Opener())
+    monkeypatch.setattr(lp_auto_cli, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(lp_auto_cli, "build_opener", lambda *args: Opener())
     assert cli.main(["prediction-arb", "lp-auto", "pause", "--url", "http://127.0.0.1:8769", "--timeout", "0.3"]) == 2
     output = capsys.readouterr().out
     assert "UNKNOWN" in output and "PAUSED" not in output
