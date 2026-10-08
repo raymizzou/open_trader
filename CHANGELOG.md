@@ -11,7 +11,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
   负责阻断修复、评论证据与交接，不以 CI 全绿、outdated 或代码变化代替反馈核查。
   明确 reviewer 结果评论的单 PR 授权、精确 SHA 门禁及 worker 收尾条件，保留独立合并和部署授权。
   文档静态检查完成；各 head 的交付证据保存在 PR/交接记录，旧 head 的评审及 CI 不转移。
-  未运行后端或部署。
+  修复 CI 命令计划测试误报：不透明 SOURCE_SHA 含端口数字时触发既有禁用词断言；
+  两个 make dry-run 命令现使用固定 40 位十六进制 SHA，保留全部禁用词及正负断言。
+  该单项测试本地 Python 3.12.12 定向 1 项通过（CI 为 3.12.14），保留既有依赖弃用警告；
+  未运行本地全套或部署，修复后的远端 CI 待验证。
 
 ## 2026-10-08
 
