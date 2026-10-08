@@ -188,9 +188,11 @@ Use four explicit stages with exact-SHA evidence:
    Shared production changes run the union of relevant consumer tests, not whole
    services. Docker is optional for focused diagnosis, not a prerequisite to push.
    GitHub CI runs all four backend services (`gateway`, `legacy`, `account`,
-   `prediction`) with `TEST_N_LEG=1` on every branch push and PR targeting `main`,
+   `prediction`) with `TEST_N_LEG=0` and the [permanent retirement manifest](docs/operations/ci-nleg-retirement.md)
+   on every branch push and PR targeting `main`,
    including merged-main pushes and docs-only, LP-only or trend-only changes.
-   Full backend CI excludes `pressure` and `browser`. Push-head and PR-merge runs
+   Active backend CI excludes `pressure` and `browser`; only the reviewed N-leg
+   files are retired. Push-head and PR-merge runs
    intentionally test distinct SHA identities; legacy already covers trend tests.
    CI uses the locked Docker dev image and offline test containers without host
    mounts, forwarded credentials, Docker socket or published ports. It does not

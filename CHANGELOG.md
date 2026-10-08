@@ -3,6 +3,23 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-08
+
+- PR #285 对齐容器解释器安全回归：用 `make -n test` 展开的真实 Docker run 命令替代旧 Makefile 赋值文本断言，
+  在普通及 CI 记录两种模式中严格核对容器 Python 路径、字面 `pytest`、宿主解释器隔离及 metrics/JUnit 参数。
+  保留其余宿主解释器门禁断言；修复 nodeid 两种模式、104 项定向检查及 78 个 subtest 本地通过，不执行真实 Docker。
+  保留暂停护栏首次 8 通过、1 个准备期间响应耗时断言失败（1.596 秒，要求小于 1 秒）的证据。
+  同一护栏的受控环境对照支持原生 urllib 系统代理路径为延迟贡献因素；仅在检查命令中设置
+  `no_proxy=127.0.0.1,localhost,::1` 后，未插桩的 9 项暂停护栏单次通过；未改测试、阈值、源码或系统代理配置。
+  原 push/PR 的 legacy 失败证据保留；未宣称新远端 CI 通过，未部署或改变业务代码。
+
+- PR #285 修复 pytest 子测试证据核算：此前新 push/PR 的 legacy 均通过 5297 项测试及 82 个子测试，
+  但成功证据校验因 JUnit 总数包含子测试而失败。记录器现将真实子报告与父节点阶段分开，保留结果、耗时及 worker；
+  共用校验器严格核对父 testcase 加子报告总数，以及父/子跳过记录和 XML 元素数量，拒绝失败子报告冒充成功。
+  真实串行/双 worker 的通过、多个跳过及失败子测试回归通过，计数和子报告篡改均被拒绝；
+  本地定向 109 项及 78 个 subtest、宿主 stdlib 32 项检查通过。保留全部原失败及未改写的 CI/JUnit 记录，
+  未运行完整 legacy 套件、部署或宣称修复后的远端 CI 已通过。
+
 ## 2026-10-07
 
 - #282 LP 历史准备在阶段结束时释放已消费的重试快照；历史批次由 SQLite 按标的及 metadata 阶段范围筛选到期重试，
@@ -18,6 +35,21 @@ operator-facing: what changed, which workflow is affected, and what was verified
   同环境离线 40 市场/80 方向合成对照：方向 SQLite 页占用 5,365,760→77,824 字节，序列化载荷 5,341,600→54,600 字节；
   已发布元数据占用不变，每次构建增加 400 次临时库 SELECT。完整队列仍保存完整详情，Python 最终分配略增，
   不将临时库节省等同 RSS 节省；单次计时不构成速度保证，cgroup 和云端容量未验证。未部署。
+
+- #279 澄清任务工作树规则：保留本地 `main` 的分叉提交及改动，从新抓取的
+  `origin/main` 创建任务；任务 checkout 的 `AGENTS.md` 与其链接的运行手册一起读取，
+  不把单独复制 `AGENTS.md` 当作迁移源码或工作流。已核对文档差异、Markdown 链接目标
+  和 `git diff --check`；未进行运行时、测试、CI、部署或机器一致性验证。
+
+- #279 将 N-leg 视为永久停用：默认 CI 仍要求四个后端服务和 non-LIVE portable，
+  仅把显式审定的 29 个专属文件记为未执行；三份共享文件、LP、暂停及 paused-shadow 护栏保持活动。
+  Make、CI 和部署证据共用严格选择策略；完整收集必须等于活动执行与退役集合的不相交并集。
+  新增 nodeid、阶段耗时、结果及 JUnit 记录，保留失败退出码；预检拒绝遗漏 LP/暂停执行、策略/哈希篡改、旧 attempt 与 false-full 证明。
+  Python 3.12.14 锁环境下修复后定向 103 项及 78 个 subtest 通过；此前 9 个暂停护栏通过；串行/双 worker 的真实 pytest 记录验证通过，保留 nodeid 中的 `@` 参数；
+  CPU 型号与架构分列并记录来源，原生读取及不可用时显式 unknown 的回归通过。
+  成功证据必须含完整阶段、环境与 CPU 状态；生产者和预检共用 JUnit 解析校验，拒绝空/重复/遗漏 testcase、
+  不一致的身份/结果及非有限耗时；失败仍保留部分记录和原始退出码。
+  历史失败证据保留，未运行全后端、GitHub CI 或部署；同源双 worker 耗时对照待稳定评审后进行，尚不宣称节省。
 
 - 开发规则随项目统一：明确 TDD、任务委派、Herdr 实施模型和 Ponytail 的适用边界，
   不再依赖某台机器未定义的全局约定。新增 Air/Mini 独立开发环境设置与逐项比对步骤，

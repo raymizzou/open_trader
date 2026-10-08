@@ -216,8 +216,9 @@ watchlist 使用市场、标的和 Trend Animals 业务标识：
    Docker 可用于定向诊断，但不是推送已审查分支的前置条件。
    GitHub CI 在每次分支 push、每个目标为 `main` 的 PR 合并候选及合并后的 main push
    上运行 `gateway`、`legacy`、`account`、`prediction` 四个服务，统一
-   `TEST_N_LEG=1`；纯文档、LP、趋势或缺失 diff 均不缩减覆盖。
-   全后台测试排除 `pressure` 和 `browser`；push head 与 PR merge 分别验证不同 SHA，
+   `TEST_N_LEG=0` 并使用[永久停用清单](docs/operations/ci-nleg-retirement.md)；
+   仅审定的 N-leg 专属集合不执行，纯文档、LP、趋势或缺失 diff 均不缩减活动覆盖。
+   活动后台测试排除 `pressure` 和 `browser`；push head 与 PR merge 分别验证不同 SHA，
    有意保留两次运行，legacy 已包含趋势测试。CI 使用锁定依赖的 Docker dev 镜像和
    无网络、宿主挂载、转发凭据、Docker socket 或发布端口的测试容器，不运行下述部署门禁。
 2. **部署前 Candidate Acceptance**：仅在 GitHub PR 合并后准备明确授权的部署时，

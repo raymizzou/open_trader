@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "policy": "permanent-nleg-retirement-v1",
+  "retired": [
+    {
+      "path": "tests/test_prediction_executable_cost.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_live_resolver.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_market_solution.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_monitor_selection.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_canary_report.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_confirm.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_driver.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_episodes.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_execution.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_fail_closed_e2e.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_lineage_inheritance.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_metrics.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_mode.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_oracle.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_preflight.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_read_model.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_shadow.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_terminal_check.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_validation.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_n_leg_validation_books.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_partial_fill.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_snapshot_scheduler.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_solver.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_solver_backends.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_solver_benchmark.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_solver_server.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_solver_verified.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_prediction_solver_worker.py",
+      "reason": "N-leg permanently retired"
+    },
+    {
+      "path": "tests/test_run_nleg_no_submit_validation.py",
+      "reason": "N-leg permanently retired"
+    }
+  ]
+}

@@ -18,8 +18,8 @@ reuses their evidence and does not run backend pytest or build a Docker image.
 The backend still excludes `pressure` and `browser`. Gateway, Account and Legacy
 remain serial. Prediction keeps two xdist workers and its explicit shared-port
 and solver-fixture groups. Portable scenarios run serially. CI checks collected
-nodeids against the full backend collection so new files, nested tests, marker
-changes and omitted partitions cannot silently reduce coverage. The old single
+executed active plus explicitly retired nodeids against the full backend
+collection so new files, nested tests, marker changes and omitted partitions cannot silently reduce coverage. The old single
 cross-service pytest session is not reproduced: arbitrary global test ordering
 is different. No second full backend execution is added to compensate for an
 unspecified ordering dependency. Tests with a real shared-session contract must
@@ -39,10 +39,19 @@ label. Missing API access is BLOCKED. It requires:
 - The correct workflow path, completed current run attempt, all four services,
   portable scenarios and the exact `required` check from GitHub Actions app 15368
 - Unexpired artifacts from that same run and attempt, with matching source,
-  repository, scope, N-leg selection, lock, test and environment metadata
+  repository, scope, active selection, permanent retirement manifest/policy, lock,
+  test metrics and environment metadata
 - The actual selected Python environment, checked read-only against the runtime
   dependency closure in that checkout's `uv.lock`, including selected extras,
   and code imports from that release's source
+
+Each service's recorded executions must equal its active partition in the
+portable collection proof. The proof's retired collection is explicitly not
+executed and is never required to be passed. The preflight checks the exact
+manifest and selection digests against the selected checkout. It rejects missing
+LP/pause executions, unknown policies and false full-coverage claims. There is
+no fixed `TEST_N_LEG=1` requirement and no periodic N-leg full regression.
+See [the permanent retirement policy](ci-nleg-retirement.md).
 
 A later main commit does not invalidate a selected release that has its own
 successful main-push evidence and remains in main history. PR-head and synthetic
