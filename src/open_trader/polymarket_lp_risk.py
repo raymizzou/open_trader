@@ -171,6 +171,25 @@ def _levels(value: object, name: str) -> list[tuple[Decimal, Decimal]]:
     return rows
 
 
+def _select_bid_level(
+    bids: Sequence[tuple[Decimal, Decimal]], level: int = 1
+) -> tuple[Decimal, Decimal]:
+    """Return a distinct positive-size bid level in descending price order."""
+
+    if type(level) is not int or level < 1:
+        raise ValueError("bid_level_invalid")
+    by_price: dict[Decimal, Decimal] = {}
+    for price, size in bids:
+        by_price[price] = by_price.get(price, Decimal("0")) + size
+    ordered = sorted(
+        ((price, size) for price, size in by_price.items() if size > 0),
+        reverse=True,
+    )
+    if len(ordered) < level:
+        raise ValueError("second_bid_insufficient")
+    return ordered[level - 1]
+
+
 def _qualify_reward_quote(
     bids: Sequence[tuple[Decimal, Decimal]],
     asks: Sequence[tuple[Decimal, Decimal]],
@@ -470,8 +489,9 @@ def estimate_lp_stress_exit(
     price: Decimal,
     quantity: Decimal,
     own_orders: object = (),
+    bid_level: int = 1,
 ) -> dict[str, object]:
-    """Estimate full exit value after removing the proposed best-bid level."""
+    """Estimate full exit value after removing the actual best bid level."""
 
     unknown = {
         "state": "unknown",
@@ -511,8 +531,15 @@ def estimate_lp_stress_exit(
         unknown["reason_codes"] = ["book_unknown"]
         return unknown
     best_bid = max(level_price for level_price, _ in bids)
-    if best_bid != price:
-        unknown["reason_codes"] = ["best_bid_changed"]
+    try:
+        selected_bid, _selected_bid_size = _select_bid_level(bids, bid_level)
+    except ValueError as exc:
+        unknown["reason_codes"] = [str(exc)]
+        return unknown
+    if selected_bid != price:
+        unknown["reason_codes"] = [
+            "best_bid_changed" if bid_level == 1 else "bid_level_changed"
+        ]
         return unknown
 
     bid_size_by_price, order_error = _external_bid_sizes(
@@ -528,7 +555,7 @@ def estimate_lp_stress_exit(
     remaining_bids = {
         level_price: size
         for level_price, size in bid_size_by_price.items()
-        if level_price != price
+        if level_price != best_bid
     }
     gross_exit_value, exit_fee = _lp_exit_values(market, remaining_bids, quantity)
     if gross_exit_value is None:
@@ -911,6 +938,7 @@ def evaluate_lp_entry(
     now: datetime,
     reservations: object = (),
     candidate: bool = False,
+    bid_level: int = 1,
 ) -> dict[str, object]:
     """Return a manual LP entry guide when current input facts pass risk checks."""
 
@@ -1041,9 +1069,13 @@ def evaluate_lp_entry(
         return {"state": "unknown", "reason_codes": ["account_facts_unknown"], "guidance": None}
     if not bids or not asks:
         return {"state": "unknown", "reason_codes": ["book_invalid"], "guidance": None}
-    price = max(level_price for level_price, _ in bids)
+    try:
+        price, _selected_bid_size = _select_bid_level(bids, bid_level)
+    except ValueError as exc:
+        return {"state": "unknown", "reason_codes": [str(exc)], "guidance": None}
+    best_bid = max(level_price for level_price, _ in bids)
     best_ask = min(level_price for level_price, _ in asks)
-    if price >= best_ask:
+    if best_bid >= best_ask or price >= best_ask:
         return {"state": "unknown", "reason_codes": ["book_crossed"], "guidance": None}
 
     tick = _maybe_decimal(market.get("tick_size"))
@@ -1102,6 +1134,7 @@ def evaluate_lp_entry(
         market=market,
         price=price,
         quantity=quantity,
+        bid_level=bid_level,
     )
     if stress["state"] != "eligible":
         return {"state": stress["state"], "reason_codes": list(stress["reason_codes"]), "guidance": None}
@@ -1117,6 +1150,7 @@ def evaluate_lp_entry(
     guidance.update(
         {
             "price": price,
+            "bid_level": bid_level,
             "quantity": quantity,
             "required_capital": capital,
             "minimum_order_size": minimum,

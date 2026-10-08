@@ -38,6 +38,7 @@ from .polymarket_lp_risk import (
     _maybe_decimal,
     _projected_taker_fee,
     _qualify_reward_quote,
+    _select_bid_level,
     _timestamp,
     estimate_lp_queue_position,
     estimate_lp_target_share_yield,
@@ -7420,6 +7421,20 @@ class PolymarketLPService:
                 continue
             order_id = str(session.get("entry_order_id") or "").strip()
             if not order_id:
+                actions = self.store.lp_actions(str(session["session_id"]))
+                history = self._order_history(session)
+                has_buy = any(str(record.get("side") or "").upper() == "BUY"
+                              for record in history.values()) or any(
+                                  unresolved_buy_action(action)
+                                  and not buy_action_is_covered(session, action)
+                                  for action in actions)
+                has_sell = bool(session.get("passive_exit_order_id")) or any(
+                    str(record.get("side") or "").upper() == "SELL"
+                    for record in history.values())
+                if has_sell and not has_buy:
+                    # A SELL-only imported or manual session has no BUY
+                    # principal to reserve against candidate admission.
+                    continue
                 order_id = f"lp-session:{session.get('session_id', '')}"
             history = self._order_history(session)
             if str(history.get(order_id, {}).get("status") or "").upper() in TERMINAL_ORDER_STATES:
@@ -7800,7 +7815,8 @@ class PolymarketLPService:
         return {"account": dict(account), "direction": direction}
 
     def _read_candidate_snapshot(
-        self, identity: Mapping[str, object], *, now: datetime, ignore_session_id=None, account=None
+        self, identity: Mapping[str, object], *, now: datetime, ignore_session_id=None,
+        account=None, bid_level=None,
     ) -> dict[str, object]:
         if not self._candidate_allowed(((str(identity.get("condition_id") or ""), str(identity.get("token_id") or "")),)):
             raise ValueError("candidate_cooling_down")
@@ -7809,6 +7825,8 @@ class PolymarketLPService:
         if self.exclusions_enabled and exclusion_revision != self._candidate_exclusion_revision:
             raise ValueError("candidate_exclusions_changed")
         account, direction = facts["account"], facts["direction"]
+        if bid_level is None:
+            bid_level = identity.get("candidate_bid_level", identity.get("bid_level", 1))
         evaluation_now = self._now()
         evaluated = evaluate_lp_entry(
             direction,
@@ -7816,6 +7834,7 @@ class PolymarketLPService:
             now=evaluation_now,
             reservations=self._candidate_reservations(ignore_session_id=ignore_session_id),
             candidate=True,
+            bid_level=bid_level,
         )
         if evaluated.get("state") != "eligible":
             reasons = evaluated.get("reason_codes")
@@ -7849,7 +7868,11 @@ class PolymarketLPService:
             raise ValueError("candidate_cooling_down")
         evaluated = snapshot.get("candidate_evaluation")
         if not isinstance(evaluated, Mapping) or evaluated.get("state") != "eligible":
-            snapshot = self._read_candidate_snapshot(identity, now=now)
+            snapshot = self._read_candidate_snapshot(
+                identity,
+                now=now,
+                bid_level=identity.get("candidate_bid_level", identity.get("bid_level", 1)),
+            )
             evaluated = snapshot.get("candidate_evaluation")
         guidance = evaluated.get("guidance") if isinstance(evaluated, Mapping) else None
         if not isinstance(guidance, Mapping) or not _lp_guidance_is_usable(guidance):
@@ -7961,6 +7984,7 @@ class PolymarketLPService:
                     "quantity": quantity,
                     "review_at": review_at,
                     "candidate_policy": "best_bid_minimum",
+                    "candidate_bid_level": eligible.get("bid_level", 1),
                 }
             )
             facts = self._validate_snapshot(
@@ -8236,16 +8260,20 @@ class PolymarketLPService:
                 self._require_lp_history(request, now=now)
                 # Issue 158: same submit-time best-bid re-check as start.
                 credential_preflight = preview.get("preflight")
-                credential_best_bid = (
-                    _maybe_decimal(credential_preflight.get("best_bid"))
+                credential_selected_bid = (
+                    _maybe_decimal(
+                        credential_preflight.get(
+                            "selected_bid", credential_preflight.get("best_bid")
+                        )
+                    )
                     if isinstance(credential_preflight, Mapping)
                     else None
                 )
                 if (
-                    credential_best_bid is not None
-                    and credential_best_bid != facts["best_bid"]
+                    credential_selected_bid is not None
+                    and credential_selected_bid != facts["selected_bid"]
                 ):
-                    raise ValueError("best_bid_changed")
+                    raise ValueError("candidate_bid_level_changed")
                 expiration = expiration_for_review(
                     _timestamp(request["review_at"], name="review_at"), now=now
                 )
@@ -10203,20 +10231,25 @@ class PolymarketLPService:
                 if str(exc) == "candidate_best_bid_changed":
                     return {"state": "rejected", "reason": "best_bid_changed"}
                 return {"state": "rejected", "reason": str(exc)}
-            # Issue 163 定案 1（评审修复 P1）：默认试挂单锚定本次唯一快照的
-            # 盘口顶档买一 max(bids)——与 _validate_snapshot 的 candidate 检查
-            # 同源同口径（候选行 guidance 价与 UI 预填价即顶档）。奖励资格买一
-            # （facts["best_bid"]，自顶档向下累计到 reward_min_size 才落定）在
-            # 薄顶档市场低于顶档，不得用作锚，否则确认价=顶档时两个检查互斥、
-            # 提交被永久锁死。5%/custom plans do not anchor.
+            # Candidate submissions anchor to the selected configured bid level
+            # from this one snapshot. Manual/custom plans do not anchor.
             if normalized.get("candidate_policy") == "best_bid_minimum":
                 book = snapshot.get("book")
                 bids = self._levels(book.get("bids"), "bids")
-                if (
-                    cast(Decimal, normalized["price"])
-                    != max(level_price for level_price, _ in bids)
-                ):
-                    return {"state": "rejected", "reason": "best_bid_changed"}
+                try:
+                    selected_bid, _selected_bid_size = _select_bid_level(
+                        bids,
+                        normalized.get(
+                            "candidate_bid_level", normalized.get("bid_level", 1)
+                        ),
+                    )
+                except ValueError as exc:
+                    return {"state": "rejected", "reason": str(exc)}
+                if cast(Decimal, normalized["price"]) != selected_bid:
+                    return {
+                        "state": "rejected",
+                        "reason": "candidate_bid_level_changed",
+                    }
             try:
                 expiration = expiration_for_review(
                     _timestamp(normalized["review_at"], name="review_at"),
@@ -12293,10 +12326,12 @@ class PolymarketLPService:
             targets: list[str] = []
             patch: dict[str, object] = {}
             protected_id = str(current.get("protected_exit_order_id") or "")
-            for key, requested_key in (
+            cancel_fields = [
                 ("entry_order_id", "entry_cancel_requested"),
-                ("passive_exit_order_id", "passive_cancel_requested"),
-            ):
+            ]
+            if reason != "group_fill_collect":
+                cancel_fields.append(("passive_exit_order_id", "passive_cancel_requested"))
+            for key, requested_key in cancel_fields:
                 order_id = str(current.get(key) or "")
                 if (
                     order_id
@@ -12312,6 +12347,8 @@ class PolymarketLPService:
             }
             for order_id, record in history.items():
                 if (
+                    reason == "group_fill_collect"
+                    or
                     not order_id
                     or order_id == protected_id
                     or order_id in targets
@@ -13002,6 +13039,7 @@ class PolymarketLPService:
                 snapshot=snapshot,
                 expected_generation=snapshot.get("_lp_trade_generation"),
                 expected_trade_revision=trade_revision,
+                buy_only=True,
             )
         except ValueError as exc:
             if str(exc) == "account_round_invalid":
@@ -13147,6 +13185,11 @@ class PolymarketLPService:
             if result.get("review_at") is None
             else _timestamp(result.get("review_at"), name="review_at")
         )
+        if result.get("candidate_policy") == "best_bid_minimum":
+            level = result.get("candidate_bid_level", result.get("bid_level", 1))
+            if type(level) is not int or level not in (1, 2):
+                raise ValueError("bid_level_invalid")
+            result["candidate_bid_level"] = level
         return result
 
     def _read_snapshot(
@@ -13486,10 +13529,17 @@ class PolymarketLPService:
         bids = cls._levels(book.get("bids"), "bids")
         if not asks or not bids:
             raise ValueError("book_invalid")
+        selected_bid, _selected_bid_size = _select_bid_level(
+            bids,
+            request.get("candidate_bid_level", request.get("bid_level", 1)),
+        )
         if candidate_policy == "best_bid_minimum":
-            external_best_bid = max(level_price for level_price, _ in bids)
-            if price != external_best_bid:
-                raise ValueError("candidate_best_bid_changed")
+            if price != selected_bid:
+                level = request.get("candidate_bid_level", request.get("bid_level", 1))
+                raise ValueError(
+                    "candidate_best_bid_changed" if level == 1
+                    else "candidate_bid_level_changed"
+                )
         bid, ask, midpoint = _qualify_reward_quote(
             bids,
             asks,
@@ -13514,6 +13564,10 @@ class PolymarketLPService:
             "allowance": allowance_d,
             "midpoint": midpoint,
             "best_bid": bid[0],
+            "selected_bid": selected_bid,
+            "selected_bid_level": request.get(
+                "candidate_bid_level", request.get("bid_level", 1)
+            ),
             "best_ask": ask[0],
             "midpoint_source": "local_size_filtered_estimate",
             "checked_at": now,
@@ -17050,6 +17104,13 @@ class PolymarketLPService:
             if current_id != order_id:
                 continue
             status = str(_field(order, "status", "")).upper()
+            if status in TERMINAL_ORDER_STATES and session is not None:
+                prior = self._order_history(session).get(order_id, {})
+                if (str(prior.get("status") or "").upper() == "UNKNOWN"
+                        and not self._verified_fill_completed(session, order_id, prior)):
+                    # A terminal-looking aggregate row cannot resolve an old
+                    # BUY whose receipt lacks the original size/terminal proof.
+                    return False
             return status in TERMINAL_ORDER_STATES
         if session is not None:
             status = str(self._order_history(session).get(order_id, {}).get("status") or "").upper()
@@ -17332,6 +17393,7 @@ class PolymarketLPService:
         snapshot: Mapping[str, object] | None = None,
         expected_generation: int | None = None,
         expected_trade_revision: int | None = None,
+        buy_only: bool = False,
     ) -> None:
         current = dict(self.store.lp_session(str(session["session_id"])) or session)
         if current.get("order_identity_conflict"):
@@ -17340,10 +17402,10 @@ class PolymarketLPService:
         history = self._order_history(current)
         pending_cancels = self._recent_pending_cancel_order_ids(session_id)
         specs: list[tuple[str, str, str]] = []
-        for key, requested_key, role in (
-            ("entry_order_id", "entry_cancel_requested", "entry"),
-            ("passive_exit_order_id", "passive_cancel_requested", "passive_exit"),
-        ):
+        cancel_fields = [("entry_order_id", "entry_cancel_requested", "entry")]
+        if not buy_only:
+            cancel_fields.append(("passive_exit_order_id", "passive_cancel_requested", "passive_exit"))
+        for key, requested_key, role in cancel_fields:
             order_id = str(current.get(key) or "")
             if not order_id or bool(current.get(requested_key)) or order_id in pending_cancels:
                 continue
@@ -17366,6 +17428,8 @@ class PolymarketLPService:
         }
         for order_id, record in history.items():
             if (
+                buy_only
+                or
                 str(record.get("side") or "").upper() != "SELL"
                 or not order_id
                 or order_id in managed
@@ -17603,6 +17667,16 @@ class PolymarketLPService:
         if self._has_unresolved_submission(session):
             return
         history = self._order_history(session)
+        if any(
+            str(record.get("side") or "").upper() == "BUY"
+            and str(record.get("status") or "").upper() == "UNKNOWN"
+            and not self._verified_fill_completed(session, order_id, record)
+            for order_id, record in history.items()
+        ):
+            # A filled quantity and current inventory do not resolve an old
+            # BUY receipt whose original size or terminal proof is missing.
+            # Keep the existing exit identity until that prerequisite is known.
+            return
         managed_passive = str(session.get("passive_exit_order_id") or "")
         blocking_sells = [
             order_id

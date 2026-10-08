@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-08
 
+- #288 自动池将独立 UNKNOWN SELL 保留为审计且不计入未确认回款，但不再单独占用 BUY 名额、资金或阻止有效的 100/5 配置与补位；未知 BUY、身份/账户事实和代次栅栏仍阻止新增。导入持仓的旧 BUY 回执 UNKNOWN 时保留现有被动 SELL，避免重复撤单/重挂；未知前置订单仍不授权新的退出。新增持久化 `buy_price_level`（1/2，旧存储文档缺字段默认 1、后续旧请求省略时保留原值）；自动 BUY 的 2 档为第二高的不同正深度买价，候选、收益估算、提交和 POST 前复核统一使用该价，缺档或漂移拒绝且不回退。评审修复同时拒绝真实买卖盘交叉，并按实际买一计算 2 档压力退出；Issue #288 新增合同 11 项、直接调用方 35 项和 review-v2 定向 10 项在锁环境中修复后通过；全套及部署未运行。
+
 - PR #285 对齐容器解释器安全回归：用 `make -n test` 展开的真实 Docker run 命令替代旧 Makefile 赋值文本断言，
   在普通及 CI 记录两种模式中严格核对容器 Python 路径、字面 `pytest`、宿主解释器隔离及 metrics/JUnit 参数。
   保留其余宿主解释器门禁断言；修复 nodeid 两种模式、104 项定向检查及 78 个 subtest 本地通过，不执行真实 Docker。

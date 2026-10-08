@@ -22,7 +22,8 @@ ZERO = Decimal('0')
 def default_account_pool_document(path, pool_account_id: str | None, now: datetime) -> dict[str, object]:
     return dict(run_id=uuid.uuid5(uuid.NAMESPACE_URL, str(Path(path).resolve()) + str(pool_account_id)).hex,
         account_id=pool_account_id, config_version=0, desired_running=False, ever_enabled=False,
-        enabled_at=None, target_buy_count=0, budget_usd=None, allocations=[], intents={}, events={},
+        enabled_at=None, target_buy_count=0, budget_usd=None, buy_price_level=1,
+        allocations=[], intents={}, events={},
         rounds={}, last_round={}, last_reconciled_at=None, updated_at=now.isoformat())
 
 
@@ -525,6 +526,20 @@ def has_independent_unresolved_action(session, actions) -> bool:
         if (action.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
                 or action.get('state') == 'accepted' and action.get('side') in {'BUY', 'SELL'}
                 and not action.get('order_id') and kind != 'cancel'):
+            return True
+    return False
+
+
+def has_independent_unresolved_buy_action(session, actions) -> bool:
+    """Return whether an unresolved extra BUY still needs account admission."""
+    for action in actions:
+        if action.get('side') != 'BUY' or buy_action_is_covered(session, action):
+            continue
+        kind = submission_action_kind(action)
+        if kind == 'entry':
+            continue
+        if (action.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
+                or action.get('state') == 'accepted' and not action.get('order_id')):
             return True
     return False
 
