@@ -4345,8 +4345,15 @@ class PredictionArbitrageStore:
         *,
         now: datetime,
         condition_ids: Iterable[str] | None = None,
+        metadata_condition_ids: Iterable[str] | None = None,
     ) -> list[dict[str, object]]:
-        """Atomically spend due retries that the caller is ready to dispatch."""
+        """Atomically spend due retries that the caller is ready to dispatch.
+
+        With metadata_condition_ids, condition_ids selects any stage and the
+        additional scope selects metadata only. This history-dispatch mode
+        filters waiting, due rows before hydrating them. The original initial
+        claim mode remains unchanged when the additional scope is omitted.
+        """
 
         current = _canonical_timestamp(now)
         now_moment = _parse_timestamp(current)
@@ -4356,14 +4363,72 @@ class PredictionArbitrageStore:
                 str(value).strip() for value in condition_ids if str(value).strip()
             )
         )
-        if identities == ():
+        stage_scoped = metadata_condition_ids is not None
+        metadata_identities = () if metadata_condition_ids is None else tuple(
+            dict.fromkeys(
+                str(value).strip() for value in metadata_condition_ids if str(value).strip()
+            )
+        )
+        if stage_scoped:
+            identities = identities or ()
+            target_conditions = set(identities)
+            metadata_identities = tuple(
+                value for value in metadata_identities if value not in target_conditions
+            )
+        if identities == () and not metadata_identities:
             return claimed
         entered_here = self._lp_preparation_owner_entered_here()
         if not entered_here and self._lp_preparation_owner_handle is None:
             return claimed
         try:
             with self._transaction() as connection:
-                if identities is None:
+                if stage_scoped:
+                    # Match the history caller's timestamp parser, including
+                    # aware offset forms and its malformed-deadline failure.
+                    # SQLite evaluates eligibility without creating Python row
+                    # snapshots for future, paused, or spent retries.
+                    deadline_errors: list[ValueError] = []
+
+                    def dispatch_due(deadline: object, paused: int, retry_used: int) -> bool:
+                        try:
+                            if not isinstance(deadline, str):
+                                raise ValueError("next_retry_at_invalid")
+                            text = deadline.strip()
+                            if text.endswith("Z"):
+                                text = text[:-1] + "+00:00"
+                            moment = datetime.fromisoformat(text)
+                            if moment.tzinfo is None:
+                                raise ValueError("next_retry_at_invalid")
+                            due = moment.astimezone(timezone.utc) <= now_moment
+                        except ValueError:
+                            if not deadline_errors:
+                                deadline_errors.append(ValueError("next_retry_at_invalid"))
+                            return False
+                        return due and paused == 0 and retry_used == 0
+
+                    connection.create_function("lp_dispatch_retry_due", 3, dispatch_due)
+                    batch_size = max(1, connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+                    rows = []
+                    for scoped_ids, stage_filter in (
+                        (identities, ""),
+                        (metadata_identities, "AND stage='metadata'"),
+                    ):
+                        for offset in range(0, len(scoped_ids), batch_size):
+                            batch = scoped_ids[offset : offset + batch_size]
+                            placeholders = ",".join("?" for _ in batch)
+                            rows.extend(connection.execute(
+                                f"""
+                                SELECT * FROM lp_preparation_items
+                                WHERE state='waiting_retry' AND next_retry_at IS NOT NULL
+                                  AND condition_id IN ({placeholders}) {stage_filter}
+                                  AND lp_dispatch_retry_due(next_retry_at,paused,retry_used)
+                                """,
+                                batch,
+                            ).fetchall())
+                    if deadline_errors:
+                        raise deadline_errors[0]
+                    rows.sort(key=lambda row: (row["next_retry_at"], row["condition_id"]))
+                elif identities is None:
                     rows = connection.execute(
                         """
                         SELECT * FROM lp_preparation_items
