@@ -6183,6 +6183,25 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
     import open_trader.prediction_runtime as runtime_module
 
     clock = [datetime(2026, 9, 18, 12, 0, tzinfo=UTC)]
+    clock_lock = threading.Lock()
+
+    @contextmanager
+    def clock_boundary():
+        # Use the same real-time watchdog as the fixture's event waits. Logical
+        # time must not expire facts midway through a real candidate refresh.
+        assert clock_lock.acquire(timeout=2), "fixture clock boundary did not become available"
+        try:
+            yield
+        finally:
+            clock_lock.release()
+
+    class ClockStableLP(PolymarketLPService):
+        def refresh_candidates(
+            self, *, stop_event: threading.Event | None = None, force: bool = False
+        ) -> dict[str, object]:
+            with clock_boundary():
+                return super().refresh_candidates(stop_event=stop_event, force=force)
+
     history_calls: list[tuple[str, ...]] = []
     history_wait_calls: list[float] = []
     notifications: list[tuple[str, str]] = []
@@ -6405,6 +6424,7 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
     )
     monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
     monkeypatch.setattr(runtime_module, "PredictionExecutionService", TestExecution)
+    monkeypatch.setattr(runtime_module, "PolymarketLPService", ClockStableLP)
     monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 3600)
     monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 3600)
     monkeypatch.setattr(runtime_module, "_LP_SHARE_WATCH_SECONDS", 3600)
@@ -6420,19 +6440,24 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
             hourly_wait.set()
             return stop_event.wait()
         if 0 < seconds < 3600:
-            retry_deadline = datetime(2026, 9, 18, 12, 5, tzinfo=UTC)
-            if (
-                not at_299.is_set()
-                and clock[0] + timedelta(seconds=seconds)
-                >= retry_deadline - timedelta(seconds=1)
-            ):
-                clock[0] = retry_deadline - timedelta(seconds=1)
-                at_299.set()
+            with clock_boundary():
+                retry_deadline = datetime(2026, 9, 18, 12, 5, tzinfo=UTC)
+                pause_at_299 = (
+                    not at_299.is_set()
+                    and clock[0] + timedelta(seconds=seconds)
+                    >= retry_deadline - timedelta(seconds=1)
+                )
+                if pause_at_299:
+                    clock[0] = retry_deadline - timedelta(seconds=1)
+                    at_299.set()
+                else:
+                    clock[0] += timedelta(seconds=seconds)
+            # The scan and shutdown must remain free to run while we wait.
+            if pause_at_299:
                 while not release_299.wait(timeout=0.01):
                     if stop_event.is_set():
                         return True
                 return stop_event.is_set()
-            clock[0] += timedelta(seconds=seconds)
             return stop_event.is_set()
         raise AssertionError(f"unexpected history wait: {seconds}")
 
