@@ -3,6 +3,19 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-09
+
+- #293 协调 #271/#214 的 PR 交付规范：首版完成必要检查和独立评审后及时授权发布，
+  独立 GLM-5.3/max 评审与 CI 并行。Main 在每次 PR 更新及请求或执行已授权合并前，
+  完整分页核查各来源反馈，记录线程 resolved/unresolved 状态及其他评论的处置、阻断判断和负责人；
+  负责阻断修复、评论证据与交接，不以 CI 全绿、outdated 或代码变化代替反馈核查。
+  明确 reviewer 结果评论的单 PR 授权、精确 SHA 门禁及 worker 收尾条件，保留独立合并和部署授权。
+  文档静态检查完成；各 head 的交付证据保存在 PR/交接记录，旧 head 的评审及 CI 不转移。
+  修复 CI 命令计划测试误报：不透明 SOURCE_SHA 含端口数字时触发既有禁用词断言；
+  两个 make dry-run 命令现使用固定 40 位十六进制 SHA，保留全部禁用词及正负断言。
+  该单项测试本地 Python 3.12.12 定向 1 项通过（CI 为 3.12.14），保留既有依赖弃用警告；
+  未运行本地全套或部署，修复后的远端 CI 待验证。
+
 ## 2026-10-08
 
 - #292 新增 LP Auto CLI 的 `status`、`config`、`on`、`off`，保留同义 `pause`；

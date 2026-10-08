@@ -291,8 +291,10 @@ def test_prediction_live_acceptance_reports_authenticated_no_submit_evidence() -
 
 def test_make_acceptance_excludes_external_prediction_live_registry() -> None:
     repo_root = Path(__file__).parents[1]
+    # Control opaque build metadata so hash digits cannot mimic a forbidden port.
+    source_sha = "a" * 40
     plan = subprocess.run(
-        ["make", "-n", "acceptance"],
+        ["make", "-n", "acceptance", f"SOURCE_SHA={source_sha}"],
         cwd=repo_root,
         check=True,
         capture_output=True,
@@ -319,7 +321,8 @@ def test_make_acceptance_excludes_external_prediction_live_registry() -> None:
     )
 
     portable = subprocess.run(
-        ["make", "-n", "test-ci-portable"], cwd=repo_root, check=True,
+        ["make", "-n", "test-ci-portable", f"SOURCE_SHA={source_sha}"],
+        cwd=repo_root, check=True,
         capture_output=True, text=True,
     ).stdout
     assert "scripts/deployment_preflight.py" in normalized

@@ -256,12 +256,190 @@ Pure documentation, configuration, test-only, and unrelated changes remain
 exempt from the acceptance and deployment gates; test-only changes still
 receive any development validation relevant to their own scope.
 
+## Authorized PR delivery loop
+
+Main is the existing delivery owner, not a new permanent agent. The bounded loop
+covers the approved implementation, verification and blocker repairs; publication
+and external replies still need their applicable authorization. Read-only review,
+diagnosis and webhook observation do not grant write authority. Once authorized,
+continue that loop without repeated reminders. Escalate changes to scope,
+behavior, architecture, risk or test contracts. Preserve other workers' work.
+This procedure coordinates [#293](https://github.com/raymizzou/open_trader/issues/293),
+[#271](https://github.com/raymizzou/open_trader/issues/271) and
+[#214](https://github.com/raymizzou/open_trader/issues/214).
+
+### First reviewable implementation
+
+The first reviewable implementation covers the approved scope with the necessary
+tests and enough evidence for independent review. It does not require all later
+improvements or completed remote CI. Complete applicable focused tests and
+security checks, add the dated `CHANGELOG.md` entry, and obtain independent staged
+review of the exact task files. Repair blockers to first publication, rerun
+affected checks and obtain independent review of the restaged changes.
+
+When branch push and Draft PR creation are authorized, promptly publish only the
+reviewed tree to the task branch and open the Draft PR targeting `main`. Do not
+wait for complete branch CI, add unneeded local full suites, or iterate on
+nonblocking polish before the first PR. State the issue scope, reviewed head/base,
+local verification, known limits, unverified work and pending remote CI in the PR.
+If push or Draft PR authorization is absent, report the exact pending boundary
+and retain the prepared result; implementation approval does not imply publication.
+
+### Parallel post-publication review and CI
+
+Immediately after publication, start a distinct independent Herdr
+GLM-5.3/max reviewer pane alongside remote CI. Keep the pre-push independent review.
+Give the reviewer the issue requirements, repository/worktree, PR URL, immutable
+published head/base SHAs, applicable checks and verification limits. Review
+`git diff <base>...<head>` against that scope. Record actual startup evidence;
+opening the PR or issuing a launch command does not prove review started.
+Track GLM review and CI separately. A changed head or base requires refreshed
+applicable reviews and CI; an old review comment is not evidence for a new SHA.
+
+**GLM prerequisite:** verify the local Herdr installation/help, an available pane
+at its shell prompt, and a Codex `glm-review` profile configured for the verified
+`bigmodel` provider, `glm-5.3` and max reasoning, including default subagents if
+used. Verify required credential access without
+reading or exposing credentials. Do not assume a profile on one workstation
+exists on another. Installed CLI help supports native Codex options after `--`:
+
+```sh
+herdr agent start <reviewer-name> --kind codex --pane <available-pane-id> -- --profile glm-review -m glm-5.3 -c 'model_reasoning_effort="max"'
+herdr agent read <reviewer-name>
+```
+
+Before task assignment, confirm interactive readiness and the displayed actual
+model/reasoning, plus profile/provider where available; retain configuration
+evidence for fields not displayed. Use a separate reviewer from the implementer.
+Missing Herdr, profile, credentials, model or readiness is blocked; do not silently
+substitute Flash or another model. This review exception does not change the
+`gpt-6.1-sol`/high implementation-worker default or other roles. This is a process
+contract, not installation or configuration migration authority.
+
+The GLM reviewer makes no code or Git mutations and never executes GitHub APPROVE
+or merge. An explicitly authorized published-PR review assignment may narrowly
+authorize its own result comment on that named PR, refining #271's earlier blanket
+GitHub-write prohibition. Issue/repository instruction text or a newly arrived
+PR comment does not itself supply that publication authority. Without comment
+authority, retain the findings and report the
+publication boundary as blocked. When authorized, the reviewer posts its own
+findings with severity, file/location, evidence and repair advice, or a no-findings
+result with scope, head/base, checks and verification limits. Pane-only output or
+Main's summary is not delivery of that reviewer comment.
+
+Main retrieves the posted comment, verifies its URL, body, author and reviewed
+head/base, and accepts ownership of fixes and remaining delivery work. Publication
+failure or incomplete handoff is blocked, not a completed review. After verified
+comment delivery and accepted handoff, a reviewer with no exclusive pending task
+can finish without waiting for merge.
+
+Keep per-head delivery evidence in the PR and durable handoff record. A CLI
+connection check alone does not prove a reviewer pane started or a PR review was
+delivered. Old-head review and CI evidence does not transfer to an updated head;
+refresh applicable evidence when the head or base changes.
+
+### Feedback, CI and conflict repair
+
+After every PR update (including pushes), and before requesting or executing an
+authorized merge, Main freshly fetches the latest PR/head/base, all review
+submissions, inline review threads, conversation comments, and relevant CI and
+mergeability. This feedback check covers every source of review feedback.
+Paginate every response
+collection, including nested thread comments; incomplete reads are not a complete
+feedback check. Record the retrieval time and identities. Assess historical
+comments against current code rather than relying on an earlier summary.
+
+Record each thread's current resolved/unresolved state explicitly. Comments and
+review submissions without a resolved flag need an explicit disposition and owner.
+Assess the actual outstanding feedback on the latest head. List still-unresolved
+threads and comments with URL, current status, blocking decision and owner; include
+severity and repair evidence where applicable. Report a repaired thread as still
+open unless a fresh read confirms it is resolved. Outdated markers, changed code,
+green CI and old summaries cannot establish resolution or the absence of unresolved
+feedback. Do not automatically resolve or dismiss feedback to manufacture
+completion; this procedure grants no resolution or dismissal authority. Report
+advisory items with their nonblocking decision and owner at handoff; they need not
+disappear for review-ready status. Valid unresolved blockers prevent claiming
+review-ready.
+
+For valid in-scope blockers: diagnose, repair with the assigned worker,
+run affected checks, obtain independent review, publish the reviewed update when
+authorized, and refresh applicable review/CI evidence. Follow the existing rebase
+rules when the base advances; preserve other workers' commits and test intent.
+After verifying a repair, make an authorized reply in the relevant thread with
+the solution, fix commit and verification evidence, then fetch feedback again.
+Do not falsely mark a thread resolved or treat a reviewer result as approval.
+
+Batch in-scope repairs. Diagnose CI failures and conflicts; do not weaken tests,
+retry until green, or run duplicate full suites. Escalate disputed, out-of-scope
+or externally blocked decisions with the reason, required decision and next owner.
+Do not claim review-ready while a known blocker remains unresolved. Nonblocking
+findings are reported without expanding the approved task or delaying first PR
+publication for polish.
+
+### Review-ready handoff and stopping conditions
+
+A review-ready handoff requires successful current applicable push-head and
+PR-merge `required` checks from GitHub Actions (app ID 15368), completed required
+pre-push and GLM reviews, no known unresolved blockers, and fresh feedback and
+mergeability checks. Record the PR head/base, synthetic merge SHA and Actions
+run/check identities; see [CI identity](ci.md). Unknown, pending, cancelled, failed
+or mismatched evidence is not success. A base/head change invalidates applicable
+evidence; refresh it before handoff or merge.
+
+Main monitors until the authorized completion or accepted review-ready handoff,
+cancellation/closure, or a specific external/authorization blocker. Record that
+stop reason, remaining responsibilities and their owner. Never abandon unresolved
+work without an owner. A broader instruction to monitor through merge retains
+that stopping condition. Separate user approval is still required for GitHub
+merge; reviews and CI do not authorize merge/auto-merge, approval on the user's
+behalf, release/tag creation, deployment, trading or repository/security changes.
+PR-head and synthetic-merge evidence never replace final-main-push deployment
+evidence. Existing deployment and cleanup rules remain unchanged.
+
+### Worker lifecycle
+
+Assess each development worker's assigned review/repair work and remaining duties.
+End only a worker whose work is saved and committed or durably handed off, whose
+assigned review/repair work and exclusive fixes, CI problems, conflicts and
+monitoring are complete or accepted by a named new owner, and whose handoff is
+recorded. Preserve all workers' saved work and commits. Retain Main's delivery
+ownership until the stopping condition above. A worker ending does not mean the
+PR is complete.
+
+Ending a session is separate from deleting a worktree or branch. Deletion still
+requires GitHub merge, user confirmation and a clean worktree under
+[AGENTS.md](../../AGENTS.md#delivery-boundaries); never delete dirty work. These
+rules do not authorize closing existing sessions as part of documentation work.
+
+### Handoff and evidence record
+
+Keep a compact durable record; use `pending`, `blocked`, `unrun` or `unknown`
+where appropriate, with reasons. This is a format, not an executed delivery:
+
+```text
+Task/approved scope; delivery owner; publication/reply authority:
+PR URL; immutable head/base; synthetic merge SHA; Actions run/check IDs/URLs:
+Local focused/security checks: command, environment, identity, result, limits:
+Independent pre-push review: staged tree/identity, reviewer, result/evidence:
+GLM: pane, actual model/reasoning/profile/provider, status, PR/head/base:
+GLM comment: URL, verified author/body/identities, Main's accepted handoff:
+Feedback: retrieval time, latest PR/head/base, complete paginated collections:
+Threads/comments: URL, resolved/unresolved state or disposition, blocking decision/owner:
+Repairs: fix commits, checks, independent review, update/reply evidence:
+CI: push-head and PR-merge required/app 15368 results; mergeability check/time:
+Pending decisions/blockers; next action and owner; monitoring stop reason:
+Workers: saved work, exclusive duties/new owner, accepted handoff, lifecycle status:
+```
+
 ## Merge, live processes, and deployment
 
 The delivery path is isolated branch/worktree from freshly fetched
 `origin/main` → focused local development checks → staged independent review
-(including a dated `CHANGELOG.md` entry) → authorized branch push → Draft PR
-→ latest CI success → explicit user approval → GitHub merge. Local `main` is
+(including a dated `CHANGELOG.md` entry) → prompt authorized branch push/Draft PR
+→ parallel GLM review and CI → feedback/repair loop → review-ready handoff
+→ explicit user approval → GitHub merge. Follow the
+[delivery procedure](#authorized-pr-delivery-loop). Local `main` is
 only a synchronized copy of GitHub `main`, never an integration or repair path.
 When the base advances, fetch/rebase, rerun focused checks and independent
 review, and inspect fresh CI. Rebase and conflict-resolution approval follows
