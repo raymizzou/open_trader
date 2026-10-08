@@ -3259,7 +3259,18 @@ class PredictionArbitrageStore:
         *,
         now: datetime | None = None,
     ) -> dict[tuple[str, str], dict[str, object]]:
-        """Read only summary columns for many directions in one read batch."""
+        """Compatibility reader for callers that need a complete mapping."""
+
+        return {key: row for batch in self.lp_price_history_summary_batches(identities, now=now)
+                for key, row in batch.items()}
+
+    def lp_price_history_summary_batches(
+        self,
+        identities: Iterable[tuple[str, str]],
+        *,
+        now: datetime | None = None,
+    ) -> Iterator[dict[tuple[str, str], dict[str, object]]]:
+        """Decode at most 400 summaries per batch from one SQLite read snapshot."""
 
         unique = tuple(
             dict.fromkeys(
@@ -3269,9 +3280,9 @@ class PredictionArbitrageStore:
             )
         )
         if not unique:
-            return {}
-        result: dict[tuple[str, str], dict[str, object]] = {}
+            return
         with self._read_connection() as connection:
+            connection.execute("BEGIN")
             for offset in range(0, len(unique), 400):
                 batch = unique[offset : offset + 400]
                 where = " OR ".join("(condition_id=? AND token_id=?)" for _ in batch)
@@ -3279,13 +3290,14 @@ class PredictionArbitrageStore:
                 rows = connection.execute(
                     f"SELECT condition_id,token_id,summary FROM lp_price_history_cache WHERE {where}",
                     params,
-                ).fetchall()
+                )
+                result: dict[tuple[str, str], dict[str, object]] = {}
                 for row in rows:
                     key = (str(row["condition_id"]), str(row["token_id"]))
                     result[key] = self._lp_expire_price_history_summary(
                         _load_payload(str(row["summary"])), now=now
                     )
-        return result
+                yield result
 
     def lp_price_history_samples(
         self, condition_id: str, token_id: str

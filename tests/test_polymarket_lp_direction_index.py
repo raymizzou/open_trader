@@ -72,7 +72,11 @@ def test_queue_build_never_copies_trial_details_and_releases_source(
                 with pytest.raises(failure, match="controlled projection interruption"):
                     service._candidate_queue_state_build()
                 assert service._candidate_queue_state is None
-            assert sources[-1]() is None, "unused source retained after projection"
+            if failure is None:
+                assert sources[-1]() is state["directions_by_condition"]._source
+                service._candidate_queue_state = None
+                del state
+            assert sources[-1]() is None, "released queue retained its source"
             assert copies == [], "trial duplicated the direction detail database"
     finally:
         if was_enabled:

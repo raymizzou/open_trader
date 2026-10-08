@@ -4,6 +4,10 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from http.client import IncompleteRead
 from pathlib import Path
+from contextlib import closing
+import sqlite3
+
+import pytest
 
 from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.polymarket_lp_views import lp_shortlist
@@ -11,6 +15,39 @@ from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 
 
 T = datetime(2026, 9, 18, tzinfo=UTC)
+
+
+def test_history_summary_batches_keep_one_snapshot_and_close_early(tmp_path, monkeypatch):
+    store = PredictionArbitrageStore(tmp_path)
+    identities = tuple((f"c{i}", f"t{i}") for i in range(805))
+    def write(marker):
+        store.lp_save_price_history_batch({"condition_id": cid, "token_id": token,
+            "samples": [], "summary": {"state": "known", "checked_at": T, "marker": marker}}
+            for cid, token in identities)
+    write("old")
+    connections = []
+    original = store._connection
+    def observed():
+        connection = original()
+        connections.append(connection)
+        return connection
+    monkeypatch.setattr(store, "_connection", observed)
+    with closing(store.lp_price_history_summary_batches(identities, now=T)) as reader:
+        first = next(reader)
+        assert len(first) == 400
+        read_connection = connections[0]
+        assert read_connection.in_transaction
+        write("new")
+        rest = list(reader)
+        assert [len(batch) for batch in rest] == [400, 5]
+        assert all(row["marker"] == "old" for batch in (first, *rest) for row in batch.values())
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        read_connection.execute("SELECT 1")
+    with closing(store.lp_price_history_summary_batches(identities, now=T)) as reader:
+        assert next(reader)[identities[0]]["marker"] == "new"
+        early_connection = connections[-1]
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        early_connection.execute("SELECT 1")
 
 
 def _direction(condition_id: str, summary: dict[str, object]) -> dict[str, object]:

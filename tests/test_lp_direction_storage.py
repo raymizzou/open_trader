@@ -12,7 +12,7 @@ import weakref
 
 import pytest
 
-from open_trader import polymarket_lp_scratch as scratch, polymarket_lp_views as views
+from open_trader import polymarket_lp, polymarket_lp_scratch as scratch, polymarket_lp_views as views
 from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from test_lp_candidate_exclusions import ExclusionExchange
@@ -20,6 +20,10 @@ from test_polymarket_lp_views import NOW
 
 
 BULKY = "distinctive-unrecognized-market-field:" + "0123456789abcdef" * 4096
+
+
+class Summary(dict):
+    """Weak-referenceable summary at the batch handoff boundary."""
 
 
 def _base(name, *, two_sides, stamp=NOW):
@@ -249,7 +253,12 @@ def _complete_projection_trace(path, monkeypatch):
     first = service._candidate_queue_state_build()
     assert [row["condition_id"] for row in first["queue_normal"]] == ["condition-a", "condition-e", "condition-b"]
     assert [row["condition_id"] for row in first["queue_backup"]] == ["condition-c", "condition-d"]
-    states.append(deepcopy(first))
+    def snapshot(state):
+        return deepcopy({key: dict(value) if key in {
+            "directions_by_condition", "metadata_by_condition", "reward_market_by_condition"
+        } else value for key, value in state.items()})
+
+    states.append(snapshot(first))
     assert service._candidate_queue_state_build() == first
     revision = service._candidate_exclusion_revision
     assert service._exclude_candidate(
@@ -258,12 +267,12 @@ def _complete_projection_trace(path, monkeypatch):
     assert service._candidate_queue_state is None
     second = service._candidate_queue_state_build()
     assert [row["market"]["outcome"] for row in second["directions_by_condition"]["condition-c"]] == ["YES"]
-    states.append(deepcopy(second))
+    states.append(snapshot(second))
     exchange.now += timedelta(minutes=1)
     assert service.refresh_price_history()["state"] == "known"
     third = service._candidate_queue_state_build()
     assert third["version"] > second["version"]
-    states.append(deepcopy(third))
+    states.append(snapshot(third))
     return {"trials": trials, "states": states}
 
 
@@ -272,3 +281,254 @@ def test_compact_direction_projection_matches_complete_queues_and_overrides(tmp_
     digest = hashlib.sha256(json.dumps(trace, default=str, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     # Recorded independently with this fixture against read-only 3ad0d3ec source.
     assert digest == "ffbde7cce77aa091183c50a0d355b9f5a59d7f8111053cb2315dbfc51bde2bdb"
+
+
+def test_service_exclusion_of_nonqueued_direction_preserves_existing_queue(tmp_path):
+    service, _ = _service(tmp_path, pools={name: Decimal(100) for name in "abc"},
+                          exclusions_enabled=True)
+    for token in ("token-condition-c", "no-condition-c"):
+        service.store.lp_save_price_history("condition-c", token, [], {"state": "unknown"})
+    service.refresh_candidates()
+    old_queue = service._candidate_queue_state
+    assert "condition-c" not in old_queue["directions_by_condition"]
+    old_directions = deepcopy(dict(old_queue["directions_by_condition"]))
+    old_rows = deepcopy((old_queue["queue_normal"], old_queue["queue_backup"]))
+    assert old_directions, "regression requires an existing populated queue"
+    assert service._exclude_candidate("condition-c", "token-condition-c",
+        "history_amplitude_exceeded", checked_at=NOW)
+    assert not service._candidate_allowed((("condition-c", "token-condition-c"),))
+    assert service._candidate_allowed((("condition-c", "no-condition-c"),))
+    assert dict(old_queue["directions_by_condition"]) == old_directions
+    assert (old_queue["queue_normal"], old_queue["queue_backup"]) == old_rows
+    for key in ("directions_by_condition", "metadata_by_condition", "reward_market_by_condition"):
+        assert "condition-c" not in old_queue[key], f"exclusion inserted an absent {key} condition"
+    assert service._candidate_queue_state is None, "exclusion did not invalidate the queue"
+
+
+def test_cached_queue_stays_compact_through_renewals_exclusions_and_publication(tmp_path):
+    service, exchange = _service(tmp_path, pools={str(i): Decimal(100) for i in range(32)},
+                                 exclusions_enabled=True)
+    state = service._candidate_queue_state_build()
+    source = service._prepared_inputs["metadata"]
+    reference = weakref.ref(source)
+    for key in ("directions_by_condition", "metadata_by_condition", "reward_market_by_condition"):
+        assert not isinstance(state[key], dict), f"{key} retained the expanded universe"
+    assert state["directions_by_condition"]._source._metadata._source is state["metadata_by_condition"]._source
+    assert state["metadata_by_condition"]._source["condition-0"] == source["condition-0"]
+    before = deepcopy(state["directions_by_condition"]["condition-31"])
+    for offset in range(0, 32, 8):
+        exchange.now += timedelta(minutes=2)
+        ids = tuple(f"condition-{i}" for i in range(offset, offset + 8))
+        assert service._renew_batch_shared_facts(state, ids, stop_event=None) is not None
+        for cid in ids:
+            assert state["directions_by_condition"][cid][0]["market"]["metadata_checked_at"] == exchange.now
+        assert service.store.lp_record_market_exclusion(
+            ids[0], f"no-{ids[0]}", "history_amplitude_exceeded", checked_at=exchange.now,
+            cooldown_until=exchange.now + timedelta(hours=1), now=exchange.now)
+        service._candidate_queue_state = state
+        service._evict_excluded_candidates(ids[0])
+        assert [d["market"]["outcome"] for d in state["directions_by_condition"][ids[0]]] == ["YES"]
+        for key in ("directions_by_condition", "metadata_by_condition", "reward_market_by_condition"):
+            assert not isinstance(state[key], dict)
+        directions = state["directions_by_condition"]
+        assert all(BULKY not in str(row) for row in directions._source._values.values())
+        assert all(isinstance(key, str) for keys in directions._keys.values() for key in keys)
+        assert len(directions._source._values) <= 64, "renewal accumulated obsolete direction versions"
+    assert source["condition-0"]["metadata_checked_at"] == NOW, "renewal mutated published metadata"
+    assert before[0]["market"]["unrecognized"]["text"] == BULKY
+    # History invalidation builds another queue while this old reader stays usable.
+    for _ in range(2):
+        service._candidate_history_version += 1
+        replacement = service._candidate_queue_state_build()
+        assert replacement is not state
+        assert not isinstance(replacement["directions_by_condition"], dict)
+    assert service.refresh_price_history()["state"] == "known"
+    assert reference() is source
+    assert state["directions_by_condition"]["condition-31"][0]["market"]["unrecognized"]["text"] == BULKY
+    del source, state, replacement, directions
+    assert reference() is None, "obsolete queue generation needs GC to close"
+
+
+def test_candidate_build_consumes_history_batches_without_accumulating_rows(tmp_path, monkeypatch):
+    service, _ = _service(tmp_path, pools={str(i): Decimal(100) for i in range(450)})
+    batches = getattr(service.store, "lp_price_history_summary_batches", None)
+    assert callable(batches), "candidate build has no bounded snapshot reader"
+    references = []
+
+    def tracked_batches(*args, **kwargs):
+        for batch in batches(*args, **kwargs):
+            wrapped = {key: Summary(row) for key, row in batch.items()}
+            references.extend(weakref.ref(row) for row in wrapped.values())
+            yield wrapped
+            del wrapped
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("candidate build used accumulated summaries")
+
+    monkeypatch.setattr(service.store, "lp_price_history_summary_batches", tracked_batches)
+    monkeypatch.setattr(service.store, "lp_price_history_summaries", forbidden)
+    original_fact = polymarket_lp._lp_direction_fact
+
+    def fact(*args, **kwargs):
+        assert not any(ref() is not None for ref in references), "history batches retained into ranking"
+        return original_fact(*args, **kwargs)
+
+    monkeypatch.setattr("open_trader.polymarket_lp._lp_direction_fact", fact)
+    state = service._candidate_queue_state_build()
+    assert len(state["directions_by_condition"]) == 450
+    assert len(references) == 900
+    assert all(ref() is None for ref in references)
+
+
+def test_queue_direction_assignment_restores_reorders_and_replaces_tokens(tmp_path):
+    service, exchange = _service(tmp_path, exclusions_enabled=True)
+    state = service._candidate_queue_state_build()
+    directions = state["directions_by_condition"]
+    original = directions["condition-a"]
+    assert service._exclude_candidate("condition-a", "no-condition-a", "history_amplitude_exceeded", checked_at=NOW)
+    assert [row["market"]["outcome"] for row in directions["condition-a"]] == ["YES"]
+    exchange.now += timedelta(hours=2)
+    assert service._candidate_allowed((("condition-a", "no-condition-a"),))
+    # Mapping assignment must accept recovered direction sets, as dict did.
+    directions["condition-a"] = list(reversed(original))
+    assert directions["condition-a"] == list(reversed(original))
+    assert service._renew_batch_shared_facts(state, ("condition-a",), stop_event=None) is not None
+    assert [row["market"]["outcome"] for row in directions["condition-a"]] == ["NO", "YES"]
+    changed = deepcopy(directions["condition-a"])
+    changed[0]["market"]["token_id"] = "replacement-no"
+    changed[0]["market"]["one_direction_only"] = {"state": "UNKNOWN"}
+    directions["condition-a"] = changed
+    assert directions["condition-a"] == changed
+    saved = deepcopy(state)
+    directions["condition-a"] = []
+    assert directions["condition-a"] == []
+    directions["new-condition"] = changed
+    # Same dict contract: supplied condition grouping does not rewrite market identity.
+    assert directions["new-condition"] == changed
+    state["metadata_by_condition"].pop("condition-a")
+    assert "condition-a" not in state["metadata_by_condition"]
+    state["metadata_by_condition"].clear()
+    directions.clear()
+    assert len(directions) == 0 and len(directions._source._values) == 0
+    assert saved["directions_by_condition"]["condition-a"] == changed
+    assert saved["metadata_by_condition"]["condition-a"]["metadata_checked_at"] == exchange.now
+    assert service._prepared_inputs["metadata"]["condition-a"]["metadata_checked_at"] == NOW
+
+
+@pytest.mark.parametrize("phase", ["screen", "rebuild"])
+def test_renewal_does_not_resurrect_condition_evicted_during_rebuild(tmp_path, monkeypatch, phase):
+    service, exchange = _service(tmp_path, exclusions_enabled=True)
+    state = service._candidate_queue_state_build()
+    exchange.now += timedelta(minutes=2)
+    original = polymarket_lp._lp_direction_fact
+    excluded = False
+    def exclude_once():
+        nonlocal excluded
+        if not excluded:
+            excluded = True
+            assert service._exclude_candidate("condition-a", "", "history_amplitude_exceeded", checked_at=exchange.now)
+    def exclude_during_rebuild(*args, **kwargs):
+        row = original(*args, **kwargs)
+        exclude_once()
+        return row
+    if phase == "rebuild":
+        monkeypatch.setattr(polymarket_lp, "_lp_direction_fact", exclude_during_rebuild)
+    else:
+        screen = service._screen_candidate_batch
+        def exclude_during_screen(*args, **kwargs):
+            result = screen(*args, **kwargs)
+            exclude_once()
+            return result
+        monkeypatch.setattr(service, "_screen_candidate_batch", exclude_during_screen)
+    service._renew_batch_shared_facts(state, ("condition-a",), stop_event=None)
+    assert excluded
+    for key in ("directions_by_condition", "metadata_by_condition", "reward_market_by_condition"):
+        assert "condition-a" not in state[key], f"renewal resurrected excluded {key}"
+
+
+@pytest.mark.parametrize("mutation", ["filter", "pop"])
+@pytest.mark.parametrize("reader_kind", ["lookup", "deepcopy"])
+def test_queue_lookup_keeps_old_values_during_concurrent_removal(tmp_path, monkeypatch, mutation, reader_kind):
+    service, _ = _service(tmp_path)
+    state = service._candidate_queue_state_build()
+    directions = state["directions_by_condition"]
+    expected = directions["condition-a"]
+    entered, release, attempted = Event(), Event(), Event()
+    original = scratch.LPReadScratch.__getitem__
+    def blocked(self, key):
+        row = original(self, key)
+        if self is directions._source._values and not entered.is_set():
+            entered.set()
+            assert release.wait(10), "independent lookup watchdog"
+        return row
+    monkeypatch.setattr(scratch.LPReadScratch, "__getitem__", blocked)
+    original_copy = scratch.LPReadScratch.__deepcopy__
+    def blocked_copy(self, memo):
+        clone = original_copy(self, memo)
+        if self is directions._source._values:
+            entered.set()
+            assert release.wait(10), "independent deepcopy watchdog"
+        return clone
+    monkeypatch.setattr(scratch.LPReadScratch, "__deepcopy__", blocked_copy)
+    def remove():
+        attempted.set()
+        if mutation == "filter":
+            directions.filter_tokens("condition-a", lambda token: token.startswith("token-"))
+        else:
+            directions.pop("condition-a")
+    with ThreadPoolExecutor(2) as workers:
+        reader = workers.submit(lambda: directions["condition-a"] if reader_kind == "lookup" else deepcopy(directions))
+        try:
+            assert entered.wait(10)
+            mutator = workers.submit(remove)
+            assert attempted.wait(10)
+        finally:
+            release.set()
+        old = reader.result(timeout=10)
+        assert (old if reader_kind == "lookup" else old["condition-a"]) == expected
+        mutator.result(timeout=10)
+    assert expected == _expected(two_sides=True)[:2]
+    if mutation == "filter":
+        assert [row["market"]["outcome"] for row in directions["condition-a"]] == ["YES"]
+    else:
+        assert "condition-a" not in directions
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, CancelledError])
+def test_failed_summary_snapshot_discards_partial_rows_and_closes(tmp_path, monkeypatch, failure):
+    from contextlib import closing
+    service, _ = _service(tmp_path, pools={str(i): Decimal(100) for i in range(220)})
+    original = service.store.lp_price_history_summary_batches
+    closed = Event()
+    connections = []
+    connect = service.store._connection
+    def observed():
+        connection = connect()
+        connections.append(connection)
+        return connection
+    monkeypatch.setattr(service.store, "_connection", observed)
+    read_connections = []
+    def fail_second_batch(*args, **kwargs):
+        try:
+            with closing(original(*args, **kwargs)) as batches:
+                yield next(batches)
+                read_connections.append(connections[-1])
+                assert read_connections[-1].in_transaction
+                raise failure("controlled second summary batch failure")
+        finally:
+            closed.set()
+    monkeypatch.setattr(service.store, "lp_price_history_summary_batches", fail_second_batch)
+    trial = views.lp_trial_candidates
+    observed = []
+    def unknown_trial(facts, **kwargs):
+        assert all("history_summary" not in row for row in facts), "partial history survived read failure"
+        observed.append(len(facts))
+        return trial(facts, **kwargs)
+    monkeypatch.setattr(views, "lp_trial_candidates", unknown_trial)
+    state = service._candidate_queue_state_build()
+    assert closed.is_set()
+    # All 440 directions are unavailable/UNKNOWN, including the 400 already read.
+    assert observed == [440]
+    assert state["queue_normal"] == state["queue_backup"] == []
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        read_connections[0].execute("SELECT 1")
