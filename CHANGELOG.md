@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-09
 
+- #296 第一阶段修正 LP Auto CLI 人类状态输出：明确无原因/错误显示 `NONE`，
+  缺失字段仍为 `UNKNOWN`；新增活动 BUY/目标进度和检查中、最近轮次时间/原因，
+  保留各占位计数及实际运行状态，不从旧轮次原因推断当前阻塞。
+  公开 CLI/隔离 HTTP 合同定向验证通过，JSON、只读 status、认证遮蔽及控制边界保持；
+  未运行本地完整后端或部署，#296 的其他范围仍待后续处理。
+
 - #293 协调 #271/#214 的 PR 交付规范：首版完成必要检查和独立评审后及时授权发布，
   独立 GLM-5.3/max 评审与 CI 并行。Main 在每次 PR 更新及请求或执行已授权合并前，
   完整分页核查各来源反馈，记录线程 resolved/unresolved 状态及其他评论的处置、阻断判断和负责人；

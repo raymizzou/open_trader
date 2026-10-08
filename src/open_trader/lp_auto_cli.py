@@ -122,6 +122,11 @@ def _emit(result: str, state: dict[str, object] | None, reason: str | None, json
         if key == 'runtime_state' and isinstance(value, str) and result != 'UNKNOWN':
             value = value.upper()
         print(f'{key}: {value if value is not None else "UNKNOWN"}')
+    slots = state.get('slots')
+    active = slots.get('active') if isinstance(slots, dict) else None
+    target = state.get('target_buy_count')
+    print(f'buy_orders: {active if active is not None else "UNKNOWN"}/'
+          f'{target if target is not None else "UNKNOWN"}')
     for group, keys in (
         ('slots', ('active', 'pending', 'canceling', 'occupied')),
         ('funds', ('inventory_cost_usd', 'buy_reserved_usd', 'pending_reserved_usd', 'available_usd', 'spendable_usd')),
@@ -133,7 +138,18 @@ def _emit(result: str, state: dict[str, object] | None, reason: str | None, json
             print(f'{key}: {value if value is not None else "UNKNOWN"}')
     for key in ('block_reasons', 'admission_block_reasons', 'reason', 'last_check_at', 'last_check_error'):
         value = state.get(key)
+        if value is None and key in state and key in ('reason', 'last_check_error'):
+            value = 'NONE'
         print(f'{key}: {value if value is not None else "UNKNOWN"}')
+    checking = state.get('check_in_progress')
+    print('check_in_progress: ' + ('true' if checking is True else 'false' if checking is False else 'UNKNOWN'))
+    last_round = state.get('last_round')
+    last_round = last_round if isinstance(last_round, dict) else {}
+    for key in ('checked_at', 'reason'):
+        value = last_round.get(key)
+        if key == 'reason' and key in last_round and value is None:
+            value = 'NONE'
+        print(f'last_round_{key}: {value if value is not None else "UNKNOWN"}')
 
 
 
