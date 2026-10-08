@@ -192,12 +192,26 @@ def validate_metrics(metrics, nodes, sha, workers, successful=True):
                 raise ValueError('invalid duration, outcome or phase worker')
         if len({phase['worker'] for phase in phases.values()}) != 1:
             raise ValueError('inconsistent phase worker identity')
+        subtests = result.get('subtests', [])
+        if not isinstance(subtests, list):
+            raise ValueError('invalid subtest measurements')
+        parent_worker = next(iter(phases.values()))['worker']
+        for child in subtests:
+            if (not isinstance(child, dict) or child.get('when') != 'call'
+                    or child.get('outcome') not in ('passed', 'skipped')
+                    or not finite_duration(child.get('duration'))
+                    or child.get('worker') != parent_worker):
+                raise ValueError('invalid subtest duration, outcome or worker')
         outcomes = {key: phase['outcome'] for key, phase in phases.items()}
         passed = {'setup':'passed', 'call':'passed', 'teardown':'passed'}
         setup_skip = {'setup':'skipped', 'teardown':'passed'}
         call_skip = {'setup':'passed', 'call':'skipped', 'teardown':'passed'}
-        if not ((result.get('outcome') == 'passed' and outcomes == passed) or
-                (result.get('outcome') == 'skipped' and outcomes in (setup_skip, call_skip))):
+        child_skip = any(child['outcome'] == 'skipped' for child in subtests)
+        if subtests and outcomes not in (passed, call_skip):
+            raise ValueError('subtests require a complete parent call')
+        if not ((result.get('outcome') == 'passed' and outcomes == passed and not child_skip) or
+                (result.get('outcome') == 'skipped' and
+                 (outcomes in (setup_skip, call_skip) or (outcomes == passed and child_skip)))):
             raise ValueError('incomplete or inconsistent successful phase/outcome record')
     if len(executions) != len(set(executions)):
         raise ValueError('duplicate execution identities')
@@ -227,13 +241,14 @@ def validate_junit(data, metrics):
         suites = list(root.findall('testsuite'))
     else:
         raise ValueError('unsupported JUnit root')
-    expected = {junit_identity(result['execution_nodeid']): result['outcome'] for result in metrics['results']}
+    expected = {junit_identity(result['execution_nodeid']): result for result in metrics['results']}
     if len(expected) != len(metrics['results']) or not expected or not suites:
         raise ValueError('empty or ambiguous JUnit execution identities')
     seen = {}
     for suite in suites:
         cases = suite.findall('testcase')
         outcomes = {'passed':0, 'skipped':0, 'failed':0, 'error':0}
+        child_count = 0
         for case in cases:
             identity = (case.get('classname'), case.get('name'))
             if identity not in expected or identity in seen:
@@ -244,15 +259,28 @@ def validate_junit(data, metrics):
                 raise ValueError('missing or invalid JUnit duration') from error
             if not finite_duration(duration):
                 raise ValueError('nonfinite or negative JUnit duration')
-            statuses = [tag for tag in ('skipped', 'failure', 'error') for child in case.findall(tag)]
-            if len(statuses) > 1:
-                raise ValueError('ambiguous JUnit testcase outcome')
-            outcome = {'failure':'failed'}.get(statuses[0], statuses[0]) if statuses else 'passed'
-            if expected[identity] != outcome:
+            result = expected[identity]
+            children = result.get('subtests', [])
+            child_count += len(children)
+            phases = result['phases']
+            counts = {'skipped':len(case.findall('skipped')), 'failed':len(case.findall('failure')),
+                      'error':len(case.findall('error'))}
+            expected_counts = {
+                'skipped':sum(phase['outcome'] == 'skipped' for phase in phases.values())
+                          + sum(child['outcome'] == 'skipped' for child in children),
+                'failed':int(phases.get('call', {}).get('outcome') == 'failed')
+                         + sum(child['outcome'] == 'failed' for child in children),
+                'error':sum(phase['outcome'] == 'failed' for when, phase in phases.items() if when != 'call'),
+            }
+            if counts != expected_counts:
+                raise ValueError('JUnit status counts disagree with phase/subtest records')
+            outcome = 'failed' if counts['failed'] or counts['error'] else 'skipped' if counts['skipped'] else 'passed'
+            if result['outcome'] != outcome:
                 raise ValueError('JUnit outcome disagrees with phase-derived result')
             seen[identity] = outcome
-            outcomes[outcome] += 1
-        for key, expected_count in [('tests',len(cases)), ('failures',outcomes['failed']),
+            for key, count in counts.items():
+                outcomes[key] += count
+        for key, expected_count in [('tests',len(cases) + child_count), ('failures',outcomes['failed']),
                                     ('errors',outcomes['error']), ('skipped',outcomes['skipped'])]:
             value = suite.get(key)
             if not isinstance(value, str) or not value.isdecimal() or int(value) != expected_count:

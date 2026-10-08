@@ -13,6 +13,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
   `no_proxy=127.0.0.1,localhost,::1` 后，未插桩的 9 项暂停护栏单次通过；未改测试、阈值、源码或系统代理配置。
   原 push/PR 的 legacy 失败证据保留；未宣称新远端 CI 通过，未部署或改变业务代码。
 
+- PR #285 修复 pytest 子测试证据核算：此前新 push/PR 的 legacy 均通过 5297 项测试及 82 个子测试，
+  但成功证据校验因 JUnit 总数包含子测试而失败。记录器现将真实子报告与父节点阶段分开，保留结果、耗时及 worker；
+  共用校验器严格核对父 testcase 加子报告总数，以及父/子跳过记录和 XML 元素数量，拒绝失败子报告冒充成功。
+  真实串行/双 worker 的通过、多个跳过及失败子测试回归通过，计数和子报告篡改均被拒绝；
+  本地定向 109 项及 78 个 subtest、宿主 stdlib 32 项检查通过。保留全部原失败及未改写的 CI/JUnit 记录，
+  未运行完整 legacy 套件、部署或宣称修复后的远端 CI 已通过。
+
 ## 2026-10-07
 
 - #282 LP 历史准备在阶段结束时释放已消费的重试快照；历史批次由 SQLite 按标的及 metadata 阶段范围筛选到期重试，

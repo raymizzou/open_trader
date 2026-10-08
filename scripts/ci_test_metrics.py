@@ -11,6 +11,7 @@ import time
 import subprocess
 
 import pytest
+from _pytest.subtests import SubtestReport
 
 
 def cpu_identity():
@@ -77,8 +78,14 @@ class Recorder:
 
     def pytest_runtest_logreport(self, report):
         result = self.results.setdefault(report.nodeid, dict(nodeid=report.nodeid, outcome='passed', phases={}))
-        result['phases'][report.when] = dict(duration=report.duration, outcome=report.outcome,
-                                           worker=getattr(report, 'worker_id', 'serial'))
+        measurement = dict(duration=report.duration, outcome=report.outcome,
+                           worker=getattr(report, 'worker_id', 'serial'))
+        # Pytest restores this report type across xdist serialization. Children
+        # share the parent nodeid but are separate calls, never parent phases.
+        if isinstance(report, SubtestReport):
+            result.setdefault('subtests', []).append(dict(when=report.when, **measurement))
+        else:
+            result['phases'][report.when] = measurement
         if report.failed:
             result['outcome'] = 'failed'
         elif report.skipped and result['outcome'] != 'failed':
