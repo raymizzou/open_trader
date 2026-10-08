@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import hashlib
+import json
 import logging
 import math
 import os
@@ -56,7 +57,9 @@ from .polymarket_lp_notification_batches import (
     matching_batch_channels,
     plan_notification_batches,
 )
-from .polymarket_lp_scratch import LPDirectionScratch, LPReadRows, LPReadScratch
+from .polymarket_lp_scratch import (
+    LPDirectionIndex, LPDirectionScratch, LPReadOverlay, LPReadRows, LPReadScratch,
+)
 from .prediction_arbitrage_store import (
     LP_RESERVED_MANUAL_SESSION_ID,
     PredictionArbitrageStore,
@@ -1144,8 +1147,11 @@ class PolymarketLPService:
                         values.pop(cid, None)
                     if key == "directions_by_condition":
                         for cid in allowed:
-                            values[cid] = [d for d in values.get(cid, ()) if self._candidate_allowed(
-                                ((cid, str(d.get("market", {}).get("token_id") or "")),))]
+                            if isinstance(values, LPDirectionIndex):
+                                values.filter_tokens(cid, lambda token: self._candidate_allowed(((cid, token),)))
+                            else:
+                                values[cid] = [d for d in values.get(cid, ()) if self._candidate_allowed(
+                                    ((cid, str(d.get("market", {}).get("token_id") or "")),))]
                 self._candidate_queue_condition_ids = tuple(cid for cid in self._candidate_queue_condition_ids if cid not in blocked)
                 for row in (*queue.get("queue_normal", ()), *queue.get("queue_backup", ())):
                     cid, token = str(row.get("condition_id") or ""), str(row.get("token_id") or "")
@@ -4975,7 +4981,8 @@ class PolymarketLPService:
             if isinstance(saved_confirmations, Mapping)
             else {}
         )
-        direction_facts = LPDirectionScratch(metadata_by_condition)
+        direction_facts = LPDirectionScratch(LPReadOverlay(metadata_by_condition))
+        direction_keys: dict[str, list[str]] = {}
         direction_index = 0
         complete = (
             isinstance(catalog, Mapping)
@@ -5001,14 +5008,25 @@ class PolymarketLPService:
             if isinstance(outcome, Mapping)
             and str(outcome.get("token_id") or "").strip()
         )
-        cached_summaries: Mapping[tuple[str, str], Mapping[str, object]] = {}
-        if callable(cache_batch_reader):
+        snapshot_reader = getattr(self.store, "lp_price_history_summary_batches", None)
+        cached_summaries = LPReadScratch()
+        if callable(snapshot_reader):
+            from contextlib import closing
+            try:
+                with closing(snapshot_reader(cache_identities, now=checked_at)) as batches:
+                    for summary_batch in batches:
+                        cached_summaries.update((json.dumps(key), value) for key, value in summary_batch.items())
+                        del summary_batch
+            except Exception:
+                cached_summaries.clear()
+        elif callable(cache_batch_reader):
             try:
                 batch_value = cache_batch_reader(cache_identities, now=checked_at)
             except Exception:
                 batch_value = {}
             if isinstance(batch_value, Mapping):
-                cached_summaries = batch_value
+                cached_summaries.update((json.dumps(key), value) for key, value in batch_value.items())
+                del batch_value
         reward_market_by_condition = LPReadScratch()
         for reward_market in market_rows:
             condition_id = str(reward_market.get("condition_id") or "").strip()
@@ -5057,7 +5075,7 @@ class PolymarketLPService:
                     continue
                 summary: Mapping[str, object] | None = None
                 cache_key = (condition_id, token_id)
-                cached_summary = cached_summaries.get(cache_key)
+                cached_summary = cached_summaries.get(json.dumps(cache_key))
                 if isinstance(cached_summary, Mapping):
                     summary = cached_summary
                 elif not callable(cache_batch_reader) and callable(cache_reader):
@@ -5092,7 +5110,9 @@ class PolymarketLPService:
                     account=account,
                     compact_market=True,
                 )
+                direction_keys.setdefault(condition_id, []).append(str(direction_index))
                 direction_index += 1
+        del cached_summaries
 
         from .polymarket_lp_views import lp_trial_candidates
 
@@ -5131,19 +5151,6 @@ class PolymarketLPService:
             for row in (trial.get("queue_backup") or ())
             if isinstance(row, Mapping)
         ]
-        queue_condition_ids = {str(row.get("condition_id") or "") for row in (*queue_normal, *queue_backup)}
-        directions_by_condition: dict[str, list[Mapping[str, object]]] = {}
-        for direction in direction_facts.values():
-            if not isinstance(direction, Mapping):
-                continue
-            market = direction.get("market")
-            if not isinstance(market, Mapping):
-                continue
-            direction_condition = str(market.get("condition_id") or "").strip()
-            if direction_condition in queue_condition_ids:
-                directions_by_condition.setdefault(
-                    direction_condition, []
-                ).append(direction)
         trial_funnel = dict(trial.get("funnel") or {})
         queue_funnel = {
             key: deepcopy(trial_funnel.get(key))
@@ -5180,21 +5187,20 @@ class PolymarketLPService:
         # Keep the published (JSON-like) funnel shape, as the whole-scan
         # snapshot did through its durable-store round trip.
         queue_funnel = _pool_published_value(queue_funnel)
+        for cid in tuple(reward_market_by_condition):
+            if cid not in queue_condition_ids:
+                del reward_market_by_condition[cid]
         state = {
             "version": version,
             "history_version": history_version,
             "reservation_signature": reservation_signature,
             "queue_normal": queue_normal,
             "queue_backup": queue_backup,
-            "directions_by_condition": {
-                cid: directions_by_condition[cid] for cid in queue_condition_ids
-            },
-            "metadata_by_condition": {
-                cid: metadata_by_condition[cid] for cid in queue_condition_ids
-            },
-            "reward_market_by_condition": {
-                cid: reward_market_by_condition[cid] for cid in queue_condition_ids
-            },
+            "directions_by_condition": LPDirectionIndex(
+                direction_facts, {cid: direction_keys[cid] for cid in queue_condition_ids}
+            ),
+            "metadata_by_condition": LPReadOverlay(metadata_by_condition, queue_condition_ids),
+            "reward_market_by_condition": reward_market_by_condition,
             "catalog_checked_at": catalog.get("checked_at"),
             "catalog_is_known": (
                 isinstance(catalog, Mapping)
@@ -5342,15 +5348,15 @@ class PolymarketLPService:
             return None
 
         directions_by_condition = cast(
-            dict[str, list[Mapping[str, object]]],
+            MutableMapping[str, list[Mapping[str, object]]],
             queue_state["directions_by_condition"],
         )
         metadata_by_condition = cast(
-            dict[str, Mapping[str, object]],
+            MutableMapping[str, Mapping[str, object]],
             queue_state["metadata_by_condition"],
         )
         reward_market_by_condition = cast(
-            dict[str, Mapping[str, object]],
+            MutableMapping[str, Mapping[str, object]],
             queue_state["reward_market_by_condition"],
         )
         evaluation_account = queue_state.get("evaluation_account")
@@ -5404,7 +5410,9 @@ class PolymarketLPService:
                         ):
                             continue
                         fresh_metadata[condition_id] = row
-                    metadata_by_condition.update(fresh_metadata)
+                    with self._candidate_state_lock:
+                        metadata_by_condition.update({cid: row for cid, row in fresh_metadata.items()
+                            if cid in metadata_by_condition and self._candidate_conditions((cid,))})
 
             else:
                 stale_reward_ids = _lp_reward_stale_conditions(
@@ -5462,7 +5470,9 @@ class PolymarketLPService:
                         fresh_reward_stamps[condition_id] = reward_stamp
 
             if self.exclusions_enabled:
-                reward_market_by_condition.update(fresh_rewards)
+                with self._candidate_state_lock:
+                    reward_market_by_condition.update({cid: row for cid, row in fresh_rewards.items()
+                        if cid in reward_market_by_condition and self._candidate_conditions((cid,))})
                 renewal_revision = self._screen_candidate_batch(
                     queue_state,
                     condition_ids,
@@ -5551,7 +5561,9 @@ class PolymarketLPService:
                     )
                 )
             if rebuilt:
-                directions_by_condition[condition_id] = rebuilt
+                with self._candidate_state_lock:
+                    if condition_id in directions_by_condition and self._candidate_conditions((condition_id,)):
+                        directions_by_condition[condition_id] = rebuilt
         return evaluation_account
 
     def _screen_candidate_histories(
@@ -6000,7 +6012,7 @@ class PolymarketLPService:
             books_reader = getattr(self.exchange, "lp_order_books", None)
             batch_tokens: list[str] = []
             directions_by_condition = cast(
-                dict[str, list[Mapping[str, object]]],
+                MutableMapping[str, list[Mapping[str, object]]],
                 queue_state["directions_by_condition"],
             )
             for _candidate, condition_id in batch:

@@ -7,6 +7,7 @@ written by this process are decoded; no external file can be opened here.
 from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping, Sequence
+from copy import deepcopy
 from datetime import date, datetime
 from io import BytesIO
 import pickle
@@ -125,6 +126,128 @@ class LPDirectionScratch(Mapping):
 
     def __len__(self):
         return len(self._values)
+
+
+class LPReadOverlay(MutableMapping):
+    """Pinned immutable source with disk-backed updates and identifier-only removal."""
+
+    def __init__(self, source, keys=None):
+        self._source = source
+        self._keys = dict.fromkeys(source if keys is None else keys)
+        self._updates = LPReadScratch()
+
+    def __getitem__(self, key):
+        with self._updates._lock:
+            if key not in self._keys:
+                raise KeyError(key)
+            try:
+                return self._updates[key]
+            except KeyError:
+                return self._source[key]
+
+    def __setitem__(self, key, value):
+        with self._updates._lock:
+            self._updates[key] = value
+            self._keys[key] = None
+
+    def __delitem__(self, key):
+        with self._updates._lock:
+            del self._keys[key]
+            self._updates.pop(key, None)
+
+    def __iter__(self):
+        with self._updates._lock:
+            return iter(tuple(self._keys))
+
+    def __len__(self):
+        return len(self._keys)
+
+    def __deepcopy__(self, memo):
+        with self._updates._lock:
+            clone = type(self)(self._source, self._keys)
+            clone._updates = deepcopy(self._updates, memo)
+            memo[id(self)] = clone
+            return clone
+
+
+class LPDirectionIndex(MutableMapping):
+    """Queue-owned direction keys; only one condition is expanded per lookup."""
+
+    def __init__(self, source, keys):
+        self._source = source
+        self._keys = keys
+        retained = {key for group in keys.values() for key in group}
+        for key in tuple(source):
+            if key not in retained:
+                del source._values[key]
+        source._metadata._keys = dict.fromkeys(keys)
+
+    def __getitem__(self, condition):
+        with self._source._values._lock:
+            rows = []
+            for key in self._keys[condition]:
+                row = self._source._values[key]
+                row["market"] = {**self._source._metadata[condition], **row["market"]}
+                rows.append(row)
+            return rows
+
+    def __setitem__(self, condition, directions):
+        with self._source._values._lock:
+            # Renewals share one new market base, never one full base per direction.
+            base = dict(directions[0]["market"]) if directions else {}
+            base = {key: value for key, value in base.items()
+                    if all(key in row["market"] and row["market"][key] == value for row in directions)}
+            old_keys = self._keys.get(condition, ())
+            keys = [f"{len(condition)}:{condition}:{index}" for index in range(len(directions))]
+            self._source._metadata[condition] = base
+            for key, row in zip(keys, directions):
+                overrides = {name: value for name, value in row["market"].items()
+                             if name not in base or base[name] != value}
+                # Keep identity available to key-only exclusion consumers.
+                for name in ("condition_id", "token_id", "outcome"):
+                    overrides[name] = row["market"][name]
+                self._source[key] = {**row, "market": overrides}
+            self._keys[condition] = keys
+            for key in set(old_keys) - set(keys):
+                del self._source._values[key]
+
+    def __delitem__(self, condition):
+        with self._source._values._lock:
+            for key in self._keys.pop(condition):
+                del self._source._values[key]
+            del self._source._metadata[condition]
+
+    def filter_tokens(self, condition, allowed):
+        with self._source._values._lock:
+            if condition not in self._keys:
+                return
+            surviving = []
+            for key in self._keys[condition]:
+                token = self._source._values[key]["market"]["token_id"]
+                if allowed(token):
+                    surviving.append(key)
+                else:
+                    del self._source._values[key]
+            self._keys[condition] = surviving
+
+    def __iter__(self):
+        with self._source._values._lock:
+            return iter(tuple(self._keys))
+
+    def __contains__(self, condition):
+        with self._source._values._lock:
+            return condition in self._keys
+
+    def __len__(self):
+        return len(self._keys)
+
+    def __deepcopy__(self, memo):
+        with self._source._values._lock:
+            clone = type(self).__new__(type(self))
+            memo[id(self)] = clone
+            clone._source = deepcopy(self._source, memo)
+            clone._keys = deepcopy(self._keys, memo)
+            return clone
 
 
 class LPReadRows(Sequence):
