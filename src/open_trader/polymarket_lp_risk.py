@@ -1150,7 +1150,6 @@ def evaluate_lp_entry(
     guidance.update(
         {
             "price": price,
-            "bid_level": bid_level,
             "quantity": quantity,
             "required_capital": capital,
             "minimum_order_size": minimum,
@@ -1161,6 +1160,8 @@ def evaluate_lp_entry(
             "expires_at": expires_at.isoformat(timespec="microseconds").replace("+00:00", "Z"),
         }
     )
+    if bid_level != 1:
+        guidance["bid_level"] = bid_level
     return {
         "state": "eligible",
         "reason_codes": ["event_coverage_incomplete"]

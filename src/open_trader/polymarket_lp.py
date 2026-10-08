@@ -8260,20 +8260,16 @@ class PolymarketLPService:
                 self._require_lp_history(request, now=now)
                 # Issue 158: same submit-time best-bid re-check as start.
                 credential_preflight = preview.get("preflight")
-                credential_selected_bid = (
-                    _maybe_decimal(
-                        credential_preflight.get(
-                            "selected_bid", credential_preflight.get("best_bid")
-                        )
-                    )
+                credential_best_bid = (
+                    _maybe_decimal(credential_preflight.get("best_bid"))
                     if isinstance(credential_preflight, Mapping)
                     else None
                 )
                 if (
-                    credential_selected_bid is not None
-                    and credential_selected_bid != facts["selected_bid"]
+                    credential_best_bid is not None
+                    and credential_best_bid != facts["best_bid"]
                 ):
-                    raise ValueError("candidate_bid_level_changed")
+                    raise ValueError("best_bid_changed")
                 expiration = expiration_for_review(
                     _timestamp(request["review_at"], name="review_at"), now=now
                 )
@@ -12347,9 +12343,11 @@ class PolymarketLPService:
             }
             for order_id, record in history.items():
                 if (
-                    reason == "group_fill_collect"
-                    or
-                    not order_id
+                    (
+                        reason == "group_fill_collect"
+                        and order_id == str(current.get("passive_exit_order_id") or "")
+                    )
+                    or not order_id
                     or order_id == protected_id
                     or order_id in targets
                     or str(record.get("side") or "").upper() != "SELL"
@@ -13016,10 +13014,10 @@ class PolymarketLPService:
         *,
         trade_revision: int | None = None,
     ) -> Mapping[str, object]:
-        """Issue 167 D3: after any fill, cancel every owned sweep target.
+        """After any fill, collect owned orders except the managed passive exit.
 
-        ``_cancel_owned_orders`` preserves review/stop semantics for entry,
-        passive, and augment targets while authorizing the complete actual
+        ``_cancel_owned_orders`` retains entry, historical SELL, and augment
+        cleanup with the same ownership checks and authorizes the complete
         batch before its first venue cancel.
         """
 
@@ -13039,7 +13037,7 @@ class PolymarketLPService:
                 snapshot=snapshot,
                 expected_generation=snapshot.get("_lp_trade_generation"),
                 expected_trade_revision=trade_revision,
-                buy_only=True,
+                preserve_passive_exit=True,
             )
         except ValueError as exc:
             if str(exc) == "account_round_invalid":
@@ -17393,7 +17391,7 @@ class PolymarketLPService:
         snapshot: Mapping[str, object] | None = None,
         expected_generation: int | None = None,
         expected_trade_revision: int | None = None,
-        buy_only: bool = False,
+        preserve_passive_exit: bool = False,
     ) -> None:
         current = dict(self.store.lp_session(str(session["session_id"])) or session)
         if current.get("order_identity_conflict"):
@@ -17403,7 +17401,7 @@ class PolymarketLPService:
         pending_cancels = self._recent_pending_cancel_order_ids(session_id)
         specs: list[tuple[str, str, str]] = []
         cancel_fields = [("entry_order_id", "entry_cancel_requested", "entry")]
-        if not buy_only:
+        if not preserve_passive_exit:
             cancel_fields.append(("passive_exit_order_id", "passive_cancel_requested", "passive_exit"))
         for key, requested_key, role in cancel_fields:
             order_id = str(current.get(key) or "")
@@ -17428,8 +17426,6 @@ class PolymarketLPService:
         }
         for order_id, record in history.items():
             if (
-                buy_only
-                or
                 str(record.get("side") or "").upper() != "SELL"
                 or not order_id
                 or order_id in managed

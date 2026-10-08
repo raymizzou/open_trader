@@ -296,11 +296,13 @@ def test_restart_covers_dead_buy_only_with_consistent_identity(
         assert bool(store.lp_session(sid).get('reservation_coverage')) is covered
         assert current['slots']['occupied'] == 4 if covered else current['slots']['occupied'] >= 5
         if invalid == 'independent-action':
-            # API covers the original entry; independent SELL uncertainty
-            # still prevents admission without inventing another BUY slot.
-            assert current['funds']['status'] == 'unknown'
-            assert current['funds']['spendable_usd'] is None
-            assert current['admission_block_reasons']
+            # API covers the original entry. The UNKNOWN SELL adds no BUY
+            # hold; four real BUYs reserve 32 from the fixed budget of 100.
+            assert current['funds']['status'] == 'known'
+            assert Decimal(current['funds']['buy_reserved_usd']) == 32
+            assert Decimal(current['funds']['spendable_usd']) == 68
+            assert Decimal(current['funds']['inventory_cost_usd']) == 0
+            assert not current['admission_block_reasons']
         assert store.lp_actions(sid) == audit
         assert account.posts == account.cancels == []
     finally:

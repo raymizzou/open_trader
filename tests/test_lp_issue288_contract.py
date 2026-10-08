@@ -604,6 +604,76 @@ class _UnknownImportedBuyAccount(_ImportedExitAccount):
         return super().get_order(order_id=order_id)
 
 
+class _UnknownBuyWithOrphanSellAccount(_UnknownImportedBuyAccount):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.orphan_status = "LIVE"
+
+    def get_order(self, *, order_id: str) -> OpenOrder:
+        if order_id == "O1":
+            return _open_order(
+                "O1", "SELL", price="0.46", original="5",
+                status=self.orphan_status,
+            )
+        return super().get_order(order_id=order_id)
+
+    def cancel_orders(self, *, order_ids):
+        requested = tuple(order_ids)
+        self.cancel_calls.append(requested)
+        assert requested == ("O1",), "The managed passive SELL must survive"
+        self.orphan_status = "CANCELED"
+        return {"canceled": list(requested), "not_canceled": {}}
+
+
+def test_group_collect_preserves_managed_sell_but_cancels_other_owned_sell(tmp_path, monkeypatch):
+    old_receipt = _open_order(
+        "S1", "SELL", price="0.45", original="20", status="LIVE",
+    )
+    fill = _maker_order("F", "BUY", "20", "0.40")
+    monkeypatch.setattr(
+        registration_contract, "_SDKAccountClient", _UnknownBuyWithOrphanSellAccount
+    )
+    store, adapter, account, _, execution = _runtime(
+        tmp_path,
+        orders=(),
+        trades=(_trade("fill-F", fill, size="20"),),
+        positions=({
+            "condition_id": CONDITION_ID, "token_id": TOKEN_ID,
+            "outcome": "YES", "size": Decimal("20"),
+            "average_price": Decimal("0.40"),
+        },),
+    )
+    account.old_receipt = old_receipt
+    adapter._public_client_factory = lambda: _ImportedExitBook(NOW, bid_price="0.40")
+    payload = _active_payload(old_receipt)
+    payload.update(quantity=Decimal("20"), group_buy_quantity=Decimal("20"))
+    payload["order_history"]["F"].update(status="UNKNOWN", size_matched=Decimal("20"))
+    payload["order_history"]["F"].pop("original_size", None)
+    payload["order_history"]["S1"].update(status="LIVE", original_size=Decimal("20"))
+    payload["owned_order_ids"].append("O1")
+    payload["order_history"]["O1"] = {
+        "order_id": "O1", "token_id": TOKEN_ID, "side": "SELL",
+        "status": "LIVE", "price": Decimal("0.46"),
+        "original_size": Decimal("5"), "size_matched": Decimal("0"),
+    }
+    store.lp_create_session(
+        "imported-mixed", "imported-mixed", state="entry_open",
+        payload={**payload, "session_id": "imported-mixed"},
+    )
+    try:
+        assert execution.refresh_lp_dashboard_snapshot()["state"] == "ready"
+        for _ in range(3):
+            _fresh_tick(execution, adapter)
+        session = store.lp_session("imported-mixed")
+        assert account.cancel_calls == [("O1",)]
+        assert session["passive_exit_order_id"] == "S1"
+        assert session["order_history"]["F"]["status"] == "UNKNOWN"
+        assert Decimal(str(session["residual_quantity"])) == Decimal("20")
+        assert account.limit_orders == account.posts == []
+    finally:
+        adapter.close()
+
+
 def test_unknown_imported_buy_keeps_live_passive_sell(tmp_path, monkeypatch):
     old_receipt = _open_order(
         "S1", "SELL", price="0.45", original="20", status="LIVE",

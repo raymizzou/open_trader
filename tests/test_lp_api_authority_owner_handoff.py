@@ -379,9 +379,15 @@ def test_same_id_unknown_is_deduplicated_but_true_independent_risk_stays_separat
     state = execution.lp_auto_state()
     assert state['slots']['occupied'] == (4 if side == 'BUY' else 3)
     assert Decimal(state['funds']['buy_reserved_usd']) == (32 if side == 'BUY' else 24)
-    assert state['funds']['status'] == 'unknown'
-    assert state['funds']['spendable_usd'] is None
-    assert state['admission_block_reasons']
+    if side == 'BUY':
+        assert state['funds']['status'] == 'unknown'
+        assert state['funds']['spendable_usd'] is None
+        assert state['admission_block_reasons']
+    else:
+        assert state['funds']['status'] == 'known'
+        assert Decimal(state['funds']['spendable_usd']) == 16
+        assert Decimal(state['funds']['inventory_cost_usd']) == 0
+        assert not state['admission_block_reasons']
     assert state['intents'] == audit
     assert store.lp_actions(original['session_id']) == actions
     assert account.posts == account.cancels == []
