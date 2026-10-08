@@ -1,7 +1,7 @@
 # Polymarket 流动性奖励人工试验 SOP
 
-版本：v3.2
-日期：2026-09-18
+版本：v3.3
+日期：2026-10-08
 状态：只读轻筛与小时补全检查已实现；成功历史摘要缓存 24 小时；部分覆盖和逐标的恢复可见；首次真实启动仍需独立授权和当次新鲜预检查
 
 本文区分两个独立流程。Dashboard 的新“推荐标的”是只读外部入场指引：操作者可查看事实并打开普通 Polymarket 市场链接，但页面不会创建预览、启动系统会话或提交订单。原有系统管理会话仍使用固定单市场、单结果和 `$5` 止损触发线；只有操作者按本文重新核对事实并明确确认，才可通过既有 session API 启动。本文不授权入金、真实下单、候选激活、自动做市、部署或连续无人值守运行。
@@ -58,13 +58,62 @@
 
 完整候选池数量与前 10 个候选预览继续单独展示，轮换目标另记为前 N 个市场。新鲜完整事实证实旧单数量低于奖励最低数量、或价格移出计奖价差时，旧单按零预计收益排名；缺失或过期事实仍记未知，不当作零收益。
 
-“暂停新增”持久化人工意愿，保留已有自动 BUY；保护、库存退出和已发送意图核对继续。终端向运行中的 Prediction 服务发出同一暂停请求：
+### 2.2 LP Auto CLI
+
+终端通过运行中的 Prediction 服务读取和操作同一份 Auto 状态，与 Dashboard 一致。
+先保存配置，再明确开启；保存配置本身不会启用 Auto 或提交订单。
 
 ```sh
-python -m open_trader prediction-arb lp-auto pause --url http://127.0.0.1:8769 --timeout 15
+# 保存配置；保持暂停
+open-trader prediction-arb lp-auto config --budget 100 --target-buys 5 --bid-level 2
+
+# 使用已保存的预算、BUY 目标和档位开启 Auto
+open-trader prediction-arb lp-auto on
+
+# 暂停新增自动 BUY，保留现有订单与退出保护
+open-trader prediction-arb lp-auto off
+
+# 只读核对实际状态
+open-trader prediction-arb lp-auto status
+open-trader prediction-arb lp-auto status --json
+
+# 原 pause 命令保留，与 off 行为相同
+open-trader prediction-arb lp-auto pause --url http://127.0.0.1:8769 --timeout 15
 ```
 
-只有返回 `result: PAUSED`（退出码 0）才表示服务已确认暂停。不可达、超时或回执不完整返回 `UNKNOWN`（退出码 2）；此时不能推断已经暂停，可在服务恢复后重试。这条命令不会调用 LP 会话 `stop`、全撤订单或停掉进程。
+`config` 的 `--budget` 和 `--target-buys` 必填。预算接受有限、非负 Decimal，
+BUY 目标接受非负整数；0 沿用服务原有语义，不表示撤单。`--bid-level` 可省略，
+只接受 1 或 2；省略时保留已有档位，服务对旧存储缺字段使用 1。
+2 档使用第二个不同且正深度的买价，缺档不回退买一。
+
+预算是当前持仓成本与有效 BUY 未成交占款的总占用额度，不是每单金额，
+也不随历史盈亏增加。BUY 目标包含服务纳管的手动 BUY；真正未决和撤单中的 BUY
+继续占位，SELL 和单纯持仓不占 BUY 名额。目标不保证立即有 N 张 LIVE 订单，
+也不是外部手动单或迟到回执的绝对硬上限。资金、候选不足或事实未知时，保留服务阻塞原因。
+
+配置写入先读取 `config_version`，再发送 `expected_config_version`。
+版本冲突、运行中或 BUY 尚未清理而被拒绝时，CLI 显示服务原因，不自动暂停、撤单、开启或重试写入。
+失败输出中的 `state` 若存在，是已读取的服务快照；配置拒绝时可能是写入前的快照，
+不能把它当作失败后重新核对的当前状态。
+
+`on` 不修改配置。只有严格布尔 `desired_running=true` 的确认回执才返回 `result: ON`。
+同时显示实际 `runtime_state`；`ON` 配合 `BLOCKED` 表示已保存开启意愿但仍受阻，不表示已挂满目标。
+`off`/`pause` 只有 `desired_running=false` 且 `pause_confirmed=true` 的一致回执才返回
+`result: PAUSED`。暂停持久化人工意愿，保留已有 BUY/SELL；退出保护和已发送意图核对继续。
+它不会调用 LP 会话 `stop`、全撤订单、清仓、停止进程或改变 N_LEG 状态。
+
+所有命令均支持 `--url`、有限正数 `--timeout` 和 `--json`。
+默认 URL 为 `http://127.0.0.1:8769`，默认超时为 15 秒；一次命令共用一个请求时间预算。
+仅接受 HTTP loopback IP 的服务根 URL，拒绝凭据、额外路径和重定向，忽略外部代理。
+写请求通过现有 `/venues` 获取 session cookie 和 CSRF，认证只保留在内存，不输出认证值。
+CLI 不直接打开交易数据库、读取交易所密钥或调用交易所。
+
+确认成功返回 0；`status` 成功读取暂停或受阻状态同样返回 0。
+人类输出分别列出 Auto 意愿、运行状态、配置、活动/未决/撤单中/总占位数、资金、阻塞原因与最近检查。
+未知字段显示 `UNKNOWN`，不填零；`--json` 输出单个 JSON 文档，未知值保留 null 或缺失字段。
+不可达、超时、回执缺失或矛盾时返回 `UNKNOWN` 和退出码 2。
+写入可能已被服务接受；CLI 不自动重发 POST，也不宣称已回滚。
+随后使用相同 `--url` 运行只读 `status` 核对，再决定下一步。
 
 修改资金/目标前须人工暂停，并等自动 BUY、撤单中 BUY 和未决提交全部终结；页面和 API 使用同一屏障。资金或目标设为 0 不暗中撤单。普通重启保留人工意愿，先核对再恢复新增；无法核清的提交保持受阻，用户期间的人工暂停优先。
 
