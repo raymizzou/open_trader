@@ -15703,6 +15703,87 @@ def test_lp163_orders_route_happy_path(tmp_path: Path) -> None:
     assert Decimal(str(stored["estimated_target_quantity"])) == Decimal("21")
 
 
+def test_lp163_orders_route_preserves_strategy_level_and_revalidates_quote(
+    tmp_path: Path,
+) -> None:
+    """Transport the selected level to real core checks, never bypass them."""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    path = "/api/prediction-arbitrage/lp/orders"
+
+    def scenario(name: str, second: str = "0.39"):
+        result = _lp163_route_fixture(tmp_path / name, now)
+        exchange = result[2]
+        exchange.snapshot["market"].update(
+            minimum_order_size=Decimal("20"), reward_min_size=Decimal("20")
+        )
+        exchange.snapshot["book"].update(
+            bids=[
+                {"price": Decimal("0.40"), "size": Decimal("1000")},
+                {"price": Decimal(second), "size": Decimal("1000")},
+            ],
+            asks=[{"price": Decimal("0.42"), "size": Decimal("1000")}],
+        )
+        return result
+
+    runtime, _execution, exchange, store, _lp, body = scenario("selected")
+    request = body(price="0.39", candidate_bid_level=2, idempotency_key="level-two")
+    with _server(runtime, session_token="session-token", csrf_token="csrf-token") as base:
+        status, accepted = _response(
+            _production_request(base, path, data=json.dumps(request).encode())
+        )
+        assert status == 200
+        assert accepted["state"] == "entry_open"
+        assert len(exchange.posts) == 1
+        posted = exchange.posts[0]
+        assert Decimal(str(posted["price"])) == Decimal("0.39")
+        assert Decimal(str(posted["quantity"])) == 20
+        assert posted["token_id"] == request["token_id"]
+        assert posted["post_only"] is True
+        reads_before_replay = exchange.snapshot_calls
+        replay_status, replay = _response(
+            _production_request(base, path, data=json.dumps(request).encode())
+        )
+        assert replay_status == 200
+        assert replay["session_id"] == accepted["session_id"]
+        assert len(exchange.posts) == 1
+        assert exchange.snapshot_calls == reads_before_replay
+    assert store.lp_session_by_idempotency("level-two") is not None
+
+    runtime, _execution, exchange, store, _lp, body = scenario("drifted", "0.38")
+    with _server(runtime, session_token="session-token", csrf_token="csrf-token") as base:
+        status, rejected = _response(
+            _production_request(base, path, data=json.dumps(body(
+                price="0.39", candidate_bid_level=2, idempotency_key="level-drift"
+            )).encode())
+        )
+    assert status == 200
+    assert rejected == {"state": "rejected", "reason": "candidate_bid_level_changed"}
+    assert exchange.posts == []
+    assert store.lp_session_by_idempotency("level-drift") is None
+
+    runtime, _execution, exchange, _store, _lp, body = scenario("invalid-and-legacy")
+    with _server(runtime, session_token="session-token", csrf_token="csrf-token") as base:
+        for index, invalid in enumerate((0, 3, True, "2")):
+            status, _rejected = _response(
+                _production_request(base, path, data=json.dumps(body(
+                    price="0.39", candidate_bid_level=invalid,
+                    idempotency_key=f"invalid-level-{index}",
+                )).encode())
+            )
+            assert status == 400
+            assert exchange.posts == []
+            assert exchange.snapshot_calls == 0
+        status, legacy = _response(
+            _production_request(base, path, data=json.dumps(body(
+                price="0.40", idempotency_key="legacy-level-one"
+            )).encode())
+        )
+    assert status == 200
+    assert legacy["state"] == "entry_open"
+    assert len(exchange.posts) == 1
+    assert Decimal(str(exchange.posts[0]["price"])) == Decimal("0.40")
+
+
 def test_lp163_augment_route_contract(tmp_path: Path) -> None:
     """H5: /lp/augment——缺字段 400、成功 200+augment_order_id、受阻组 200+真实原因、鉴权先行。"""
     now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)

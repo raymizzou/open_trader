@@ -838,6 +838,7 @@ class PolymarketLPService:
         self._candidate_preparation_wakeup = None
         self.owner_lock = owner_lock
         self._mutation_guard = mutation_guard
+        self._candidate_buy_price_level_reader: Callable[[], int] | None = None
         listener = getattr(store, "set_lp_trade_change_listener", None)
         if callable(listener):
             listener(self._invalidate_lp_account_round)
@@ -2417,6 +2418,40 @@ class PolymarketLPService:
         if reason is not None:
             raise ValueError(reason)
 
+    def set_candidate_buy_price_level_reader(self, reader: Callable[[], int]) -> None:
+        """Use the effective persisted Auto quote level for strategy estimates."""
+        self._candidate_buy_price_level_reader = reader
+
+    def _candidate_buy_price_level(self) -> int | None:
+        reader = self._candidate_buy_price_level_reader
+        if reader is None:
+            return 1
+        try:
+            level = reader()
+        except Exception:
+            return None
+        return level if type(level) is int and level in (1, 2) else None
+
+    @staticmethod
+    def _candidate_strategy_projection(
+        row: Mapping[str, object], bid_level: int | None
+    ) -> dict[str, object]:
+        projected = deepcopy(dict(row))
+        # Before level-aware estimates, all saved candidate estimates used
+        # buy one. Preserve that provenance rather than relabeling on reload.
+        estimated_level = row.get("estimate_buy_price_level", 1)
+        if (bid_level is not None and type(estimated_level) is int
+                and estimated_level == bid_level):
+            return projected
+        _apply_row_estimate_fields(projected, None)
+        projected.update(state="unknown", verification="pending",
+                         selected_direction=None, directions={},
+                         estimate_reason_codes=["strategy_level_pending"])
+        for field in ("realtime_price", "realtime_capital", "realtime_checked_at",
+                      "estimated_exit_loss", "estimated_exit_loss_ratio"):
+            projected[field] = None
+        return projected
+
     def candidate_snapshot(self) -> dict[str, object]:
         """Project the rolling candidate pool without external reads.
 
@@ -2429,6 +2464,7 @@ class PolymarketLPService:
         """
 
         self._evict_excluded_candidates()
+        bid_level = self._candidate_buy_price_level()
         with self._candidate_state_lock:
             pool = deepcopy(self._candidate_pool)
             snapshot = deepcopy(self._candidate_snapshot)
@@ -2459,7 +2495,7 @@ class PolymarketLPService:
                     }
                 )
                 continue
-            valid_rows.append(row)
+            valid_rows.append(self._candidate_strategy_projection(row, bid_level))
         valid_rows.sort(key=_candidate_yield_sort_key)
         published = []
         for row in valid_rows[:LP_TRIAL_CANDIDATE_LIMIT]:
@@ -2552,6 +2588,7 @@ class PolymarketLPService:
             if isinstance(trial_reasons, list):
                 trial_reasons.extend(history_reasons)
         projection = {
+            "buy_price_level": bid_level,
             "state": snapshot_state,
             "complete": snapshot.get("complete") is True,
             "scanning": snapshot.get("scanning") is True,
@@ -5966,6 +6003,7 @@ class PolymarketLPService:
         global_recovery_generation: int | None = None
         try:
             attempted_at = self._now()
+            bid_level = self._candidate_buy_price_level()
             global_recovery_generation = self._current_candidate_global_generation()
             if global_recovery_generation is None:
                 return self._finish_candidate_scan(
@@ -6186,6 +6224,7 @@ class PolymarketLPService:
                             now=evaluation_now,
                             reservations=reservations,
                             candidate=True,
+                            bid_level=bid_level,
                         )
                     qualified_directions.append(qualified_direction)
                     result = {
@@ -6289,6 +6328,7 @@ class PolymarketLPService:
                     )
                     continue
                 row = dict(candidate)
+                row["estimate_buy_price_level"] = bid_level
                 row["directions"] = direction_results
                 row["selected_direction"] = selected_direction
                 row["state"] = row_state
@@ -6442,6 +6482,7 @@ class PolymarketLPService:
             return snapshot
         try:
             now = self._now()
+            bid_level = self._candidate_buy_price_level()
             global_recovery_generation = self._current_candidate_global_generation()
             if global_recovery_generation is None:
                 return self.candidate_snapshot()
@@ -6470,7 +6511,7 @@ class PolymarketLPService:
             # Issue #157: maintenance renews the currently displayed top ten
             # valid pool rows (whole-table framework, pool publication).
             valid_rows = [
-                row
+                self._candidate_strategy_projection(row, bid_level)
                 for row in pool.values()
                 if isinstance(row, Mapping)
                 and not _candidate_pool_row_expired(row, now)
@@ -6569,6 +6610,10 @@ class PolymarketLPService:
             lead_due = bool(source_times) and min(source_times) + timedelta(
                 seconds=float(LP_RECOMMENDATION_REFRESH_LEAD_SECONDS)
             ) <= now
+            level_changed = any(
+                row.get("estimate_buy_price_level", 1) != bid_level
+                for row in selected_rows
+            )
             if failures > 0 and last_finished_at is not None:
                 # Issue #146: a failed maintenance attempt suppresses further
                 # reads until its backoff window (60/120/300s, counted from
@@ -6581,7 +6626,7 @@ class PolymarketLPService:
                     < backoff
                 ):
                     return self.candidate_snapshot()
-            if not lead_due and not source_expired:
+            if not lead_due and not source_expired and not level_changed:
                 return self.candidate_snapshot()
             if stop_event is not None and stop_event.is_set():
                 return self.candidate_snapshot()
@@ -7043,6 +7088,7 @@ class PolymarketLPService:
                                 now=evaluation_now,
                                 reservations=reservations,
                                 candidate=True,
+                                bid_level=bid_level,
                             )
                     updated_directions.append(maintenance_direction)
                     result: dict[str, object] = {
@@ -7108,6 +7154,8 @@ class PolymarketLPService:
                     else None
                 )
                 new_row = dict(row)
+                new_row["estimate_buy_price_level"] = bid_level
+                new_row.pop("estimate_reason_codes", None)
                 new_row["directions"] = direction_results
                 new_row["selected_direction"] = selected_direction
                 new_row["state"] = (

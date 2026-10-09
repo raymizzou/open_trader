@@ -844,6 +844,9 @@ class PredictionExecutionService:
         if self._lp is not None:
             from .polymarket_lp_auto import LPAutoPool
             self._auto_pool = LPAutoPool(self)
+            level_reader_setter = getattr(self._lp, "set_candidate_buy_price_level_reader", None)
+            if callable(level_reader_setter):
+                level_reader_setter(self._auto_pool.buy_price_level)
             self._lp._facts_publisher = self._auto_pool.publish_session
             self._lp._facts_validator = self._validate_lp_facts
             self._lp._facts_attention_flusher = self._auto_pool.flush_attention
@@ -1917,6 +1920,20 @@ class PredictionExecutionService:
         cached = self._lp_dashboard_cache
         if cached is not None:
             result = deepcopy(cached)
+            if self._lp is not None and hasattr(self._lp, "set_candidate_buy_price_level_reader"):
+                try:
+                    level = self._auto_pool.buy_price_level()
+                except Exception:
+                    level = None
+                if result.get("buy_price_level", 1) != level:
+                    # Only the candidate projection changes with strategy.
+                    # Account facts, resting rewards and paid history retain
+                    # their own background observations and timestamps.
+                    strategy = self._lp.candidate_snapshot()
+                    for field in ("candidates", "recommendations", "selected_results",
+                                  "selected_market_ids", "buy_price_level"):
+                        result[field] = deepcopy(strategy.get(field))
+                    result["candidate_state"] = strategy.get("state", "unknown")
             if getattr(self, "_display_only", False) and self._lp_account_snapshot_expired(result.get("checked_at")):
                 result.update(state="stale", stale=True, reason="account_snapshot_expired")
             return result
@@ -3035,6 +3052,7 @@ class PredictionExecutionService:
                     "lp_orders_today": lp_orders_today,
                     "non_lp_row_count": non_lp_row_count,
                     "candidates": candidates,
+                    "buy_price_level": candidate_snapshot.get("buy_price_level", 1),
                     "recommendations": recommendations,
                     "selected_results": selected_results,
                     "preparation": preparation,
@@ -3182,6 +3200,7 @@ class PredictionExecutionService:
                     else {}
                 )
                 candidate_projection = {
+                    "buy_price_level": candidate_snapshot.get("buy_price_level", 1),
                     "candidates": [
                         dict(row)
                         for row in candidate_rows
