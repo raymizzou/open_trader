@@ -21,8 +21,8 @@ when the project already grants an exemption.
 Delegate implementation only when the user or applicable instructions authorize
 it. Give the worker the approved scope, worktree, and verification contract.
 The required independent review remains separate from implementation: the author
-does not serve as their own reviewer. Follow the staged-review and repair rules
-in `AGENTS.md` before publication.
+does not serve as their own reviewer. Follow the publication, review and repair
+ordering in `AGENTS.md`; required independent review follows first publication.
 
 When the user selects Herdr for implementation, start new Codex implementation
 workers with `gpt-6.1-sol` and `high` reasoning unless the user chooses otherwise:
@@ -56,7 +56,7 @@ affect a testable contract; CI planner/workflow contracts need focused regressio
 checks. Missing dependencies or unavailable environments are blockers to report,
 not passing evidence. Keep TDD, relevant stability checks and independent review.
 
-Docker is not a prerequisite to push a reviewed branch. Optional focused Docker
+Docker is not a prerequisite to task-branch publication. Optional focused Docker
 diagnosis can use `make test TEST='tests/path.py::test_name'`; local development
 does not require whole-service or full-backend suites. GitHub CI owns the complete active
 backend test suite on every branch push and every PR targeting `main`,
@@ -175,8 +175,11 @@ they do not change the scope-specific verification routes above.
    a later pass does not erase a failed attempt, and repetition alone does not
    prove correctness. Diagnostic retries must not turn failures into success.
 4. Report all failures and any remaining uncertainty or blocked verification.
-   Restage the exact changes and obtain independent review before publication;
-   existing exact-SHA, rebase, CI, and approval requirements still apply.
+   Main stages/commits only the exact changes and publishes the task update, then
+   obtains refreshed independent review of the published head/base. For unpublished
+   local-only work, restage task files and review `git diff --cached` without
+   publishing. Existing exact-SHA, rebase, CI,
+   and approval requirements still apply.
 
 ## Verification and deployment boundaries
 
@@ -259,8 +262,9 @@ receive any development validation relevant to their own scope.
 ## Authorized PR delivery loop
 
 Main is the existing delivery owner, not a new permanent agent. The bounded loop
-covers the approved implementation, verification and blocker repairs; publication
-and external replies still need their applicable authorization. Read-only review,
+covers the approved implementation, verification and blocker repairs. Task-branch
+publication has the standing authorization below; external replies still need
+their applicable authorization. Read-only review,
 diagnosis and webhook observation do not grant write authority. Once authorized,
 continue that loop without repeated reminders. Escalate changes to scope,
 behavior, architecture, risk or test contracts. Preserve other workers' work.
@@ -273,22 +277,40 @@ This procedure coordinates [#293](https://github.com/raymizzou/open_trader/issue
 The first reviewable implementation covers the approved scope with the necessary
 tests and enough evidence for independent review. It does not require all later
 improvements or completed remote CI. Complete applicable focused tests and
-security checks, add the dated `CHANGELOG.md` entry, and obtain independent staged
-review of the exact task files. Repair blockers to first publication, rerun
-affected checks and obtain independent review of the restaged changes.
+security checks and add the dated `CHANGELOG.md` entry. Documentation-only work
+uses diff inspection and `git diff --check`, without local backend tests.
 
-When branch push and Draft PR creation are authorized, promptly publish only the
-reviewed tree to the task branch and open the Draft PR targeting `main`. Do not
-wait for complete branch CI, add unneeded local full suites, or iterate on
-nonblocking polish before the first PR. State the issue scope, reviewed head/base,
-local verification, known limits, unverified work and pending remote CI in the PR.
-If push or Draft PR authorization is absent, report the exact pending boundary
-and retain the prepared result; implementation approval does not imply publication.
+Standing user authorization dated 2026-10-09, scoped to `raymizzou/open_trader`
+across machines and checkouts, requires Main to promptly stage/commit only the
+task files, push the task branch and open a normal (non-draft) PR targeting
+`main`, or update its existing PR. Do not ask again for push or PR permission.
+Explicit local-only, no-push, do-not-publish or draft instructions override this
+default. Workers never publish. This authorization also covers Main's task-local
+repair commits/pushes to the same PR without repeated permission; it grants no
+force-push, direct `main` push, automatic merge, release/tag or deployment authority.
+This standing authorization supersedes older requirements for completed review
+before publication or separate push/PR permission.
+
+Publish before independent reviewer completion, dots feedback, repair closure,
+final acceptance or merge. A failed, unavailable or not-started reviewer does
+not delay first publication. Do not wait for complete branch CI, add unneeded
+local full suites, or iterate on nonblocking polish before the first PR. Continue
+required independent review and in-scope repairs afterward. Publication is a
+review handoff, not a readiness or approval claim.
+
+Verify the remote PR exists, its URL and exact head/base, and that its head
+matches the pushed task commit. Record issue scope, local verification, known
+limits, unverified work, pending review and CI. Report actual Git, authentication,
+network or PR access/publication failures; do not label standing authorization
+as pending permission. Claim dots has started only with observed evidence.
 
 ### Parallel post-publication review and CI
 
 Immediately after publication, start a distinct independent Herdr
-GLM-5.3/max reviewer pane alongside remote CI. Keep the pre-push independent review.
+GLM-5.3/max reviewer pane alongside remote CI. Use a fresh reviewer for the initial
+independent review; reuse it for this target's in-scope repairs. An explicitly
+local-only unpublished review uses the staged diff; published reviews use the
+exact PR head/base range. Required final independent review remains a merge gate.
 Give the reviewer the issue requirements, repository/worktree, PR URL, immutable
 published head/base SHAs, applicable checks and verification limits. Review
 `git diff <base>...<head>` against that scope. Record actual startup evidence;
@@ -412,8 +434,9 @@ disappear for review-ready status. Valid unresolved blockers prevent claiming
 review-ready.
 
 For valid in-scope blockers: diagnose, repair with the assigned worker,
-run affected checks, obtain independent review, publish the reviewed update when
-authorized, and refresh applicable review/CI evidence. Follow the existing rebase
+run affected checks, have Main stage/commit/push only task changes to the same PR
+under the standing authorization, then refresh independent review and CI evidence.
+Reuse the assigned reviewer for in-scope repairs. Follow the existing rebase
 rules when the base advances; preserve other workers' commits and test intent.
 After verifying a repair, make an authorized reply in the relevant thread with
 the solution, fix commit and verification evidence, then fetch feedback again.
@@ -430,7 +453,8 @@ publication for polish.
 
 A review-ready handoff requires successful current applicable push-head and
 PR-merge `required` checks from GitHub Actions (app ID 15368), completed required
-pre-push and GLM reviews, no known unresolved blockers, and fresh feedback and
+independent GLM review of the current published target, no known unresolved
+blockers, and fresh feedback and
 mergeability checks. Record the PR head/base, synthetic merge SHA and Actions
 run/check identities; see [CI identity](ci.md). Unknown, pending, cancelled, failed
 or mismatched evidence is not success. A base/head change invalidates applicable
@@ -470,7 +494,7 @@ where appropriate, with reasons. This is a format, not an executed delivery:
 Task/approved scope; delivery owner; publication/reply authority:
 PR URL; immutable head/base; synthetic merge SHA; Actions run/check IDs/URLs:
 Local focused/security checks: command, environment, identity, result, limits:
-Independent pre-push review: staged tree/identity, reviewer, result/evidence:
+Independent review: published head/base (or unpublished local-only staged tree), result/evidence:
 GLM: pane, actual model/reasoning/profile/provider, status, PR/head/base:
 GLM comment: URL, verified author/body/identities, Main's accepted handoff:
 Feedback: retrieval time, latest PR/head/base, complete paginated collections:
@@ -484,8 +508,8 @@ Workers: saved work, exclusive duties/new owner, accepted handoff, lifecycle sta
 ## Merge, live processes, and deployment
 
 The delivery path is isolated branch/worktree from freshly fetched
-`origin/main` → focused local development checks → staged independent review
-(including a dated `CHANGELOG.md` entry) → prompt authorized branch push/Draft PR
+`origin/main` → focused local development/security checks and dated `CHANGELOG.md`
+entry → Main stages/commits task-only files → prompt task-branch push/normal PR
 → parallel GLM review and CI → feedback/repair loop → review-ready handoff
 → explicit user approval → GitHub merge. Follow the
 [delivery procedure](#authorized-pr-delivery-loop). Local `main` is
@@ -493,7 +517,8 @@ only a synchronized copy of GitHub `main`, never an integration or repair path.
 When the base advances, fetch/rebase, rerun focused checks and independent
 review, and inspect fresh CI. Rebase and conflict-resolution approval follows
 [AGENTS.md](../../AGENTS.md#review-and-merge). Never force-push `main`.
-A reviewed branch rewrite also requires authorized publication; do not discard
+A branch rewrite requires its own applicable authorization; the standing
+publication authorization does not grant force-push. Do not discard
 another worker's commits.
 
 There are three distinct identities: the reviewed PR head; GitHub's synthetic
@@ -530,14 +555,16 @@ Failed Deployment Preflight or Host `BLOCKED` blocks forward deployment. Missing
 expired, cancelled or mismatched CI evidence is not a reason to rerun local full
 pytest. Report the missing check and obtain fresh trusted CI evidence through the
 approved process. A real test failure returns through focused diagnosis, approved
-in-scope repair, independent review, Draft PR, CI and separately authorized merge.
+in-scope repair, task-branch/PR update, independent review, CI and separately
+authorized merge.
 Do not weaken tests, invent attestations, provision credentials or expand scope to
 turn an unknown result into success.
 
 Deployment requires exact-SHA preflight success, fresh Host `READY`, and explicit
 user authorization. Production Smoke must report `HEALTHY` for that same SHA.
-Branch push, Draft PR, GitHub merge, release/tag creation and deployment remain
-separate authorization boundaries. Preserve the exact selected SHA, immutable
+Task-branch push and PR creation/updates have the standing authorization above;
+GitHub merge, release/tag creation and deployment retain separate authorization
+boundaries. Preserve the exact selected SHA, immutable
 root, `code_root`, service owner and rollback evidence throughout the handoff.
 Existing authorized rollback uses the recorded compatible release and retained
 environment; it is not blocked by expired forward CI artifacts. Low-level helpers
