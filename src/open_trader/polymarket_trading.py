@@ -5196,6 +5196,7 @@ class PolymarketTradingClient:
         start_cursor: str | None = None,
         stop_event: threading.Event | None = None,
         previous: Mapping[str, object] | None = None,
+        publish_batch: Callable[..., None] | None = None, batch_size: int = 500,
     ) -> dict[str, object]:
         """Read official market competitiveness across all reward pages.
 
@@ -5208,8 +5209,12 @@ class PolymarketTradingClient:
         a completed round clears it.  Explicit zero competitiveness is kept
         as zero; the projection owns the danger-signal exclusion.
         The returned map is newly owned; previous is only read, never changed.
+        With publish_batch, extraction is bounded and no full-round map is built.
+        The callback commits each batch and advances a page only after its last batch.
         """
 
+        if batch_size < 1:
+            raise ValueError("competition_batch_size_invalid")
         checked_at = datetime.now(UTC)
         ended_condition_ids: list[str] = []
 
@@ -5291,7 +5296,7 @@ class PolymarketTradingClient:
                             raw = response.read()
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8")
-                        payload = json.loads(raw)
+                        payload = json.loads(raw, parse_float=Decimal)
                         page_read = True
                         break
                     except Exception as exc:
@@ -5313,28 +5318,37 @@ class PolymarketTradingClient:
                 rows = payload.get("data")
                 if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
                     raise ValueError("competitiveness_page_unknown")
-                for raw_row in rows:
-                    row = _model_dict(raw_row)
-                    if row is None:
-                        continue
-                    condition_id = row.get("condition_id")
-                    if not isinstance(condition_id, str) or not condition_id.strip():
-                        continue
-                    state = row.get("state")
-                    state = state if isinstance(state, Mapping) else {}
-                    if any(source.get(key) is True for source in (row, state) for key in ("closed", "resolved")):
-                        ended_condition_ids.append(condition_id)
-                    value = _lp_decimal(row.get("market_competitiveness"))
-                    if value is None or value < 0:
-                        continue
-                    merged[condition_id] = (value, checked_at)
-                pages_ok += 1
                 next_cursor = payload.get("next_cursor")
-                if not isinstance(next_cursor, str) or not next_cursor or next_cursor == "LTE=":
+                next_cursor = next_cursor if isinstance(next_cursor, str) and next_cursor and next_cursor != "LTE=" else None
+                if next_cursor is not None and (next_cursor == cursor or next_cursor in seen_cursors):
+                    raise ValueError("competitiveness_pagination_loop")
+                batch: dict[str, tuple[Decimal, datetime]] = {}
+                page_checked_at = datetime.now(UTC) if publish_batch is not None else checked_at
+                for offset, raw_row in enumerate(rows):
+                    row = _model_dict(raw_row) or {}
+                    condition_id = row.get("condition_id")
+                    if isinstance(condition_id, str) and condition_id.strip():
+                        state = row.get("state")
+                        state = state if isinstance(state, Mapping) else {}
+                        if any(source.get(key) is True for source in (row, state) for key in ("closed", "resolved")):
+                            ended_condition_ids.append(condition_id)
+                        value = _lp_decimal(row.get("market_competitiveness"))
+                        if value is not None and value >= 0:
+                            (batch if publish_batch is not None else merged)[condition_id] = (value, page_checked_at)
+                    if publish_batch is not None and ((offset + 1) % batch_size == 0 or offset + 1 == len(rows)):
+                        if stop_event is not None and stop_event.is_set():
+                            raise _RewardReadCancelled
+                        publish_batch(batch, page_cursor=cursor,
+                                      resume_cursor=next_cursor if offset + 1 == len(rows) else cursor,
+                                      checked_at=checked_at, stop_event=stop_event)
+                        batch = {}
+                if publish_batch is not None and not rows:
+                    publish_batch({}, page_cursor=cursor, resume_cursor=next_cursor,
+                                  checked_at=checked_at, stop_event=stop_event)
+                pages_ok += 1
+                if next_cursor is None:
                     resume_cursor = None
                     break
-                if next_cursor in seen_cursors:
-                    raise ValueError("competitiveness_pagination_loop")
                 seen_cursors.add(next_cursor)
                 cursor = next_cursor
                 resume_cursor = next_cursor

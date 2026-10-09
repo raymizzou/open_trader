@@ -62,7 +62,7 @@ def test_adapter_retains_valid_previous_facts_only_when_needed(monkeypatch, mode
     assert result["resume_cursor"] == ("Mg==" if mode == "partial" else None)
 
 
-def test_monitor_refresh_transfers_native_map_without_snapshot(tmp_path, monkeypatch):
+def test_monitor_refresh_keeps_one_cache_owner_without_round_map_or_snapshot(tmp_path, monkeypatch):
     exchange = make_competition_adapter(CompetitionOpener())
     service = PolymarketLPService(PredictionArbitrageStore(tmp_path), exchange)
     read = PolymarketTradingClient.lp_market_competitiveness
@@ -83,7 +83,7 @@ def test_monitor_refresh_transfers_native_map_without_snapshot(tmp_path, monkeyp
     monkeypatch.setattr(polymarket_lp, "deepcopy", reject_snapshot)
     assert service.refresh_competition_cache(snapshot=False) is None
     first_map = service._competition_state["competitiveness"]
-    assert first_map is rounds[0]["competitiveness"]
+    assert rounds[0]["competitiveness"] == {}, "native reader accumulated a full round"
     assert service.store.lp_competitiveness_map() == first_map
     monkeypatch.setattr(polymarket_lp, "deepcopy", copy)
     snapshot = service.refresh_competition_cache()
@@ -91,7 +91,8 @@ def test_monitor_refresh_transfers_native_map_without_snapshot(tmp_path, monkeyp
     snapshot["competitiveness"].clear()
     snapshot["not_updated"].append("mutated")
     assert service._competition_state["competitiveness"] == expected
-    assert service._competition_state["competitiveness"] is rounds[1]["competitiveness"]
+    assert service._competition_state["competitiveness"] is first_map
+    assert rounds[1]["competitiveness"] == {}
     assert "mutated" not in service._competition_state["not_updated"]
 
 
@@ -253,26 +254,41 @@ def test_projection_preserves_legacy_store_and_failure_unknown(tmp_path, failure
 
 
 def test_projection_keeps_captured_round_when_publication_interleaves(tmp_path):
-    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), object())
-    old = {"round_checked_at": NOW, "competitiveness": {"a": (Decimal("1"), NOW)}}
+    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), object(), clock=lambda: NOW)
+    entered, release, attempted = Event(), Event(), Event()
+    class Cache(dict):
+        def get(self, key, default=None):
+            entered.set()
+            assert release.wait(10), "cache capture not released"
+            return super().get(key, default)
+    old = {"round_checked_at": NOW, "competitiveness": Cache({"a": (Decimal("1"), NOW)})}
     new = {"round_checked_at": NOW + timedelta(minutes=1),
            "competitiveness": {"a": (Decimal("2"), NOW + timedelta(minutes=1))}}
     service._competition_state = old
-    def publish_during_projection():
+    def publish():
+        attempted.set()
         with service._competition_lock:
             service._competition_state = new
-        return NOW
-    service.clock = publish_during_projection
-    assert service._competition_entries(("a",)) == {"a": {"value": Decimal("1"), "checked_at": NOW,
-                                                          "source": "fresh", "updated": True}}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        projection = executor.submit(service._competition_entries, ("a",))
+        try:
+            assert entered.wait(10)
+            publication = executor.submit(publish)
+            assert attempted.wait(10)
+        finally:
+            release.set()
+        entries = projection.result(timeout=10)
+        publication.result(timeout=10)
+    assert entries == {"a": {"value": Decimal("1"), "checked_at": NOW, "source": "fresh", "updated": True}}
     assert service._competition_state is new
 
 
-def test_projection_keeps_old_round_until_atomic_publish(tmp_path, monkeypatch):
+def test_projection_keeps_old_facts_until_first_batch_commit(tmp_path, monkeypatch):
     exchange = make_competition_adapter(CompetitionOpener())
     service = PolymarketLPService(PredictionArbitrageStore(tmp_path), exchange, clock=lambda: NOW)
     old = {"state": "known", "round_checked_at": NOW,
            "competitiveness": {"condition-a": (Decimal("9"), NOW), "old": (Decimal("2"), NOW)}}
+    service.store.lp_competitiveness_upsert([("old", Decimal("2"), NOW)])
     service._competition_state = old
     entered, release = Event(), Event()
     read = exchange._urlopen_fn
@@ -292,8 +308,10 @@ def test_projection_keeps_old_round_until_atomic_publish(tmp_path, monkeypatch):
         finally:
             release.set()
         assert pending.result(timeout=10) is None
-    assert old["competitiveness"] == {"condition-a": (Decimal("9"), NOW), "old": (Decimal("2"), NOW)}
-    assert service._competition_state is not old
+    assert "old" not in old["competitiveness"]
+    assert service._competition_entries(("old",))["old"]["value"] == Decimal("2")
+    assert service._competition_state is old
+    assert old["competitiveness"]["condition-a"][0] == Decimal("16.6")
     assert service._competition_state["competitiveness"]["condition-b"][0] == 0
 
 

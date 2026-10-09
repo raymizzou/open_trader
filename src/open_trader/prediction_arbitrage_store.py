@@ -447,7 +447,8 @@ class PredictionArbitrageStore:
 
     @contextmanager
     def _transaction(self, *, immediate: bool = True, prepared_at: float | None = None,
-                     diagnostics: dict | None = None, prepare_seconds: float = 0.0) -> Iterator[sqlite3.Connection]:
+                     diagnostics: dict | None = None, prepare_seconds: float = 0.0,
+                     commit_guard=None, after_commit: Callable[[], None] | None = None) -> Iterator[sqlite3.Connection]:
         started = monotonic()
         connection = self._connection()
         operation = sys._getframe(2).f_code.co_qualname
@@ -467,9 +468,12 @@ class PredictionArbitrageStore:
             yield connection
             body_end = monotonic()
             phase = "commit"
-            connection.execute("COMMIT")
-            commit_end = monotonic()
-            phase = "complete"
+            with commit_guard if commit_guard is not None else nullcontext():
+                connection.execute("COMMIT")
+                commit_end = monotonic()
+                phase = "complete"
+                if after_commit is not None:
+                    after_commit()
         except BaseException as error:
             failed = True
             wait_failure = isinstance(error, LpObservationWait) and str(error) in {
@@ -994,6 +998,11 @@ class PredictionArbitrageStore:
                 payload TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(account_id, condition_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS lp_competition_progress (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                payload TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS lp_market_competitiveness (
@@ -4939,8 +4948,11 @@ class PredictionArbitrageStore:
     def lp_competitiveness_upsert(
         self,
         entries: Iterable[tuple[str, Decimal, datetime]],
+        *, progress: Mapping[str, object] | None = None,
+        stop_event: threading.Event | None = None, commit_guard=None,
+        after_commit: Callable[[], None] | None = None,
     ) -> int:
-        """Persist one full competition round in a single transaction (#181).
+        """Persist a supplied batch and its page bookmark atomically.
 
         Rows are keyed by condition_id; a re-read of the same market replaces
         its previous value and checked_at instead of stacking a second row.
@@ -4965,20 +4977,43 @@ class PredictionArbitrageStore:
                 diagnostics["input_rows"] += 1
                 yield row
 
-        encoded = encode()
+        # Production batches are bounded and encoded before BEGIN; legacy callers stream.
+        encoded = iter(tuple(encode())) if progress is not None else encode()
         first = next(encoded, None)
-        if first is None:
+        if first is None and progress is None:
             return 0
-        with self._transaction(prepared_at=prepared_at, diagnostics=diagnostics) as connection:
+        progress_payload = _dump_relation_payload(dict(progress)) if progress is not None else None
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("competition_cancelled")
+        with self._transaction(prepared_at=prepared_at, diagnostics=diagnostics,
+                               commit_guard=commit_guard, after_commit=after_commit) as connection:
             connection.executemany(
                 """
                 INSERT OR REPLACE INTO lp_market_competitiveness
                 (condition_id, value, checked_at)
                 VALUES (?, ?, ?)
                 """,
-                chain((first,), encoded),
+                chain((first,), encoded) if first is not None else (),
             )
+            if progress_payload is not None:
+                connection.execute("INSERT OR REPLACE INTO lp_competition_progress(singleton,payload) VALUES (1,?)",
+                                   (progress_payload,))
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("competition_cancelled")
         return diagnostics["input_rows"]
+
+    def lp_competitiveness_progress(self) -> dict[str, object]:
+        with self._read_connection() as connection:
+            row = connection.execute("SELECT payload FROM lp_competition_progress WHERE singleton=1").fetchone()
+        return _load_payload(str(row["payload"])) if row else {}
+
+    @contextmanager
+    def lp_competitiveness_snapshot(self):
+        """Pin a read snapshot before a competing cache/SQLite publication."""
+        with self._read_connection() as connection:
+            connection.execute("BEGIN")
+            connection.execute("SELECT condition_id FROM lp_market_competitiveness LIMIT 1").fetchone()
+            yield connection
 
     def lp_competitiveness_entry(self, condition_id: str):
         with self._read_connection() as connection:
@@ -4989,7 +5024,7 @@ class PredictionArbitrageStore:
         return (Decimal(str(row[0])), _parse_timestamp(row[1])) if row else None
 
     def lp_competitiveness_map(
-        self, *, condition_ids: Iterable[str] | None = None
+        self, *, condition_ids: Iterable[str] | None = None, connection=None
     ) -> dict[str, tuple[Decimal, datetime]]:
         """Read all values, or all requested identities in one read snapshot."""
 
@@ -4997,8 +5032,9 @@ class PredictionArbitrageStore:
         if identities == ():
             return {}
         result: dict[str, tuple[Decimal, datetime]] = {}
-        with self._read_connection() as connection:
-            connection.execute("BEGIN")
+        with self._read_connection() if connection is None else nullcontext(connection) as connection:
+            if not connection.in_transaction:
+                connection.execute("BEGIN")
             batches = (None,) if identities is None else (
                 identities[offset:offset + 400] for offset in range(0, len(identities), 400)
             )

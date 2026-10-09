@@ -10037,7 +10037,7 @@ def test_competition_refresh_persists_full_round_to_store(tmp_path) -> None:
 
 
 def test_competition_refresh_survives_store_persistence_failure(tmp_path) -> None:
-    """Issue #181: 落库失败只记警告，内存刷新照常完成。"""
+    """Issue #306: 落库失败保留旧缓存，失败批的新值不可见。"""
     now = datetime(2026, 9, 22, 12, tzinfo=UTC)
 
     class Exchange:
@@ -10062,7 +10062,11 @@ def test_competition_refresh_survives_store_persistence_failure(tmp_path) -> Non
 
     lp = PolymarketLPService(FailingStore(), Exchange())  # type: ignore[arg-type]
 
-    assert lp.refresh_competition_cache()["state"] == "known"
+    lp._competition_state = {"competitiveness": {"condition-A": (Decimal("1"), now)}}
+    result = lp.refresh_competition_cache()
+    assert result["state"] == "partial"
+    assert result["complete"] is False
+    assert result["competitiveness"] == {"condition-A": (Decimal("1"), now)}
 
 
 def test_competition_entries_fall_back_to_persisted_store_values(tmp_path) -> None:
