@@ -428,3 +428,47 @@ def test_final_precancel_guard_logs_its_actual_blocking_inputs(tmp_path, monkeyp
     assert final[-1]['round_id'] == hashlib.sha256(b'final-precancel-guard').hexdigest()[:16]
     assert final[-1]['order_id'] == hashlib.sha256(b'o1').hexdigest()[:16]
     assert final[-1]['session_id'] == hashlib.sha256(session_id.encode()).hexdigest()[:16]
+
+
+@pytest.mark.parametrize('source_stale', ['reward', 'book'])
+def test_confirmed_level_departure_uses_cancel_fact_freshness(tmp_path, monkeypatch, source_stale):
+    engine, exchange, lp, _ = _level_pool(tmp_path, monkeypatch)
+    _change_level_book(exchange, 'add')
+    if source_stale == 'reward':
+        catalog = exchange.lp_reward_catalog
+
+        def expired_reward_receipt(**kwargs):
+            result = catalog(**kwargs)
+            for row in result['markets']:
+                row['reward_checked_at'] = pool.NOW - timedelta(seconds=61)
+            return result
+
+        exchange.lp_reward_catalog = expired_reward_receipt
+    else:
+        books = exchange.lp_order_books
+
+        def expired_book_receipt(ids, **kwargs):
+            result = books(ids, **kwargs)
+            for book in result.values():
+                book['received_at'] = pool.NOW - timedelta(seconds=61)
+            return result
+
+        exchange.lp_order_books = expired_book_receipt
+    state = engine.lp_auto_run_once(round_id='cancel-fact-freshness')
+    expected_cancels = ['o1'] if source_stale == 'reward' else []
+    assert exchange.cancels == expected_cancels, state['last_round']
+    assert len(exchange.posts) == 1
+    assert state['slots']['occupied'] == 1
+    assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('7.80')
+    state = engine.lp_auto_run_once()
+    assert exchange.cancels == expected_cancels
+    assert len(exchange.posts) == 1
+    assert state['slots']['occupied'] == 1
+    assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('7.80')
+    if source_stale == 'reward':
+        exchange.orders[0]['status'] = 'CANCELED'
+        state = engine.lp_auto_run_once()
+        assert exchange.cancels == ['o1']
+        assert len(exchange.posts) == 1
+        assert state['slots']['occupied'] == 0
+        assert Decimal(state['funds']['buy_reserved_usd']) == 0

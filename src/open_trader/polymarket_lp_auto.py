@@ -1054,12 +1054,10 @@ class LPAutoPool:
                         or self.lp._queue_row_remaining(current[0]) != _decimal(intent['quantity'])):
                     raise ValueError('rotation_order_changed')
                 if self._configured_level_departure(intent, direction, account, bid_level):
-                    estimate = minimum_order_estimate(direction, intent, self._now(), resting_quantity=_decimal(intent['quantity']))
-                    if estimate['state'] != 'known':
-                        raise ValueError('rotation_yield_unknown')
-                    row = {**intent, 'minimum_order_estimate': estimate, 'ranking_account': account,
-                           'ranking_book_at': direction['book']['received_at'],
-                           'ranking_reward_at': direction['reward_checked_at'], 'configuration_drift': True}
+                    # Factual departure cancels the current quote; it does not
+                    # require a reward estimate or authorize a replacement.
+                    row = {**intent, 'ranking_account': account,
+                           'ranking_book_at': direction['book']['received_at'], 'configuration_drift': True}
                     self._ranking_fresh(row)
                     rows.append(row)
                     drifted.append(row)
@@ -1074,12 +1072,9 @@ class LPAutoPool:
                     raise ValueError('rotation_yield_unknown')
                 row = {**intent, 'minimum_order_estimate': estimate,
                        'ranking_account': account, 'ranking_book_at': direction['book']['received_at'],
-                       'ranking_reward_at': direction['reward_checked_at'],
-                       'configuration_drift': _decimal(evaluated['guidance']['price']) != _decimal(intent['price'])}
+                       'ranking_reward_at': direction['reward_checked_at']}
                 self._ranking_fresh(row)
                 rows.append(row)
-                if row['configuration_drift']:
-                    drifted.append(row)
             except ValueError as exc:
                 if 'identity' in str(exc):
                     raise
@@ -1198,7 +1193,10 @@ class LPAutoPool:
         wallet = str(row['ranking_account'].get('wallet_address') or '').strip().casefold()
         if not wallet or hashlib.sha256(wallet.encode()).hexdigest() != self.execution._lp_account_id():
             raise ValueError('account_identity_mismatch')
-        for stamp in (row['ranking_account'].get('checked_at'), row['ranking_book_at'], row['ranking_reward_at']):
+        stamps = [row['ranking_account'].get('checked_at'), row['ranking_book_at']]
+        if not row.get('configuration_drift'):
+            stamps.append(row['ranking_reward_at'])
+        for stamp in stamps:
             _freshness(stamp, self._now(), 'ranking_freshness', max_age=60)
 
     def _rotate_out(self, victims, targets, version, *, diagnostics=None):
@@ -1240,7 +1238,7 @@ class LPAutoPool:
                             if not row.get('account_order'):
                                 self._event(d, intent, 'rotation_requested', occurred_at=self._stamp(),
                                     target_conditions=[t['condition_id'] for t in targets],
-                                    previous_yield=row['minimum_order_estimate']['yield_pct_per_hour'])
+                                    previous_yield=(row.get('minimum_order_estimate') or {}).get('yield_pct_per_hour'))
                     self._update(record)
                     attempts = self.lp.begin_order_cancel([r['order_id'] for r in victims])
                     for row in victims:
@@ -2444,7 +2442,7 @@ class LPAutoPool:
         if state['desired_running'] and not reason and not state['admission_block_reasons'] and self.execution.lp_mutation_allowed():
             try:
                 targets, victims, candidates, blocked = self._ranked_buys(state, diagnostics=diagnostics)
-                if not targets and blocked:
+                if not targets and blocked and state['slots']['occupied'] >= state['target_buy_count']:
                     reason = blocked[0]['reason']
                 if victims:
                     actions.extend(self._rotate_out(victims, targets, d['config_version'], diagnostics=diagnostics))
