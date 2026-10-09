@@ -6433,6 +6433,7 @@ class PolymarketLPService:
     def refresh_candidate_recommendations(
         self, *, stop_event: threading.Event | None = None,
         condition_ids: Sequence[str] | None = None,
+        refresh_priorities: Mapping[str, Decimal | None] | None = None,
     ) -> dict[str, object]:
         """Refresh the displayed pool rows on one batch book read (issue #157).
 
@@ -6493,7 +6494,14 @@ class PolymarketLPService:
                 and (requested is None or cid in requested)
                 and not _candidate_pool_row_expired(row, now)
             ]
-            valid_rows.sort(key=_candidate_yield_sort_key)
+            if refresh_priorities is None:
+                valid_rows.sort(key=_candidate_yield_sort_key)
+            else:
+                def refresh_key(row):
+                    hint = _maybe_decimal(refresh_priorities.get(str(row.get("condition_id") or "")))
+                    return (hint is None, -(hint if hint is not None else Decimal(0)),
+                            *_candidate_yield_sort_key(row))
+                valid_rows.sort(key=refresh_key)
             selected_rows = [
                 row for row in valid_rows
                 if self._candidate_rotation_due(str(row.get("condition_id") or ""), now=now)

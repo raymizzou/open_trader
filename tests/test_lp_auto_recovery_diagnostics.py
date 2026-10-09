@@ -36,7 +36,7 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
     real_reader=adapter.lp_account_snapshot_shared
     entered,release=Event(),Event();reads=[]
     def reader(*args,**kwargs):
-        reads.append(1)
+        reads.append(dict(kwargs))
         if len(reads)==1:
             entered.set()
             assert release.wait(5), 'controlled read watchdog'
@@ -73,7 +73,11 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
     assert result['slots']['occupied']==5
     assert result['admission_block_reasons']==[]
     assert result['funds']['status']=='known'
-    assert len(reads)==6, 'initial invalidated read, two reads per send, and final refresh'
+    assert len(reads)==7, 'initial invalidated read, maintenance reuse/read, two reads per send, and final refresh'
+    forced = [read for read in reads if read.get('max_age_seconds') == 0
+              and read.get('trade_generation_provider') == store.lp_trade_generation]
+    assert len(forced)==6, 'initial/final refresh and both mandatory fresh reads per BUY remain forced'
+    assert sum('max_age_seconds' not in read for read in reads)==1, 'one shared-window maintenance call'
 
 
 def test_recovered_account_can_refill_three_to_five(runtime):
@@ -252,6 +256,9 @@ def test_candidate_diagnostics_uses_consumed_snapshot_under_concurrent_publicati
     engine.lp_auto_configure(dict(budget_usd='100', target_buy_count=5))
     engine.lp_auto_set_desired_running(True)
     lp._candidate_qualification_facts['m00']['directions'][0]['reward_checked_at'] = pool.NOW - timedelta(seconds=61)
+    # This negative snapshot case needs the external reward to remain
+    # unavailable after #310's bounded prefilter refresh, not become fresh.
+    exchange.lp_reward_catalog = lambda **kwargs: dict(state='unknown', markets=[])
     entered, release = Event(), Event()
     excluded = engine._auto_pool._excluded
     def delayed(condition):

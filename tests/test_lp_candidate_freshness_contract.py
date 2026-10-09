@@ -347,7 +347,8 @@ class _ElevenMarketPublic(RefillPublic):
         })
 
 
-def test_stale_best_at_selected_level_outside_display_head_gets_bounded_refresh(runtime):
+@pytest.mark.parametrize("stale_scope", ["best_only", "all"])
+def test_stale_best_at_selected_level_outside_display_head_gets_bounded_refresh(runtime, stale_scope):
     import io
     import json
     from tests.test_lp_order_registration_contract import _open_order
@@ -386,8 +387,10 @@ def test_stale_best_at_selected_level_outside_display_head_gets_bounded_refresh(
 
     stale_at = lp._now() - timedelta(seconds=65)
     with lp._candidate_state_lock:
-        for direction in lp._candidate_qualification_facts[condition_b]["directions"]:
-            direction["market"]["metadata_checked_at"] = stale_at
+        stale_conditions = [condition_b] if stale_scope == "best_only" else list(lp._candidate_qualification_facts)
+        for condition in stale_conditions:
+            for direction in lp._candidate_qualification_facts[condition]["directions"]:
+                direction["market"]["metadata_checked_at"] = stale_at
     public.metadata_batches.clear()
     public.book_requests.clear()
 
@@ -411,10 +414,15 @@ def test_stale_best_at_selected_level_outside_display_head_gets_bounded_refresh(
 
     assert [post.token_id for post in account.posts] == [token_b], state["last_round"]
     assert public.metadata_batches and condition_b in public.metadata_batches[0]
-    assert all(len(batch) <= 10 for batch in public.metadata_batches)
-    assert sum(map(len, public.metadata_batches)) <= 10
-    assert set().union(*map(set, public.metadata_batches)) == {condition_b}
+    assert len(set(public.metadata_batches[0])) <= 10
+    # Mandatory selected-market admission/presend reads remain separate.
+    if stale_scope == "best_only":
+        assert set().union(*map(set, public.metadata_batches)) == {condition_b}
     assert lp._candidate_qualification_facts[condition_b]["directions"][0]["market"]["metadata_checked_at"] > stale_at
     assert Decimal(account.posts[0].maker_amount) / account.posts[0].taker_amount == Decimal(".39")
+    assert Decimal(account.posts[0].taker_amount) / Decimal("1000000") == Decimal("20")
     # Main's buy2 worked value, recomputed from the freshly read source facts.
     assert Decimal(state["last_round"]["candidates"][0]["minimum_order_estimate"]["yield_pct_per_hour"]).quantize(Decimal(".000001")) == Decimal(".053232")
+    a_rows = [row for row in state["last_round"]["candidates"] if row["condition_id"] != condition_b]
+    assert a_rows
+    assert Decimal(a_rows[0]["minimum_order_estimate"]["yield_pct_per_hour"]).quantize(Decimal(".000001")) == Decimal(".046378")

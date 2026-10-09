@@ -27,8 +27,16 @@ earlier than its usual freshness limit.
 Before automatic ranking excludes stale source facts, it invokes the existing
 maintenance path with the IDs of the stale markets that triggered the check.
 A fresh display head cannot hide a stale market whose yield is highest at the
-configured BUY level. One attempt refreshes at most ten retry-eligible markets,
-with one account read and one batch per due source class. It then recomputes
+configured BUY level. If several markets are stale, cached mathematical estimates
+at that level provide refresh priority hints before the batch limit is applied.
+Unknown hints retain a deterministic fallback order. These hints do not renew
+source timestamps, change the displayed estimate or authorize an order; fresh
+qualification and current-level ranking remain authoritative.
+
+One maintenance attempt refreshes at most ten retry-eligible markets, with one
+account read and one batch per due source class. Mandatory selected-candidate
+admission and presend reads are separate from this maintenance batch limit and
+remain in place. It then recomputes
 qualification and ranking at the configured BUY level. It does not admit a
 stale candidate directly or run a synchronous whole-catalog scan.
 
