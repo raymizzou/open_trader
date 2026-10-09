@@ -715,6 +715,21 @@ class LPAutoPool:
         if bid_level is None:
             bid_level = self._read().get('buy_price_level', 1)
         self.lp._evict_excluded_candidates()
+        # Requalify before stale source gates remove a market from ranking.
+        # Maintenance owns the ten-market bound, in-flight fence and retries;
+        # ranking still evaluates the returned facts at the configured level.
+        from .polymarket_lp import _candidate_head_source_values, _candidate_source_expired
+        now = self._now()
+        with self.lp._candidate_state_lock:
+            stale_conditions = tuple(
+                key for key, value in self.lp._candidate_qualification_facts.items()
+                if key in self.lp._candidate_pool
+                and not _candidate_pool_row_expired(self.lp._candidate_pool[key], now)
+                and any(_candidate_source_expired(stamp, now)
+                        for stamp in _candidate_head_source_values(value)[1:])
+            )
+        if stale_conditions:
+            self.lp.refresh_candidate_recommendations(condition_ids=stale_conditions)
         with self.lp._candidate_state_lock:
             facts={}
             expired=set()

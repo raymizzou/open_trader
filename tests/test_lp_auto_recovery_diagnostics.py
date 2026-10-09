@@ -190,6 +190,9 @@ def test_zero_candidate_round_keeps_filter_counts(tmp_path, case, reason, count)
     engine.lp_auto_set_desired_running(True)
     if case == 'stale_reward':
         lp._candidate_qualification_facts['m00']['directions'][0]['reward_checked_at'] = pool.NOW - timedelta(seconds=61)
+        # #310 now requalifies before filtering. Keep the source unavailable
+        # so this diagnostic case still observes a genuinely stale fact.
+        exchange.lp_reward_catalog = lambda **kwargs: dict(state='unknown', markets=[])
     elif case == 'missing_facts':
         lp._candidate_qualification_facts.clear()
     elif case == 'expired_pool':
@@ -450,6 +453,9 @@ def test_known_candidate_filter_reasons_survive_real_evaluate(tmp_path, case, re
         direction['book']['bids'][1]['price'] = '.35' if case == 'stress_loss_exceeded' else '.36'
     elif case == 'book_time_invalid':
         direction['book']['received_at'] = None
+        # A successful source read repairs the missing stamp before ranking;
+        # this negative diagnostic needs the external book to remain unknown.
+        exchange.lp_order_books = lambda ids, **kwargs: {}
     elif case == 'account_time_invalid':
         account['checked_at'] = None
     else:
