@@ -14,6 +14,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   自动下单一致性、缺档/离线与重启恢复，保留原有配置、资金及压力退出门限。
   独立评审修复手动试挂链路：弹窗与 HTTP 保留展示报价的买档，缺省仍为买一；
   提交时重新核对所选档位，报价漂移仍拒绝，custom/追加及单次提交幂等行为不变。
+  CI 修复首次加载的待刷新 Dashboard 同样返回已配置买档，页面读取不触发场所查询；
+  历史回放保持原夹具和全量哈希，仅单独验证新增档位来源字段，保留排序及负向检查。
   未执行生产操作、发布或部署；独立评审及 Git 交付由 Main 负责。
 
 - 修正 GLM 评审前置检查：按实际启动环境的 Codex 版本与 `CODEX_HOME` 核查独立 profile，

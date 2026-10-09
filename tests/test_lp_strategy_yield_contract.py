@@ -177,6 +177,60 @@ def test_auto_and_dashboard_share_selected_level_estimate(runtime):
     assert Decimal(state["funds"]["verified_rewards_usd"]) == 0
 
 
+@pytest.mark.parametrize("level", [1, 2])
+def test_pending_dashboard_reports_configured_level_without_external_reads(runtime, level):
+    """Pending and cached page reads expose the saved level without SDK I/O."""
+    class CountingPublic(StrategyPublic):
+        reads = 0
+
+        def get_market(self, **kwargs):
+            self.reads += 1
+            return super().get_market(**kwargs)
+
+        def get_order_book(self, **kwargs):
+            self.reads += 1
+            return super().get_order_book(**kwargs)
+
+        def list_markets(self, **kwargs):
+            self.reads += 1
+            return super().list_markets(**kwargs)
+
+        def list_current_rewards(self, **kwargs):
+            self.reads += 1
+            return super().list_current_rewards(**kwargs)
+
+        def list_market_rewards(self, **kwargs):
+            self.reads += 1
+            return super().list_market_rewards(**kwargs)
+
+    public = CountingPublic(runtime.clock)
+    public.rates = {1: "32", 2: "24"}
+    _, _, account, _, execution = _configure_and_refresh(runtime, level, public=public)
+
+    def external_reads():
+        return (public.reads, account.balance_reads, account.order_reads,
+                account.trade_reads, account.position_reads)
+
+    before = external_reads()
+    pending = execution.lp_dashboard()
+    assert pending["state"] == "snapshot_pending"
+    assert pending["candidates"] == []
+    assert type(pending["buy_price_level"]) is int
+    assert pending["buy_price_level"] == level
+    assert external_reads() == before
+
+    published = execution.refresh_lp_dashboard_snapshot()
+    assert published["state"] == "ready"
+    assert type(published["buy_price_level"]) is int
+    assert published["buy_price_level"] == level
+    after_refresh = external_reads()
+    for _ in range(3):
+        cached = execution.lp_dashboard()
+        assert cached["state"] == "ready"
+        assert cached["buy_price_level"] == level
+        assert external_reads() == after_refresh
+
+
 def _assert_no_old_level_estimate(snapshot):
     for field in ("candidates", "recommendations", "selected_results"):
         for row in snapshot.get(field, []):

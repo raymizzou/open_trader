@@ -1782,8 +1782,13 @@ class PredictionExecutionService:
         """Issue #146 D2: first-visit payload while the background snapshot
         thread has not published yet. Key-complete, value-empty."""
 
+        try:
+            buy_price_level = self._lp_auto_pool().buy_price_level()
+        except Exception:
+            buy_price_level = None
         return {
             "state": "snapshot_pending",
+            "buy_price_level": buy_price_level,
             "stale": True,
             "orders": [],
             "positions": [],
