@@ -254,18 +254,32 @@ def test_projection_preserves_legacy_store_and_failure_unknown(tmp_path, failure
 
 
 def test_projection_keeps_captured_round_when_publication_interleaves(tmp_path):
-    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), object())
-    old = {"round_checked_at": NOW, "competitiveness": {"a": (Decimal("1"), NOW)}}
+    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), object(), clock=lambda: NOW)
+    entered, release, attempted = Event(), Event(), Event()
+    class Cache(dict):
+        def get(self, key, default=None):
+            entered.set()
+            assert release.wait(10), "cache capture not released"
+            return super().get(key, default)
+    old = {"round_checked_at": NOW, "competitiveness": Cache({"a": (Decimal("1"), NOW)})}
     new = {"round_checked_at": NOW + timedelta(minutes=1),
            "competitiveness": {"a": (Decimal("2"), NOW + timedelta(minutes=1))}}
     service._competition_state = old
-    def publish_during_projection():
+    def publish():
+        attempted.set()
         with service._competition_lock:
             service._competition_state = new
-        return NOW
-    service.clock = publish_during_projection
-    assert service._competition_entries(("a",)) == {"a": {"value": Decimal("1"), "checked_at": NOW,
-                                                          "source": "fresh", "updated": True}}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        projection = executor.submit(service._competition_entries, ("a",))
+        try:
+            assert entered.wait(10)
+            publication = executor.submit(publish)
+            assert attempted.wait(10)
+        finally:
+            release.set()
+        entries = projection.result(timeout=10)
+        publication.result(timeout=10)
+    assert entries == {"a": {"value": Decimal("1"), "checked_at": NOW, "source": "fresh", "updated": True}}
     assert service._competition_state is new
 
 

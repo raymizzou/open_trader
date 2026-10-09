@@ -92,7 +92,7 @@ PYTHONPATH=src:tests /Users/ray/.local/share/open-trader/release-envs/d9a6167e2f
 
 成对回放后补充队列发布逆序保护及本轮 P1 兼容 reader 能力判定；新增投影守卫要求显式 connection 和已固定快照。量化所用原生 store 已满足该条件，其执行的锁外查询分支、批量/等待、竞争读取、持久化、发布及候选 view 不变；没有为新基础 SHA 扩展 benchmark。回放不是完整 service/runtime 验收。最终源码/测试冻结后的 staged tree identity 与文件 hash 由协调交接记录固定；不把基础 HEAD 单独当作未提交实现的身份。
 
-未执行完整后端/服务 suite、CI、独立 review、提交/推送、GitHub 写入、merge、release、部署、SSH/cloud、service/order 操作。后续由协调者安排 fresh Standards 与 Spec staged review。
+以上是首版 worker 阶段记录：该阶段未执行完整后端/服务 suite、CI、独立 review、提交/推送、GitHub 写入、merge、release、部署、SSH/cloud、service/order 操作。其后 Main 的发布、CI 及本轮修复见下节；新的 staged tree 仍需独立复审。
 
 
 ## 独立 Spec P1 修复与 rebase
@@ -100,3 +100,30 @@ PYTHONPATH=src:tests /Users/ray/.local/share/open-trader/release-envs/d9a6167e2f
 初次 tree `8806f3a2607c1348464d898d8df9f7a3987f4ef1` 的 Spec review 发现：`condition_ids=None, **kwargs` wrapper 可忽略 connection，签名 bind 成功却不是共享快照能力证明。新增 Event/barrier RED 确定性读到 A旧/B新；无 snapshot 入口及返回空 connection 同样复现，snapshot 创建失败则暴露旧 fallback 未执行。先取得 3 failed（11.34 s）与空快照 1 failed（2.25 s），日志为 `repair-red.log`、`repair-red-empty.log`。修复后的四种场景 4 passed（1.30 s），日志 `repair-green.log`。原生并发 fixture 改为显式声明并转发 connection，提交不阻塞和稳定旧投影负断言保持。相关两 worker 交错 7 passed（1.85 s），两条既有弃用警告；结果记录在 `repair-concurrent.log` 与 `repair-concurrent-command.json`。
 
 `git rebase --autostash origin/main` 仅 CHANGELOG 冲突，保留 upstream #305 的 GLM 检查记录和本票记录；其余十个任务文件与保存副本逐字一致。未创建任务 commit，冲突 autostash 与十一文件/双补丁备份保留在证据目录。新 main 仅有 CHANGELOG/runbook 文档变化，已读新 runbook；GLM profile/provider 实际前置由协调者处理，未访问凭据或机器 config。P3 命名建议未扩展实施范围。
+
+
+## PR #307 CI 与 fresh cache P2 修复
+
+Main 将已审查实现提交为 `5dd64fd75abcb9ee6f60b7d8fc44d839f182a3f9` 并发布 Draft PR #307。原两条 CI 终态均失败：push run `37896769516` 的 required check `113714101664`、PR run `37896854772` 的 required check `113714306614` 均来自 GitHub Actions app **15368**。API/check head 均为分支 head；各七个实际 checkout 日志及各五个 artifacts 确认 push 被测 SHA 为该 head、PR 为 synthetic merge `a830f17117ccfb96066a3a77e80008f16af0b9f0`，base 为 `c692d9a52c9f904139cf3ba1fc0f69fdd8506e96`。完整 CI jobs、required/app 和失败日志在原证据目录的 `ci/summary.json`、`ci/handoff.md`。Main 持有 CI、反馈和交付责任；GLM blocked，不能称 review-ready。
+
+本轮将三个有据 CI 失败与有效 P2 反馈一起修复。P2 线程 [discussion_r4227595819](https://github.com/raymizzou/open_trader/pull/307#discussion_r4227595819) 由 Main 记录为 unresolved/blocking；worker 不回复或 resolve。当前 parent HEAD 为上述 `5dd64fd…`，本轮未提交。
+
+- 原三条失败 nodeid 本机聚焦 RED：3 failed，6.08 s。过期 fixture 仍挂单项 entry reader，实际生产边界已是 scoped map；调整为显式转发 condition_ids/connection 的 map wrapper，仍在 metadata 已取得后的同一业务阶段暂停。metadata/competition_lookup 两分支、61 s 业务过期、无 cooldown/无候选负断言及原 5 s watchdog 全保留。
+- schema 只在精确 table-set 中增加批准的新表 `lp_competition_progress`；WAL、foreign_keys、busy_timeout、版本、索引和查询计划断言不变。
+- 相同 fixture 对 `c692d9a5` 与 head 捕获完整结构化 trace，递归逐字段比较。只有三个 state 各增加 `competition_version` 和 `build_sequence`，共六处；trial 数量四个、state 数量三个一致。所有其余值、source、时间、理由和完整排序逐字段一致。去除精确的两个内部字段后恢复原完整业务 golden `ffbde7cce77aa091183c50a0d355b9f5a59d7f8111053cb2315dbfc51bde2bdb`，没有替换该期望 hash。测试单独断言竞争版本 `[1,1,1]`、构建序号 `[1,3,4]`，其余字段仍全量进入旧 golden。
+
+P2 先新增“全部请求 identity 命中新鲜 cache 不打开 SQLite”确定性 RED（1 failed、2 passed，1.44 s），再恢复最小无 DB 快路径。一次读取固定一个 clock 值，cache 判定及最终投影使用同一时间；只有 scoped 请求全部命中新鲜事实或空请求可以直接返回。混合、缺失、超龄、未来时间继续按既有 fallback 规则；需要 fallback 时仍 pin SQLite 与捕获 cache/metadata 版本，不能使用 connection 的 legacy wrapper 仍在发布锁内读取。`condition_ids=None` 明确保留全库读取，不遗漏未缓存的持久事实。返回字段独立，显式零和 Decimal 不变。cache 原子捕获的并发 fixture 改为 Event/barrier，在实际捕获阶段安排发布；保持稳定旧投影断言，clock 不用于偷偷改变发布状态。
+
+本机隔离、固定 20,000 个不同公开 fixture identity 的相同新鲜 Decimal cache，通过真实 `_candidate_market_rejection` 测量；不含账户、网络、凭据或生产数据。与外部 review 测量独立：
+
+| 同输入 P2 probe | 修复前 head | 本轮实现 |
+|---|---:|---:|
+| SQLite 连接数 | 20,000 | 0 |
+| 耗时 s | 10.500209 | 0.102335 |
+| 全部返回 | 20,000 | 20,000 |
+
+输入 hash `cae87d152640889caedd46319542a7a5652c8dd0993a5242500e064cd57da0d7`；全部返回 hash `09135bd3f277a04ad5cd677560fd9258d5573377cc6056829fd688d1544e54a8`，完整返回文件逐字节相同。两版 interpreter 同为已选 Python 3.12.12，同 DB 初态；probe 执行时没有并行测试。源码文件 hash 和精确 runner 为 `ci-repair/before-cache-probe.json`、`after-cache-probe.json`、`cache-probe.py`；这不是新的云端容量结论，也不是重跑原 128,500 行 benchmark。
+
+过期错误的负向证明采用独立 subprocess 内存 mutation：将 `_candidate_source_expired` 临时置为总 False。metadata/competition_lookup 两分支都在“无 cooldown”断言失败，实际错误为 `event_starting_soon:1`（2 failed，0.19 s），不是 watchdog 超时；源码未写入 mutation。正常首轮 GREEN 为 8 passed（1.99 s），最终直接消费者 55 个选择 nodeid 展开 **83 passed**（9.10 s），相关两 worker Event/barrier/过期场景 **13 passed**（1.72 s）。保留既有弃用警告。完整 RED/GREEN、负向日志、节点及命令在证据目录 `ci-repair/attempts.md`、`red-original-three.log`、`p2-red.log`、`negative-expired-receipt.log`、`focused-serial.log`、`focused-concurrent.log`；trace 在 `baseline-trace.json`、`head-trace.json`、`trace-field-diff.json`、`trace-comparison.json`。
+
+原性能回放约 8 s vs 1 s、RSS 无下降、派生非云端原样及历史测量身份限制保持；没有无关 benchmark 扩展。未重跑旧 CI 或完整 suite，未提高 timeout、skip、弱化断言，未处理 P3 polish，未改机器/GLM config 或接触凭据。worker 不 commit/push/GitHub 回复/resolve/merge/deploy，stage 后冻结交原 Standards/Spec reviewer；Main 负责统一复审、发布及新 head CI。

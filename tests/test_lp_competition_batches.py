@@ -554,3 +554,63 @@ def test_legacy_wrapper_requires_explicit_connection_and_pinned_snapshot(tmp_pat
         publication.result(timeout=10)
     assert [values[cid]['value'] for cid in ('a', 'b')] == [Decimal('1'), Decimal('1')]
     assert committed.is_set()
+
+
+def test_fresh_requested_cache_projection_opens_no_sqlite(tmp_path, monkeypatch):
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, object(), clock=lambda: NOW)
+    facts = {'a': (Decimal('0'), NOW), 'b': (Decimal('2.1234567890123456789'), NOW)}
+    service._competition_state = {'round_checked_at': NOW, 'competitiveness': facts}
+    service._competition_version = 7
+    connections = []
+    connection = store._connection
+    def counted():
+        connections.append(True)
+        return connection()
+    monkeypatch.setattr(store, '_connection', counted)
+    metadata = {}
+    entries = service._competition_entries(('a', 'b'), metadata=metadata)
+    assert connections == [], 'all fresh identities opened SQLite'
+    assert metadata == {'version': 7, 'round_checked_at': NOW}
+    assert entries == {cid: {'value': value, 'checked_at': stamp, 'source': 'fresh', 'updated': True}
+                       for cid, (value, stamp) in facts.items()}
+    entries['a']['value'] = Decimal('99')
+    assert facts['a'] == (Decimal('0'), NOW)
+    assert service._competition_entries(()) == {}
+    assert connections == []
+
+
+def test_projection_uses_one_clock_for_freshness_and_fallback(tmp_path, monkeypatch):
+    from open_trader.polymarket_lp_views import LP_COMPETITION_MAX_AGE
+    store = PredictionArbitrageStore(tmp_path)
+    near_expiry = NOW - LP_COMPETITION_MAX_AGE + timedelta(microseconds=1)
+    store.lp_competitiveness_upsert([('b', Decimal('3'), NOW)])
+    calls = []
+    def clock():
+        stamp = NOW + timedelta(seconds=len(calls))
+        calls.append(stamp)
+        return stamp
+    service = PolymarketLPService(store, object(), clock=clock)
+    service._competition_state = {'round_checked_at': NOW, 'competitiveness': {
+        'a': (Decimal('2'), near_expiry), 'b': (Decimal('99'), NOW + timedelta(seconds=1))}}
+    entries = service._competition_entries(('a', 'b'))
+    assert calls == [NOW]
+    assert entries['a'] == {'value': Decimal('2'), 'checked_at': near_expiry, 'source': 'fresh', 'updated': False}
+    assert entries['b'] == {'value': Decimal('3'), 'checked_at': NOW, 'source': 'store', 'updated': None}
+
+
+def test_unscoped_projection_keeps_uncached_store_identities(tmp_path, monkeypatch):
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_competitiveness_upsert([('b', Decimal('3'), NOW)])
+    service = PolymarketLPService(store, object(), clock=lambda: NOW)
+    service._competition_state = {'round_checked_at': NOW, 'competitiveness': {'a': (Decimal('2'), NOW)}}
+    connections = []
+    connection = store._connection
+    def counted():
+        connections.append(True)
+        return connection()
+    monkeypatch.setattr(store, '_connection', counted)
+    entries = service._competition_entries()
+    assert len(connections) == 1
+    assert set(entries) == {'a', 'b'}
+    assert entries['a']['source'] == 'fresh' and entries['b']['source'] == 'store'

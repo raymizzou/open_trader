@@ -7434,6 +7434,7 @@ class PolymarketLPService:
         A caller can scope this projection to its complete required identity set.
         """
 
+        now = self.clock()
         with ExitStack() as stack:
             with self._competition_lock:
                 state = self._competition_state if state is None else state
@@ -7442,6 +7443,12 @@ class PolymarketLPService:
                 state = {"round_checked_at": state.get("round_checked_at"),
                          "competitiveness": dict(raw) if condition_ids is None else
                          {cid: raw.get(cid) for cid in condition_ids}}
+                if metadata is not None:
+                    metadata.update(version=self._competition_version, round_checked_at=state.get("round_checked_at"))
+                if condition_ids is not None:
+                    entries = self._competition_projection(condition_ids, state=state, connection=None, read_store=False, now=now)
+                    if all(cid in entries for cid in condition_ids):
+                        return entries
                 reader = getattr(self.store, "lp_competitiveness_map", None)
                 snapshot_reader = getattr(self.store, "lp_competitiveness_snapshot", None)
                 try:
@@ -7453,24 +7460,21 @@ class PolymarketLPService:
                     )
                 except (TypeError, ValueError):
                     shared_snapshot = False
-                if metadata is not None:
-                    metadata.update(version=self._competition_version, round_checked_at=state.get("round_checked_at"))
                 if not shared_snapshot:
                     # Legacy readers reopen SQLite: fence their fallback read with cache capture.
-                    return self._competition_projection(condition_ids, state=state, connection=None, read_store=True)
+                    return self._competition_projection(condition_ids, state=state, connection=None, read_store=True, now=now)
                 try:
                     connection = stack.enter_context(snapshot_reader())
                 except Exception:
                     logger.warning("lp competition snapshot unavailable")
                     connection = None
                 if connection is None:
-                    return self._competition_projection(condition_ids, state=state, connection=None, read_store=True)
-            return self._competition_projection(condition_ids, state=state, connection=connection, read_store=True)
+                    return self._competition_projection(condition_ids, state=state, connection=None, read_store=True, now=now)
+            return self._competition_projection(condition_ids, state=state, connection=connection, read_store=True, now=now)
 
-    def _competition_projection(self, condition_ids, *, state, connection, read_store):
+    def _competition_projection(self, condition_ids, *, state, connection, read_store, now):
         from .polymarket_lp_views import LP_COMPETITION_MAX_AGE
         round_checked_at = state.get("round_checked_at")
-        now = self.clock()
         entries: dict[str, object] = {}
         raw_map = state.get("competitiveness")
         if isinstance(raw_map, Mapping):

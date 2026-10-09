@@ -867,14 +867,14 @@ def test_delayed_preparation_metadata_cannot_recool_after_receipt_expires(tmp_pa
         return rows
     exchange.lp_market_metadata = delayed_metadata
     store = PredictionArbitrageStore(tmp_path)
-    competition = store.lp_competitiveness_entry
-    def delayed_competition(cid):
-        row = competition(cid)
+    competition = store.lp_competitiveness_map
+    def delayed_competition(*, condition_ids=None, connection=None):
+        row = competition(condition_ids=condition_ids, connection=connection)
         if delay_stage == 'competition_lookup' and metadata_seen.is_set():
             entered.set()
             assert release.wait(5), 'independent competition-read watchdog'
         return row
-    store.lp_competitiveness_entry = delayed_competition
+    store.lp_competitiveness_map = delayed_competition
     service = PolymarketLPService(store, exchange, clock=lambda: exchange.now, exclusions_enabled=True)
     with ThreadPoolExecutor(1) as workers:
         job = workers.submit(service.refresh_price_history)
