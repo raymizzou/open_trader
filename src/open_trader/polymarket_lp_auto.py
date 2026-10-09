@@ -18,7 +18,7 @@ from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from typing import Mapping
 
@@ -29,7 +29,7 @@ from .polymarket_lp_accounting import (account_position_quantity,
     submission_action_kind)
 from .polymarket_lp_risk import (
     TERMINAL_ORDER_STATES, _account_after_reservations, _decimal as _money, _freshness, _levels,
-    _maybe_decimal, _timestamp, evaluate_lp_entry, minimum_order_estimate,
+    _maybe_decimal, _select_bid_level, _timestamp, evaluate_lp_entry, minimum_order_estimate,
 )
 from .daily_premarket import _notifier_channel, send_notification_with_results
 from .notifications import CompositeNotifier, notification_delivery_episode
@@ -42,6 +42,29 @@ from .polymarket_trading import _lp_capture_read_log, _lp_causal_event, _lp_read
 logger = logging.getLogger(__name__)
 
 ZERO = Decimal('0')
+
+
+def _candidate_refresh_priority(cached, *, bid_level, now):
+    """Cached arithmetic orders reads only; it never qualifies a BUY."""
+    best = None
+    for direction in cached.get('directions', ()):
+        try:
+            market = direction['market']
+            minimum = _maybe_decimal(market.get('minimum_order_size'))
+            reward_minimum = _maybe_decimal(market.get('reward_min_size'))
+            if minimum is None or reward_minimum is None or min(minimum, reward_minimum) <= ZERO:
+                continue
+            price, _ = _select_bid_level(_levels(direction['book'].get('bids'), 'bids'), bid_level)
+            quantity = (max(minimum, reward_minimum) / Decimal('.01')).to_integral_value(
+                rounding=ROUND_CEILING) * Decimal('.01')
+            estimate = minimum_order_estimate(direction, {'price': price, 'quantity': quantity}, now)
+            hint = _maybe_decimal(estimate.get('yield_pct_per_hour')) if estimate.get('state') == 'known' else None
+            if hint is not None:
+                best = hint if best is None else max(best, hint)
+        except (KeyError, TypeError, ValueError, ArithmeticError, AttributeError):
+            continue
+    return best
+
 
 # Fixed codes only; arbitrary external reasons never enter round diagnostics.
 _CANDIDATE_FILTER_REASONS = frozenset('''candidate_pool_expired qualification_facts_missing participating_market
@@ -205,6 +228,10 @@ class LPAutoPool:
             document = json.loads(row[0]) if row else self._default()
             document.setdefault('buy_price_level', 1)
             return document
+
+    def buy_price_level(self):
+        """Return the effective quote level, including legacy default one."""
+        return self._read()['buy_price_level']
 
     def _update(self, fn, *, connection=None):
         # ponytail: one SQLite document serializes this single-account MVP;
@@ -718,6 +745,26 @@ class LPAutoPool:
         if bid_level is None:
             bid_level = self._read().get('buy_price_level', 1)
         self.lp._evict_excluded_candidates()
+        # Requalify before stale source gates remove a market from ranking.
+        # Maintenance owns the ten-market bound, in-flight fence and retries;
+        # ranking still evaluates the returned facts at the configured level.
+        from .polymarket_lp import _candidate_head_source_values, _candidate_source_expired
+        now = self._now()
+        with self.lp._candidate_state_lock:
+            stale_conditions = tuple(
+                key for key, value in self.lp._candidate_qualification_facts.items()
+                if key in self.lp._candidate_pool
+                and not _candidate_pool_row_expired(self.lp._candidate_pool[key], now)
+                and any(_candidate_source_expired(stamp, now)
+                        for stamp in _candidate_head_source_values(value)[1:])
+            )
+            stale_facts = {key: deepcopy(self.lp._candidate_qualification_facts[key])
+                           for key in stale_conditions}
+        if stale_conditions:
+            priorities = {key: _candidate_refresh_priority(value, bid_level=bid_level, now=now)
+                          for key, value in stale_facts.items()}
+            self.lp.refresh_candidate_recommendations(
+                condition_ids=stale_conditions, refresh_priorities=priorities)
         with self.lp._candidate_state_lock:
             facts={}
             expired=set()

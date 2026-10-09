@@ -23716,6 +23716,56 @@ console.log(JSON.stringify({
     assert rendered["submittingToast"] is True
 
 
+def test_lp_trial_confirm_preserves_displayed_strategy_bid_level() -> None:
+    """Confirm transports the displayed level only for a strategy trial."""
+    output = _lp163_interactive(r'''
+enterLpView();
+const strategyRow = {...candidateRow, estimate_state: "known",
+  estimate_buy_price_level: 2,
+  selected_direction: {...candidateRow.selected_direction, price: "0.39", quantity: "20"}};
+const confirmed = {};
+for (const mode of ["strategy", "legacy", "custom", "augment"]) {
+  resetLp163SubmitState();
+  const augment = mode === "augment";
+  const match = augment ? lpAugmentSubmitMatch : lpOrdersSubmitMatch;
+  const previous = augment ? lpAugmentPosts().length : lpOrdersPosts().length;
+  deferResponse(match).respond(jsonResponse({state: "rejected", reason: "offline-response"}));
+  if (augment) {
+    openPredictionModal("lp_augment", null, lpAugmentIntent([], lp163Session));
+  } else {
+    const row = mode === "legacy" ? candidateRow : strategyRow;
+    openPredictionModal("lp_order", null, lpOrderIntent(row));
+    if (mode === "custom") await modalClick({modalAction: "lp-order-case", caseMode: "custom"});
+  }
+  const modalHtml = modalRoot.innerHTML;
+  await modalClick({modalAction: augment ? "lp-augment-confirm" : "lp-order-confirm"});
+  const posts = (augment ? lpAugmentPosts() : lpOrdersPosts()).slice(previous);
+  confirmed[mode] = {count: posts.length, body: JSON.parse(posts[0].body),
+    url: posts[0].url, modalHtml};
+}
+console.log(JSON.stringify(confirmed));
+''')
+    confirmed = json.loads(output)
+    strategy = confirmed["strategy"]
+    assert strategy["count"] == 1
+    assert strategy["url"].endswith("/api/prediction-arbitrage/lp/orders")
+    assert 'value="0.39"' in strategy["modalHtml"]
+    assert strategy["body"]["price"] == "0.39"
+    assert strategy["body"]["quantity"] == "20"
+    assert strategy["body"]["token_id"] == "token-fed"
+    assert strategy["body"]["outcome"] == "YES"
+    assert strategy["body"]["candidate_policy"] == "best_bid_minimum"
+    assert strategy["body"]["candidate_bid_level"] == 2
+    legacy = confirmed["legacy"]
+    assert legacy["count"] == 1
+    assert legacy["body"]["candidate_policy"] == "best_bid_minimum"
+    assert legacy["body"].get("candidate_bid_level", 1) == 1
+    for mode in ("custom", "augment"):
+        assert confirmed[mode]["count"] == 1
+        assert "candidate_policy" not in confirmed[mode]["body"]
+        assert "candidate_bid_level" not in confirmed[mode]["body"]
+
+
 def test_lp163_cooldown_fixed_10s() -> None:
     """W3: 2 秒成功回执 → toast 变成功但按钮仍禁用；手动触发 10 秒定时器 → 解锁。"""
     output = _lp163_interactive(r'''

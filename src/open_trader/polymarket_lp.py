@@ -77,6 +77,7 @@ from .polymarket_trading import (
     _lp_read_lock,
     _lp_market_read_diagnostic,
     _lp_causal_event,
+    _lp_capture_read_log,
     _lp_trade,
     _safe_read_error_chain,
     _safe_sqlite_error_facts,
@@ -606,6 +607,16 @@ def _candidate_head_source_times(
     return source_times, any_expired
 
 
+def _lp_candidate_maintenance_log(event: str, facts: Mapping[str, object]) -> None:
+    """Capture only pre-redacted, bounded attempt facts in the existing sink."""
+    try:
+        captured = deepcopy(dict(facts))
+        _lp_capture_read_log(lambda: logger.info(
+            "lp_candidate_maintenance event=%s facts=%s", event, captured))
+    except Exception:
+        pass
+
+
 def _lp_direction_estimate(
     direction: Mapping[str, object],
     guidance: Mapping[str, object],
@@ -838,6 +849,7 @@ class PolymarketLPService:
         self._candidate_preparation_wakeup = None
         self.owner_lock = owner_lock
         self._mutation_guard = mutation_guard
+        self._candidate_buy_price_level_reader: Callable[[], int] | None = None
         listener = getattr(store, "set_lp_trade_change_listener", None)
         if callable(listener):
             listener(self._invalidate_lp_account_round)
@@ -900,6 +912,7 @@ class PolymarketLPService:
         self._sample_target_version = 0
         self._candidate_attempted_at: datetime | None = None
         self._candidate_maintenance_failures = 0
+        self._candidate_maintenance_global_failure = False
         self._candidate_maintenance_last_finished_at: datetime | None = None
         self._candidate_qualification_facts: dict[str, object] = {}
         # Issue #157 rolling pool: valid estimates keyed by condition_id, a
@@ -2417,6 +2430,40 @@ class PolymarketLPService:
         if reason is not None:
             raise ValueError(reason)
 
+    def set_candidate_buy_price_level_reader(self, reader: Callable[[], int]) -> None:
+        """Use the effective persisted Auto quote level for strategy estimates."""
+        self._candidate_buy_price_level_reader = reader
+
+    def _candidate_buy_price_level(self) -> int | None:
+        reader = self._candidate_buy_price_level_reader
+        if reader is None:
+            return 1
+        try:
+            level = reader()
+        except Exception:
+            return None
+        return level if type(level) is int and level in (1, 2) else None
+
+    @staticmethod
+    def _candidate_strategy_projection(
+        row: Mapping[str, object], bid_level: int | None
+    ) -> dict[str, object]:
+        projected = deepcopy(dict(row))
+        # Before level-aware estimates, all saved candidate estimates used
+        # buy one. Preserve that provenance rather than relabeling on reload.
+        estimated_level = row.get("estimate_buy_price_level", 1)
+        if (bid_level is not None and type(estimated_level) is int
+                and estimated_level == bid_level):
+            return projected
+        _apply_row_estimate_fields(projected, None)
+        projected.update(state="unknown", verification="pending",
+                         selected_direction=None, directions={},
+                         estimate_reason_codes=["strategy_level_pending"])
+        for field in ("realtime_price", "realtime_capital", "realtime_checked_at",
+                      "estimated_exit_loss", "estimated_exit_loss_ratio"):
+            projected[field] = None
+        return projected
+
     def candidate_snapshot(self) -> dict[str, object]:
         """Project the rolling candidate pool without external reads.
 
@@ -2429,6 +2476,7 @@ class PolymarketLPService:
         """
 
         self._evict_excluded_candidates()
+        bid_level = self._candidate_buy_price_level()
         with self._candidate_state_lock:
             pool = deepcopy(self._candidate_pool)
             snapshot = deepcopy(self._candidate_snapshot)
@@ -2459,7 +2507,7 @@ class PolymarketLPService:
                     }
                 )
                 continue
-            valid_rows.append(row)
+            valid_rows.append(self._candidate_strategy_projection(row, bid_level))
         valid_rows.sort(key=_candidate_yield_sort_key)
         published = []
         for row in valid_rows[:LP_TRIAL_CANDIDATE_LIMIT]:
@@ -2552,6 +2600,7 @@ class PolymarketLPService:
             if isinstance(trial_reasons, list):
                 trial_reasons.extend(history_reasons)
         projection = {
+            "buy_price_level": bid_level,
             "state": snapshot_state,
             "complete": snapshot.get("complete") is True,
             "scanning": snapshot.get("scanning") is True,
@@ -2624,13 +2673,14 @@ class PolymarketLPService:
                 == global_recovery_generation
             }
             failures = self._candidate_maintenance_failures
+            global_failure = self._candidate_maintenance_global_failure
             last_finished_at = self._candidate_maintenance_last_finished_at
             pool = deepcopy(self._candidate_pool)
         now = self._now()
         floor = _CANDIDATE_SCHEDULER_WAIT_FLOOR_SECONDS
         ceiling = _CANDIDATE_SCHEDULER_WAIT_CEILING_SECONDS
 
-        if failures > 0 and last_finished_at is not None:
+        if global_failure and failures > 0 and last_finished_at is not None:
             backoff = _CANDIDATE_MAINTENANCE_BACKOFF_SECONDS[
                 min(failures - 1, 2)
             ]
@@ -2646,38 +2696,36 @@ class PolymarketLPService:
             for row in pool.values()
             if isinstance(row, Mapping) and not _candidate_pool_row_expired(row, now)
         ]
-        selected_rows = sorted(
-            valid_rows, key=_candidate_yield_sort_key
-        )[:_LP_CANDIDATE_BATCH_SIZE]
+        ordered = sorted(valid_rows, key=_candidate_yield_sort_key)
+        ready, waiting = [], []
+        for row in ordered:
+            target = ready if self._candidate_rotation_due(
+                str(row.get("condition_id") or ""), now=now) else waiting
+            if len(target) < _LP_CANDIDATE_BATCH_SIZE:
+                target.append(row)
+        selected_rows = ready + waiting
         if not selected_rows:
             return None
-        # Issue #138 round 2: maintenance refreshes the whole published
-        # table, so the wait is governed by the oldest source receipt
-        # across every published row's facts.
-        source_times: list[datetime] = []
+        waits: list[float] = []
         for row in selected_rows:
             condition_id = str(row.get("condition_id") or "").strip()
+            entry = self._candidate_rotation_entry(condition_id)
+            failures = entry.get("failures")
+            attempted = _candidate_row_updated_at({"updated_at": entry.get("last_attempt_at")})
+            if isinstance(failures, int) and failures > 0 and attempted is not None:
+                backoff = _CANDIDATE_MAINTENANCE_BACKOFF_SECONDS[min(failures - 1, 2)]
+                waits.append((attempted + timedelta(seconds=float(backoff)) - now).total_seconds())
+                continue
             cached = qualification_facts.get(condition_id)
             if not isinstance(cached, Mapping):
                 continue
-            for value in _candidate_head_source_values(cached):
-                try:
-                    checked_at = _timestamp(value, name="candidate_source_checked_at")
-                except ValueError:
-                    # An unparseable stamp is degenerate: retry on the floor.
-                    return floor
-                if checked_at > now:
-                    # A future stamp is degenerate: retry on the floor.
-                    return floor
-                source_times.append(checked_at)
-        if not source_times:
-            return None
-        wait_seconds = (
-            min(source_times)
-            + timedelta(seconds=float(LP_RECOMMENDATION_REFRESH_LEAD_SECONDS))
-            - now
-        ).total_seconds()
-        return min(max(wait_seconds, floor), ceiling)
+            times, expired = _candidate_head_source_times(cached, now)
+            if expired or not times:
+                waits.append(floor)
+            else:
+                waits.append((min(times) + timedelta(
+                    seconds=float(LP_RECOMMENDATION_REFRESH_LEAD_SECONDS)) - now).total_seconds())
+        return min(max(min(waits), floor), ceiling) if waits else None
 
     def _publish_sample_targets(
         self, targets: Sequence[tuple[str, str]]
@@ -5966,6 +6014,7 @@ class PolymarketLPService:
         global_recovery_generation: int | None = None
         try:
             attempted_at = self._now()
+            bid_level = self._candidate_buy_price_level()
             global_recovery_generation = self._current_candidate_global_generation()
             if global_recovery_generation is None:
                 return self._finish_candidate_scan(
@@ -6186,6 +6235,7 @@ class PolymarketLPService:
                             now=evaluation_now,
                             reservations=reservations,
                             candidate=True,
+                            bid_level=bid_level,
                         )
                     qualified_directions.append(qualified_direction)
                     result = {
@@ -6289,6 +6339,7 @@ class PolymarketLPService:
                     )
                     continue
                 row = dict(candidate)
+                row["estimate_buy_price_level"] = bid_level
                 row["directions"] = direction_results
                 row["selected_direction"] = selected_direction
                 row["state"] = row_state
@@ -6420,16 +6471,19 @@ class PolymarketLPService:
             self._candidate_scan_lock.release()
 
     def refresh_candidate_recommendations(
-        self, *, stop_event: threading.Event | None = None
+        self, *, stop_event: threading.Event | None = None,
+        condition_ids: Sequence[str] | None = None,
+        refresh_priorities: Mapping[str, Decimal | None] | None = None,
     ) -> dict[str, object]:
         """Refresh the displayed pool rows on one batch book read (issue #157).
 
         The maintenance thread keeps the issue-#146 trigger — the oldest
         source age across the displayed rows with a 30-second lead, plus
-        the 60/120/300s failure backoff — and the whole-table batch read
+        an independent 60/120/300s retry per failed market — and the batch read
         framework (one batched book read plus one account, metadata, and
         targeted reward read per due source class).  Publication rewrites
-        pool rows one by one: a refreshed row re-enters with its new
+        pool rows one by one. Account uncertainty or a failed entire book
+        read retains the account/source-wide backoff. A refreshed row re-enters with its new
         judgment time, a failed row keeps its values marked
         ``refresh_failed`` until its original expiry, and a deterministic
         rejection leaves the pool at once.
@@ -6442,12 +6496,14 @@ class PolymarketLPService:
             return snapshot
         try:
             now = self._now()
+            bid_level = self._candidate_buy_price_level()
             global_recovery_generation = self._current_candidate_global_generation()
             if global_recovery_generation is None:
                 return self.candidate_snapshot()
             exclusion_revision = self._candidate_exclusion_revision
             with self._candidate_state_lock:
                 failures = self._candidate_maintenance_failures
+                global_failure = self._candidate_maintenance_global_failure
                 last_finished_at = self._candidate_maintenance_last_finished_at
                 cached_facts = {
                     condition_id: deepcopy(facts)
@@ -6467,16 +6523,30 @@ class PolymarketLPService:
                     )
                     == global_recovery_generation
                 }
-            # Issue #157: maintenance renews the currently displayed top ten
-            # valid pool rows (whole-table framework, pool publication).
+            # Background maintenance retains its displayed-head selection.
+            # Automatic requalification targets the stale rows that triggered
+            # it, so a fresh stored-yield prefix cannot hide a level-specific
+            # winner. Both paths share the same ten-market bound and retries.
+            requested = set(condition_ids) if condition_ids is not None else None
             valid_rows = [
-                row
-                for row in pool.values()
+                self._candidate_strategy_projection(row, bid_level)
+                for cid, row in pool.items()
                 if isinstance(row, Mapping)
+                and (requested is None or cid in requested)
                 and not _candidate_pool_row_expired(row, now)
             ]
-            valid_rows.sort(key=_candidate_yield_sort_key)
-            selected_rows = valid_rows[:_LP_CANDIDATE_BATCH_SIZE]
+            if refresh_priorities is None:
+                valid_rows.sort(key=_candidate_yield_sort_key)
+            else:
+                def refresh_key(row):
+                    hint = _maybe_decimal(refresh_priorities.get(str(row.get("condition_id") or "")))
+                    return (hint is None, -(hint if hint is not None else Decimal(0)),
+                            *_candidate_yield_sort_key(row))
+                valid_rows.sort(key=refresh_key)
+            selected_rows = [
+                row for row in valid_rows
+                if self._candidate_rotation_due(str(row.get("condition_id") or ""), now=now)
+            ][:_LP_CANDIDATE_BATCH_SIZE]
             if not selected_rows:
                 return self.candidate_snapshot()
 
@@ -6569,7 +6639,11 @@ class PolymarketLPService:
             lead_due = bool(source_times) and min(source_times) + timedelta(
                 seconds=float(LP_RECOMMENDATION_REFRESH_LEAD_SECONDS)
             ) <= now
-            if failures > 0 and last_finished_at is not None:
+            level_changed = any(
+                row.get("estimate_buy_price_level", 1) != bid_level
+                for row in selected_rows
+            )
+            if global_failure and failures > 0 and last_finished_at is not None:
                 # Issue #146: a failed maintenance attempt suppresses further
                 # reads until its backoff window (60/120/300s, counted from
                 # the attempt's finish) has elapsed.
@@ -6581,13 +6655,24 @@ class PolymarketLPService:
                     < backoff
                 ):
                     return self.candidate_snapshot()
-            if not lead_due and not source_expired:
+            if not lead_due and not source_expired and not level_changed:
                 return self.candidate_snapshot()
             if stop_event is not None and stop_event.is_set():
                 return self.candidate_snapshot()
 
             # Issue #146: expose how long each source read took so the
             # operator can see which source drove a refresh.
+            batch_id = uuid.uuid4().hex
+            def market_key(condition_id: str) -> str:
+                return hashlib.sha256(condition_id.encode()).hexdigest()[:16]
+
+            _lp_candidate_maintenance_log("begin", {
+                "batch_id": batch_id, "started_at": now.isoformat(),
+                "markets": [market_key(str(row.get("condition_id") or "")) for row, _ in row_facts],
+            })
+            source_causes: dict[str, str] = {}
+            reward_causes: dict[str, str] = {}
+            metadata_causes: dict[str, str] = {}
             read_seconds: dict[str, float] = {
                 "account": 0.0,
                 "metadata": 0.0,
@@ -6609,7 +6694,8 @@ class PolymarketLPService:
                     refreshed_account = (
                         account_reader() if callable(account_reader) else None
                     )
-                except Exception:
+                except Exception as exc:
+                    source_causes["account"] = self._safe_error_type(type(exc).__name__)
                     refreshed_account = None
                 read_seconds["account"] = float(
                     (self._now() - read_started_at).total_seconds()
@@ -6643,7 +6729,7 @@ class PolymarketLPService:
                 )
             )
             def read_rewards():
-                reward_error: str | None = None
+                reward_errors: dict[str, str] = {}
                 refreshed_rewards: dict[str, Mapping[str, object]] = {}
                 raw_reward: Mapping[str, object] | None = None
                 if reward_due:
@@ -6665,15 +6751,22 @@ class PolymarketLPService:
                                 if callable(reward_reader)
                                 else None
                             )
-                        except Exception:
+                        except Exception as exc:
+                            source_causes["reward"] = self._safe_error_type(type(exc).__name__)
                             raw_reward = None
-                    except Exception:
+                    except Exception as exc:
+                        source_causes["reward"] = self._safe_error_type(type(exc).__name__)
                         raw_reward = None
                     reward_rows = (
                         raw_reward.get("markets")
                         if isinstance(raw_reward, Mapping)
                         else None
                     )
+                    diagnostic_rewards = reward_rows.values() if isinstance(reward_rows, Mapping) else reward_rows
+                    if isinstance(diagnostic_rewards, (list, tuple)) or isinstance(reward_rows, Mapping):
+                        for reward_row in diagnostic_rewards:
+                            if isinstance(reward_row, Mapping) and reward_row.get("error_type"):
+                                reward_causes[str(reward_row.get("condition_id") or "")] = self._safe_error_type(reward_row["error_type"])
                     if isinstance(reward_rows, Mapping):
                         for condition_id in refresh_conditions:
                             candidate_reward = reward_rows.get(condition_id)
@@ -6702,16 +6795,15 @@ class PolymarketLPService:
                         if refreshed_reward_row is None or _candidate_source_expired(
                             reward_checked_at, self._now()
                         ):
-                            reward_error = "reward_unknown"
-                            break
+                            reward_errors[condition_id] = "reward_unknown"
                     read_seconds["reward"] = float(
                         (self._now() - read_started_at).total_seconds()
                     )
 
-                return reward_error, refreshed_rewards, raw_reward
+                return reward_errors, refreshed_rewards, raw_reward
 
             if self.exclusions_enabled:
-                reward_error, refreshed_rewards, raw_reward = read_rewards()
+                reward_errors, refreshed_rewards, raw_reward = read_rewards()
                 for row, cached in refreshable:
                     cid = str(row.get("condition_id") or "")
                     directions = live_directions(cached)
@@ -6726,7 +6818,7 @@ class PolymarketLPService:
                             exclusion_revision = self._candidate_exclusion_revision
                 refresh_conditions = self._candidate_conditions(refresh_conditions)
 
-            metadata_error: str | None = None
+            metadata_errors: dict[str, str] = {}
             refreshed_metadata: dict[str, Mapping[str, object]] = {}
             if metadata_due and refresh_conditions:
                 metadata_reader = getattr(
@@ -6738,10 +6830,12 @@ class PolymarketLPService:
                     )
                 read_started_at = self._now()
                 try:
+                    options = {"stop_event": stop_event}
+                    if getattr(metadata_reader, "__func__", None) is PolymarketTradingClient.lp_market_metadata_fresh:
+                        options["include_diagnostics"] = True
                     raw_metadata = (
-                        metadata_reader(refresh_conditions, stop_event=stop_event)
-                        if callable(metadata_reader)
-                        else None
+                        metadata_reader(refresh_conditions, **options)
+                        if callable(metadata_reader) else None
                     )
                 except TypeError:
                     try:
@@ -6750,10 +6844,19 @@ class PolymarketLPService:
                             if callable(metadata_reader)
                             else None
                         )
-                    except Exception:
+                    except Exception as exc:
+                        source_causes["metadata"] = self._safe_error_type(type(exc).__name__)
                         raw_metadata = None
-                except Exception:
+                except Exception as exc:
+                    source_causes["metadata"] = self._safe_error_type(type(exc).__name__)
                     raw_metadata = None
+                if isinstance(raw_metadata, Mapping):
+                    failure_facts = raw_metadata.get("failure_facts")
+                    if isinstance(failure_facts, Mapping):
+                        for condition_id in refresh_conditions:
+                            failure = failure_facts.get(condition_id)
+                            if isinstance(failure, Mapping) and failure.get("error_type"):
+                                metadata_causes[condition_id] = self._safe_error_type(failure["error_type"])
                 metadata_rows = (
                     raw_metadata.get("markets")
                     if isinstance(raw_metadata, Mapping)
@@ -6766,26 +6869,22 @@ class PolymarketLPService:
                         if isinstance(candidate_market, Mapping):
                             refreshed_metadata[condition_id] = candidate_market
                 metadata_checked_now = self._now()
-                if not refreshed_metadata:
-                    metadata_error = "market_metadata_unknown"
-                else:
-                    for market_row in refreshed_metadata.values():
-                        if _candidate_source_expired(
-                            market_row.get("metadata_checked_at"),
-                            metadata_checked_now,
-                        ):
-                            metadata_error = "market_metadata_unknown"
-                        elif _candidate_source_expired(
-                            market_row.get("fees_checked_at"),
-                            metadata_checked_now,
-                        ):
-                            metadata_error = "market_fees_unknown"
+                for condition_id in refresh_conditions:
+                    market_row = refreshed_metadata.get(condition_id)
+                    if not isinstance(market_row, Mapping) or _candidate_source_expired(
+                        market_row.get("metadata_checked_at"), metadata_checked_now
+                    ):
+                        metadata_errors[condition_id] = "market_metadata_unknown"
+                    elif _candidate_source_expired(
+                        market_row.get("fees_checked_at"), metadata_checked_now
+                    ):
+                        metadata_errors[condition_id] = "market_fees_unknown"
                 read_seconds["metadata"] = float(
                     (self._now() - read_started_at).total_seconds()
                 )
 
             if not self.exclusions_enabled:
-                reward_error, refreshed_rewards, raw_reward = read_rewards()
+                reward_errors, refreshed_rewards, raw_reward = read_rewards()
 
             if self.exclusions_enabled:
                 for row, cached in refreshable:
@@ -6838,9 +6937,11 @@ class PolymarketLPService:
                             if callable(books_reader)
                             else None
                         )
-                    except Exception:
+                    except Exception as exc:
+                        source_causes["books"] = self._safe_error_type(type(exc).__name__)
                         raw_books = None
-                except Exception:
+                except Exception as exc:
+                    source_causes["books"] = self._safe_error_type(type(exc).__name__)
                     raw_books = None
                 read_seconds["books"] = float(
                     (self._now() - read_started_at).total_seconds()
@@ -6851,15 +6952,9 @@ class PolymarketLPService:
                     books_failed = True
 
             reservations = self._candidate_reservations()
-            # One whole-round gate, per the issue-138 round-2 decision: an
-            # account, metadata, reward, or entire-book failure keeps every
-            # published value this cycle instead of half-refreshed tables.
-            round_failed = (
-                account_error is not None
-                or metadata_error is not None
-                or reward_error is not None
-                or books_failed
-            )
+            # Account uncertainty remains account-wide. Market source gaps
+            # retain only that market's old facts and its own retry deadline.
+            round_failed = account_error is not None or books_failed
 
             def evaluate_row(
                 row: Mapping[str, object],
@@ -6874,6 +6969,8 @@ class PolymarketLPService:
                 """
 
                 condition_id = str(row.get("condition_id") or "").strip()
+                if condition_id in metadata_errors or condition_id in reward_errors:
+                    return None, None
                 directions = live_directions(cached)
                 updated_directions: list[Mapping[str, object]] = []
                 direction_results: dict[str, dict[str, object]] = {}
@@ -6894,7 +6991,7 @@ class PolymarketLPService:
                     if (
                         metadata_due
                         and isinstance(refreshed_market, Mapping)
-                        and metadata_error is None
+                        and condition_id not in metadata_errors
                     ):
                         market = {
                             **dict(refreshed_market),
@@ -6914,12 +7011,12 @@ class PolymarketLPService:
                         (
                             metadata_due
                             and isinstance(refreshed_market, Mapping)
-                            and metadata_error is None
+                            and condition_id not in metadata_errors
                         )
                         or (
                             reward_due
                             and condition_id in refreshed_rewards
-                            and reward_error is None
+                            and condition_id not in reward_errors
                         )
                     ):
                         reward_source: dict[str, object] = {}
@@ -6972,7 +7069,7 @@ class PolymarketLPService:
                     if (
                         reward_due
                         and isinstance(refreshed_reward_row, Mapping)
-                        and reward_error is None
+                        and condition_id not in reward_errors
                     ):
                         maintenance_direction["reward_active"] = (
                             refreshed_reward_row.get("reward_active")
@@ -7043,6 +7140,7 @@ class PolymarketLPService:
                                 now=evaluation_now,
                                 reservations=reservations,
                                 candidate=True,
+                                bid_level=bid_level,
                             )
                     updated_directions.append(maintenance_direction)
                     result: dict[str, object] = {
@@ -7108,6 +7206,8 @@ class PolymarketLPService:
                     else None
                 )
                 new_row = dict(row)
+                new_row["estimate_buy_price_level"] = bid_level
+                new_row.pop("estimate_reason_codes", None)
                 new_row["directions"] = direction_results
                 new_row["selected_direction"] = selected_direction
                 new_row["state"] = (
@@ -7165,17 +7265,57 @@ class PolymarketLPService:
                 return new_row, facts
 
             evaluation_now = self._now()
+            def age(value: object) -> float | None:
+                try:
+                    return (evaluation_now - _timestamp(value, name="source_at")).total_seconds()
+                except ValueError:
+                    return None
+
+            try:
+                for source, due in (("account", account_due), ("metadata", metadata_due),
+                                    ("fees", metadata_due), ("reward", reward_due), ("books", book_due)):
+                    markets = []
+                    for row, cached in row_facts:
+                        cid = str(row.get("condition_id") or "")
+                        directions = live_directions(cached) if cached else []
+                        values = []
+                        failed = cached is None
+                        cause = "unknown"
+                        if source == "account":
+                            values = [account.get("checked_at") if not account_error else row_account(cached or {}).get("checked_at")]
+                            failed = failed or account_error is not None
+                            cause = source_causes.get("account", "unknown")
+                        elif source in {"metadata", "fees"}:
+                            stamp = "metadata_checked_at" if source == "metadata" else "fees_checked_at"
+                            failed = failed or cid in metadata_errors or (due and cid not in refreshed_metadata)
+                            values = [refreshed_metadata[cid].get(stamp)] if due and not failed else [d["market"].get(stamp) for d in directions]
+                            cause = metadata_causes.get(cid, source_causes.get("metadata", "unknown"))
+                        elif source == "reward":
+                            failed = failed or cid in reward_errors
+                            reward = refreshed_rewards.get(cid, {})
+                            values = [reward.get("reward_checked_at") or (raw_reward or {}).get("checked_at")] if due and not failed else [d.get("reward_checked_at") for d in directions]
+                            cause = reward_causes.get(cid, source_causes.get("reward", "unknown"))
+                        else:
+                            values = [(books.get(str(d["market"].get("token_id") or "")) if due else d.get("book")) for d in directions]
+                            failed = failed or books_failed or not values or any(not isinstance(v, Mapping) for v in values)
+                            values = [v.get("received_at") if isinstance(v, Mapping) else None for v in values]
+                            cause = source_causes.get("books", "unknown")
+                        ages = [age(value) for value in values]
+                        markets.append({"market": market_key(cid),
+                            "outcome": "failed" if failed else "refreshed" if due else "reused",
+                            "cause": cause if failed else None,
+                            "age_seconds": max(ages) if ages and all(v is not None for v in ages) else None})
+                    _lp_candidate_maintenance_log("source", {"batch_id": batch_id,
+                        "source": source, "used_at": evaluation_now.isoformat(), "markets": markets,
+                        "read_seconds": read_seconds["metadata" if source == "fees" else source]})
+            except Exception:
+                pass  # Diagnostics never change qualification or publication.
+            row_outcomes: dict[str, str] = {}
             # Issue #157: publication rewrites pool rows one by one.  A
             # refreshed row re-enters with its new judgment time, a failed
             # row keeps its values marked refresh_failed until its original
             # expiry, and a deterministically rejected row leaves the pool
             # immediately.
-            round_failure_reason = (
-                account_error
-                or metadata_error
-                or reward_error
-                or ("book_unknown" if books_failed else None)
-            )
             refreshed_any = False
             for row, cached in row_facts:
                 condition_id = str(row.get("condition_id") or "").strip()
@@ -7188,6 +7328,7 @@ class PolymarketLPService:
                     # whose re-read could not produce a verdict: keep the
                     # stored values until their original expiry and mark
                     # the row refresh_failed.
+                    row_outcomes[condition_id] = "failed"
                     self._candidate_pool_record_failure(
                         condition_id,
                         attempted_at=evaluation_now,
@@ -7195,6 +7336,7 @@ class PolymarketLPService:
                     )
                     continue
                 if new_row.get("state") == "rejected":
+                    row_outcomes[condition_id] = "rejected"
                     self._candidate_pool_record_rejection(
                         condition_id,
                         judged_at=evaluation_now,
@@ -7206,7 +7348,7 @@ class PolymarketLPService:
                 # the line.  The row was refreshed either way, so a
                 # guard-rejected success is not a round failure and must not
                 # advance the 60/120/300s maintenance backoff.
-                self._candidate_pool_record_success(
+                published = self._candidate_pool_record_success(
                     condition_id,
                     new_row,
                     judged_at=evaluation_now,
@@ -7214,6 +7356,7 @@ class PolymarketLPService:
                     exclusion_revision=exclusion_revision,
                     global_recovery_generation=global_recovery_generation,
                 )
+                row_outcomes[condition_id] = "refreshed" if published else "publication_guarded"
                 refreshed_any = True
             # Issue #146: the maintenance attempt's backoff bookkeeping is
             # applied together with its publication.
@@ -7224,11 +7367,27 @@ class PolymarketLPService:
                 self._candidate_maintenance_last_finished_at = (
                     maintenance_finished_at
                 )
+                self._candidate_maintenance_global_failure = round_failed
                 if refreshed_any:
                     self._candidate_maintenance_failures = 0
                 else:
                     self._candidate_maintenance_failures += 1
                 failures_now = self._candidate_maintenance_failures
+            try:
+                diagnostic_markets = []
+                for cid, outcome in row_outcomes.items():
+                    entry = self._candidate_rotation_entry(cid)
+                    count = entry.get("failures")
+                    attempted = _candidate_row_updated_at({"updated_at": entry.get("last_attempt_at")})
+                    backoff = float(_CANDIDATE_MAINTENANCE_BACKOFF_SECONDS[min(count - 1, 2)]) if type(count) is int and count > 0 and attempted else 0
+                    diagnostic_markets.append({"market": market_key(cid), "outcome": outcome,
+                        "backoff_seconds": backoff,
+                        "next_attempt_at": (attempted + timedelta(seconds=backoff)).isoformat() if backoff else None})
+                _lp_candidate_maintenance_log("end", {"batch_id": batch_id,
+                    "finished_at": maintenance_finished_at.isoformat(), "markets": diagnostic_markets,
+                    "global_backoff": round_failed, "consecutive_failures": failures_now})
+            except Exception:
+                pass  # Business retry state is independent of log construction.
             notes: dict[str, object] = {
                 "maintenance_consecutive_failures": failures_now,
             }

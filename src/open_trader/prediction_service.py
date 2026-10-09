@@ -1119,7 +1119,7 @@ def create_prediction_server(
                     result = lp_augment_preview(payload)
                 elif path == lp_submit_entry_path:
                     # Issue 163: strict schema — eight required fields plus
-                    # the two optional ones; anything missing or extra is a
+                    # explicit optional fields; anything missing or extra is a
                     # 400 before the facade runs.  A non-decimal price or
                     # quantity raises through _normalize_request and lands
                     # here as a 400 with the reason.
@@ -1135,6 +1135,7 @@ def create_prediction_server(
                     }
                     lp_entry_optional = {
                         "candidate_policy",
+                        "candidate_bid_level",
                         "estimated_target_quantity",
                     }
                     if not lp_entry_required <= set(payload) or set(payload) - lp_entry_required - lp_entry_optional:
