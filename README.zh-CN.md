@@ -200,8 +200,11 @@ watchlist 使用市场、标的和 Trend Animals 业务标识：
 ## 开发与发布四阶段门禁
 
 正式交付采用 PR-first：从最新拉取的 `origin/main` 建立独立分支/worktree，
-开发与验证、独立 staged review 后，按授权推送分支并创建 Draft PR；CI 通过后，
-由用户明确批准在 GitHub 合并。本地 `main` 只同步远端，不再用于集成任务分支。
+完成适用的开发与安全检查后，Main 依据长期授权仅暂存、提交和推送任务文件，
+创建普通（非 Draft）PR，无需再次询问推送或 PR 权限；随后进行独立 GLM 审查与 CI。
+范围内修复先更新同一 PR，再刷新审查；最终审查、CI 和反馈门禁完成后，
+由用户明确批准在 GitHub 合并。验证手册中的明确 local-only/no-push/
+do-not-publish/draft 覆盖指令仍适用。本地 `main` 只同步远端，不再用于集成任务分支。
 合并不代表发布、创建 tag 或部署授权。详见
 [验证手册](docs/operations/agent-verification.md)、
 [CI 与精确 required 检查](docs/operations/ci.md)及

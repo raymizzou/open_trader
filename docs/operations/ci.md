@@ -84,11 +84,15 @@ Test-only changes run changed tests; shared test helpers add their directly
 affected consumers. Shared production modules run the union of relevant consumer
 tests across services, not whole services. Pure documentation/configuration work
 needs no local backend run unless it changes a testable contract. Report blocked
-focused checks honestly; Docker is not a prerequisite to push a reviewed branch.
+focused checks honestly; Docker is not a prerequisite to task-branch publication.
 
-Follow the [PR-first verification runbook](agent-verification.md): focused local
-checks, independent staged review, authorized branch push, Draft PR, latest
-exact-SHA `required` success, and explicit user approval before GitHub merge.
+Follow the [PR-first verification runbook](agent-verification.md#first-reviewable-implementation):
+applicable development/security checks, Main's task-only stage/commit/push and
+normal PR under standing authorization, then independent GLM review and CI.
+No additional push/PR permission question is needed; the runbook's explicit
+local-only/no-push/do-not-publish/draft overrides apply. Publish in-scope repairs
+to the same PR before refreshed review. Final review, feedback and exact-SHA
+`required` success precede explicit user approval for GitHub merge.
 Local main only synchronizes the remote. Merge remains separate from release/tag
 creation, Deployment Preflight and deployment; no CI job grants production or
 trading authorization.
