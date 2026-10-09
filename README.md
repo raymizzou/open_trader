@@ -171,9 +171,13 @@ Run one real daily check for a market:
 ## Development and release gates
 
 Delivery is PR-first: start an isolated branch/worktree from freshly fetched
-`origin/main`, develop and verify, obtain independent staged review, push the
-authorized branch, open a Draft PR, pass CI, then obtain user approval to merge
-on GitHub. Local `main` only synchronizes the remote. Merge does not authorize
+`origin/main`, complete applicable development/security checks, then Main stages,
+commits and pushes only task files and opens a normal PR under standing
+authorization, without another push/PR question. Independent GLM review and CI
+follow publication; in-scope repairs update the same PR before refreshed review.
+Final review, CI and feedback gates precede explicit user approval to merge
+on GitHub. The runbook's explicit local-only/no-push/do-not-publish/draft overrides
+apply. Local `main` only synchronizes the remote. Merge does not authorize
 release/tag creation or deployment. See the binding
 [verification runbook](docs/operations/agent-verification.md),
 [CI identity and exact required check](docs/operations/ci.md), and

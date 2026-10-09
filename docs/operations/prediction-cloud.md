@@ -2,9 +2,11 @@
 
 This workflow deploys only Prediction. It does not install OpenD, Legacy,
 Account, Nginx, Docker or a new OS. Existing CRS, Nginx, V2Ray and x-ui remain
-outside the operation. Branch push, Draft PR, GitHub merge, release/tag creation,
-cloud provisioning, deployment and
-trading authorization are separate. The client never starts the cloud backend.
+outside the operation. Task-branch push and PR creation/updates have the
+[standing publication authorization](agent-verification.md#first-reviewable-implementation),
+subject to its explicit local-only/no-push/do-not-publish/draft overrides.
+GitHub merge, release/tag creation, cloud provisioning, deployment and trading
+retain separate authorization boundaries. The client never starts the cloud backend.
 
 ## Optional LP candidate exclusion cooldowns
 
@@ -198,9 +200,12 @@ trading resumes. Stopping the service does not cancel exchange orders.
 
 ## Acceptance boundary
 
-Development uses affected-service Docker checks and independent staged review.
-Use the [PR-first delivery flow](agent-verification.md): reviewed branch, Draft
-PR, exact CI evidence, user-approved GitHub merge. Local `main` only synchronizes
+Development uses affected-service Docker checks and applicable security checks.
+Use the [PR-first delivery flow](agent-verification.md#first-reviewable-implementation):
+Main's task-only stage/commit/push and normal PR under standing authorization
+without another push/PR question, then independent GLM review and CI. In-scope
+repairs update the same PR before refreshed review; final review, feedback and
+exact CI gates precede explicit user-approved GitHub merge. Local `main` only synchronizes
 the remote. Deployment Preflight reuses trusted main-push CI for the selected final GitHub
 `main` SHA during an explicitly authorized deployment; it does not repeat pytest.
 Use [the forward wrapper](deployment-preflight.md) for systemd install/start and

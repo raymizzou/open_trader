@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-09
 
+- First-publication instructions and active README, CI, cloud, release and dependency workflow summaries now require Main to push the first completed task version after applicable focused checks and open a normal PR before independent review, so dots can begin review promptly. Standing task-branch/PR authorization includes in-scope repair updates; GitHub CI, final independent review, merge approval and deployment gates remain required. Verified the precise documentation diffs, targeted publication/review consistency searches and `git diff --check`; no backend tests or deployment gates were run.
 - Project review-publication instructions now carry the standing 2026-10-09 same-PR reviewer result-comment authorization across every checkout, including Air and Mini, removing redundant separate-confirmation prompts while preserving local-only, pre-publication, and reviewer read-only boundaries. Verified documentation portability, semantics, reviewer task/tab/pane ownership and placement, Markdown anchors/fences, changed paths, and `git diff --check`; no tests, deployment gates, or external publication.
 - #310 LP 候选按市场隔离元数据、奖励和盘口刷新失败；健康市场继续刷新，失败市场沿用
   60/120/300 秒恢复期限。自动比较在过滤过期事实前进行有界复核，失败时用合格候选补位，
