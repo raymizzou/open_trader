@@ -174,5 +174,10 @@ including transitive additions and hashes. For intended upgrades use a targeted
 `build` group pin equal. Confirm Python/uv image tags and their manifest digests
 against the official registries before editing Dockerfile.dev, update this
 baseline, then repeat both clean builds and the focused checks above. Never
-replace a digest with an unverified guess. Stage the dated CHANGELOG and request
-independent review of `git diff --cached` before publication.
+replace a digest with an unverified guess. Add the dated CHANGELOG, then follow
+the [PR-first delivery loop](agent-verification.md#first-reviewable-implementation):
+Main stages/commits/pushes only task files and opens a normal PR under standing
+authorization without another push/PR question, subject to its explicit
+local-only/no-push/do-not-publish/draft overrides. Independent GLM review and CI
+follow publication; in-scope repairs update the same PR before refreshed review.
+Final review, CI and feedback gates precede explicit user approval for GitHub merge.

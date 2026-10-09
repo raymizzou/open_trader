@@ -21,15 +21,20 @@ install 脚本为准;任何一步失败即停止,不要临场发明替代做法�
 
 ## PR 合并与发布边界
 
-正式交付先按[验证手册](../docs/operations/agent-verification.md)完成独立
-分支/worktree、开发检查、staged 独立审查、授权推送、Draft PR、CI 和用户批准的
-GitHub 合并。本地 `main` 只同步远端，不能通过本地合并或直接推送绕过 PR。
+正式交付先按[验证手册](../docs/operations/agent-verification.md#first-reviewable-implementation)
+建立独立分支/worktree，完成适用开发与安全检查；Main 依据长期授权仅暂存、提交和
+推送任务文件，创建普通（非 Draft）PR，无需再次询问推送或 PR 权限，然后进行独立
+GLM 审查与 CI。范围内修复先更新同一 PR，再刷新审查；最终审查、CI 和反馈门禁
+完成后，由用户明确批准 GitHub 合并。手册中的明确 local-only/no-push/
+do-not-publish/draft 覆盖指令仍适用。本地 `main` 只同步远端，不能通过本地合并或
+直接推送绕过 PR。
 PR head、GitHub 合成 PR merge commit、最终 GitHub `main` commit 是不同身份；
 发布选定最后一种完整 SHA，核对其 CI 后，在明确授权的部署准备中运行 Candidate
 Acceptance。PR CI 不能代替该 SHA 的 Candidate `PASS`，合并不自动运行验收或部署。
 
-验收失败时先审计全部错误及下游影响，修复走独立分支、检查、审查、PR、CI、用户
-批准合并，再对新的最终 main SHA 验收；不直接修补 main 或生产。发布/tag 创建、
+验收失败时先审计全部错误及下游影响，范围内修复走独立分支、检查、任务分支/PR
+更新、独立审查、CI 与反馈门禁、用户批准合并，再对新的最终 main SHA 验收；
+不直接修补 main 或生产。发布/tag 创建、
 生产变更、owner 切换、回滚各按其授权范围执行。保留不可变目录、精确 SHA/
 `code_root`、单一 owner、备份与回滚证据；`ROLLBACK` 结果本身不授权执行回滚。
 [仓库保护设计](../docs/operations/repository-protection.md)尚未启用，另行审批。
