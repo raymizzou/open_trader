@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-09
 
+- Project review-publication instructions now carry the standing 2026-10-09 same-PR reviewer result-comment authorization across every checkout, including Air and Mini, removing redundant separate-confirmation prompts while preserving local-only, pre-publication, and reviewer read-only boundaries. Verified documentation portability, semantics, reviewer task/tab/pane ownership and placement, Markdown anchors/fences, changed paths, and `git diff --check`; no tests, deployment gates, or external publication.
+
 - #309 LP 候选、推荐排序及 Dashboard 的策略预估跟随当前买一/买二配置，
   探索与维护统一使用真实档位和最小计奖数量；估值保存档位来源，配置切换或重启后
   旧档位报价、占资及收益率显示待测，刷新成功后恢复当前档位值。
