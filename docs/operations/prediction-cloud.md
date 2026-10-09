@@ -497,21 +497,34 @@ introduced; selected cloud content is displayed as returned.
 
 ## #226: bounded Shadow startup before the 24-hour run
 
-The agreed capacity target is the current complete market universe, with Air
-remaining the trading owner and cloud N-leg paused. The entire cloud Prediction
-cgroup, including children and charged file cache, must stay within **1 GB
-(1,000,000,000 bytes)**, including startup and refresh peaks. This is a target
-requiring live evidence, not a claim that the release already meets it. Do not
-truncate discovery, candidates or backup queues to meet the budget.
+The historical #226 capacity target was the current complete market universe,
+with Air remaining the trading owner and cloud N-leg paused, within **1 GB
+(1,000,000,000 bytes)** for the entire cloud Prediction cgroup, including
+children, charged file cache, startup and refresh peaks. That target has not
+been established by live evidence. Current service budgets are configurable;
+raising a budget does not establish capacity acceptance or show that the #226
+target was met. Do not truncate discovery, candidates or backup queues to meet
+the budget.
 
 Paused Shadow units now set `MemoryAccounting=yes`, `CPUQuota=100%` (one core),
 `TasksMax=96` and `Restart=no`. The default `MemoryMax` is 768 MiB; the optional
-non-secret cloud config field `memory_max_bytes` can lower it or raise it up to
-1 GB. Before `start`, the helper requires at least that budget plus 350 MiB of
-host `MemAvailable` and no used swap. A protected startup independently checks
-the effective kernel memory, CPU and PID limits before starting the runtime.
+non-secret cloud config field `memory_max_bytes` can lower or raise it. It must
+be an integer greater than 64 MiB; booleans are invalid. There is no fixed 1 GB
+upper ceiling. The selected budget remains an explicit finite systemd
+`MemoryMax` and runtime guard maximum, never an unlimited service. Before
+`start`, the helper requires at least that budget plus 350 MiB of host
+`MemAvailable` and no used swap. A protected startup independently checks the
+effective kernel memory, CPU and PID limits and requires host availability for
+the remaining cgroup budget plus 350 MiB before starting the runtime.
+A kernel memory limit above the configured maximum blocks startup, including
+the numeric cgroup v1 unlimited sentinel; cgroup v2 `memory.max=max` is invalid.
 Missing/contradictory resource evidence blocks startup. These settings apply to
 paused Shadow only; existing production ownership and restart policy remain.
+
+For example, a 2 GiB budget is `memory_max_bytes: 2147483648`. Use it only through
+an authorized exact-SHA deployment with fresh checks of actual host headroom
+and effective limits. No long-run resource evidence exists for this budget yet;
+the staged startup and 24-hour observations below are still required.
 
 The guard checks cgroup usage and host availability each second. At 64 MiB below
 the actual cgroup ceiling, below 350 MiB host availability, used swap, a kernel

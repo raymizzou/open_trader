@@ -3,6 +3,16 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-10
+
+- Paused cloud Shadow now accepts configured finite memory budgets above 1 GB,
+  including 2 GiB, while retaining the 768 MiB default, host and service reserves,
+  swap/CPU/task checks, bounded shutdown and `Restart=no`. Raising the budget
+  does not establish #226 capacity acceptance. Ordered renderer, cgroup v1/v2
+  and guard RED/GREEN checks passed; the focused union finished with 24 passed
+  and one existing Linux-only skip on macOS. No cloud restart or deployment;
+  2 GiB long-run resource evidence remains unavailable.
+
 ## 2026-10-09
 
 - First-publication instructions and active README, CI, cloud, release and dependency workflow summaries now require Main to push the first completed task version after applicable focused checks and open a normal PR before independent review, so dots can begin review promptly. Standing task-branch/PR authorization includes in-scope repair updates; GitHub CI, final independent review, merge approval and deployment gates remain required. Verified the precise documentation diffs, targeted publication/review consistency searches and `git diff --check`; no backend tests or deployment gates were run.
