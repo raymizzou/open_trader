@@ -7,6 +7,19 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - First-publication instructions and active README, CI, cloud, release and dependency workflow summaries now require Main to push the first completed task version after applicable focused checks and open a normal PR before independent review, so dots can begin review promptly. Standing task-branch/PR authorization includes in-scope repair updates; GitHub CI, final independent review, merge approval and deployment gates remain required. Verified the precise documentation diffs, targeted publication/review consistency searches and `git diff --check`; no backend tests or deployment gates were run.
 - Project review-publication instructions now carry the standing 2026-10-09 same-PR reviewer result-comment authorization across every checkout, including Air and Mini, removing redundant separate-confirmation prompts while preserving local-only, pre-publication, and reviewer read-only boundaries. Verified documentation portability, semantics, reviewer task/tab/pane ownership and placement, Markdown anchors/fences, changed paths, and `git diff --check`; no tests, deployment gates, or external publication.
+- #311 LP Auto 对完整账户事实中的零成交 BUY 使用精确回执恢复轮换资格，保留原提交审计，
+  独立未决 BUY/SELL、在途发送与身份冲突继续阻止对应轮换。新鲜盘口确认挂单偏离配置档位时
+  先撤原订单，真实终态核清后按当前收益率和预算全局补位，同市场可重新入选；撤单 ACK 不释放占用，
+  部分成交保留库存成本。已确认的档位偏离不因替代报价超出余额、配置档位暂缺或奖励时间过期
+  而保留旧单；撤单只依赖原订单、账户及盘口的有效安全事实，不推定可补入的新报价或未知收益。
+  不再用替代报价与旧单价不同推定离档，保留手动/增仓订单及发送审计的真实归属。
+  未满池的入场不足原因与旧单轮换阻断分别记录。满池选优按收益率逐项跳过不可负担候选，
+  最多保留五个 BUY 名额；两轮保护补位验证保留逐次资金读取守卫，另核算有界排序读取。
+  复用有界诊断队列记录首个阻断判断及当时账户/会话输入，包括撤单登记前的最终守卫；
+  身份脱敏，日志故障不改变交易决策。
+  隔离 SQLite 与离线交易边界的定向验证随证据交付；两项旧预算断言按批准的可负担选择契约更新，
+  保留手动订单、精确撤单 ID、ACK 占资与不得提前新增订单的保护。独立评审及远端 CI 待 Main 完成；
+  未发布、部署或执行实际交易。
 
 - #309 LP 候选、推荐排序及 Dashboard 的策略预估跟随当前买一/买二配置，
   探索与维护统一使用真实档位和最小计奖数量；估值保存档位来源，配置切换或重启后

@@ -411,7 +411,7 @@ def test_cancel_timeout_survives_restart_and_reselects_latest_leader_after_termi
     assert [o['token_id'] for o in exchange.orders if o['status'] == 'LIVE'] == ['m02']
 
 
-def test_unaffordable_top_set_does_not_cancel_or_replace_with_lower_rank(tmp_path, monkeypatch):
+def test_unaffordable_best_candidate_keeps_affordable_resting_buy(tmp_path, monkeypatch):
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=2, target=1, budget='8')
     direction = exchange.direction
     def larger(token):
@@ -423,10 +423,18 @@ def test_unaffordable_top_set_does_not_cancel_or_replace_with_lower_rank(tmp_pat
     exchange.direction = larger
     exchange.rewards['m01'] = Decimal('100')
     refresh(lp, exchange, 2)
+    resting_buy = exchange.orders[0].copy()
     state = engine.lp_auto_run_once()
-    assert state['last_round']['reason'] == 'top_yield_funds_insufficient'
+    assert state['last_round']['reason'] == 'target_filled'
+    assert [row['condition_id'] for row in state['last_round']['targets']] == ['m00']
+    assert state['last_round']['blocked'] == [
+        {'condition_id': 'm01', 'token_id': 'm01', 'reason': 'rotation_budget_insufficient'}]
     assert exchange.cancels == []
     assert len(exchange.posts) == 1
+    assert exchange.orders == [resting_buy]
+    assert state['slots']['occupied'] == 1
+    assert Decimal(state['funds']['buy_reserved_usd']) == 8
+    assert Decimal(state['funds']['available_usd']) == 0
 
 
 @pytest.mark.parametrize('change', ['observation', 'fill', 'stop', 'protection'])
@@ -574,7 +582,7 @@ def test_cancel_recovery_uses_known_owned_receipts_and_preserves_fills(tmp_path,
         assert len(exchange.posts) == 1
 
 
-@pytest.mark.parametrize('balance,expected_cancels', [('20', []), ('24', ['o2'])])
+@pytest.mark.parametrize('balance,expected_cancels', [('20', ['o1', 'o2']), ('24', ['o2'])])
 def test_rotation_budget_counts_manual_and_retained_buys_once(tmp_path, monkeypatch, balance, expected_cancels):
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=3, target=2)
     manual = dict(order_id='manual-buy', token_id='manual', condition_id='manual',
@@ -589,8 +597,14 @@ def test_rotation_budget_counts_manual_and_retained_buys_once(tmp_path, monkeypa
     assert exchange.orders[-1] == manual
     assert len(exchange.posts) == 2
     assert Decimal(state['funds']['buy_reserved_usd']) == 16
-    if not expected_cancels:
-        assert state['last_round']['reason'] == 'top_yield_funds_insufficient'
+    expected_targets = ['m02'] if balance == '20' else ['m02', 'm00']
+    assert [row['condition_id'] for row in state['last_round']['targets']] == expected_targets
+    assert len(state['last_round']['targets']) == len(expected_targets)
+    assert state['last_round']['reason'] == 'rotation_awaiting_reconciliation'
+    if balance == '20':
+        assert state['last_round']['blocked'] == [
+            {'condition_id': 'm00', 'token_id': 'm00', 'reason': 'rotation_budget_insufficient'},
+            {'condition_id': 'm01', 'token_id': 'm01', 'reason': 'rotation_budget_insufficient'}]
 
 
 def test_full_candidate_count_and_preview_are_not_truncated_to_target_count(tmp_path, monkeypatch):
