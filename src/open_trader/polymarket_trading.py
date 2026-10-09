@@ -3181,7 +3181,8 @@ class PolymarketTradingClient:
         condition_ids: Sequence[str],
         *,
         stop_event: threading.Event | None = None,
-    ) -> dict[str, dict[str, object]]:
+        include_diagnostics: bool = False,
+    ) -> dict[str, object]:
         """Read metadata directly, without serving a stale cached payload."""
 
         requested = self._normalise_condition_ids(condition_ids)
@@ -3193,11 +3194,12 @@ class PolymarketTradingClient:
         )
         markets = cast(dict[str, dict[str, object]], result["markets"])
         failed_ids = cast(dict[str, object], result["failed_ids"])
-        return {
+        filtered = {
             condition_id: dict(value)
             for condition_id, value in markets.items()
             if condition_id not in failed_ids
         }
+        return {**result, "markets": filtered} if include_diagnostics else filtered
 
     @staticmethod
     def _normalise_condition_ids(condition_ids: Sequence[str]) -> tuple[str, ...]:
@@ -4123,10 +4125,10 @@ class PolymarketTradingClient:
 
         def read_rewards(
             request: tuple[str, bool],
-        ) -> tuple[str, bool, tuple[object, ...], str | None]:
+        ) -> tuple[str, bool, tuple[object, ...], str | None, str | None]:
             condition_id, sponsored = request
             if stop_event is not None and stop_event.is_set():
-                return condition_id, sponsored, (), "reward_read_cancelled"
+                return condition_id, sponsored, (), "reward_read_cancelled", "cancelled"
             public = self._public_client_factory()
             try:
                 reader = getattr(public, "list_market_rewards", None)
@@ -4134,23 +4136,23 @@ class PolymarketTradingClient:
                     raise ValueError("selected_reward_reader_unavailable")
                 return condition_id, sponsored, _collect(
                     reader(condition_id=condition_id, sponsored=sponsored), stop_event=stop_event
-                ), None
+                ), None, None
             except _RewardReadCancelled:
-                return condition_id, sponsored, (), "reward_read_cancelled"
-            except Exception:
-                return condition_id, sponsored, (), "reward_read_failed"
+                return condition_id, sponsored, (), "reward_read_cancelled", "cancelled"
+            except Exception as exc:
+                return condition_id, sponsored, (), "reward_read_failed", type(exc).__name__
             finally:
                 close_public(public)
 
-        results: dict[tuple[str, bool], tuple[tuple[object, ...], str | None]] = {}
+        results: dict[tuple[str, bool], tuple[tuple[object, ...], str | None, str | None]] = {}
         with ThreadPoolExecutor(
             max_workers=min(LP_REWARD_SELECTED_MAX_CONCURRENCY, len(requests)),
             thread_name_prefix="polymarket-selected-rewards",
         ) as executor:
-            for condition_id, sponsored, rows, error in executor.map(
+            for condition_id, sponsored, rows, error, error_type in executor.map(
                 read_rewards, requests
             ):
-                results[(condition_id, sponsored)] = (rows, error)
+                results[(condition_id, sponsored)] = (rows, error, error_type)
 
         markets: list[dict[str, object]] = []
         known_count = 0
@@ -4182,9 +4184,11 @@ class PolymarketTradingClient:
             combined_total: Decimal | None = Decimal("0")
 
             for sponsored in (False, True):
-                rows, read_error = results[(condition_id, sponsored)]
+                rows, read_error, error_type = results[(condition_id, sponsored)]
                 if read_error is not None:
                     reason_codes.append(read_error)
+                    if error_type is not None:
+                        market.setdefault("error_type", error_type)
                     continue
                 for reward in rows:
                     row = _model_dict(reward)
