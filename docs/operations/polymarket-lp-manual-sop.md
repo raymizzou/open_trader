@@ -60,6 +60,10 @@
 
 ### 2.2 LP Auto CLI
 
+macOS 的稳定 `lpauto` 入口、显式安装、当前部署版本核对与修复/卸载见
+[稳定 LP Auto 命令](lp-auto-cli.md)。每次调用验证当前受管 Prediction 服务的源码和解释器；
+安装与只读检查不授权启用 Auto、改预算或下单。
+
 终端通过运行中的 Prediction 服务读取和操作同一份 Auto 状态，与 Dashboard 一致。
 先保存配置，再明确开启；保存配置本身不会启用 Auto 或提交订单。
 
