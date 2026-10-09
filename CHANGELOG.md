@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-09
 
+- Project review-publication instructions now carry the standing 2026-10-09 same-PR reviewer result-comment authorization across every checkout, including Air and Mini, removing redundant separate-confirmation prompts while preserving local-only, pre-publication, and reviewer read-only boundaries. Verified documentation portability, semantics, reviewer task/tab/pane ownership and placement, Markdown anchors/fences, changed paths, and `git diff --check`; no tests, deployment gates, or external publication.
 - #311 LP Auto 对完整账户事实中的零成交 BUY 使用精确回执恢复轮换资格，保留原提交审计，
   独立未决 BUY/SELL、在途发送与身份冲突继续阻止对应轮换。新鲜盘口确认挂单偏离配置档位时
   先撤原订单，真实终态核清后按当前收益率和预算全局补位，同市场可重新入选；撤单 ACK 不释放占用，
