@@ -1,5 +1,10 @@
 # Prediction on CVM, local browser over SSH
 
+For a fresh Ubuntu 24.04 Lighthouse Tokyo/Linux host, use the Chinese
+[Tokyo deployment SOP](prediction-tokyo-deployment-sop.md). It records initial
+provisioning, bounded operator transport prerequisites and the separate
+credentialless, authenticated Shadow and trading acceptance boundaries.
+
 This workflow deploys only Prediction. It does not install OpenD, Legacy,
 Account, Nginx, Docker or a new OS. Existing CRS, Nginx, V2Ray and x-ui remain
 outside the operation. Task-branch push and PR creation/updates have the

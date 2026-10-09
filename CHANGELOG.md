@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-09
 
+- 新增 Prediction 东京新 Linux 主机中文部署 SOP，记录 Ubuntu 初始准备、锁定环境、
+  权限/packaging/临时传输阻断及正式两主机门禁；区分无凭据 Shadow、认证账户读取、
+  待验收 live-feed/容量与未执行交易，保留地域阻断和 1 USDC 诊断方案边界。
+  本文档变更核对源码命令、Markdown 链接、shell 语法及 `git diff --check`，
+  文档检查未运行后端测试、部署门禁或交易；Main 另行授权的云端操作结果单独记载。
+
 - First-publication instructions and active README, CI, cloud, release and dependency workflow summaries now require Main to push the first completed task version after applicable focused checks and open a normal PR before independent review, so dots can begin review promptly. Standing task-branch/PR authorization includes in-scope repair updates; GitHub CI, final independent review, merge approval and deployment gates remain required. Verified the precise documentation diffs, targeted publication/review consistency searches and `git diff --check`; no backend tests or deployment gates were run.
 - Project review-publication instructions now carry the standing 2026-10-09 same-PR reviewer result-comment authorization across every checkout, including Air and Mini, removing redundant separate-confirmation prompts while preserving local-only, pre-publication, and reviewer read-only boundaries. Verified documentation portability, semantics, reviewer task/tab/pane ownership and placement, Markdown anchors/fences, changed paths, and `git diff --check`; no tests, deployment gates, or external publication.
 - 修正 GLM 评审前置检查：按实际启动环境的 Codex 版本与 `CODEX_HOME` 核查独立 profile，
