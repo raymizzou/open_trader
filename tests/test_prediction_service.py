@@ -6148,7 +6148,9 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
         "catalog_fail": False,
         "omit_no_book": False,
     }
-    clock_state = {"now": datetime.now(UTC)}
+    # Keep success fixtures away from the fixed 08:00 Beijing cutoff.
+    # test_lp_candidate_review_time_is_next_beijing_eight covers that boundary.
+    clock_state = {"now": datetime(2026, 9, 15, 6, 0, tzinfo=UTC)}
 
     # Age the prepared catalog and the first account read by business phase,
     # independent of how many timestamps diagnostics collect.
@@ -6484,7 +6486,7 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
         assert dashboard["candidate_stale"] is False
         preview_status, preview = candidate_preview(base)
         assert preview_status == 200
-        assert preview["state"] == "previewed"
+        assert preview["state"] == "previewed", preview
         assert preview["request"]["price"] == "0.51"
         assert preview["request"]["quantity"] == "20"
         public_state["bids"] = [

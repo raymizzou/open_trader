@@ -133,7 +133,7 @@ def test_status_reports_service_state_without_mutation(service, capsys):
                     'target_buy_count: 5', 'buy_price_level: 2', 'active: 2', 'pending: 1',
                     'canceling: 1', 'occupied: 4', 'inventory_cost_usd: 20', 'buy_reserved_usd: 30',
                     'available_usd: 50', 'spendable_usd: UNKNOWN', 'financial_facts_unknown',
-                    'last_check_at: 2026-10-08T01:02:03+00:00', 'last_check_error: UNKNOWN'):
+                    'last_check_at: 2026-10-08T01:02:03+00:00', 'last_check_error: NONE'):
         assert literal in output
     assert 'LIVE' not in output
     assert invoke(service, 'status', '--json') == 0
@@ -148,6 +148,132 @@ def test_status_reports_service_state_without_mutation(service, capsys):
     output = capsys.readouterr().out
     assert 'budget_usd: UNKNOWN' in output and 'active: UNKNOWN' in output
     assert 'desired_running: OFF' in output and 'runtime_state: PAUSED' in output
+
+
+@pytest.mark.parametrize('fields,expected', [
+    ({'reason': None, 'last_check_error': None},
+     ('reason: NONE', 'last_check_error: NONE')),
+    ({}, ('reason: UNKNOWN', 'last_check_error: UNKNOWN')),
+    ({'reason': 'account_read_failed', 'last_check_error': 'transport_error'},
+     ('reason: account_read_failed', 'last_check_error: transport_error')),
+], ids=['null', 'absent', 'concrete'])
+def test_human_status_distinguishes_absent_null_and_error(service, capsys, fields, expected):
+    service.state.pop('reason', None)
+    service.state.pop('last_check_error', None)
+    service.state.update(fields)
+    before, orders = deepcopy(service.state), deepcopy(service.orders)
+    assert invoke(service, 'status') == 0
+    human = capsys.readouterr()
+    assert human.err == ''
+    assert service.state == before and service.orders == orders
+    assert invoke(service, 'status', '--json') == 0
+    machine = capsys.readouterr()
+    assert machine.err == ''
+    assert json.loads(machine.out) == {
+        'result': 'STATUS', 'state': before, 'reason': None, 'next_action': None,
+    }
+    assert [(method, path, body) for method, path, body, _ in service.requests] == [
+        ('GET', ROOT + 'state', None), ('GET', ROOT + 'state', None),
+    ]
+    assert service.state == before and service.orders == orders
+    for literal in expected:
+        assert literal in human.out.splitlines()
+
+
+@pytest.mark.parametrize('slots,configuration,expected', [
+    ({'active': 5, 'pending': 0, 'canceling': 0, 'occupied': 5}, {'target_buy_count': 5},
+     ('buy_orders: 5/5', 'active: 5', 'pending: 0', 'canceling: 0', 'occupied: 5')),
+    ({'active': 3, 'pending': 2, 'canceling': 0, 'occupied': 5}, {'target_buy_count': 5},
+     ('buy_orders: 3/5', 'active: 3', 'pending: 2', 'canceling: 0', 'occupied: 5')),
+    ({'pending': 2, 'canceling': 0, 'occupied': 5}, {'target_buy_count': 5},
+     ('buy_orders: UNKNOWN/5', 'active: UNKNOWN', 'pending: 2', 'canceling: 0', 'occupied: 5')),
+    ({'active': 5, 'pending': 0, 'canceling': 0, 'occupied': 5}, {},
+     ('buy_orders: 5/UNKNOWN', 'active: 5', 'pending: 0', 'canceling: 0', 'occupied: 5')),
+    ({'active': None, 'pending': 2, 'canceling': 0, 'occupied': 5}, {'target_buy_count': 5},
+     ('buy_orders: UNKNOWN/5', 'active: UNKNOWN', 'pending: 2', 'canceling: 0', 'occupied: 5')),
+    ({'active': 5, 'pending': 0, 'canceling': 0, 'occupied': 5}, {'target_buy_count': None},
+     ('buy_orders: 5/UNKNOWN', 'target_buy_count: UNKNOWN', 'active: 5', 'pending: 0',
+      'canceling: 0', 'occupied: 5')),
+], ids=['full', 'pending', 'missing-active', 'missing-target', 'null-active', 'null-target'])
+def test_human_status_reports_active_buy_progress(service, capsys, slots, configuration, expected):
+    service.state['slots'] = slots
+    service.state.pop('target_buy_count', None)
+    service.state.update(configuration)
+    before, orders = deepcopy(service.state), deepcopy(service.orders)
+    assert invoke(service, 'status') == 0
+    human = capsys.readouterr()
+    assert human.err == ''
+    assert service.state == before and service.orders == orders
+    assert invoke(service, 'status', '--json') == 0
+    machine = capsys.readouterr()
+    assert machine.err == ''
+    assert json.loads(machine.out) == {
+        'result': 'STATUS', 'state': before, 'reason': None, 'next_action': None,
+    }
+    assert [(method, path, body) for method, path, body, _ in service.requests] == [
+        ('GET', ROOT + 'state', None), ('GET', ROOT + 'state', None),
+    ]
+    assert service.state == before and service.orders == orders
+    for literal in expected:
+        assert literal in human.out.splitlines()
+
+
+@pytest.mark.parametrize('context,expected', [
+    ({'check_in_progress': True,
+      'last_round': {'checked_at': '2026-10-09T01:02:03+00:00',
+                     'reason': 'rotation_awaiting_reconciliation'}},
+     ('check_in_progress: true', 'last_round_checked_at: 2026-10-09T01:02:03+00:00',
+      'last_round_reason: rotation_awaiting_reconciliation')),
+    ({'check_in_progress': False,
+      'last_round': {'checked_at': '2026-10-09T01:02:03+00:00', 'reason': None}},
+     ('check_in_progress: false', 'last_round_checked_at: 2026-10-09T01:02:03+00:00',
+      'last_round_reason: NONE')),
+    ({}, ('check_in_progress: UNKNOWN', 'last_round_checked_at: UNKNOWN',
+          'last_round_reason: UNKNOWN')),
+    ({'check_in_progress': 0,
+      'last_round': {'checked_at': '2026-10-09T01:02:03+00:00', 'reason': None}},
+     ('check_in_progress: UNKNOWN', 'last_round_checked_at: 2026-10-09T01:02:03+00:00',
+      'last_round_reason: NONE')),
+    ({'check_in_progress': 1,
+      'last_round': {'checked_at': '2026-10-09T01:02:03+00:00', 'reason': None}},
+     ('check_in_progress: UNKNOWN', 'last_round_checked_at: 2026-10-09T01:02:03+00:00',
+      'last_round_reason: NONE')),
+    ({'check_in_progress': 'false',
+      'last_round': {'checked_at': '2026-10-09T01:02:03+00:00', 'reason': None}},
+     ('check_in_progress: UNKNOWN', 'last_round_checked_at: 2026-10-09T01:02:03+00:00',
+      'last_round_reason: NONE')),
+    ({'check_in_progress': None,
+      'last_round': {'checked_at': '2026-10-09T01:02:03+00:00', 'reason': None}},
+     ('check_in_progress: UNKNOWN', 'last_round_checked_at: 2026-10-09T01:02:03+00:00',
+      'last_round_reason: NONE')),
+    ({'check_in_progress': False, 'last_round': None},
+     ('check_in_progress: false', 'last_round_checked_at: UNKNOWN', 'last_round_reason: UNKNOWN')),
+    ({'check_in_progress': False, 'last_round': ['unexpected']},
+     ('check_in_progress: false', 'last_round_checked_at: UNKNOWN', 'last_round_reason: UNKNOWN')),
+], ids=['in-progress', 'completed-without-reason', 'legacy', 'check-zero', 'check-one',
+        'check-string-false', 'check-null', 'round-null', 'round-list'])
+def test_human_status_reports_round_context_without_overriding_runtime(service, capsys, context, expected):
+    service.state.update(desired_running=True, pause_confirmed=False, runtime_state='running')
+    service.state.update(context)
+    before, orders = deepcopy(service.state), deepcopy(service.orders)
+    assert invoke(service, 'status') == 0
+    human = capsys.readouterr()
+    assert human.err == ''
+    assert service.state == before and service.orders == orders
+    assert invoke(service, 'status', '--json') == 0
+    machine = capsys.readouterr()
+    assert machine.err == ''
+    assert json.loads(machine.out) == {
+        'result': 'STATUS', 'state': before, 'reason': None, 'next_action': None,
+    }
+    assert [(method, path, body) for method, path, body, _ in service.requests] == [
+        ('GET', ROOT + 'state', None), ('GET', ROOT + 'state', None),
+    ]
+    assert service.state == before and service.orders == orders
+    assert 'runtime_state: RUNNING' in human.out.splitlines()
+    assert 'runtime_state: BLOCKED' not in human.out.splitlines()
+    for literal in expected:
+        assert literal in human.out.splitlines()
 
 
 def test_config_saves_parameters_without_enabling(service, capsys):
