@@ -53,7 +53,7 @@ def read_resources(proc=Path('/proc'), groups=Path('/sys/fs/cgroup')):
         quota = int((cpu/'cpu.cfs_quota_us').read_text())
         period = int((cpu/'cpu.cfs_period_us').read_text())
         tasks = int((groups/'pids'/paths['pids']/'pids.max').read_text())
-    if not (0 < limit <= 1_000_000_000 and 0 < quota <= period and 0 < tasks <= 96
+    if not (0 < limit and 0 < quota <= period and 0 < tasks <= 96
             and current >= 0 and failures >= 0):
         raise ValueError('effective kernel resource limits are missing or excessive')
     return {**host_memory(proc), 'current': current, 'limit': limit, 'failures': failures}
@@ -102,7 +102,7 @@ def shadow_resource_guard(mode):
         return
     maximum = int(raw)
     if (mode != 'shadow' or os.environ.get('OPEN_TRADER_NLEG_PAUSED') != '1'
-            or not SERVICE_RESERVE < maximum <= 1_000_000_000):
+            or not SERVICE_RESERVE < maximum):
         raise ValueError('resource guard requires explicitly capped paused Shadow')
     sample = read_resources()
     reason = stop_reason(sample, maximum)

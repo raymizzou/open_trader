@@ -3,7 +3,27 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-10
+
+- Paused cloud Shadow now accepts configured finite memory budgets above 1 GB,
+  including 2 GiB, while retaining the 768 MiB default, host and service reserves,
+  swap/CPU/task checks, bounded shutdown and `Restart=no`. Integrates the reusable
+  Tokyo deployment SOP with the current configurable budget and preserves its
+  historical guard-stop evidence and unresolved acceptance limits. Raising the budget
+  does not establish #226 capacity acceptance. Ordered renderer, cgroup v1/v2
+  and guard RED/GREEN checks passed; the focused union finished with 24 passed
+  and one existing Linux-only skip on macOS. No cloud restart or deployment;
+  2 GiB long-run resource evidence remains unavailable.
+
 ## 2026-10-09
+
+- 新增 Prediction 东京新 Linux 主机中文部署 SOP，记录 Ubuntu 初始准备、锁定环境、
+  权限/packaging/临时传输阻断及正式两主机门禁；区分无凭据 Shadow、认证账户读取、
+  待验收 live-feed/容量与未执行交易，保留地域阻断和 1 USDC 诊断方案边界。
+  补记认证 Shadow 的服务内存 headroom guard 停止；区别于主机 RAM 耗尽、kernel OOM
+  或回滚，metadata transport 错误与服务预算触发仍分别未解决，未重启或提交订单。
+  本文档变更核对源码命令、Markdown 链接、shell 语法及 `git diff --check`，
+  文档检查未运行后端测试、部署门禁或交易；Main 另行授权的云端操作结果单独记载。
 
 - First-publication instructions and active README, CI, cloud, release and dependency workflow summaries now require Main to push the first completed task version after applicable focused checks and open a normal PR before independent review, so dots can begin review promptly. Standing task-branch/PR authorization includes in-scope repair updates; GitHub CI, final independent review, merge approval and deployment gates remain required. Verified the precise documentation diffs, targeted publication/review consistency searches and `git diff --check`; no backend tests or deployment gates were run.
 - Project review-publication instructions now carry the standing 2026-10-09 same-PR reviewer result-comment authorization across every checkout, including Air and Mini, removing redundant separate-confirmation prompts while preserving local-only, pre-publication, and reviewer read-only boundaries. Verified documentation portability, semantics, reviewer task/tab/pane ownership and placement, Markdown anchors/fences, changed paths, and `git diff --check`; no tests, deployment gates, or external publication.

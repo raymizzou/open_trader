@@ -132,8 +132,8 @@ def trusted_layout(c: CloudConfig) -> None:
 def render_unit(c: CloudConfig) -> str:
     if type(c.candidate_exclusions) is not bool:
         raise ValueError("candidate_exclusions must be a boolean")
-    if type(c.memory_max_bytes) is not int or not 64 * 1024**2 < c.memory_max_bytes <= 1_000_000_000:
-        raise ValueError('cloud memory budget must exceed 64MiB and be at most 1GB')
+    if type(c.memory_max_bytes) is not int or not 64 * 1024**2 < c.memory_max_bytes:
+        raise ValueError('cloud memory budget must be an integer exceeding 64MiB')
     for path in (c.release_root, c.runtime_root, c.python):
         if not path.is_absolute() or not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(path)) or '..' in path.parts:
             raise ValueError('absolute paths without whitespace or systemd specifiers required')
