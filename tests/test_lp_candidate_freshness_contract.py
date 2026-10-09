@@ -358,7 +358,7 @@ def test_stale_best_at_selected_level_outside_display_head_gets_bounded_refresh(
         runtime, count=0, target=1, public=public
     )
     execution.lp_auto_set_desired_running(False)
-    execution.lp_auto_configure({"budget_usd": "100", "target_buy_count": 1, "buy_price_level": 2})
+    execution.lp_auto_configure({"budget_usd": "100", "target_buy_count": 1, "buy_price_level": 1})
 
     def public_response(request, **kwargs):
         if request.data:
@@ -384,6 +384,8 @@ def test_stale_best_at_selected_level_outside_display_head_gets_bounded_refresh(
     # Independent hand-worked buy1 values supplied by Main, rounded only here.
     assert Decimal(displayed[0]["estimated_yield_raw"]).quantize(Decimal(".000001")) == Decimal(".096216")
     assert Decimal(lp._candidate_pool[condition_b]["estimated_yield_raw"]).quantize(Decimal(".000001")) == Decimal(".065615")
+
+    execution.lp_auto_configure({"budget_usd": "100", "target_buy_count": 1, "buy_price_level": 2})
 
     stale_at = lp._now() - timedelta(seconds=65)
     with lp._candidate_state_lock:

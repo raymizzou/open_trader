@@ -7224,7 +7224,7 @@ function lpOrderModalHtml(data = {}) {
     + `<div class="pm-check"><span>数量（份）</span><span><input class="lp-order-input" id="lp-order-quantity" type="number" step="1" min="1" value="${escapeHtml(String(data.quantity ?? ""))}"${locked ? " readonly" : ""}> <span class="sub">${hint}</span></span></div>`
     + `<div class="pm-check"><span>预计占用</span><strong id="lp-order-cost">${lpOrderCostText(data.price, data.quantity)}</strong></div>`
     + `</div>`
-    + `<div class="lp-submit-note" role="note"><strong>提交时校验（一次新鲜事实）</strong>账户 · 余额/授权 · 标的身份 · 价位/数量 · 盘口新鲜度 · 奖励资格 · 退出深度 · 复核时间；默认试挂单确认价与提交时买一不一致将直接拒绝。</div>`
+    + `<div class="lp-submit-note" role="note"><strong>提交时校验（一次新鲜事实）</strong>账户 · 余额/授权 · 标的身份 · 价位/数量 · 盘口新鲜度 · 奖励资格 · 退出深度 · 复核时间；默认试挂单确认价与提交时所选买档不一致将直接拒绝。</div>`
     + `<div class="pm-risk-note" role="note"><strong>提交即登记 #152 位置保护</strong><p>经系统入口提交的单自动带基线：初始 A = 前方份额 ÷ 同价位总量，A ≤ 50% 时自动撤掉该价位全部自己 BUY。网页手动单显示与行为不变。</p></div>`;
   const footer = `<footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button>`
     + `<button class="pm-button primary" type="button" data-modal-action="lp-order-confirm">确认提交 · 登记受保护</button></footer>`;
@@ -7279,6 +7279,7 @@ function lpOrderIntent(row) {
     mode: "trial",
     trialPrice: price,
     trialQuantity: quantity,
+    trialBidLevel: row?.estimate_buy_price_level,
     price,
     quantity,
     // Issue 162: 数量一律原样字符串——formatDisplayNumber 的千位逗号/两位舍入
@@ -8148,8 +8149,14 @@ async function handlePredictionModalClick(event) {
       if (rowTarget !== null && rowTarget !== undefined && String(rowTarget).trim() !== "") {
         body.estimated_target_quantity = String(rowTarget);
       }
-      // 定案 1：只有默认试挂单带 candidate_policy（5%/custom 不锚定买一）。
-      if (data.mode === "trial") body.candidate_policy = "best_bid_minimum";
+      // Only the trial anchors to its captured quote level; legacy rows
+      // omit the marker and retain the server's default level one.
+      if (data.mode === "trial") {
+        body.candidate_policy = "best_bid_minimum";
+        if (data.trialBidLevel !== null && data.trialBidLevel !== undefined) {
+          body.candidate_bid_level = data.trialBidLevel;
+        }
+      }
       submittingMain = `正在提交 · 买 ${body.outcome} @ ${priceText} × ${quantityText} 份`;
     }
     closePredictionModal();
