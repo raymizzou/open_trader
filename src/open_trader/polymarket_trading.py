@@ -5207,19 +5207,22 @@ class PolymarketTradingClient:
         ``resume_cursor`` so the next round resumes instead of restarting;
         a completed round clears it.  Explicit zero competitiveness is kept
         as zero; the projection owns the danger-signal exclusion.
+        The returned map is newly owned; previous is only read, never changed.
         """
 
         checked_at = datetime.now(UTC)
         ended_condition_ids: list[str] = []
-        previous_map: dict[str, tuple[Decimal, datetime]] = {}
-        if isinstance(previous, Mapping):
+
+        def previous_entries():
+            if not isinstance(previous, Mapping):
+                return
             for key, value in previous.items():
                 if not isinstance(key, str) or not key.strip():
                     continue
                 if isinstance(value, tuple) and len(value) == 2:
                     stamp = value[1]
                     if isinstance(value[0], Decimal) and isinstance(stamp, datetime):
-                        previous_map[key] = (value[0], stamp)
+                        yield key, value
 
         # Issue #177: the bookmark for the next round — the next_cursor of
         # the last page that was read successfully, or the round's own
@@ -5228,22 +5231,26 @@ class PolymarketTradingClient:
         resume_cursor: str | None = cursor
         resumed = cursor is not None
 
-        def incomplete(
-            state: str, merged: dict[str, tuple[Decimal, datetime]], updated: set[str]
-        ) -> dict[str, object]:
+        def finish(state: str, *, complete: bool = False) -> dict[str, object]:
+            not_updated = []
+            # Only interrupted/resumed walks retain untouched previous facts.
+            for key, value in previous_entries():
+                if key not in merged:
+                    not_updated.append(key)
+                    if not complete or resumed:
+                        merged[key] = value
             return {
                 "state": state,
-                "complete": False,
+                "complete": complete,
                 "checked_at": checked_at,
                 "round_checked_at": checked_at,
                 "competitiveness": merged,
-                "not_updated": sorted(key for key in previous_map if key not in updated),
+                "not_updated": sorted(not_updated),
                 "resume_cursor": resume_cursor,
                 "ended_condition_ids": tuple(ended_condition_ids),
             }
 
         merged: dict[str, tuple[Decimal, datetime]] = {}
-        updated: set[str] = set()
         pages_ok = 0
         try:
             if stop_event is not None and stop_event.is_set():
@@ -5321,7 +5328,6 @@ class PolymarketTradingClient:
                     if value is None or value < 0:
                         continue
                     merged[condition_id] = (value, checked_at)
-                    updated.add(condition_id)
                 pages_ok += 1
                 next_cursor = payload.get("next_cursor")
                 if not isinstance(next_cursor, str) or not next_cursor or next_cursor == "LTE=":
@@ -5332,32 +5338,13 @@ class PolymarketTradingClient:
                 seen_cursors.add(next_cursor)
                 cursor = next_cursor
                 resume_cursor = next_cursor
-            if resumed:
-                # A resumed round only re-reads from its bookmark onward:
-                # targets before the bookmark keep their previous values and
-                # timestamps instead of being dropped by the fresh tail.
-                for key, value in previous_map.items():
-                    merged.setdefault(key, value)
-            return {
-                "state": "known",
-                "complete": True,
-                "checked_at": checked_at,
-                "round_checked_at": checked_at,
-                "competitiveness": merged,
-                "not_updated": sorted(key for key in previous_map if key not in updated),
-                "resume_cursor": None,
-                "ended_condition_ids": tuple(ended_condition_ids),
-            }
+            return finish("known", complete=True)
         except _RewardReadCancelled:
-            for key, value in previous_map.items():
-                merged.setdefault(key, value)
-            return incomplete("unknown", merged, updated)
+            return finish("unknown")
         except Exception:
-            for key, value in previous_map.items():
-                merged.setdefault(key, value)
             # Some pages succeeded: keep the partial round.  Nothing arrived:
             # the whole read failed and must not block the funnel.
-            return incomplete("partial" if pages_ok else "unknown", merged, updated)
+            return finish("partial" if pages_ok else "unknown")
 
     @staticmethod
     def _lp_reward_market_rows(

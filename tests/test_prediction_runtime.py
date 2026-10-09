@@ -10368,12 +10368,14 @@ def test_candidate_competition_monitor_refreshes_and_stops(
     class FakeLP:
         def __init__(self) -> None:
             self.calls: list[threading.Event | None] = []
+            self.snapshots: list[bool] = []
             self.first_call = threading.Event()
 
         def refresh_competition_cache(
-            self, *, stop_event: threading.Event | None = None
+            self, *, stop_event: threading.Event | None = None, snapshot: bool = True
         ) -> dict[str, object]:
             self.calls.append(stop_event)
+            self.snapshots.append(snapshot)
             self.first_call.set()
             return {"state": "unknown"}
 
@@ -10400,6 +10402,7 @@ def test_candidate_competition_monitor_refreshes_and_stops(
             time.sleep(0.01)
         assert len(lp.calls) >= 3
         assert all(call is runtime._reward_stop_event for call in lp.calls)
+        assert lp.snapshots and not any(lp.snapshots)
 
         runtime._start_candidate_competition_monitor()
         assert runtime._candidate_competition_thread is thread
