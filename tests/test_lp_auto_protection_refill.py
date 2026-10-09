@@ -1,7 +1,7 @@
 """Repeated protection/refill through the real adapter and isolated SQLite."""
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
-from threading import Event
+from threading import Event, local
 import time
 from types import SimpleNamespace
 
@@ -42,8 +42,71 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
     store, adapter, account, lp, execution, _ = prepare(runtime, public=public)
     post = account.post_order
     orders_by_id = {}
+    active_trace = None
+    read_role = local()
+    shared_reader = adapter.lp_account_snapshot_shared
+
+    def request_record(args, kwargs):
+        return dict(max_age=args[0] if args else kwargs.get('max_age_seconds'),
+                    generation_provider_matches=kwargs.get('trade_generation_provider') == store.lp_trade_generation,
+                    posts_before=len(account.posts), sdk_before=account.position_reads)
+
+    def observed_shared_reader(*args, **kwargs):
+        record = request_record(args, kwargs)
+        if active_trace is not None:
+            destination = 'publishers' if getattr(read_role, 'publisher', False) else 'requests'
+            active_trace[destination].append(record)
+        try:
+            result = shared_reader(*args, **kwargs)
+            record['successful'] = True
+            return result
+        finally:
+            record['sdk_after'] = account.position_reads
+
+    adapter.lp_account_snapshot_shared = observed_shared_reader
+
+    def start_trace():
+        return dict(requests=[], publishers=[], posts=[], posts_before=len(account.posts),
+                    sdk_before=account.position_reads)
+
+    def assert_fence_accounting(trace, *, invalidated=False):
+        requests = trace['requests']
+        posts_before = trace['posts_before']
+        assert len(requests) == 6, 'Initial, two mandatory fresh requests per BUY, final refresh'
+        assert all(r['max_age'] == 0 and r['generation_provider_matches'] for r in requests)
+        assert [r['posts_before'] for r in requests] == [
+            posts_before, posts_before, posts_before, posts_before + 1, posts_before + 1, posts_before + 2]
+        assert [p['request_count'] for p in trace['posts']] == [3, 5]
+        assert [p['posts_before'] for p in trace['posts']] == [posts_before, posts_before + 1]
+        assert [p['sdk_reads'] for p in trace['posts']] == [requests[2]['sdk_after'], requests[4]['sdk_after']]
+        successful = requests[1:] if invalidated else requests
+        assert all(r.get('successful') is True and r['sdk_after'] - r['sdk_before'] == 1 for r in successful), (
+            'Every successful mandatory age-zero request reads current SDK facts once')
+        if invalidated:
+            assert requests[0].get('invalidated') is True and not requests[0].get('successful')
+            assert len(trace['publishers']) == 1
+            publisher = trace['publishers'][0]
+            assert publisher['sdk_after'] - publisher['sdk_before'] == 1
+            assert requests[0]['sdk_after'] - requests[0]['sdk_before'] == 1, (
+                'Only the independent publisher reads while the initial request waits')
+        else:
+            assert not trace['publishers']
+        # Extra observations may inspect three existing orders before admission.
+        # They cannot replace either mandatory fence, occur between BUY fences,
+        # or substitute for the final refresh.
+        extra = requests[1]['sdk_before'] - requests[0]['sdk_after']
+        assert 0 <= extra <= 3
+        for previous, current in zip(requests[1:], requests[2:]):
+            assert current['sdk_before'] == previous['sdk_after']
+        baseline = requests[0]['sdk_after'] if invalidated else trace['sdk_before']
+        mandatory = 5 if invalidated else 6
+        assert account.position_reads - baseline == mandatory + extra
+        assert mandatory <= account.position_reads - baseline <= mandatory + 3
 
     def venue_post(signed):
+        if active_trace is not None:
+            active_trace['posts'].append(dict(posts_before=len(account.posts), sdk_reads=account.position_reads,
+                                              request_count=len(active_trace['requests'])))
         receipt = post(signed)
         order = account.orders[-1].model_copy(update={'id': f'cycle-{len(account.posts)}'})
         account.orders = (*account.orders[:-1], order)
@@ -131,11 +194,16 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
                 entered, release = Event(), Event()
                 calls = []
                 before_publication = account.position_reads
+                trace = start_trace()
+                active_trace = trace
                 def interrupted(*args, **kwargs):
                     calls.append(1)
                     if len(calls) == 1:
+                        record = request_record(args, kwargs)
+                        trace['requests'].append(record)
                         entered.set()
                         assert release.wait(5), 'Independent publication watchdog'
+                        record.update(invalidated=True, sdk_after=account.position_reads)
                         raise LpObservationWait('account_round_invalid')
                     return reader(*args, **kwargs)
                 with monkeypatch.context() as race:
@@ -144,10 +212,15 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
                         pending = workers.submit(execution.lp_auto_run_once, round_id=f'refill-{cycle}')
                         try:
                             assert entered.wait(5)
+                            assert account.position_reads == before_publication, 'Invalidated initial wait has no SDK I/O'
                             _advance(runtime)
                             # Publish a separate complete read through the same
                             # public registration seam used by the dashboard.
-                            fresh = reader(max_age_seconds=0, trade_generation_provider=store.lp_trade_generation)
+                            read_role.publisher = True
+                            try:
+                                fresh = reader(max_age_seconds=0, trade_generation_provider=store.lp_trade_generation)
+                            finally:
+                                read_role.publisher = False
                             assert account.position_reads - before_publication == 1, 'Independent publisher reads the SDK once'
                             after_publication = account.position_reads
                             assert lp.register_account_snapshot(fresh)['state'] == 'registered'
@@ -158,7 +231,9 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
                 assert result['admission_block_reasons'] == [], result
                 assert len(account.orders) == 5, result['last_round']
                 assert len(calls) == 6, 'Invalidated initial read, two per BUY, final read'
-                assert account.position_reads - after_publication == 5, 'Two SDK reads per new BUY plus final refresh; injected initial wait has no I/O'
+                assert_fence_accounting(trace, invalidated=True)
+                assert 5 <= account.position_reads - after_publication <= 8
+                active_trace = None
                 assert result['slots']['occupied'] == 5
                 assert len(account.posts) == 7 + 2 * cycle
                 continue
@@ -189,12 +264,16 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
                     publish_qualification()
                 lp.refresh_candidate_recommendations()
             before = account.position_reads
+            trace = start_trace()
+            active_trace = trace
             result = execution.lp_auto_run_once(round_id=f'refill-{cycle}')
             assert len(account.orders) == 5, result['last_round']
             assert len(account.posts) == 7 + 2 * cycle
             assert result['slots']['occupied'] == 5
             assert result['funds']['status'] == 'known'
-            assert account.position_reads - before == 6, 'Initial, two per BUY, final account reads'
+            assert_fence_accounting(trace)
+            assert 6 <= account.position_reads - before <= 9
+            active_trace = None
     finally:
         try:
             settle_workers()

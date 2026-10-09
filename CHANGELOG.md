@@ -17,6 +17,19 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - First-publication instructions and active README, CI, cloud, release and dependency workflow summaries now require Main to push the first completed task version after applicable focused checks and open a normal PR before independent review, so dots can begin review promptly. Standing task-branch/PR authorization includes in-scope repair updates; GitHub CI, final independent review, merge approval and deployment gates remain required. Verified the precise documentation diffs, targeted publication/review consistency searches and `git diff --check`; no backend tests or deployment gates were run.
 - Project review-publication instructions now carry the standing 2026-10-09 same-PR reviewer result-comment authorization across every checkout, including Air and Mini, removing redundant separate-confirmation prompts while preserving local-only, pre-publication, and reviewer read-only boundaries. Verified documentation portability, semantics, reviewer task/tab/pane ownership and placement, Markdown anchors/fences, changed paths, and `git diff --check`; no tests, deployment gates, or external publication.
+- #311 LP Auto 对完整账户事实中的零成交 BUY 使用精确回执恢复轮换资格，保留原提交审计，
+  独立未决 BUY/SELL、在途发送与身份冲突继续阻止对应轮换。新鲜盘口确认挂单偏离配置档位时
+  先撤原订单，真实终态核清后按当前收益率和预算全局补位，同市场可重新入选；撤单 ACK 不释放占用，
+  部分成交保留库存成本。已确认的档位偏离不因替代报价超出余额、配置档位暂缺或奖励时间过期
+  而保留旧单；撤单只依赖原订单、账户及盘口的有效安全事实，不推定可补入的新报价或未知收益。
+  不再用替代报价与旧单价不同推定离档，保留手动/增仓订单及发送审计的真实归属。
+  未满池的入场不足原因与旧单轮换阻断分别记录。满池选优按收益率逐项跳过不可负担候选，
+  最多保留五个 BUY 名额；两轮保护补位验证保留逐次资金读取守卫，另核算有界排序读取。
+  复用有界诊断队列记录首个阻断判断及当时账户/会话输入，包括撤单登记前的最终守卫；
+  身份脱敏，日志故障不改变交易决策。
+  隔离 SQLite 与离线交易边界的定向验证随证据交付；两项旧预算断言按批准的可负担选择契约更新，
+  保留手动订单、精确撤单 ID、ACK 占资与不得提前新增订单的保护。独立评审及远端 CI 待 Main 完成；
+  未发布、部署或执行实际交易。
 
 - #309 LP 候选、推荐排序及 Dashboard 的策略预估跟随当前买一/买二配置，
   探索与维护统一使用真实档位和最小计奖数量；估值保存档位来源，配置切换或重启后
@@ -28,6 +41,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
   CI 修复首次加载的待刷新 Dashboard 同样返回已配置买档，页面读取不触发场所查询；
   历史回放保持原夹具和全量哈希，仅单独验证新增档位来源字段，保留排序及负向检查。
   未执行生产操作、发布或部署；独立评审及 Git 交付由 Main 负责。
+
+- #310 LP 候选按市场隔离元数据、奖励和盘口刷新失败；健康市场继续刷新，失败市场沿用
+  60/120/300 秒恢复期限。自动比较在过滤过期事实前进行有界复核，失败时用合格候选补位，
+  恢复后重新竞争；复核明确指向过期市场，避免新鲜展示前十挡住当前报价档位的更优候选。
+  多个候选同时过期时，按配置档位的缓存数学估算安排刷新优先级；仅决定读取顺序，
+  不更新旧事实时间或授权下单，仍由新鲜资格和收益比较决定执行。
+  保持原有执行时效、账户与提交保护。复用有界日志记录关联来源年龄、
+  安全错误类别和实际恢复期限；隔离来源/账户、固定时钟与日志拥塞定向验证随证据交付。
+  区分 300 秒历史展示与执行资格；历史首发来源仍未知。未部署或执行实际交易。
 
 - 修正 GLM 评审前置检查：按实际启动环境的 Codex 版本与 `CODEX_HOME` 核查独立 profile，
   不以主配置缺少 profile/provider 段判定缺失；区分配置加载、凭据/API 与实际启动证据。
