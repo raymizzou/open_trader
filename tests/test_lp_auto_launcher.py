@@ -68,6 +68,10 @@ def managed(tmp_path):
     )
 
     class Handler(BaseHTTPRequestHandler):
+        @property
+        def control(self):
+            return self.server.control
+
         def log_message(self, *args):
             pass
 
@@ -77,54 +81,55 @@ def managed(tmp_path):
             self.send_header('Content-Length', str(len(raw)))
             self.send_header('Content-Type', 'application/json')
             if cookie:
-                self.send_header('Set-Cookie', f'session={control.cookie}; Path=/')
+                self.send_header('Set-Cookie', f'session={self.control.cookie}; Path=/')
             self.end_headers()
             self.wfile.write(raw)
 
         def do_GET(self):
-            control.requests.append(('GET', self.path, None, dict(self.headers)))
+            self.control.requests.append(('GET', self.path, None, dict(self.headers)))
             if self.path == '/healthz':
-                health = deepcopy(control.health)
-                if control.health_hook:
-                    control.health_hook()
+                health = deepcopy(self.control.health)
+                if self.control.health_hook:
+                    self.control.health_hook()
                 self.respond(health)
             elif self.path.endswith('/venues'):
-                self.respond({'csrf_token': control.csrf}, cookie=True)
+                self.respond({'csrf_token': self.control.csrf}, cookie=True)
             elif self.path == ROOT + 'state':
-                if control.block:
-                    control.entered.set()
-                    assert control.release.wait(15), 'independent state barrier watchdog expired'
-                self.respond(control.state)
+                if self.control.block:
+                    self.control.entered.set()
+                    assert self.control.release.wait(15), 'independent state barrier watchdog expired'
+                self.respond(self.control.state)
             else:
                 self.send_error(404)
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-            control.requests.append(('POST', self.path, body, dict(self.headers)))
-            if (self.headers.get('Cookie') != f'session={control.cookie}'
-                    or self.headers.get('X-CSRF-Token') != control.csrf
-                    or self.headers.get('Origin') != control.url):
+            self.control.requests.append(('POST', self.path, body, dict(self.headers)))
+            if (self.headers.get('Cookie') != f'session={self.control.cookie}'
+                    or self.headers.get('X-CSRF-Token') != self.control.csrf
+                    or self.headers.get('Origin') != self.control.url):
                 self.send_error(403)
                 return
             if self.path == ROOT + 'config':
-                control.state.update({k: v for k, v in body.items() if k != 'expected_config_version'})
-                control.state['config_version'] += 1
+                self.control.state.update({k: v for k, v in body.items() if k != 'expected_config_version'})
+                self.control.state['config_version'] += 1
             elif self.path == ROOT + 'enable':
-                control.state.update(desired_running=True, pause_confirmed=False, runtime_state='blocked')
+                self.control.state.update(desired_running=True, pause_confirmed=False, runtime_state='blocked')
             elif self.path == ROOT + 'pause':
-                control.state.update(desired_running=False, pause_confirmed=True, runtime_state='paused')
+                self.control.state.update(desired_running=False, pause_confirmed=True, runtime_state='paused')
             else:
                 self.send_error(404)
                 return
-            control.entered.set()
-            if control.disconnect:
-                assert control.release.wait(15), 'independent disconnect barrier watchdog expired'
+            self.control.entered.set()
+            if self.control.disconnect:
+                assert self.control.release.wait(15), 'independent disconnect barrier watchdog expired'
                 self.connection.shutdown(socket.SHUT_RDWR)
                 self.connection.close()
                 return
-            self.respond(control.state)
+            self.respond(self.control.state)
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server.control = control
     assert server.server_port != 8769
     control.url = f'http://127.0.0.1:{server.server_port}'
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -232,7 +237,8 @@ else: print(s['owner_pid'])
                               tools=tools, tool_state=tool_state, runtime=runtime, releases=releases,
                               make_release=make_release, select=select, child_log=child_log,
                               bin=home / 'bin', payload=home / 'payload',
-                              launcher_source=launcher_source / 'scripts/lp_auto_launcher.py', launcher_sha=launcher_sha)
+                              launcher_source=launcher_source / 'scripts/lp_auto_launcher.py', launcher_sha=launcher_sha,
+                              handler=Handler)
     try:
         yield fixture
     finally:
@@ -299,6 +305,67 @@ def test_init_is_repeatable_and_never_controls_service(managed, target):
     assert before == (managed.plist.read_bytes(), managed.record.read_bytes(), managed.control.state, managed.control.orders)
     assert managed.control.state['desired_running'] is False
     assert managed.control.state['config_version'] == 7
+
+
+def test_failed_first_guard_publication_is_recoverable(managed, tmp_path):
+    managed.bin.mkdir(parents=True)
+    managed.payload.mkdir()
+    home_note, bin_note = managed.home / 'sentinel.txt', managed.bin / 'sentinel.txt'
+    home_note.write_bytes(b'unrelated home sentinel')
+    bin_note.write_bytes(b'unrelated bin sentinel')
+    runtime_config = managed.runtime / 'independent-config.json'
+    runtime_config.write_bytes(b'{"budget":"100","desired_running":false}')
+    sentinels = {path: path.read_bytes() for path in (home_note, bin_note)}
+    before = (managed.plist.read_bytes(), managed.record.read_bytes(), runtime_config.read_bytes(),
+              deepcopy(managed.control.state), list(managed.control.orders))
+    wrapper = tmp_path / 'guard-limited-installer.py'
+    wrapper.write_text('import os, resource, signal, sys\n'
+                       'resource.setrlimit(resource.RLIMIT_FSIZE, (1, 1))\n'
+                       'signal.signal(signal.SIGXFSZ, signal.SIG_IGN)\n'
+                       'os.execv(sys.argv[1], sys.argv[1:])\n')
+    failed = process([PYTHON, '-I', '-B', str(wrapper), *installation_args(managed)])
+    assert failed.returncode != 0, 'external one-byte limit must interrupt first guard publication'
+    print('FAILED_FIRST_GUARD', failed.returncode, failed.stdout, failed.stderr)
+    print('GUARD_ARTIFACTS_AFTER_FAILURE', {str(path.relative_to(managed.home)): path.read_bytes()
+                                          for path in managed.home.rglob('*.lock') if path.is_file()})
+    assert not (managed.bin / 'lpauto').exists()
+    assert all(not (managed.payload / name).exists() for name in ('launcher.py', 'config.json', 'receipt.json'))
+    assert posts(managed) == [] and children(managed) == []
+    assert all(path == '/healthz' for _, path, _, _ in managed.control.requests)
+    assert before == (managed.plist.read_bytes(), managed.record.read_bytes(), runtime_config.read_bytes(),
+                      managed.control.state, managed.control.orders)
+    assert all(path.read_bytes() == raw for path, raw in sentinels.items())
+
+    # Remove only the external file-size limit: do not delete/adopt a guard.
+    result = install(managed)
+    assert result.returncode == 0, result.stdout + result.stderr
+    status = invoke(managed, 'status', '--json')
+    assert status.returncode == 0, status.stdout + status.stderr
+    assert json.loads(status.stdout)['marker'] == 'A'
+    assert json.loads(status.stdout)['state'] == before[3]
+    assert install(managed, 'uninstall').returncode == 0
+    assert not (managed.bin / 'lpauto').exists()
+    assert all(not (managed.payload / name).exists() for name in ('launcher.py', 'config.json', 'receipt.json'))
+    assert all(path.read_bytes() == raw for path, raw in sentinels.items())
+
+    # An unrelated malformed marker is still a collision, never recovery input.
+    guards = sorted(managed.home.rglob('*.lock'))
+    assert len(guards) == 2
+    guard = guards[0]
+    guard.write_bytes(b'unknown pre-existing guard artifact')
+    guard_identity = guard.stat().st_dev, guard.stat().st_ino
+    guard_bytes = {path: path.read_bytes() for path in guards}
+    requests = deepcopy(managed.control.requests)
+    refusal = install(managed)
+    assert refusal.returncode == 2, refusal.stdout + refusal.stderr
+    assert all(path.exists() and path.read_bytes() == raw for path, raw in guard_bytes.items())
+    assert (guard.stat().st_dev, guard.stat().st_ino) == guard_identity
+    assert managed.control.requests == requests and posts(managed) == []
+    assert not (managed.bin / 'lpauto').exists()
+    assert all(not (managed.payload / name).exists() for name in ('launcher.py', 'config.json', 'receipt.json'))
+    assert before == (managed.plist.read_bytes(), managed.record.read_bytes(), runtime_config.read_bytes(),
+                      managed.control.state, managed.control.orders)
+    assert all(path.read_bytes() == raw for path, raw in sentinels.items())
 
 
 @pytest.mark.parametrize('manager', ['plain-manager', 'quoted-manager'])
@@ -658,11 +725,14 @@ def test_isolated_writes_are_not_retried(managed):
     ['config', '--budget', '100', '--target-buys', '5', '--bid-level', '3'],
     ['on', '--unknown-lp-option'],
     ['status', '--url', 'SECOND_LISTENER'],
-], ids=['nonloopback', 'credentials', 'extra-path', 'https', 'nonfinite-timeout', 'bad-bid', 'unknown-option', 'wrong-managed-loopback'])
+    ['on', 'SHORT_UR'], ['on', 'SHORT_U'], ['on', 'SHORT_UR_EQUALS'], ['on', 'SHORT_U_EQUALS'],
+], ids=['nonloopback', 'credentials', 'extra-path', 'https', 'nonfinite-timeout', 'bad-bid', 'unknown-option', 'wrong-managed-loopback',
+        'full-then-short-ur', 'full-then-short-u', 'full-then-short-ur-equals', 'full-then-short-u-equals'])
 def test_url_and_argument_failures_never_reach_control(managed, tail):
     trap = None
     trap_thread = None
     trap_requests = []
+    secondary = None
     if tail[-1] == 'SECOND_LISTENER':
         class Trap(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -688,10 +758,29 @@ def test_url_and_argument_failures_never_reach_control(managed, tail):
     else:
         managed.make_release('REAL', real=True)
         managed.select('REAL')
+        if tail[-1] in ('SHORT_UR', 'SHORT_U', 'SHORT_UR_EQUALS', 'SHORT_U_EQUALS'):
+            secondary = SimpleNamespace(state=deepcopy(managed.control.state), orders=list(managed.control.orders),
+                                        requests=[], health={}, health_hook=None, block=False, disconnect=False,
+                                        entered=threading.Event(), release=threading.Event(),
+                                        csrf='second-csrf-secret', cookie='second-cookie-secret')
+            trap = ThreadingHTTPServer(('127.0.0.1', 0), managed.handler)
+            assert trap.server_port != 8769
+            trap.control = secondary
+            secondary.url = f'http://127.0.0.1:{trap.server_port}'
+            trap_thread = threading.Thread(target=trap.serve_forever, daemon=True)
+            trap_thread.start()
+            option = '--ur' if tail[-1] in ('SHORT_UR', 'SHORT_UR_EQUALS') else '--u'
+            short = [option + '=' + secondary.url] if tail[-1].endswith('EQUALS') else [option, secondary.url]
+            tail = ['on', '--url', managed.control.url, *short]
+            secondary_before = deepcopy(secondary.state), list(secondary.orders)
     installed(managed)
     state = deepcopy(managed.control.state)
     try:
         result = invoke(managed, *tail, '--json')
+        if secondary and secondary.requests:
+            print('SHORT_URL_BYPASS', result.stdout, [(method, path, body) for method, path, body, _ in secondary.requests], secondary.state)
+            assert [(path, body) for method, path, body, _ in secondary.requests if method == 'POST'] == [(ROOT + 'enable', {'confirm': True})], 'bypass fixture must demonstrate real accepted control, not an authentication failure'
+            assert secondary.state['desired_running'] is True
         assert result.returncode == 2, result.stdout + result.stderr
         document = json.loads(result.stdout)
         assert document['result'] == 'UNKNOWN' and document['state'] is None and document['reason']
@@ -701,12 +790,112 @@ def test_url_and_argument_failures_never_reach_control(managed, tail):
         if trap:
             assert children(managed) == []
             assert trap_requests == []
+        if secondary:
+            assert secondary.requests == []
+            assert (secondary.state, secondary.orders) == secondary_before
     finally:
         if trap:
             trap.shutdown()
             trap.server_close()
             trap_thread.join(5)
             assert not trap_thread.is_alive()
+
+
+@pytest.mark.parametrize('second_mode', ['repair', 'uninstall'])
+def test_concurrent_installation_management_preserves_owned_state(managed, tmp_path, second_mode):
+    installed(managed)
+    note = managed.payload / 'operator-note.txt'
+    note.write_bytes(b'preserve unrelated operator file')
+    runtime_config = managed.runtime / 'independent-config.json'
+    runtime_config.write_bytes(b'{"budget":"100","desired_running":false}')
+    runtime_before = (managed.plist.read_bytes(), managed.record.read_bytes(), runtime_config.read_bytes(),
+                      deepcopy(managed.control.state), list(managed.control.orders))
+    bootstrap_b, bootstrap_c = tmp_path / 'bootstrap-B', tmp_path / 'bootstrap-C'
+    bootstrap_b.symlink_to(PYTHON)
+    bootstrap_c.symlink_to(PYTHON)
+    entered, release = threading.Event(), threading.Event()
+    barrier_errors = []
+    barrier = socket.socket()
+    barrier.bind(('127.0.0.1', 0))
+    assert barrier.getsockname()[1] != 8769
+    barrier.listen(1)
+    barrier.settimeout(15)
+
+    def synchronize():
+        try:
+            connection, _ = barrier.accept()
+            with connection:
+                connection.settimeout(15)
+                assert connection.makefile('rb').read(7) == b'entered'
+                entered.set()
+                assert release.wait(15), 'independent first-installer barrier watchdog expired'
+                connection.sendall(b'go')
+        except BaseException as exc:
+            barrier_errors.append(exc)
+            entered.set()
+
+    barrier_thread = threading.Thread(target=synchronize, daemon=True)
+    barrier_thread.start()
+    observations = json.loads(managed.tool_state.read_text())
+    observations['barrier'] = barrier.getsockname()[1]
+    managed.tool_state.write_text(json.dumps(observations))
+    first = subprocess.Popen(installation_args(managed, 'repair', extra=['--launcher-python', str(bootstrap_b)]),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert entered.wait(15), 'first repair must reach external validation barrier'
+        assert not barrier_errors, barrier_errors
+        artifacts = {path: path.read_bytes() for path in [managed.bin / 'lpauto',
+                     *[managed.payload / name for name in ('launcher.py', 'config.json', 'receipt.json')]]}
+        requests_before = deepcopy(managed.control.requests)
+        result = install(managed, second_mode, extra=['--launcher-python', str(bootstrap_c)])
+        print('SECOND_MANAGEMENT', result.returncode, result.stdout, result.stderr)
+        print('SECOND_PROBES', managed.control.requests[len(requests_before):])
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert 'INSTALLATION_IN_PROGRESS' in result.stdout + result.stderr
+        assert managed.control.requests == requests_before
+        assert all(path.exists() and path.read_bytes() == raw for path, raw in artifacts.items())
+        assert not (managed.payload / '.transaction.json').exists()
+        release.set()
+        stdout, stderr = first.communicate(timeout=15)
+        assert first.returncode == 0, stdout + stderr
+
+        def coherent(bootstrap):
+            receipt = json.loads((managed.payload / 'receipt.json').read_text())
+            assert receipt['source_sha'] == managed.launcher_sha
+            for filename, key in (('launcher.py', 'source_sha256'), ('config.json', 'config_sha256')):
+                assert __import__('hashlib').sha256((managed.payload / filename).read_bytes()).hexdigest() == receipt[key]
+            assert __import__('hashlib').sha256((managed.bin / 'lpauto').read_bytes()).hexdigest() == receipt['entry_sha256']
+            assert json.loads((managed.payload / 'config.json').read_text())['bootstrap'] == str(bootstrap)
+            assert not (managed.payload / '.transaction.json').exists()
+            assert invoke(managed, '--version', '--json').returncode == 0
+            status = invoke(managed, 'status', '--json')
+            assert status.returncode == 0, status.stdout + status.stderr
+            assert json.loads(status.stdout)['result'] == 'STATUS'
+
+        coherent(bootstrap_b)
+        guards = {path: path.read_bytes() for path in managed.home.rglob('*.lock')}
+        assert len(guards) == 2
+        assert all(path.is_file() and not path.is_symlink() and managed.bin not in path.parents
+                   and managed.payload not in path.parents for path in guards)
+        result = install(managed, second_mode, extra=['--launcher-python', str(bootstrap_c)])
+        assert result.returncode == 0, result.stdout + result.stderr
+        if second_mode == 'repair':
+            coherent(bootstrap_c)
+        else:
+            assert not (managed.bin / 'lpauto').exists()
+            assert {path.name for path in managed.payload.iterdir()} == {'operator-note.txt'}
+        assert all(path.exists() and path.read_bytes() == raw for path, raw in guards.items())
+        assert note.read_bytes() == b'preserve unrelated operator file'
+        assert posts(managed) == []
+        assert runtime_before == (managed.plist.read_bytes(), managed.record.read_bytes(), runtime_config.read_bytes(),
+                                  managed.control.state, managed.control.orders)
+    finally:
+        release.set()
+        if first.poll() is None:
+            first.communicate(timeout=15)
+        barrier_thread.join(15)
+        barrier.close()
+        assert not barrier_thread.is_alive() and not barrier_errors, barrier_errors
 
 
 @pytest.mark.parametrize('recovery', ['normal-lifecycle', 'interrupted-init-repair', 'interrupted-init-uninstall',

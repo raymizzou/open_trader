@@ -17,6 +17,7 @@ from pathlib import Path
 import plistlib
 import re
 import shlex
+import stat
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
@@ -44,6 +45,11 @@ class SourceUnverified(Unverified):
 
 class InstallationIncomplete(Unverified):
     reason = 'LAUNCHER_INSTALLATION_INCOMPLETE'
+
+
+class InstallationBusy(Unverified):
+    reason = 'INSTALLATION_IN_PROGRESS'
+    next_action = 'Wait for the current local installation operation to finish, then explicitly retry.'
 
 
 def require(condition):
@@ -190,6 +196,69 @@ def publish(directory, binary, contents, entry, versions, snapshot):
         (directory / TRANSACTION).unlink(missing_ok=True)
 
 
+def open_management_guard(path, expected):
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        return os.open(path, flags)
+    except FileNotFoundError:
+        descriptor = None
+        try:
+            with NamedTemporaryFile(dir=path.parent, prefix='.lpauto-guard-') as handle:
+                handle.write(expected)
+                handle.flush()
+                os.fsync(handle.fileno())
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    # link is atomic and never replaces an authoritative guard.
+                    os.link(handle.name, path, follow_symlinks=False)
+                except FileExistsError:
+                    # Another creator published first; use its stable inode.
+                    pass
+                else:
+                    descriptor = os.dup(handle.fileno())
+            return descriptor if descriptor is not None else os.open(path, flags)
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
+
+
+@contextmanager
+def management_locks(directory, binary):
+    """Serialize every manager that shares an entry or payload resource.
+
+    Guards live outside the directories that publication/uninstall replace.
+    They are persistent: unlinking a guard could split current and new holders.
+    """
+    specifications = [(safe_path(binary.parent.parent / f'.{binary.parent.name}.lpauto-entry.lock'), 'entry', binary),
+                      (safe_path(directory.parent / f'.{directory.name}.lpauto-payload.lock'), 'payload', directory)]
+    descriptors = []
+    try:
+        for path, kind, resource in sorted(specifications, key=lambda item: str(item[0])):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            expected = (json.dumps({'schema': 'open_trader.lpauto.management-lock.v1',
+                                    'kind': kind, 'resource': str(resource)}, sort_keys=True) + '\n').encode()
+            descriptor = open_management_guard(path, expected)
+            descriptors.append(descriptor)
+            observed = os.fstat(descriptor)
+            require(stat.S_ISREG(observed.st_mode) and observed.st_uid == os.getuid())
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise InstallationBusy() from exc
+            # The marker is immutable under this protocol. A killed publisher
+            # may leave its private staging link: extra links to this same valid
+            # inode do not split lock holders or authorize marker rewrites.
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            require(os.read(descriptor, len(expected) + 1) == expected)
+            current = os.stat(path, follow_symlinks=False)
+            require((current.st_dev, current.st_ino) == (observed.st_dev, observed.st_ino))
+        yield
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def install(args):
     parser = argparse.ArgumentParser(description='Explicit local lpauto installation management')
     parser.add_argument('mode', choices=('init', 'repair', 'uninstall'))
@@ -201,8 +270,13 @@ def install(args):
                           ('ps', '/bin/ps'), ('git', '/usr/bin/git')):
         parser.add_argument('--' + name, default=default)
     options = parser.parse_args(args)
-    directory = safe_path(options.payload_dir)
-    binary = safe_path(Path(options.bin_dir) / 'lpauto')
+    directory = safe_path(safe_path(options.payload_dir).resolve())
+    binary = safe_path(safe_path(Path(options.bin_dir) / 'lpauto').resolve())
+    with management_locks(directory, binary):
+        return manage_installation(options, directory, binary)
+
+
+def manage_installation(options, directory, binary):
     versions, snapshot = publication_state(directory, binary)
     if options.mode == 'uninstall':
         if versions:
@@ -276,6 +350,7 @@ def release_lock(config):
 def launch(config, receipt, args, lock_fd):
     urls = []
     for index, arg in enumerate(args):
+        require(arg.split('=', 1)[0] not in ('--u', '--ur'))
         if arg == '--url':
             require(index + 1 < len(args))
             urls.append(url_identity(args[index + 1]))
@@ -449,10 +524,11 @@ def main():
         return install(args)
     except (Unverified, OSError, ValueError, KeyError, TypeError, IndexError, HTTPException, subprocess.SubprocessError) as exc:
         reason = exc.reason if isinstance(exc, Unverified) else 'DEPLOYED_TARGET_UNVERIFIABLE'
+        advice = getattr(exc, 'next_action', NEXT)
         if '--json' in args:
-            print(json.dumps({'result': 'UNKNOWN', 'state': None, 'reason': reason, 'next_action': NEXT}))
+            print(json.dumps({'result': 'UNKNOWN', 'state': None, 'reason': reason, 'next_action': advice}))
         else:
-            print(f'{reason}: {NEXT}', file=sys.stderr)
+            print(f'{reason}: {advice}', file=sys.stderr)
         return 2
 
 
