@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-09
 
+- 修正 GLM 评审前置检查：按实际启动环境的 Codex 版本与 `CODEX_HOME` 核查独立 profile，
+  不以主配置缺少 profile/provider 段判定缺失；区分配置加载、凭据/API 与实际启动证据。
+  本机 CLI 0.161.0 help 已核对，支持的只读加载命令退出 0、输出解析为 JSON list；
+  文档差异与 Markdown 检查通过，未进行新的 GLM 启动/API 调用、后端测试或配置修改。
+
 - #300 稳定 PR #299 的 LP 候选预览 CI 成功样例：使用远离北京时间 08:00 截止的固定业务时间，
   保留原价格变动、资金、奖励等拒绝断言及幂等重放断言；
   独立截止测试仍验证短 GTD 窗口拒绝。
