@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-09
 
+- Project review-publication instructions now carry the standing 2026-10-09 same-PR reviewer result-comment authorization across every checkout, including Air and Mini, removing redundant separate-confirmation prompts while preserving local-only, pre-publication, and reviewer read-only boundaries. Verified documentation portability, semantics, reviewer task/tab/pane ownership and placement, Markdown anchors/fences, changed paths, and `git diff --check`; no tests, deployment gates, or external publication.
 - #310 LP 候选按市场隔离元数据、奖励和盘口刷新失败；健康市场继续刷新，失败市场沿用
   60/120/300 秒恢复期限。自动比较在过滤过期事实前进行有界复核，失败时用合格候选补位，
   恢复后重新竞争；复核明确指向过期市场，避免新鲜展示前十挡住当前报价档位的更优候选。
