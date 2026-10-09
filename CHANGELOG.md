@@ -7,6 +7,18 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - First-publication instructions and active README, CI, cloud, release and dependency workflow summaries now require Main to push the first completed task version after applicable focused checks and open a normal PR before independent review, so dots can begin review promptly. Standing task-branch/PR authorization includes in-scope repair updates; GitHub CI, final independent review, merge approval and deployment gates remain required. Verified the precise documentation diffs, targeted publication/review consistency searches and `git diff --check`; no backend tests or deployment gates were run.
 - Project review-publication instructions now carry the standing 2026-10-09 same-PR reviewer result-comment authorization across every checkout, including Air and Mini, removing redundant separate-confirmation prompts while preserving local-only, pre-publication, and reviewer read-only boundaries. Verified documentation portability, semantics, reviewer task/tab/pane ownership and placement, Markdown anchors/fences, changed paths, and `git diff --check`; no tests, deployment gates, or external publication.
+
+- #309 LP 候选、推荐排序及 Dashboard 的策略预估跟随当前买一/买二配置，
+  探索与维护统一使用真实档位和最小计奖数量；估值保存档位来源，配置切换或重启后
+  旧档位报价、占资及收益率显示待测，刷新成功后恢复当前档位值。
+  账户挂单奖励与已到账记录保持独立；隔离 SDK/SQLite 定向验证覆盖双向切换、排序、
+  自动下单一致性、缺档/离线与重启恢复，保留原有配置、资金及压力退出门限。
+  独立评审修复手动试挂链路：弹窗与 HTTP 保留展示报价的买档，缺省仍为买一；
+  提交时重新核对所选档位，报价漂移仍拒绝，custom/追加及单次提交幂等行为不变。
+  CI 修复首次加载的待刷新 Dashboard 同样返回已配置买档，页面读取不触发场所查询；
+  历史回放保持原夹具和全量哈希，仅单独验证新增档位来源字段，保留排序及负向检查。
+  未执行生产操作、发布或部署；独立评审及 Git 交付由 Main 负责。
+
 - 修正 GLM 评审前置检查：按实际启动环境的 Codex 版本与 `CODEX_HOME` 核查独立 profile，
   不以主配置缺少 profile/provider 段判定缺失；区分配置加载、凭据/API 与实际启动证据。
   本机 CLI 0.161.0 help 已核对，支持的只读加载命令退出 0、输出解析为 JSON list；

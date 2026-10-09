@@ -203,6 +203,10 @@ class LPAutoPool:
             document.setdefault('buy_price_level', 1)
             return document
 
+    def buy_price_level(self):
+        """Return the effective quote level, including legacy default one."""
+        return self._read()['buy_price_level']
+
     def _update(self, fn, *, connection=None):
         # ponytail: one SQLite document serializes this single-account MVP;
         # split event rows if retained history makes document rewrites material.

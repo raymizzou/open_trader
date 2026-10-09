@@ -73,6 +73,34 @@ def _trace_hash(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
+def _assert_level_one_provenance(value):
+    """The fixed replay uses level one; every new marker must say so."""
+    if isinstance(value, list):
+        for item in value:
+            _assert_level_one_provenance(item)
+    elif isinstance(value, dict):
+        if 'candidates' in value:
+            assert type(value['buy_price_level']) is int
+            assert value['buy_price_level'] == 1
+        if 'estimate_state' in value:
+            assert type(value['estimate_buy_price_level']) is int
+            assert value['estimate_buy_price_level'] == 1
+        for key, item in value.items():
+            if key in ('buy_price_level', 'estimate_buy_price_level'):
+                assert type(item) is int and item == 1, (key, item)
+            _assert_level_one_provenance(item)
+
+
+def _legacy_strategy_trace(value):
+    """Remove only #309's separately asserted provenance from old hashes."""
+    if isinstance(value, list):
+        return [_legacy_strategy_trace(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _legacy_strategy_trace(item) for key, item in value.items()
+                if key not in ('buy_price_level', 'estimate_buy_price_level')}
+    return value
+
+
 def test_complete_ranking_trace_matches_issue249_minimum_order_contract(tmp_path):
     fixtures = Path(__file__).parent / 'fixtures'
     historical = json.loads((fixtures / 'lp_memory_ranking_4fbddaae.json').read_text())
@@ -91,8 +119,10 @@ def test_complete_ranking_trace_matches_issue249_minimum_order_contract(tmp_path
                 assert Decimal(row['estimated_target_quantity']) == 20
                 assert Decimal(row['estimated_target_capital_usd']) == 10
                 assert Decimal(row['estimated_yield_pct_per_hour']) == (pool * Decimal(81) / (24 * 1616 * 10) * 100).quantize(Decimal('.000001'))
-        assert _trace_hash(_unchanged_contract(actual)) == expected['unchanged_contract_sha256'], expected['step']
-        assert _trace_hash(actual) == expected['sha256'], (expected['step'], actual)
+        _assert_level_one_provenance(actual)
+        legacy = _legacy_strategy_trace(actual)
+        assert _trace_hash(_unchanged_contract(legacy)) == expected['unchanged_contract_sha256'], expected['step']
+        assert _trace_hash(legacy) == expected['sha256'], (expected['step'], actual)
 
 
 def test_full_normal_and_backup_traversal_matches_issue249_minimum_order_contract(tmp_path):
@@ -108,8 +138,10 @@ def test_full_normal_and_backup_traversal_matches_issue249_minimum_order_contrac
             assert Decimal(row['estimated_target_quantity']) == 20
             assert Decimal(row['estimated_target_capital_usd']) == Decimal('6.80')
             assert Decimal(row['estimated_yield_pct_per_hour']) == (Decimal(100) * 81 / (24 * 1616 * Decimal('6.80')) * 100).quantize(Decimal('.000001'))
-    assert _trace_hash(_unchanged_contract(trace)) == contract['backfill_unchanged_contract_sha256']
-    assert _trace_hash(trace) == contract['backfill_sha256']
+    _assert_level_one_provenance(trace)
+    legacy = _legacy_strategy_trace(trace)
+    assert _trace_hash(_unchanged_contract(legacy)) == contract['backfill_unchanged_contract_sha256']
+    assert _trace_hash(legacy) == contract['backfill_sha256']
 
 
 def test_preparation_and_rejected_queue_details_are_released_and_can_reenter(tmp_path):
