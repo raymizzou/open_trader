@@ -24,13 +24,13 @@ Readiness `READY`、正式 wrapper install/start 和 Cloud Smoke `HEALTHY`。
 | --- | --- | --- |
 | 无凭据 paused Shadow | backend=disabled，无 LP account reader；LP 503 是预期；N-leg paused，candidate_exclusions=false | 不能据此认证 LP、完整池遍历或交易容量 |
 | 凭据读取 | Main 随后私下导入既有凭据；带 require-trading-region 的 read-auth 初始化 ready，完整认证账户读取成功，mutation/notification attempts 均为 0 | 总结果因 trading_region blocked 而 BLOCKED；认证读取成功不等于交易可用 |
-| 认证 paused Shadow | 同一接受 SHA 已 RUNNING；真实 Dashboard authenticated=true、stale=false，完整 orders/positions/trades 与 balance 读取，N-leg paused，guard attempts 为 0 | 认证 Cloud Smoke FAILED，输出 ROLLBACK 标签但未执行回滚；完整 feed 状态 UNKNOWN，完整 catalog/candidate/history 遍历、24 小时容量和 12 小时刷新尚未验收 |
+| 认证 paused Shadow | 同一接受 SHA 曾 RUNNING，认证读取成功；当时真实 Dashboard authenticated=true、stale=false，完整 orders/positions/trades 与 balance 读取，N-leg paused，guard attempts 为 0；本次尝试现已被资源 guard 停止 | 认证 Cloud Smoke FAILED，输出 ROLLBACK 标签但未执行回滚；metadata transport 错误与服务内存预算触发分别未解决；完整 feed 状态 UNKNOWN，完整 catalog/candidate/history 遍历、24 小时容量和 12 小时刷新尚未验收 |
 | 实盘/订单诊断 | 未提交订单；现有 Shadow 禁写和 production 地域门禁不变 | 新诊断执行路径/例外需要独立具体方案批准 |
 
 认证 Smoke 的远端直接诊断为 `runtime logs missing or contain errors`。
 启动 journal 反复出现
 `lp_metadata_read_failed stage=market|event error_types=TransportError>RemoteProtocolError>RemoteProtocolError`。
-认证/账户 Dashboard 仍可用；上游 transport 错误原因尚未确认。不能沿用此前
+该阶段认证/账户 Dashboard 可用；上游 transport 错误原因尚未确认。不能沿用此前
 无凭据 profile 的历史 `HEALTHY` 宣称认证 full feed 健康。
 
 无凭据空闲样本约 130 MiB cgroup current、133 MiB peak，180 个采样中
@@ -379,6 +379,17 @@ make prediction-cloud-smoke \
 disabled profile 的 LP 503 验收。不要扰动原 Mac 生产 8766/8769。
 
 ## 7. 启动检查、重连与容量验收
+
+本次认证 Shadow 在 2026-10-09 23:57:21+08:00 被现有资源 guard 以
+`service_memory_headroom` 停止。采样 current=935,288,832 bytes，effective
+limit=999,997,440 bytes；host MemAvailable=2,733,596,672 bytes、swap_used=0，
+kernel memory failures=0。随后 systemd ActiveState=failed、无主进程，
+Result=signal、ExecMainStatus=9、NRestarts=0。这是服务预算保护及其后强制终止，
+不是 4 GB 主机耗尽 RAM、kernel OOM 或 agent 回滚的证据；未重试或重启。
+原本地生产 owner 不变，无订单提交，已批准的 1 USDC 测试上限尚未使用。
+metadata transport 错误与服务内存预算触发是两个独立未解决事项；下一步
+代码/行为变更须另行提出具体方案并获批。保持现有最高 1 GB 政策，不提高
+到支持范围之外，也不重试到绿。
 
 远端检查实际 PID、`/proc/<PID>/cwd`/命令身份、root/code_root/SHA、mode、
 runtime lock、release record、8769 loopback listener、N-leg pause、
