@@ -171,6 +171,16 @@ See [CI identity](docs/operations/ci.md) and the
 [proposed repository protections](docs/operations/repository-protection.md);
 documented settings are not evidence that protection is enabled.
 
+## OpenTrader PR review publication
+
+The standing user authorization dated 2026-10-09 applies to
+`raymizzou/open_trader` across machines and checkouts, including Air and Mini.
+An authorized PR creation/update or review of an already published PR includes
+the assigned independent reviewer's own result comment on that same PR; see the
+[publication procedure](docs/operations/agent-verification.md#open-trader-pr-review-publication).
+Explicit local-only or do-not-post instructions override it, and
+pre-publication staged reviews stay local.
+
 ## Delivery boundaries
 
 Branch push, Draft PR, GitHub merge, release/tag creation, and deployment are
