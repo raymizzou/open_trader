@@ -88,7 +88,7 @@ consumers. Shared production changes run the union of relevant consumer tests,
 not whole service suites. Pure documentation/configuration changes need no local
 backend run unless they affect a testable contract. Report missing dependencies
 or blocked focused checks rather than claiming success. Docker is optional for
-focused diagnosis and is not a prerequisite to pushing a reviewed branch.
+focused diagnosis and is not a prerequisite to task-branch publication.
 
 GitHub CI runs all four backend services (`gateway`, `legacy`, `account`,
 `prediction`) with `TEST_N_LEG=0` and the explicit permanent N-leg retirement
@@ -96,8 +96,9 @@ manifest on every branch push and every PR targeting
 `main`, including the final merged-main push. Documentation-only, LP-only,
 trend-only, and missing-diff cases have the same active backend coverage, excluding
 `pressure` and `browser`. Push-head and PR-merge runs intentionally test distinct
-SHA identities. Before authorized publication, complete focused local checks
-and independent review; inspect exact-SHA CI before requesting merge approval.
+SHA identities. Before first publication, complete applicable focused local
+checks; independent review follows publication. Inspect exact-SHA CI before
+requesting merge approval.
 Deployment Preflight runs only for a selected final GitHub `main` SHA during an
 explicitly authorized deployment. It reuses trusted exact-SHA main-push CI and
 checks immutable source/lock/runtime identity; it never reruns backend tests.
@@ -130,26 +131,36 @@ require explicit user approval. Follow the detailed
 
 ## Review and merge
 
-Before pre-commit review, update the dated operator-facing entry in `CHANGELOG.md`,
-then stage only the exact task files. The reviewer target is `git diff --cached`.
-For an existing PR, pin the base and head SHAs and review
+Before first publication, update the dated operator-facing entry in `CHANGELOG.md`,
+complete applicable focused/security checks, then Main stages and commits only
+the exact task files. For an unpublished local-only review, stage those files
+and use `git diff --cached`. After publication, pin the base and head SHAs and review
 `git diff <base>...<head>`; read-only PR review requires no staging or file edits.
-After any post-review change, restage only the exact task files, rerun relevant
-verification, and obtain a fresh review.
+After any post-review change, rerun relevant verification; Main stages, commits
+and pushes only the task changes to the same PR, then refresh independent review.
+For unpublished local-only work, restage only task files and refresh staged review
+without publishing.
 Use a fresh independent reviewer for the initial review; reuse that reviewer
-for in-scope repairs after restaging and rerunning relevant verification. A
+for in-scope repairs against the updated published head/base. A
 new reviewer is needed when scope or architecture changes. If GitHub `main`
 advances, fetch and rebase task commits onto `origin/main`, then rerun required
 worktree checks and review. A rebase or conflict resolution that changes behavior,
 scope, risk, or architecture requires a new approved plan. Mechanical resolutions
 that preserve these may proceed within approved scope, with required checks and
-independent review. Publish only the reviewed tree to the authorized task branch,
-open a Draft PR targeting `main` promptly once the
+independent review. Under the standing 2026-10-09 user authorization scoped to
+`raymizzou/open_trader`, Main must promptly push the task branch and create a
+normal (non-draft) PR targeting `main`, or update its existing PR, once the
 [first reviewable implementation](docs/operations/agent-verification.md#first-reviewable-implementation)
-passes applicable focused/security checks and independent staged review, with
-first-publication blockers repaired. Do not delay it for nonblocking polish,
-unneeded local full suites, or remote CI completion. Report missing publication
-authorization and record unverified work in the PR when publication is authorized.
+passes applicable focused/security checks. Documentation-only work uses its
+verification exemption. Do not ask again for task-branch push or PR permission.
+Explicit local-only, no-push, do-not-publish or draft instructions override this
+default. This standing authorization supersedes older pre-publication review
+and separate push/PR permission requirements. Publish before independent review
+completion, dots feedback, repair
+closure, final acceptance or merge; an unavailable reviewer does not delay it.
+Report actual publication/access failures. Verify the remote PR URL and exact
+head/base, and record checks and pending review status. Publication is a review
+handoff, not approval or readiness; claim dots has started only with observed evidence.
 Immediately start a separate Herdr GLM-5.3/max reviewer pane alongside
 CI; verify actual startup and keep review and CI status separate. Pin issue scope, PR
 URL, head/base SHAs and verification; unavailable prerequisites are blockers,
@@ -183,8 +194,12 @@ pre-publication staged reviews stay local.
 
 ## Delivery boundaries
 
-Branch push, Draft PR, GitHub merge, release/tag creation, and deployment are
-separate actions requiring their applicable explicit authorization. A merged PR
+Task-branch commits/pushes and PR creation/updates, including in-scope repair
+commits to the same PR, have the standing authorization above. Workers and
+reviewers retain their Git boundaries; Main owns publication. This grants no
+force-push, direct `main` push, automatic merge or deployment authority.
+GitHub merge, release/tag creation, and deployment remain separate actions
+requiring their applicable explicit authorization. A merged PR
 does not release or deploy. Neither PR-head checks nor GitHub's synthetic PR
 merge SHA substitute for trusted main-push CI evidence on the selected final GitHub `main` SHA.
 
