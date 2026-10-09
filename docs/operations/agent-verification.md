@@ -297,11 +297,36 @@ Track GLM review and CI separately. A changed head or base requires refreshed
 applicable reviews and CI; an old review comment is not evidence for a new SHA.
 
 **GLM prerequisite:** verify the local Herdr installation/help, an available pane
-at its shell prompt, and a Codex `glm-review` profile configured for the verified
-`bigmodel` provider, `glm-5.3` and max reasoning, including default subagents if
-used. Verify required credential access without
-reading or exposing credentials. Do not assume a profile on one workstation
-exists on another. Installed CLI help supports native Codex options after `--`:
+at its shell prompt, and the actual Codex executable/version and effective
+`CODEX_HOME` in the reviewer launch environment, including the Herdr pane/host.
+Check that executable's installed `--help` for supported profile semantics;
+do not assume that sessions or hosts use the same executable or environment.
+
+For the currently verified CLI (`codex-cli 0.161.0`), `--profile glm-review`
+layers `$CODEX_HOME/glm-review.config.toml` over the base user config;
+`CODEX_HOME` defaults to `$HOME/.codex` when unset. The independent profile file
+can define `[model_providers.bigmodel]`. Absence of `[profiles.glm-review]` or
+`[model_providers.bigmodel]` from the main `config.toml` alone does not establish
+a missing profile or provider. For another CLI version, use its installed help;
+report unsupported semantics or `UNKNOWN` when not established, rather than
+inventing missing configuration.
+
+Use the same actual executable and environment for supported read-only
+config-load validation. The verified command for this CLI is:
+
+```sh
+codex --profile glm-review mcp list --json >/dev/null
+```
+
+Capture output when inspecting its format; do not expose raw configuration,
+MCP environment or credentials. Exit zero proves configuration loading only.
+It does not verify credentials, API connectivity, the effective selected
+model/provider/reasoning, interactive readiness, actual review startup or
+completion. Verify a `glm-review` profile configured for `bigmodel`, `glm-5.3`
+and max reasoning, including default subagents if used. Verify required
+credential access without reading or exposing credentials. Do not assume a
+profile on one workstation exists on another. Installed Herdr help supports
+native Codex options after `--`:
 
 ```sh
 herdr agent start <reviewer-name> --kind codex --pane <available-pane-id> -- --profile glm-review -m glm-5.3 -c 'model_reasoning_effort="max"'
@@ -309,10 +334,17 @@ herdr agent read <reviewer-name>
 ```
 
 Before task assignment, confirm interactive readiness and the displayed actual
-model/reasoning, plus profile/provider where available; retain configuration
-evidence for fields not displayed. Use a separate reviewer from the implementer.
+`glm-5.3` model and max reasoning, plus the `glm-review` profile and `bigmodel`
+provider where available; retain profile/provider configuration evidence for
+fields not displayed. Verify actual startup through the pane read, not just an
+issued start command. Use a separate reviewer from the implementer.
+Distinguish confirmed missing files, parse/load errors, unsupported CLI semantics,
+credential errors, API/network failures and startup/readiness failures. Record
+the actual evidence and report `UNKNOWN` for anything not established.
 Missing Herdr, profile, credentials, model or readiness is blocked; do not silently
-substitute Flash or another model. This review exception does not change the
+substitute Flash or another model. A failed check does not authorize automatic
+configuration rewrites, credential reads/re-entry or model reinstallation.
+This review exception does not change the
 `gpt-6.1-sol`/high implementation-worker default or other roles. This is a process
 contract, not installation or configuration migration authority.
 
