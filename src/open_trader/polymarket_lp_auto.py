@@ -1155,7 +1155,7 @@ class LPAutoPool:
                 self._ranking_fresh(row)
                 rows.append(row)
             except ValueError as exc:
-                if 'identity' in str(exc):
+                if str(exc) == 'account_financial_facts_changed' or 'identity' in str(exc):
                     raise
                 blocked.append({'condition_id': intent['condition_id'], 'token_id': intent['token_id'], 'reason': str(exc)})
                 continue
@@ -1236,7 +1236,8 @@ class LPAutoPool:
                 self._ranking_fresh(pending)
                 refreshed.add((pending['condition_id'], pending['token_id']))
             except ValueError as exc:
-                if 'identity' in str(exc) and str(exc) != 'history_identity_mismatch':
+                if (str(exc) == 'account_financial_facts_changed'
+                        or ('identity' in str(exc) and str(exc) != 'history_identity_mismatch')):
                     raise
                 blocked.append({'condition_id': pending['condition_id'], 'token_id': pending['token_id'], 'reason': str(exc)})
                 rows.remove(pending)

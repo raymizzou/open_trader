@@ -92,30 +92,34 @@ def test_rotation_waits_for_first_real_shared_read_and_recovers_without_overbuyi
 
     slow_entered, fast_entered = threading.Event(), threading.Event()
     slow_release, fast_release = threading.Event(), threading.Event()
+    slow_completed, fast_completed = threading.Event(), threading.Event()
+    slow_returned, fast_returned = threading.Event(), threading.Event()
+    read_errors = {}
     metadata = exchange.lp_market_metadata_fresh
     def blocked_metadata(ids, **kwargs):
         values = {str(value) for value in ids}
-        if 'm10' in values:
-            slow_entered.set()
-            assert slow_release.wait(5)
-        if 'm11' in values:
-            fast_entered.set()
-            assert fast_release.wait(5)
+        for token, entered, release, completed in (
+                ('m10', slow_entered, slow_release, slow_completed),
+                ('m11', fast_entered, fast_release, fast_completed)):
+            if token in values:
+                try:
+                    entered.set()
+                    assert release.wait(5)
+                    return metadata(ids, **kwargs)
+                finally:
+                    completed.set()
         return metadata(ids, **kwargs)
     exchange.lp_market_metadata_fresh = blocked_metadata
 
-    def read(identity):
+    def read(identity, returned):
         try:
             lp._read_candidate_facts(identity)
-        except ValueError:
-            pass
-    slow = threading.Thread(target=read, args=(dict(condition_id='m10', token_id='m10', outcome='YES'),))
-    slow.start()
-    assert slow_entered.wait(2)
-    fast = threading.Thread(target=read, args=(dict(condition_id='m11', token_id='m11', outcome='YES'),))
-    fast.start()
-    assert fast_entered.wait(2)
-    lp._market_read_timeout = 1
+        except ValueError as error:
+            read_errors[identity['token_id']] = str(error)
+        finally:
+            returned.set()
+    slow = threading.Thread(target=read, args=(dict(condition_id='m10', token_id='m10', outcome='YES'), slow_returned))
+    fast = threading.Thread(target=read, args=(dict(condition_id='m11', token_id='m11', outcome='YES'), fast_returned))
 
     from open_trader import polymarket_lp as lp_module
     original_wait = lp_module.wait
@@ -127,11 +131,21 @@ def test_rotation_waits_for_first_real_shared_read_and_recovers_without_overbuyi
 
     round_thread = None
     try:
+        lp._market_read_timeout = 1
+        slow.start()
+        assert slow_entered.wait(2)
+        fast.start()
+        assert fast_entered.wait(2)
         state = engine.lp_auto_scheduled_check()
         assert state['last_round']['reason'] == 'market_read_capacity'
         assert [row['condition_id'] for row in state['last_round']['blocked']] == ['m00']
         assert exchange.cancels == []
         assert len(exchange.posts) == 1
+        assert slow_returned.wait(2) and fast_returned.wait(2)
+        assert read_errors == {'m10': 'market_read_timeout', 'm11': 'market_read_timeout'}
+        # Caller timeout does not finish either real external metadata read.
+        assert not slow_completed.is_set() and not fast_completed.is_set()
+        assert not slow_release.is_set() and not fast_release.is_set()
 
         advance_auto_wait(engine, monkeypatch)
         engine.lp_auto_reconcile_unknown()
@@ -155,11 +169,14 @@ def test_rotation_waits_for_first_real_shared_read_and_recovers_without_overbuyi
         round_thread = threading.Thread(target=check)
         round_thread.start()
         assert wait_entered.wait(2), str([x['last_round'] for x in checked])
-        assert slow.is_alive() and fast.is_alive()
+        assert not slow_completed.is_set() and not fast_completed.is_set()
+        assert not slow_release.is_set() and not fast_release.is_set()
         assert exchange.cancels == [] and len(exchange.posts) == 1
         fast_release.set()
+        assert fast_completed.wait(2)
         round_thread.join(5)
         assert checked
+        assert not slow_completed.is_set() and not slow_release.is_set()
         state = checked[0]
         assert exchange.cancels == ['o1']
         assert len(exchange.posts) == 1
@@ -171,12 +188,14 @@ def test_rotation_waits_for_first_real_shared_read_and_recovers_without_overbuyi
         lp._market_read_timeout = 10
         fast_release.set()
         slow_release.set()
-        slow.join(2)
-        fast.join(2)
+        for thread, completed in ((slow, slow_completed), (fast, fast_completed)):
+            if thread.ident is not None:
+                assert completed.wait(2)
+                thread.join(2)
+                assert not thread.is_alive()
         if round_thread is not None:
             round_thread.join(2)
             assert not round_thread.is_alive()
-        assert not slow.is_alive() and not fast.is_alive()
 
     for order in exchange.orders:
         order['status'] = 'CANCELED'

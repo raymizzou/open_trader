@@ -9,7 +9,7 @@ import pytest
 
 from open_trader.polymarket_lp_scheduler import LPAutoScheduler
 from tests import test_lp_auto_pool as pool
-from tests.test_lp_auto_target_convergence import plan_setup, live_orders
+from tests.test_lp_auto_target_convergence import plan_setup, live_orders, publish_candidates
 
 
 def at_deadline(monkeypatch, engine, *, before=0):
@@ -26,6 +26,80 @@ def restart_engine(engine, exchange):
     restored._breaker_open = False  # The simulated venue has no actual runtime owner.
     exchange.lp = lp
     return restored
+
+
+@pytest.mark.parametrize('initial', [(), ('A', 'B', 'C', 'D', 'I')], ids=['zero', 'five'])
+def test_ranking_generation_change_uses_api_wait(tmp_path, monkeypatch, initial):
+    engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch, initial)
+    engine.lp_auto_configure(dict(round_interval_seconds=1,
+        api_retry_interval_seconds=60, order_check_interval_seconds=10))
+    original_orders = live_orders(exchange)
+    original_generation = store.lp_trade_generation()
+    reads = dict(account=0, shared=0, metadata=0, reward=0, books=0)
+    trace, invalidated_at = [], []
+    race_enabled = [True]
+    for name, counter in [('lp_account_snapshot', 'account'),
+                          ('lp_account_snapshot_shared', 'shared'),
+                          ('lp_market_metadata_fresh', 'metadata'),
+                          ('lp_reward_catalog', 'reward'), ('lp_order_books', 'books')]:
+        external = getattr(exchange, name)
+        def observed(*args, _read=external, _counter=counter, **kwargs):
+            reads[_counter] += 1
+            trace.append((_counter, args, kwargs))
+            result = _read(*args, **kwargs)
+            if _counter == 'reward' and race_enabled[0] and not invalidated_at:
+                assert reads['shared'] == 1, 'the complete account read precedes ranking'
+                assert store.lp_advance_trade_generation(original_generation)
+                invalidated_at.append(pool.NOW)
+            return result
+        monkeypatch.setattr(exchange, name, observed)
+    scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
+    assert scheduler.run_due()
+    state = engine.lp_auto_state()
+    first_reward = next(row for row in trace if row[0] == 'reward')
+    assert first_reward[2]['condition_ids'] == (('A',) if initial else ('B',))
+    assert len(invalidated_at) == 1
+    assert store.lp_trade_generation() == original_generation + 1
+    assert exchange.cancels == exchange.posts == []
+    assert live_orders(exchange) == original_orders
+    assert state['slots']['occupied'] == (5 if initial else 0)
+    assert Decimal(state['funds']['buy_reserved_usd']) == (Decimal('39.00') if initial else Decimal(0))
+    assert state['plan_wait']['kind'] == 'api', state['last_round']
+    assert state['last_round']['reason'] == 'account_financial_facts_changed'
+    assert not state['last_round'].get('completed_at')
+    assert state['active_plan'] is None and state['last_round']['actions'] == []
+    assert 'account_financial_facts_changed' in state['admission_block_reasons']
+    started = datetime.fromisoformat(state['plan_wait']['started_at'])
+    deadline = datetime.fromisoformat(state['plan_wait']['deadline'])
+    assert started == invalidated_at[0] and deadline == started + timedelta(seconds=60)
+    stopped_reads = dict(reads)
+    for elapsed in (1, 59):
+        monkeypatch.setattr(pool, 'NOW', started + timedelta(seconds=elapsed))
+        scheduler.request_check()
+        assert not scheduler.run_due()
+        assert reads == stopped_reads
+        assert exchange.cancels == exchange.posts == []
+        assert live_orders(exchange) == original_orders
+    race_enabled[0] = False
+    monkeypatch.setattr(pool, 'NOW', deadline)
+    publish_candidates(exchange, lp, store, tuple('ABCDEFGHI'))
+    assert scheduler.run_due()
+    state = engine.lp_auto_state()
+    assert {row['condition_id'] for row in state['last_round']['targets']} == {'B', 'C', 'E', 'F', 'G'}
+    if state['active_plan']:
+        assert initial and state['plan_wait']['kind'] == 'order'
+        at_deadline(monkeypatch, engine)
+        assert scheduler.run_due()
+        state = engine.lp_auto_state()
+    assert [post['token_id'] for post in exchange.posts] == (['E', 'F', 'G'] if initial else ['B', 'C', 'E', 'F', 'G'])
+    assert exchange.cancels == (['original-A', 'original-D', 'original-I'] if initial else [])
+    assert set(live_orders(exchange)) == {'B', 'C', 'E', 'F', 'G'}
+    if initial:
+        assert live_orders(exchange)['B'] == 'original-B'
+        assert live_orders(exchange)['C'] == 'original-C'
+    assert state['slots']['occupied'] == 5
+    assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('39.00')
+    assert state['funds']['status'] == 'known' and state['last_round']['completed_at']
 
 
 @pytest.mark.parametrize('window', ['initial_account', 'pre_send_account'])
