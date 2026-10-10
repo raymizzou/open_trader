@@ -5,6 +5,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-10
 
+- LP 自动 BUY 在未满池与满池时统一选优，固定本轮目标和报价；单笔明确拒绝后继续其余动作。
+  API 暂时失败、撤单 ACK 后仍 LIVE、订单确认消失与短暂资源争用均可自动接续原计划，
+  保留精确订单身份、未知提交防重、部分成交库存及保护门禁。新增独立持久参数
+  `--round-interval-seconds`、`--api-retry-interval-seconds`、`--order-check-interval-seconds`，
+  默认 60/60/10 秒；运行中修改只影响下一次等待，CLI 校验服务持久状态回执。
+  已完成 #322 的 16 项公开入口契约逐案 RED/GREEN 或不变式验证，以及相关聚焦消费者修复；
+  最终候选检查、独立评审及 CI 由交付流程确认，未执行实盘或部署。
+
 - 新增 #321 人工 Polymarket 单笔诊断 CLI：只读 check、GET-only status 与明确确认的
   run/cancel；仅 BUY/post-only/GTD，名义金额硬上限 1 USDC，记录真实地域结果，
   不修改 Shadow 或 production 门禁。私有原子回执在提交前保存 attempted，未知结果

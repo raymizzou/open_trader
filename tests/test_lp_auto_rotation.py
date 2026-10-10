@@ -262,6 +262,7 @@ def test_second_cancel_registration_failure_sends_nothing_and_recovers_safely(tm
     engine, exchange, lp, store = setup(tmp_path, monkeypatch)
     for index in range(5, 10):
         exchange.rewards[f'm{index:02}'] = Decimal('25')
+    monkeypatch.setattr(pool, 'NOW', pool._maybe_datetime(engine.lp_auto_state()['plan_wait']['deadline']))
     refresh(lp, exchange)
     upsert = store.lp_upsert_action
     registrations = []
@@ -301,11 +302,13 @@ def test_partial_fill_during_cancel_aborts_replacement_and_keeps_inventory_cost(
     exchange.orders.append(dict(order_id='self-managed-sell', token_id='legacy', condition_id='legacy',
         side='SELL', status='LIVE', price='.30', original_size='13.31', size_matched='0'))
     exchange.rewards['m01'] = Decimal('25')
+    assert engine.lp_auto_run_once()['last_round']['completed_at']
+    monkeypatch.setattr(pool, 'NOW', pool._maybe_datetime(engine.lp_auto_state()['plan_wait']['deadline']))
     refresh(lp, exchange, 2)
     engine.lp_auto_run_once()
     exchange.orders[0].update(status='CANCELED', size_matched='8')
     exchange.positions = [dict(token_id='m00', condition_id='m00', size='8')]
-
+    monkeypatch.setattr(pool, 'NOW', pool._maybe_datetime(engine.lp_auto_state()['plan_wait']['deadline']))
     state = engine.lp_auto_run_once()
     assert exchange.cancels == ['o1']
     assert len(exchange.posts) == 1
@@ -359,6 +362,9 @@ def test_rotation_keeps_existing_buy_when_guard_blocks(tmp_path, monkeypatch, gu
     else:
         exchange.orders[0]['status'] = 'UNKNOWN'
 
+    early = engine.lp_auto_run_once()
+    assert exchange.cancels == [] and len(exchange.posts) == 1
+    monkeypatch.setattr(pool, 'NOW', pool._maybe_datetime(early['plan_wait']['deadline']))
     state = engine.lp_auto_run_once()
     assert exchange.cancels == []
     assert len(exchange.posts) == 1

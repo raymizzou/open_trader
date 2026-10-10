@@ -42,6 +42,56 @@ def runtime_for(tmp_path):
     return runtime
 
 
+def test_timing_config_reaches_persistent_runtime_scheduler(tmp_path, monkeypatch, capsys):
+    from tests import test_lp_auto_pool as pool
+    from tests.test_lp_auto_target_convergence import plan_setup
+    from tests.test_lp_auto_plan_scheduler import restart_engine, at_deadline
+    from datetime import datetime, timedelta
+
+    runtime = runtime_for(tmp_path)
+    engine, exchange, _, _ = plan_setup(tmp_path, monkeypatch, ('A', 'B', 'C', 'D', 'I'))
+    exchange.cancel_terminal = False
+    runtime.execution = engine
+    runtime._lp_auto_scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
+    assert runtime._lp_auto_scheduler.run_due()
+    before = runtime.lp_auto_state()
+    root = '/api/prediction-arbitrage/lp/auto/'
+    with _server(runtime, session_token='session-token', csrf_token='csrf-token') as base:
+        code = cli.main(['prediction-arb', 'lp-auto', 'config', '--url', base,
+            '--round-interval-seconds', '90', '--api-retry-interval-seconds', '30',
+            '--order-check-interval-seconds', '5', '--json'])
+        receipt = json.loads(capsys.readouterr().out)
+        assert code == 0, receipt['reason']
+        assert receipt['result'] == 'CONFIGURED'
+        status, state = _response(base + root + 'state')
+        assert status == 200
+        for key, value in dict(round_interval_seconds=90, api_retry_interval_seconds=30, order_check_interval_seconds=5).items():
+            assert state[key] == receipt['state'][key] == value
+        assert state['check_interval_seconds'] == 90
+        assert state['config_version'] == before['config_version'] + 1
+        for key in ('active_plan', 'plan_wait', 'trading_config_version', 'desired_running', 'budget_usd', 'target_buy_count', 'buy_price_level'):
+            assert state[key] == before[key]
+        for invalid in ({'round_interval_seconds': 120, 'order_check_interval_seconds': 0},
+                        {'order_check_interval_seconds': 7, 'budget_usd': '200', 'target_buy_count': 5},
+                        {'api_retry_interval_seconds': 1.5}):
+            assert _response(_production_request(base, root + 'config', json.dumps(invalid).encode()))[0] == 400
+            assert _response(base + root + 'state')[1] == state
+        runtime.execution = restart_engine(engine, exchange)
+        runtime._lp_auto_scheduler = LPAutoScheduler(runtime.execution, clock=lambda: pool.NOW)
+        restored = _response(base + root + 'state')[1]
+        for key in ('active_plan', 'plan_wait', 'desired_running', 'round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds'):
+            assert restored[key] == state[key]
+        at_deadline(monkeypatch, runtime.execution, before=1)
+        runtime._lp_auto_scheduler.request_check()
+        assert not runtime._lp_auto_scheduler.run_due()
+        at_deadline(monkeypatch, runtime.execution)
+        assert runtime._lp_auto_scheduler.run_due()
+        waiting = _response(base + root + 'state')[1]['plan_wait']
+        assert datetime.fromisoformat(waiting['deadline']) - datetime.fromisoformat(waiting['started_at']) == timedelta(seconds=5)
+        runtime._lp_auto_scheduler = None
+        assert runtime.lp_auto_state()['check_interval_seconds'] == 90
+
+
 def test_dashboard_omits_intents_without_materializing_detail_projection(tmp_path, monkeypatch):
     from open_trader import polymarket_lp_auto
     from tests.test_lp_auto_pool import setup

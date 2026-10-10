@@ -117,7 +117,8 @@ def test_presend_relative_rank_change_skips_only_this_candidate(runtime, change)
     tokens = [p.token_id for p in account.posts]
     assert tokens == [_refill_identity(i)[2] for i in ([2, 3] if change == 'rank' else [1, 2])], state['last_round']
     if change == 'rank':
-        assert state['last_round']['actions'][0]['reason'] == 'candidate_rank_changed'
+        assert [r['token_id'] for r in state['last_round']['targets']] == [_refill_identity(i)[2] for i in [2, 3]]
+        assert _refill_identity(1)[2] not in tokens
     else:
         assert account.posts[0].maker_amount == 7800000
     assert state['slots']['occupied'] == 2
@@ -371,8 +372,9 @@ def test_later_candidate_cannot_jump_a_processed_rank_inside_the_round(runtime):
         return result
     account.post_order = post
     state = execution.lp_auto_run_once(round_id='rank-jump')
-    assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in [1, 3]], state['last_round']
-    assert state['last_round']['actions'][1]['reason'] == 'candidate_rank_changed'
+    assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in [1, 2]], state['last_round']
+    assert _refill_identity(3)[2] not in [p.token_id for p in account.posts]
+    assert all(a.get('reason') != 'candidate_rank_changed' for a in state['last_round']['actions'])
 
 
 @pytest.mark.parametrize('invalid', ['stale', 'identity', 'incomplete', 'generation'])
@@ -401,7 +403,12 @@ def test_presend_account_fences_still_block_real_adapter_submissions(runtime, in
     assert account.posts == [], state['last_round']
     assert state['slots']['occupied'] == 0
     assert Decimal(state['funds']['buy_reserved_usd']) == 0
-    assert state['last_round']['actions'][0]['state'] == 'entry_rejected'
+    action = state['last_round']['actions'][0]
+    assert action['request_state'] == 'entry_rejected'
+    assert action['state'] == ('rejected' if invalid == 'stale' else 'pending')
+    if invalid != 'stale':
+        assert state['plan_wait']['kind'] == 'api'
+        assert not state['last_round']['completed_at']
 
 
 def test_sendtime_allowance_drop_skips_expensive_candidate_then_uses_api_remainder(runtime):

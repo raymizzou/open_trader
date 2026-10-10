@@ -1,6 +1,7 @@
 """Public offline contracts for receipt recovery and configured-level rotation."""
 import fcntl
 from datetime import timedelta
+from datetime import datetime
 from decimal import Decimal
 
 import pytest
@@ -171,6 +172,9 @@ def test_configured_price_level_departure_cancels_before_reselection(tmp_path, m
     engine, exchange, lp, _ = _level_pool(tmp_path, monkeypatch, level, target=target)
     assert Decimal(exchange.posts[0]['price']) == (Decimal('.39') if level == 2 else Decimal('.40'))
     _change_level_book(exchange, book)
+    assert engine.lp_auto_run_once()['last_round']['completed_at']
+    assert exchange.cancels == []
+    monkeypatch.setattr(pool, 'NOW', datetime.fromisoformat(engine.lp_auto_state()['plan_wait']['deadline']))
     state = engine.lp_auto_run_once()
     assert exchange.cancels == (['o1'] if canceled else []), state['last_round']
     assert len(exchange.posts) == 1
@@ -181,6 +185,8 @@ def test_configured_price_level_departure_cancels_before_reselection(tmp_path, m
 def test_cancel_confirmation_precedes_global_refill_and_can_reselect_same_market(tmp_path, monkeypatch, winner, fill):
     engine, exchange, lp, _ = _level_pool(tmp_path, monkeypatch, count=2)
     _change_level_book(exchange, 'add')
+    assert engine.lp_auto_run_once()['last_round']['completed_at']
+    monkeypatch.setattr(pool, 'NOW', datetime.fromisoformat(engine.lp_auto_state()['plan_wait']['deadline']))
     engine.lp_auto_run_once()
     assert exchange.cancels == ['o1']
     # ACK alone leaves the old BUY live and prevents a second order.
@@ -196,6 +202,7 @@ def test_cancel_confirmation_precedes_global_refill_and_can_reselect_same_market
     if fill != '0':
         exchange.positions = [dict(token_id='m00', condition_id='m00', size=fill)]
     rotation.refresh(lp, exchange, 2)
+    monkeypatch.setattr(pool, 'NOW', datetime.fromisoformat(engine.lp_auto_state()['plan_wait']['deadline']))
     state = engine.lp_auto_run_once()
     if fill != '0':
         assert len(exchange.posts) == 1
@@ -203,11 +210,23 @@ def test_cancel_confirmation_precedes_global_refill_and_can_reselect_same_market
         assert Decimal(state['funds']['available_usd']) == Decimal('96.88')
         assert state['last_round']['reason'] == 'rotation_filled'
     else:
-        expected = 'm00' if winner == 'same' else 'm01'
-        assert [p['token_id'] for p in exchange.posts] == ['m00', expected], str(state['last_round'])
-        assert Decimal(exchange.posts[-1]['price']) == (Decimal('.40') if winner == 'same' else Decimal('.39'))
+        # The originally selected m01 executes before the later ranking change.
+        assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01'], str(state['last_round'])
+        assert Decimal(exchange.posts[-1]['price']) == Decimal('.39')
         assert exchange.orders[-1]['order_id'] != 'o1'
         assert state['slots']['occupied'] == 1
+        if winner == 'same':
+            monkeypatch.setattr(pool, 'NOW', datetime.fromisoformat(state['plan_wait']['deadline']))
+            rotation.refresh(lp, exchange, 2)
+            state = engine.lp_auto_run_once()
+            assert exchange.cancels[-1] == exchange.orders[-1]['order_id']
+            exchange.orders[-1]['status'] = 'CANCELED'
+            monkeypatch.setattr(pool, 'NOW', datetime.fromisoformat(state['plan_wait']['deadline']))
+            state = engine.lp_auto_run_once()
+            assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01', 'm00']
+            assert Decimal(exchange.posts[-1]['price']) == Decimal('.40')
+            assert exchange.orders[-1]['order_id'] not in {'o1', 'o2'}
+            assert state['slots']['occupied'] == 1
 
 
 def test_full_pool_greedy_ranking_skips_unaffordable_candidates(tmp_path, monkeypatch):

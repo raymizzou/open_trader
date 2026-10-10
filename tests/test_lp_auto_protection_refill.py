@@ -4,6 +4,7 @@ from decimal import Decimal
 from threading import Event, local
 import time
 from types import SimpleNamespace
+from datetime import datetime
 
 import pytest
 from polymarket.models.clob.order_book import OrderBookLevel
@@ -68,6 +69,12 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
     def start_trace():
         return dict(requests=[], publishers=[], posts=[], posts_before=len(account.posts),
                     sdk_before=account.position_reads)
+
+    def advance_to_due():
+        waiting = execution.lp_auto_state().get('plan_wait')
+        if waiting:
+            runtime.clock[0] = max(runtime.clock[0], datetime.fromisoformat(waiting['deadline']))
+        _advance(runtime)
 
     def assert_fence_accounting(trace, *, invalidated=False):
         requests = trace['requests']
@@ -229,15 +236,31 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
                         result = pending.result(timeout=5)
                 assert result['funds']['status'] == 'known', result
                 assert result['admission_block_reasons'] == [], result
+                assert len(account.orders) == 3 and len(account.posts) == trace['posts_before']
+                assert result['plan_wait']['kind'] == 'api'
+                assert len(calls) == 1
+                assert len(trace['requests']) == len(trace['publishers']) == 1
+                assert trace['requests'][0]['invalidated'] is True
+                assert trace['requests'][0]['sdk_after'] == trace['requests'][0]['sdk_before'] + 1
+                assert account.position_reads == after_publication
+                early = execution.lp_auto_scheduled_check()
+                assert early['plan_wait'] == result['plan_wait']
+                assert len(account.posts) == trace['posts_before']
+                active_trace = None
+                advance_to_due()
+                publish_qualification()
+                lp.refresh_candidate_recommendations()
+                trace = start_trace()
+                active_trace = trace
+                result = execution.lp_auto_scheduled_check()
                 assert len(account.orders) == 5, result['last_round']
-                assert len(calls) == 6, 'Invalidated initial read, two per BUY, final read'
-                assert_fence_accounting(trace, invalidated=True)
-                assert 5 <= account.position_reads - after_publication <= 8
+                assert_fence_accounting(trace)
                 active_trace = None
                 assert result['slots']['occupied'] == 5
                 assert len(account.posts) == 7 + 2 * cycle
                 continue
             if dependency != 'healthy':
+                advance_to_due()
                 with monkeypatch.context() as blocked:
                     if dependency == 'timeout':
                         def unavailable(**kwargs):
@@ -263,11 +286,18 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
                 if dependency == 'qualification':
                     publish_qualification()
                 lp.refresh_candidate_recommendations()
+            advance_to_due()
+            # This fixture has no background candidate scanner. The added
+            # business waits can expire its initially published candidate pool.
+            publish_qualification()
             before = account.position_reads
             trace = start_trace()
             active_trace = trace
             result = execution.lp_auto_run_once(round_id=f'refill-{cycle}')
-            assert len(account.orders) == 5, result['last_round']
+            assert len(account.orders) == 5, dict(reason=result['last_round']['reason'],
+                candidates=result['last_round']['candidate_count'],
+                filters={key: result['last_round']['candidate_filter'].get(key) for key in
+                         ('counts', 'reasons', 'recheck_reasons')})
             assert len(account.posts) == 7 + 2 * cycle
             assert result['slots']['occupied'] == 5
             assert result['funds']['status'] == 'known'

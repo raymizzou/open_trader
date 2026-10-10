@@ -298,6 +298,67 @@ def test_config_saves_parameters_without_enabling(service, capsys):
     assert service.orders == [{'id': 'buy-1', 'side': 'BUY'}, {'id': 'sell-1', 'side': 'SELL'}]
 
 
+@pytest.mark.parametrize('field,value', [('round_interval_seconds', 90), ('api_retry_interval_seconds', 30), ('order_check_interval_seconds', 15)])
+def test_timing_parameters_can_be_configured_independently(service, capsys, field, value):
+    defaults = dict(round_interval_seconds=60, api_retry_interval_seconds=60, order_check_interval_seconds=10)
+    service.state.update(defaults, desired_running=True, pause_confirmed=False, runtime_state='running')
+    before = deepcopy(service.state)
+    option = '--' + field.replace('_', '-')
+    assert invoke(service, 'config', option, str(value), '--json') == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['result'] == 'CONFIGURED'
+    assert posts(service) == [(ROOT + 'config', {field: value, 'expected_config_version': 7})]
+    assert result['state']['config_version'] == 8
+    for key in defaults:
+        assert result['state'][key] == (value if key == field else before[key])
+    for key in ('budget_usd', 'target_buy_count', 'buy_price_level', 'desired_running'):
+        assert result['state'][key] == before[key]
+    assert invoke(service, 'status') == 0
+    output = capsys.readouterr().out
+    for key in defaults:
+        assert f'{key}: {value if key == field else before[key]}' in output.splitlines()
+    service.state.update(desired_running=False, pause_confirmed=True, runtime_state='paused')
+    assert invoke(service, 'config', '--budget', '120', '--target-buys', '0', '--json') == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['state'][field] == value
+    assert result['state']['buy_price_level'] == 2
+
+
+@pytest.mark.parametrize('field', ['round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds'])
+@pytest.mark.parametrize('fault', ['0', '-1', '1.5', 'invalid', 'wrong_value', 'string_value', 'bool_value', 'missing_value', 'wrong_version', 'changed_omitted', 'changed_intent'])
+def test_timing_parameters_reject_invalid_values_and_unconfirmed_results(service, capsys, field, fault):
+    service.state.update(round_interval_seconds=60, api_retry_interval_seconds=60, order_check_interval_seconds=10,
+                         desired_running=True, pause_confirmed=False, runtime_state='running')
+    before = deepcopy(service.state)
+    invalid = fault in {'0', '-1', '1.5', 'invalid'}
+    if not invalid:
+        reply = {**service.state, field: 15, 'config_version': 8}
+        if fault == 'missing_value':
+            reply.pop(field)
+        elif fault == 'wrong_version':
+            reply['config_version'] = 7
+        elif fault == 'changed_omitted':
+            omitted = next(key for key in ('round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds') if key != field)
+            reply[omitted] = 99
+        elif fault == 'changed_intent':
+            reply['desired_running'] = False
+        else:
+            reply[field] = {'wrong_value': 14, 'string_value': '15', 'bool_value': True}[fault]
+        service.reply = reply
+    assert invoke(service, 'config', '--' + field.replace('_', '-') + '=' + (fault if invalid else '15'), '--json') == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result['result'] == 'UNKNOWN'
+    assert result['reason']
+    if invalid:
+        assert service.requests == []
+        assert service.state == before
+    else:
+        assert posts(service) == [(ROOT + 'config', {field: 15, 'expected_config_version': 7})]
+        assert service.state['config_version'] == 8
+        assert service.state[field] == 15
+    assert service.orders == [{'id': 'buy-1', 'side': 'BUY'}, {'id': 'sell-1', 'side': 'SELL'}]
+
+
 @pytest.mark.parametrize('option,value', [
     ('--budget', '-1'), ('--budget', 'NaN'), ('--budget', 'Infinity'),
     ('--budget', '-Infinity'), ('--target-buys', '-1'), ('--target-buys', '1.5'),
