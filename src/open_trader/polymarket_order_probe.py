@@ -358,8 +358,12 @@ def run(client, args, config, account, book, server, price, quantity, report, st
         with deadline():
             signed = client.lp_create_limit_order(token_id=args.token, price=price, quantity=quantity,
                     side='BUY', post_only=True, expiration=expiration)
-        if (signed.maker_amount != int(price * quantity * 1000000)
-                or signed.taker_amount != int(quantity * 1000000)
+        # Integer cross-products retain every requested digit, independent of Decimal precision.
+        price_numerator, price_denominator = price.as_integer_ratio()
+        quantity_numerator, quantity_denominator = quantity.as_integer_ratio()
+        if (signed.maker_amount * price_denominator * quantity_denominator
+                != price_numerator * quantity_numerator * 1000000
+                or signed.taker_amount * quantity_denominator != quantity_numerator * 1000000
                 or str(signed.token_id) != args.token or signed.side != 'BUY'
                 or signed.expiration != expiration or signed.order_type != 'GTD' or signed.post_only is not True):
             raise ProbeError('signed_order_mismatch', 'BLOCKED')
@@ -367,6 +371,8 @@ def run(client, args, config, account, book, server, price, quantity, report, st
             now = client._client._ctx.clob.get_json('/time')
         if type(now) is not int or expiration - now < 180:
             raise ProbeError('expiration_too_close', 'BLOCKED')
+        if not 0 <= now - book.timestamp.timestamp() <= 10:
+            raise ProbeError('market_stale')
         if time.monotonic() - started > 10:
             raise ProbeError('account_or_market_stale')
         data['attempted'] = True
@@ -387,8 +393,13 @@ def run(client, args, config, account, book, server, price, quantity, report, st
         hooks = client._client._ctx.secure_clob._client.event_hooks['response']
         hooks.append(observe)
         try:
-            with deadline():
-                response = client.lp_post_order(signed)
+            try:
+                with deadline():
+                    response = client.lp_post_order(signed)
+            except RequestRejectedError as error:
+                report['submit_http_status'] = error.status
+                raise ProbeError('venue_rejected' if 400 <= error.status < 500 else 'submit_unknown',
+                                 'REJECTED' if 400 <= error.status < 500 else 'UNKNOWN') from None
             order_id = getattr(response, 'order_id', None)
             if submit_facts.get('explicit_rejection'):
                 raise ProbeError('venue_rejected', 'REJECTED')
@@ -407,14 +418,10 @@ def run(client, args, config, account, book, server, price, quantity, report, st
             finally:
                 if write_failed:
                     report.update(result='UNKNOWN', reason='record_write_failed', order_validation='UNKNOWN')
-        except RequestRejectedError as error:
-            report.update(result='REJECTED' if 400 <= error.status < 500 else 'UNKNOWN',
-                          reason='venue_rejected' if 400 <= error.status < 500 else 'submit_unknown',
-                          submit_http_status=error.status)
         except ProbeError as error:
             report.update(result=error.result, reason=error.reason)
         except Exception:
-            report.update(result='UNKNOWN', reason='submit_or_reconciliation_unknown')
+            report.update(result='UNKNOWN', order_validation='UNKNOWN', reason='submit_or_reconciliation_unknown')
         finally:
             hooks.remove(observe)
         data.update(report)

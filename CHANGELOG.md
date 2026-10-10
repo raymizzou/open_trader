@@ -9,7 +9,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   run/cancel；仅 BUY/post-only/GTD，名义金额硬上限 1 USDC，记录真实地域结果，
   不修改 Shadow 或 production 门禁。私有原子回执在提交前保存 attempted，未知结果
   不重发、不猜 ID；仅撤明确自有订单，并核对终态、成交、资金和选定 token 持仓。
-  合成凭据、SDK 外部 HTTP fixture 与相关认证用例共 49 项聚焦检查通过，
+  独立评审修复签名金额比对的有损取整及长精度数量被舍入、已接受订单的后续 GET 被误记为提交拒绝，
+  以及提交前遗漏最终 CLOB 时间对应盘口年龄检查的问题；用户输入不被隐式截断。
+  合成凭据、SDK 外部 HTTP fixture 与相关认证用例共 56 项聚焦检查通过，
   shell 语法和离线入口一致性通过；事实时效用例的有序 RED 证据缺口已披露。
   未执行实盘下单、部署或跨主机互斥验证，独立评审及 CI 由 Main 接手。
 

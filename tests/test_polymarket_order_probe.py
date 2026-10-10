@@ -46,6 +46,9 @@ class Exchange:
         self.clock = None
         self.book_token = None
         self.market_token = None
+        self.terminal_get_status = None
+        self.time_sequence = None
+        self.submission_clock = None
 
     @property
     def mutations(self):
@@ -90,7 +93,9 @@ class Exchange:
             data = [dict(conditionId=CONDITION, proxyWallet=SIGNER, asset=TOKEN,
                          size='2' if self.position_changed and self.cancelled else '0')]
         elif path == '/time':
-            data = self.server_time
+            data = self.server_time if self.time_sequence is None else self.time_sequence.pop(0)
+            if self.submission_clock is not None and not self.time_sequence:
+                self.submission_clock['now'] = 2
         elif path == '/book':
             data = dict(market=CONDITION, asset_id=self.book_token or TOKEN, timestamp=str(self.book_time),
                         bids=[dict(price='0.09', size='10')], asks=[dict(price=self.ask, size='10')],
@@ -121,6 +126,8 @@ class Exchange:
             self.cancelled = self.cancel_mode != 'still_live'
             data = dict(canceled=[] if self.cancel_mode == 'missing_ack' else ['probe-1'], not_canceled={})
         elif path == '/data/order/probe-1':
+            if self.cancelled and self.terminal_get_status is not None:
+                return httpx.Response(self.terminal_get_status, json={'error': SECRET}, request=request)
             if self.cancelled and self.cancel_mode == 'read_error':
                 return httpx.Response(500, json={'error': SECRET}, request=request)
             data = self.order()
@@ -455,3 +462,56 @@ def test_run_rejects_book_for_another_token(exchange, capsys):
     assert report['result'] == 'UNKNOWN'
     assert report['reason'] == 'book_token_mismatch'
     assert exchange.mutations == []
+
+
+@pytest.mark.parametrize('quantity', ['5.0000001', '5.000001', '5.0000000000000000000000000001'])
+def test_run_rejects_inexact_signed_amounts(exchange, capsys, quantity):
+    code, report, _ = invoke(exchange, capsys, 'run', LIVE, quantity=quantity)
+    assert code == 2
+    assert report['result'] == 'BLOCKED'
+    assert report['reason'] == 'signed_order_mismatch'
+    assert exchange.mutations == []
+
+
+@pytest.mark.parametrize('terminal_get_status', [401, 403, 404])
+def test_post_submit_read_rejection_remains_unknown(exchange, capsys, terminal_get_status):
+    exchange.terminal_get_status = terminal_get_status
+    code, report, output = invoke(exchange, capsys, 'run', LIVE)
+    assert code == 2
+    assert report['result'] == 'UNKNOWN'
+    assert report['order_validation'] == 'UNKNOWN'
+    assert report['order_id'] == 'probe-1'
+    assert report['live_observed'] is True
+    assert report['cancel_acknowledged'] is True
+    assert report.get('submit_http_status') != terminal_get_status
+    assert SECRET not in output
+    receipt = json.loads(exchange.record.read_text())
+    assert receipt['order_id'] == 'probe-1'
+    assert receipt['result'] == 'UNKNOWN'
+    assert receipt['order_validation'] == 'UNKNOWN'
+    assert receipt['live_observed'] is True
+    assert receipt['cancel_acknowledged'] is True
+    assert receipt.get('submit_http_status') != terminal_get_status
+    assert [json.loads(r.content) for r in exchange.mutations if r.method == 'DELETE'] == [['probe-1']]
+    assert len([r for r in exchange.mutations if r.method == 'POST']) == 1
+    before = len(exchange.mutations)
+    code, report, _ = invoke(exchange, capsys, 'status')
+    assert code == 2
+    assert report['result'] == 'UNKNOWN'
+    assert len(exchange.mutations) == before
+    code, _, _ = invoke(exchange, capsys, 'run', LIVE)
+    assert code == 2
+    assert len(exchange.mutations) == before
+
+
+def test_run_rechecks_book_age_at_submission(exchange, capsys, monkeypatch):
+    clock = {'now': 0}
+    exchange.time_sequence = [1700000009, 1700000011]
+    exchange.submission_clock = clock
+    monkeypatch.setattr(time, 'monotonic', lambda: clock['now'])
+    code, report, _ = invoke(exchange, capsys, 'run', LIVE)
+    assert clock['now'] == 2
+    assert exchange.mutations == []
+    assert code == 2
+    assert report['result'] == 'UNKNOWN'
+    assert report['reason'] == 'market_stale'
