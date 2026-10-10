@@ -5,6 +5,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-10
 
+- 新增独立 `lpprobe tokyo` 一命令诊断入口与专属安装器：从当前托管发布及其
+  已配置可信 Python 自动解析，以 Prediction 用户扫描至多 3 页/20 个盘口，
+  选择一 tick 买价和向上取整的最小份额，保留 1 USDC 上限、一次 POST、精确
+  撤单和完整对账。新模式记录 `single_writer=not_claimed`；私有钱包回执锁支持
+  已知 ID 自动恢复，未知 ID 不重发，其他订单或持仓变化不能误报 PASS。
+  保留人工 check/run/status/cancel；地域独立报告。合成 HTTP、离线安装/SSH
+  与解析器进程/文件边界及相关认证的 95 项聚焦检查通过，shell/离线入口检查通过；
+  未安装真实入口、连接东京、部署或下单。
+
 - 新增 #321 人工 Polymarket 单笔诊断 CLI：只读 check、GET-only status 与明确确认的
   run/cancel；仅 BUY/post-only/GTD，名义金额硬上限 1 USDC，记录真实地域结果，
   不修改 Shadow 或 production 门禁。私有原子回执在提交前保存 attempted，未知结果
