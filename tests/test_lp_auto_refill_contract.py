@@ -423,9 +423,11 @@ def test_presend_account_fences_still_block_real_adapter_submissions(runtime, in
     action = state['last_round']['actions'][0]
     assert action['request_state'] == 'entry_rejected'
     assert action['state'] == ('rejected' if invalid == 'stale' else 'pending')
-    if invalid != 'stale':
-        assert state['plan_wait']['kind'] == 'api'
-        assert not state['last_round']['completed_at']
+    if invalid == 'stale':
+        assert action['reason'] == 'market_metadata_stale'
+        assert 'account_financial_facts_stale' in state['admission_block_reasons']
+    assert state['plan_wait']['kind'] == 'api'
+    assert not state['last_round']['completed_at']
 
 
 def test_sendtime_allowance_drop_skips_expensive_candidate_then_uses_api_remainder(runtime):

@@ -195,6 +195,208 @@ def test_precancel_generation_change_uses_api_wait(tmp_path, monkeypatch):
         datetime.fromisoformat(state['last_round']['completed_at']) + timedelta(seconds=300))
 
 
+def test_precancel_account_ttl_uses_api_wait(tmp_path, monkeypatch):
+    engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch, ('A', 'B', 'C', 'D', 'I'))
+    engine.lp_auto_configure(dict(round_interval_seconds=300,
+        api_retry_interval_seconds=60, order_check_interval_seconds=1))
+    original_orders = live_orders(exchange)
+    reads = dict(account=0, shared=0, metadata=0, reward=0, books=0)
+    account_times, book_tokens, market_ages, selected = [], [], [], []
+    metadata_times, reward_times = {}, {}
+    aging = [True]
+    for name, counter in [('lp_account_snapshot', 'account'),
+                          ('lp_account_snapshot_shared', 'shared'),
+                          ('lp_market_metadata_fresh', 'metadata'),
+                          ('lp_reward_catalog', 'reward'), ('lp_order_books', 'books')]:
+        external = getattr(exchange, name)
+        def observed(*args, _read=external, _counter=counter, **kwargs):
+            reads[_counter] += 1
+            if _counter == 'books' and aging[0]:
+                if len(book_tokens) == 8:
+                    selected.append(engine.lp_auto_state())
+                monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(seconds=6))
+            result = _read(*args, **kwargs)
+            if _counter == 'shared':
+                account_times.append(result['checked_at'])
+            elif _counter == 'metadata':
+                metadata_times.update({token: row['metadata_checked_at'] for token, row in result.items()})
+            elif _counter == 'reward':
+                reward_times.update({row['condition_id']: row['reward_checked_at'] for row in result['markets']})
+            elif _counter == 'books' and aging[0]:
+                token = args[0][0]
+                book_tokens.append(token)
+                assert result[token]['received_at'] == pool.NOW
+                market_ages.append((pool.NOW - metadata_times[token], pool.NOW - reward_times[token]))
+            return result
+        monkeypatch.setattr(exchange, name, observed)
+    scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
+    assert scheduler.run_due()
+    state = engine.lp_auto_state()
+    assert book_tokens == ['A', 'B', 'C', 'D', 'I', 'E', 'F', 'G', 'A', 'D', 'I']
+    assert all(metadata_age == reward_age == timedelta(seconds=6) for metadata_age, reward_age in market_ages)
+    assert len(account_times) == 1 and len(selected) == 1
+    plan = selected[0]['active_plan']
+    original_targets = selected[0]['last_round']['targets']
+    assert datetime.fromisoformat(plan['started_at']) - account_times[0] == timedelta(seconds=48)
+    assert pool.NOW - account_times[0] == timedelta(seconds=66)
+    assert [row['condition_id'] for row in plan['targets']] == ['B', 'C', 'E', 'F', 'G']
+    assert all(Decimal(row['price']) == Decimal('.39') and Decimal(row['quantity']) == 20 for row in plan['targets'])
+    assert [(action['kind'], action['condition_id']) for action in plan['actions']] == [
+        ('cancel', 'A'), ('cancel', 'D'), ('cancel', 'I'), ('buy', 'E'), ('buy', 'F'), ('buy', 'G')]
+    action_ids = [action['action_id'] for action in plan['actions']]
+    assert all(action['state'] == 'pending' for action in state['active_plan']['actions'])
+    assert state['active_plan']['targets'] == plan['targets']
+    assert not state['last_round']['completed_at']
+    assert exchange.cancels == exchange.posts == [] and live_orders(exchange) == original_orders
+    assert state['slots']['occupied'] == 5 and Decimal(state['funds']['buy_reserved_usd']) == Decimal('39.00')
+    assert all(not store.lp_actions(session['session_id']) for session in store.lp_sessions())
+    assert state['last_round']['reason'] == 'account_financial_facts_stale'
+    assert state['plan_wait']['kind'] == 'api', state['plan_wait']
+    started = datetime.fromisoformat(state['plan_wait']['started_at'])
+    deadline = datetime.fromisoformat(state['plan_wait']['deadline'])
+    assert started == pool.NOW and deadline == started + timedelta(seconds=60)
+    stopped_reads = dict(reads)
+    for elapsed in (1, 59):
+        monkeypatch.setattr(pool, 'NOW', started + timedelta(seconds=elapsed))
+        scheduler.request_check()
+        assert not scheduler.run_due()
+        assert reads == stopped_reads and exchange.cancels == exchange.posts == []
+        pending = engine.lp_auto_state()['active_plan']
+        assert pending['round_id'] == plan['round_id'] and pending['targets'] == plan['targets']
+        assert [action['action_id'] for action in pending['actions']] == action_ids
+    aging[0] = False
+    monkeypatch.setattr(pool, 'NOW', deadline)
+    publish_candidates(exchange, lp, store, tuple('ABCDEFGHI'))
+    assert scheduler.run_due()
+    state = engine.lp_auto_state()
+    if state['active_plan']:
+        assert state['plan_wait']['kind'] == 'order'
+        at_deadline(monkeypatch, engine)
+        assert scheduler.run_due()
+        state = engine.lp_auto_state()
+    assert state['last_round']['round_id'] == plan['round_id']
+    assert state['last_round']['targets'] == original_targets
+    assert [action['action_id'] for action in state['last_round']['actions']] == action_ids
+    assert exchange.cancels == ['original-A', 'original-D', 'original-I']
+    assert [post['token_id'] for post in exchange.posts] == ['E', 'F', 'G']
+    assert live_orders(exchange)['B'] == 'original-B' and live_orders(exchange)['C'] == 'original-C'
+    assert set(live_orders(exchange)) == {'B', 'C', 'E', 'F', 'G'}
+    assert state['slots']['occupied'] == 5 and state['funds']['status'] == 'known'
+    assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('39.00')
+    assert len([action for session in store.lp_sessions() for action in store.lp_actions(session['session_id'])
+                if action.get('role') == 'reconciliation_cancel']) == 3
+    assert state['last_round']['completed_at'] and state['plan_wait']['kind'] == 'round'
+    assert datetime.fromisoformat(state['plan_wait']['deadline']) == (
+        datetime.fromisoformat(state['last_round']['completed_at']) + timedelta(seconds=300))
+
+
+def test_final_buy_guard_account_invalidity_pauses_plan(tmp_path, monkeypatch):
+    engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch)
+    engine.lp_auto_configure(dict(round_interval_seconds=1,
+        api_retry_interval_seconds=60, order_check_interval_seconds=10))
+    reads = dict(account=0, shared=0, metadata=0, reward=0, books=0)
+    signs, sign_reads, shared_snapshots = [], [], []
+    selected, invalidated_at, invalid_states = [], [], []
+    armed = [False]
+    for name, counter in [('lp_account_snapshot', 'account'),
+                          ('lp_account_snapshot_shared', 'shared'),
+                          ('lp_market_metadata_fresh', 'metadata'),
+                          ('lp_reward_catalog', 'reward'), ('lp_order_books', 'books')]:
+        external = getattr(exchange, name)
+        def observed(*args, _read=external, _counter=counter, **kwargs):
+            reads[_counter] += 1
+            result = _read(*args, **kwargs)
+            if _counter == 'shared':
+                assert result['trade_generation'] == store.lp_trade_generation()
+                assert all(result[key] is True for key in ('balance_complete', 'trades_complete',
+                    'pagination_complete', 'open_orders_complete', 'positions_complete'))
+                shared_snapshots.append(result)
+            if _counter == 'books' and armed[0] and not invalidated_at and args[0] == ('B',):
+                assert reads['shared'] == sign_reads[0] + 1, 'final shared refresh succeeded after B signing'
+                selected.append(engine.lp_auto_state())
+                generation = shared_snapshots[-1]['trade_generation']
+                assert store.lp_advance_trade_generation(generation)
+                invalidated_at.append(pool.NOW)
+                invalid_states.append(engine.lp_auto_state())
+            return result
+        monkeypatch.setattr(exchange, name, observed)
+    sign = exchange.lp_create_limit_order
+    def observed_sign(**kwargs):
+        signed = sign(**kwargs)
+        signs.append(kwargs['token_id'])
+        if kwargs['token_id'] == 'B' and not invalidated_at:
+            sign_reads.append(reads['shared'])
+            armed[0] = True
+        return signed
+    exchange.lp_create_limit_order = observed_sign
+    scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
+    assert scheduler.run_due()
+    state = engine.lp_auto_state()
+    assert len(invalidated_at) == 1 and signs[0] == 'B'
+    assert 'account_financial_facts_changed' in invalid_states[0]['admission_block_reasons']
+    plan = selected[0]['active_plan']
+    original_targets = selected[0]['last_round']['targets']
+    assert [row['condition_id'] for row in plan['targets']] == ['B', 'C', 'E', 'F', 'G']
+    assert all(Decimal(row['price']) == Decimal('.39') and Decimal(row['quantity']) == 20 for row in plan['targets'])
+    assert [(action['kind'], action['condition_id']) for action in plan['actions']] == [
+        ('buy', 'B'), ('buy', 'C'), ('buy', 'E'), ('buy', 'F'), ('buy', 'G')]
+    action_ids = [action['action_id'] for action in plan['actions']]
+    failed_session = next(session for session in store.lp_sessions()
+                          if session['idempotency_key'] == 'lp-auto:' + action_ids[0])
+    original_audit = store.lp_actions(failed_session['session_id'])
+    assert len(original_audit) == 1 and original_audit[0]['state'] == 'rejected'
+    assert original_audit[0]['post_started'] is False
+    assert exchange.posts == exchange.cancels == [], state['last_round']
+    assert signs == ['B']
+    assert failed_session['state'] == 'entry_rejected'
+    assert failed_session['submit_stage'] == 'pre_send_rejected' and failed_session['post_started'] is False
+    assert failed_session['reason'] == 'account_financial_facts_changed'
+    assert state['active_plan']['round_id'] == plan['round_id']
+    assert state['active_plan']['targets'] == plan['targets']
+    assert [action['action_id'] for action in state['last_round']['actions']] == action_ids
+    assert all(action['state'] == 'pending' for action in state['last_round']['actions'])
+    first, *others = state['last_round']['actions']
+    assert first['request_state'] == 'entry_rejected'
+    assert first['attempts'] == [dict(request_id=action_ids[0], session_id=failed_session['session_id'],
+        state='not_sent', reason='account_financial_facts_changed')]
+    assert first['request_id'] != first['attempts'][0]['request_id']
+    assert all('request_state' not in action and 'attempts' not in action for action in others)
+    assert state['slots']['occupied'] == 0 and Decimal(state['funds']['buy_reserved_usd']) == 0
+    assert not state['last_round']['completed_at'] and state['plan_wait']['kind'] == 'api'
+    started = datetime.fromisoformat(state['plan_wait']['started_at'])
+    deadline = datetime.fromisoformat(state['plan_wait']['deadline'])
+    assert started == invalidated_at[0] and deadline == started + timedelta(seconds=60)
+    stopped_reads = dict(reads)
+    for elapsed in (1, 59):
+        monkeypatch.setattr(pool, 'NOW', started + timedelta(seconds=elapsed))
+        scheduler.request_check()
+        assert not scheduler.run_due()
+        assert reads == stopped_reads and signs == ['B'] and exchange.posts == exchange.cancels == []
+        pending = engine.lp_auto_state()['active_plan']
+        assert pending['round_id'] == plan['round_id'] and pending['targets'] == plan['targets']
+        assert [action['action_id'] for action in pending['actions']] == action_ids
+    armed[0] = False
+    monkeypatch.setattr(pool, 'NOW', deadline)
+    publish_candidates(exchange, lp, store, tuple('ABCDEFGHI'))
+    assert scheduler.run_due()
+    state = engine.lp_auto_state()
+    assert state['last_round']['round_id'] == plan['round_id']
+    assert state['last_round']['targets'] == original_targets
+    assert [action['action_id'] for action in state['last_round']['actions']] == action_ids
+    assert [post['token_id'] for post in exchange.posts] == ['B', 'C', 'E', 'F', 'G']
+    assert signs == ['B', 'B', 'C', 'E', 'F', 'G'] and exchange.cancels == []
+    assert store.lp_actions(failed_session['session_id']) == original_audit
+    assert state['last_round']['actions'][0]['session_id'] != failed_session['session_id']
+    assert state['last_round']['actions'][0]['request_id'] != action_ids[0]
+    assert state['last_round']['actions'][0]['attempts'] == first['attempts']
+    assert set(live_orders(exchange)) == {'B', 'C', 'E', 'F', 'G'}
+    assert state['slots']['occupied'] == 5 and state['funds']['status'] == 'known'
+    assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('39.00')
+    assert state['last_round']['completed_at'] and state['plan_wait']['kind'] == 'round'
+    assert datetime.fromisoformat(state['plan_wait']['deadline']) == (
+        datetime.fromisoformat(state['last_round']['completed_at']) + timedelta(seconds=1))
+
+
 @pytest.mark.parametrize('window', ['initial_account', 'pre_send_account'])
 def test_api_failure_pauses_and_recovers_the_same_plan(tmp_path, monkeypatch, window):
     initial = ('A', 'B', 'C', 'D', 'I') if window == 'initial_account' else ('B', 'C')

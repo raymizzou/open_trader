@@ -393,6 +393,22 @@ class LPAutoPool:
             newer = newer or current > previous
         return newer
 
+    def _account_failure_reason(self, cause=None):
+        document = self._read()
+        _, _, reasons = self._account_projection_facts(document)
+        sync_error = getattr(self.lp, '_account_order_sync_error', None)
+        if sync_error:
+            reasons.append(sync_error)
+        if not document['account_id'] or document['account_id'] != self.execution._lp_account_id():
+            reasons.append('account_identity_unknown')
+        if not reasons:
+            return None
+        if cause is None or cause in reasons or cause in {
+                'account_freshness_stale', 'account_freshness_invalid',
+                'account_facts_unknown', 'account_auth_unknown', 'account_funds_unknown'}:
+            return reasons[0]
+        return None
+
     def _unrepresented_intents(self, intents, account_buys, *, account_valid):
         """Keep audit rows, projecting only exposure not already priced by the API."""
         current_ids = {(b['order_id'], b['token_id']) for b in account_buys
@@ -2472,6 +2488,8 @@ class LPAutoPool:
                     reservations=self.lp._candidate_reservations(ignore_session_id=session_id))
                 self.lp._require_lp_history(request, now=self._now())
             except ValueError as exc:
+                if account_read_failure is None:
+                    account_read_failure = self._account_failure_reason()
                 raise AutoEntryNotSent(str(exc)) from exc
             with self._send_barrier():
                 lock=self.execution._acquire_global_lock()
@@ -2484,6 +2502,8 @@ class LPAutoPool:
                             if self.store.active_execution() is not None:
                                 raise ValueError('active_execution')
                         except ValueError as exc:
+                            if account_read_failure is None:
+                                account_read_failure = self._account_failure_reason()
                             raise AutoEntryNotSent(str(exc)) from exc
                         self._update(lambda d:d['intents'][intent_id].update(state='sending', financial_status='unknown', reconcile_reason='submission_pending'))
                 finally:
@@ -2670,7 +2690,8 @@ class LPAutoPool:
                 for action, result in zip(cancels, results):
                     action.update(result)
             except ValueError as exc:
-                wait_kind = 'api' if str(exc) == 'account_financial_facts_changed' else 'order'
+                wait_kind = ('api' if self._account_failure_reason()
+                    or str(exc) == 'account_financial_facts_changed' else 'order')
                 self._save_plan(plan, reason=str(exc), blocked=plan['blocked'], wait_kind=wait_kind)
                 return self.state()
         document = self._read()
@@ -2719,12 +2740,17 @@ class LPAutoPool:
                     plan.get('trading_config_version', plan['config_version']))
                 action.update(session_id=result.get('session_id'), order_id=result.get('entry_order_id'),
                               request_state=result.get('state'))
+                result_reason = result.get('reason') or result.get('submit_error')
                 if failure:
-                    if result.get('submit_stage') == 'pre_send_rejected':
-                        self._defer_unsent(plan, action, failure, result.get('session_id'))
+                    if (result.get('state') == 'entry_rejected'
+                            and result.get('submit_stage') == 'pre_send_rejected'
+                            and result.get('post_started') is False):
+                        if result_reason == failure or self._account_failure_reason(result_reason):
+                            self._defer_unsent(plan, action, result_reason, result.get('session_id'))
+                        else:
+                            action.update(state='rejected', reason=result_reason)
                     self._save_plan(plan, reason=failure, blocked=plan['blocked'], wait_kind='api')
                     return self.state()
-                result_reason = result.get('reason') or result.get('submit_error')
                 if (result.get('submit_stage') == 'pre_send_rejected' and result_reason in _PLAN_TRANSIENT_WAITS):
                     self._defer_unsent(plan, action, result_reason, result.get('session_id'))
                 else:
@@ -2732,10 +2758,14 @@ class LPAutoPool:
                         reason=result_reason)
             except ValueError as exc:
                 reason = str(exc)
-                if reason in _PLAN_TRANSIENT_WAITS:
+                failure = self._account_failure_reason()
+                if reason in _PLAN_TRANSIENT_WAITS or failure and self._account_failure_reason(reason):
                     action['wait_reason'] = reason
                 else:
                     action.update(state='rejected', reason=reason)
+                if failure:
+                    self._save_plan(plan, reason=failure, blocked=plan['blocked'], wait_kind='api')
+                    return self.state()
             self._save_plan(plan, blocked=plan['blocked'])
             if (not callable(getattr(self.lp.exchange, 'lp_account_snapshot_shared', None))
                     and self.state()['admission_block_reasons']):
