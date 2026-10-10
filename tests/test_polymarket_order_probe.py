@@ -737,3 +737,89 @@ def test_self_test_handles_submit_cancel_and_receipt_failures(self_exchange, cap
     if fault in ('fill2', 'fill5'):
         assert report['filled_quantity'] == ('2' if fault == 'fill2' else '5')
         assert report['filled_notional'] == ('0.02' if fault == 'fill2' else '0.05')
+
+
+def test_self_test_recovers_durable_cancel_ack_without_recancelling_terminal_order(self_exchange, capsys, monkeypatch):
+    self_exchange.terminal_get_status = 404
+    code, first, _ = invoke_self(self_exchange, capsys)
+    assert code == 2 and first['result'] == 'UNKNOWN'
+    assert first['order_id'] == 'probe-1'
+    assert first['live_observed'] is True and first['cancel_acknowledged'] is True
+    path = Path(first['evidence_path'])
+    durable = json.loads(path.read_text())
+    assert durable['result'] == 'UNKNOWN'
+    assert durable['order_id'] == 'probe-1'
+    assert durable['live_observed'] is True and durable['cancel_acknowledged'] is True
+    assert len([r for r in self_exchange.mutations if r.method == 'POST']) == 1
+    assert [json.loads(r.content) for r in self_exchange.mutations if r.method == 'DELETE'] == [['probe-1']]
+    self_exchange.terminal_get_status = None
+    assert self_exchange.cancelled is True
+    phase_two_start = len(self_exchange.requests)
+    original = self_exchange.handle
+    def venue(request):
+        if request.method == 'DELETE' and request.url.path == '/orders':
+            self_exchange.requests.append(request)
+            return httpx.Response(200, json=dict(canceled=[], not_canceled={'probe-1': 'already canceled'}), request=request)
+        return original(request)
+    monkeypatch.setattr(httpx.HTTPTransport, 'handle_request', lambda _, request: venue(request))
+    code, recovered, _ = invoke_self(self_exchange, capsys)
+    assert code == 0, recovered
+    assert recovered['result'] == 'PASS' and recovered['order_validation'] == 'VERIFIED'
+    assert recovered['order_id'] == 'probe-1' and recovered['recovered_previous'] is True
+    assert recovered['live_observed'] is True and recovered['cancel_acknowledged'] is True
+    assert recovered['terminal_status'] == 'CANCELED' and recovered['filled_quantity'] == '0'
+    assert recovered['funds_reconciled'] is True and recovered['other_activity_reconciled'] is True
+    phase_two = self_exchange.requests[phase_two_start:]
+    assert all(r.method == 'GET' for r in phase_two)
+    assert not any(r.url.path == '/markets/keyset' for r in phase_two)
+    assert len([r for r in self_exchange.mutations if r.method == 'POST']) == 1
+    assert len([r for r in self_exchange.mutations if r.method == 'DELETE']) == 1
+    completed = json.loads(path.read_text())
+    assert completed['result'] == 'PASS' and completed['order_validation'] == 'VERIFIED'
+    assert completed['order_id'] == 'probe-1'
+    assert completed['cancel_acknowledged'] is True and completed['live_observed'] is True
+
+
+@pytest.mark.parametrize('fault', ['terminal_unknown', 'no_historical_ack', 'still_live'])
+def test_self_test_recovery_requires_fresh_terminal_proof(self_exchange, capsys, monkeypatch, fault):
+    self_exchange.terminal_get_status = 404
+    if fault == 'no_historical_ack': self_exchange.cancel_mode = 'missing_ack'
+    code, first, _ = invoke_self(self_exchange, capsys)
+    assert code == 2 and first['result'] == 'UNKNOWN'
+    assert first['order_id'] == 'probe-1' and first['live_observed'] is True
+    assert first['cancel_acknowledged'] is (fault != 'no_historical_ack')
+    path = Path(first['evidence_path'])
+    phase_two_start = len(self_exchange.requests)
+    if fault != 'terminal_unknown': self_exchange.terminal_get_status = None
+    if fault == 'still_live': self_exchange.cancelled = False
+    original = self_exchange.handle
+    def venue(request):
+        if request.method == 'DELETE' and request.url.path == '/orders':
+            self_exchange.requests.append(request)
+            assert json.loads(request.content) == ['probe-1']
+            # Still-LIVE simulates an acknowledged request with unverified effect.
+            canceled = ['probe-1'] if fault == 'still_live' else []
+            return httpx.Response(200, json=dict(canceled=canceled,
+                not_canceled={} if canceled else {'probe-1': 'already canceled'}), request=request)
+        return original(request)
+    monkeypatch.setattr(httpx.HTTPTransport, 'handle_request', lambda _, request: venue(request))
+    code, recovered, _ = invoke_self(self_exchange, capsys)
+    assert code == 2 and recovered['result'] == 'UNKNOWN', recovered
+    assert recovered['order_id'] == 'probe-1' and recovered['recovered_previous'] is True
+    assert recovered['cancel_acknowledged'] is (fault != 'no_historical_ack')
+    phase_two = self_exchange.requests[phase_two_start:]
+    assert not any(r.method == 'POST' for r in phase_two)
+    assert not any(r.url.path == '/markets/keyset' for r in phase_two)
+    deletes = [json.loads(r.content) for r in phase_two if r.method == 'DELETE']
+    assert deletes == [['probe-1']]
+    assert all(r.url.path == '/orders' for r in phase_two if r.method != 'GET')
+    if fault == 'no_historical_ack':
+        assert recovered['terminal_status'] == 'CANCELED'
+        assert recovered['filled_quantity'] == '0' and recovered['funds_reconciled'] is True
+        assert recovered['order_validation'] == 'UNKNOWN'
+    if fault == 'still_live':
+        assert recovered['terminal_status'] == 'LIVE' and recovered['order_validation'] == 'UNKNOWN'
+    durable = json.loads(path.read_text())
+    assert durable['result'] == 'UNKNOWN' and durable['order_id'] == 'probe-1'
+    assert durable['live_observed'] is True
+    assert durable['cancel_acknowledged'] is (fault != 'no_historical_ack')

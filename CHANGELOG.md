@@ -5,6 +5,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-10
 
+- PR #325 评审修复一命令诊断的两个阻断项：应用 Python 使用 `-P`，防止 SSH
+  继承目录中的同名包覆盖已核对源码；自动恢复保留同一订单的持久撤单 ACK，
+  对已验证终态不重复撤单，并仍要求新鲜终态、零成交及完整对账才能 PASS。
+  未知终态、缺少历史 ACK 和仍 LIVE 的订单保持 UNKNOWN；人工命令语义不变。
+  实际 Python 解析与合成 HTTP 回归覆盖修复，增量 5 例及聚焦回归共 100 项通过；
+  初始 F2 完整有序 RED 受 fixture 历史丢失影响；一次标注的旧基线重放核对
+  实际导入路径及 Git blob 散列，确认回归敏感性，不能改记为有序 RED。
+  未执行真实主机或实盘验证。
+
 - 新增独立 `lpprobe tokyo` 一命令诊断入口与专属安装器：从当前托管发布及其
   已配置可信 Python 自动解析，以 Prediction 用户扫描至多 3 页/20 个盘口，
   选择一 tick 买价和向上取整的最小份额，保留 1 USDC 上限、一次 POST、精确

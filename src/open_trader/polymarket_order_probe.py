@@ -283,7 +283,7 @@ def trade_fills(account, data):
     return quantity, notional
 
 
-def reconcile(client, data, report, *, cancel=False):
+def reconcile(client, data, report, *, cancel=False, recovering=False):
     """Read at most once per phase; cancel only this submission's explicit ID."""
     stop = time.monotonic() + 30
     def bounded(call):
@@ -295,6 +295,9 @@ def reconcile(client, data, report, *, cancel=False):
     order_id = data['order_id']
     if not order_id:
         raise ProbeError('order_id_unknown')
+    historical_ack = recovering and data.get('cancel_acknowledged') is True
+    if recovering:
+        report['cancel_acknowledged'] = historical_ack
     observed = None
     read_failed = False
     try:
@@ -306,14 +309,16 @@ def reconcile(client, data, report, *, cancel=False):
     if observed is not None:
         report['live_observed'] = data.get('live_observed', False) or observed.status.upper() == 'LIVE'
         report['identity_verified'] = True
-    if cancel:
+    terminal_with_ack = (recovering and historical_ack and observed is not None
+                         and observed.status.upper() in ('CANCELED', 'CANCELLED', 'EXPIRED'))
+    if cancel and not terminal_with_ack:
         # An unreadable response does not remove the explicit ID returned by our POST.
         # An observed identity mismatch above prevents DELETE.
         try:
             ack = bounded(lambda: client.cancel_orders_detailed((order_id,)))
-            report['cancel_acknowledged'] = order_id in ack['canceled']
+            report['cancel_acknowledged'] = historical_ack or order_id in ack['canceled']
         except Exception:
-            report['cancel_acknowledged'] = False
+            report['cancel_acknowledged'] = historical_ack
     else:
         report['cancel_acknowledged'] = data.get('cancel_acknowledged', False)
     terminal = bounded(lambda: client._client.get_order(order_id=order_id))
@@ -610,7 +615,7 @@ def self_test_bounded(args):
                                   notional=str(Decimal(data['price']) * Decimal(data['quantity'])),
                                   selected_market=data.get('selected_market'), outcome=data.get('outcome'))
                     try:
-                        reconcile(client, data, report, cancel=True)
+                        reconcile(client, data, report, cancel=True, recovering=True)
                     except ProbeError as error:
                         report.update(result=error.result, reason=error.reason)
                     except Exception:

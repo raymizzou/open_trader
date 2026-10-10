@@ -256,6 +256,9 @@ host-key 校验，禁用 agent 转发及复用连接。远端固定 bootstrap �
 当前不可变源码及已配置可信 Python。它通过 `runuser -u prediction` 执行
 财务应用，绝不以 root 下单。Python 可以来自另一个既有、锁匹配的不可变
 venv；不假定其目录 SHA 与源码 SHA 相同，不安装或同步环境。
+应用 Python 使用 `-P`，配合已核对源码的显式 `PYTHONPATH`，排除 SSH 继承的
+工作目录作为隐式包搜索入口。同名旧包不能覆盖当前发布；不使用会忽略该
+`PYTHONPATH` 的 `-I` 来执行财务模块。root bootstrap 的 `-I` 仍只隔离解析器。
 
 每次从 `/etc/open-trader/prediction-cloud.json`、
 `/var/lib/open-trader/prediction/prediction-systemd-release.json` 和实际 unit
@@ -285,8 +288,16 @@ transport 等待上限 130 秒，不抢先中止正常清理窗口。仅一 POST
 `single_writer=not_claimed` 不声称全钱包或跨主机互斥，不要求人工单写者证明。
 在 runtime 内自动创建 service-owned 0700 的 `order-probe` 目录，并使用
 钱包标识散列命名的 0600 回执与非阻塞锁。目录允许正常的多个 link；普通账户、
-凭据和控制文件仍须单 link，并分别核对 service/root 所有权。发现未完成旧回执时，已知 ID 先撤单
-并对账，本次不再 POST；attempted 但未知 ID 保持 UNKNOWN，不搜索、猜 ID
+凭据和控制文件仍须单 link，并分别核对 service/root 所有权。发现未完成旧回执时，已知 ID 先核对
+精确身份；已有同一订单的持久撤单 ACK，且新鲜读取证明已终态时，只读核对
+终态、成交、资金和持仓，不重复 DELETE，本次不再 POST。仍 LIVE 或无法可靠
+读取终态时可执行一次必要的精确 ID 清理；历史 ACK 事实不会因再次撤单未 ACK
+而丢失，但历史事实不能代替新鲜终态证明。没有历史 ACK 时，终态本身不算撤单
+ACK；无法取得 ACK 仍为 UNKNOWN。人工 status/cancel 的行为不变。
+2026-10-10 的合成回归验证了该恢复行为。初始完整有序 RED 受测试 fixture 的
+请求历史丢失影响；一次明确标注、实际导入路径/散列核对的旧基线重放确认
+回归敏感性。当前修复的 GREEN 与该重放分开记录，均不是实盘验证。
+attempted 但未知 ID 保持 UNKNOWN，不搜索、猜 ID
 或重发。完成回执归档后，下一次调用才能创建独立 attempt。断网、主机故障或
 磁盘故障后可能仍是 UNKNOWN；保留证据，不承诺任何故障下都能自动清理。
 

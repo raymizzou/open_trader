@@ -281,3 +281,33 @@ def test_remote_resolver_accepts_actual_directory_and_control_record_ownership(i
     assert commands[0][:5] == ['/usr/sbin/runuser', '-u', 'prediction', '--', '/usr/bin/env']
     assert '/opt/open-trader/venvs/2797cd5029c7812e9405825674f559e7d1ebafaa/bin/python' in commands[0]
     assert 'PYTHONPATH=/opt/open-trader/releases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/src' in commands[0]
+
+
+def test_remote_launcher_executes_verified_module_despite_inherited_shadow_package(installation, monkeypatch, tmp_path):
+    verified_src = tmp_path / 'verified-release' / 'src'
+    inherited_cwd = tmp_path / 'ssh-cwd'
+    for parent, marker in [(verified_src, 'VERIFIED_RELEASE'), (inherited_cwd, 'CWD_SHADOW')]:
+        package = parent / 'open_trader'
+        package.mkdir(parents=True)
+        (package / '__init__.py').write_text('')
+        (package / 'polymarket_order_probe.py').write_text('print(' + repr(marker) + ')\n')
+    profile_data = json.loads(installation['profile'].read_text())
+    code, commands = remote_boundary(monkeypatch, profile_data, 'a' * 40,
+        runtime_sha='2797cd5029c7812e9405825674f559e7d1ebafaa')
+    assert code == 0 and len(commands) == 1
+    emitted = commands[0]
+    assert emitted[:5] == ['/usr/sbin/runuser', '-u', 'prediction', '--', '/usr/bin/env']
+    interpreter_index = emitted.index('/opt/open-trader/venvs/2797cd5029c7812e9405825674f559e7d1ebafaa/bin/python')
+    environment = emitted[5:interpreter_index]
+    assert 'PYTHONPATH=/opt/open-trader/releases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/src' in environment
+    # Translate only the virtual host's verified src/interpreter and runuser boundary.
+    # Preserve every emitted interpreter option, environment setting and inherited cwd.
+    translated_environment = [
+        'PYTHONPATH=' + str(verified_src) if item ==
+        'PYTHONPATH=/opt/open-trader/releases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/src' else item
+        for item in environment]
+    process = subprocess.run(['/usr/bin/env', *translated_environment, sys.executable,
+                              *emitted[interpreter_index + 1:]], cwd=inherited_cwd,
+                             stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=15)
+    assert process.returncode == 0, process.stderr
+    assert process.stdout.strip() == 'VERIFIED_RELEASE'

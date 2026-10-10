@@ -146,7 +146,7 @@ def remote(p):
         need(remaining >= 40)
         signal.alarm(0)
         command=['/usr/sbin/runuser','-u',c['user'],'--','/usr/bin/env','-i','PATH=/usr/bin:/bin',
-            'PYTHONPATH='+str(root/'src'),'PYTHONDONTWRITEBYTECODE=1',str(python),'-B',
+            'PYTHONPATH='+str(root/'src'),'PYTHONDONTWRITEBYTECODE=1',str(python),'-P','-B',
             '-m','open_trader.polymarket_order_probe','self-test','--config',str(account),
             '--credential-backend','file','--credentials-file',p['credentials_file'],
             '--receipt-dir',str(runtime/'order-probe'),'--budget-seconds',str(remaining)]
