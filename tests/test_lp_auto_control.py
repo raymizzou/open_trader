@@ -50,6 +50,8 @@ def test_timing_config_reaches_persistent_runtime_scheduler(tmp_path, monkeypatc
 
     runtime = runtime_for(tmp_path)
     engine, exchange, _, _ = plan_setup(tmp_path, monkeypatch, ('A', 'B', 'C', 'D', 'I'))
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     exchange.cancel_terminal = False
     runtime.execution = engine
     runtime._lp_auto_scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)

@@ -142,6 +142,8 @@ def rotation_pool(tmp_path, monkeypatch, *, same_token=False, target=1):
 
 def test_account_rotation_ranks_and_cancels_real_id_without_fake_intent(tmp_path, monkeypatch):
     engine, exchange, lp, store, rotation = rotation_pool(tmp_path, monkeypatch)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 3)
@@ -160,6 +162,8 @@ def test_account_rotation_ranks_and_cancels_real_id_without_fake_intent(tmp_path
 
 def test_overcapacity_same_token_buys_use_two_slots_and_exact_rotation_victim(tmp_path, monkeypatch):
     engine, exchange, lp, _, rotation = rotation_pool(tmp_path, monkeypatch, same_token=True)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m00'] = Decimal('30')
     rotation.refresh(lp, exchange, 3)
@@ -177,23 +181,66 @@ def test_overcapacity_same_token_buys_use_two_slots_and_exact_rotation_victim(tm
 
 
 def test_account_rotation_fill_keeps_inventory_budget_without_sale(tmp_path, monkeypatch):
-    engine, exchange, lp, store, rotation = rotation_pool(tmp_path, monkeypatch)
+    from tests import test_lp_auto_rotation as rotation
+    engine, exchange, lp, store = rotation.setup(tmp_path, monkeypatch, count=3, target=1)
+    pool.NOW += timedelta(microseconds=1)
+    assert lp.register_account_snapshot(pool._fresh_registration_bundle(exchange, lp))['state'] == 'registered'
+    registered = engine.lp_auto_state()
+    assert [r['order_id'] for r in registered['account_buys']] == ['o1']
+    original = registered['intents'][0]
+    assert original['reservation_coverage']['state'] == 'covered'
+    assert registered['slots']['occupied'] == 1 and Decimal(registered['funds']['buy_reserved_usd']) == 8
+    assert registered['account_buys'][0]['session_id'] == original['session_id']
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 3)
     engine.lp_auto_run_once()
+    assert exchange.cancels == ['o1']
+    assert engine.lp_auto_state()['active_plan']['victims'][0]['account_order'] is True
+    assert engine.lp_auto_state()['active_plan']['victims'][0]['order_id'] == 'o1'
+    original_as_of = engine.lp_auto_state()['funds']['as_of']
     exchange.orders[0].update(status='CANCELED', size_matched='8')
+    exchange.positions = [dict(token_id='m00', condition_id='m00', size='8', average_price='.40')]
+    exchange.trades = [dict(trade_id='actual-o1-fill', status='CONFIRMED', trader_side='MAKER',
+        taker_order_id='external-taker', token_id='m00', condition_id='m00', side='BUY', size='8', price='.40',
+        fee='0', timestamp=pool.NOW, match_time=pool.NOW, maker_orders=[dict(order_id='o1', token_id='m00', side='BUY',
+            price='.40', matched_amount='8', fee='0', maker_address='test-wallet')])]
     advance_auto_wait(engine, monkeypatch)
-    def terminal(d):
-        d['account_financial_facts'].update(buys=[], order_fills={'o1': '8'},
-            inventory_cost_usd='3.2', checked_at=pool.NOW.isoformat(), trade_generation=store.lp_trade_generation())
-    engine._auto_pool._update(terminal)
     state = engine.lp_auto_run_once()
-    assert state['last_round']['reason'] == 'rotation_filled'
-    assert state['slots']['occupied'] == 0
+    assert state['last_round']['completed_at'] and state['active_plan'] is None
+    assert state['slots']['occupied'] == 1
     assert Decimal(state['funds']['inventory_cost_usd']) == Decimal('3.2')
-    assert Decimal(state['funds']['spendable_usd']) == Decimal('96.8')
-    assert len(exchange.posts) == 1
+    assert Decimal(state['funds']['buy_reserved_usd']) == 8
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == original_as_of
+    assert state['funds']['available_usd'] is None
+    assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01']
+    assert exchange.posts[-1]['price'] == Decimal('.40') and exchange.posts[-1]['quantity'] == 20
+    assert all(p['side'] == 'BUY' for p in exchange.posts)
+    def complete_account_round(*, max_age_seconds=0, trade_generation_provider=None):
+        del max_age_seconds
+        pool.NOW += timedelta(microseconds=1)
+        packet = pool._fresh_registration_bundle(exchange, lp)
+        packet['open_orders'] = [o for o in exchange.orders if o['status'] == 'LIVE']
+        if trade_generation_provider is not None:
+            packet['trade_generation'] = trade_generation_provider()
+        return packet
+    exchange.lp_account_snapshot_shared = complete_account_round
+    registration = lp.register_account_snapshot
+    publication_results = []
+    def observed_publication(snapshot):
+        result = registration(snapshot)
+        publication_results.append(result)
+        return result
+    monkeypatch.setattr(lp, 'register_account_snapshot', observed_publication)
+    published = engine.refresh_lp_dashboard_snapshot()
+    assert published['state'] == 'ready', (published, publication_results)
+    financial = engine.lp_auto_state()
+    assert financial['funds']['status'] == 'known'
+    assert Decimal(financial['funds']['buy_reserved_usd']) == 8
+    assert Decimal(financial['funds']['inventory_cost_usd']) == Decimal('3.2')
+    assert Decimal(financial['funds']['available_usd']) == Decimal('88.8')
 
 
 def test_late_known_receipt_cannot_reattribute_covered_unknown_request(tmp_path):
@@ -260,29 +307,44 @@ def test_rotation_metadata_cannot_overwrite_new_partial_fill_capital(tmp_path):
 def test_first_account_coverage_preserves_inflight_rotation_fill_stop(tmp_path, monkeypatch):
     from tests import test_lp_auto_rotation as rotation
     engine, exchange, lp, store = rotation.setup(tmp_path, monkeypatch, count=2, target=1)
+    from copy import deepcopy
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 2)
     engine.lp_auto_run_once()
     intent = engine.lp_auto_state()['intents'][0]
     assert intent['state'] == 'canceling'
+    assert exchange.cancels == ['o1']
+    original_audit = deepcopy(store.lp_actions(intent['session_id']))
     exchange.orders[0].update(status='CANCELED', size_matched='8')
+    exchange.positions = [dict(token_id='m00', condition_id='m00', size='8', average_price='.40')]
+    exchange.trades = [dict(trade_id='actual-o1-fill', status='CONFIRMED', trader_side='MAKER',
+        taker_order_id='external-taker', token_id='m00', condition_id='m00', side='BUY', size='8', price='.40',
+        fee='0', timestamp=pool.NOW, maker_orders=[dict(order_id='o1', token_id='m00', side='BUY',
+            price='.40', matched_amount='8', fee='0', maker_address='test-wallet')])]
     advance_auto_wait(engine, monkeypatch)
-    def cover(d):
-        d['intents'][intent['intent_id']]['reservation_coverage'] = {
-            **old_intent()['reservation_coverage'], 'session_id': intent['session_id'],
-            'intent_id': intent['intent_id']}
-        d['account_financial_facts'] = dict(account_id='test-wallet', pool_account_id=engine._lp_account_id(),
-            checked_at=pool.NOW.isoformat(), trade_generation=store.lp_trade_generation(),
-            inventory_cost_usd='3.2', realized_pnl_usd='0', financial_status='known',
-            reason_codes=[], buys=[], order_fills={'o1': '8'})
-    engine._auto_pool._update(cover)
+    pool.NOW += timedelta(microseconds=1)
+    packet = pool._fresh_registration_bundle(exchange, lp)
+    packet['open_orders'] = [o for o in exchange.orders if o['status'] == 'LIVE']
+    assert lp.register_account_snapshot(packet)['state'] == 'registered'
+    covered = engine.lp_auto_state()['intents'][0]
+    assert covered['reservation_coverage']['state'] == 'covered'
+    assert covered['state'] == 'canceling'
+    original_as_of = engine.lp_auto_state()['funds']['as_of']
     state = engine.lp_auto_run_once()
-    assert state['last_round']['reason'] == 'rotation_filled'
-    assert state['slots']['occupied'] == 0
+    assert state['last_round']['completed_at'] and state['active_plan'] is None
+    assert state['slots']['occupied'] == 1
     assert Decimal(state['funds']['inventory_cost_usd']) == Decimal('3.2')
-    assert len(exchange.posts) == 1
-    assert state['intents'][0]['state'] == 'canceling'  # Audit is frozen at replacement.
+    assert Decimal(state['funds']['buy_reserved_usd']) == 8
+    assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01']
+    assert exchange.posts[-1]['price'] == Decimal('.40') and exchange.posts[-1]['quantity'] == 20
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == original_as_of
+    assert store.lp_actions(intent['session_id']) == original_audit
+    assert state['intents'][0]['state'] == 'canceling'  # Original audit stays frozen after coverage.
+    assert state['intents'][0]['reservation_coverage'] == covered['reservation_coverage']
+    assert all(p['side'] == 'BUY' for p in exchange.posts)
 
 
 def test_initial_configuration_accepts_known_manual_account_overcapacity(tmp_path):
@@ -322,15 +384,20 @@ def test_covered_request_attention_is_inactive_but_audit_is_preserved(tmp_path, 
     assert auto._read()['intents']['old'] == intent
 
 
-def test_covered_unknown_session_rotates_its_known_account_order(tmp_path, monkeypatch):
+def test_covered_unknown_session_keeps_its_unbound_original_plan(tmp_path, monkeypatch):
     from tests import test_lp_auto_rotation as rotation
     monkeypatch.setattr(pool, 'Exchange', rotation.RotationExchange)
     engine, exchange, lp, store = pool.setup(tmp_path, 2)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     engine.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     engine.lp_auto_set_desired_running(True)
     exchange.fail = True
     engine.lp_auto_run_once()
     original = engine.lp_auto_state()['intents'][0]
+    from copy import deepcopy
+    original_audit = deepcopy(store.lp_actions(original['session_id']))
+    original_plan = deepcopy(engine.lp_auto_state()['active_plan'])
     assert original['state'] == 'unknown'
     exchange.fail = False
     exchange.orders = [dict(order_id='manual-late', token_id='m00', condition_id='m00',
@@ -350,11 +417,18 @@ def test_covered_unknown_session_rotates_its_known_account_order(tmp_path, monke
     advance_auto_wait(engine, monkeypatch)
     assert lp.register_account_snapshot(pool._fresh_registration_bundle(exchange, lp))['state'] == 'registered'
     state = engine.lp_auto_run_once()
-    assert exchange.cancels == ['manual-late'], str(state['last_round'])
+    assert exchange.cancels == [], str(state['last_round'])
+    assert state['active_plan']['round_id'] == original_plan['round_id']
+    assert not state['last_round']['completed_at']
+    assert [(a['action_id'], a.get('request_id')) for a in state['active_plan']['actions']] == [
+        (a['action_id'], a.get('request_id')) for a in original_plan['actions']]
+    assert store.lp_actions(original['session_id']) == original_audit
+    assert [o['order_id'] for o in exchange.orders if o['status'] == 'LIVE'] == ['manual-late']
     assert len(exchange.posts) == 1  # Only the original timed-out POST occurred.
     audit = state['intents'][0]
     assert audit['state'] == 'unknown' and audit['order_id'] is None
-    assert state['slots']['canceling'] == 1
+    assert state['slots']['occupied'] == 1
+    assert state['slots']['canceling'] == 0
 
 
 def test_account_row_fill_blocks_rotation_even_before_session_fill_updates(tmp_path, monkeypatch):
@@ -527,9 +601,14 @@ def test_older_pool_success_cannot_clear_newer_concurrent_wait(tmp_path, monkeyp
     assert state['funds']['spendable_usd'] is None
 
 
-@pytest.mark.parametrize('partial_status', ['known', 'unknown'])
-def test_account_overcapacity_cancels_only_unfilled_extra_beside_partial_buy(tmp_path, monkeypatch, partial_status):
+@pytest.mark.parametrize('partial_status,mismatched_original_size',
+    [('known', False), ('unknown', False), ('known', True)],
+    ids=['known', 'unknown', 'original-size-mismatch'])
+def test_account_overcapacity_cancels_only_unfilled_extra_beside_partial_buy(
+        tmp_path, monkeypatch, partial_status, mismatched_original_size):
     engine, exchange, lp, store, _ = rotation_pool(tmp_path, monkeypatch)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
     partial = dict(order_id='partial-buy', token_id='m01', condition_id='m01', side='BUY',
         status='LIVE', price='.4', original_size='20', size_matched='1')
@@ -547,6 +626,14 @@ def test_account_overcapacity_cancels_only_unfilled_extra_beside_partial_buy(tmp
         facts.update(inventory_cost_usd='.4', trade_generation=store.lp_trade_generation(),
                      financial_status=partial_status, reason_codes=[] if partial_status == 'known' else ['trade_fee_unknown'])
     engine._auto_pool._update(include_partial)
+    if mismatched_original_size:
+        def actual_result(request):
+            packet = result_reader(request)
+            for row in packet['orders'] + packet['open_orders']:
+                if row['order_id'] == 'partial-buy':
+                    row['original_size'] = '21'
+            return packet
+        exchange.lp_order_result_snapshot = actual_result
     before = engine.lp_auto_state()
     assert before['slots']['occupied'] == 2 and before['target_buy_count'] == 1
     advance_auto_wait(engine, monkeypatch)
@@ -555,6 +642,13 @@ def test_account_overcapacity_cancels_only_unfilled_extra_beside_partial_buy(tmp
     assert Decimal(state['funds']['inventory_cost_usd']) == Decimal('.4')
     assert len(exchange.posts) == 1
     assert not store.lp_session('partial-session').get('entry_cancel_requested')
+    if mismatched_original_size:
+        assert exchange.cancels == []
+        assert state['active_plan'] and state['plan_wait']['kind'] == 'api'
+        assert state['last_round']['reason'] == 'owned_order_identity_mismatch'
+        retained = state['active_plan']['targets'][0]
+        assert Decimal(retained['original_quantity']) == 20 and Decimal(retained['quantity']) == 19
+        return
     if partial_status == 'unknown':
         assert exchange.cancels == []
         assert state['funds']['spendable_usd'] is None
@@ -567,6 +661,7 @@ def test_account_overcapacity_cancels_only_unfilled_extra_beside_partial_buy(tmp
             d['account_financial_facts'].update(buys=[partial_fact], order_fills={'o1': '0', 'partial-buy': '1'},
                 trade_generation=store.lp_trade_generation())
         engine._auto_pool._update(terminal)
+        advance_auto_wait(engine, monkeypatch)
         settled = engine.lp_auto_run_once()
         assert settled['slots']['occupied'] == 1
         assert Decimal(settled['funds']['buy_reserved_usd']) == Decimal('7.6')

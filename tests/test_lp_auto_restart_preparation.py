@@ -184,17 +184,23 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
     assert store.lp_actions(sid) == audit
     _terminate_old(child)
     if shape == 'observed-review':
-        # The deployed old row was reconciled to review/UNKNOWN, with no
-        # session-level submit fields. Only its exact entry action has them.
+        # Observe the ended current sender in review while retaining its honest
+        # durable never-POST markers on both original carriers.
         session = store.lp_update_session(sid, state='review')
         _, _, _, _, reader = runtime()
         reader._auto_pool._record_session(original['intent_id'], session)
         assert reader.lp_auto_state()['intents'][0]['state'] == 'unknown'
-        assert not any(key in session for key in ('submit_stage', 'post_started', 'submit_requested_at'))
+        assert session['submit_stage'] == 'preparing' and session['post_started'] is False
+        assert audit[0]['submit_stage'] == 'preparing' and audit[0]['post_started'] is False
     owner, store, _, account, _ = _new_owner(runtime, monkeypatch, tmp_path)
     owner.start()
     try:
         assert owner.state == 'RUNNING'
+        original_plan = deepcopy(owner.execution.lp_auto_state()['active_plan'])
+        original_action = next(a for a in original_plan['actions'] if a['kind'] == 'buy')
+        original_terms = [(t['token_id'], t['price'], t['quantity']) for t in original_plan['targets']]
+        original_target = next(t for t in original_plan['targets'] if t['token_id'] == original['token_id'])
+        assert Decimal(original_target['price']) == Decimal('.89') and Decimal(original_target['quantity']) == 20
         before = owner.execution.lp_auto_state()
         assert before['slots']['occupied'] == 5
         assert not before['intents'][0].get('reservation_coverage')
@@ -208,23 +214,54 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         assert state['intents'][0]['intent_id'] == original['intent_id']
         assert not state['intents'][0]['order_id']
         marker = deepcopy(store.lp_session(sid)['submission_owner_exit'])
+        original_financial_as_of = state['funds']['as_of']
         advance_api_wait(runtime, owner.execution, refresh=False)
-        owner.execution.lp_auto_run_once(round_id='old-preparing-request')
-        advance_api_wait(runtime, owner.execution, refresh=False)
+        resolved = owner.execution.lp_auto_run_once(round_id='old-preparing-request')
+        assert resolved['last_round']['round_id'] == original_plan['round_id']
+        assert [(t['token_id'], t['price'], t['quantity']) for t in resolved['last_round']['targets']] == original_terms
+        assert resolved['last_round']['completed_at'] and resolved['active_plan'] is None, resolved['last_round']
+        action = next(a for a in resolved['last_round']['actions'] if a['action_id'] == original_action['action_id'])
+        assert action['state'] == 'rejected' and action['reason'] == 'candidate_best_bid_changed'
+        assert len(action['attempts']) == 1
+        assert action['attempts'][0]['request_id'] == original_action['action_id']
+        assert action['attempts'][0]['session_id'] == sid and action['attempts'][0]['reason'] == 'preparation_interrupted'
+        assert action['request_id'] != original_action['action_id']
+        final_audit = deepcopy(store.lp_actions(sid))
+        assert len(final_audit) == len(audit) == 1
+        assert final_audit[0]['state'] == 'rejected' and final_audit[0]['reason'] == 'preparation_interrupted'
+        assert final_audit[0]['post_started'] is False
+        for key in ('action_id', 'action_key', 'created_at', 'token_id', 'side', 'price', 'quantity'):
+            assert final_audit[0].get(key) == audit[0].get(key)
+        assert account.posts == account.cancels == []
+        assert resolved['funds']['as_of'] == original_financial_as_of
+        from datetime import datetime
+        completed = datetime.fromisoformat(resolved['last_round']['completed_at'])
+        assert datetime.fromisoformat(resolved['plan_wait']['deadline']) == completed + timedelta(seconds=60)
+        runtime.clock[0] = completed + timedelta(seconds=59)
+        owner.execution.lp_auto_run_once(round_id='new-owner-refill')
+        assert account.posts == account.cancels == [] and store.lp_actions(sid) == final_audit
+        runtime.clock[0] = completed + timedelta(seconds=60)
         _arm_refill(runtime, owner, account)
-        reads = account.position_reads
+        reads, planning_as_of = account.position_reads, []
+        sign = account.create_limit_order
+        def new_sign(**kwargs):
+            planning_as_of.append(owner.execution.lp_auto_state()['funds']['as_of'])
+            assert kwargs['price'] == Decimal('.40') and kwargs['size'] == 20
+            return sign(**kwargs)
+        account.create_limit_order = new_sign
         state = owner.execution.lp_auto_run_once(round_id='new-owner-refill')
         assert state['slots']['occupied'] == len(account.orders) == 5, state['last_round']
         assert len(account.posts) == 1
-        assert account.position_reads > reads, 'Refill still needs mandatory fresh account reads'
-        assert state['funds']['status'] == 'known'
+        assert account.position_reads > reads, 'A new plan still requires fresh complete account publication'
+        assert Decimal(state['funds']['buy_reserved_usd']) == 40
+        assert planning_as_of and planning_as_of[0]
+        assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[0]
         assert next(i for i in state['intents'] if i['intent_id'] == original['intent_id'])['order_id'] is None
         assert any(i['session_id'] != sid and i['order_id'] == 'new-owner-buy' for i in state['intents'])
         owner.execution.lp_auto_reconcile_unknown()
         owner.execution.lp_auto_run_once(round_id='old-preparing-request')
         owner.execution.lp_auto_run_once(round_id='new-owner-refill')
-        assert len(account.posts) == 1
-        assert store.lp_actions(sid) == audit
+        assert len(account.posts) == 1 and store.lp_actions(sid) == final_audit
         orders = account.orders
     finally:
         owner.stop()
@@ -237,7 +274,7 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         assert store.lp_session(sid)['submission_owner_exit'] == marker
         owner.execution.lp_auto_run_once(round_id='after-second-restart')
         assert account.posts == account.cancels == account.market_orders == []
-        assert store.lp_actions(sid) == audit
+        assert store.lp_actions(sid) == final_audit
         # A late current API order is real occupancy, independent of the old
         # request audit. Publish it without running overcapacity cancellation.
         _, condition, token = _refill_identity(5)
@@ -249,7 +286,7 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         late = owner.execution.lp_auto_state()
         assert late['slots']['occupied'] == 6
         assert Decimal(late['funds']['buy_reserved_usd']) == 48
-        assert store.lp_actions(sid) == audit
+        assert store.lp_actions(sid) == final_audit
         assert account.posts == account.cancels == []
     finally:
         owner.stop()
@@ -446,6 +483,7 @@ def test_dead_post_started_sender_with_lagging_preparing_action_is_covered_after
     assert store.lp_session(sid)['post_started'] is True
     owner.start()
     try:
+        original_plan = deepcopy(owner.execution.lp_auto_state()['active_plan'])
         _advance(runtime)
         owner.execution.refresh_lp_dashboard_snapshot()
         state = owner.execution.lp_auto_state()
@@ -461,8 +499,15 @@ def test_dead_post_started_sender_with_lagging_preparing_action_is_covered_after
         advance_api_wait(runtime, owner.execution, refresh=False)
         _arm_refill(runtime, owner, account)
         state = owner.execution.lp_auto_run_once(round_id='post-owner-exit-refill')
-        assert state['slots']['occupied'] == 5
-        assert len(account.posts) == 1
+        assert state['slots']['occupied'] == 4
+        assert Decimal(state['funds']['buy_reserved_usd']) == 32
+        assert state['active_plan']['round_id'] == original_plan['round_id']
+        assert not state['last_round']['completed_at']
+        original_action = next(a for a in state['active_plan']['actions'] if a['kind'] == 'buy')
+        assert original_action['action_id'] == original_plan['actions'][0]['action_id']
+        assert original_action['state'] == 'unknown' and not original_action.get('order_id')
+        assert store.lp_session(sid)['post_started'] is True
+        assert account.posts == account.cancels == []
         assert store.lp_actions(sid) == audit
     finally:
         owner.stop()
@@ -481,7 +526,13 @@ def test_recovery_preserves_new_submission_pause_and_configuration_fences(
         owner.execution.refresh_lp_dashboard_snapshot()
         assert owner.execution.lp_auto_state()['slots']['occupied'] == 4
         advance_api_wait(runtime, owner.execution, refresh=False)
-        owner.execution.lp_auto_run_once(round_id='old-preparing-request')
+        completed = owner.execution.lp_auto_run_once(round_id='old-preparing-request')
+        assert completed['last_round']['completed_at'] and completed['active_plan'] is None
+        assert completed['last_round']['actions'][0]['state'] == 'rejected'
+        assert account.posts == account.cancels == []
+        from datetime import datetime
+        assert datetime.fromisoformat(completed['plan_wait']['deadline']) == datetime.fromisoformat(
+            completed['last_round']['completed_at']) + timedelta(seconds=60)
         advance_api_wait(runtime, owner.execution, refresh=False)
         _arm_refill(runtime, owner, account)
         sign = account.create_limit_order

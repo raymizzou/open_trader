@@ -27,6 +27,16 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
         original_orders.append(_open_order(f'existing-{i}', 'BUY', price='.40', original='20',token_id=token)
                                .model_copy(update={'market':condition,'condition_id':condition}))
     account.orders=tuple(original_orders)
+    active_finance, planning_as_of = [], []
+    balance, sign = account.get_balance_allowance, account.create_limit_order
+    def observed_balance(**kwargs):
+        if execution.lp_auto_state()['active_plan']:
+            active_finance.append(runtime.clock[0])
+        return balance(**kwargs)
+    def observed_sign(**kwargs):
+        planning_as_of.append(execution.lp_auto_state()['funds']['as_of'])
+        return sign(**kwargs)
+    account.get_balance_allowance, account.create_limit_order = observed_balance, observed_sign
     auto=execution._auto_pool
     assert auto._refresh_account_facts() is True
     assert auto.state()['slots']['occupied']==3
@@ -86,16 +96,18 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
                     failure.add_note('attention cleanup watchdog')
                 else:
                     raise AssertionError('attention cleanup watchdog')
-    assert len(account.posts)==2, 'fresh publication and two fresh candidates must reach mandatory per-send reads: ' + str(result['last_round'])
+    assert len(account.posts)==2, 'fresh planning publication and two frozen candidates must execute once: ' + str(result['last_round'])
     assert len(account.orders)==5
     assert result['slots']['occupied']==5
-    assert result['admission_block_reasons']==[]
-    assert result['funds']['status']=='known'
-    assert len(reads) in (6, 7), 'due initial read, four mandatory BUY fences, final refresh and at most one maintenance reuse'
+    assert 'account_financial_facts_changed' in result['admission_block_reasons']
+    assert planning_as_of and planning_as_of[0]
+    assert result['funds']['status']=='unknown' and result['funds']['as_of']==planning_as_of[0]
+    assert active_finance == []
+    assert len(reads) in (1, 2), 'one forced planning read and at most one existing maintenance reuse'
     forced = [read for read in reads if read.get('max_age_seconds') == 0
               and read.get('trade_generation_provider') == store.lp_trade_generation]
-    assert len(forced)==6, 'initial/final refresh and both mandatory fresh reads per BUY remain forced'
-    assert sum('max_age_seconds' not in read for read in reads) == len(reads) - 6, 'only the existing optional maintenance call'
+    assert len(forced)==1, 'the complete planning publication stays fresh and forced'
+    assert sum('max_age_seconds' not in read for read in reads) == len(reads) - 1, 'only the existing optional maintenance call'
 
 
 def test_recovered_account_can_refill_three_to_five(runtime):

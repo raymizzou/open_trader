@@ -588,7 +588,7 @@ def test_auto_rechecks_second_bid_before_post(tmp_path, monkeypatch):
     assert stale_action["condition_id"] == "m00"
     assert stale_action["state"] == "rejected"
     assert stale_action["request_state"] == "entry_rejected"
-    assert stale_action["reason"] == "candidate_changed"
+    assert stale_action["reason"] == "candidate_bid_level_changed"
 
     exchange.before_sign = None
     advance_auto_wait(e, monkeypatch, refresh=False)

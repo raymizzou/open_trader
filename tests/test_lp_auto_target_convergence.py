@@ -82,6 +82,8 @@ def live_orders(exchange):
                          ids=['zero', 'three', 'four', 'five'])
 def test_unified_selection_for_zero_three_four_five_buys(tmp_path, monkeypatch, initial):
     engine, exchange, _, _ = plan_setup(tmp_path, monkeypatch, initial)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     state = engine.lp_auto_run_once()
     assert {r['condition_id'] for r in state['last_round']['targets']} == {'B', 'C', 'E', 'F', 'G'}
     # Confirm the simulated venue's cancels, then resume through the public path.
@@ -99,6 +101,8 @@ def test_unified_selection_for_zero_three_four_five_buys(tmp_path, monkeypatch, 
 def test_triggered_protection_retains_order_but_monitoring_does_not(tmp_path, monkeypatch, protection):
     tokens = ('A', 'B', 'C', 'D', 'I') if protection == 'all-triggered' else ('A', 'B', 'C', 'D')
     engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch, tokens=tokens)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     engine.lp_auto_run_once()
     original = live_orders(exchange)
     monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(seconds=60))
@@ -158,7 +162,9 @@ def test_triggered_protection_retains_order_but_monitoring_does_not(tmp_path, mo
 
 
 def test_independent_exits_keep_exact_survivors_and_reservations(tmp_path, monkeypatch):
-    engine, exchange, _, _ = plan_setup(tmp_path, monkeypatch, ('A', 'B', 'C', 'D', 'I'))
+    engine, exchange, _, store = plan_setup(tmp_path, monkeypatch, ('A', 'B', 'C', 'D', 'I'))
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     exchange.cancel_terminal = False
     state = engine.lp_auto_run_once()
     assert exchange.cancels == ['original-A', 'original-D', 'original-I']
@@ -167,9 +173,17 @@ def test_independent_exits_keep_exact_survivors_and_reservations(tmp_path, monke
     assert exchange.posts == []
     assert state['slots']['occupied'] == 5
     assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('39.00')
+    original_as_of = state['funds']['as_of']
+    original_i = next(s for s in store.lp_sessions() if s.get('entry_order_id') == 'original-I')
+    original_audit = store.lp_actions(original_i['session_id'])
     next(o for o in exchange.orders if o['token_id'] == 'A')['status'] = 'CANCELED'
     next(o for o in exchange.orders if o['token_id'] == 'I').update(status='CANCELED', size_matched='8')
     exchange.positions = [dict(token_id='I', condition_id='I', size='8', average_price='.39')]
+    exchange.trades = [dict(trade_id='original-I-owned-fill', order_id='original-I', condition_id='I',
+        token_id='I', side='BUY', size='8', price='.39', fee='0', status='CONFIRMED',
+        timestamp=pool.NOW, trader_side='MAKER', taker_order_id='external-taker',
+        maker_orders=[dict(order_id='original-I', token_id='I', side='BUY', price='.39',
+            matched_amount='8', fee='0', maker_address='test-wallet', owner='credential-owner-uuid')])]
     monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(seconds=10))
     state = engine.lp_auto_run_once()
     assert live_orders(exchange)['D'] == 'original-D'
@@ -180,10 +194,14 @@ def test_independent_exits_keep_exact_survivors_and_reservations(tmp_path, monke
     assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('39.00')
     assert Decimal(state['funds']['inventory_cost_usd']) == Decimal('3.12')
 
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == original_as_of
+    assert store.lp_actions(original_i['session_id']) == original_audit
 
 def test_round_plan_survives_better_ranking_until_next_round(tmp_path, monkeypatch):
     from open_trader.polymarket_lp_scheduler import LPAutoScheduler
     engine, exchange, _, _ = plan_setup(tmp_path, monkeypatch, ('A', 'B', 'C', 'D', 'I'))
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
     assert scheduler.run_due()
     first = engine.lp_auto_state()['last_round']
@@ -243,7 +261,7 @@ def test_changed_price_rejects_only_that_planned_action(tmp_path, monkeypatch, p
     assert [p['token_id'] for p in exchange.posts] == ['F', 'G'], state['last_round']
     action = next(a for a in state['last_round']['actions'] if a['condition_id'] == 'E')
     assert action['state'] == 'rejected'
-    assert action['reason'] == 'candidate_changed'
+    assert action['reason'] == 'candidate_bid_level_changed'
     assert state['last_round']['completed_at']
     assert Decimal(next(r for r in state['last_round']['targets'] if r['condition_id'] == 'E')['price']) == Decimal('.39')
     monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(seconds=60))

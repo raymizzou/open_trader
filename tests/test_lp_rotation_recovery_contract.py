@@ -100,6 +100,8 @@ def test_verified_receipt_recovery_restores_rotation_without_erasing_audit(tmp_p
         _assert_actual_sender_retains_reservation(tmp_path, monkeypatch)
         return
     engine, exchange, lp, store, session_id, original, action = _delayed_entry(tmp_path, monkeypatch)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
     engine.lp_auto_run_once()
     advance_auto_wait(engine, monkeypatch)
@@ -175,6 +177,8 @@ def _change_level_book(exchange, variant):
 ])
 def test_configured_price_level_departure_cancels_before_reselection(tmp_path, monkeypatch, level, book, canceled, target):
     engine, exchange, lp, _ = _level_pool(tmp_path, monkeypatch, level, target=target)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     assert Decimal(exchange.posts[0]['price']) == (Decimal('.39') if level == 2 else Decimal('.40'))
     _change_level_book(exchange, book)
     assert engine.lp_auto_run_once()['last_round']['completed_at']
@@ -189,6 +193,8 @@ def test_configured_price_level_departure_cancels_before_reselection(tmp_path, m
 @pytest.mark.parametrize('winner, fill', [('same', '0'), ('other', '0'), ('same', '8')])
 def test_cancel_confirmation_precedes_global_refill_and_can_reselect_same_market(tmp_path, monkeypatch, winner, fill):
     engine, exchange, lp, _ = _level_pool(tmp_path, monkeypatch, count=2)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     _change_level_book(exchange, 'add')
     assert engine.lp_auto_run_once()['last_round']['completed_at']
     monkeypatch.setattr(pool, 'NOW', datetime.fromisoformat(engine.lp_auto_state()['plan_wait']['deadline']))
@@ -205,15 +211,24 @@ def test_cancel_confirmation_precedes_global_refill_and_can_reselect_same_market
         exchange.rewards['m00'] = Decimal('100')
     exchange.orders[0].update(status='CANCELED', size_matched=fill)
     if fill != '0':
-        exchange.positions = [dict(token_id='m00', condition_id='m00', size=fill)]
+        exchange.positions = [dict(token_id='m00', condition_id='m00', size='8', average_price='.39')]
+        exchange.trades = [dict(trade_id='actual-o1-fill', status='CONFIRMED', trader_side='MAKER',
+            taker_order_id='external-taker', token_id='m00', condition_id='m00', side='BUY', size='8', price='.39',
+            fee='0', timestamp=pool.NOW, maker_orders=[dict(order_id='o1', token_id='m00', side='BUY',
+                price='.39', matched_amount='8', fee='0', maker_address='test-wallet')])]
     rotation.refresh(lp, exchange, 2)
     monkeypatch.setattr(pool, 'NOW', datetime.fromisoformat(engine.lp_auto_state()['plan_wait']['deadline']))
     state = engine.lp_auto_run_once()
     if fill != '0':
-        assert len(exchange.posts) == 1
+        assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01']
+        assert exchange.posts[-1]['price'] == Decimal('.39') and exchange.posts[-1]['quantity'] == 20
+        assert state['slots']['occupied'] == 1
+        assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('7.8')
         assert Decimal(state['funds']['inventory_cost_usd']) == Decimal('3.12')
-        assert Decimal(state['funds']['available_usd']) == Decimal('96.88')
-        assert state['last_round']['reason'] == 'rotation_filled'
+        assert state['funds']['status'] == 'unknown' and state['funds']['available_usd'] is None
+        assert state['last_round']['completed_at'] and state['active_plan'] is None
+        assert datetime.fromisoformat(state['plan_wait']['deadline']) == datetime.fromisoformat(state['last_round']['completed_at']) + timedelta(seconds=60)
+        assert all(p['side'] == 'BUY' for p in exchange.posts)
     else:
         # The originally selected m01 executes before the later ranking change.
         assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01'], str(state['last_round'])
@@ -236,6 +251,8 @@ def test_cancel_confirmation_precedes_global_refill_and_can_reselect_same_market
 
 def test_full_pool_greedy_ranking_skips_unaffordable_candidates(tmp_path, monkeypatch):
     engine, exchange, lp, _ = _level_pool(tmp_path, monkeypatch, level=1, count=11, target=5)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
     direction = exchange.direction
     sizes = {'m05': '320', 'm06': '120', 'm07': '40', 'm08': '20', 'm09': '20', 'm10': '20'}
@@ -282,6 +299,8 @@ def test_full_pool_greedy_ranking_skips_unaffordable_candidates(tmp_path, monkey
 
 def test_independent_rotation_continues_while_one_order_reconciles(tmp_path, monkeypatch):
     engine, exchange, lp, _ = _level_pool(tmp_path, monkeypatch, level=1, count=10, target=5)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     exchange.rewards.update({f'm{i:02}': Decimal('100') for i in range(5, 10)})
     rotation.refresh(lp, exchange, 10)
     snapshot = exchange.lp_snapshot
@@ -329,6 +348,8 @@ def test_rotation_diagnostics_capture_actual_block_and_recovery_inputs(tmp_path,
     from open_trader import polymarket_trading as trading_module
 
     engine, exchange, lp, store, session_id, _, _ = _delayed_entry(tmp_path, monkeypatch)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
     engine.lp_auto_run_once()
     advance_auto_wait(engine, monkeypatch)
@@ -393,6 +414,8 @@ def test_rotation_diagnostics_capture_actual_block_and_recovery_inputs(tmp_path,
 @pytest.mark.parametrize('restriction', ['funds', 'missing-configured-level'])
 def test_off_level_cancel_does_not_require_replacement_admission(tmp_path, monkeypatch, restriction):
     engine, exchange, lp, _ = _level_pool(tmp_path, monkeypatch)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
     assert Decimal(exchange.posts[0]['price']) == Decimal('.39')
     assert Decimal(exchange.posts[0]['quantity']) == 20
@@ -434,6 +457,8 @@ def test_final_precancel_guard_logs_its_actual_blocking_inputs(tmp_path, monkeyp
     import hashlib
 
     engine, exchange, lp, store = _level_pool(tmp_path, monkeypatch, level=1, count=2)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 2)
@@ -473,6 +498,8 @@ def test_final_precancel_guard_logs_its_actual_blocking_inputs(tmp_path, monkeyp
 @pytest.mark.parametrize('source_stale', ['reward', 'book'])
 def test_confirmed_level_departure_uses_cancel_fact_freshness(tmp_path, monkeypatch, source_stale):
     engine, exchange, lp, _ = _level_pool(tmp_path, monkeypatch)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
     _change_level_book(exchange, 'add')
     if source_stale == 'reward':
