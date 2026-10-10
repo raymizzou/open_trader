@@ -550,6 +550,41 @@ class LPAutoPool:
                 for i in account_buys if i.get('order_id') not in terminal_ids]
             intents = [{**i, 'reserved_usd': str(partial_principal[i['order_id']])}
                 if i.get('order_id') in partial_principal else i for i in intents]
+            for oid, proof in (results.get('live_buy_results') or {}).items():
+                session = self.store.lp_session(proof.get('session_id')) if proof.get('session_id') else None
+                history = self.lp._order_history(session or {}).get(oid, {})
+                if (not session or session.get('order_identity_conflict') or oid in terminal_ids
+                        or oid not in results.get('live_buy_ids', ())
+                        or proof.get('result_round_id') != results.get('round_id')
+                        or account is None or tuple(results.get('approval_facts_identity') or ()) != self._account_facts_identity(account)
+                        or _timestamp(proof.get('read_ended_at')) != _timestamp(results['as_of'])
+                        or hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest() != d['account_id']
+                        or (session.get('yield_rotation_cancel_owners') or {}).get(oid) != proof.get('owner_round_id')
+                        or not proof.get('owner_round_id') or not proof.get('owner_action_keys')
+                        or oid not in self.lp._session_order_ids(session) or self.lp.entry_send_inflight(session['session_id'])
+                        or proof.get('status') != 'LIVE' or proof.get('side') != 'BUY'
+                        or _maybe_decimal(proof.get('size_matched')) != ZERO
+                        or (_maybe_decimal(proof.get('original_size')) or ZERO) <= ZERO
+                        or (_maybe_decimal(proof.get('price')) or ZERO) <= ZERO
+                        or history.get('side') != 'BUY' or history.get('token_id') != proof.get('token_id')
+                        or session.get('token_id') != proof.get('token_id') or session.get('condition_id') != proof.get('condition_id')
+                        or _maybe_decimal(history.get('price')) != _maybe_decimal(proof.get('price'))
+                        or _maybe_decimal(history.get('original_size')) != _maybe_decimal(proof.get('original_size'))
+                        or any(i.get('order_id') == oid for i in intents + account_buys)):
+                    continue
+                actions = self.store.lp_actions(session['session_id'])
+                owned_audits = [a for a in actions if a.get('order_id') == oid]
+                if (has_independent_unresolved_action(session, [a for a in actions if submission_action_kind(a) != 'cancel'])
+                        or sorted(a['action_key'] for a in owned_audits) != proof['owner_action_keys']
+                        or any(a.get('state') != 'accepted' or a.get('rotation_round_id') != proof['owner_round_id']
+                            or a.get('role') != 'reconciliation_cancel' for a in owned_audits)):
+                    continue
+                account_buys.append(dict(order_id=oid, session_id=session['session_id'],
+                    token_id=proof['token_id'], condition_id=proof['condition_id'], side='BUY',
+                    price=proof['price'], quantity=proof['original_size'], original_quantity=proof['original_size'],
+                    filled_quantity='0', reserved_usd=str(_decimal(proof['original_size']) * _decimal(proof['price'])),
+                    state='canceling' if self.lp._order_cancel_requested(session, oid) else 'active',
+                    financial_status='unknown', execution_result=True))
         execution_ids = set()
         if (account is not None and account_reasons
                 and set(account_reasons) <= {'account_financial_facts_changed', 'account_financial_facts_stale'}
@@ -1772,12 +1807,11 @@ class LPAutoPool:
             self._update(lambda d: self._rotation_record(d, rotation).update(
                 state='active', rotation_settled_at=self._stamp()))
 
-    def _finish_converged_plan_cancels(self, plan, session_id, rows):
+    def _finish_converged_plan_cancels(self, plan, session_id, rows, *, older_owners=None):
         """Restore the saved shared baseline only after this session's batch ends."""
         actions = [a for a in plan['actions']
             if a['kind'] == 'cancel' and a.get('session_id') == session_id]
-        if (not any(a['state'] == 'rejected' for a in actions)
-                or any(a['state'] not in ('success', 'rejected') for a in actions)):
+        if not actions or any(a['state'] not in ('success', 'rejected') for a in actions):
             return
         session = self.store.lp_session(session_id)
         if not session:
@@ -1787,18 +1821,23 @@ class LPAutoPool:
         batch_ids = {a['order_id'] for a in actions}
         baseline = next((saved[oid] for oid in sorted(batch_ids)
             if oid in saved and owners.get(oid) in (None, plan['round_id'])), None)
-        if baseline is None:
-            return
         terminal = {oid for oid in batch_ids
             if str(rows.get(oid, {}).get('status')).upper() in TERMINAL_ORDER_STATES
             and rows[oid].get('fill_quantity_known') is not False
             and _maybe_decimal(rows[oid].get('size_matched')) is not None}
         finished = {oid for oid in terminal if owners.get(oid) == plan['round_id']}
+        obsolete = {oid for oid, original in (older_owners or {}).items()
+            if owners.get(oid) == original['owner_round_id']
+            and oid in plan.get('terminal_buy_results', {})
+            and not session.get('order_identity_conflict')}
+        finished |= obsolete
+        terminal |= obsolete
         for oid in finished:
             owners.pop(oid)
+        consumed = (batch_ids if not owners else finished) | obsolete
         patch = {'yield_rotation_cancel_owners': owners,
             'yield_rotation_protection_before': {oid: value for oid, value in saved.items()
-                if oid not in batch_ids or owners.get(oid) not in (None, plan['round_id'])}}
+                if oid not in consumed or owners.get(oid) not in (None, plan['round_id'])}}
         levels = self.lp._queue_protection_levels(session)
         owns_protection = all(b.get('state') in ('registered', 'monitoring') or
             b.get('state') == 'canceling' and b.get('cancel_reason') == 'yield_rotation'
@@ -1808,7 +1847,7 @@ class LPAutoPool:
                 patch['entry_cancel_requested'] = False
             patch['augment_cancel_requested'] = [oid for oid in
                 session.get('augment_cancel_requested', ()) if oid not in finished]
-            if not owners:
+            if not owners and baseline is not None:
                 restored = deepcopy(baseline)
                 history = self.lp._order_history(session)
                 owned_ids = self.lp._session_order_ids(session)
@@ -3072,6 +3111,7 @@ class LPAutoPool:
                     order_identities=identities, approval_facts_identity=plan.get('facts_identity'),
                     terminal_buy_results=deepcopy(plan.get('terminal_buy_results', {})),
                     partial_buy_results=deepcopy(plan.get('partial_buy_results', {})),
+                    live_buy_results=deepcopy(plan.get('live_buy_results', {})),
                     as_of=plan.get('order_result_as_of') or
                         (plan.get('approval_account_facts') or {}).get('checked_at') or plan['started_at'])
             d['last_round'] = dict(round_id=plan['round_id'], started_at=plan['started_at'],
@@ -3253,6 +3293,44 @@ class LPAutoPool:
         for action in plan['actions']:
             if action['kind'] == 'buy' and action.get('order_id'):
                 expected[action['order_id']] = plan['targets'][action['index']]
+        # Old owner maps are not authority. Bind an exact prior request and its
+        # owned receipt before asking the existing result endpoint about it.
+        older_owners = {}
+        document = self._read()
+        for sid in {a['session_id'] for a in plan['actions'] if a['kind'] == 'cancel'}:
+            session = self.store.lp_session(sid)
+            if (not session or session.get('order_identity_conflict')
+                    or hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest() != plan['account_id']):
+                continue
+            history = self.lp._order_history(session)
+            audits = self.store.lp_actions(sid)
+            for oid, owner in (session.get('yield_rotation_cancel_owners') or {}).items():
+                if owner == plan['round_id'] or oid in expected or oid not in self.lp._session_order_ids(session):
+                    continue
+                receipt = history.get(oid, {})
+                rotation = document.get('account_rotations', {}).get(oid) or next(
+                    (i for i in document['intents'].values() if i.get('order_id') == oid), {})
+                original_audits = [a for a in audits if a.get('order_id') == oid]
+                if (not owner or not original_audits
+                        or any(a.get('state') != 'accepted' or a.get('rotation_round_id') != owner
+                            or a.get('role') != 'reconciliation_cancel'
+                            or not str(a.get('action_key') or '').startswith(sid + ':reconciliation-cancel:')
+                            for a in original_audits)
+                        or rotation.get('rotation_round_id') != owner or rotation.get('session_id') != sid
+                        or receipt.get('side') != 'BUY' or receipt.get('order_id') != oid
+                        or str(receipt.get('status')).upper() not in TERMINAL_ORDER_STATES
+                        or _maybe_decimal(receipt.get('size_matched')) is None
+                        or any(str(rotation.get(k)) != str(session.get(k)) for k in ('token_id', 'condition_id'))
+                        or str(receipt.get('token_id')) != str(session.get('token_id'))
+                        or _maybe_decimal(receipt.get('price')) != _maybe_decimal(rotation.get('price'))
+                        or _maybe_decimal(receipt.get('original_size')) != _maybe_decimal(rotation.get('original_quantity', rotation.get('quantity')))
+                        or (_maybe_decimal(receipt.get('original_size')) or ZERO) <= ZERO
+                        or (_maybe_decimal(receipt.get('price')) or ZERO) <= ZERO):
+                    continue
+                original = {**rotation, 'owner_round_id': owner,
+                    'owner_action_keys': sorted(a['action_key'] for a in original_audits)}
+                older_owners.setdefault(sid, {})[oid] = original
+                expected[oid] = original
         generation = self.store.lp_trade_generation()
         request = {'owned_order_ids': sorted(expected),
             'condition_ids': sorted({r['condition_id'] for r in plan['targets'] + plan['victims']})}
@@ -3294,6 +3372,9 @@ class LPAutoPool:
                         or _maybe_decimal(row.get('original_size')) != _decimal(target.get('original_quantity', target['quantity']))):
                     raise ValueError('owned_order_identity_mismatch')
             rows[oid] = row
+        if any(oid not in rows or oid in snapshot.get('order_read_errors', {})
+                for originals in older_owners.values() for oid in originals):
+            raise ValueError('order_result_incomplete')
         terminal_ids = {oid for oid, row in rows.items()
             if str(row.get('status')).upper() in TERMINAL_ORDER_STATES
             and row.get('fill_quantity_known') is not False and _maybe_decimal(row.get('size_matched')) is not None}
@@ -3312,6 +3393,14 @@ class LPAutoPool:
                 original_size=str(original.get('original_quantity', original['quantity'])), size_matched='0', read_ended_at=ended.isoformat())
         plan['terminal_buy_results'] = terminal_results
         plan['partial_buy_results'] = {}
+        plan['live_buy_results'] = {oid: dict(session_id=sid, side='BUY',
+            token_id=original['token_id'], condition_id=original['condition_id'],
+            price=str(original['price']), original_size=str(original.get('original_quantity', original['quantity'])),
+            status='LIVE', size_matched='0', owner_round_id=original['owner_round_id'],
+            owner_action_keys=original['owner_action_keys'], result_round_id=plan['round_id'], read_ended_at=ended.isoformat())
+            for sid, originals in older_owners.items() for oid, original in originals.items()
+            if rows[oid].get('status') == 'LIVE' and rows[oid].get('fill_quantity_known') is True
+            and _maybe_decimal(rows[oid].get('size_matched')) == ZERO}
         self._plan_order_results = snapshot
         _lp_causal_event('auto_order_result_use', account=snapshot, used_at=self._now())
         self._restore_plan_buy_progress(plan, rows=rows, generation=generation, snapshot=snapshot)
@@ -3366,7 +3455,8 @@ class LPAutoPool:
                 action.update(state='success', confirmed_at=self._stamp(),
                     filled_quantity=str(row['size_matched']))
         for session_id in {a['session_id'] for a in plan['actions'] if a['kind'] == 'cancel'}:
-            self._finish_converged_plan_cancels(plan, session_id, rows)
+            self._finish_converged_plan_cancels(plan, session_id, rows,
+                older_owners=older_owners.get(session_id))
         self._retry_planned_cancels(plan, snapshot, rows, generation)
         return snapshot
 

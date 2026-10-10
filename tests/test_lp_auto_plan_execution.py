@@ -2308,3 +2308,283 @@ def test_execution_diagnostics_separate_planning_and_result_reads(runtime, monke
     assert len(results) == 1 and results[0]['read_started_at'] and results[0]['read_ended_at']
     assert datetime.fromisoformat(results[0]['read_ended_at']) > datetime.fromisoformat(planning[0]['read_ended_at'])
     assert state['funds']['as_of'] == captured[0]['funds']['as_of']
+
+
+@pytest.mark.parametrize('mode', ['prospective', 'legacy_terminal', 'legacy_live',
+    'legacy_incomplete', 'legacy_wrong_maker'])
+def test_successful_terminal_owner_does_not_block_later_refused_round(runtime, monkeypatch, tmp_path, mode):
+    import base64
+    import hashlib
+    import json
+    from pathlib import Path
+    import zlib
+    from polymarket.models.clob.account import OpenOrder
+    from time import monotonic
+    from polymarket.models.clob.cancel import CancelOrdersResponse
+    from polymarket.models.clob.order_book import OrderBookLevel
+    from tests.test_lp_account_reservation_reconciliation import _CandidateSDKPublic
+    from tests.test_lp_order_registration_contract import _open_order
+
+    public = _CandidateSDKPublic(runtime.clock[0])
+    book = public.get_order_book
+    protective, monitor_phase, pause = [False], [False], Event()
+    protective_book = Event()
+    def current_book(*, token_id):
+        value = book(token_id=token_id).model_copy(update={'timestamp': runtime.clock[0], 'bids': (
+            OrderBookLevel(price=Decimal('.40'), size=Decimal('3000' if protective[0] else '1000')),
+            OrderBookLevel(price=Decimal('.39'), size=Decimal('1000')))})
+        if protective[0]:
+            protective_book.set()
+        return value
+    monkeypatch.setattr(public, 'get_order_book', current_book)
+    originals = tuple(_open_order('rank-'+letter, 'BUY', price='.39', original='20') for letter in 'abc')
+    original_ids = {o.id:o for o in originals}
+    terminal, exact_reads, financial_reads, result_reads, failed_ends = {}, [], [], [], []
+    result_fault = [False]
+    legacy = mode != 'prospective'
+    if legacy:
+        fixture_path = Path(__file__).parent/'fixtures/lp_auto_terminal_cancel_owners_0906.json'
+        fixture_bytes = fixture_path.read_bytes()
+        assert hashlib.sha256(fixture_bytes).hexdigest() == '16b4b00c9833bc8129abef4d1a9a3567c4490acc70ba45439a7e6aec5db34260'
+        fixture = json.loads(fixture_bytes)
+        assert fixture['source_sha'] == '090648f807b20df34890375f66e0b29f587c8432'
+        raw = zlib.decompress(base64.b64decode(fixture['database']))
+        assert len(raw) == 528384
+        assert hashlib.sha256(raw).hexdigest() == '279de489937108c95d41a4ddf4e75aa6428a4cdd89f50d1e9e1e41e5899b556b'
+        database = tmp_path/'state.sqlite/prediction_arbitrage/prediction_arbitrage.sqlite3'
+        database.parent.mkdir(parents=True)
+        database.write_bytes(raw)
+        runtime.clock[0] = datetime.fromisoformat(fixture['business_time'])
+        originals = tuple(OpenOrder.model_validate(o) for o in fixture['external_orders'])
+        original_ids.update({o.id:o for o in originals})
+        terminal.update({o['id']:OpenOrder.model_validate(o) for o in fixture['exact_terminal_orders']})
+        original_ids.update(terminal)
+    store, adapter, account, lp, engine = runtime(orders=originals, public_client=public)
+    if not legacy:
+        engine.lp_auto_configure(dict(budget_usd='39', target_buy_count=2, buy_price_level=2))
+    assert engine.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    session, = store.lp_active_sessions()
+    sid = session['session_id']
+    before = engine.lp_auto_state()
+    assert before['slots']['occupied'] == 3
+    assert Decimal(before['funds']['buy_reserved_usd']) == Decimal('23.60' if legacy else '23.40')
+    balance = account.get_balance_allowance
+    def observed_balance(**kwargs):
+        if engine.lp_auto_state()['active_plan']:
+            financial_reads.append('explicit_monitor' if monitor_phase[0] else 'planned_auto')
+        return balance(**kwargs)
+    monkeypatch.setattr(account, 'get_balance_allowance', observed_balance)
+    def venue(*, order_ids):
+        account.cancels.append(order_ids)
+        runtime.clock[0] += timedelta(seconds=1)
+        if order_ids == ('rank-c',) or protective[0]:
+            for oid in order_ids:
+                terminal[oid] = original_ids[oid].model_copy(update={'status':'CANCELED'})
+            account.orders = tuple(o for o in account.orders if o.id not in order_ids)
+            return CancelOrdersResponse(canceled=order_ids, not_canceled={})
+        assert order_ids == ('rank-d',)
+        return CancelOrdersResponse(canceled=(), not_canceled={'rank-d':'venue_denied'})
+    def exact_order(*, order_id):
+        exact_reads.append(order_id)
+        if order_id == 'rank-c' and result_fault[0] and mode == 'legacy_wrong_maker':
+            return terminal[order_id].model_copy(update={
+                'owner':'d55eb563-8b8f-4a49-a0f5-343c99f274ba',
+                'maker_address':'0x'+'b'*40})
+        return terminal.get(order_id, original_ids[order_id])
+    open_orders = account.list_open_orders
+    def current_open_orders(**kwargs):
+        result_reads.append(runtime.clock[0])
+        if result_fault[0] and mode == 'legacy_incomplete':
+            failed_ends.append(runtime.clock[0])
+            raise RuntimeError('actual SDK list-open-orders unavailable')
+        return open_orders(**kwargs)
+    monkeypatch.setattr(account, 'cancel_orders', venue)
+    monkeypatch.setattr(account, 'get_order', exact_order, raising=False)
+    monkeypatch.setattr(account, 'list_open_orders', current_open_orders)
+    scheduler = LPAutoScheduler(engine, clock=lambda:runtime.clock[0])
+    if not legacy:
+        engine.lp_auto_set_desired_running(True)
+        assert scheduler.run_due()
+        sent = engine.lp_auto_state()
+        original_c = deepcopy(sent['active_plan'])
+        assert [a['order_id'] for a in original_c['actions']] == ['rank-c']
+        assert [r['order_id'] for r in original_c['targets']] == ['rank-a','rank-b']
+        assert original_c['actions'][0]['session_id'] == sid
+        audit_c, = deepcopy(store.lp_actions(sid))
+        assert audit_c['state'] == 'accepted' and audit_c['order_id'] == 'rank-c'
+        assert audit_c['rotation_round_id'] == original_c['round_id']
+        runtime.clock[0] = datetime.fromisoformat(sent['plan_wait']['deadline'])
+        assert scheduler.run_due()
+        settled = engine.lp_auto_state()
+        assert settled['active_plan'] is None and settled['last_round']['round_id'] == original_c['round_id']
+        assert settled['last_round']['actions'][0]['action_id'] == original_c['actions'][0]['action_id']
+        assert settled['last_round']['actions'][0]['state'] == 'success'
+        assert settled['slots']['occupied'] == 2 and Decimal(settled['funds']['buy_reserved_usd']) == Decimal('15.60')
+        assert datetime.fromisoformat(settled['plan_wait']['deadline']) == datetime.fromisoformat(settled['last_round']['completed_at']) + timedelta(seconds=60)
+        assert store.lp_actions(sid) == [audit_c] and account.cancels == [('rank-c',)] and account.posts == []
+        assert financial_reads == []
+        assert settled['funds']['status'] == 'unknown' and settled['funds']['as_of'] == sent['funds']['as_of']
+        retired = store.lp_session(sid)
+        assert retired.get('yield_rotation_cancel_owners') == {}, 'Exact successful terminal owner must retire without a rejected sibling'
+        assert 'rank-c' not in retired.get('yield_rotation_protection_before', {})
+        assert 'rank-c' not in retired.get('augment_cancel_requested', [])
+
+        # Public monitor applies the genuine terminal history and original baseline.
+        deadline, pause = monotonic()+5, Event()
+        monitor_phase[0] = True
+        try:
+            while (store.lp_session(sid)['order_history']['rank-c']['status'] != 'CANCELED'
+                    or store.lp_session(sid)['queue_protection']['levels']['0.39']['state'] != 'monitoring'):
+                assert monotonic() < deadline, 'Public terminal-history/monitor watchdog'
+                engine.lp_tick()
+                pause.wait(min(.01, max(0, deadline-monotonic())))
+        finally:
+            monitor_phase[0] = False
+        low = deepcopy(store.lp_session(sid)['queue_protection']['levels']['0.39'])
+        runtime.clock[0] += timedelta(seconds=1)
+        original_ids['rank-d'] = _open_order('rank-d', 'BUY', price='.40', original='20')
+        account.orders = (*account.orders, original_ids['rank-d'])
+        reads = account.order_reads
+        adapter.lp_account_snapshot_shared(max_age_seconds=-1, trade_generation_provider=store.lp_trade_generation)
+        assert account.order_reads > reads
+        assert engine.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+        assert {'rank-a','rank-b','rank-c','rank-d'} <= store.lp_session(sid)['order_history'].keys()
+        for key in ('baseline_front','baseline_level_total','baseline_price','baseline_book_time','order_id'):
+            assert store.lp_session(sid)['queue_protection']['levels']['0.39'].get(key) == low.get(key)
+        deadline = monotonic()+5
+        monitor_phase[0] = True
+        try:
+            while store.lp_session(sid)['queue_protection']['levels']['0.40']['state'] != 'monitoring':
+                assert monotonic() < deadline, 'New public price-level monitoring watchdog'
+                engine.lp_tick()
+                pause.wait(min(.01, max(0, deadline-monotonic())))
+        finally:
+            monitor_phase[0] = False
+    else:
+        assert store.path == database
+        assert sid == fixture['original_session_id']
+        assert before['active_plan'] is None
+        original_c = deepcopy(before['last_round'])
+        audit_c, = deepcopy(store.lp_actions(sid))
+        assert audit_c == fixture['original_audit']
+        assert audit_c['state'] == 'accepted' and audit_c['order_id'] == 'rank-c'
+        assert audit_c['rotation_round_id'] == fixture['original_round_id'] == original_c['round_id']
+        assert original_c['actions'][0]['action_id'] == fixture['original_action_id']
+        assert original_c['actions'][0]['state'] == 'success' and original_c['completed_at']
+        assert session['yield_rotation_cancel_owners'] == {'rank-c':original_c['round_id']}
+        assert session['order_history']['rank-c']['status'] == 'CANCELED'
+        assert Decimal(session['order_history']['rank-c']['size_matched']) == 0
+        assert {'rank-a','rank-b','rank-c','rank-d'} <= session['order_history'].keys()
+        assert session['queue_protection']['levels']['0.40']['state'] == 'monitoring'
+        assert account.cancels == account.posts == []
+    baseline = deepcopy(store.lp_session(sid)['queue_protection'])
+    assert Decimal(baseline['levels']['0.40']['baseline_front']) == Decimal('980')
+    ready = engine.lp_auto_state()
+    assert ready['slots']['occupied'] == 3 and Decimal(ready['funds']['buy_reserved_usd']) == Decimal('23.60')
+    runtime.clock[0] = datetime.fromisoformat(ready['plan_wait']['deadline'])
+    assert scheduler.run_due()
+    waiting = engine.lp_auto_state()
+    original_d = deepcopy(waiting['active_plan'])
+    assert original_d['round_id'] != original_c['round_id']
+    assert [a['order_id'] for a in original_d['actions']] == ['rank-d']
+    assert [r['order_id'] for r in original_d['targets']] == ['rank-a','rank-b']
+    audit_d, = [deepcopy(a) for a in store.lp_actions(sid) if a.get('order_id') == 'rank-d']
+    assert audit_d['state'] == 'rejected' and audit_d['reason'] == 'venue_denied'
+    assert audit_d['rotation_round_id'] == original_d['round_id']
+    first_calls = list(account.cancels)
+    assert first_calls == ([('rank-d',)] if legacy else [('rank-c',),('rank-d',)])
+    result_fault[0] = mode in ('legacy_incomplete', 'legacy_wrong_maker')
+    if mode == 'legacy_live':
+        account.orders = (*account.orders, original_ids['rank-c'].model_copy(update={'status':'LIVE'}))
+    if mode == 'legacy_wrong_maker':
+        terminal['rank-c'] = terminal['rank-c'].model_copy(update={'owner':'d55eb563-8b8f-4a49-a0f5-343c99f274ba'})
+    runtime.clock[0] = datetime.fromisoformat(waiting['plan_wait']['deadline'])
+    result_at = runtime.clock[0]
+    assert scheduler.run_due()
+    state = engine.lp_auto_state()
+    if result_fault[0]:
+        assert state['active_plan']['round_id'] == original_d['round_id']
+        assert state['last_round']['actions'][0]['action_id'] == original_d['actions'][0]['action_id']
+        assert state['last_round']['actions'][0]['state'] == 'canceling'
+        assert not state['last_round']['completed_at']
+        assert state['reason'] == state['last_round']['reason'] == 'order_result_incomplete'
+        assert state['plan_wait']['kind'] == 'api'
+        assert datetime.fromisoformat(state['plan_wait']['deadline']) == result_at + timedelta(seconds=60)
+        assert state['slots']['occupied'] == 3 and Decimal(state['funds']['buy_reserved_usd']) == Decimal('23.60')
+        assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == waiting['funds']['as_of']
+        held = store.lp_session(sid)
+        assert held['yield_rotation_cancel_owners'] == {'rank-c':original_c['round_id'],'rank-d':original_d['round_id']}
+        assert 'rank-c' in held.get('augment_cancel_requested', [])
+        assert held['yield_rotation_protection_before']['rank-d'] == baseline
+        assert store.lp_actions(sid) == [audit_c,audit_d]
+        read_count, exact_count = len(result_reads), len(exact_reads)
+        for elapsed in (1,59):
+            runtime.clock[0] = result_at + timedelta(seconds=elapsed)
+            scheduler.request_check()
+            assert not scheduler.run_due()
+            assert len(result_reads) == read_count and len(exact_reads) == exact_count
+            assert account.cancels == first_calls and account.posts == []
+            assert financial_reads == []
+            assert store.lp_actions(sid) == [audit_c,audit_d]
+        if mode == 'legacy_incomplete':
+            assert failed_ends == [result_at]
+        else:
+            assert 'rank-c' in exact_reads
+        result_fault[0] = False
+        runtime.clock[0] = datetime.fromisoformat(state['plan_wait']['deadline'])
+        assert scheduler.run_due()
+        state = engine.lp_auto_state()
+    assert state['active_plan'] is None and state['last_round']['round_id'] == original_d['round_id']
+    action, = state['last_round']['actions']
+    assert action['action_id'] == original_d['actions'][0]['action_id']
+    assert action['state'] == 'rejected' and action['reason'] == 'venue_denied'
+    assert state['slots']['occupied'] == (4 if mode == 'legacy_live' else 3)
+    assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('31.40' if mode == 'legacy_live' else '23.60')
+    assert datetime.fromisoformat(state['plan_wait']['deadline']) == datetime.fromisoformat(state['last_round']['completed_at']) + timedelta(seconds=60)
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == waiting['funds']['as_of']
+    if legacy and mode != 'legacy_live':
+        assert 'rank-c' in exact_reads, 'Recovery must query the actual original terminal ID'
+    restored = store.lp_session(sid)
+    if mode == 'legacy_live':
+        assert restored['yield_rotation_cancel_owners'] == {'rank-c':original_c['round_id']}
+        assert 'rank-c' in restored.get('augment_cancel_requested', [])
+        assert restored['queue_protection']['levels']['0.40']['state'] == 'canceling'
+        assert restored['yield_rotation_protection_before']['rank-d'] == baseline
+        assert store.lp_actions(sid) == [audit_c,audit_d]
+        scheduler.request_check()
+        assert not scheduler.run_due()
+        engine.lp_auto_run_once()
+        assert account.cancels == [('rank-d',)] and account.posts == []
+        assert financial_reads == []
+        return
+    assert restored.get('yield_rotation_cancel_owners') == {}
+    assert restored.get('yield_rotation_protection_before') == {}
+    assert restored['queue_protection'] == baseline
+    assert not restored.get('entry_cancel_requested') and restored.get('augment_cancel_requested', []) == []
+    assert store.lp_actions(sid) == [audit_c,audit_d]
+    scheduler.request_check()
+    assert not scheduler.run_due()
+    engine.lp_auto_run_once()
+    assert account.cancels == first_calls and account.posts == []
+    _, _, restarted_account, _, restarted = runtime(orders=account.orders, public_client=public)
+    restarted.lp_auto_run_once()
+    assert restarted_account.cancels == restarted_account.posts == []
+    assert 'planned_auto' not in financial_reads
+    protective[0] = True
+    deadline = monotonic()+5
+    monitor_phase[0] = True
+    try:
+        engine.lp_tick()
+        assert protective_book.wait(max(0,deadline-monotonic())), 'Actual SDK protective book watchdog'
+        while account.cancels == first_calls:
+            assert monotonic() < deadline, 'Public ordinary protection watchdog'
+            pause.wait(min(.01,max(0,deadline-monotonic())))
+            engine.lp_tick()
+    finally:
+        monitor_phase[0] = False
+    assert account.cancels == first_calls+[('rank-d',)] and account.posts == []
+    bucket = store.lp_session(sid)['queue_protection']['levels']['0.40']
+    assert bucket['cancel_reason'] == 'queue_ahead_ratio' and bucket['cancel_targets'] == ['rank-d']
+    assert 'planned_auto' not in financial_reads
+    for original in (audit_c,audit_d):
+        assert next(a for a in store.lp_actions(sid) if a['action_key']==original['action_key']) == original
