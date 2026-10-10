@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 from .polymarket_lp_risk import (
     BOOK_FRESHNESS_SECONDS,
+    _MARKET_METADATA_MAX_AGE_SECONDS,
     LP_QUEUE_PROTECTION_THRESHOLD,
     TERMINAL_ORDER_STATES,
     _account_after_reservations,
@@ -7968,18 +7969,31 @@ class PolymarketLPService:
         )
 
     def _fetch_candidate_facts(self, identity, *, account=None, candidate=False):
+        if account is None:
+            reader = getattr(self.exchange, "lp_account_snapshot", None)
+            if not callable(reader):
+                raise ValueError("candidate_readers_unavailable")
+            try:
+                account = reader()
+            except Exception as exc:
+                raise ValueError("account_unknown") from exc
+        if not isinstance(account, Mapping):
+            raise ValueError("account_unknown")
+        return {"account": dict(account),
+                "direction": self._fetch_market_direction(identity, candidate=candidate)}
+
+    def _fetch_market_direction(self, identity, *, candidate=False):
         condition_id = str(identity.get("condition_id") or "").strip()
         token_id = str(identity.get("token_id") or "").strip()
         outcome = str(identity.get("outcome") or "").upper()
         if not condition_id or not token_id or outcome not in {"YES", "NO"}:
             raise ValueError("candidate_identity_unknown")
-        account_reader = getattr(self.exchange, "lp_account_snapshot", None)
         metadata_reader = getattr(self.exchange, "lp_market_metadata_fresh", None)
         reward_reader = getattr(self.exchange, "lp_reward_catalog", None)
         books_reader = getattr(self.exchange, "lp_order_books", None)
         if not all(
             callable(reader)
-            for reader in (account_reader, metadata_reader, reward_reader, books_reader)
+            for reader in (metadata_reader, reward_reader, books_reader)
         ):
             raise ValueError("candidate_readers_unavailable")
         def read_reward():
@@ -8026,12 +8040,6 @@ class PolymarketLPService:
                 self._exclude_candidate(condition_id, "", reason, checked_at=read_started,
                     exclusion_revision=exclusion_revision)
                 raise ValueError(reason)
-        try:
-            account = account_reader() if account is None else account
-        except Exception as exc:
-            raise ValueError("account_unknown") from exc
-        if not isinstance(account, Mapping):
-            raise ValueError("account_unknown")
         try:
             try:
                 raw_metadata = metadata_reader((condition_id,), stop_event=None)
@@ -8120,7 +8128,41 @@ class PolymarketLPService:
             ),
             "reward_guidance_deadline": self._reward_guidance_deadline(reward_market),
         }
-        return {"account": dict(account), "direction": direction}
+        return direction
+
+    def _read_plan_market_snapshot(self, identity):
+        """Read execution eligibility without financial qualification or repricing."""
+        if not self._candidate_allowed(((str(identity.get('condition_id') or ''),
+                                         str(identity.get('token_id') or '')),)):
+            raise ValueError('candidate_cooling_down')
+        revision = self._candidate_exclusion_revision
+        direction = self._market_read(identity,
+            lambda: self._fetch_market_direction(identity, candidate=True))
+        if self.exclusions_enabled and revision != self._candidate_exclusion_revision:
+            raise ValueError('candidate_exclusions_changed')
+        market, book = direction['market'], direction['book']
+        now = self._now()
+        for value, age, reason in (
+            (market.get('metadata_checked_at'), _MARKET_METADATA_MAX_AGE_SECONDS, 'market_metadata'),
+            (market.get('fees_checked_at'), _MARKET_METADATA_MAX_AGE_SECONDS, 'market_fees'),
+            (direction.get('reward_checked_at'), 60, 'reward_data'),
+        ):
+            _freshness(value, now, reason, max_age=age)
+        deadline = direction.get('reward_guidance_deadline')
+        if deadline is not None and _timestamp(deadline) <= now:
+            raise ValueError('reward_expired')
+        event_state, event_reason, _, _ = _event_window_check(direction, market, now)
+        if event_state is not None:
+            raise ValueError(event_reason or 'event_timing_unknown')
+        if direction.get('reward_active') is not True:
+            raise ValueError('reward_inactive' if direction.get('reward_active') is False else 'reward_status_unknown')
+        reward = _maybe_decimal(direction.get('daily_pool_usd'))
+        if reward is None or reward <= 0:
+            raise ValueError('reward_pool_unknown' if reward is None else 'reward_pool_empty')
+        if (str(book.get('condition_id', book.get('market'))) != str(identity['condition_id'])
+                or str(book.get('token_id', book.get('asset_id'))) != str(identity['token_id'])):
+            raise ValueError('book_identity_mismatch')
+        return {'market': market, 'book': book, 'candidate_direction': direction}
 
     def _read_candidate_snapshot(
         self, identity: Mapping[str, object], *, now: datetime, ignore_session_id=None,
@@ -10083,6 +10125,7 @@ class PolymarketLPService:
         post: Callable[[object, Callable[[], None]], object] | None = None,
         release_preparation_lock: Callable[[], None] | None = None,
         apply_lock: tuple[Callable[[], object | None], Callable[[object], None]] | None = None,
+        plan_authorization=None,
     ) -> dict[str, object]:
         """Register the session and submit exactly one post-only BUY.
 
@@ -10129,6 +10172,7 @@ class PolymarketLPService:
         session_id = session_id or uuid.uuid4().hex
         intent: dict[str, object] = {
             **request,
+            **(entry_action_base if plan_authorization is not None else {}),
             "account_id": account_id,
             "preflight": facts,
             "entry_order_id": None,
@@ -10245,6 +10289,7 @@ class PolymarketLPService:
                 side="BUY",
                 post_only=True,
                 expiration=expiration,
+                plan_authorization=plan_authorization,
             )
             submit_revision = self.store.lp_session_revision(session_id, trading=True)
             response = execute_post(signed, side="BUY")
@@ -10312,11 +10357,16 @@ class PolymarketLPService:
             return self._status_payload(session)
         accepted, order_id = self._order_response(response)
         response_at = _iso(self._now())
-        if not accepted and not (
+        opaque_plan_response = (plan_authorization is not None
+            and _field(response, 'ok', None) is False
+            and _field(response, 'code', None) == 'unknown'
+            and _field(response, 'accepted', None) is None
+            and not order_id)
+        if not accepted and (opaque_plan_response or not (
             _field(response, "accepted", None) is False
             or _field(response, "ok", None) is False
             or str(_field(response, "status", "")).upper() in {"REJECTED", "FAILED"}
-        ):
+        )):
             self.store.lp_upsert_action(session_id, entry_action_key, state="unknown",
                 payload={"role": "entry", "side": "BUY", "token_id": request["token_id"],
                          "expiration": expiration, **send_receipt_base,
@@ -10329,11 +10379,20 @@ class PolymarketLPService:
             return self._status_payload(session)
         if not accepted:
             rejected_at = response_at
+            rejection = {}
+            if plan_authorization is not None:
+                reason = _field(response, 'code', _field(response, 'reason',
+                    _field(response, 'error_code', _field(response, 'errorMsg', None))))
+                rejection['reason'] = str(reason)[:256] if reason else 'exchange_rejected'
+                message = _field(response, 'message', None)
+                if isinstance(message, str):
+                    rejection['exchange_rejection_message'] = message[:256]
             self.store.lp_upsert_action(
                 session_id,
                 entry_action_key,
                 state="rejected",
                 payload={
+                    **rejection,
                     "role": "entry",
                     "side": "BUY",
                     "token_id": request["token_id"],
@@ -10348,7 +10407,7 @@ class PolymarketLPService:
             session = self.store.lp_update_session(
                 session_id,
                 state="entry_rejected",
-                patch={"entry_order_id": order_id, "submit_status": "rejected",
+                patch={**rejection, "entry_order_id": order_id, "submit_status": "rejected",
                        **send_receipt_base, "submit_stage": "exchange_rejected",
                        "submit_finished_at": rejected_at,
                        "submit_receipt_at": rejected_at},
@@ -13747,6 +13806,22 @@ class PolymarketLPService:
         else:
             available_balance = balance_d
             available_allowance = allowance_d
+        rules = cls._validate_market_rules(request, snapshot)
+        if (available_balance < 0 or available_allowance < 0
+                or available_balance < request["price"] * request["quantity"]
+                or available_allowance < request["price"] * request["quantity"]):
+            raise ValueError("balance_insufficient")
+        facts = cls._validate_market_book(request, snapshot, rules, now=now)
+        return {**facts, "balance": balance_d, "allowance": allowance_d}
+
+    @classmethod
+    def _validate_market_snapshot(cls, request, snapshot, *, now):
+        """Validate the frozen order against current market facts only."""
+        rules = cls._validate_market_rules(request, snapshot)
+        return cls._validate_market_book(request, snapshot, rules, now=now)
+
+    @classmethod
+    def _validate_market_rules(cls, request, snapshot):
         market = snapshot.get("market")
         if not isinstance(market, Mapping):
             raise ValueError("market_unknown")
@@ -13809,13 +13884,14 @@ class PolymarketLPService:
             raise ValueError("price_off_tick")
         if quantity < minimum_d or quantity < reward_min_d:
             raise ValueError("order_size_invalid")
-        if (
-            available_balance < 0
-            or available_allowance < 0
-            or available_balance < price * quantity
-            or available_allowance < price * quantity
-        ):
-            raise ValueError("balance_insufficient")
+        return dict(tick_size=tick_d, minimum_order_size=minimum_d,
+            reward_min_size=reward_min_d, reward_max_spread=reward_spread_d,
+            fee=fee_d, taker_fee_rate=taker_fee_rate_d)
+
+    @classmethod
+    def _validate_market_book(cls, request, snapshot, rules, *, now):
+        price, quantity = request['price'], request['quantity']
+        reward_min_d, reward_spread_d = rules['reward_min_size'], rules['reward_max_spread']
         book = snapshot.get("book")
         if not isinstance(book, Mapping):
             raise ValueError("book_unknown")
@@ -13860,14 +13936,7 @@ class PolymarketLPService:
         review_at = _timestamp(request["review_at"], name="review_at")
         expiration = expiration_for_review(review_at, now=now)
         return {
-            "tick_size": tick_d,
-            "minimum_order_size": minimum_d,
-            "reward_min_size": reward_min_d,
-            "reward_max_spread": reward_spread_d,
-            "fee": fee_d,
-            "taker_fee_rate": taker_fee_rate_d,
-            "balance": balance_d,
-            "allowance": allowance_d,
+            **rules,
             "midpoint": midpoint,
             "best_bid": bid[0],
             "selected_bid": selected_bid,
@@ -16751,11 +16820,17 @@ class PolymarketLPService:
             and _maybe_decimal(fact.get("fee")) is not None
         )
 
-    def _create_limit(self, **kwargs: object) -> object:
+    def _create_limit(self, *, plan_authorization=None, **kwargs: object) -> object:
         self._require_mutation()
+        if plan_authorization is not None:
+            from .polymarket_lp_auto import _PlanEntryAuthorization
+            if not isinstance(plan_authorization, _PlanEntryAuthorization) or plan_authorization.pool.lp is not self:
+                raise _MutationBlocked('plan_authorization_invalid')
+            plan_authorization.validate(kwargs)
         if (
             str(kwargs.get("side") or "").upper() == "BUY"
             and self._account_order_sync_error is not None
+            and plan_authorization is None
         ):
             raise _MutationBlocked(self._account_order_sync_error)
         direct = getattr(self.exchange, "lp_create_limit_order", None)
@@ -16772,11 +16847,18 @@ class PolymarketLPService:
         *,
         side: str | None = None,
         on_post_started: Callable[[], None] | None = None,
+        plan_authorization=None,
     ) -> object:
         self._require_mutation()
+        if plan_authorization is not None:
+            from .polymarket_lp_auto import _PlanEntryAuthorization
+            if not isinstance(plan_authorization, _PlanEntryAuthorization) or plan_authorization.pool.lp is not self:
+                raise _MutationBlocked('plan_authorization_invalid')
+            plan_authorization.validate()
         if (
             str(side or "").upper() == "BUY"
             and self._account_order_sync_error is not None
+            and plan_authorization is None
         ):
             raise _MutationBlocked(self._account_order_sync_error)
         direct = getattr(self.exchange, "lp_post_order", None)
@@ -17871,7 +17953,7 @@ class PolymarketLPService:
             return str(response_id or "") == target and status in TERMINAL_ORDER_STATES
         return target in {str(value) for value in values}
 
-    def begin_order_cancel(self, order_ids: Collection[str], *, serialized=True):
+    def begin_order_cancel(self, order_ids: Collection[str], *, serialized=True, plan_round_id=None):
         """Persist exact owned cancel attempts before allowing network I/O."""
         attempts = []
         with self._mutex if serialized else nullcontext():
@@ -17882,6 +17964,8 @@ class PolymarketLPService:
                     key = self._action_key(session_id, 'reconciliation-cancel', uuid.uuid4().hex)
                     payload = dict(role='reconciliation_cancel', order_id=order_id,
                                    submit_requested_at=_iso(self._now()))
+                    if plan_round_id is not None:
+                        payload['rotation_round_id'] = plan_round_id
                     self.store.lp_upsert_action(session_id, key, state='pending', payload=payload)
                     attempts.append((session_id, key, payload))
         return attempts
@@ -17894,7 +17978,7 @@ class PolymarketLPService:
         if attempts and self._facts_wakeup:
             self._facts_wakeup()
 
-    def _cancel_order(self, order_id: str, *, attempts=None) -> bool:
+    def _cancel_order(self, order_id: str, *, attempts=None, on_response=None) -> bool:
         try:
             self._require_mutation()
         except _MutationBlocked:
@@ -17914,10 +17998,14 @@ class PolymarketLPService:
             if callable(direct):
                 response = direct(order_id)
             else:
-                method = getattr(self.exchange, "cancel_orders", None)
+                method = getattr(self.exchange, "cancel_orders_detailed", None) if on_response is not None else None
+                if not callable(method):
+                    method = getattr(self.exchange, "cancel_orders", None)
                 if not callable(method):
                     raise RuntimeError("cancel_adapter_unavailable")
                 response = method((order_id,))
+            if on_response is not None:
+                on_response(response)
             acknowledged = self._cancel_acknowledged(response, order_id)
             return acknowledged
         finally:

@@ -5,6 +5,16 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-10
 
+- #322 修订自动 LP 为规划时校验账户、执行固定动作并独立确认结果。已批准计划不因财务 TTL 或代次变化重新验资；局部失败、明确拒单及实际名额不足只结束当前动作，资源等待与 UNKNOWN 保留原请求。明确撤单拒绝且确认 LIVE 不在同轮暗中重试。真实成交库存保留，预算在下一轮重新分配，不承诺执行期连续敞口上限。手动入场、独立增仓、保护及财务发布规则保留。分支聚焦证据与旧节点迁移单独记录；CI、独立评审、合并与部署未在此确认。
+
+- #322 修复排名、首次撤单及 BUY 最终安全复核中的账户失效等待：账户事实过期或
+  代际失效时按独立 API 间隔恢复原计划；明确未提交的 BUY 保留原失败审计并使用新请求身份。
+  保留精确订单、报价、占资及单笔明确拒绝语义。公开入口有序 RED/GREEN 与相关聚焦检查通过；
+  新候选的独立评审及 CI 待确认，未执行实盘或部署。
+
+- 明确交付规则：独立新增的 `CHANGELOG.md` 条目发生冲突时可直接保留双方内容并解决；
+  已发布任务分支可用正常 merge 同步 `origin/main`，仍须完成规定检查和独立评审。
+
 - 东京部署 SOP 文档收尾：区分 `9eab8d32` 的停止安装、Mac-mini.local 上
   `lpprobe tokyo` 的只读解析验证，以及用户在 SSH pane 执行原生 `self-test`
   的真实单笔结果。回执于 `2026-10-10T09:45:42.976862Z` 核对为 PASS：
@@ -41,6 +51,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
   保留人工 check/run/status/cancel；地域独立报告。合成 HTTP、离线安装/SSH
   与解析器进程/文件边界及相关认证的 95 项聚焦检查通过，shell/离线入口检查通过；
   未安装真实入口、连接东京、部署或下单。
+
+- LP 自动 BUY 在未满池与满池时统一选优，固定本轮目标和报价；单笔明确拒绝后继续其余动作。
+  API 暂时失败、撤单 ACK 后仍 LIVE、订单确认消失与短暂资源争用均可自动接续原计划，
+  保留精确订单身份、未知提交防重、部分成交库存及保护门禁。新增独立持久参数
+  `--round-interval-seconds`、`--api-retry-interval-seconds`、`--order-check-interval-seconds`，
+  默认 60/60/10 秒；运行中修改只影响下一次等待，CLI 校验服务持久状态回执。
+  已完成 #322 的 16 项公开入口契约逐案 RED/GREEN 或不变式验证，以及相关聚焦消费者修复；
+  最终候选检查、独立评审及 CI 由交付流程确认，未执行实盘或部署。
 
 - 新增 #321 人工 Polymarket 单笔诊断 CLI：只读 check、GET-only status 与明确确认的
   run/cancel；仅 BUY/post-only/GTD，名义金额硬上限 1 USDC，记录真实地域结果，

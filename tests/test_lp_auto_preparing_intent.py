@@ -11,9 +11,9 @@ from tests.test_lp_order_registration_contract import _open_order
 
 
 @pytest.mark.parametrize('reconcile', [False, True], ids=['control', 'overlap'])
-@pytest.mark.parametrize('phase', ['signing', 'presend-account-read'])
+@pytest.mark.parametrize('phase', ['signing', 'after-sign'])
 def test_three_to_five_keeps_both_preparing_reservations(runtime, reconcile, phase):
-    store, adapter, account, lp, execution, _ = prepare(runtime)
+    store, adapter, account, lp, execution, public = prepare(runtime)
     account.orders = tuple(_open_order(f'manual-{i}', 'BUY', price='.40', original='20',
         token_id=_refill_identity(i)[2]).model_copy(update={
             'market': _refill_identity(i)[1], 'condition_id': _refill_identity(i)[1]})
@@ -21,8 +21,8 @@ def test_three_to_five_keeps_both_preparing_reservations(runtime, reconcile, pha
     entered, release = [Event(), Event()], [Event(), Event()]
     signing_entered, signing_release = [Event(), Event()], [Event(), Event()]
     original_sign = account.create_limit_order
-    armed = [None]
-    rounds = []
+    signed_objects = [None, None]
+    rounds, latest_financial_as_of = [], []
 
     def pause(index):
         entered[index].set()
@@ -35,31 +35,30 @@ def test_three_to_five_keeps_both_preparing_reservations(runtime, reconcile, pha
         else:
             signing_entered[index].set()
             assert signing_release[index].wait(5), 'Independent signing watchdog'
-            armed[0] = index
-        return original_sign(**kwargs)
-
-    def positions_read(_):
-        index, armed[0] = armed[0], None
-        if index is not None:
+        signed = original_sign(**kwargs)
+        signed_objects[index] = signed
+        if phase == 'after-sign':
+            # Hold the genuine SDK result before returning to the live LP sender.
             pause(index)
+        return signed
 
     account.create_limit_order = sign
-    account.before_positions = positions_read
     with ThreadPoolExecutor(1) as workers:
         pending = workers.submit(execution.lp_auto_run_once, round_id='refill-two')
         try:
             for index in range(2):
                 account_round = None
-                if phase == 'presend-account-read':
+                if phase == 'after-sign':
                     assert signing_entered[index].wait(5)
-                    # The adapter serializes private reads. Complete the
-                    # reconciler's real round before blocking the send read;
-                    # its facts publish while that later read is still active.
+                    # Pre-read a real account round before SDK signing completes;
+                    # publish it while the external signer holds its real result.
                     account_round = adapter.lp_account_round_begin(store.lp_trade_generation)
                     rounds.append(account_round)
                     adapter.lp_account_snapshot(account_round=account_round)
                     signing_release[index].set()
                 assert entered[index].wait(5), 'Independent auto-submit watchdog'
+                if phase == 'after-sign':
+                    assert signed_objects[index] is not None
                 before = execution.lp_auto_state()
                 intent = next(i for i in before['intents'] if i['state'] == 'reserved')
                 sid = intent['session_id']
@@ -68,19 +67,21 @@ def test_three_to_five_keeps_both_preparing_reservations(runtime, reconcile, pha
                 action = next(a for a in store.lp_actions(sid) if a['role'] == 'entry')
                 assert action['state'] == 'pending'
                 assert action['submit_stage'] == 'preparing' and action['post_started'] is False
-                # These fields are initially on the action, not the session.
-                assert store.lp_session(sid).get('post_started') is None
+                assert store.lp_session(sid).get('post_started') is False
+                assert store.lp_session(sid)['submit_stage'] == 'preparing'
                 if reconcile:
-                    lp.reconcile_facts(sid, apply_lock=(
+                    reconciled = lp.reconcile_facts(sid, apply_lock=(
                         execution._acquire_global_lock, execution._release_global_lock),
                         account_round=account_round)
                     after = execution.lp_auto_state()
                     current = next(i for i in after['intents'] if i['intent_id'] == intent['intent_id'])
                     assert current['state'] == 'reserved', current
                     assert current['reserved_usd'] == intent['reserved_usd']
-                    assert current['financial_status'] == 'known'
+                    assert current['financial_status'] == 'known', (current, reconciled[3])
                     assert after['slots']['occupied'] == before['slots']['occupied']
                     assert not current.get('reconcile_reason')
+                latest_financial_as_of.append(execution.lp_auto_state()['funds']['as_of'])
+                assert latest_financial_as_of[-1]
                 release[index].set()
         finally:
             for event in (*release, *signing_release):
@@ -91,7 +92,10 @@ def test_three_to_five_keeps_both_preparing_reservations(runtime, reconcile, pha
     assert len(account.orders) == state['slots']['occupied'] == 5
     assert len(account.posts) == 2
     assert Decimal(state['funds']['buy_reserved_usd']) == 40
-    assert state['funds']['status'] == 'known'
+    from datetime import datetime
+    assert datetime.fromisoformat(latest_financial_as_of[-1]) <= runtime.clock[0]
+    assert state['funds']['status'] == 'unknown'
+    assert state['funds']['as_of'] == latest_financial_as_of[-1]
     _advance(runtime)
     assert execution.lp_auto_run_once(round_id='refill-two')['slots']['occupied'] == 5
     assert execution.lp_auto_run_once(round_id='next-round')['slots']['occupied'] == 5
@@ -130,7 +134,7 @@ def test_preparing_publication_keeps_send_fences(runtime, fence, reason):
             else:
                 # Inject a durable version invalidation. Public configuration
                 # correctly refuses edits while an entry is still occupied.
-                execution._auto_pool._update(lambda d: d.update(config_version=d['config_version'] + 1))
+                execution._auto_pool._update(lambda d: d.update(config_version=d['config_version'] + 1, trading_config_version=d['trading_config_version'] + 1))
         finally:
             release.set()
         state = pending.result(timeout=5)
@@ -209,6 +213,7 @@ def test_preparing_uncertainty_still_becomes_unknown(runtime, uncertainty):
 @pytest.mark.parametrize('receipt', ['late', 'missing', 'idless'])
 @pytest.mark.parametrize('stale_reserved', [False, True], ids=['sending-intent', 'stale-reserved-intent'])
 def test_post_started_with_stale_preparing_action_keeps_unknown_until_receipt(runtime, receipt, stale_reserved):
+    from datetime import datetime
     store, _, account, lp, execution, _ = prepare(runtime, target=1, count=1)
     entered, release = Event(), Event()
     original_post = account.post_order
@@ -248,6 +253,8 @@ def test_post_started_with_stale_preparing_action_keeps_unknown_until_receipt(ru
             assert current['reserved_usd'] == intent['reserved_usd']
             assert not current.get('reservation_coverage')
             assert execution.lp_auto_state()['slots']['occupied'] == 1
+            financial_as_of = execution.lp_auto_state()['funds']['as_of']
+            assert financial_as_of and datetime.fromisoformat(str(financial_as_of).replace('Z', '+00:00'))
         finally:
             release.set()
         state = pending.result(timeout=5)
@@ -258,7 +265,8 @@ def test_post_started_with_stale_preparing_action_keeps_unknown_until_receipt(ru
         assert session['entry_order_id'] == action['order_id'] == 'refill-1'
         assert action['state'] == 'accepted'
         assert state['slots']['occupied'] == 1
-        assert state['funds']['status'] == 'known'
+        assert state['funds']['status'] == 'unknown'
+        assert state['funds']['as_of'] == financial_as_of
     else:
         assert not session['entry_order_id']
         assert session['submit_status'] == ('unknown' if receipt == 'missing' else 'accepted_without_order_id')

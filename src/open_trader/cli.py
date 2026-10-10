@@ -1544,9 +1544,11 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--timeout", default=15.0)
         command.add_argument("--json", action="store_true")
         if action == "config":
-            command.add_argument("--budget", required=True)
-            command.add_argument("--target-buys", required=True)
+            command.add_argument("--budget")
+            command.add_argument("--target-buys")
             command.add_argument("--bid-level")
+            for option in ('round-interval-seconds', 'api-retry-interval-seconds', 'order-check-interval-seconds'):
+                command.add_argument('--' + option)
 
     cross_auto_parser = prediction_commands.add_parser(
         "cross-auto", help="Inspect Service-owned cross-venue execution state"
@@ -2035,7 +2037,10 @@ def main(argv: list[str] | None = None) -> int:
                                json_output=getattr(args, "json", False),
                                budget=getattr(args, "budget", None),
                                target_buys=getattr(args, "target_buys", None),
-                               bid_level=getattr(args, "bid_level", None))
+                               bid_level=getattr(args, "bid_level", None),
+                               round_interval_seconds=getattr(args, 'round_interval_seconds', None),
+                               api_retry_interval_seconds=getattr(args, 'api_retry_interval_seconds', None),
+                               order_check_interval_seconds=getattr(args, 'order_check_interval_seconds', None))
         if args.prediction_command == "cross-auto":
             if args.cross_auto_command == "status":
                 try:

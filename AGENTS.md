@@ -131,6 +131,15 @@ require explicit user approval. Follow the detailed
 
 ## Review and merge
 
+When a conflict only combines independent added `CHANGELOG.md` entries, preserve
+both entries, dates, and meaning and resolve it directly without a new permission
+question. Continue required checks and independent review. For this mechanical
+resolution on an already-published task branch, Main may synchronize `origin/main`
+into that same task branch with a normal merge commit and ordinary push, without
+rewriting history. This does not authorize merging the PR into GitHub `main`,
+force-pushing, deployment, or choosing between contradictory release claims;
+meaning-changing conflicts still require the existing plan approval.
+
 Before first publication, update the dated operator-facing entry in `CHANGELOG.md`,
 complete applicable focused/security checks, then Main stages and commits only
 the exact task files. For an unpublished local-only review, stage those files

@@ -1,8 +1,11 @@
 """Focused public contracts for Issue #288."""
 
+from tests.test_lp_auto_pool import advance_auto_wait
+
 from datetime import timedelta
 from decimal import Decimal
 import json
+import sys
 from types import SimpleNamespace
 
 from polymarket.models.clob.account import OpenOrder
@@ -542,7 +545,7 @@ def test_auto_second_bid_requires_depth_and_budget(tmp_path):
     assert shallow_exchange.posts == []
     assert shallow_state["last_round"]["candidate_filter"]["reasons"] == {
         "second_bid_insufficient": 1
-    }
+    }, shallow_state["last_round"]
 
     budget, budget_exchange, budget_lp, budget_store = setup(tmp_path / "budget", 1)
     _install_level2_books(
@@ -558,12 +561,13 @@ def test_auto_second_bid_requires_depth_and_budget(tmp_path):
     budget.lp_auto_set_desired_running(True)
     budget_state = budget.lp_auto_run_once(round_id="issue288-f-budget")
     assert budget_exchange.posts == []
-    assert budget_state["last_round"]["actions"] == [
-        {"condition_id": "m00", "state": "rejected", "reason": "strategy_funds_insufficient"}
+    assert budget_state["last_round"]["actions"] == []
+    assert budget_state["last_round"]["blocked"] == [
+        {"condition_id": "m00", "token_id": "m00", "reason": "rotation_budget_insufficient"}
     ]
 
 
-def test_auto_rechecks_second_bid_before_post(tmp_path):
+def test_auto_rechecks_second_bid_before_post(tmp_path, monkeypatch):
     e, exchange, lp, store = setup(tmp_path, 1)
     bids = [("0.40", "1000"), ("0.37", "1000")]
     _install_level2_books(exchange, lp, store, bids=bids, count=1)
@@ -579,12 +583,16 @@ def test_auto_rechecks_second_bid_before_post(tmp_path):
     stale = e.lp_auto_run_once(round_id="issue288-g-stale")
     assert exchange.posts == []
     assert stale["slots"]["occupied"] == 0
+    assert stale["last_round"]["actions"], stale["last_round"]
     stale_action = stale["last_round"]["actions"][0]
     assert stale_action["condition_id"] == "m00"
-    assert stale_action["state"] == "entry_rejected"
-    assert stale_action["reason"] == "candidate_changed"
+    assert stale_action["state"] == "rejected"
+    assert stale_action["request_state"] == "entry_rejected"
+    assert stale_action["reason"] == "candidate_bid_level_changed"
 
     exchange.before_sign = None
+    advance_auto_wait(e, monkeypatch, refresh=False)
+    monkeypatch.setattr(sys.modules[__name__], 'NOW', e._lp._now())
     lp._candidate_pool_record_success(
         "m00",
         dict(condition_id="m00"),

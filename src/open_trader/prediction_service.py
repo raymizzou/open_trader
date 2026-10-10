@@ -978,7 +978,12 @@ def create_prediction_server(
                     if path == lp_auto_prefix + "reservations/release":
                         result = execution.lp_auto_release_reservations(payload, audit=audit)
                     elif path == lp_auto_prefix + "config":
-                        expected = {"budget_usd", "target_buy_count"}
+                        timing_fields = {'round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds'}
+                        trading = bool(set(payload) & {'budget_usd', 'target_buy_count', 'buy_price_level'})
+                        expected = {"budget_usd", "target_buy_count"} if trading else set()
+                        expected.update(set(payload) & timing_fields)
+                        if not trading and not expected:
+                            raise ValueError('auto_config_invalid')
                         if "buy_price_level" in payload:
                             expected.add("buy_price_level")
                         if "expected_config_version" in payload:
