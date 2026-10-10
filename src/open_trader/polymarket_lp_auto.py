@@ -1781,26 +1781,73 @@ class LPAutoPool:
 
     def _finish_rejected_plan_cancel(self, plan, action, rows):
         """Remove only this round's yield intent; protection/stop retain ownership."""
-        session = self.store.lp_session(action['session_id'])
-        if not session:
-            raise ValueError('rotation_session_missing')
-        owners = dict(session.get('yield_rotation_cancel_owners') or {})
         oid = action['order_id']
-        if owners.get(oid) != plan['round_id']:
-            raise ValueError('rotation_cancel_owner_mismatch')
-        owners.pop(oid)
-        patch = {'yield_rotation_cancel_owners': owners}
-        levels = self.lp._queue_protection_levels(session)
-        owns_protection = all(b.get('state') in ('registered', 'monitoring') or
-            b.get('state') == 'canceling' and b.get('cancel_reason') == 'yield_rotation'
-            for b in levels.values())
-        if not session.get('stop_requested') and not session.get('stop_loss_latched') and owns_protection:
-            if session.get('entry_order_id') == oid:
-                patch['entry_cancel_requested'] = False
-            else:
-                patch['augment_cancel_requested'] = [value for value in
-                    session.get('augment_cancel_requested', ()) if value != oid]
-        self.store.lp_update_session(action['session_id'], patch=patch)
+        def build_patch(session, connection):
+            # Registration is already intent, even before its bucket merge or an
+            # accepted ACK becomes terminal. Read it from this same writer image.
+            owned_ids = set(self.lp._session_order_ids(session))
+            history = self.lp._order_history(session)
+            independent = set()
+            for audit in self.store.lp_actions(session['session_id'], connection=connection):
+                if submission_action_kind(audit) != 'cancel' or audit.get('state') not in ('pending', 'unknown', 'accepted'):
+                    continue
+                targets = {str(oid) for oid in audit.get('targets', ()) if oid}
+                if audit.get('order_id'):
+                    targets.add(str(audit['order_id']))
+                for target in targets & owned_ids:
+                    owner = audit.get('rotation_round_id')
+                    if owner and owner in (plan['round_id'], (session.get('yield_rotation_cancel_owners') or {}).get(target)):
+                        continue
+                    original = history.get(target, {})
+                    # Current results always outrank history. Only a prior
+                    # accepted yield request may retire from owned terminal history.
+                    receipt = rows.get(target, {})
+                    if (target not in rows and owner and owner != plan['round_id']
+                            and audit.get('state') == 'accepted'
+                            and audit.get('role') == 'reconciliation_cancel'
+                            and audit.get('session_id') == session['session_id']
+                            and str(audit.get('action_key') or '').startswith(
+                                session['session_id'] + ':reconciliation-cancel:')
+                            and not session.get('order_identity_conflict')
+                            and hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest() == plan['account_id']):
+                        receipt = original
+                    quantity = _maybe_decimal(original.get('original_size', original.get('quantity')))
+                    matched = _maybe_decimal(receipt.get('size_matched'))
+                    if (self.lp._order_id(original) == target and original.get('side') == 'BUY'
+                            and str(original.get('token_id')) == str(session.get('token_id'))
+                            and self.lp._order_id(receipt) == target and receipt.get('side') == 'BUY'
+                            and str(receipt.get('token_id')) == str(session.get('token_id'))
+                            and _maybe_decimal(receipt.get('price')) == _maybe_decimal(original.get('price'))
+                            and (_maybe_decimal(original.get('price')) or ZERO) > ZERO
+                            and _maybe_decimal(receipt.get('original_size')) == quantity
+                            and quantity is not None and quantity > ZERO
+                            and matched is not None and ZERO <= matched <= quantity
+                            and str(receipt.get('status')).upper() in TERMINAL_ORDER_STATES
+                            and receipt.get('fill_quantity_known') is not False):
+                        continue
+                    independent.add(target)
+            owners = dict(session.get('yield_rotation_cancel_owners') or {})
+            if owners.get(oid) != plan['round_id']:
+                raise ValueError('rotation_cancel_owner_mismatch')
+            owners.pop(oid)
+            patch = {'yield_rotation_cancel_owners': owners}
+            levels = self.lp._queue_protection_levels(session)
+            owns_protection = all(b.get('state') in ('registered', 'monitoring') or
+                b.get('state') == 'canceling' and b.get('cancel_reason') == 'yield_rotation'
+                for b in levels.values())
+            if not session.get('stop_requested') and not session.get('stop_loss_latched') and owns_protection:
+                if session.get('entry_order_id') == oid and oid not in independent:
+                    patch['entry_cancel_requested'] = False
+                else:
+                    patch['augment_cancel_requested'] = [value for value in
+                        session.get('augment_cancel_requested', ()) if value != oid or value in independent]
+            return patch
+        try:
+            self.store.lp_update_session(action['session_id'], patch_builder=build_patch)
+        except ValueError as exc:
+            if str(exc) == 'lp_session_not_found':
+                raise ValueError('rotation_session_missing') from exc
+            raise
         rotation = (self._read().get('account_rotations', {}).get(oid) or
             next((i for i in self._read()['intents'].values() if i.get('order_id') == oid), None))
         if rotation:
@@ -1813,62 +1860,109 @@ class LPAutoPool:
             if a['kind'] == 'cancel' and a.get('session_id') == session_id]
         if not actions or any(a['state'] not in ('success', 'rejected') for a in actions):
             return
-        session = self.store.lp_session(session_id)
-        if not session:
-            raise ValueError('rotation_session_missing')
-        owners = dict(session.get('yield_rotation_cancel_owners') or {})
-        saved = dict(session.get('yield_rotation_protection_before') or {})
-        batch_ids = {a['order_id'] for a in actions}
-        baseline = next((saved[oid] for oid in sorted(batch_ids)
-            if oid in saved and owners.get(oid) in (None, plan['round_id'])), None)
-        terminal = {oid for oid in batch_ids
-            if str(rows.get(oid, {}).get('status')).upper() in TERMINAL_ORDER_STATES
-            and rows[oid].get('fill_quantity_known') is not False
-            and _maybe_decimal(rows[oid].get('size_matched')) is not None}
-        finished = {oid for oid in terminal if owners.get(oid) == plan['round_id']}
-        obsolete = {oid for oid, original in (older_owners or {}).items()
-            if owners.get(oid) == original['owner_round_id']
-            and oid in plan.get('terminal_buy_results', {})
-            and not session.get('order_identity_conflict')}
-        finished |= obsolete
-        terminal |= obsolete
-        for oid in finished:
-            owners.pop(oid)
-        consumed = (batch_ids if not owners else finished) | obsolete
-        patch = {'yield_rotation_cancel_owners': owners,
-            'yield_rotation_protection_before': {oid: value for oid, value in saved.items()
-                if oid not in consumed or owners.get(oid) not in (None, plan['round_id'])}}
-        levels = self.lp._queue_protection_levels(session)
-        owns_protection = all(b.get('state') in ('registered', 'monitoring') or
-            b.get('state') == 'canceling' and b.get('cancel_reason') == 'yield_rotation'
-            for b in levels.values())
-        if not session.get('stop_requested') and not session.get('stop_loss_latched') and owns_protection:
-            if session.get('entry_order_id') in finished:
-                patch['entry_cancel_requested'] = False
-            patch['augment_cancel_requested'] = [oid for oid in
-                session.get('augment_cancel_requested', ()) if oid not in finished]
-            if not owners and baseline is not None:
-                restored = deepcopy(baseline)
-                history = self.lp._order_history(session)
-                owned_ids = self.lp._session_order_ids(session)
-                for key, bucket in (restored.get('levels') or {}).items():
-                    if bucket.get('order_id') not in terminal:
+        def build_patch(session, connection):
+            # Registration is already intent, even before its bucket merge or an
+            # accepted ACK becomes terminal. Read it from this same writer image.
+            owned_ids = set(self.lp._session_order_ids(session))
+            history = self.lp._order_history(session)
+            independent = set()
+            for audit in self.store.lp_actions(session['session_id'], connection=connection):
+                if submission_action_kind(audit) != 'cancel' or audit.get('state') not in ('pending', 'unknown', 'accepted'):
+                    continue
+                targets = {str(oid) for oid in audit.get('targets', ()) if oid}
+                if audit.get('order_id'):
+                    targets.add(str(audit['order_id']))
+                for target in targets & owned_ids:
+                    owner = audit.get('rotation_round_id')
+                    if owner and owner in (plan['round_id'], (session.get('yield_rotation_cancel_owners') or {}).get(target)):
                         continue
-                    price = _maybe_decimal(bucket.get('baseline_price'))
-                    survivors = sorted(oid for oid, receipt in rows.items()
-                        if oid in history and oid in owned_ids
-                        and receipt.get('status') == 'LIVE' and receipt.get('side') == 'BUY'
-                        and str(receipt.get('token_id')) == str(session.get('token_id'))
-                        and price is not None and _maybe_decimal(receipt.get('price')) == price
-                        and _maybe_decimal(receipt.get('size_matched')) == ZERO
-                        and (self.lp._queue_row_remaining(receipt) or ZERO) > ZERO
-                        and not self.lp._order_cancel_requested({**session, **patch}, oid))
-                    if survivors:
-                        bucket['order_id'] = survivors[0]
-                    else:
-                        restored['levels'][key] = deepcopy(levels[key])
-                patch['queue_protection'] = restored
-        self.store.lp_update_session(session_id, patch=patch)
+                    original = history.get(target, {})
+                    # Current results always outrank history. Only a prior
+                    # accepted yield request may retire from owned terminal history.
+                    receipt = rows.get(target, {})
+                    if (target not in rows and owner and owner != plan['round_id']
+                            and audit.get('state') == 'accepted'
+                            and audit.get('role') == 'reconciliation_cancel'
+                            and audit.get('session_id') == session['session_id']
+                            and str(audit.get('action_key') or '').startswith(
+                                session['session_id'] + ':reconciliation-cancel:')
+                            and not session.get('order_identity_conflict')
+                            and hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest() == plan['account_id']):
+                        receipt = original
+                    quantity = _maybe_decimal(original.get('original_size', original.get('quantity')))
+                    matched = _maybe_decimal(receipt.get('size_matched'))
+                    if (self.lp._order_id(original) == target and original.get('side') == 'BUY'
+                            and str(original.get('token_id')) == str(session.get('token_id'))
+                            and self.lp._order_id(receipt) == target and receipt.get('side') == 'BUY'
+                            and str(receipt.get('token_id')) == str(session.get('token_id'))
+                            and _maybe_decimal(receipt.get('price')) == _maybe_decimal(original.get('price'))
+                            and (_maybe_decimal(original.get('price')) or ZERO) > ZERO
+                            and _maybe_decimal(receipt.get('original_size')) == quantity
+                            and quantity is not None and quantity > ZERO
+                            and matched is not None and ZERO <= matched <= quantity
+                            and str(receipt.get('status')).upper() in TERMINAL_ORDER_STATES
+                            and receipt.get('fill_quantity_known') is not False):
+                        continue
+                    independent.add(target)
+            owners = dict(session.get('yield_rotation_cancel_owners') or {})
+            saved = dict(session.get('yield_rotation_protection_before') or {})
+            batch_ids = {a['order_id'] for a in actions}
+            baseline = next((saved[oid] for oid in sorted(batch_ids)
+                if oid in saved and owners.get(oid) in (None, plan['round_id'])), None)
+            terminal = {oid for oid in batch_ids
+                if str(rows.get(oid, {}).get('status')).upper() in TERMINAL_ORDER_STATES
+                and rows[oid].get('fill_quantity_known') is not False
+                and _maybe_decimal(rows[oid].get('size_matched')) is not None}
+            finished = {oid for oid in terminal if owners.get(oid) == plan['round_id']}
+            obsolete = {oid for oid, original in (older_owners or {}).items()
+                if owners.get(oid) == original['owner_round_id']
+                and oid in plan.get('terminal_buy_results', {})
+                and not session.get('order_identity_conflict')}
+            finished |= obsolete
+            terminal |= obsolete
+            for oid in finished:
+                owners.pop(oid)
+            consumed = (batch_ids if not owners else finished) | obsolete
+            patch = {'yield_rotation_cancel_owners': owners,
+                'yield_rotation_protection_before': {oid: value for oid, value in saved.items()
+                    if oid not in consumed or owners.get(oid) not in (None, plan['round_id'])}}
+            levels = self.lp._queue_protection_levels(session)
+            owns_protection = all(b.get('state') in ('registered', 'monitoring') or
+                b.get('state') == 'canceling' and b.get('cancel_reason') == 'yield_rotation'
+                for b in levels.values())
+            if not session.get('stop_requested') and not session.get('stop_loss_latched') and owns_protection:
+                if session.get('entry_order_id') in finished and session.get('entry_order_id') not in independent:
+                    patch['entry_cancel_requested'] = False
+                patch['augment_cancel_requested'] = [oid for oid in
+                    session.get('augment_cancel_requested', ()) if oid not in finished or oid in independent]
+                if not owners and baseline is not None and not independent:
+                    restored = deepcopy(baseline)
+                    history = self.lp._order_history(session)
+                    owned_ids = set(self.lp._session_order_ids(session))
+                    for key, bucket in (restored.get('levels') or {}).items():
+                        if bucket.get('order_id') not in terminal:
+                            continue
+                        price = _maybe_decimal(bucket.get('baseline_price'))
+                        survivors = sorted(oid for oid, receipt in rows.items()
+                            if oid in history and oid in owned_ids
+                            and receipt.get('status') == 'LIVE' and receipt.get('side') == 'BUY'
+                            and str(receipt.get('token_id')) == str(session.get('token_id'))
+                            and price is not None and _maybe_decimal(receipt.get('price')) == price
+                            and _maybe_decimal(receipt.get('size_matched')) == ZERO
+                            and (self.lp._queue_row_remaining(receipt) or ZERO) > ZERO
+                            and not self.lp._order_cancel_requested({**session, **patch}, oid))
+                        if survivors:
+                            bucket['order_id'] = survivors[0]
+                        else:
+                            restored['levels'][key] = deepcopy(levels[key])
+                    patch['queue_protection'] = restored
+            return patch
+        try:
+            self.store.lp_update_session(session_id, patch_builder=build_patch)
+        except ValueError as exc:
+            if str(exc) == 'lp_session_not_found':
+                raise ValueError('rotation_session_missing') from exc
+            raise
 
     def _retry_rotation_cancel(self, intent):
         """At most one retry per new authoritative LIVE receipt; never free a slot."""

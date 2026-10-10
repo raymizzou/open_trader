@@ -2588,3 +2588,316 @@ def test_successful_terminal_owner_does_not_block_later_refused_round(runtime, m
     assert 'planned_auto' not in financial_reads
     for original in (audit_c,audit_d):
         assert next(a for a in store.lp_actions(sid) if a['action_key']==original['action_key']) == original
+
+
+@pytest.mark.parametrize('case', ['converged_protection', 'rejected_protection',
+    'converged_stop', 'rejected_stop', 'healthy'])
+def test_cancel_restoration_preserves_concurrent_public_control(runtime, monkeypatch, tmp_path, case):
+    import json
+    from pathlib import Path
+    import sqlite3
+    from threading import Thread, get_ident
+    from time import monotonic
+    from polymarket.models.clob.cancel import CancelOrdersResponse
+    from polymarket.models.clob.order_book import OrderBookLevel
+    from tests.test_lp_account_reservation_reconciliation import _CandidateSDKPublic
+    from tests.test_lp_order_registration_contract import _open_order
+
+    public = _CandidateSDKPublic(runtime.clock[0])
+    book = public.get_order_book
+    protective, normal_book, normal_seen = [False], [False], Event()
+    protective_seen, result_complete, observed, control_done = Event(), Event(), Event(), Event()
+    scheduler_threads, control_threads, monitor_threads = [], [], set()
+    explicit_control, explicit_monitor = [False], [False]
+    rows_seen, events, errors, control_errors, control_capture = [], [], [], [], {}
+    deadline = [None]
+    def current_book(*, token_id):
+        value = book(token_id=token_id).model_copy(update={'timestamp':runtime.clock[0], 'bids':(
+            OrderBookLevel(price=Decimal('.40'), size=Decimal('1000')),
+            OrderBookLevel(price=Decimal('.39'), size=Decimal('3000' if protective[0] else '1000')))})
+        if protective[0]:
+            protective_seen.set()
+        if normal_book[0]:
+            normal_seen.set()
+        return value
+    monkeypatch.setattr(public, 'get_order_book', current_book)
+    originals = (_open_order('rank-a', 'BUY', price='.40', original='20'),
+        _open_order('rank-b', 'BUY', price='.40', original='20'),
+        _open_order('rank-c', 'BUY', price='.39', original='20'))
+    store, adapter, account, lp, engine = runtime(orders=originals, public_client=public)
+    engine.lp_auto_configure(dict(budget_usd='39', target_buy_count=1, buy_price_level=2))
+    assert engine.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    session, = store.lp_active_sessions()
+    sid = session['session_id']
+    baseline = deepcopy(session['queue_protection'])
+    assert baseline['levels']['0.40']['order_id'] == 'rank-a'
+    assert baseline['levels']['0.39']['order_id'] == 'rank-c'
+    assert Decimal(baseline['levels']['0.39']['baseline_front']) == 980
+    finances = []
+    balance = account.get_balance_allowance
+    def observed_balance(**kwargs):
+        active = bool(engine.lp_auto_state()['active_plan'])
+        phase = 'explicit_control' if explicit_control[0] else (
+            'explicit_monitor' if explicit_monitor[0] else 'planned_auto')
+        finances.append(dict(active_plan=active, phase=phase, as_of=runtime.clock[0].isoformat(), request=deepcopy(kwargs)))
+        return balance(**kwargs)
+    monkeypatch.setattr(account, 'get_balance_allowance', observed_balance)
+    def venue(*, order_ids):
+        account.cancels.append(order_ids)
+        runtime.clock[0] += timedelta(seconds=1)
+        if explicit_control[0]:
+            events.append(dict(event='real_control_ack', ids=order_ids, at=monotonic()))
+            return CancelOrdersResponse(canceled=order_ids, not_canceled={})
+        assert order_ids in (('rank-a',), ('rank-b',))
+        return CancelOrdersResponse(canceled=(), not_canceled={oid:'venue_denied' for oid in order_ids})
+    monkeypatch.setattr(account, 'cancel_orders', venue)
+    monkeypatch.setattr(account, 'get_order', lambda *,order_id:next(o for o in originals if o.id==order_id), raising=False)
+    engine.lp_auto_set_desired_running(True)
+    scheduler = LPAutoScheduler(engine, clock=lambda:runtime.clock[0])
+    assert scheduler.run_due()
+    sent = engine.lp_auto_state()
+    plan = deepcopy(sent['active_plan'])
+    assert [a['order_id'] for a in plan['actions']] == ['rank-a','rank-b']
+    assert [r['order_id'] for r in plan['targets']] == ['rank-c']
+    assert all(a['session_id']==sid for a in plan['actions'])
+    original_audits = deepcopy(store.lp_actions(sid))
+    assert len(original_audits)==2
+    assert all(a['state']=='rejected' and a['reason']=='venue_denied'
+        and a['rotation_round_id']==plan['round_id'] for a in original_audits)
+    assert account.cancels==[('rank-a',),('rank-b',)] and account.posts==[]
+    assert not any(r['active_plan'] and r['phase']=='planned_auto' for r in finances)
+    runtime.clock[0] = datetime.fromisoformat(sent['plan_wait']['deadline'])
+    positions = account.list_positions
+    def result_positions(**kwargs):
+        value = positions(**kwargs)
+        if scheduler_threads and not result_complete.is_set():
+            events.append(dict(event='original_sdk_result_complete', thread=get_ident(), at=monotonic()))
+            result_complete.set()
+        return value
+    monkeypatch.setattr(account, 'list_positions', result_positions)
+
+    def control():
+        control_threads.append(get_ident())
+        explicit_control[0] = True
+        events.append(dict(event='control_started', at=monotonic()))
+        try:
+            runtime.clock[0] += timedelta(seconds=1)
+            if case.endswith('_stop'):
+                control_capture['result'] = lp.stop(sid)
+            else:
+                protective[0] = True
+                pause = Event()
+                while True:
+                    assert monotonic()<deadline[0], 'Real public control watchdog'
+                    engine.lp_tick()
+                    current = store.lp_session(sid)
+                    bucket = current['queue_protection']['levels']['0.39']
+                    if (bucket.get('state')=='canceling' and bucket.get('cancel_reason')=='queue_ahead_ratio'
+                            and bucket.get('cancel_targets')==['rank-c'] and 'rank-c' in current.get('augment_cancel_requested', [])):
+                        break
+                    pause.wait(min(.01,max(0,deadline[0]-monotonic())))
+                assert protective_seen.is_set()
+            control_capture['session'] = deepcopy(store.lp_session(sid))
+            control_capture['audits'] = deepcopy(store.lp_actions(sid))
+            control_capture['funds'] = deepcopy(engine.lp_auto_state()['funds'])
+            control_capture['calls'] = list(account.cancels)
+            events.append(dict(event='control_committed', at=monotonic()))
+        except BaseException as exc:
+            control_errors.append(repr(exc))
+        finally:
+            explicit_control[0] = False
+            control_done.set()
+    control_jobs = []
+    connect = sqlite3.connect
+    class ObservedCursor(sqlite3.Cursor):
+        def execute(self, sql, parameters=(), /):
+            self.observed_sql, self.observed_parameters = sql, parameters
+            result = super().execute(sql, parameters)
+            compact = sql.strip().upper()
+            if compact in ('BEGIN', 'BEGIN IMMEDIATE'):
+                self.connection.observed_transaction = compact
+                self.connection.observed_dml = False
+                events.append(dict(event='native_begin_succeeded', transaction=compact,
+                    thread=get_ident(), connection=id(self.connection), at=monotonic()))
+            elif compact.startswith(('UPDATE ', 'INSERT ', 'DELETE ', 'REPLACE ')):
+                self.connection.observed_dml = True
+            elif compact in ('COMMIT','ROLLBACK'):
+                events.append(dict(event='native_transaction_finished', outcome=compact,
+                    thread=get_ident(), connection=id(self.connection), at=monotonic()))
+                self.connection.observed_transaction = None
+            return result
+        def fetchone(self):
+            row = super().fetchone()
+            if (row is None or not isinstance(row,sqlite3.Row) or observed.is_set()
+                    or not scheduler_threads or get_ident()!=scheduler_threads[0] or not result_complete.is_set()
+                    or getattr(self.connection,'observed_dml',False)
+                    or not {'session_id','payload','idempotency_key','state'} <= set(row.keys())
+                    or str(row['session_id'])!=sid):
+                return row
+            payload = json.loads(row['payload'])
+            owners = payload.get('yield_rotation_cancel_owners') or {}
+            saved = payload.get('yield_rotation_protection_before') or {}
+            expected_owners = ({'rank-a':plan['round_id'],'rank-b':plan['round_id']}
+                if case.startswith('rejected_') else {})
+            if (owners!=expected_owners or set(saved)!={'rank-a','rank-b'}
+                    or any(saved[oid]!=baseline for oid in saved)
+                    or payload.get('stop_requested') or 'rank-c' in payload.get('augment_cancel_requested',[])):
+                return row
+            transaction = getattr(self.connection,'observed_transaction',None)
+            writer = self.connection.in_transaction and transaction=='BEGIN IMMEDIATE'
+            record = dict(sql=self.observed_sql, parameters=self.observed_parameters,
+                row=dict(row), row_identity=id(row), writer=writer, transaction=transaction,
+                thread=get_ident(), connection=id(self.connection), at=monotonic())
+            rows_seen.append(record)
+            events.append(dict(event='actual_row_fetched', writer=writer, at=record['at']))
+            observed.set()
+            if case!='healthy':
+                job = Thread(target=control)
+                control_jobs.append(job)
+                events.append(dict(event='control_launched', at=monotonic()))
+                job.start()
+                if not writer:
+                    assert control_done.wait(max(0,deadline[0]-monotonic())), 'Outside-writer control commit watchdog'
+                    assert not control_errors, control_errors
+                    assert control_capture['session']['session_id']==sid
+                    record['control_committed_before_delivery'] = True
+            record['returned_row_identity'] = id(row)
+            record['delivered_at'] = monotonic()
+            events.append(dict(event='actual_row_delivered', writer=writer, at=record['delivered_at']))
+            return row
+    class ObservedConnection(sqlite3.Connection):
+        def execute(self, *args, **kwargs):
+            return self.cursor(factory=ObservedCursor).execute(*args, **kwargs)
+    def observed_connect(database, *args, **kwargs):
+        if Path(database).resolve()==store.path.resolve():
+            kwargs['factory'] = ObservedConnection
+        return connect(database,*args,**kwargs)
+    monkeypatch.setattr(sqlite3,'connect',observed_connect)
+    outcomes = []
+    def run_result():
+        scheduler_threads.append(get_ident())
+        try:
+            outcomes.append(scheduler.run_due())
+        except BaseException as exc:
+            errors.append(repr(exc))
+    deadline[0] = monotonic()+5
+    sender = Thread(target=run_result)
+    sender.start()
+    try:
+        assert observed.wait(max(0,deadline[0]-monotonic())), 'Semantic real SQLite row watchdog'
+        sender.join(max(0,deadline[0]-monotonic()))
+        assert not sender.is_alive(), 'Original scheduler publication watchdog'
+        for job in control_jobs:
+            job.join(max(0,deadline[0]-monotonic()))
+            assert not job.is_alive(), 'Public control completion watchdog'
+        assert not errors and not control_errors, (errors,control_errors,rows_seen)
+        assert outcomes==[True] and len(rows_seen)==1
+        row = rows_seen[0]
+        assert row['row_identity']==row['returned_row_identity']
+        assert row['thread']==scheduler_threads[0]
+        if row['writer']:
+            assert row['transaction']=='BEGIN IMMEDIATE'
+            assert any(e['event']=='native_begin_succeeded' and e['connection']==row['connection'] and e['at']<row['at'] for e in events)
+            commit = next(e for e in events if e['event']=='native_transaction_finished'
+                and e['outcome']=='COMMIT' and e['connection']==row['connection'] and e['at']>row['at'])
+            assert row['delivered_at']<commit['at']
+            if case!='healthy':
+                assert commit['at']<next(e['at'] for e in events if e['event']=='control_committed')
+        elif case!='healthy':
+            assert row['control_committed_before_delivery']
+            assert next(e['at'] for e in events if e['event']=='control_committed')<row['delivered_at']
+        state = engine.lp_auto_state()
+        assert state['active_plan'] is None and state['last_round']['round_id']==plan['round_id']
+        assert [a['action_id'] for a in state['last_round']['actions']]==[a['action_id'] for a in plan['actions']]
+        assert [(a['state'],a['reason']) for a in state['last_round']['actions']]==[('rejected','venue_denied')]*2
+        assert [t['order_id'] for t in state['last_round']['targets']]==['rank-c']
+        assert state['plan_wait']['kind']=='round'
+        assert datetime.fromisoformat(state['plan_wait']['deadline'])==datetime.fromisoformat(state['last_round']['completed_at'])+timedelta(seconds=60)
+        assert state['slots']['occupied']==3 and Decimal(state['funds']['buy_reserved_usd'])==Decimal('23.80')
+        assert {o.id for o in account.orders}=={'rank-a','rank-b','rank-c'} and account.posts==[]
+        final = store.lp_session(sid)
+        for old in original_audits:
+            assert next(a for a in store.lp_actions(sid) if a['action_key']==old['action_key'])==old
+        if case.endswith('_protection'):
+            assert account.cancels==[('rank-a',),('rank-b',),('rank-c',)]
+            protected_audit, = [a for a in control_capture['audits'] if a.get('role')=='entry-protection-cancel']
+            assert protected_audit['state']=='accepted' and protected_audit['targets']==['rank-c']
+            bucket = final['queue_protection']['levels']['0.39']
+            assert bucket['state']=='canceling' and bucket['cancel_reason']=='queue_ahead_ratio', (bucket,rows_seen,control_capture)
+            assert bucket['cancel_targets']==['rank-c']
+            assert 'rank-c' in final.get('augment_cancel_requested',[]), (final,rows_seen)
+            assert next(a for a in store.lp_actions(sid) if a['action_key']==protected_audit['action_key'])==protected_audit
+            assert any(r['phase']=='explicit_control' and r['request'] for r in finances)
+        elif case.endswith('_stop'):
+            assert final['stop_requested'] is True
+            assert final['state']==control_capture['session']['state']
+            stop_audits = [a for a in control_capture['audits'] if a.get('source')=='owned_cancel_sweep']
+            assert stop_audits and any(a['order_id']=='rank-c' for a in stop_audits)
+            for audit in stop_audits:
+                assert audit['state']=='accepted'
+                assert next(a for a in store.lp_actions(sid) if a['action_key']==audit['action_key'])==audit
+                if audit['order_id']=='rank-a':
+                    assert final['entry_cancel_requested'] is True
+                else:
+                    assert audit['order_id'] in final.get('augment_cancel_requested',[])
+            assert all(ids in (('rank-a',),('rank-b',),('rank-c',)) for ids in account.cancels[2:])
+            assert account.cancels[2:].count(('rank-c',))==1
+            assert account.cancels[2:].count(('rank-a',))<=1 and account.cancels[2:].count(('rank-b',))<=1
+        else:
+            assert final['yield_rotation_cancel_owners']=={}
+            assert final['yield_rotation_protection_before']=={}
+            assert not final.get('entry_cancel_requested') and final.get('augment_cancel_requested',[])==[]
+            assert final['queue_protection']==baseline
+            assert store.lp_actions(sid)==original_audits and account.cancels==[('rank-a',),('rank-b',)]
+        assert not any(r['active_plan'] and r['phase']=='planned_auto' for r in finances)
+        if not row['writer'] and case!='healthy':
+            assert state['funds']['as_of']==control_capture['funds']['as_of']
+        calls, audits = list(account.cancels), deepcopy(store.lp_actions(sid))
+        protective[0] = False
+        normal_book[0] = True
+        monitor_threads.add(get_ident())
+        explicit_monitor[0] = True
+        try:
+            normal_deadline, pause = monotonic()+5, Event()
+            engine.lp_tick()
+            assert normal_seen.wait(max(0,normal_deadline-monotonic())), 'Actual normal SDK book watchdog'
+            while True:
+                engine.lp_tick()
+                current = store.lp_session(sid)
+                if case.endswith('_protection'):
+                    assert current['queue_protection']['levels']['0.39']['state']=='canceling'
+                    assert 'rank-c' in current.get('augment_cancel_requested',[])
+                    break
+                if case.endswith('_stop'):
+                    assert current['stop_requested'] is True
+                    break
+                if current['queue_protection']['levels']['0.39']['state']=='monitoring':
+                    break
+                assert monotonic()<normal_deadline, 'Public normal monitoring watchdog'
+                pause.wait(min(.01,max(0,normal_deadline-monotonic())))
+        finally:
+            monitor_threads.discard(get_ident())
+            explicit_monitor[0] = False
+        scheduler.request_check()
+        assert not scheduler.run_due()
+        engine.lp_auto_run_once()
+        assert account.cancels==calls and account.posts==[]
+        assert store.lp_actions(sid)==audits
+        _, _, restarted_account, _, restarted = runtime(orders=account.orders,public_client=public)
+        restarted.lp_auto_run_once()
+        assert restarted_account.cancels==restarted_account.posts==[]
+        restarted_session = store.lp_session(sid)
+        if case.endswith('_protection'):
+            assert restarted_session['queue_protection']['levels']['0.39']['state']=='canceling'
+            assert 'rank-c' in restarted_session.get('augment_cancel_requested',[])
+        elif case.endswith('_stop'):
+            assert restarted_session['stop_requested'] is True
+        assert not any(r['active_plan'] and r['phase']=='planned_auto' for r in finances)
+    finally:
+        control_done.set()
+        sender.join(5)
+        for job in control_jobs:
+            job.join(5)
+        (tmp_path/'publication-observer.json').write_text(json.dumps(dict(case=case,rows=rows_seen,events=events,
+            errors=errors,control_errors=control_errors,control=control_capture,finances=finances,
+            actual_calls=account.cancels,sender_alive=sender.is_alive(),control_alive=[j.is_alive() for j in control_jobs]),indent=2,default=str)+'\n')
