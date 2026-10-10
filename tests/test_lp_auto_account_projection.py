@@ -181,6 +181,7 @@ def test_overcapacity_same_token_buys_use_two_slots_and_exact_rotation_victim(tm
 
 
 def test_account_rotation_fill_keeps_inventory_budget_without_sale(tmp_path, monkeypatch):
+    monkeypatch.setattr(pool, 'NOW', pool.NOW)
     from tests import test_lp_auto_rotation as rotation
     engine, exchange, lp, store = rotation.setup(tmp_path, monkeypatch, count=3, target=1)
     pool.NOW += timedelta(microseconds=1)

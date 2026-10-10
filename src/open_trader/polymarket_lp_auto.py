@@ -13,7 +13,7 @@ import hashlib
 import uuid
 import threading
 from time import monotonic
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from copy import deepcopy
@@ -1754,16 +1754,7 @@ class LPAutoPool:
         if owners.get(oid) != plan['round_id']:
             raise ValueError('rotation_cancel_owner_mismatch')
         owners.pop(oid)
-        terminal = {a['order_id'] for a in plan['actions']
-            if a['kind'] == 'cancel' and a.get('session_id') == action['session_id']
-            and str(rows.get(a['order_id'], {}).get('status')).upper() in TERMINAL_ORDER_STATES
-            and rows[a['order_id']].get('fill_quantity_known') is not False
-            and _maybe_decimal(rows[a['order_id']].get('size_matched')) is not None}
-        for finished in terminal:
-            if owners.get(finished) == plan['round_id']:
-                owners.pop(finished)
         patch = {'yield_rotation_cancel_owners': owners}
-        before = (session.get('yield_rotation_protection_before') or {}).get(oid)
         levels = self.lp._queue_protection_levels(session)
         owns_protection = all(b.get('state') in ('registered', 'monitoring') or
             b.get('state') == 'canceling' and b.get('cancel_reason') == 'yield_rotation'
@@ -1774,31 +1765,71 @@ class LPAutoPool:
             else:
                 patch['augment_cancel_requested'] = [value for value in
                     session.get('augment_cancel_requested', ()) if value != oid]
-            if before is not None and not owners:
-                restored = deepcopy(before)
-                history = self.lp._order_history(session)
-                for key, bucket in (restored.get('levels') or {}).items():
-                    if bucket.get('order_id') not in terminal:
-                        continue
-                    price = _maybe_decimal(bucket.get('baseline_price'))
-                    survivors = sorted(order_id for order_id, receipt in rows.items()
-                        if order_id in history and receipt.get('status') == 'LIVE' and receipt.get('side') == 'BUY'
-                        and str(receipt.get('token_id')) == str(session.get('token_id'))
-                        and price is not None and _maybe_decimal(receipt.get('price')) == price
-                        and _maybe_decimal(receipt.get('size_matched')) == ZERO
-                        and (self.lp._queue_row_remaining(receipt) or ZERO) > ZERO
-                        and not self.lp._order_cancel_requested({**session, **patch}, order_id))
-                    if survivors:
-                        bucket['order_id'] = survivors[0]
-                    else:
-                        restored['levels'][key] = deepcopy(levels[key])
-                patch['queue_protection'] = restored
         self.store.lp_update_session(action['session_id'], patch=patch)
         rotation = (self._read().get('account_rotations', {}).get(oid) or
             next((i for i in self._read()['intents'].values() if i.get('order_id') == oid), None))
         if rotation:
             self._update(lambda d: self._rotation_record(d, rotation).update(
                 state='active', rotation_settled_at=self._stamp()))
+
+    def _finish_converged_plan_cancels(self, plan, session_id, rows):
+        """Restore the saved shared baseline only after this session's batch ends."""
+        actions = [a for a in plan['actions']
+            if a['kind'] == 'cancel' and a.get('session_id') == session_id]
+        if (not any(a['state'] == 'rejected' for a in actions)
+                or any(a['state'] not in ('success', 'rejected') for a in actions)):
+            return
+        session = self.store.lp_session(session_id)
+        if not session:
+            raise ValueError('rotation_session_missing')
+        owners = dict(session.get('yield_rotation_cancel_owners') or {})
+        saved = dict(session.get('yield_rotation_protection_before') or {})
+        batch_ids = {a['order_id'] for a in actions}
+        baseline = next((saved[oid] for oid in sorted(batch_ids)
+            if oid in saved and owners.get(oid) in (None, plan['round_id'])), None)
+        if baseline is None:
+            return
+        terminal = {oid for oid in batch_ids
+            if str(rows.get(oid, {}).get('status')).upper() in TERMINAL_ORDER_STATES
+            and rows[oid].get('fill_quantity_known') is not False
+            and _maybe_decimal(rows[oid].get('size_matched')) is not None}
+        finished = {oid for oid in terminal if owners.get(oid) == plan['round_id']}
+        for oid in finished:
+            owners.pop(oid)
+        patch = {'yield_rotation_cancel_owners': owners,
+            'yield_rotation_protection_before': {oid: value for oid, value in saved.items()
+                if oid not in batch_ids or owners.get(oid) not in (None, plan['round_id'])}}
+        levels = self.lp._queue_protection_levels(session)
+        owns_protection = all(b.get('state') in ('registered', 'monitoring') or
+            b.get('state') == 'canceling' and b.get('cancel_reason') == 'yield_rotation'
+            for b in levels.values())
+        if not session.get('stop_requested') and not session.get('stop_loss_latched') and owns_protection:
+            if session.get('entry_order_id') in finished:
+                patch['entry_cancel_requested'] = False
+            patch['augment_cancel_requested'] = [oid for oid in
+                session.get('augment_cancel_requested', ()) if oid not in finished]
+            if not owners:
+                restored = deepcopy(baseline)
+                history = self.lp._order_history(session)
+                owned_ids = self.lp._session_order_ids(session)
+                for key, bucket in (restored.get('levels') or {}).items():
+                    if bucket.get('order_id') not in terminal:
+                        continue
+                    price = _maybe_decimal(bucket.get('baseline_price'))
+                    survivors = sorted(oid for oid, receipt in rows.items()
+                        if oid in history and oid in owned_ids
+                        and receipt.get('status') == 'LIVE' and receipt.get('side') == 'BUY'
+                        and str(receipt.get('token_id')) == str(session.get('token_id'))
+                        and price is not None and _maybe_decimal(receipt.get('price')) == price
+                        and _maybe_decimal(receipt.get('size_matched')) == ZERO
+                        and (self.lp._queue_row_remaining(receipt) or ZERO) > ZERO
+                        and not self.lp._order_cancel_requested({**session, **patch}, oid))
+                    if survivors:
+                        bucket['order_id'] = survivors[0]
+                    else:
+                        restored['levels'][key] = deepcopy(levels[key])
+                patch['queue_protection'] = restored
+        self.store.lp_update_session(session_id, patch=patch)
 
     def _retry_rotation_cancel(self, intent):
         """At most one retry per new authoritative LIVE receipt; never free a slot."""
@@ -3155,7 +3186,13 @@ class LPAutoPool:
                         condition_id=r['condition_id'], token_id=r['token_id'], state='pending')
                        for index, r in enumerate(targets) if not self._resting_buy(r)])
             try:
-                with self.store._transaction() as connection:
+                with ExitStack() as guards, self.store._transaction() as connection:
+                    # Registration takes its apply lane before SQLite. Never
+                    # wait on that lane while holding the first approval writer.
+                    for lock in (self._account_refresh_lock, self.lp._first_seen_apply_lock):
+                        if not lock.acquire(blocking=False):
+                            raise ValueError('account_round_invalid')
+                        guards.callback(lock.release)
                     generation = connection.execute(
                         'SELECT generation FROM lp_trade_generation WHERE singleton=1').fetchone()
                     current_generation = int(generation[0]) if generation is not None else None
@@ -3187,6 +3224,14 @@ class LPAutoPool:
                             for row in plan['targets'] + plan['victims']:
                                 if row.get('ranking_account') is not None:
                                     self._ranking_fresh(row)
+                        sync_error = getattr(self.lp, '_account_order_sync_error', None)
+                        if sync_error:
+                            raise ValueError(sync_error)
+                        waiting = self._account_facts_wait
+                        if waiting:
+                            reasons = self._account_projection_facts(document)[2]
+                            if reasons and reasons[0] == waiting['reason']:
+                                raise ValueError(waiting['reason'])
                         document['rounds'][round_id] = dict(started_at=plan['started_at'])
 
                     self._update(approve, connection=connection)
@@ -3320,6 +3365,8 @@ class LPAutoPool:
                     and _maybe_decimal(row.get('size_matched')) is not None):
                 action.update(state='success', confirmed_at=self._stamp(),
                     filled_quantity=str(row['size_matched']))
+        for session_id in {a['session_id'] for a in plan['actions'] if a['kind'] == 'cancel'}:
+            self._finish_converged_plan_cancels(plan, session_id, rows)
         self._retry_planned_cancels(plan, snapshot, rows, generation)
         return snapshot
 

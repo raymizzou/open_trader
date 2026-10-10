@@ -31,7 +31,8 @@ def install_order_result_reader(exchange, monkeypatch):
     return result_reader
 
 
-@pytest.mark.parametrize('invalidation', ['generation', 'ttl', 'timing_only'])
+@pytest.mark.parametrize('invalidation', ['generation', 'ttl', 'timing_only',
+    'incomplete_publication', 'registration_inflight'])
 def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch, invalidation):
     import json
     import sqlite3
@@ -42,6 +43,9 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
     entered, release = Event(), Event()
     caller, armed, intercepted = [], [False], []
     barrier_errors, signed, account_reads, market_reads = [], [], [], []
+    incomplete, financial_reads = [False], []
+    registration_entered, registration_release = Event(), Event()
+    registration_caller, registration_armed, registration_intercepted = [], [False], []
     connect = sqlite3.connect
     books = exchange.lp_order_books
     account = exchange.lp_account_snapshot_shared
@@ -61,6 +65,16 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
                             barrier_errors.append('Independent SQLite approval watchdog expired')
                     except BaseException as exc:
                         barrier_errors.append(type(exc).__name__)
+                elif (registration_caller and get_ident() == registration_caller[0]
+                        and registration_armed[0] and statement.strip().upper() == 'BEGIN IMMEDIATE'):
+                    registration_armed[0] = False
+                    registration_intercepted.append(dict(thread=get_ident(), statement=statement))
+                    registration_entered.set()
+                    try:
+                        if not registration_release.wait(5):
+                            barrier_errors.append('Independent registration watchdog expired')
+                    except BaseException as exc:
+                        barrier_errors.append(type(exc).__name__)
             connection.set_trace_callback(trace)
         return connection
 
@@ -72,7 +86,10 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
         return result
 
     def observed_account(**kwargs):
+        financial_reads.append(bool(engine.lp_auto_state()['active_plan']))
         result = account(**kwargs)
+        if incomplete[0]:
+            result['pagination_complete'] = False
         account_reads.append(deepcopy(result))
         return result
 
@@ -90,7 +107,7 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
         caller.append(get_ident())
         return scheduler.run_due()
 
-    with ThreadPoolExecutor(1) as workers:
+    with ThreadPoolExecutor(2) as workers:
         pending = workers.submit(run)
         try:
             assert entered.wait(5), 'Original round reaches the real first approval write'
@@ -115,6 +132,54 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
                     size='20', average_price='.39')]
             elif invalidation == 'ttl':
                 monkeypatch.setattr(pool, 'NOW', planning_at + timedelta(seconds=61))
+            elif invalidation == 'incomplete_publication':
+                exchange.positions = [dict(token_id='H', condition_id='H',
+                    size='20', average_price='.39')]
+                incomplete[0] = True
+                published = engine.refresh_lp_dashboard_snapshot()
+                assert published['reason'] == 'account_order_sync_unknown', published
+                invalid = engine.lp_auto_state()
+                assert 'account_order_sync_unknown' in invalid['admission_block_reasons']
+                with connect(store.path) as connection:
+                    current = json.loads(connection.execute(
+                        'SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
+                assert current['account_financial_facts'] == approval
+                assert store.lp_trade_generation() == approval['trade_generation']
+                assert invalid['funds']['as_of'] == approval['checked_at']
+                assert invalid['active_plan'] is None and invalid['intents'] == []
+                assert store.lp_sessions() == [] and signed == exchange.posts == exchange.cancels == []
+                incomplete[0] = False
+            elif invalidation == 'registration_inflight':
+                exchange.positions = [dict(token_id='H', condition_id='H',
+                    size='20', average_price='.39')]
+                def publish():
+                    registration_caller.append(get_ident())
+                    registration_armed[0] = True
+                    return engine.refresh_lp_dashboard_snapshot()
+                publishing = workers.submit(publish)
+                try:
+                    assert registration_entered.wait(5), 'Real registration reaches its own writer in its apply lane'
+                    assert registration_caller[0] != caller[0]
+                    refusal_at = pool.NOW
+                    release.set()
+                    assert pending.result(timeout=5), 'First approval rolls back without waiting for registration'
+                    refused = engine.lp_auto_state()
+                    assert refused['active_plan'] is None and refused['intents'] == []
+                    assert refused['last_round']['reason'] == 'account_round_invalid'
+                    assert signed == exchange.posts == exchange.cancels == []
+                    assert store.lp_sessions() == []
+                    with connect(store.path) as connection:
+                        assert connection.execute('SELECT COUNT(*) FROM lp_actions').fetchone()[0] == 0
+                finally:
+                    registration_release.set()
+                published = publishing.result(timeout=5)
+                assert published['state'] == 'ready', published
+                assert registration_intercepted == [dict(thread=registration_caller[0], statement='BEGIN IMMEDIATE')]
+                with connect(store.path) as connection:
+                    current = json.loads(connection.execute(
+                        'SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
+                assert current['account_financial_facts']['financial_status'] == 'known'
+                assert Decimal(current['account_financial_facts']['inventory_cost_usd']) == Decimal('7.80')
             else:
                 configured = engine.lp_auto_configure(dict(round_interval_seconds=90))
                 assert configured['config_version'] == before['config_version'] + 1
@@ -128,7 +193,8 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
                     current = json.loads(connection.execute(
                         'SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
                 assert current['account_financial_facts'] == approval
-            refusal_at = pool.NOW
+            if invalidation != 'registration_inflight':
+                refusal_at = pool.NOW
         finally:
             release.set()
         assert pending.result(timeout=5)
@@ -152,8 +218,9 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
         assert connection.execute('SELECT COUNT(*) FROM lp_actions').fetchone()[0] == 0
     assert state['last_round']['actions'] == []
     assert not state['last_round'].get('completed_at')
-    assert state['last_round']['reason'] == ('account_financial_facts_changed'
-        if invalidation == 'generation' else 'account_financial_facts_stale')
+    assert state['last_round']['reason'] == dict(generation='account_financial_facts_changed',
+        ttl='account_financial_facts_stale', incomplete_publication='account_order_sync_unknown',
+        registration_inflight='account_round_invalid')[invalidation]
     assert state['plan_wait']['kind'] == 'api'
     started = datetime.fromisoformat(state['plan_wait']['started_at'])
     deadline = datetime.fromisoformat(state['plan_wait']['deadline'])
@@ -170,7 +237,7 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
     monkeypatch.setattr(pool, 'NOW', deadline)
     assert scheduler.run_due()
     state = engine.lp_auto_state()
-    expected = ['B', 'C', 'E', 'F'] if invalidation == 'generation' else ['B', 'C', 'E', 'F', 'G']
+    expected = ['B', 'C', 'E', 'F'] if invalidation in ('generation', 'incomplete_publication', 'registration_inflight') else ['B', 'C', 'E', 'F', 'G']
     assert [p['token_id'] for p in exchange.posts] == expected, state['last_round']
     assert all(p['price'] == Decimal('.39') and p['quantity'] == 20 for p in exchange.posts)
     assert [r['token_id'] for r in state['last_round']['targets']] == expected
@@ -179,8 +246,9 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
     assert exchange.cancels == [] and state['slots']['occupied'] == len(expected)
     assert Decimal(state['funds']['total_usd']) == 39
     assert Decimal(state['funds']['inventory_cost_usd']) == (Decimal('7.80')
-        if invalidation == 'generation' else Decimal(0))
+        if invalidation in ('generation', 'incomplete_publication', 'registration_inflight') else Decimal(0))
     assert len(account_reads) > read_counts[0]
+    assert not any(financial_reads)
 
 
 @pytest.mark.parametrize('window', ['before_prepare', 'after_sign'])
@@ -255,7 +323,8 @@ def test_frozen_buy_keeps_current_stress_exit_gate(tmp_path, monkeypatch, window
     assert financial_reads == exchange.cancels == []
 
 
-@pytest.mark.parametrize('outcome', ['all_refused', 'mixed'])
+@pytest.mark.parametrize('outcome', ['all_refused', 'mixed', 'refused_A_late_B',
+    'late_A_refused_B', 'late_terminal_with_stop', 'late_terminal_with_protection'])
 def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkeypatch, outcome):
     from time import monotonic
     from polymarket.models.clob.cancel import CancelOrdersResponse
@@ -270,8 +339,10 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
     def current_book(*, token_id):
         value = book(token_id=token_id)
         result = value.model_copy(update={'timestamp': runtime.clock[0], 'bids': (
-            OrderBookLevel(price=Decimal('.40'), size=Decimal('3000' if protective[0] else '1000')),
-            OrderBookLevel(price=Decimal('.39'), size=Decimal('1000')))})
+            OrderBookLevel(price=Decimal('.40'), size=Decimal('3000'
+                if protective[0] and outcome != 'late_terminal_with_protection' else '1000')),
+            OrderBookLevel(price=Decimal('.39'), size=Decimal('3000'
+                if protective[0] and outcome == 'late_terminal_with_protection' else '1000')))})
         if protective[0]:
             protective_book.set()
         return result
@@ -292,11 +363,16 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
     assert lp._queue_protection_gate_open(session)
     terminal = {}
     original_ids = {o.id: o for o in originals}
+    late = outcome not in ('all_refused', 'mixed')
+    acknowledged_id = 'rank-a' if outcome == 'late_A_refused_B' else 'rank-b'
+    refused_id = 'rank-b' if acknowledged_id == 'rank-a' else 'rank-a'
     financial_reads = []
+    monitor_phase = [False]
     balance = account.get_balance_allowance
     def observed_balance(**kwargs):
         if engine.lp_auto_state()['active_plan']:
-            financial_reads.append(runtime.clock[0])
+            financial_reads.append(dict(phase='explicit_monitor' if monitor_phase[0] else 'planned_auto',
+                checked_at=runtime.clock[0], request=deepcopy(kwargs)))
         return balance(**kwargs)
     monkeypatch.setattr(account, 'get_balance_allowance', observed_balance)
     def venue(*, order_ids):
@@ -306,6 +382,8 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
             for oid in order_ids:
                 terminal[oid] = original_ids[oid].model_copy(update={'status': 'CANCELED'})
             account.orders = tuple(o for o in account.orders if o.id not in order_ids)
+            return CancelOrdersResponse(canceled=order_ids, not_canceled={})
+        if late and order_ids == (acknowledged_id,):
             return CancelOrdersResponse(canceled=order_ids, not_canceled={})
         return CancelOrdersResponse(canceled=(), not_canceled={oid: 'venue_denied' for oid in order_ids})
     def exact_order(*, order_id):
@@ -321,11 +399,136 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
     assert [r['order_id'] for r in original['targets']] == ['rank-c']
     assert all(a['session_id'] == session['session_id'] for a in original['actions'])
     assert account.cancels == [('rank-a',), ('rank-b',)] and account.posts == []
+    original_audits = deepcopy(store.lp_actions(session['session_id']))
     runtime.clock[0] = datetime.fromisoformat(saved['plan_wait']['deadline'])
     assert scheduler.run_due()
     state = engine.lp_auto_state()
     assert state['last_round']['round_id'] == original['round_id']
     assert [a['action_id'] for a in state['last_round']['actions']] == [a['action_id'] for a in original['actions']]
+    if late:
+        assert [a['state'] for a in state['last_round']['actions']] == (
+            ['canceling', 'rejected'] if acknowledged_id == 'rank-a' else ['rejected', 'canceling'])
+        assert state['active_plan']['round_id'] == original['round_id']
+        assert not state['last_round']['completed_at'] and state['plan_wait']['kind'] == 'order'
+        assert state['slots']['occupied'] == 3 and Decimal(state['funds']['buy_reserved_usd']) == Decimal('23.80')
+        assert account.cancels == [('rank-a',), ('rank-b',), (acknowledged_id,)]
+        assert account.posts == [] and financial_reads == []
+        audits = deepcopy(store.lp_actions(session['session_id']))
+        assert len(audits) == 3
+        assert len({a['action_key'] for a in audits}) == 3
+        assert [a['state'] for a in audits if a.get('order_id') == acknowledged_id] == ['accepted', 'accepted']
+        refused_audit, = [a for a in audits if a.get('order_id') == refused_id]
+        assert refused_audit['state'] == 'rejected' and refused_audit['reason'] == 'venue_denied'
+        assert refused_audit['rotation_round_id'] == original['round_id']
+        for audit in original_audits:
+            assert next(a for a in audits if a['action_key'] == audit['action_key']) == audit
+        control = None
+        if outcome == 'late_terminal_with_stop':
+            stopped = lp.stop(session['session_id'])
+            control = store.lp_session(session['session_id'])
+            assert stopped['session_id'] == session['session_id']
+            assert control['stop_requested'] is True
+            assert control['state'] in ('review', 'needs_attention')
+        elif outcome == 'late_terminal_with_protection':
+            protective[0] = True
+            runtime.clock[0] += timedelta(seconds=1)
+            deadline = monotonic() + 5
+            pause = Event()
+            monitor_phase[0] = True
+            try:
+                while account.cancels == [('rank-a',), ('rank-b',), (acknowledged_id,)]:
+                    assert monotonic() < deadline, 'Public protection takeover watchdog'
+                    engine.lp_tick()
+                    pause.wait(min(.01, max(0, deadline - monotonic())))
+            finally:
+                monitor_phase[0] = False
+            assert protective_book.is_set()
+            assert account.cancels == [('rank-a',), ('rank-b',), (acknowledged_id,), ('rank-c',)]
+            control = store.lp_session(session['session_id'])
+            bucket = control['queue_protection']['levels'][low_key]
+            assert bucket['cancel_reason'] == 'queue_ahead_ratio'
+            assert bucket['state'] == 'canceling' and bucket['cancel_targets'] == ['rank-c']
+            assert 'rank-c' in control['augment_cancel_requested']
+            assert len(financial_reads) == 2, financial_reads
+            assert all(row['phase'] == 'explicit_monitor' and row['request'] for row in financial_reads)
+            monitor_reads = deepcopy(financial_reads)
+            protective[0] = False
+        if control is not None:
+            control = deepcopy(control)
+            control_audits = deepcopy(store.lp_actions(session['session_id']))
+            control_calls = list(account.cancels)
+            assert control.get('yield_rotation_cancel_owners') == {acknowledged_id: original['round_id']}
+        terminal[acknowledged_id] = original_ids[acknowledged_id].model_copy(update={'status': 'CANCELED'})
+        account.orders = tuple(o for o in account.orders if o.id != acknowledged_id)
+        runtime.clock[0] = datetime.fromisoformat(state['plan_wait']['deadline'])
+        assert scheduler.run_due()
+        state = engine.lp_auto_state()
+        assert state['last_round']['round_id'] == original['round_id']
+        assert [a['action_id'] for a in state['last_round']['actions']] == [a['action_id'] for a in original['actions']]
+        assert state['last_round']['targets'] == saved['last_round']['targets']
+        assert [a['state'] for a in state['last_round']['actions']] == (
+            ['success', 'rejected'] if acknowledged_id == 'rank-a' else ['rejected', 'success'])
+        assert state['last_round']['completed_at'] and state['active_plan'] is None
+        assert state['plan_wait']['kind'] == 'round'
+        assert datetime.fromisoformat(state['plan_wait']['deadline']) == datetime.fromisoformat(
+            state['last_round']['completed_at']) + timedelta(seconds=60)
+        if control is None:
+            assert state['slots']['occupied'] == 2 and Decimal(state['funds']['buy_reserved_usd']) == Decimal('15.80')
+        assert account.posts == []
+        assert financial_reads == (monitor_reads if outcome == 'late_terminal_with_protection' else [])
+        restored = store.lp_session(session['session_id'])
+        if control is not None:
+            for key in ('state', 'stop_requested', 'stop_loss_latched', 'entry_cancel_requested',
+                    'augment_cancel_requested', 'owned_cancel_requested', 'queue_protection'):
+                assert restored.get(key) == control.get(key), (key, control, restored)
+            assert restored.get('yield_rotation_cancel_owners') == {}
+            assert restored['queue_protection'] != baseline
+            assert store.lp_actions(session['session_id']) == control_audits
+            assert account.cancels == control_calls and account.posts == []
+            scheduler.request_check()
+            assert not scheduler.run_due()
+            engine.lp_auto_run_once()
+            _, _, restarted_account, _, restarted = runtime(orders=account.orders, public_client=public)
+            restarted.lp_auto_run_once()
+            assert restarted_account.cancels == restarted_account.posts == []
+            assert account.cancels == control_calls and account.posts == []
+            assert store.lp_actions(session['session_id']) == control_audits
+            assert financial_reads == (monitor_reads if outcome == 'late_terminal_with_protection' else [])
+            return
+        assert restored.get('yield_rotation_cancel_owners') == {}
+        assert not restored.get('entry_cancel_requested')
+        assert restored.get('augment_cancel_requested', []) == []
+        assert restored['queue_protection']['levels'][high_key] == {
+            **baseline['levels'][high_key], 'order_id': refused_id}
+        assert restored['queue_protection']['levels'][low_key] == baseline['levels'][low_key]
+        assert {o.id for o in account.orders} == {refused_id, 'rank-c'}
+        assert store.lp_actions(session['session_id']) == audits
+        calls = list(account.cancels)
+        scheduler.request_check()
+        assert not scheduler.run_due()
+        engine.lp_auto_run_once()
+        engine.lp_tick()
+        assert account.cancels == calls and account.posts == []
+        assert store.lp_actions(session['session_id']) == audits
+        _, _, restarted_account, _, restarted = runtime(orders=account.orders, public_client=public)
+        restarted.lp_auto_run_once()
+        assert restarted_account.cancels == restarted_account.posts == []
+        protective[0] = True
+        runtime.clock[0] += timedelta(seconds=1)
+        deadline = monotonic() + 5
+        expected = calls + [(refused_id,)]
+        pause = Event()
+        while account.cancels != expected:
+            assert monotonic() < deadline, 'Public protection progression watchdog'
+            engine.lp_tick()
+            pause.wait(min(.01, max(0, deadline - monotonic())))
+        assert protective_book.is_set(), 'Original external SDK book was observed'
+        assert account.cancels == expected
+        assert store.lp_session(session['session_id'])['queue_protection']['levels'][high_key]['cancel_reason'] == 'queue_ahead_ratio'
+        assert account.posts == []
+        for audit in audits:
+            assert next(a for a in store.lp_actions(session['session_id']) if a['action_key'] == audit['action_key']) == audit
+        return
     assert [a['state'] for a in state['last_round']['actions']] == (['rejected', 'rejected']
         if outcome == 'all_refused' else ['success', 'rejected'])
     assert state['last_round']['completed_at'] and state['active_plan'] is None
@@ -1493,7 +1696,7 @@ def test_next_round_uses_new_facts_after_the_full_interval(tmp_path, monkeypatch
     'legacy_approved_unsent', 'legacy_cancel_pending', 'legacy_unknown_post',
     'legacy_accepted_idless', 'legacy_completed_wait', 'accepted_before_progress', 'receipt_await_apply', 'sign_interrupted',
     'rejected_before_progress', 'receipt_await_apply_terminal', 'receipt_await_apply_terminal_fill',
-    'resource_rejected_before_progress',
+    'resource_rejected_before_progress', 'resource_rejected_clock_gap',
 ])
 def test_restart_and_legacy_plan_upgrade_preserve_progress(tmp_path, monkeypatch, scenario):
     import base64
@@ -1506,9 +1709,11 @@ def test_restart_and_legacy_plan_upgrade_preserve_progress(tmp_path, monkeypatch
     from tests.test_lp_auto_target_convergence import PlanExchange
     legacy = scenario.startswith('legacy_')
     case = scenario.removeprefix('legacy_')
+    resource_rejection = case in ('resource_rejected_before_progress', 'resource_rejected_clock_gap')
     initial = ('A', 'B', 'C', 'D', 'I') if case == 'cancel_pending' else ()
     held = None
     trigger = False
+    clock_gap, trace_errors, rejection_identity = [], [], {}
     if legacy:
         manifest = json.loads((Path(__file__).parent / 'fixtures/lp_auto_legacy_plans.json').read_text())
         sample = manifest['samples'][case]
@@ -1561,14 +1766,49 @@ def test_restart_and_legacy_plan_upgrade_preserve_progress(tmp_path, monkeypatch
                 def interrupted():
                     raise SystemExit('original sign invocation ended before POST')
                 exchange.before_sign = interrupted
-            elif case == 'resource_rejected_before_progress':
+            elif resource_rejection:
                 sign = exchange.lp_create_limit_order
                 signatures = []
+                if case == 'resource_rejected_clock_gap':
+                    from threading import get_ident
+                    connect = sqlite3.connect
+                    advance_at_commit = [False]
+                    def observed_connect(database, *args, **kwargs):
+                        connection = connect(database, *args, **kwargs)
+                        if Path(database).resolve() == store.path.resolve():
+                            def trace(statement):
+                                try:
+                                    if not rejection_identity or get_ident() != rejection_identity['thread']:
+                                        return
+                                    compact = statement.replace(' ', '')
+                                    if (not clock_gap and statement.lstrip().upper().startswith('INSERT INTO LP_ACTIONS')
+                                            and rejection_identity['session_id'] in statement
+                                            and rejection_identity['action_key'] in statement
+                                            and all(value in compact for value in ('"role":"entry"', '"side":"BUY"',
+                                                '"token_id":"B"', '"submit_stage":"pre_send_rejected"',
+                                                '"post_started":false', '"reason":"execution_lock"'))):
+                                        advance_at_commit[0] = True
+                                        clock_gap.append(dict(statement=statement, **rejection_identity))
+                                    elif advance_at_commit[0] and statement.strip().upper() == 'COMMIT':
+                                        advance_at_commit[0] = False
+                                        before = pool.NOW
+                                        monkeypatch.setattr(pool, 'NOW', before + timedelta(microseconds=1))
+                                        clock_gap[0].update(before=before, after=pool.NOW, commit=statement)
+                                except BaseException as exc:
+                                    trace_errors.append(str(exc))
+                            connection.set_trace_callback(trace)
+                        return connection
+                    monkeypatch.setattr(sqlite3, 'connect', observed_connect)
                 def signed_then_locked(**kwargs):
                     nonlocal held
                     signed = sign(**kwargs)
                     if kwargs['token_id'] == 'B' and not signatures:
                         signatures.append(deepcopy(signed))
+                        if case == 'resource_rejected_clock_gap':
+                            actual, = [row for row in store.lp_sessions() if row['token_id'] == 'B']
+                            audit, = store.lp_actions(actual['session_id'])
+                            rejection_identity.update(thread=get_ident(), session_id=actual['session_id'],
+                                action_key=audit['action_key'], idempotency_key=actual['idempotency_key'])
                         held = engine._lock_path.open('a+')
                         fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     return signed
@@ -1627,7 +1867,7 @@ def test_restart_and_legacy_plan_upgrade_preserve_progress(tmp_path, monkeypatch
                     engine.lp_auto_run_once()
                 exchange.before_sign = None
             elif trigger:
-                error = ('resource rejection persisted before plan progress' if case == 'resource_rejected_before_progress'
+                error = ('resource rejection persisted before plan progress' if resource_rejection
                     else f'{"rejected" if case == "rejected_before_progress" else "accepted"} receipt persisted before plan progress')
                 with pytest.raises(sqlite3.IntegrityError, match=error):
                     engine.lp_auto_run_once()
@@ -1637,7 +1877,7 @@ def test_restart_and_legacy_plan_upgrade_preserve_progress(tmp_path, monkeypatch
         assert saved['last_round']['round_id']
         previous_posts, previous_cancels = deepcopy(exchange.posts), list(exchange.cancels)
         audit = {s['session_id']: deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
-        if case == 'resource_rejected_before_progress':
+        if resource_rejection:
             first = saved['active_plan']['actions'][0]
             original_request = first.get('request_id', first['action_id'])
             original_intent = next(i for i in saved['intents'] if i['intent_id'] == original_request)
@@ -1654,6 +1894,15 @@ def test_restart_and_legacy_plan_upgrade_preserve_progress(tmp_path, monkeypatch
             assert original_audit['token_id'] == original_session['token_id'] == 'B'
             assert not original_audit.get('order_id') and not original_session.get('entry_order_id')
             assert not lp.entry_send_inflight(original_session['session_id'])
+            if case == 'resource_rejected_clock_gap':
+                assert trace_errors == [] and len(clock_gap) == 1, (clock_gap, trace_errors)
+                gap = clock_gap[0]
+                assert gap['session_id'] == original_session['session_id']
+                assert gap['action_key'] == original_audit['action_key']
+                assert gap['idempotency_key'] == original_session['idempotency_key'] == f'lp-auto:{original_request}'
+                assert gap['commit'] == 'COMMIT' and gap['after'] == gap['before'] + timedelta(microseconds=1)
+                assert datetime.fromisoformat(original_audit['submit_finished_at']) <= datetime.fromisoformat(
+                    original_session['submit_finished_at']) <= pool.NOW
             assert exchange.posts == exchange.cancels == []
             with sqlite3.connect(store.path) as connection:
                 connection.execute('DROP TRIGGER fail_plan_progress')
@@ -1728,7 +1977,7 @@ def test_restart_and_legacy_plan_upgrade_preserve_progress(tmp_path, monkeypatch
         if case == 'completed_wait':
             assert state['active_plan'] is None and state['plan_wait']['kind'] == 'round'
             return
-        if held is not None and case != 'resource_rejected_before_progress':
+        if held is not None and not resource_rejection:
             fcntl.flock(held.fileno(), fcntl.LOCK_UN)
             held.close()
             held = None
@@ -1744,7 +1993,9 @@ def test_restart_and_legacy_plan_upgrade_preserve_progress(tmp_path, monkeypatch
         monkeypatch.setattr(pool, 'NOW', max(pool.NOW, deadline))
         assert scheduler.run_due()
         state = restored.lp_auto_state()
-        if case == 'resource_rejected_before_progress':
+        if resource_rejection:
+            if case == 'resource_rejected_clock_gap':
+                assert state['active_plan']['actions'][0]['state'] == 'pending', state['active_plan']['actions']
             assert state['active_plan']['round_id'] == saved['active_plan']['round_id']
             assert state['active_plan']['targets'] == saved['active_plan']['targets']
             assert state['plan_wait']['kind'] == 'order'

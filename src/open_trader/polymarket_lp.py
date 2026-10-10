@@ -10301,17 +10301,18 @@ class PolymarketLPService:
         except AutoEntryNotSent as exc:
             stage = str(getattr(exc, "submit_stage", "pre_send_rejected"))
             failure = _submit_failure_facts(exc)
+            finished_at = _iso(self._now())
             self.store.lp_upsert_action(session_id, entry_action_key, state="rejected",
                 payload={
                     "role": "entry", "side": "BUY", "reason": str(exc),
                     **send_receipt_base, "submit_stage": stage,
-                    "submit_finished_at": _iso(self._now()), **failure,
+                    "submit_finished_at": finished_at, **failure,
                 })
             session = self.store.lp_update_session(session_id, state="entry_rejected",
                 patch={
                     "submit_status": "rejected", "reason": str(exc),
                     **send_receipt_base, "submit_stage": stage,
-                    "submit_finished_at": _iso(self._now()),
+                    "submit_finished_at": finished_at,
                     **failure,
                 })
             return self._status_payload(session)
