@@ -13,6 +13,49 @@ N-leg 暂停的 Shadow；它不接管原生产实例，不提交订单。购买�
 
 ## 1. 已验证范围与未完成事项
 
+### 2026-10-10 当前记录：停止安装与用户单笔实测
+
+东京已安装源码为 `9eab8d32ed6cd7d5157a0a3bf76ae355606d9e6b`
+（简称 `9eab8d32`）；PR #324 人工诊断、PR #325 一命令入口及 PR #327
+时效修复均已合并。以下是该源码的实测记录，不是本文档提交的实盘验证。
+
+既有正式 wrapper 在核对精确 main-push CI `38038294083`、本地及远端
+Deployment Preflight `PASS`、停止安装范围的 Host Readiness `READY` 后，
+将源码及 unit 安装为 `INSTALLED_STOPPED`。安装汇总时间为
+`2026-10-10T09:37:58.403509Z`。独立 CLI 不要求后台服务运行；完整运行服务
+Smoke 因所选记录仍停止而返回 `ROLLBACK`，没有实际回滚，也没有云服务
+`HEALTHY` 结论。东京后台保持停止的 Shadow、`N_LEG_PAUSED=1`、
+`memory_max_bytes=2147483648`（2 GiB）。拟议的 3 GiB、swap guard 调整及
+production/Auto 恢复均未实施；本次订单测试不关闭或验收 #313 内存容量和
+#320 metadata 故障，也不证明完整遍历、长期容量或持续刷新稳定。
+
+Mac 入口 `~/.local/bin/lpprobe tokyo` 已安装于 `Mac-mini.local`，须在 Mac
+执行，由入口自行登录东京。它没有安装于东京的 `/home/ubuntu/.local/bin/lpprobe`；
+在 SSH shell 执行这个 Mac 本地路径会失败。`2026-10-10T09:36:21.720722Z`
+的独立只读检查确认已安装 Mac transport 解析到上述东京源码，并以 UID 999
+选择应用身份；助手未执行财务模块，交易所请求数为 0。
+
+用户在 2026-10-10 的 SSH pane 执行远端原生模块
+`python -m open_trader.polymarket_order_probe self-test`，这是同一后端自测路径，
+无需另一个安装器或用户提供 token ID。此次不是新的 Mac wrapper 端到端实盘
+运行。私有回执于 `2026-10-10T09:45:42.976862Z` 只读核对，结果如下：
+
+| 核对项 | 用户实测结果 |
+| --- | --- |
+| 单笔提交及观察 | `PASS`、`live_observed=true`；price=`0.001`、quantity=`5.00`、notional=`0.00500 USDC` |
+| 撤单及成交 | `cancel_acknowledged=true`、`terminal_status=CANCELED`、`filled_quantity=0`、`fill_discrepancy=false` |
+| 身份及对账 | `identity_verified=true`、`funds_reconciled=true`、`position_before=position_after=0`、`other_activity_reconciled=true` |
+| 独立地域报告 | `blocked=true`、country=`JP`、region=`13`；这一确切 API 订单仍被接受并撤销 |
+
+这是实际单笔订单的接受、LIVE 观察、撤单和对账证据，不只是认证或合成测试。
+地域报告没有变为 unblocked；冲突原因仍未知，不据此作法律合规、永久可用、
+全市场可达、全钱包安全或持续稳定的结论。production 交易地域门禁和 Shadow
+mutation guard 保持不变。原始回执及诊断留在东京私有 runtime 目录
+`/var/lib/open-trader/prediction/order-probe/`，不公开钱包派生文件名、完整订单 ID
+或秘密。后续会话仍须刷新主机及外部状态；下列早期失败记录继续保留。
+
+### 2026-10-09 历史部署与未验收限制
+
 2026-10-09 的历史部署选择了 GitHub main 历史中的发布
 `2797cd5029c7812e9405825674f559e7d1ebafaa`，使用
 [main-push CI 37930163820](https://github.com/raymizzou/open_trader/actions/runs/37930163820)。
@@ -25,7 +68,7 @@ Readiness `READY`、正式 wrapper install/start 和 Cloud Smoke `HEALTHY`。
 | 无凭据 paused Shadow | backend=disabled，无 LP account reader；LP 503 是预期；N-leg paused，candidate_exclusions=false | 不能据此认证 LP、完整池遍历或交易容量 |
 | 凭据读取 | Main 随后私下导入既有凭据；带 require-trading-region 的 read-auth 初始化 ready，完整认证账户读取成功，mutation/notification attempts 均为 0 | 总结果因 trading_region blocked 而 BLOCKED；认证读取成功不等于交易可用 |
 | 认证 paused Shadow | 同一接受 SHA 曾 RUNNING，认证读取成功；当时真实 Dashboard authenticated=true、stale=false，完整 orders/positions/trades 与 balance 读取，N-leg paused，guard attempts 为 0；本次尝试现已被资源 guard 停止 | 认证 Cloud Smoke FAILED，输出 ROLLBACK 标签但未执行回滚；metadata transport 错误与服务内存预算触发分别未解决；完整 feed 状态 UNKNOWN，完整 catalog/candidate/history 遍历、24 小时容量和 12 小时刷新尚未验收 |
-| 实盘/订单诊断 | 未提交订单；现有 Shadow 禁写和 production 地域门禁不变 | 新诊断执行路径/例外需要独立具体方案批准 |
+| 实盘/订单诊断（2026-10-09） | 当时未提交订单；Shadow 禁写和 production 地域门禁不变 | 当时诊断方案待批准；2026-10-10 的已批准单笔结果见上方当前记录，不改变这些门禁 |
 
 认证 Smoke 的远端直接诊断为 `runtime logs missing or contain errors`。
 启动 journal 反复出现
@@ -240,15 +283,19 @@ mutation/notification attempts。`data-check --config <runtime-config> --sample 
 称日本 API 不受限，而 [帮助页](https://help.polymarket.com/en/articles/13364163-geographic-restrictions)
 的地域说明不同；此文档未重新联网核对，保留该冲突为未知原因，不能用文档
 解释覆盖实际 gate。不得绕过限制、使用 proxy/VPN 规避或伪造 region attestation。
-production 的 require-trading-region 当前阻断；Shadow 禁止所有交易 POST。
+production 的 require-trading-region 保持阻断；Shadow 禁止所有交易 POST。
+2026-10-10 用户单笔诊断的地域报告与实际订单结果并列记录于第 1 节，
+不能用该订单的接受覆盖地域报告或 production 门禁。
 
 ### 一命令东京单笔诊断（2026-10-10）
 
 新增专属稳定入口 `~/.local/bin/lpprobe tokyo`。该命令在前提满足时执行一次
 真实 BUY/post-only/GTD 订单诊断；本节不是实盘执行授权。由 Main 完成发布、
 所选源码部署及本地安装后，用户执行这一命令；无需 SSH、环境变量、token、
-价格、份额、回执路径、交互确认或普通成功流程的后续命令。**本次开发只做了
-合成 HTTP 与离线进程/文件检查，尚未安装真实入口或实盘验证。**
+价格、份额、回执路径、交互确认或普通成功流程的后续命令。**PR #325 开发阶段
+只做了合成 HTTP 与离线进程/文件检查，当时尚未安装真实入口或实盘验证。
+2026-10-10 已安装 Mac 入口的只读解析检查及用户 SSH 原生自测结果见第 1 节；
+两者不合并为 Mac wrapper 端到端实盘证据。**
 
 入口只用既有 `open-trader-tokyo-experiment` SSH alias，开启非交互登录、严格
 host-key 校验，禁用 agent 转发及复用连接。远端固定 bootstrap 仅以 root
@@ -351,7 +398,9 @@ runtime_root=`/var/lib/open-trader/prediction` 和上述 credentials_file 路径
 新增独立入口 `python -m open_trader.polymarket_order_probe` 和薄脚本
 `scripts/polymarket-order-probe.sh`。本入口不修改 Shadow、production 地域门禁或
 Auto。用户手工指定 token、价格和数量；工具不扫描或推荐市场。
-**实盘下单尚未验证；以下交易命令只供用户手动执行。** GET 成功仅说明认证及
+**PR #324 开发阶段未验证实盘下单；2026-10-10 原生 `self-test` 的用户单笔
+实测见第 1 节，不代替下列人工 `run` 命令的独立实测。以下交易命令只供用户
+手动执行。** GET 成功仅说明认证及
 读取成功，不能证明交易可用。地域报告保留真实 `blocked`、country 和 region，
 隐藏 IP；结果未知时明确显示 unknown，不伪造地域、不提供代理或替代 HTTP 地址。
 
@@ -432,7 +481,7 @@ RECORD='<absolute-private-probe-directory>/attempt-001.json'
 时，用户须直接查看交易所并核对账户；工具不按价格/时间猜 ID、不全撤、不卖出、
 不重下。退出码 0 表示 `CHECKED` 或已完成核对的 `PASS`；拒绝、部分/全部成交、
 阻断及 UNKNOWN 返回 2，仍须读取 JSON 结果区别处理。CLI 使用 POSIX 截止时间，
-只适用于独立主线程进程，不应嵌入 Shadow 线程。当前验证仅为合成凭据和阻断真实
+只适用于独立主线程进程，不应嵌入 Shadow 线程。PR #324 开发阶段验证仅为合成凭据和阻断真实
 网络的 SDK HTTP 边界测试、离线入口及 shell 语法检查；不构成东京交易、部署、
 资源容量、跨主机锁或地域可交易证据。
 
@@ -577,7 +626,8 @@ limit=999,997,440 bytes；host MemAvailable=2,733,596,672 bytes、swap_used=0，
 kernel memory failures=0。随后 systemd ActiveState=failed、无主进程，
 Result=signal、ExecMainStatus=9、NRestarts=0。这是服务预算保护及其后强制终止，
 不是 4 GB 主机耗尽 RAM、kernel OOM 或 agent 回滚的证据；未重试或重启。
-原本地生产 owner 不变，无订单提交，已批准的 1 USDC 测试上限尚未使用。
+该次历史尝试未改变原本地生产 owner，未提交订单，当时已批准的 1 USDC 测试
+上限尚未使用；2026-10-10 用户单笔实测见第 1 节。
 metadata transport 错误与服务内存预算触发是两个独立未验收事项。移除固定
 1 GB 上限及配置 2 GiB 已获批准，无需为同一变更再次申请批准；配置支持不
 证明云端已部署或健康，也不证明完整启动与长期容量验收通过。未来无关的

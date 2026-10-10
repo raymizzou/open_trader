@@ -13,6 +13,16 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - 明确交付规则：独立新增的 `CHANGELOG.md` 条目发生冲突时可直接保留双方内容并解决；
   已发布任务分支可用正常 merge 同步 `origin/main`，仍须完成规定检查和独立评审。
 
+- 东京部署 SOP 文档收尾：区分 `9eab8d32` 的停止安装、Mac-mini.local 上
+  `lpprobe tokyo` 的只读解析验证，以及用户在 SSH pane 执行原生 `self-test`
+  的真实单笔结果。回执于 `2026-10-10T09:45:42.976862Z` 核对为 PASS：
+  价格 0.001、数量 5.00、名义额 0.00500 USDC，观察 LIVE、撤单 ACK、
+  CANCELED、零成交，身份、资金及零持仓对账通过。地域仍为 blocked/JP/13。
+  后台保持停止 Shadow、N-leg paused、2 GiB；保留历史 Smoke 失败和 TDD
+  证据限制，不宣称 Mac wrapper 端到端实盘、云服务健康或 #313/#320 验收。
+  本文档变更仅核对既有证据、差异、Markdown 链接及 whitespace；未执行新的
+  交易、后台测试或部署，实测源码不等于本文档提交。
+
 - 一命令 Polymarket 诊断在有界扫描中跳过过旧或未来时间的盘口，继续寻找新鲜
   候选；保留 `[0,10]` 秒门禁、选择后复核和全部金额/单次提交/精确撤单保护。
   提交前失败报告实际阶段、盘口/服务器时间、年龄及明确未提交结论；私有诊断
