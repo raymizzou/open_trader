@@ -1,4 +1,6 @@
 """Issue #249: public auto-buy contracts with the real adapter and SQLite."""
+
+from tests.test_lp_account_reservation_reconciliation import advance_api_wait
 from datetime import timedelta
 from decimal import Decimal
 
@@ -164,9 +166,23 @@ def test_selected_price_history_rejects_only_this_candidate(runtime, phase, inva
             return signed
         account.create_limit_order = sign
     state = execution.lp_auto_run_once(round_id=f'price-history-{phase}-{invalid}')
-    assert [p.token_id for p in account.posts] == [_refill_identity(2)[2]], state['last_round']
-    assert state['last_round']['actions'][0]['reason'] == reason
-    assert state['last_round']['actions'][0]['state'] == ('rejected' if phase == 'preparation' else 'entry_rejected')
+    if phase == 'preparation':
+        assert [p.token_id for p in account.posts] == [_refill_identity(2)[2]], state['last_round']
+        assert state['last_round']['candidate_filter']['recheck_reasons'] == {reason: 1}
+        assert len(state['last_round']['actions']) == 1
+        assert state['last_round']['actions'][0]['token_id'] == _refill_identity(2)[2]
+        assert state['last_round']['actions'][0]['state'] == 'success'
+    else:
+        assert account.posts == []
+        action = state['last_round']['actions'][0]
+        assert action['reason'] == reason
+        assert action['state'] == 'rejected' and action['request_state'] == 'entry_rejected'
+        assert state['slots']['occupied'] == 0
+        assert Decimal(state['funds']['buy_reserved_usd']) == 0
+        assert not state['admission_block_reasons']
+        advance_api_wait(runtime, execution)
+        state = execution.lp_auto_run_once(round_id='next-history-round')
+        assert [p.token_id for p in account.posts] == [_refill_identity(2)[2]], state['last_round']
     assert state['slots']['occupied'] == 1
     assert Decimal(state['funds']['buy_reserved_usd']) == 8
     assert not state['admission_block_reasons']
@@ -279,9 +295,9 @@ def test_candidate_failures_and_unknown_account_have_distinct_scope(runtime, fai
     account.create_limit_order, account.post_order = sign, post
     state = execution.lp_auto_run_once(round_id='failure-scope')
     if failure in ('rejected', 'prepare'):
-        assert [o.id for o in account.orders] == ['refill-2', 'refill-3'], state['last_round']
-        assert state['slots']['occupied'] == 2
-        assert Decimal(state['funds']['buy_reserved_usd']) == 16
+        assert [o.id for o in account.orders] == ['refill-2'], state['last_round']
+        assert state['slots']['occupied'] == 1
+        assert Decimal(state['funds']['buy_reserved_usd']) == 8
     elif failure == 'pause':
         assert account.posts == []
         assert state['pause_confirmed']
@@ -293,7 +309,7 @@ def test_candidate_failures_and_unknown_account_have_distinct_scope(runtime, fai
         assert state['slots']['occupied'] == 1
         assert Decimal(state['funds']['buy_reserved_usd']) == 8
     else:
-        assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (1, 2, 3)], state['last_round']
+        assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (1, 2)], state['last_round']
         first = next(i for i in state['intents'] if i['token_id'] == _refill_identity(1)[2])
         sid = first['session_id']
         assert store.lp_session(sid)['submit_status'] == 'unknown'
@@ -301,22 +317,23 @@ def test_candidate_failures_and_unknown_account_have_distinct_scope(runtime, fai
         assert first['reservation_coverage']['state'] == 'covered'
         assert state['funds']['status'] == 'known'
         assert not state['admission_block_reasons']
-        assert state['slots']['active'] == state['slots']['occupied'] == 2
-        assert Decimal(state['funds']['buy_reserved_usd']) == 16
-        assert Decimal(state['funds']['spendable_usd']) == 0
+        assert state['slots']['active'] == state['slots']['occupied'] == 1
+        assert Decimal(state['funds']['buy_reserved_usd']) == 8
+        assert Decimal(state['funds']['spendable_usd']) == 8
         audit = store.lp_actions(sid)
         execution.lp_auto_run_once(round_id='failure-scope')
-        assert len(account.posts) == 3
+        assert len(account.posts) == 2
         _advance(runtime)
         execution.refresh_lp_dashboard_snapshot()
         repaired = execution.lp_auto_state()
         first = next(i for i in repaired['intents'] if i['session_id'] == sid)
         assert first['reservation_coverage']['state'] == 'covered'
-        assert repaired['slots']['occupied'] == 2
-        assert Decimal(repaired['funds']['buy_reserved_usd']) == 16
+        assert repaired['slots']['occupied'] == 1
+        assert Decimal(repaired['funds']['buy_reserved_usd']) == 8
         assert store.lp_actions(sid) == audit
         assert store.lp_session(sid)['submit_status'] == 'unknown'
         assert store.lp_actions(sid)[0]['state'] == 'unknown'
+    assert all(p.token_id != _refill_identity(3)[2] for p in account.posts)
     assert account.cancels == account.market_orders == []
 
 
@@ -428,8 +445,14 @@ def test_sendtime_allowance_drop_skips_expensive_candidate_then_uses_api_remaind
         return signed
     account.create_limit_order = sign
     state = execution.lp_auto_run_once(round_id='allowance-drop')
-    assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in [2, 3]], state['last_round']
-    assert state['last_round']['actions'][0]['state'] == 'entry_rejected'
+    assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in [2]], state['last_round']
+    assert state['last_round']['actions'][0]['state'] == 'rejected'
+    assert state['last_round']['actions'][0]['request_state'] == 'entry_rejected'
+    assert state['slots']['occupied'] == 1
+    assert Decimal(state['funds']['buy_reserved_usd']) == 8
+    advance_api_wait(runtime, execution)
+    state = execution.lp_auto_run_once(round_id='next-allowance-round')
+    assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in [2, 3]]
     assert state['slots']['occupied'] == 2
     assert Decimal(state['funds']['buy_reserved_usd']) == 16
 
@@ -499,10 +522,31 @@ def test_newer_dashboard_publication_cannot_make_an_old_presend_snapshot_current
         return signed
     account.create_limit_order = sign
     state = execution.lp_auto_run_once(round_id='presend-generation')
+    assert account.posts == []
+    action = state['last_round']['actions'][0]
+    assert action['state'] == 'rejected' and action['request_state'] == 'entry_rejected'
+    assert action['reason'] == 'account_financial_facts_changed'
+    assert state['last_round']['completed_at']
+    original_round = state['last_round']['round_id']
+    original_action = dict(action)
+    original_audit = store.lp_actions(action['session_id'])
+    waiting = state['plan_wait']
+    from datetime import datetime
+    deadline = datetime.fromisoformat(waiting['deadline'])
+    assert deadline - datetime.fromisoformat(waiting['started_at']) == timedelta(seconds=60)
+    runtime.clock[0] = deadline - timedelta(seconds=1)
+    before = account.position_reads
+    execution.lp_auto_run_once(round_id=original_round)
+    assert account.position_reads == before and account.posts == []
+    assert action['token_id'] == _refill_identity(2)[2]
+    advance_api_wait(runtime, execution)
+    next_state = execution.lp_auto_run_once(round_id='next-generation-round')
+    assert next_state['last_round']['round_id'] != original_round
+    assert store.lp_actions(action['session_id']) == original_audit
     assert len(account.posts) == 1
-    assert account.posts[0].token_id == _refill_identity(1)[2], state['last_round']
-    assert state['last_round']['actions'][0]['state'] == 'entry_rejected'
-    assert state['last_round']['actions'][0]['reason'] == 'account_financial_facts_changed'
+    assert account.posts[0].token_id == _refill_identity(2)[2], state['last_round']
+    assert next_state['last_round']['actions'][0]['token_id'] == _refill_identity(2)[2]
+    assert original_action['reason'] == 'account_financial_facts_changed'
 
 
 def test_ui_and_auto_both_reject_the_only_candidate_with_adverse_price_history(runtime):
@@ -515,7 +559,8 @@ def test_ui_and_auto_both_reject_the_only_candidate_with_adverse_price_history(r
     assert lp.candidate_snapshot()['candidate_valid_count'] == 0
     state = execution.lp_auto_run_once(round_id='adverse-only-candidate')
     assert account.posts == []
-    assert state['last_round']['actions'][0]['reason'] == 'history_amplitude_exceeded'
+    assert state['last_round']['actions'] == []
+    assert state['last_round']['candidate_filter']['recheck_reasons'] == {'history_amplitude_exceeded': 1}
     assert state['slots']['occupied'] == 0
     assert Decimal(state['funds']['buy_reserved_usd']) == 0
 
@@ -775,6 +820,7 @@ def test_failed_current_api_read_retains_matching_unknown_holds_until_recovery(r
     assert account.posts == account.cancels == []
     account.list_positions = positions
     _advance(runtime)
+    advance_api_wait(runtime, execution)
     state = execution.lp_auto_run_once(round_id=f'recovered-current-api-{invalid}')
     assert len(account.posts) == 2, state['last_round']
     assert state['slots']['occupied'] == 5
@@ -899,12 +945,25 @@ def test_presend_account_failure_cause_survives_a_different_final_refresh_failur
         return signed
     account.create_limit_order = sign
     state = execution.lp_auto_run_once(round_id='latched-account-failure')
-    assert len(reads) == 2, 'Only failed presend and existing final account reads'
+    assert len(reads) == 1, 'Failed account read starts the full API wait'
     assert signs == [_refill_identity(1)[2]]
     assert account.posts == account.cancels == []
     assert state['last_round']['reason'] == 'account_order_sync_unknown'
-    assert state['last_round']['actions'][0]['state'] == 'entry_rejected'
-    assert state['last_round']['actions'][0]['reason'] == 'account_order_sync_unknown'
-    assert len(state['last_round']['actions']) == 1
-    assert 'account_identity_mismatch' in state['admission_block_reasons']
+    actions = state['last_round']['actions']
+    assert len(actions) == 2
+    assert actions[0]['state'] == 'pending' and actions[0]['request_state'] == 'entry_rejected'
+    original_attempt = dict(actions[0]['attempts'][0])
+    assert original_attempt['state'] == 'not_sent'
+    assert original_attempt['reason'] == 'account_order_sync_unknown'
+    assert actions[1]['state'] == 'pending' and 'request_state' not in actions[1]
     assert state['slots']['occupied'] == 0
+    runtime.clock[0] += timedelta(seconds=59)
+    execution.lp_auto_run_once(round_id='latched-account-failure')
+    assert len(reads) == 1 and len(signs) == 1
+    advance_api_wait(runtime, execution, refresh=False)
+    state = execution.lp_auto_run_once(round_id='latched-account-failure')
+    assert len(reads) == 2
+    assert 'account_identity_mismatch' in state['admission_block_reasons']
+    assert state['last_round']['actions'][0]['attempts'][0] == original_attempt
+    assert state['slots']['occupied'] == 0
+    assert len(signs) == 1 and account.posts == account.cancels == []

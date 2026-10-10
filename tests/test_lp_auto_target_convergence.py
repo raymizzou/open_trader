@@ -95,27 +95,49 @@ def test_unified_selection_for_zero_three_four_five_buys(tmp_path, monkeypatch, 
     assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('39.00')
 
 
-@pytest.mark.parametrize('protection', ['monitoring', 'triggered'])
+@pytest.mark.parametrize('protection', ['monitoring', 'triggered', 'all-triggered'])
 def test_triggered_protection_retains_order_but_monitoring_does_not(tmp_path, monkeypatch, protection):
-    engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch, tokens=('A', 'B', 'C', 'D'))
+    tokens = ('A', 'B', 'C', 'D', 'I') if protection == 'all-triggered' else ('A', 'B', 'C', 'D')
+    engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch, tokens=tokens)
     engine.lp_auto_run_once()
     original = live_orders(exchange)
     monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(seconds=60))
     direction = exchange.direction
-    if protection == 'triggered':
+    if protection != 'monitoring':
         def depleted(token):
             result = direction(token)
-            if token == 'A':
+            if token == 'A' or protection == 'all-triggered' and token in original:
                 result['book']['bids'][1]['size'] = '3000'
             return result
         exchange.direction = depleted
         exchange.cancel_terminal = False
     engine.lp_tick()
+    if protection == 'all-triggered':
+        # Tick drains bounded observation lanes; advance their public clock
+        # between passes so all five genuine protection episodes are consumed.
+        for _ in range(3):
+            monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(seconds=1))
+            engine.lp_tick()
     session = next(s for s in store.lp_sessions() if s['token_id'] == 'A')
     states = {b['state'] for b in session['queue_protection']['levels'].values()}
-    assert states & ({'triggered', 'canceling', 'cancel_unknown'} if protection == 'triggered' else {'registered', 'monitoring'}), session
+    assert states & ({'triggered', 'canceling', 'cancel_unknown'} if protection != 'monitoring' else {'registered', 'monitoring'}), session
+    if protection == 'all-triggered':
+        for session in store.lp_sessions():
+            states = {b['state'] for b in session['queue_protection']['levels'].values()}
+            assert states & {'triggered', 'canceling', 'cancel_unknown'}, session
+        protection_cancels = list(exchange.cancels)
+        assert set(protection_cancels) == set(original.values())
+        posts = list(exchange.posts)
     publish_candidates(exchange, lp, store, REWARDS)
     state = engine.lp_auto_run_once()
+    if protection == 'all-triggered':
+        assert {r['condition_id'] for r in state['last_round']['targets']} == set(tokens), state['last_round']
+        assert {r['condition_id']: r['order_id'] for r in state['last_round']['targets']} == original
+        assert live_orders(exchange) == original
+        assert state['slots']['occupied'] == 5
+        assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('39.00')
+        assert exchange.cancels == protection_cancels and exchange.posts == posts
+        return
     expected = {'A', 'B', 'C', 'E', 'F'} if protection == 'triggered' else {'B', 'C', 'E', 'F', 'G'}
     assert {r['condition_id'] for r in state['last_round']['targets']} == expected, state['last_round']
     if protection == 'triggered':

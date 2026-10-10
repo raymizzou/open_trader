@@ -2902,6 +2902,9 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
             pass
 
     class FakeLP:
+        def _now(self):
+            return datetime.now(UTC)
+
         def __init__(self, _store: object, _trading: object, **_kwargs: object) -> None:
             self.probe = probe_holder[0]
 

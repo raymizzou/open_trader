@@ -1,5 +1,7 @@
 """A failed order import is visible and cannot authorize another BUY."""
-from datetime import timedelta
+
+from tests.test_lp_auto_pool import advance_auto_wait
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -44,7 +46,7 @@ def test_failed_registration_keeps_dashboard_stale_until_success(tmp_path, monke
 
 
 @pytest.mark.parametrize("during_sign", [False, True])
-def test_failed_registration_blocks_auto_buy_before_or_during_sign(tmp_path, during_sign):
+def test_failed_registration_blocks_auto_buy_before_or_during_sign(tmp_path, monkeypatch, during_sign):
     execution, exchange, lp, store = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd="100", target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
@@ -79,5 +81,15 @@ def test_failed_registration_blocks_auto_buy_before_or_during_sign(tmp_path, dur
         return snapshot
     exchange.lp_account_snapshot_shared = complete_account_round
     assert lp.register_account_snapshot(complete_account_round())["state"] == "registered"
-    execution.lp_auto_run_once()
-    assert len(exchange.posts) == 1
+    waiting = execution.lp_auto_state()['plan_wait']
+    now[0] = datetime.fromisoformat(waiting['deadline'])
+    advance_auto_wait(execution, monkeypatch)
+    recovered = execution.lp_auto_run_once()
+    if during_sign:
+        assert exchange.posts == [] and recovered['last_round']['completed_at']
+        waiting = recovered['plan_wait']
+        assert waiting['kind'] == 'round'
+        now[0] = datetime.fromisoformat(waiting['deadline'])
+        advance_auto_wait(execution, monkeypatch)
+        recovered = execution.lp_auto_run_once()
+    assert len(exchange.posts) == 1, str(recovered['last_round'])

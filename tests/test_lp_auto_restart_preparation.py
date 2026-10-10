@@ -1,4 +1,6 @@
 """A dead pre-POST owner must yield its temporary hold to fresh account facts."""
+
+from tests.test_lp_account_reservation_reconciliation import advance_api_wait
 import multiprocessing
 import faulthandler
 from concurrent.futures import ThreadPoolExecutor
@@ -206,6 +208,9 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         assert state['intents'][0]['intent_id'] == original['intent_id']
         assert not state['intents'][0]['order_id']
         marker = deepcopy(store.lp_session(sid)['submission_owner_exit'])
+        advance_api_wait(runtime, owner.execution, refresh=False)
+        owner.execution.lp_auto_run_once(round_id='old-preparing-request')
+        advance_api_wait(runtime, owner.execution, refresh=False)
         _arm_refill(runtime, owner, account)
         reads = account.position_reads
         state = owner.execution.lp_auto_run_once(round_id='new-owner-refill')
@@ -451,6 +456,9 @@ def test_dead_post_started_sender_with_lagging_preparing_action_is_covered_after
         assert store.lp_session(sid).get('reservation_coverage')
         assert store.lp_actions(sid) == audit
         assert account.posts == account.cancels == []
+        advance_api_wait(runtime, owner.execution, refresh=False)
+        owner.execution.lp_auto_run_once(round_id='old-preparing-request')
+        advance_api_wait(runtime, owner.execution, refresh=False)
         _arm_refill(runtime, owner, account)
         state = owner.execution.lp_auto_run_once(round_id='post-owner-exit-refill')
         assert state['slots']['occupied'] == 5
@@ -472,6 +480,9 @@ def test_recovery_preserves_new_submission_pause_and_configuration_fences(
         _advance(runtime)
         owner.execution.refresh_lp_dashboard_snapshot()
         assert owner.execution.lp_auto_state()['slots']['occupied'] == 4
+        advance_api_wait(runtime, owner.execution, refresh=False)
+        owner.execution.lp_auto_run_once(round_id='old-preparing-request')
+        advance_api_wait(runtime, owner.execution, refresh=False)
         _arm_refill(runtime, owner, account)
         sign = account.create_limit_order
         def blocked(**kwargs):
@@ -486,7 +497,7 @@ def test_recovery_preserves_new_submission_pause_and_configuration_fences(
                 if fence == 'pause':
                     owner.execution.lp_auto_set_desired_running(False)
                 else:
-                    owner.execution._auto_pool._update(lambda d: d.update(config_version=d['config_version']+1))
+                    owner.execution._auto_pool._update(lambda d: d.update(config_version=d['config_version']+1, trading_config_version=d['trading_config_version']+1))
             finally:
                 release.set()
             state = pending.result(timeout=5)

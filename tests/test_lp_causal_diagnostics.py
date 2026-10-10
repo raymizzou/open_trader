@@ -205,7 +205,8 @@ def test_both_presend_account_uses_log_the_actual_distinct_reads(runtime, monkey
         assert records[0]['used_at'] == actual['used_at'].isoformat()
     assert len(account.posts) == (0 if reject else 1), state['last_round']
     if reject:
-        assert state['last_round']['actions'][0]['state'] == 'entry_rejected'
+        assert state['last_round']['actions'][0]['state'] == 'rejected'
+        assert state['last_round']['actions'][0]['request_state'] == 'entry_rejected'
         assert state['last_round']['actions'][0]['reason'] == 'balance_insufficient'
     else:
         replay = execution.lp_auto_run_once(round_id='causal-two-presend-reads')

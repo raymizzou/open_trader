@@ -1,4 +1,6 @@
 """Account coverage replaces temporary automatic allocations without reattribution."""
+
+from tests.test_lp_auto_pool import advance_auto_wait
 from copy import deepcopy
 from datetime import timedelta
 import hashlib
@@ -140,8 +142,10 @@ def rotation_pool(tmp_path, monkeypatch, *, same_token=False, target=1):
 
 def test_account_rotation_ranks_and_cancels_real_id_without_fake_intent(tmp_path, monkeypatch):
     engine, exchange, lp, store, rotation = rotation_pool(tmp_path, monkeypatch)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 3)
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert exchange.cancels == ['o1']
     assert len(exchange.posts) == 1
@@ -156,6 +160,7 @@ def test_account_rotation_ranks_and_cancels_real_id_without_fake_intent(tmp_path
 
 def test_overcapacity_same_token_buys_use_two_slots_and_exact_rotation_victim(tmp_path, monkeypatch):
     engine, exchange, lp, _, rotation = rotation_pool(tmp_path, monkeypatch, same_token=True)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m00'] = Decimal('30')
     rotation.refresh(lp, exchange, 3)
     state = engine.lp_auto_state()
@@ -173,13 +178,15 @@ def test_overcapacity_same_token_buys_use_two_slots_and_exact_rotation_victim(tm
 
 def test_account_rotation_fill_keeps_inventory_budget_without_sale(tmp_path, monkeypatch):
     engine, exchange, lp, store, rotation = rotation_pool(tmp_path, monkeypatch)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 3)
     engine.lp_auto_run_once()
     exchange.orders[0].update(status='CANCELED', size_matched='8')
+    advance_auto_wait(engine, monkeypatch)
     def terminal(d):
         d['account_financial_facts'].update(buys=[], order_fills={'o1': '8'},
-            inventory_cost_usd='3.2', trade_generation=store.lp_trade_generation())
+            inventory_cost_usd='3.2', checked_at=pool.NOW.isoformat(), trade_generation=store.lp_trade_generation())
     engine._auto_pool._update(terminal)
     state = engine.lp_auto_run_once()
     assert state['last_round']['reason'] == 'rotation_filled'
@@ -253,12 +260,14 @@ def test_rotation_metadata_cannot_overwrite_new_partial_fill_capital(tmp_path):
 def test_first_account_coverage_preserves_inflight_rotation_fill_stop(tmp_path, monkeypatch):
     from tests import test_lp_auto_rotation as rotation
     engine, exchange, lp, store = rotation.setup(tmp_path, monkeypatch, count=2, target=1)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 2)
     engine.lp_auto_run_once()
     intent = engine.lp_auto_state()['intents'][0]
     assert intent['state'] == 'canceling'
     exchange.orders[0].update(status='CANCELED', size_matched='8')
+    advance_auto_wait(engine, monkeypatch)
     def cover(d):
         d['intents'][intent['intent_id']]['reservation_coverage'] = {
             **old_intent()['reservation_coverage'], 'session_id': intent['session_id'],
@@ -333,10 +342,15 @@ def test_covered_unknown_session_rotates_its_known_account_order(tmp_path, monke
     managed = store.lp_session(original['session_id'])
     assert managed['state'] == 'entry_open'
     assert managed['submit_status'] == 'unknown'
+    advance_auto_wait(engine, monkeypatch)
+    engine.lp_auto_run_once()
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 2)
+    advance_auto_wait(engine, monkeypatch)
+    assert lp.register_account_snapshot(pool._fresh_registration_bundle(exchange, lp))['state'] == 'registered'
     state = engine.lp_auto_run_once()
-    assert exchange.cancels == ['manual-late']
+    assert exchange.cancels == ['manual-late'], str(state['last_round'])
     assert len(exchange.posts) == 1  # Only the original timed-out POST occurred.
     audit = state['intents'][0]
     assert audit['state'] == 'unknown' and audit['order_id'] is None
@@ -516,6 +530,7 @@ def test_older_pool_success_cannot_clear_newer_concurrent_wait(tmp_path, monkeyp
 @pytest.mark.parametrize('partial_status', ['known', 'unknown'])
 def test_account_overcapacity_cancels_only_unfilled_extra_beside_partial_buy(tmp_path, monkeypatch, partial_status):
     engine, exchange, lp, store, _ = rotation_pool(tmp_path, monkeypatch)
+    advance_auto_wait(engine, monkeypatch)
     partial = dict(order_id='partial-buy', token_id='m01', condition_id='m01', side='BUY',
         status='LIVE', price='.4', original_size='20', size_matched='1')
     exchange.orders.append(partial)
@@ -534,6 +549,7 @@ def test_account_overcapacity_cancels_only_unfilled_extra_beside_partial_buy(tmp
     engine._auto_pool._update(include_partial)
     before = engine.lp_auto_state()
     assert before['slots']['occupied'] == 2 and before['target_buy_count'] == 1
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert state['slots']['occupied'] == 2
     assert Decimal(state['funds']['inventory_cost_usd']) == Decimal('.4')

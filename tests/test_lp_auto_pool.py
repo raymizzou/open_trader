@@ -4,6 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 from threading import Barrier, Event
 import time
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -126,6 +127,18 @@ def _fresh_registration_bundle(x, lp):
     return snapshot
 
 
+def advance_auto_wait(execution, monkeypatch, *, refresh=True):
+    """Reach a persisted business deadline without changing the plan."""
+    waiting = execution.lp_auto_state()['plan_wait']
+    if waiting and _maybe_datetime(waiting['deadline']) > NOW:
+        monkeypatch.setattr(sys.modules[__name__], 'NOW', _maybe_datetime(waiting['deadline']))
+    if refresh:
+        lp, exchange = execution._lp, execution._trading
+        for token in tuple(lp._candidate_pool):
+            lp._candidate_pool_record_success(token, dict(condition_id=token), judged_at=NOW,
+                facts=dict(directions=[exchange.direction(token)], account=exchange.lp_account_snapshot()))
+
+
 def test_default_configure_enable_and_idempotent_round(tmp_path):
     e,x,lp,s=setup(tmp_path,5)
     assert e.lp_auto_state()['desired_running'] is False
@@ -151,13 +164,13 @@ def test_default_configure_enable_and_idempotent_round(tmp_path):
     (['market_read_cooling_down'], 'market_read_cooling_down'),
     (['market_read_in_progress'], 'market_read_in_progress'),
     (['market_read_capacity', 'market_read_timeout'], 'market_read_capacity'),
-    (['market_read_capacity', 'strategy_funds_insufficient'], 'candidates_or_funds_insufficient'),
-    (['market_read_capacity', None], 'target_filled'),
-    (['market_read_capacity', None, 'market_read_timeout'], 'candidates_or_funds_insufficient'),
+    (['market_read_capacity', 'strategy_funds_insufficient'], 'market_read_capacity'),
+    (['market_read_capacity', None], 'market_read_capacity'),
+    (['market_read_capacity', None, 'market_read_timeout'], 'market_read_capacity'),
 ])
 def test_round_summary_preserves_read_refusals_without_hiding_other_outcomes(tmp_path, monkeypatch, reasons, expected):
     e, exchange, _, _ = setup(tmp_path, len(reasons))
-    e.lp_auto_configure(dict(budget_usd='100', target_buy_count=1 if expected == 'target_filled' else len(reasons)))
+    e.lp_auto_configure(dict(budget_usd='100', target_buy_count=1 if reasons == ['market_read_capacity', None] else len(reasons)))
     e.lp_auto_set_desired_running(True)
     pool = e._lp_auto_pool()
     submit = pool._submit
@@ -172,10 +185,13 @@ def test_round_summary_preserves_read_refusals_without_hiding_other_outcomes(tmp
 
     monkeypatch.setattr(pool, '_submit', controlled)
     state = e.lp_auto_run_once(round_id='read-summary')
-    assert len(attempted) == len(reasons)
+    planned = reasons[:state['target_buy_count']]
+    assert len(attempted) == len(planned)
     assert state['last_round']['reason'] == expected
-    assert [a.get('reason') for a in state['last_round']['actions'] if a['state'] == 'rejected'] == [r for r in reasons if r]
-    assert len(exchange.posts) == reasons.count(None)
+    assert [a.get('wait_reason') or a.get('reason') for a in state['last_round']['actions']] == planned
+    assert [a['state'] for a in state['last_round']['actions']] == [('pending' if r and r.startswith('market_read_') else 'rejected' if r else 'success') for r in planned]
+    assert not state['last_round']['completed_at']
+    assert len(exchange.posts) == planned.count(None)
 
 
 @pytest.mark.parametrize('case, expected', [
@@ -184,7 +200,7 @@ def test_round_summary_preserves_read_refusals_without_hiding_other_outcomes(tmp
     ('account', 'account_unknown'),
     ('filled', 'target_filled'),
 ])
-def test_round_summary_keeps_existing_admission_and_empty_reasons(tmp_path, case, expected):
+def test_round_summary_keeps_existing_admission_and_empty_reasons(tmp_path, monkeypatch, case, expected):
     e, exchange, lp, _ = setup(tmp_path, 0 if case == 'empty' else 1)
     e.lp_auto_configure(dict(budget_usd='1' if case == 'funds' else '100', target_buy_count=1))
     e.lp_auto_set_desired_running(True)
@@ -192,9 +208,12 @@ def test_round_summary_keeps_existing_admission_and_empty_reasons(tmp_path, case
         lp._account_order_sync_error = 'account_unknown'
     if case == 'filled':
         assert e.lp_auto_run_once(round_id='fill')['slots']['occupied'] == 1
+        advance_auto_wait(e, monkeypatch)
     state = e.lp_auto_run_once(round_id='summary')
     assert state['last_round']['reason'] == expected
-    assert state['last_round']['actions'] == ([dict(condition_id='m00', state='rejected', reason='strategy_funds_insufficient')] if case == 'funds' else [])
+    assert state['last_round']['actions'] == []
+    if case == 'funds':
+        assert state['last_round']['blocked'] == [dict(condition_id='m00', token_id='m00', reason='rotation_budget_insufficient')]
 
 
 def test_account_blocker_after_read_refusal_has_summary_priority(tmp_path, monkeypatch):
@@ -207,8 +226,11 @@ def test_account_blocker_after_read_refusal_has_summary_priority(tmp_path, monke
     monkeypatch.setattr(e._lp_auto_pool(), '_submit', reject)
     state = e.lp_auto_run_once()
     assert state['last_round']['reason'] == 'account_unknown'
-    assert len(state['last_round']['actions']) == 1
-    assert state['last_round']['actions'][0]['reason'] == 'market_read_capacity'
+    actions = state['last_round']['actions']
+    assert len(actions) == 2
+    assert actions[0]['state'] == 'pending' and actions[0]['wait_reason'] == 'market_read_capacity'
+    assert actions[1]['state'] == 'pending'
+    assert 'wait_reason' not in actions[1] and 'request_state' not in actions[1]
 
 
 def test_full_pool_manual_exclusion_unknown_isolated_and_restart(tmp_path):
@@ -478,7 +500,7 @@ def test_concurrent_rounds_single_reservation(tmp_path, request):
     assert len(e.lp_auto_state()['intents'])==1
 
 
-def test_three_to_five_and_no_infinite_refill(tmp_path):
+def test_three_to_five_and_no_infinite_refill(tmp_path, monkeypatch):
     e,x,lp,s=setup(tmp_path,3)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=5))
     e.lp_auto_set_desired_running(True)
@@ -486,6 +508,7 @@ def test_three_to_five_and_no_infinite_refill(tmp_path):
     for n in ('m03','m04'):
         lp._candidate_pool_record_success(n,dict(condition_id=n),judged_at=NOW,facts=dict(directions=[x.direction(n)],account=x.lp_account_snapshot()))
         s.lp_save_price_history(n,n,[],dict(state='known',amplitude=Decimal('.005'),checked_at=NOW,valid_until=NOW+timedelta(days=1)))
+    advance_auto_wait(e, monkeypatch)
     assert e.lp_auto_run_once()['slots']['occupied']==5
     assert len(x.posts)==5
 
@@ -607,7 +630,7 @@ def test_sync_manages_exchange_ids_without_precomputed_match(tmp_path, monkeypat
     assert len(x.posts)==2
 
 
-def test_full_verified_sell_releases_slot_and_wakes_refill_beside_missing_identity(tmp_path):
+def test_full_verified_sell_releases_slot_and_wakes_refill_beside_missing_identity(tmp_path, monkeypatch):
     e,x,lp,s=setup(tmp_path,5)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=5))
     e.lp_auto_set_desired_running(True)
@@ -653,8 +676,20 @@ def test_full_verified_sell_releases_slot_and_wakes_refill_beside_missing_identi
         facts=dict(directions=[x.direction('m05')],account=x.lp_account_snapshot()))
     s.lp_save_price_history('m05','m05',[],dict(state='known',amplitude=Decimal('.005'),
         checked_at=NOW,valid_until=NOW+timedelta(days=1)))
+    direction = x.direction
+    def current_direction(token):
+        result = direction(token)
+        if token == 'm00':
+            result['market']['accepting_orders'] = False
+        return result
+    x.direction = current_direction
+    posts_before = len(x.posts)
+    advance_auto_wait(e, monkeypatch)
     state=e.lp_auto_run_once()
-    assert state['slots'] == dict(active=4,pending=1,pending_review=1,canceling=0,occupied=5)
+    assert [a['condition_id'] for a in state['last_round']['actions'] if a['kind'] == 'buy'] == ['m05']
+    assert len(x.posts) == posts_before + 1
+    assert sum(p['token_id'] == 'm00' and p['side'] == 'BUY' for p in x.posts) == 1
+    assert state['slots'] == dict(active=4,pending=1,pending_review=1,canceling=0,occupied=5), str(state['last_round'])
     assert state['slots']['pending_review'] == 1
     assert [p['token_id'] for p in x.posts[-1:]] == ['m05']
     unresolved=next(i for i in state['intents'] if i['session_id']==unknown['session_id'])
@@ -739,7 +774,7 @@ def test_read_state_and_report_facts_do_not_initialize_storage(tmp_path):
     assert not x.posts
 
 
-def test_send_time_cash_recheck_and_automatic_augment_block(tmp_path):
+def test_send_time_cash_recheck_and_automatic_augment_block(tmp_path, monkeypatch):
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
@@ -752,6 +787,7 @@ def test_send_time_cash_recheck_and_automatic_augment_block(tmp_path):
     assert r['slots']['occupied']==0
     x.before_sign=None
     x.lp_account_snapshot=account
+    advance_auto_wait(e, monkeypatch)
     r=e.lp_auto_run_once()
     assert len(x.posts)==1
     sid=[i['session_id'] for i in r['intents'] if i['state']=='active'][0]
@@ -798,7 +834,7 @@ def test_account_switch_cannot_reconcile_another_wallets_pool(tmp_path):
 
 
 @pytest.mark.parametrize('stage',['snapshot','sign','post'])
-def test_slow_automatic_network_does_not_block_existing_session_cancel(tmp_path,stage):
+def test_slow_automatic_network_does_not_block_existing_session_cancel(tmp_path,monkeypatch,stage):
     from threading import Barrier, Event
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
@@ -831,6 +867,7 @@ def test_slow_automatic_network_does_not_block_existing_session_cancel(tmp_path,
         canceled.append(oid)
         return {'canceled':[oid]}
     x.cancel_order=cancel
+    advance_auto_wait(e, monkeypatch)
     with ThreadPoolExecutor(2) as pool:
         automatic=pool.submit(e.lp_auto_run_once)
         try:
@@ -845,7 +882,7 @@ def test_slow_automatic_network_does_not_block_existing_session_cancel(tmp_path,
         automatic.result(timeout=5)
 
 
-def test_presend_rejection_leaves_round_quota_for_next_market(tmp_path):
+def test_presend_rejection_leaves_round_quota_for_next_market(tmp_path, monkeypatch):
     e,x,lp,s=setup(tmp_path,2)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
@@ -857,6 +894,10 @@ def test_presend_rejection_leaves_round_quota_for_next_market(tmp_path):
         return signed
     x.lp_create_limit_order=change_first
     r=e.lp_auto_run_once()
+    assert x.posts == [], r['last_round']
+    assert r['last_round']['actions'][0]['state'] == 'rejected'
+    advance_auto_wait(e, monkeypatch)
+    r = e.lp_auto_run_once()
     assert len(x.posts)==1, r['last_round']
     assert x.posts[0]['token_id']=='m01'
 
@@ -1065,7 +1106,7 @@ def test_exchange_receipt_id_is_owner_when_signed_id_differs(tmp_path):
     assert len(x.posts)==2
 
 
-def test_accepted_sell_missing_receipt_blocks_new_buys_until_exact_id_recovers(tmp_path):
+def test_accepted_sell_missing_receipt_blocks_new_buys_until_exact_id_recovers(tmp_path, monkeypatch):
     e,x,lp,s=setup(tmp_path,2)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
@@ -1078,6 +1119,7 @@ def test_accepted_sell_missing_receipt_blocks_new_buys_until_exact_id_recovers(t
     assert any(a.get('side')=='SELL' and a['state']=='accepted' for a in s.lp_actions(sid))
     e.lp_auto_reconcile_unknown()
     sell=x.orders.pop()
+    advance_auto_wait(e, monkeypatch)
     r=e.lp_auto_run_once()
     assert 'submission_unknown' in r['block_reasons']
     assert r['funds']['available_usd'] is None
@@ -1089,10 +1131,12 @@ def test_accepted_sell_missing_receipt_blocks_new_buys_until_exact_id_recovers(t
     r=e.lp_auto_reconcile_unknown()
     assert 'submission_unknown' not in r['block_reasons']
     assert r['funds']['status']=='known'
+    resolved_at = NOW.isoformat()
+    advance_auto_wait(e, monkeypatch)
     e.lp_auto_run_once()
     assert len(x.posts)==3 and x.posts[-1]['token_id']=='m01'
     event=next(v for v in e.lp_auto_report_facts()['events'] if v['event_id']==f"receipt_unknown:{sell['order_id']}")
-    assert event['occurred_at'] is None and event['resolved_at']==NOW.isoformat()
+    assert event['occurred_at'] is None and event['resolved_at']==resolved_at
 
 
 def test_known_buy_receipt_uncertainty_resolves_and_reopens_without_new_intent(tmp_path):

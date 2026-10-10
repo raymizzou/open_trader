@@ -1119,7 +1119,7 @@ class LPAutoPool:
         for intent in active:
             try:
                 self._rotation_session(intent, diagnostics=diagnostics, account=account_facts)
-                facts = self.lp._read_candidate_facts(intent, wait_for_capacity=True)
+                facts = self.lp._read_candidate_facts(intent, account=self._current_account, wait_for_capacity=True)
                 account, direction = facts['account'], facts['direction']
                 wallet = str(account.get('wallet_address') or '').strip().casefold()
                 if not wallet or hashlib.sha256(wallet.encode()).hexdigest() != state['account_id']:
@@ -1135,7 +1135,7 @@ class LPAutoPool:
                 if self._configured_level_departure(intent, direction, account, bid_level):
                     # Factual departure cancels the current quote; it does not
                     # require a reward estimate or authorize a replacement.
-                    row = {**intent, 'ranking_account': account,
+                    row = {**intent, 'ranking_account': {k: v for k, v in account.items() if not k.startswith('raw_')},
                            'ranking_book_at': direction['book']['received_at'], 'configuration_drift': True}
                     self._ranking_fresh(row)
                     rows.append(row)
@@ -1150,7 +1150,7 @@ class LPAutoPool:
                 if estimate['state'] != 'known':
                     raise ValueError('rotation_yield_unknown')
                 row = {**intent, 'minimum_order_estimate': estimate,
-                       'ranking_account': account, 'ranking_book_at': direction['book']['received_at'],
+                       'ranking_account': {k: v for k, v in account.items() if not k.startswith('raw_')}, 'ranking_book_at': direction['book']['received_at'],
                        'ranking_reward_at': direction['reward_checked_at']}
                 self._ranking_fresh(row)
                 rows.append(row)
@@ -1170,8 +1170,8 @@ class LPAutoPool:
                 # Protected/partially filled actual BUYs keep their slots.
                 # Validated unfilled extras still leave through the same
                 # exact-ID rotation lane even with no replacement capacity.
-                return [], rows, [], blocked
-            return [], [], [], blocked
+                return retained, rows, [], blocked
+            return retained, [], [], blocked
         candidates = self.candidates(releasing=active, diagnostics=diagnostics, bid_level=bid_level)
         rows = [r for r in rows if not r.get('configuration_drift')]
         rows.extend(candidates)
@@ -1212,7 +1212,7 @@ class LPAutoPool:
             if pending is None:
                 break
             try:
-                facts = self.lp._read_candidate_facts(pending, wait_for_capacity=True)
+                facts = self.lp._read_candidate_facts(pending, account=self._current_account, wait_for_capacity=True)
                 account, direction = facts['account'], facts['direction']
                 evaluated = evaluate_lp_entry(direction, account=self._ranking_account(account, active),
                     now=self._now(), reservations=self._ranking_reservations(active), candidate=True,
@@ -1230,12 +1230,13 @@ class LPAutoPool:
                 estimate = minimum_order_estimate(direction, evaluated['guidance'], self._now())
                 if estimate['state'] != 'known':
                     raise ValueError('ranking_yield_unknown')
-                pending.update(evaluated['guidance'], minimum_order_estimate=estimate, ranking_account=account,
+                pending.update(evaluated['guidance'], minimum_order_estimate=estimate,
+                               ranking_account={k: v for k, v in account.items() if not k.startswith('raw_')},
                                ranking_book_at=direction['book']['received_at'], ranking_reward_at=direction['reward_checked_at'])
                 self._ranking_fresh(pending)
                 refreshed.add((pending['condition_id'], pending['token_id']))
             except ValueError as exc:
-                if 'identity' in str(exc):
+                if 'identity' in str(exc) and str(exc) != 'history_identity_mismatch':
                     raise
                 blocked.append({'condition_id': pending['condition_id'], 'token_id': pending['token_id'], 'reason': str(exc)})
                 rows.remove(pending)
@@ -1266,6 +1267,9 @@ class LPAutoPool:
         wallet = str(row['ranking_account'].get('wallet_address') or '').strip().casefold()
         if not wallet or hashlib.sha256(wallet.encode()).hexdigest() != self.execution._lp_account_id():
             raise ValueError('account_identity_mismatch')
+        generation = row['ranking_account'].get('trade_generation')
+        if generation is not None and generation != self.store.lp_trade_generation():
+            raise ValueError('account_financial_facts_changed')
         stamps = [row['ranking_account'].get('checked_at'), row['ranking_book_at']]
         if not row.get('configuration_drift'):
             stamps.append(row['ranking_reward_at'])
@@ -1404,10 +1408,24 @@ class LPAutoPool:
 
     def _retry_rotation_cancel(self, intent):
         """At most one retry per new authoritative LIVE receipt; never free a slot."""
+        from .polymarket_lp import LpAccountRoundInvalid
         try:
-            account = self.lp.exchange.lp_account_snapshot()
-        except Exception:
-            return
+            generation = self.store.lp_trade_generation()
+            reader = getattr(self.lp.exchange, 'lp_account_snapshot_shared', None)
+            account = (reader(max_age_seconds=0, trade_generation_provider=self.store.lp_trade_generation)
+                       if callable(reader) else self.lp.exchange.lp_account_snapshot())
+            observed_generation = (account.get('trade_generation') if callable(reader)
+                                   else account.get('trade_generation', generation)) if isinstance(account, dict) else None
+            if callable(reader) and (not isinstance(account, dict) or any(account.get(key) is not True
+                    for key in ('balance_complete', 'trades_complete', 'pagination_complete',
+                                'open_orders_complete', 'positions_complete'))):
+                raise LpAccountRoundInvalid('account_round_invalid')
+            if type(observed_generation) is not int or observed_generation != self.store.lp_trade_generation():
+                raise LpAccountRoundInvalid('account_financial_facts_changed')
+        except LpAccountRoundInvalid:
+            raise
+        except Exception as exc:
+            raise LpAccountRoundInvalid('account_order_sync_unknown') from exc
         try:
             if not isinstance(account, dict):
                 return
@@ -1437,6 +1455,8 @@ class LPAutoPool:
                     return
                 try:
                     with self.lp._mutex:
+                        if observed_generation != self.store.lp_trade_generation():
+                            raise LpAccountRoundInvalid('account_financial_facts_changed')
                         _freshness(checked_at, self._now(), 'account_freshness', max_age=60)
                         current = self._rotation_record(self._read(), intent)
                         session = self.store.lp_session(intent['session_id'])
@@ -1461,6 +1481,8 @@ class LPAutoPool:
                 finally:
                     self.execution._release_global_lock(lock)
                 self._send_rotation_cancel(intent, attempts)
+        except LpAccountRoundInvalid:
+            raise
         except (ValueError, RuntimeError, OSError):
             return
 
@@ -2544,11 +2566,11 @@ class LPAutoPool:
         action.pop('order_id', None)
 
     def _run_once(self, *, round_id=None, reuse_facts=False):
+        from .polymarket_lp import LpAccountRoundInvalid
         d = self._read()
         waiting = d.get('plan_wait')
         if waiting and self._now() < _timestamp(waiting['deadline']):
             return self.state()
-        self._update(lambda doc: doc.update(plan_wait=None))
         plan = d.get('active_plan')
         if callable(getattr(self.lp.exchange, 'lp_account_snapshot_shared', None)):
             refreshed = self._refresh_account_facts()
@@ -2556,6 +2578,11 @@ class LPAutoPool:
             self._reconcile_unknown(reuse=reuse_facts, bounded=True)
             refreshed = None
         state = self.state()
+        _lp_causal_event('auto_account_use', account=self._read().get('account_financial_facts'), used_at=self._now())
+        round_id = plan['round_id'] if plan else round_id or uuid.uuid4().hex
+        diagnostics = dict(round_id=round_id, state='not_evaluated', counts={}, reasons={},
+            recheck_reasons={}, facts={}, account_sources=dict(current=0, candidate=0, unknown=0),
+            round_started_at=self._stamp())
         if refreshed is False or state['admission_block_reasons']:
             reason = self._account_refresh_failure_reason() if refreshed is False else state['admission_block_reasons'][0]
             if plan:
@@ -2563,29 +2590,40 @@ class LPAutoPool:
             else:
                 def pause_planning(doc):
                     doc['last_round'] = dict(round_id=round_id, checked_at=self._stamp(),
-                        targets=[], actions=[], blocked=[], candidates=[], candidate_count=0, reason=reason)
+                        targets=[], actions=[], blocked=[], candidates=[], candidate_count=0,
+                        candidate_filter=diagnostics, reason=reason)
                     self._set_plan_wait(doc, 'api')
                 self._update(pause_planning)
             return self.state()
-        rotation_reason = self._settle_rotations()
+        try:
+            rotation_reason = self._settle_rotations()
+        except LpAccountRoundInvalid as exc:
+            if plan:
+                self._save_plan(plan, reason=str(exc), wait_kind='api')
+            else:
+                self._plan_wait('api')
+            return self.state()
         d = self._read()
         if not state['desired_running'] or not self.execution.lp_mutation_allowed():
-            self._plan_wait('order' if plan else 'round')
+            def paused(doc):
+                if not plan:
+                    doc['last_round'] = dict(round_id=round_id, checked_at=self._stamp(),
+                        targets=[], actions=[], blocked=[], candidates=[], candidate_count=0,
+                        candidate_filter=diagnostics, reason=state['reason'])
+                self._set_plan_wait(doc, 'order' if plan else 'round')
+            self._update(paused)
             return self.state()
         if plan is None:
-            round_id = round_id or uuid.uuid4().hex
             if not isinstance(round_id, str) or not round_id or len(round_id) > 128:
                 raise ValueError('round_id_invalid')
             if round_id in d['rounds']:
                 return self.state()
-            diagnostics = dict(round_id=round_id, state='not_evaluated', counts={}, reasons={},
-                recheck_reasons={}, facts={}, account_sources=dict(current=0, candidate=0, unknown=0),
-                round_started_at=self._stamp())
             try:
                 targets, victims, candidates, blocked = self._ranked_buys(self.state(), diagnostics=diagnostics)
             except ValueError as exc:
                 self._update(lambda doc: doc.update(last_round=dict(round_id=round_id,
-                    checked_at=self._stamp(), actions=[], targets=[], blocked=[], reason=str(exc))))
+                    checked_at=self._stamp(), actions=[], targets=[], blocked=[],
+                    candidate_filter=diagnostics, reason=str(exc))))
                 self._plan_wait('api')
                 return self.state()
             plan = dict(round_id=round_id, started_at=self._stamp(), config_version=d['config_version'],
@@ -2599,6 +2637,7 @@ class LPAutoPool:
                        for index, r in enumerate(targets) if not self._resting_buy(r)])
             self._update(lambda doc: doc['rounds'].update({round_id: dict(started_at=plan['started_at'])}))
             self._save_plan(plan, blocked=blocked)
+        submitted = False
         # A durable action identity is written before a request is prepared.
         # Restart never regenerates targets or substitutes another candidate.
         account, buys, account_reasons = self._account_projection_facts(d)
@@ -2646,7 +2685,7 @@ class LPAutoPool:
                 continue
             if action['state'] in ('success', 'rejected'):
                 continue
-            if account is None and rotation_reason == 'rotation_filled':
+            if self._current_account is None and rotation_reason == 'rotation_filled':
                 action.update(state='rejected', reason='rotation_filled')
                 continue
             existing = document['intents'].get(action.get('request_id', action['action_id']))
@@ -2673,6 +2712,7 @@ class LPAutoPool:
                 continue
             row = plan['targets'][action['index']]
             try:
+                submitted = True
                 result, failure = self._submit(row, plan['round_id'], action.get('request_index', action['index']),
                     plan.get('trading_config_version', plan['config_version']))
                 action.update(session_id=result.get('session_id'), order_id=result.get('entry_order_id'),
@@ -2697,9 +2737,9 @@ class LPAutoPool:
             self._save_plan(plan, blocked=plan['blocked'])
             if (not callable(getattr(self.lp.exchange, 'lp_account_snapshot_shared', None))
                     and self.state()['admission_block_reasons']):
-                self._plan_wait('api')
+                self._save_plan(plan, reason=self.state()['admission_block_reasons'][0], wait_kind='api')
                 return self.state()
-        if any(a['kind'] == 'buy' and a['state'] == 'unknown' for a in plan['actions']):
+        if submitted or any(a['kind'] == 'buy' and a['state'] == 'unknown' for a in plan['actions']):
             refreshed = self._refresh_account_facts()
             document = self._read()
             account, buys, reasons = self._account_projection_facts(document)
@@ -2719,10 +2759,13 @@ class LPAutoPool:
         complete = all(a['state'] in ('success', 'rejected') for a in plan['actions'])
         if complete:
             plan['completed_at'] = self._stamp()
-        reason = (rotation_reason if complete and rotation_reason == 'rotation_filled' else
+        wait_reason = next((a.get('wait_reason') for a in plan['actions']
+            if a['state'] not in ('success', 'rejected') and a.get('wait_reason')), None)
+        reason = (wait_reason or (rotation_reason if complete and rotation_reason == 'rotation_filled' else
             plan['blocked'][0]['reason'] if complete and not plan['actions'] and plan['blocked']
+            and any(t.get('retained_constraint') for t in plan['targets'])
             and self.state()['slots']['occupied'] >= d['target_buy_count'] else
-            None if complete else 'rotation_awaiting_reconciliation')
+            None if complete else 'rotation_awaiting_reconciliation'))
         self._save_plan(plan, reason=reason, blocked=plan['blocked'], wait_kind='round' if complete else 'order')
         return self.state()
 

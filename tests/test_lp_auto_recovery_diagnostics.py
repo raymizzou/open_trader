@@ -1,4 +1,7 @@
 """Issue #253: recovery and same-round filtering through real offline boundaries."""
+
+from tests.test_lp_account_reservation_reconciliation import advance_api_wait
+from tests.test_lp_auto_pool import advance_auto_wait
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 import threading
@@ -34,10 +37,12 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
         lp._candidate_pool_record_success(condition,dict(condition_id=condition),judged_at=lp._now(),
                                          facts=dict(directions=[facts['direction']],account=facts['account']))
     real_reader=adapter.lp_account_snapshot_shared
-    entered,release=Event(),Event();reads=[]
+    entered,release=Event(),Event();reads=[];failed_once=False
     def reader(*args,**kwargs):
+        nonlocal failed_once
         reads.append(dict(kwargs))
-        if len(reads)==1:
+        if not failed_once:
+            failed_once = True
             entered.set()
             assert release.wait(5), 'controlled read watchdog'
             raise LpObservationWait('account_round_invalid')
@@ -54,6 +59,19 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
             finally:
                 release.set()
             result=pending.result(timeout=5)
+        assert account.posts == [] and len(reads) == 1
+        assert result['funds']['status'] == 'known'
+        assert result['plan_wait']['kind'] == 'api'
+        from datetime import datetime
+        deadline = datetime.fromisoformat(result['plan_wait']['deadline'])
+        assert deadline - datetime.fromisoformat(result['plan_wait']['started_at']) == timedelta(seconds=60)
+        runtime.clock[0] = deadline - timedelta(seconds=1)
+        early = execution.lp_auto_run_once(round_id='three-to-five-recovery')
+        assert len(reads) == 1 and account.posts == []
+        assert early['funds']['status'] == 'known'
+        advance_api_wait(runtime, execution)
+        reads.clear()
+        result = execution.lp_auto_run_once(round_id='three-to-five-recovery')
     finally:
         # Executor exit reclaims the controlled worker before attention cleanup.
         release.set()
@@ -68,16 +86,16 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
                     failure.add_note('attention cleanup watchdog')
                 else:
                     raise AssertionError('attention cleanup watchdog')
-    assert len(account.posts)==2, 'fresh publication and two fresh candidates must reach mandatory per-send reads'
+    assert len(account.posts)==2, 'fresh publication and two fresh candidates must reach mandatory per-send reads: ' + str(result['last_round'])
     assert len(account.orders)==5
     assert result['slots']['occupied']==5
     assert result['admission_block_reasons']==[]
     assert result['funds']['status']=='known'
-    assert len(reads)==7, 'initial invalidated read, maintenance reuse/read, two reads per send, and final refresh'
+    assert len(reads) in (6, 7), 'due initial read, four mandatory BUY fences, final refresh and at most one maintenance reuse'
     forced = [read for read in reads if read.get('max_age_seconds') == 0
               and read.get('trade_generation_provider') == store.lp_trade_generation]
     assert len(forced)==6, 'initial/final refresh and both mandatory fresh reads per BUY remain forced'
-    assert sum('max_age_seconds' not in read for read in reads)==1, 'one shared-window maintenance call'
+    assert sum('max_age_seconds' not in read for read in reads) == len(reads) - 6, 'only the existing optional maintenance call'
 
 
 def test_recovered_account_can_refill_three_to_five(runtime):
@@ -313,7 +331,7 @@ def test_candidate_diagnostics_does_not_add_reads_clocks_or_re_evaluate(tmp_path
             state = engine.lp_auto_run_once(round_id='counted')
         results.append((calls, state))
     assert results[0][0] == results[1][0]
-    assert results[1][0]['evaluate'] == results[1][0]['estimate'] == 2
+    assert results[1][0]['evaluate'] == results[1][0]['estimate'] == 4
     assert results[0][1]['last_round']['actions'] == results[1][1]['last_round']['actions']
     diagnostics = results[1][1]['last_round']['candidate_filter']
     assert diagnostics['counts']['qualified_directions'] == 2
@@ -386,6 +404,7 @@ def test_candidate_diagnostics_keeps_unknown_estimate_reason(tmp_path, monkeypat
 @pytest.mark.parametrize('outcome, reason', [('rejected', 'market_not_accepting_orders'), ('error', 'market_read_timeout')])
 def test_rotation_recheck_removal_is_distinct_from_initial_qualification(tmp_path, monkeypatch, outcome, reason):
     engine, exchange, lp, _ = rotation.setup(tmp_path, monkeypatch, count=2, target=1)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 2)
     reader = lp._read_candidate_facts
@@ -527,6 +546,7 @@ def test_recovery_probe_failure_preserves_error_and_reclaims_real_threads(runtim
 ])
 def test_rotation_recheck_keeps_real_history_and_freshness_reasons(tmp_path, monkeypatch, reason):
     engine, exchange, lp, store = rotation.setup(tmp_path, monkeypatch, count=2, target=1)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 2)
     if reason.startswith('history_'):

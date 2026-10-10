@@ -158,6 +158,27 @@ def _advance(runtime, seconds=1):
     runtime.clock[0] += timedelta(seconds=seconds)
 
 
+def advance_api_wait(runtime, execution, *, refresh=True):
+    """Use the public deadline and publish new external qualification facts."""
+    from datetime import datetime
+    waiting = execution.lp_auto_state()['plan_wait']
+    if waiting and datetime.fromisoformat(waiting['deadline']) > runtime.clock[0]:
+        runtime.clock[0] = datetime.fromisoformat(waiting['deadline'])
+    if refresh:
+        lp = execution._lp
+        for condition, cached in tuple(lp._candidate_qualification_facts.items()):
+            directions = []
+            account = None
+            for direction in cached.get('directions', ()):
+                market = direction['market']
+                facts = lp._read_candidate_facts({k: market[k] for k in ('market_id', 'condition_id', 'token_id', 'outcome')})
+                directions.append(facts['direction'])
+                account = facts['account']
+            if directions:
+                lp._candidate_pool_record_success(condition, dict(condition_id=condition), judged_at=lp._now(),
+                    facts=dict(directions=directions, account=account))
+
+
 def _amount(state, name):
     return Decimal(state["funds"][name])
 
@@ -841,6 +862,7 @@ def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_acco
     # inventing a terminal receipt for the historical cancel audit.
     account.orders = tuple(order for order in orders if order.id == "rank-a")
     _advance(runtime)
+    advance_api_wait(runtime, execution, refresh=False)
     absent = execution.lp_auto_run_once(round_id="cancel-absent")
     assert absent["slots"]["occupied"] == 1, absent
     assert absent["slots"]["canceling"] == 0
@@ -864,6 +886,7 @@ def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_acco
     assert receipt_reads == ["rank-b"]
     assert store.lp_session(sid)["order_history"]["rank-b"]["status"] == "CANCELED"
     _advance(runtime)
+    advance_api_wait(runtime, execution, refresh=False)
     settled = execution.lp_auto_run_once(round_id="exact-terminal")
     assert settled["slots"]["occupied"] == 1
     assert settled["slots"]["canceling"] == 0

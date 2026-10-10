@@ -130,7 +130,7 @@ def test_preparing_publication_keeps_send_fences(runtime, fence, reason):
             else:
                 # Inject a durable version invalidation. Public configuration
                 # correctly refuses edits while an entry is still occupied.
-                execution._auto_pool._update(lambda d: d.update(config_version=d['config_version'] + 1))
+                execution._auto_pool._update(lambda d: d.update(config_version=d['config_version'] + 1, trading_config_version=d['trading_config_version'] + 1))
         finally:
             release.set()
         state = pending.result(timeout=5)

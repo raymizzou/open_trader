@@ -66,13 +66,13 @@ def test_api_failure_pauses_and_recovers_the_same_plan(tmp_path, monkeypatch, wi
     assert state['plan_wait']['kind'] == 'round'
 
 
-@pytest.mark.parametrize('receipt', ['timeout', 'rejected', 'ACK'])
+@pytest.mark.parametrize('receipt', ['timeout', 'rejected', 'ACK', 'ACK-generation-race', 'ACK-retry-api-failure'])
 def test_live_after_cancel_automatically_reconciles_and_retries(tmp_path, monkeypatch, receipt):
     engine, exchange, _, store = plan_setup(tmp_path, monkeypatch, ('A', 'B', 'C', 'D', 'I'))
     exchange.cancel_terminal = False
     cancel = exchange.cancel_order
     def response(order_id):
-        if receipt == 'ACK':
+        if receipt.startswith('ACK'):
             return cancel(order_id)
         exchange.cancels.append(order_id)
         if receipt == 'timeout':
@@ -87,6 +87,48 @@ def test_live_after_cancel_automatically_reconciles_and_retries(tmp_path, monkey
     scheduler.request_check()
     assert not scheduler.run_due()
     assert len(exchange.cancels) == 3
+    if receipt in {'ACK-generation-race', 'ACK-retry-api-failure'}:
+        original_plan = engine.lp_auto_state()['active_plan']
+        account, shared = exchange.lp_account_snapshot, exchange.lp_account_snapshot_shared
+        reads = []
+        failed_read_end = []
+        def generation_race(**kwargs):
+            pool.NOW += timedelta(microseconds=1)
+            snapshot = account()
+            snapshot.update(account_id='test-wallet', read_started_at=pool.NOW,
+                read_ended_at=pool.NOW, checked_at=pool.NOW, balance_complete=True,
+                trades_complete=True, pagination_complete=True, raw_trades=exchange.trades,
+                trade_generation=store.lp_trade_generation())
+            reads.append(snapshot['trade_generation'])
+            if len(reads) == 2:
+                if receipt == 'ACK-retry-api-failure':
+                    pool.NOW += timedelta(seconds=3)
+                    failed_read_end.append(pool.NOW)
+                    raise TimeoutError('temporary retry account API failure')
+                assert store.lp_advance_trade_generation(snapshot['trade_generation'])
+            return snapshot
+        exchange.lp_account_snapshot = generation_race
+        exchange.lp_account_snapshot_shared = generation_race
+        at_deadline(monkeypatch, engine)
+        assert scheduler.run_due()
+        raced = engine.lp_auto_state()
+        assert exchange.cancels == ['original-A', 'original-D', 'original-I']
+        assert exchange.posts == []
+        assert raced['active_plan']['round_id'] == original
+        assert raced['active_plan']['targets'] == original_plan['targets']
+        assert raced['slots']['occupied'] == 5
+        assert Decimal(raced['funds']['buy_reserved_usd']) == Decimal('39.00')
+        assert raced['plan_wait']['kind'] == 'api'
+        assert datetime.fromisoformat(raced['plan_wait']['deadline']) - datetime.fromisoformat(raced['plan_wait']['started_at']) == timedelta(seconds=60)
+        if failed_read_end:
+            assert datetime.fromisoformat(raced['plan_wait']['started_at']) == failed_read_end[0]
+            assert datetime.fromisoformat(raced['plan_wait']['deadline']) == failed_read_end[0] + timedelta(seconds=60)
+        assert len(reads) == 2
+        at_deadline(monkeypatch, engine, before=1)
+        scheduler.request_check()
+        assert not scheduler.run_due()
+        assert len(reads) == 2
+        exchange.lp_account_snapshot, exchange.lp_account_snapshot_shared = account, shared
     at_deadline(monkeypatch, engine)
     assert scheduler.run_due()
     assert exchange.cancels == ['original-A', 'original-D', 'original-I'] * 2

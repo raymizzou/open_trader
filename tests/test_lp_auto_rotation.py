@@ -1,4 +1,6 @@
 """Automatic BUYs converge to the highest-yield eligible markets, offline."""
+
+from tests.test_lp_auto_pool import advance_auto_wait
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -56,10 +58,12 @@ def refresh(lp, exchange, count=10):
 
 def test_full_pool_replaces_every_market_outside_top_five_without_threshold(tmp_path, monkeypatch):
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch)
+    advance_auto_wait(engine, monkeypatch)
     for index in range(5, 10):
         exchange.rewards[f'm{index:02}'] = Decimal('24.000001')
     refresh(lp, exchange)
 
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert set(exchange.cancels) == {'o1', 'o2', 'o3', 'o4', 'o5'}
     assert len(exchange.posts) == 5
@@ -71,6 +75,7 @@ def test_full_pool_replaces_every_market_outside_top_five_without_threshold(tmp_
 
     for order in exchange.orders:
         order['status'] = 'CANCELED'
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert {o['token_id'] for o in exchange.orders if o['status'] == 'LIVE'} == {
         'm05', 'm06', 'm07', 'm08', 'm09'}
@@ -80,6 +85,7 @@ def test_full_pool_replaces_every_market_outside_top_five_without_threshold(tmp_
 
 def test_rotation_waits_for_first_real_shared_read_and_recovers_without_overbuying(tmp_path, monkeypatch):
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=2, target=1)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     refresh(lp, exchange, 2)
     engine.lp_auto_reconcile_unknown()
@@ -119,6 +125,7 @@ def test_rotation_waits_for_first_real_shared_read_and_recovers_without_overbuyi
         return original_wait(futures, **kwargs)
     monkeypatch.setattr(lp_module, 'wait', observed_wait)
 
+    round_thread = None
     try:
         state = engine.lp_auto_scheduled_check()
         assert state['last_round']['reason'] == 'market_read_capacity'
@@ -126,13 +133,30 @@ def test_rotation_waits_for_first_real_shared_read_and_recovers_without_overbuyi
         assert exchange.cancels == []
         assert len(exchange.posts) == 1
 
+        advance_auto_wait(engine, monkeypatch)
+        engine.lp_auto_reconcile_unknown()
+        published = lp.register_account_snapshot(pool._fresh_registration_bundle(exchange, lp))
+        assert published['state'] == 'registered', published
+        account_reads = []
+        def complete_account_round(*, max_age_seconds=0, trade_generation_provider=None):
+            del max_age_seconds
+            pool.NOW += timedelta(microseconds=1)
+            snapshot = pool._fresh_registration_bundle(exchange, lp)
+            if trade_generation_provider is not None:
+                snapshot['trade_generation'] = trade_generation_provider()
+            assert snapshot['trade_generation'] == lp.store.lp_trade_generation()
+            account_reads.append(snapshot)
+            return snapshot
+        exchange.lp_account_snapshot_shared = complete_account_round
         wait_entered.clear()
         checked = []
         def check():
             checked.append(engine.lp_auto_scheduled_check())
         round_thread = threading.Thread(target=check)
         round_thread.start()
-        assert wait_entered.wait(2)
+        assert wait_entered.wait(2), str([x['last_round'] for x in checked])
+        assert slow.is_alive() and fast.is_alive()
+        assert exchange.cancels == [] and len(exchange.posts) == 1
         fast_release.set()
         round_thread.join(5)
         assert checked
@@ -149,17 +173,28 @@ def test_rotation_waits_for_first_real_shared_read_and_recovers_without_overbuyi
         slow_release.set()
         slow.join(2)
         fast.join(2)
+        if round_thread is not None:
+            round_thread.join(2)
+            assert not round_thread.is_alive()
+        assert not slow.is_alive() and not fast.is_alive()
 
     for order in exchange.orders:
         order['status'] = 'CANCELED'
+    advance_auto_wait(engine, monkeypatch)
+    reads_before_refill = len(account_reads)
     state = engine.lp_auto_scheduled_check()
     assert {o['token_id'] for o in exchange.orders if o['status'] == 'LIVE'} == {'m01'}
     assert state['slots']['occupied'] == 1
     assert Decimal(state['funds']['buy_reserved_usd']) == 8
+    refill_reads = account_reads[reads_before_refill:]
+    assert len(refill_reads) >= 3  # Authoritative absence and both fresh BUY fences.
+    assert all(later['checked_at'] > earlier['checked_at']
+               for earlier, later in zip(refill_reads, refill_reads[1:]))
 
 
 def test_rotation_reports_exact_block_when_financial_facts_expire(tmp_path, monkeypatch):
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=2, target=1)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     refresh(lp, exchange, 2)
     intent = engine.lp_auto_state()['intents'][0]
@@ -168,6 +203,7 @@ def test_rotation_reports_exact_block_when_financial_facts_expire(tmp_path, monk
         checked_at=(pool.NOW - timedelta(seconds=61)).isoformat()))
     engine._auto_pool._reconcile_unknown = lambda **kwargs: engine._auto_pool.state()
 
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert exchange.cancels == []
     assert len(exchange.posts) == 1
@@ -186,7 +222,8 @@ def test_rotation_keeps_unknown_occupied_slots_blocked_and_ranks_known_actives(t
         state='unknown', financial_status='unknown', reconcile_reason='missing_reliable_order_id'))
     targets, _, _, blocked = engine._auto_pool._ranked_buys(engine._auto_pool.state())
     assert blocked == [{'condition_id': 'm00', 'token_id': 'm00', 'reason': 'missing_reliable_order_id'}]
-    assert targets and targets[0]['condition_id'] == 'm02'
+    assert [t['condition_id'] for t in targets] == ['m00', 'm02']
+    assert targets[0]['retained_constraint'] is True
 
     def all_unknown(document):
         for intent in document['intents'].values():
@@ -194,6 +231,7 @@ def test_rotation_keeps_unknown_occupied_slots_blocked_and_ranks_known_actives(t
                           reconcile_reason='missing_reliable_order_id')
     engine._auto_pool._update(all_unknown)
     engine._auto_pool._reconcile_unknown = lambda **kwargs: engine._auto_pool.state()
+    advance_auto_wait(engine, monkeypatch, refresh=False)
     state = engine.lp_auto_run_once()
     assert len(exchange.posts) == 2
     assert state['slots']['occupied'] == 2
@@ -204,6 +242,7 @@ def test_rotation_keeps_unknown_occupied_slots_blocked_and_ranks_known_actives(t
 
 def test_rotation_registers_all_victims_and_isolates_unresolved_terminal(tmp_path, monkeypatch):
     engine, exchange, lp, store = setup(tmp_path, monkeypatch)
+    advance_auto_wait(engine, monkeypatch)
     intents = engine.lp_auto_state()['intents']
     revisions = {i['session_id']: store.lp_session_revision(i['session_id'], trading=True) for i in intents}
     for index in range(5, 10):
@@ -243,12 +282,14 @@ def test_rotation_registers_all_victims_and_isolates_unresolved_terminal(tmp_pat
 
     for order in exchange.orders[:4]:
         order['status'] = 'CANCELED'
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert len(exchange.posts) == 9
     assert state['slots']['occupied'] == 5
     assert Decimal(state['funds']['buy_reserved_usd']) == 40
     assert exchange.orders[4]['status'] == 'LIVE'
     exchange.orders[4]['status'] = 'CANCELED'
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert len(exchange.posts) == 10
     assert {o['token_id'] for o in exchange.orders if o['status'] == 'LIVE'} == {
@@ -395,6 +436,7 @@ def test_cached_leader_is_reestimated_before_any_cancel(tmp_path, monkeypatch):
 
 def test_cancel_timeout_survives_restart_and_reselects_latest_leader_after_terminal(tmp_path, monkeypatch):
     engine, exchange, lp, store = setup(tmp_path, monkeypatch, count=3, target=1)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     refresh(lp, exchange, 3)
     def timeout(order_id):
@@ -413,12 +455,21 @@ def test_cancel_timeout_survives_restart_and_reselects_latest_leader_after_termi
     exchange.orders[0]['status'] = 'CANCELED'
     exchange.rewards['m02'] = Decimal('26')
     refresh(lp, exchange, 3)
+    advance_auto_wait(restarted, monkeypatch)
+    restarted.lp_auto_run_once()
+    assert [o['token_id'] for o in exchange.orders if o['status'] == 'LIVE'] == ['m01']
+    advance_auto_wait(restarted, monkeypatch)
+    restarted.lp_auto_run_once()
+    assert exchange.cancels[-1] == exchange.orders[-1]['order_id']
+    exchange.orders[-1]['status'] = 'CANCELED'
+    advance_auto_wait(restarted, monkeypatch)
     restarted.lp_auto_run_once()
     assert [o['token_id'] for o in exchange.orders if o['status'] == 'LIVE'] == ['m02']
 
 
 def test_unaffordable_best_candidate_keeps_affordable_resting_buy(tmp_path, monkeypatch):
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=2, target=1, budget='8')
+    advance_auto_wait(engine, monkeypatch)
     direction = exchange.direction
     def larger(token):
         result = direction(token)
@@ -430,6 +481,7 @@ def test_unaffordable_best_candidate_keeps_affordable_resting_buy(tmp_path, monk
     exchange.rewards['m01'] = Decimal('100')
     refresh(lp, exchange, 2)
     resting_buy = exchange.orders[0].copy()
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert state['last_round']['reason'] == 'target_filled'
     assert [row['condition_id'] for row in state['last_round']['targets']] == ['m00']
@@ -446,6 +498,7 @@ def test_unaffordable_best_candidate_keeps_affordable_resting_buy(tmp_path, monk
 @pytest.mark.parametrize('change', ['observation', 'fill', 'stop', 'protection'])
 def test_concurrent_session_changes_are_checked_by_trading_facts(tmp_path, monkeypatch, change):
     engine, exchange, lp, store = setup(tmp_path, monkeypatch, count=2, target=1)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     refresh(lp, exchange, 2)
     session_id = engine.lp_auto_state()['intents'][0]['session_id']
@@ -485,6 +538,7 @@ def test_rotation_waits_when_replacement_cannot_meet_existing_gtd_minimum(tmp_pa
 @pytest.mark.parametrize('change', ['size', 'price'])
 def test_resting_buy_that_no_longer_scores_has_zero_estimated_yield(tmp_path, monkeypatch, change):
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=2, target=1)
+    advance_auto_wait(engine, monkeypatch)
     direction = exchange.direction
     def changed(token):
         result = direction(token)
@@ -514,6 +568,7 @@ def test_resting_buy_that_no_longer_scores_has_zero_estimated_yield(tmp_path, mo
 @pytest.mark.parametrize('failure', ['timeout', 'denied'])
 def test_failed_cancel_retries_only_after_a_new_known_live_receipt(tmp_path, monkeypatch, failure):
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=2, target=1)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     refresh(lp, exchange, 2)
     def timeout(order_id):
@@ -527,18 +582,20 @@ def test_failed_cancel_retries_only_after_a_new_known_live_receipt(tmp_path, mon
     assert exchange.cancels == ['o1']
     monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(seconds=60))
     exchange.cancel_order = lambda oid: (exchange.cancels.append(oid) or {'canceled': [oid]})
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert exchange.cancels == ['o1', 'o1']
     assert len(exchange.posts) == 1
     assert Decimal(state['funds']['buy_reserved_usd']) == 8
     monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(seconds=60))
     engine.lp_auto_run_once()
-    assert exchange.cancels == ['o1', 'o1']  # Ack waits for terminal reconciliation.
+    assert exchange.cancels == ['o1', 'o1', 'o1']  # New LIVE facts warrant an exact recovery retry.
 
 
 @pytest.mark.parametrize('receipt', ['unknown', 'incomplete', 'stale', 'terminal', 'partial'])
 def test_cancel_recovery_uses_known_owned_receipts_and_preserves_fills(tmp_path, monkeypatch, receipt):
     engine, exchange, lp, store = setup(tmp_path, monkeypatch, count=2, target=1)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     refresh(lp, exchange, 2)
     exchange.cancel_order = lambda oid: (exchange.cancels.append(oid) or {})
@@ -556,6 +613,7 @@ def test_cancel_recovery_uses_known_owned_receipts_and_preserves_fills(tmp_path,
     else:
         exchange.orders[0]['size_matched'] = '8'
         exchange.positions = [dict(token_id='m00', condition_id='m00', size='8')]
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert exchange.cancels == (['o1', 'o1'] if receipt == 'partial' else ['o1'])
     if receipt == 'terminal':
@@ -579,6 +637,7 @@ def test_cancel_recovery_uses_known_owned_receipts_and_preserves_fills(tmp_path,
         assert Decimal(session['buy_cost']) == Decimal('3.2')
         assert Decimal(session['residual_quantity']) == 8
         exchange.orders[0]['status'] = 'CANCELED'
+        advance_auto_wait(engine, monkeypatch)
         state = engine.lp_auto_run_once()
         assert state['last_round']['reason'] == 'rotation_filled'
         assert state['funds']['status'] == 'known'
@@ -591,6 +650,7 @@ def test_cancel_recovery_uses_known_owned_receipts_and_preserves_fills(tmp_path,
 @pytest.mark.parametrize('balance,expected_cancels', [('20', ['o1', 'o2']), ('24', ['o2'])])
 def test_rotation_budget_counts_manual_and_retained_buys_once(tmp_path, monkeypatch, balance, expected_cancels):
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=3, target=2)
+    advance_auto_wait(engine, monkeypatch)
     manual = dict(order_id='manual-buy', token_id='manual', condition_id='manual',
                   side='BUY', status='LIVE', price='.40', original_size='20', size_matched='0')
     exchange.orders.append(manual.copy())
@@ -598,6 +658,7 @@ def test_rotation_budget_counts_manual_and_retained_buys_once(tmp_path, monkeypa
     exchange.lp_account_snapshot = lambda: {**account(), 'balance': balance, 'allowance': balance}
     exchange.rewards['m02'] = Decimal('25')
     refresh(lp, exchange, 3)
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert exchange.cancels == expected_cancels
     assert exchange.orders[-1] == manual
@@ -615,7 +676,9 @@ def test_rotation_budget_counts_manual_and_retained_buys_once(tmp_path, monkeypa
 
 def test_full_candidate_count_and_preview_are_not_truncated_to_target_count(tmp_path, monkeypatch):
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=18)
+    advance_auto_wait(engine, monkeypatch)
     refresh(lp, exchange, 18)
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert state['last_round']['candidate_count'] == 13
     assert len(state['last_round']['candidates']) == 10
@@ -628,6 +691,7 @@ def test_rotation_retry_uses_real_adapter_account_completeness(tmp_path, monkeyp
     from open_trader.polymarket_trading import PolymarketTradingClient, TradingConfig
 
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=2, target=1)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     refresh(lp, exchange, 2)
     exchange.cancel_order = lambda oid: (exchange.cancels.append(oid) or {})
@@ -653,6 +717,7 @@ def test_rotation_retry_uses_real_adapter_account_completeness(tmp_path, monkeyp
     adapter.lp_market_metadata = lambda ids: {}
     # Real production normalization and completeness flags; only transport is fake.
     exchange.lp_account_snapshot = adapter.lp_account_snapshot
+    advance_auto_wait(engine, monkeypatch, refresh=False)
     state = engine.lp_auto_run_once()
     assert exchange.cancels == (['o1', 'o1'] if raw_facts in ('complete', 'partial') else ['o1'])
     assert len(exchange.posts) == 1
@@ -663,12 +728,14 @@ def test_rotation_retry_uses_real_adapter_account_completeness(tmp_path, monkeyp
 
 def test_cancel_recovery_waits_when_session_is_missing(tmp_path, monkeypatch):
     engine, exchange, lp, store = setup(tmp_path, monkeypatch, count=2, target=1)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     refresh(lp, exchange, 2)
     exchange.cancel_order = lambda oid: (exchange.cancels.append(oid) or {})
     engine.lp_auto_run_once()
     monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(seconds=60))
     monkeypatch.setattr(store, 'lp_session', lambda session_id: None)
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert 'financial_facts_unknown' in state['block_reasons']
     assert state['funds']['available_usd'] is None
@@ -681,6 +748,7 @@ def test_cancel_recovery_waits_when_session_is_missing(tmp_path, monkeypatch):
 
 def test_failed_market_does_not_block_healthy_market_rotation(tmp_path, monkeypatch):
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=3, target=2)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m02'] = Decimal('30')
     refresh(lp, exchange, 3)
     read = exchange.lp_snapshot
@@ -691,11 +759,13 @@ def test_failed_market_does_not_block_healthy_market_rotation(tmp_path, monkeypa
         return read(request)
 
     exchange.lp_snapshot = unavailable
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert exchange.cancels == ['o2'], 'only the healthy market may rotate'
     assert len(exchange.posts) == 2
     assert Decimal(state['funds']['buy_reserved_usd']) == 16
     exchange.orders[1]['status'] = 'CANCELED'
+    advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
     assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01', 'm02']
     assert state['slots']['occupied'] == 2
