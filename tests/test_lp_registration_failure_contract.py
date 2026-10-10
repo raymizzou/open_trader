@@ -65,6 +65,32 @@ def test_failed_registration_blocks_auto_buy_before_or_during_sign(tmp_path, mon
     assert "account_order_sync_unknown" in blocked["admission_block_reasons"]
     assert blocked["slots"]["occupied"] == 0
     assert Decimal(blocked["funds"]["buy_reserved_usd"]) == 0
+    assert blocked['plan_wait']['kind'] == 'api'
+    assert not blocked['last_round'].get('completed_at')
+    if during_sign:
+        original_plan = blocked['active_plan']
+        original_action, = original_plan['actions']
+        original_target, = original_plan['targets']
+        assert original_target['token_id'] == 'm00'
+        assert Decimal(original_target['price']) == Decimal('.40')
+        assert Decimal(original_target['quantity']) == 20
+        assert original_action['state'] == 'pending'
+        assert original_action['request_state'] == 'entry_rejected'
+        failed_session = next(session for session in store.lp_sessions()
+                              if session['idempotency_key'] == 'lp-auto:' + original_action['action_id'])
+        assert failed_session['state'] == 'entry_rejected'
+        assert failed_session['submit_stage'] == 'pre_send_rejected'
+        assert failed_session['post_started'] is False
+        assert failed_session['reason'] == 'account_order_sync_unknown'
+        original_audit = store.lp_actions(failed_session['session_id'])
+        assert len(original_audit) == 1 and original_audit[0]['state'] == 'rejected'
+        assert original_audit[0]['reason'] == 'account_order_sync_unknown'
+        assert original_audit[0]['post_started'] is False
+        assert original_action['attempts'] == [dict(request_id=original_action['action_id'],
+            session_id=failed_session['session_id'], state='not_sent', reason='account_order_sync_unknown')]
+        assert original_action['request_id'] != original_action['action_id']
+    else:
+        assert blocked['active_plan'] is None and blocked['last_round']['actions'] == []
 
     exchange.before_sign = None
     # Recovery and the subsequent send each need a new complete, fenced
@@ -86,10 +112,19 @@ def test_failed_registration_blocks_auto_buy_before_or_during_sign(tmp_path, mon
     advance_auto_wait(execution, monkeypatch)
     recovered = execution.lp_auto_run_once()
     if during_sign:
-        assert exchange.posts == [] and recovered['last_round']['completed_at']
-        waiting = recovered['plan_wait']
-        assert waiting['kind'] == 'round'
-        now[0] = datetime.fromisoformat(waiting['deadline'])
-        advance_auto_wait(execution, monkeypatch)
-        recovered = execution.lp_auto_run_once()
+        assert recovered['last_round']['round_id'] == original_plan['round_id']
+        assert recovered['last_round']['targets'] == blocked['last_round']['targets']
+        recovered_action, = recovered['last_round']['actions']
+        assert recovered_action['action_id'] == original_action['action_id']
+        assert recovered_action['request_id'] == original_action['request_id']
+        assert recovered_action['session_id'] != failed_session['session_id']
+        assert recovered_action['attempts'] == original_action['attempts']
+        assert store.lp_actions(failed_session['session_id']) == original_audit
+    else:
+        assert recovered['last_round']['round_id'] != blocked['last_round']['round_id']
     assert len(exchange.posts) == 1, str(recovered['last_round'])
+    assert exchange.posts[0]['token_id'] == 'm00'
+    assert exchange.posts[0]['price'] == Decimal('.40') and exchange.posts[0]['quantity'] == 20
+    assert recovered['last_round']['completed_at'] and recovered['plan_wait']['kind'] == 'round'
+    execution.lp_auto_run_once()
+    assert len(exchange.posts) == 1
