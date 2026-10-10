@@ -242,7 +242,90 @@ mutation/notification attempts。`data-check --config <runtime-config> --sample 
 解释覆盖实际 gate。不得绕过限制、使用 proxy/VPN 规避或伪造 region attestation。
 production 的 require-trading-region 当前阻断；Shadow 禁止所有交易 POST。
 
-### 人工单笔诊断 CLI（#321）
+### 一命令东京单笔诊断（2026-10-10）
+
+新增专属稳定入口 `~/.local/bin/lpprobe tokyo`。该命令在前提满足时执行一次
+真实 BUY/post-only/GTD 订单诊断；本节不是实盘执行授权。由 Main 完成发布、
+所选源码部署及本地安装后，用户执行这一命令；无需 SSH、环境变量、token、
+价格、份额、回执路径、交互确认或普通成功流程的后续命令。**本次开发只做了
+合成 HTTP 与离线进程/文件检查，尚未安装真实入口或实盘验证。**
+
+入口只用既有 `open-trader-tokyo-experiment` SSH alias，开启非交互登录、严格
+host-key 校验，禁用 agent 转发及复用连接。远端固定 bootstrap 仅以 root
+读取 root-owned 0600 非秘密 cloud 配置及托管记录、root-owned unit，并检查 clean/detached 的
+当前不可变源码及已配置可信 Python。它通过 `runuser -u prediction` 执行
+财务应用，绝不以 root 下单。Python 可以来自另一个既有、锁匹配的不可变
+venv；不假定其目录 SHA 与源码 SHA 相同，不安装或同步环境。
+应用 Python 使用 `-P`，配合已核对源码的显式 `PYTHONPATH`，排除 SSH 继承的
+工作目录作为隐式包搜索入口。同名旧包不能覆盖当前发布；不使用会忽略该
+`PYTHONPATH` 的 `-I` 来执行财务模块。root bootstrap 的 `-I` 仍只隔离解析器。
+
+每次从 `/etc/open-trader/prediction-cloud.json`、
+`/var/lib/open-trader/prediction/prediction-systemd-release.json` 和实际 unit
+核对当前发布；不固定“永远最新”的 SHA，不依赖 Dashboard 或服务正在运行。
+使用 runtime 内的 `config/prediction_arbitrage.json` 和外置 file backend 路径
+`/var/lib/open-trader/prediction-credentials/polymarket.json`。工具只传引用，
+不输出或复制秘密内容，不触碰 Auto、Shadow 模式或 production 地域门禁。
+
+公开 SDK `list_markets(closed=False,page_size=100)` 至多读 3 页，按市场/token
+确定顺序检查至多 20 个盘口，扫描上限 30 秒。实际新鲜 CLOB 状态必须 active、
+open、accepting，bid/ask、tick、最小份额齐全；已有挂单或非零持仓的 token
+被排除。诊断价为一 tick，严格低于 ask，份额按最小值向上取整到 0.01 share。
+例如 tick=0.01、最小份额=5、ask=0.12，价格为 0.01、份额为 5，名义金额
+为 0.05 USDC；最小份额=200 对应 2 USDC，超过不变的 1 USDC 上限而跳过。
+选择后重新读取账户、盘口、市场和时间；旧扫描事实不计作提交前的新鲜事实。
+
+保留本地事实/盘口 10 秒、GTD +240 秒、SDK 至少 180 秒及精确签名金额检查。
+后端硬上限 120 秒；提交前须余下至少 40 秒，覆盖一次有界提交、既有 30 秒
+撤单/对账及关闭。远端从 110 秒预算扣除解析时间，给连接保留 10 秒；本地
+transport 等待上限 130 秒，不抢先中止正常清理窗口。仅一 POST，仅撤返回的
+精确自有 ID。PASS 要求观察 LIVE、撤单 ACK、验证终态、零成交、资金及持仓
+对账成功；同时发生的未解释账户变化为 UNKNOWN。结果含简短中文结论、
+选定市场/outcome、名义金额、order ID、独立 region 和机器可读 evidence_path；
+一命令实盘模式仅 PASS 退出 0，其余 REJECTED/BLOCKED/PARTIAL/FILLED/UNKNOWN
+保持不同分类并退出 2。
+
+`single_writer=not_claimed` 不声称全钱包或跨主机互斥，不要求人工单写者证明。
+在 runtime 内自动创建 service-owned 0700 的 `order-probe` 目录，并使用
+钱包标识散列命名的 0600 回执与非阻塞锁。目录允许正常的多个 link；普通账户、
+凭据和控制文件仍须单 link，并分别核对 service/root 所有权。发现未完成旧回执时，已知 ID 先核对
+精确身份；已有同一订单的持久撤单 ACK，且新鲜读取证明已终态时，只读核对
+终态、成交、资金和持仓，不重复 DELETE，本次不再 POST。仍 LIVE 或无法可靠
+读取终态时可执行一次必要的精确 ID 清理；历史 ACK 事实不会因再次撤单未 ACK
+而丢失，但历史事实不能代替新鲜终态证明。没有历史 ACK 时，终态本身不算撤单
+ACK；无法取得 ACK 仍为 UNKNOWN。人工 status/cancel 的行为不变。
+2026-10-10 的合成回归验证了该恢复行为。初始完整有序 RED 受测试 fixture 的
+请求历史丢失影响；一次明确标注、实际导入路径/散列核对的旧基线重放确认
+回归敏感性。当前修复的 GREEN 与该重放分开记录，均不是实盘验证。
+attempted 但未知 ID 保持 UNKNOWN，不搜索、猜 ID
+或重发。完成回执归档后，下一次调用才能创建独立 attempt。断网、主机故障或
+磁盘故障后可能仍是 UNKNOWN；保留证据，不承诺任何故障下都能自动清理。
+
+本地安装由 Main 在已提交源码上执行专属 `scripts/order_probe_launcher.py install`，
+传入已配置 private profile、既有绝对 bootstrap Python 和既有 Git。示例只描述
+安装接口，不能当作实际安装证据：
+
+```sh
+<existing-python> -I -B <committed-release>/scripts/order_probe_launcher.py install \
+  --profile <private-nonsecret-tokyo-profile.json> \
+  --launcher-python <existing-absolute-bootstrap-python>
+```
+
+Profile 是 0600 普通文件，字段为 schema=`open_trader.lpprobe.tokyo.v1`、
+ssh=`/usr/bin/ssh`、host=`open-trader-tokyo-experiment`、bootstrap=`/usr/bin/python3`、
+cloud_config=`/etc/open-trader/prediction-cloud.json`、user=`prediction`、
+runtime_root=`/var/lib/open-trader/prediction` 和上述 credentials_file 路径。
+它只包含非秘密引用，由 Main 管理，用户不需要填写。
+
+安装器核对 payload 等于 HEAD 中已提交字节，专属创建
+`~/.local/bin/lpprobe`（0700），以及
+`~/.local/share/open-trader/order-probe/{launcher.py,tokyo.json,installation.json}`
+（目录 0700、文件 0600）。安装回执绑定源码 SHA、配置/payload/入口散列并读回
+核验。缺失/不匹配的 profile、发布或安装信息、symlink/不安全路径、已有不属于
+本次安装的目标均拒绝；不会覆盖已有可执行文件、修改 lpauto、PATH 或 shell
+启动文件。安装失败后的诊断或重装须保留原文件并由 Main 明确处理。
+
+### 人工单笔诊断 CLI（#321，保持原契约）
 
 新增独立入口 `python -m open_trader.polymarket_order_probe` 和薄脚本
 `scripts/polymarket-order-probe.sh`。本入口不修改 Shadow、production 地域门禁或

@@ -10,8 +10,9 @@ import uuid
 import os
 import re
 import signal
-from contextlib import contextmanager
-from decimal import Decimal, InvalidOperation
+from contextlib import contextmanager, nullcontext
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
+import hashlib
 from pathlib import Path
 
 import httpx
@@ -32,12 +33,17 @@ def deadline(seconds=5.0):
     def expired(*_):
         raise ProbeError('operation_deadline')
     previous = signal.signal(signal.SIGALRM, expired)
-    previous_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    real_started = time.perf_counter()
+    # Nested per-call bounds must not reset or extend the overall watchdog.
+    signal.setitimer(signal.ITIMER_REAL, min(seconds, previous_timer[0]) if previous_timer[0] else seconds)
     try:
         yield
     finally:
-        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+        signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
+        remaining = max(0.000001, previous_timer[0] - (time.perf_counter() - real_started)) if previous_timer[0] else 0
+        signal.setitimer(signal.ITIMER_REAL, remaining, previous_timer[1])
 
 
 @contextmanager
@@ -198,10 +204,13 @@ class Receipt:
     def save(self, data):
         name = '.' + self.path.name + '.' + uuid.uuid4().hex
         try:
+            raw = json.dumps(data, sort_keys=True)
+            if len(raw.encode()) > 16384:
+                raise ValueError('record exceeds bounded reader')
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                          0o600, dir_fd=self.dirfd)
             with os.fdopen(fd, 'w') as file:
-                json.dump(data, file, sort_keys=True)
+                file.write(raw)
                 file.flush()
                 os.fsync(file.fileno())
             os.replace(name, self.path.name, src_dir_fd=self.dirfd, dst_dir_fd=self.dirfd)
@@ -274,7 +283,7 @@ def trade_fills(account, data):
     return quantity, notional
 
 
-def reconcile(client, data, report, *, cancel=False):
+def reconcile(client, data, report, *, cancel=False, recovering=False):
     """Read at most once per phase; cancel only this submission's explicit ID."""
     stop = time.monotonic() + 30
     def bounded(call):
@@ -286,6 +295,9 @@ def reconcile(client, data, report, *, cancel=False):
     order_id = data['order_id']
     if not order_id:
         raise ProbeError('order_id_unknown')
+    historical_ack = recovering and data.get('cancel_acknowledged') is True
+    if recovering:
+        report['cancel_acknowledged'] = historical_ack
     observed = None
     read_failed = False
     try:
@@ -297,14 +309,16 @@ def reconcile(client, data, report, *, cancel=False):
     if observed is not None:
         report['live_observed'] = data.get('live_observed', False) or observed.status.upper() == 'LIVE'
         report['identity_verified'] = True
-    if cancel:
+    terminal_with_ack = (recovering and historical_ack and observed is not None
+                         and observed.status.upper() in ('CANCELED', 'CANCELLED', 'EXPIRED'))
+    if cancel and not terminal_with_ack:
         # An unreadable response does not remove the explicit ID returned by our POST.
         # An observed identity mismatch above prevents DELETE.
         try:
             ack = bounded(lambda: client.cancel_orders_detailed((order_id,)))
-            report['cancel_acknowledged'] = order_id in ack['canceled']
+            report['cancel_acknowledged'] = historical_ack or order_id in ack['canceled']
         except Exception:
-            report['cancel_acknowledged'] = False
+            report['cancel_acknowledged'] = historical_ack
     else:
         report['cancel_acknowledged'] = data.get('cancel_acknowledged', False)
     terminal = bounded(lambda: client._client.get_order(order_id=order_id))
@@ -331,6 +345,9 @@ def reconcile(client, data, report, *, cancel=False):
     report['funds_reconciled'] = (complete and position_before == position_after and account['balance'] == Decimal(data['balance_before'])
         and account['allowance'] == Decimal(data['allowance_before'])
         and all(row.get('order_id') != order_id for row in account['open_orders']))
+    if data.get('single_writer') == 'not_claimed':
+        report['other_activity_reconciled'] = data.get('inventory_before') == inventory(account, excluding=order_id)
+        report['funds_reconciled'] = report['funds_reconciled'] and report['other_activity_reconciled']
     passed = (not read_failed and report.get('live_observed') is True
               and report['cancel_acknowledged'] is True
               and report['terminal_status'] in ('CANCELED', 'CANCELLED', 'EXPIRED')
@@ -341,19 +358,23 @@ def reconcile(client, data, report, *, cancel=False):
     report['order_validation'] = 'VERIFIED' if passed else 'UNKNOWN'
 
 
-def run(client, args, config, account, book, server, price, quantity, report, started):
-    with Receipt(args.record) as receipt:
+def run(client, args, config, account, book, server, price, quantity, report, started, held_receipt=None):
+    with (nullcontext(held_receipt) if held_receipt is not None else Receipt(args.record)) as receipt:
         if receipt.data is not None:
             raise ProbeError('existing_record_requires_status')
         if type(server) is not int or server <= 0:
             raise ProbeError('server_time_unknown')
         expiration = server + 240
-        data = dict(version=1, wallet=config.wallet_address, signer=config.signer_address,
+        data = dict(version=1, attempt_id=uuid.uuid4().hex, wallet=config.wallet_address, signer=config.signer_address,
                     token=args.token, condition=str(book.condition_id), price=str(price), quantity=str(quantity),
                     expiration=expiration, attempted=False, order_id=None, result='UNKNOWN',
                     balance_before=str(account['balance']), allowance_before=str(account['allowance']),
                     position_before=str(target_position(account, args.token)),
-                    credential_backend=args.credential_backend, single_writer='manual_confirmation')
+                    credential_backend=args.credential_backend, single_writer=report['single_writer'])
+        if args.command == 'self-test':
+            data['inventory_before'] = inventory(account)
+            data['selected_market'] = report['selected_market']
+            data['outcome'] = report['outcome']
         receipt.save(data)
         with deadline():
             signed = client.lp_create_limit_order(token_id=args.token, price=price, quantity=quantity,
@@ -375,6 +396,8 @@ def run(client, args, config, account, book, server, price, quantity, report, st
             raise ProbeError('market_stale')
         if time.monotonic() - started > 10:
             raise ProbeError('account_or_market_stale')
+        if hasattr(args, 'overall_stop') and args.overall_stop - time.monotonic() < 40:
+            raise ProbeError('cleanup_budget_unavailable', 'BLOCKED')
         data['attempted'] = True
         receipt.save(data)  # Durable before POST. Failure prevents submission.
         submit_facts = {}
@@ -431,7 +454,7 @@ def run(client, args, config, account, book, server, price, quantity, report, st
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest='command', required=True)
-    for name in ('check', 'run', 'status', 'cancel'):
+    for name in ('check', 'run', 'status', 'cancel', 'self-test'):
         command = commands.add_parser(name)
         command.add_argument('--config', type=Path, required=True)
         command.add_argument('--credential-backend', choices=('file', 'keychain', 'tencent-ssm'), required=True)
@@ -440,7 +463,10 @@ def parser():
             command.add_argument('--token', required=True)
             command.add_argument('--price', required=True)
             command.add_argument('--quantity', required=True)
-        if name != 'check':
+        if name == 'self-test':
+            command.add_argument('--receipt-dir', type=Path, required=True)
+            command.add_argument('--budget-seconds', type=float, default=120)
+        elif name != 'check':
             command.add_argument('--record', type=Path, required=True)
         if name in ('run', 'cancel'):
             command.add_argument('--confirm-live', action='store_true')
@@ -448,8 +474,201 @@ def parser():
     return root
 
 
+def discover(client, account):
+    """Bounded public catalog; fresh CLOB facts decide eligibility, never ranking."""
+    stop = time.monotonic() + 30
+    used = {row['token_id'] for row in account['open_orders']}
+    used.update(row['token_id'] for row in account['positions'] if row.get('size') != 0)
+    books = 0
+    with client._lp_snapshot_public_client() as public:
+        pages = iter(public.list_markets(closed=False, page_size=100))
+        for _ in range(3):
+            remaining = stop - time.monotonic()
+            if remaining <= 0:
+                raise ProbeError('discovery_deadline')
+            with deadline(min(5, remaining)):
+                try:
+                    page = next(pages)
+                except StopIteration:
+                    break
+            for candidate in sorted(page.items, key=lambda item: str(item.id)):
+                outcomes = (candidate.outcomes.yes, candidate.outcomes.no)
+                for outcome in sorted(outcomes, key=lambda item: str(item.token_id)):
+                    token = str(outcome.token_id) if outcome.token_id is not None else ''
+                    if not token or token in used:
+                        continue
+                    if books >= 20:
+                        raise ProbeError('no_eligible_candidate', 'BLOCKED')
+                    remaining = stop - time.monotonic()
+                    if remaining <= 0:
+                        raise ProbeError('discovery_deadline')
+                    books += 1
+                    with deadline(min(5, remaining)):
+                        book = client._client.get_order_book(token_id=token)
+                        if str(book.token_id) != token or str(book.condition_id) != str(candidate.condition_id):
+                            raise ProbeError('book_token_or_market_mismatch')
+                        market = client._client._ctx.clob.get_json('/markets/' + str(book.condition_id))
+                        server = client._client._ctx.clob.get_json('/time')
+                    if time.monotonic() >= stop:
+                        raise ProbeError('discovery_deadline')
+                    price = book.tick_size
+                    quantity = book.min_order_size.quantize(Decimal('0.01'), rounding=ROUND_CEILING)
+                    if price * quantity > Decimal('1'):
+                        continue
+                    try:
+                        validate_market(price, quantity, book, market, server, account)
+                    except ProbeError as error:
+                        if error.result == 'BLOCKED' or error.reason == 'market_unknown':
+                            continue
+                        raise
+                    return token, price, quantity, candidate.question or str(candidate.id), outcome.label
+            if not page.has_more:
+                break
+    raise ProbeError('no_eligible_candidate', 'BLOCKED')
+
+
+def inventory(account, excluding=None):
+    """Independent orders/positions remain unchanged; no wallet lock is asserted."""
+    positions = {}
+    for row in account['positions']:
+        token, size = row.get('token_id'), row.get('size')
+        if not isinstance(token, str) or not isinstance(size, Decimal) or not size.is_finite() or size < 0:
+            raise ProbeError('account_inventory_unknown')
+        positions[token] = positions.get(token, Decimal('0')) + size
+    orders = {}
+    for row in account['open_orders']:
+        if row.get('order_id') == excluding:
+            continue
+        oid = row.get('order_id')
+        if not isinstance(oid, str):
+            raise ProbeError('account_inventory_unknown')
+        orders[oid] = {key: str(row.get(key)) for key in (
+            'token_id', 'side', 'price', 'original_size', 'size_matched', 'status')}
+    return {'positions': {key: str(value) for key, value in sorted(positions.items()) if value != 0},
+            'orders': orders}
+
+
+def receipt_directory(path):
+    if not path.is_absolute() or '..' in path.parts:
+        raise ProbeError('unsafe_or_unavailable_record', 'BLOCKED')
+    try:
+        for part in (path, *path.parents):
+            if part.is_symlink():
+                raise ValueError
+        if not path.exists():
+            parent = path.parent.lstat()
+            if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid()
+                    or stat.S_IMODE(parent.st_mode) != 0o700):
+                raise ValueError
+            path.mkdir(mode=0o700)
+        info = path.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700):
+            raise ValueError
+    except Exception:
+        raise ProbeError('unsafe_or_unavailable_record', 'BLOCKED') from None
+
+
+def self_test(args):
+    if not 40 <= args.budget_seconds <= 120:
+        return finish_self_report(dict(result='BLOCKED', reason='invalid_command_budget', single_writer='not_claimed'))
+    try:
+        with deadline(args.budget_seconds):
+            return self_test_bounded(args)
+    except ProbeError as error:
+        return finish_self_report(dict(result='UNKNOWN', reason=error.reason, single_writer='not_claimed'))
+
+
+def self_test_bounded(args):
+    report = dict(result='UNKNOWN', order_validation='UNVERIFIED',
+                  credential_backend=args.credential_backend, single_writer='not_claimed')
+    client = None
+    try:
+        args.overall_stop = time.monotonic() + args.budget_seconds
+        receipt_directory(args.receipt_dir)
+        with backend(args):
+            config = load_trading_config(args.config)
+            identity = hashlib.sha256(config.wallet_address.lower().encode()).hexdigest()[:24]
+            args.record = args.receipt_dir / ('probe-' + identity + '.json')
+            report['evidence_path'] = str(args.record)
+            with Receipt(args.record) as receipt:
+                data = receipt.data
+                if data is not None:
+                    if (data.get('wallet', '').lower() != config.wallet_address.lower()
+                            or data.get('signer', '').lower() != config.signer_address.lower()
+                            or data.get('credential_backend') != args.credential_backend
+                            or data.get('single_writer') != 'not_claimed'):
+                        raise ProbeError('record_identity_mismatch', 'BLOCKED')
+                    if data.get('result') in ('PASS', 'REJECTED') or data.get('attempted') is False:
+                        archive = args.record.stem + '-' + uuid.uuid4().hex + '.json'
+                        os.rename(args.record.name, archive, src_dir_fd=receipt.dirfd, dst_dir_fd=receipt.dirfd)
+                        os.fsync(receipt.dirfd)
+                        receipt.data = None
+                    elif not data.get('order_id'):
+                        raise ProbeError('order_id_unknown')
+                with deadline():
+                    client = PolymarketTradingClient.from_keychain(config, read_only=True)
+                report['region'] = region()
+                if receipt.data is not None:
+                    report.update(recovered_previous=True, order_id=data['order_id'], token=data['token'],
+                                  price=data['price'], quantity=data['quantity'],
+                                  notional=str(Decimal(data['price']) * Decimal(data['quantity'])),
+                                  selected_market=data.get('selected_market'), outcome=data.get('outcome'))
+                    try:
+                        reconcile(client, data, report, cancel=True, recovering=True)
+                    except ProbeError as error:
+                        report.update(result=error.result, reason=error.reason)
+                    except Exception:
+                        report.update(result='UNKNOWN', reason='reconciliation_unknown')
+                    data.update(report)
+                    receipt.save(data)
+                    return finish_self_report(report)
+                with deadline():
+                    account = client._lp_account_facts(include_raw_trades=True)
+                if not all(account.get(key) is True for key in (
+                    'authenticated', 'balance_complete', 'open_orders_complete', 'positions_complete', 'trades_complete')):
+                    raise ProbeError('account_incomplete')
+                args.token, price, quantity, market_name, outcome = discover(client, account)
+                started = time.monotonic()
+                account, book, market, server = facts(client, args.token)
+                if (any(row.get('token_id') == args.token for row in account['open_orders'])
+                        or target_position(account, args.token) != 0):
+                    raise ProbeError('selected_token_now_in_use', 'BLOCKED')
+                price = book.tick_size
+                quantity = book.min_order_size.quantize(Decimal('0.01'), rounding=ROUND_CEILING)
+                if price * quantity > Decimal('1'):
+                    raise ProbeError('budget_exceeded', 'BLOCKED')
+                validate_market(price, quantity, book, market, server, account)
+                report.update(token=args.token, price=str(price), quantity=str(quantity),
+                              notional=str(price * quantity), selected_market=market_name, outcome=outcome)
+                run(client, args, config, account, book, server, price, quantity, report, started, receipt)
+    except ProbeError as error:
+        report.update(result=error.result, reason=error.reason)
+    except Exception:
+        report.update(result='UNKNOWN', reason='external_or_local_failure')
+    finally:
+        if client is not None:
+            try:
+                with deadline():
+                    client.close()
+            except Exception:
+                pass
+    return finish_self_report(report)
+
+
+def finish_self_report(report):
+    report['summary_zh'] = {'PASS': '通过：本诊断订单已挂出、精确撤销且零成交；资金与持仓已核对。',
+        'BLOCKED': '阻断：未满足诊断前提。', 'REJECTED': '拒绝：交易场所拒绝提交。',
+        'PARTIAL': '部分成交：请核查证据。', 'FILLED': '全部成交：请核查证据。',
+        'UNKNOWN': '未知：不能确认订单或资金状态；请保留证据。'}[report['result']]
+    print(json.dumps(report, sort_keys=True, ensure_ascii=False))
+    return 0 if report['result'] == 'PASS' else 2
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.command == 'self-test':
+        return self_test(args)
     report = {'result': 'UNKNOWN', 'order_validation': 'UNVERIFIED',
               'credential_backend': args.credential_backend,
               'single_writer': 'manual_confirmation' if getattr(args, 'confirm_single_writer', False) else 'unconfirmed'}
