@@ -255,6 +255,45 @@ def test_run_posts_once_and_verifies_exact_order_cancelled(exchange, capsys, exp
     assert receipt['result'] == 'PASS'
 
 
+@pytest.mark.parametrize('age', ['old', 'future'])
+def test_self_test_exhausted_stale_candidates_reports_no_submission(self_exchange, capsys, monkeypatch, age):
+    original = self_exchange.handle
+    def venue(request):
+        response = original(request)
+        if request.url.path == '/book':
+            data = response.json()
+            data.update(min_order_size='5', timestamp=(
+                '1699999989000' if age == 'old' else '1700000002000'))
+            return httpx.Response(200, json=data, request=request)
+        return response
+    monkeypatch.setattr(httpx.HTTPTransport, 'handle_request', lambda _, request: venue(request))
+    for _ in range(2):
+        self_exchange.requests.clear()
+        self_exchange.book_reads = 0
+        code, report, output = invoke_self(self_exchange, capsys)
+        assert code == 2 and report['result'] == 'BLOCKED'
+        assert report['reason'] == 'no_eligible_candidate'
+        assert report['submission_state'] == 'not_attempted'
+        assert '本次诊断未提交订单' in report['summary_zh']
+        assert self_exchange.mutations == []
+        assert 0 < len([r for r in self_exchange.requests if r.url.path == '/markets/keyset']) <= 3
+        assert 0 < self_exchange.book_reads <= 20
+        assert not list(self_exchange.record.parent.glob('probe-*.json'))
+        if report.get('evidence_path'):
+            path = Path(report['evidence_path'])
+            info = path.lstat()
+            assert path.is_file() and not path.is_symlink()
+            assert info.st_uid == os.geteuid() and info.st_mode & 0o777 == 0o600 and info.st_nlink == 1
+            diagnostic = json.loads(path.read_text())
+            assert diagnostic['stage'] == 'discovery'
+            assert diagnostic['server_time'] == 1700000000
+            assert diagnostic['book_timestamp'] == (1699999989.0 if age == 'old' else 1700000002.0)
+            assert diagnostic['book_age_seconds'] == (11.0 if age == 'old' else -2.0)
+            assert diagnostic['submission_state'] == 'not_attempted'
+            assert PRIVATE not in path.read_text() and SECRET not in path.read_text()
+        assert PRIVATE not in output and SECRET not in output
+
+
 @pytest.mark.parametrize('fault,result,reason', [
     ('balance', 'BLOCKED', 'balance_insufficient'),
     ('allowance', 'BLOCKED', 'allowance_insufficient'),
@@ -614,6 +653,86 @@ def test_self_test_selects_token_and_runs_one_order_without_manual_inputs(self_e
     assert all(r.url.params['limit'] == '100' and r.url.params['closed'] == 'false' for r in pages)
     assert all(r.url.path != '/cancel-all' for r in self_exchange.requests)
     assert SECRET not in output and PRIVATE not in output
+
+
+def test_self_test_skips_stale_discovery_candidate(self_exchange, capsys, monkeypatch):
+    original = self_exchange.handle
+    def venue(request):
+        response = original(request)
+        if request.url.path == '/book':
+            data = response.json()
+            token = request.url.params['token_id']
+            data.update(min_order_size='5', timestamp=(
+                '1699999967123' if token == '2001' else '1699999998000'))
+            return httpx.Response(200, json=data, request=request)
+        return response
+    monkeypatch.setattr(httpx.HTTPTransport, 'handle_request', lambda _, request: venue(request))
+    code, report, _ = invoke_self(self_exchange, capsys)
+    assert code == 0, report
+    assert report['result'] == 'PASS' and report['token'] == '3001'
+    assert report['price'] == '0.01' and report['quantity'] == '5.00'
+    assert report['notional'] == '0.0500'
+    posts = [r for r in self_exchange.mutations if r.method == 'POST']
+    assert len(posts) == 1
+    order = json.loads(posts[0].content)['order']
+    assert order['tokenId'] == '3001'
+    assert order['makerAmount'] == '50000' and order['takerAmount'] == '5000000'
+    assert [json.loads(r.content) for r in self_exchange.mutations if r.method == 'DELETE'] == [['probe-1']]
+    assert report['other_activity_reconciled'] is True
+    assert self_exchange.order('other-1')['status'] == 'LIVE'
+    assert all(r.url.path in ('/order', '/orders') for r in self_exchange.mutations)
+
+
+@pytest.mark.parametrize('prior', ['stale_selected', 'prior_unknown_submission'])
+def test_self_test_pre_submit_freshness_failure_has_truthful_diagnostics(self_exchange, capsys, prior):
+    pending_path = None
+    if prior == 'prior_unknown_submission':
+        self_exchange.mode = 'missing_id'
+        code, initial, _ = invoke_self(self_exchange, capsys)
+        assert code == 2 and initial['result'] == 'UNKNOWN'
+        assert len([r for r in self_exchange.mutations if r.method == 'POST']) == 1
+        pending_path = Path(initial['evidence_path'])
+        pending_bytes = pending_path.read_bytes()
+        pending = json.loads(pending_bytes)
+        assert pending['attempted'] is True and pending['order_id'] is None
+        self_exchange.requests.clear()
+    else:
+        self_exchange.self_fault = 'stale_selected'
+    code, report, output = invoke_self(self_exchange, capsys)
+    assert code == 2 and report['result'] == 'UNKNOWN'
+    assert self_exchange.mutations == []
+    assert PRIVATE not in output and SECRET not in output
+    if prior == 'prior_unknown_submission':
+        assert report['reason'] == 'order_id_unknown'
+        assert report['submission_state'] == 'attempted'
+        assert '本次诊断未提交订单' not in report['summary_zh']
+        assert '已有提交尝试' in report['summary_zh']
+        assert report['stage'] == 'recovery'
+        assert pending_path.read_bytes() == pending_bytes
+        assert not any(r.url.path == '/markets/keyset' for r in self_exchange.requests)
+    else:
+        assert report['reason'] == 'market_stale'
+        assert report['submission_state'] == 'not_attempted'
+        assert '本次诊断未提交订单' in report['summary_zh']
+        assert report['stage'] == 'pre_submit'
+        assert report['server_time'] == 1700000000
+        assert report['book_timestamp'] == 1699999989.0
+        assert report['book_age_seconds'] == 11.0
+        assert not list(self_exchange.record.parent.glob('probe-*.json'))
+    if report.get('evidence_path'):
+        path = Path(report['evidence_path'])
+        info = path.lstat()
+        assert path.is_file() and not path.is_symlink()
+        assert info.st_uid == os.geteuid() and info.st_mode & 0o777 == 0o600 and info.st_nlink == 1
+    if report.get('diagnostic_path'):
+        diagnostic = Path(report['diagnostic_path'])
+        data = json.loads(diagnostic.read_text())
+        assert data['stage'] == report['stage']
+        assert data['submission_state'] == report['submission_state']
+        if prior == 'stale_selected':
+            assert data['book_age_seconds'] == 11.0 and data['book_timestamp'] == 1699999989.0
+            assert data['server_time'] == 1700000000
+        assert PRIVATE not in diagnostic.read_text() and SECRET not in diagnostic.read_text()
 
 
 @pytest.mark.parametrize('fault,result,reason', [
