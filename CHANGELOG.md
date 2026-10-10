@@ -5,6 +5,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-10
 
+- 新增 #321 人工 Polymarket 单笔诊断 CLI：只读 check、GET-only status 与明确确认的
+  run/cancel；仅 BUY/post-only/GTD，名义金额硬上限 1 USDC，记录真实地域结果，
+  不修改 Shadow 或 production 门禁。私有原子回执在提交前保存 attempted，未知结果
+  不重发、不猜 ID；仅撤明确自有订单，并核对终态、成交、资金和选定 token 持仓。
+  合成凭据、SDK 外部 HTTP fixture 与相关认证用例共 49 项聚焦检查通过，
+  shell 语法和离线入口一致性通过；事实时效用例的有序 RED 证据缺口已披露。
+  未执行实盘下单、部署或跨主机互斥验证，独立评审及 CI 由 Main 接手。
+
 - Paused cloud Shadow now accepts configured finite memory budgets above 1 GB,
   including 2 GiB, while retaining the 768 MiB default, host and service reserves,
   swap/CPU/task checks, bounded shutdown and `Restart=no`. Integrates the reusable
