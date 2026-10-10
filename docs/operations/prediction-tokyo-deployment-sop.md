@@ -242,11 +242,95 @@ mutation/notification attempts。`data-check --config <runtime-config> --sample 
 解释覆盖实际 gate。不得绕过限制、使用 proxy/VPN 规避或伪造 region attestation。
 production 的 require-trading-region 当前阻断；Shadow 禁止所有交易 POST。
 
-用户为未来诊断选择：硬名义金额上限 **1 USDC**，仅 **1 个 post-only BUY**，
-确认后立即取消；最小数量若超过 1 USDC 则跳过。**尚未执行订单测试**。
-它不是现有 Shadow 的能力或地域例外授权。若需新的诊断执行路径，Main 须先
-提交并获批独立具体方案；方案还需明确有界到期、单钱包唯一 writer、确认与
-对账、取消回执、UNKNOWN 处理，不能在未知提交结果时重复下单。
+### 人工单笔诊断 CLI（#321）
+
+新增独立入口 `python -m open_trader.polymarket_order_probe` 和薄脚本
+`scripts/polymarket-order-probe.sh`。本入口不修改 Shadow、production 地域门禁或
+Auto。用户手工指定 token、价格和数量；工具不扫描或推荐市场。
+**实盘下单尚未验证；以下交易命令只供用户手动执行。** GET 成功仅说明认证及
+读取成功，不能证明交易可用。地域报告保留真实 `blocked`、country 和 region，
+隐藏 IP；结果未知时明确显示 unknown，不伪造地域、不提供代理或替代 HTTP 地址。
+
+`check` 只读已有认证、账户余额/allowance、挂单、成交、持仓、市场、盘口、tick、
+最小数量和 CLOB 时间，不创建 API key 或钱包。它验证输入但保持订单验证状态
+`UNVERIFIED`。`run` 仅允许 **BUY / post-only / GTD**，名义金额硬上限
+**1 USDC**，没有提高上限的参数。价格或数量无效、报价跨 ask、事实缺失/过期、
+市场不接受订单、余额/allowance 不足、tick 或最小数量不满足时均不提交。
+签名中的份额和金额须精确对应用户输入，不截断数量或将有损取整视为匹配。
+无法精确编码为交易所金额或份额单位的输入在提交前拒绝，包括长精度的小数尾数。
+CLOB 时间 +240 秒用于到期；SDK 要求至少 180 秒，提交前再次读取时间，准备
+耗时过长时阻断，不退回 GTC。提交前还按最终 CLOB 时间核对盘口年龄不超过
+10 秒；该检查独立于总本地事实年龄 10 秒和 GTD 至少 180 秒的检查。名义上限
+不表示本工具保证无成交或无资金风险。
+
+运行前，用户须停止同钱包其他交易写入，或改用独立测试账户。工具不自动停止
+production。`--confirm-single-writer` 记录**人工确认**，不是跨主机技术锁证明。
+`--confirm-live` 明确允许该命令的一次 POST，以及已知订单 ID 的撤单 DELETE。
+地域信息单独报告；若 CLOB 拒绝，结果保持 `REJECTED`，不能因其他 GET 成功而
+改称交易成功。只有提交阶段的拒绝能分类为订单 `REJECTED`；已接受订单的后续
+GET 401/403/404 等读取失败保留明确订单 ID、已观察 LIVE 和撤单 ACK，结果为
+`UNKNOWN`，不能把 GET 状态码记作 POST 拒绝。SSM backend 使用已有
+region/secret/version/role 引用和隔离前提，
+不得为诊断添加凭据、降低权限或改变正式 backend。
+
+显式选择锁定 Python、账户配置和 backend。以下 file 示例只传凭据路径，不传
+秘密内容；凭据目录须属当前用户且为 0700，凭据文件为 0600，并遵循现有 file
+backend 结构。不要将密钥、签名、secret 或 bearer header 放入命令参数或日志。
+将 `<...>` 替换为已验证路径及人工选择的值后再执行：
+
+```bash
+export OPEN_TRADER_PYTHON='<absolute-lock-matched-python3.12>'
+PROBE='<absolute-release-root>/scripts/polymarket-order-probe.sh'
+ACCOUNT='<absolute-account-config.json>'
+CREDENTIALS='<absolute-private-credential-file.json>'
+TOKEN='<manually-selected-token-id>'
+PRICE='<explicit-buy-price>'
+QUANTITY='<explicit-share-quantity>'
+
+# GET-only；不表示订单可提交或已提交。
+"$PROBE" check --config "$ACCOUNT" --credential-backend file \
+  --credentials-file "$CREDENTIALS" --token "$TOKEN" --price "$PRICE" --quantity "$QUANTITY"
+
+# 用户确认写入所有权后，创建专属私有回执目录。每次诊断选一个新文件名。
+umask 077
+mkdir -m 700 '<absolute-private-probe-directory>'
+RECORD='<absolute-private-probe-directory>/attempt-001.json'
+
+# 有真实 POST/DELETE 副作用；仅由用户手动执行。
+"$PROBE" run --config "$ACCOUNT" --credential-backend file \
+  --credentials-file "$CREDENTIALS" --token "$TOKEN" --price "$PRICE" --quantity "$QUANTITY" \
+  --record "$RECORD" --confirm-live --confirm-single-writer
+
+# GET-only 读取回执中明确的订单；不猜测订单 ID。
+"$PROBE" status --config "$ACCOUNT" --credential-backend file \
+  --credentials-file "$CREDENTIALS" --record "$RECORD"
+
+# 恢复撤单：用户再次手动确认；只针对该回执中的明确订单 ID。
+"$PROBE" cancel --config "$ACCOUNT" --credential-backend file \
+  --credentials-file "$CREDENTIALS" --record "$RECORD" --confirm-live --confirm-single-writer
+```
+
+模块入口接受完全相同的参数。keychain 或 tencent-ssm 必须显式选择相应 backend；
+只有 file backend 使用 `--credentials-file`。运行回执要求绝对路径、私有 0700
+父目录和 0600 普通文件，拒绝符号链接、错误权限及账户/backend 身份冲突。工具
+原子更新并 fsync 回执，POST 前保存 `attempted=true`。同一路径的本地排他锁
+只防止该回执并发使用，不证明钱包全局互斥；保留回执和 `.lock` 文件。
+已有回执不允许 `run` 重发；不要删除回执或换文件名绕过 UNKNOWN。
+
+每个外部操作有 5 秒硬截止时间；对账总窗口最多 30 秒，无无限 POST/DELETE
+重试。收到明确订单 ID 后核对身份与 LIVE 状态，并立即只撤此 ID；后续读取
+失败仍尽力撤已知自有 ID。`PASS` 必须同时具备 LIVE 观察、明确撤单 ACK、真实
+终态、零成交及资金/选定 token 持仓核对。仅收到撤单 ACK 不够。确认成交时
+报告 `PARTIAL`/`FILLED` 及数量/名义额，保留订单字段与成交记录的差异；持仓
+变化但无成交证据时报告 `UNKNOWN`，不凭持仓差额虚构成交或损失。
+
+进程崩溃、超时、缺订单 ID、终态或资金事实不完整均保留 `UNKNOWN`。无明确 ID
+时，用户须直接查看交易所并核对账户；工具不按价格/时间猜 ID、不全撤、不卖出、
+不重下。退出码 0 表示 `CHECKED` 或已完成核对的 `PASS`；拒绝、部分/全部成交、
+阻断及 UNKNOWN 返回 2，仍须读取 JSON 结果区别处理。CLI 使用 POSIX 截止时间，
+只适用于独立主线程进程，不应嵌入 Shadow 线程。当前验证仅为合成凭据和阻断真实
+网络的 SDK HTTP 边界测试、离线入口及 shell 语法检查；不构成东京交易、部署、
+资源容量、跨主机锁或地域可交易证据。
 
 ## 6. 门禁传输前提与正式部署
 
