@@ -117,10 +117,25 @@ def test_sell_unknown_does_not_block_configuration_or_buy_refill(tmp_path):
     assert configured["funds"]["realized_pnl_usd"] is None
     assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
 
+    planning_as_of, financial_calls = [], []
+    sign, read = exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared
+    def observed_sign(**kwargs):
+        planning_as_of.append(e.lp_auto_state()['funds']['as_of'])
+        return sign(**kwargs)
+    def observed_read(**kwargs):
+        financial_calls.append(bool(e.lp_auto_state()['active_plan']))
+        return read(**kwargs)
+    exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared = observed_sign, observed_read
     e.lp_auto_set_desired_running(True)
     state = e.lp_auto_run_once(round_id="issue288-a")
     assert exchange.posts
     assert all(post["side"] == "BUY" for post in exchange.posts)
+    assert planning_as_of[-1] and not any(financial_calls)
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+    assert state['funds']['available_usd'] is None and state['funds']['spendable_usd'] is None
+    assert e.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = e.lp_auto_state()
+    assert state['funds']['status'] == 'known'
     assert Decimal(state["funds"]["available_usd"]) == Decimal("80") - Decimal("8") * len(exchange.posts)
     assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
 
@@ -152,10 +167,25 @@ def test_sell_unknown_does_not_block_configuration_with_represented_buys(tmp_pat
     assert Decimal(configured["funds"]["available_usd"]) == Decimal("56")
     assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
 
+    planning_as_of, financial_calls = [], []
+    sign, read = exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared
+    def observed_sign(**kwargs):
+        planning_as_of.append(e.lp_auto_state()['funds']['as_of'])
+        return sign(**kwargs)
+    def observed_read(**kwargs):
+        financial_calls.append(bool(e.lp_auto_state()['active_plan']))
+        return read(**kwargs)
+    exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared = observed_sign, observed_read
     e.lp_auto_set_desired_running(True)
     state = e.lp_auto_run_once(round_id="issue288-a-represented")
     assert len(exchange.posts) == 2
     assert state["slots"]["occupied"] == 5
+    assert planning_as_of[-1] and not any(financial_calls)
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+    assert state['funds']['available_usd'] is None and state['funds']['spendable_usd'] is None
+    assert e.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = e.lp_auto_state()
+    assert state['funds']['status'] == 'known'
     assert Decimal(state["funds"]["available_usd"]) == Decimal("40")
     assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
 

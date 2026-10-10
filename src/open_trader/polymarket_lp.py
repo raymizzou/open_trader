@@ -43,6 +43,7 @@ from .polymarket_lp_risk import (
     _select_bid_level,
     _timestamp,
     estimate_lp_queue_position,
+    estimate_lp_stress_exit,
     estimate_lp_target_share_yield,
     evaluate_lp_entry,
     minimum_order_estimate,
@@ -10255,6 +10256,10 @@ class PolymarketLPService:
         post_started = False
         post_started_at = None
         send_receipt_base = dict(entry_action_base)
+        if plan_authorization is not None:
+            send_receipt_base.update({key: request[key] for key in
+                ('market_id', 'condition_id', 'token_id', 'outcome', 'price', 'quantity')})
+            send_receipt_base['expiration'] = expiration
 
         def mark_post_started() -> None:
             nonlocal post_started, post_started_at, send_receipt_base
@@ -13818,7 +13823,13 @@ class PolymarketLPService:
     def _validate_market_snapshot(cls, request, snapshot, *, now):
         """Validate the frozen order against current market facts only."""
         rules = cls._validate_market_rules(request, snapshot)
-        return cls._validate_market_book(request, snapshot, rules, now=now)
+        facts = cls._validate_market_book(request, snapshot, rules, now=now)
+        stress = estimate_lp_stress_exit(snapshot.get('book'), market=snapshot['market'],
+            price=request['price'], quantity=request['quantity'],
+            bid_level=request.get('candidate_bid_level', request.get('bid_level', 1)))
+        if stress['state'] != 'eligible':
+            raise ValueError(stress['reason_codes'][0])
+        return facts
 
     @classmethod
     def _validate_market_rules(cls, request, snapshot):

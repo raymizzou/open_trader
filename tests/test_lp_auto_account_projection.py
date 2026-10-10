@@ -342,8 +342,9 @@ def test_first_account_coverage_preserves_inflight_rotation_fill_stop(tmp_path, 
     assert exchange.posts[-1]['price'] == Decimal('.40') and exchange.posts[-1]['quantity'] == 20
     assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == original_as_of
     assert store.lp_actions(intent['session_id']) == original_audit
-    assert state['intents'][0]['state'] == 'canceling'  # Original audit stays frozen after coverage.
-    assert state['intents'][0]['reservation_coverage'] == covered['reservation_coverage']
+    original = next(i for i in state['intents'] if i['intent_id'] == intent['intent_id'])
+    assert original['state'] == 'canceling'  # Original audit stays frozen after coverage.
+    assert original['reservation_coverage'] == covered['reservation_coverage']
     assert all(p['side'] == 'BUY' for p in exchange.posts)
 
 
@@ -446,8 +447,11 @@ def test_account_row_fill_blocks_rotation_even_before_session_fill_updates(tmp_p
 
 def test_rotation_reanchors_same_price_survivor_without_resetting_protection(tmp_path, monkeypatch):
     from tests import test_lp_auto_rotation as rotation
+    monkeypatch.setattr(pool, 'NOW', pool.NOW)
     monkeypatch.setattr(pool, 'Exchange', rotation.RotationExchange)
     engine, exchange, lp, store = pool.setup(tmp_path, 2)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    install_order_result_reader(exchange, monkeypatch)
     engine.lp_auto_configure(dict(budget_usd='16', target_buy_count=1))
     exchange.orders = [dict(order_id=oid, token_id='m00', condition_id='m00', market_id='m00',
         outcome='YES', side='BUY', status='LIVE', price='.4', original_size='20', remaining_size='20', size_matched='0')

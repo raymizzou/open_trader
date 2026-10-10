@@ -400,31 +400,57 @@ def test_pause_during_signing_prevents_post(tmp_path):
         assert fact['submit_post_started_at'] is None
 
 
-def test_callback_read_failure_before_post_releases_reservation(tmp_path):
+def test_callback_read_failure_before_post_releases_reservation(tmp_path, monkeypatch):
+    from copy import deepcopy
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
-    original=lp._read_candidate_snapshot
-    reads=0
-    def read(request,**kwargs):
-        nonlocal reads
-        reads+=1
-        if reads==1:
-            return original(request,**kwargs)
-        raise RuntimeError('private pre-send failure')
-    lp._read_candidate_snapshot=read
+    sign,books=x.lp_create_limit_order,x.lp_order_books
+    signed_objects,failures=[],[]
+    def signed(**kwargs):
+        value=sign(**kwargs)
+        signed_objects.append(value)
+        return value
+    def read(ids,**kwargs):
+        if signed_objects:
+            failures.append(tuple(ids))
+            raise RuntimeError('external final market read failed')
+        return books(ids,**kwargs)
+    monkeypatch.setattr(x,'lp_create_limit_order',signed)
+    monkeypatch.setattr(x,'lp_order_books',read)
+    observed=[]
+    account=x.lp_account_snapshot
+    def planning_account():
+        value=account()
+        observed.append(e.lp_auto_state()['funds']['as_of'])
+        return value
+    monkeypatch.setattr(x,'lp_account_snapshot',planning_account)
+    cancels=[]
+    monkeypatch.setattr(x,'cancel_order',lambda oid: cancels.append(oid),raising=False)
     r=e.lp_auto_run_once()
     sid=r['intents'][0]['session_id']
     session=s.lp_session(sid)
     action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
-    assert reads==2 and not x.posts
+    assert len(signed_objects)==1 and failures and not x.posts
     assert session['state']=='entry_rejected'
-    assert session['submit_stage']=='prepare_failed'
-    assert session['submit_error_chain']==['RuntimeError']
+    assert session['submit_stage']=='pre_send_rejected'
+    assert session['reason']=='book_unknown'
+    assert session['submit_error_chain']==['AutoEntryNotSent','ValueError','RuntimeError']
     assert session['post_started'] is False
-    assert action['submit_stage']=='prepare_failed'
+    assert action['submit_stage']=='pre_send_rejected' and action['reason']=='book_unknown'
+    assert action['post_started'] is False and action['submit_error_chain']==['AutoEntryNotSent','ValueError','RuntimeError']
+    assert action['token_id']==session['token_id']=='m00'
+    assert not action.get('order_id') and not session.get('entry_order_id')
+    assert x.posts==[] and r['last_round']['reason']=='book_unknown' and r['last_round']['completed_at']
     assert r['slots']['occupied']==0
     assert r['funds']['status']=='known'
+    assert r['funds']['as_of']==observed[-1] and observed[-1]
+    assert Decimal(r['funds']['buy_reserved_usd'])==0 and cancels==[]
+    original_audit=deepcopy(s.lp_actions(sid))
+    r=e.lp_auto_reconcile_unknown()
+    assert r['funds']['status']=='known'
+    e.lp_auto_run_once()
+    assert s.lp_actions(sid)==original_audit and x.posts==cancels==[]
 
 
 def test_callback_lock_failure_before_post_releases_reservation(tmp_path):
@@ -955,6 +981,9 @@ def test_slow_automatic_network_does_not_block_existing_session_cancel(tmp_path,
 
 
 def test_new_external_buy_is_absorbed_by_next_plan(tmp_path, monkeypatch):
+    from tests import test_lp_auto_pool as shared_pool
+    monkeypatch.setattr(shared_pool, 'NOW', shared_pool.NOW)
+    monkeypatch.setattr(sys.modules[__name__], 'NOW', NOW)
     e,x,lp,s=setup(tmp_path,2)
     from copy import deepcopy
     from tests.test_lp_auto_plan_execution import install_order_result_reader

@@ -204,10 +204,19 @@ def test_preparing_uncertainty_still_becomes_unknown(runtime, uncertainty):
             assert current['reserved_usd'] == intent['reserved_usd']
             assert owner.lp_auto_state()['slots']['occupied'] == 1
             assert account.posts == []
+            financial_as_of = owner.lp_auto_state()['funds']['as_of']
         finally:
             release.set()
         pending.result(timeout=5)
-    assert account.posts == account.cancels == []
+    if uncertainty == 'read-error':
+        assert len(account.posts) == 1 and account.cancels == []
+        assert account.posts[0].token_id == intent['token_id']
+        assert account.posts[0].maker_amount == 8000000 and account.posts[0].taker_amount == 20000000
+        final = execution.lp_auto_state()
+        assert final['funds']['status'] == 'unknown' and final['funds']['as_of'] == financial_as_of
+        assert financial_as_of
+    else:
+        assert account.posts == account.cancels == []
 
 
 @pytest.mark.parametrize('receipt', ['late', 'missing', 'idless'])

@@ -667,7 +667,15 @@ def test_enabled_round_refills_covered_legacy_market_once_without_overspending(r
         "valid_until": lp._now() + timedelta(days=1),
     })
 
+    planning_as_of = []
+    financial_calls = []
+    balance = account.get_balance_allowance
+    def observed_balance(**kwargs):
+        financial_calls.append(bool(execution.lp_auto_state()['active_plan']))
+        return balance(**kwargs)
+    account.get_balance_allowance = observed_balance
     def signed_order(**kwargs):
+        planning_as_of.append(execution.lp_auto_state()["funds"]["as_of"])
         assert kwargs["price"] == Decimal(".40")
         assert kwargs["size"] == Decimal("20")
         _advance(runtime)  # Signing precedes the next generation-fenced account read.
@@ -692,10 +700,19 @@ def test_enabled_round_refills_covered_legacy_market_once_without_overspending(r
     assert len(account.posts) == 1, {"last_round": first["last_round"], "blocks": first["block_reasons"]}
     assert _amount(first, "buy_reserved_usd") == 8
     assert first["slots"]["occupied"] == 1
+    assert first['funds']['status'] == 'unknown' and first['funds']['as_of'] == planning_as_of[-1]
+    assert planning_as_of[-1] and first['funds']['available_usd'] is None and first['funds']['spendable_usd'] is None
+    assert not any(financial_calls)
     _advance(runtime)
     second = execution.lp_auto_run_once(round_id="refill-repeat")
     assert len(account.posts) == 1
     assert _amount(second, "buy_reserved_usd") == 8
+    assert second['funds']['status'] == 'unknown' and second['funds']['as_of'] == planning_as_of[-1]
+    assert second['funds']['available_usd'] is None and not any(financial_calls)
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    second = execution.lp_auto_state()
+    assert second['funds']['status'] == 'known' and _amount(second, 'total_usd') == 8
     assert _amount(second, "available_usd") == 0
     assert second["slots"]["occupied"] == 1
     assert len(second["intents"]) == 2

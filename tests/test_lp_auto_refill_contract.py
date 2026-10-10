@@ -99,9 +99,25 @@ def test_current_account_replaces_stale_candidate_account(runtime):
     _, _, account, lp, execution, _ = prepare(runtime, count=2, target=2)
     for cached in lp._candidate_qualification_facts.values():
         cached['account']['checked_at'] = lp._now() - timedelta(seconds=61)
+    planning_as_of, financial_calls = [], []
+    sign, balance = account.create_limit_order, account.get_balance_allowance
+    def observed_sign(**kwargs):
+        planning_as_of.append(execution.lp_auto_state()['funds']['as_of'])
+        return sign(**kwargs)
+    def observed_balance(**kwargs):
+        financial_calls.append(bool(execution.lp_auto_state()['active_plan']))
+        return balance(**kwargs)
+    account.create_limit_order, account.get_balance_allowance = observed_sign, observed_balance
     state = execution.lp_auto_run_once(round_id='stale-candidate-account')
     assert len(account.posts) == 2
     assert state['slots']['occupied'] == 2
+    assert planning_as_of and planning_as_of[-1]
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+    assert state['funds']['spendable_usd'] is None and state['funds']['available_usd'] is None
+    assert not any(financial_calls), 'Approved plan must not read balance/allowance'
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = execution.lp_auto_state()
     assert state['funds']['status'] == 'known'
 
 
@@ -203,8 +219,24 @@ def test_unknown_unrelated_account_report_history_does_not_block_new_buys(runtim
     # Current API inventory cost is known; its absent historical fills cannot
     # reconstruct the report's PnL. Selected tokens keep valid price summaries.
     account.positions = (_position().model_copy(update={'token_id': token, 'condition_id': condition}),)
+    planning_as_of, financial_calls = [], []
+    sign, balance = account.create_limit_order, account.get_balance_allowance
+    def observed_sign(**kwargs):
+        planning_as_of.append(execution.lp_auto_state()['funds']['as_of'])
+        return sign(**kwargs)
+    def observed_balance(**kwargs):
+        financial_calls.append(bool(execution.lp_auto_state()['active_plan']))
+        return balance(**kwargs)
+    account.create_limit_order, account.get_balance_allowance = observed_sign, observed_balance
     state = execution.lp_auto_run_once(round_id='unrelated-report-history')
     assert len(account.posts) == 2, state['last_round']
+    assert planning_as_of and planning_as_of[-1]
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+    assert state['funds']['spendable_usd'] is None and state['funds']['available_usd'] is None
+    assert not any(financial_calls), 'Approved plan must not read balance/allowance'
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = execution.lp_auto_state()
     assert state['funds']['status'] == 'known'
     assert state['funds']['realized_pnl_usd'] is None
     assert Decimal(state['funds']['inventory_cost_usd']) == 8
@@ -243,9 +275,25 @@ def test_recommendation_yield_and_auto_order_use_the_same_minimum_quantity(runti
     # Independent worked example: bid scores 810 + 640, ask score 810;
     # competition 810 + 640/3, own score 20*.90**2/3.
     assert Decimal(rows[0]['estimated_yield_pct_per_hour']) == Decimal('0.131229')
+    planning_as_of, financial_calls = [], []
+    sign, balance = account.create_limit_order, account.get_balance_allowance
+    def observed_sign(**kwargs):
+        planning_as_of.append(execution.lp_auto_state()['funds']['as_of'])
+        return sign(**kwargs)
+    def observed_balance(**kwargs):
+        financial_calls.append(bool(execution.lp_auto_state()['active_plan']))
+        return balance(**kwargs)
+    account.create_limit_order, account.get_balance_allowance = observed_sign, observed_balance
     state = execution.lp_auto_run_once(round_id='same-yield-basis')
     assert [p.token_id for p in account.posts] == [r['selected_direction']['token_id'] for r in rows[:5]]
     assert state['slots']['active'] == state['slots']['occupied'] == 5
+    assert planning_as_of and planning_as_of[-1]
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+    assert state['funds']['spendable_usd'] is None and state['funds']['available_usd'] is None
+    assert not any(financial_calls), 'Approved plan must not read balance/allowance'
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = execution.lp_auto_state()
     assert state['funds']['status'] == 'known'
     assert Decimal(state['funds']['buy_reserved_usd']) == 40
     assert Decimal(state['last_round']['candidates'][0]['minimum_order_estimate']['yield_pct_per_hour']).quantize(Decimal('.000001')) == Decimal(rows[0]['estimated_yield_pct_per_hour'])
@@ -260,10 +308,27 @@ def test_yield_priority_skips_only_unaffordable_candidates(runtime, budget, size
     public.sizes = sizes
     public.rates = {1: '240', 2: '48', 3: '12'}
     _, _, account, _, execution, _ = prepare(runtime, count=3, target=2, budget=budget, public=public)
+    planning_as_of, financial_calls = [], []
+    sign, balance = account.create_limit_order, account.get_balance_allowance
+    def observed_sign(**kwargs):
+        planning_as_of.append(execution.lp_auto_state()['funds']['as_of'])
+        return sign(**kwargs)
+    def observed_balance(**kwargs):
+        financial_calls.append(bool(execution.lp_auto_state()['active_plan']))
+        return balance(**kwargs)
+    account.create_limit_order, account.get_balance_allowance = observed_sign, observed_balance
     state = execution.lp_auto_run_once(round_id='budget-priority')
     assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in expected], state['last_round']
     assert state['slots']['occupied'] == 1
     assert Decimal(state['funds']['buy_reserved_usd']) <= Decimal(budget)
+    assert planning_as_of and planning_as_of[-1]
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+    assert state['funds']['spendable_usd'] is None and state['funds']['available_usd'] is None
+    assert not any(financial_calls), 'Approved plan must not read balance/allowance'
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = execution.lp_auto_state()
+    assert Decimal(state['funds']['buy_reserved_usd']) == (Decimal('40') if budget == '50' else Decimal('25'))
     assert Decimal(state['funds']['spendable_usd']) >= 0
 
 
@@ -715,6 +780,15 @@ def test_current_api_buys_replace_unknown_history_once_and_refill_after_restart(
         assert release.wait(5), 'Independent real-time watchdog'
         return original_sign(**kwargs)
     account.create_limit_order = delayed_sign
+    planning_as_of, financial_calls = [], []
+    sign, balance = account.create_limit_order, account.get_balance_allowance
+    def observed_sign(**kwargs):
+        planning_as_of.append(execution.lp_auto_state()['funds']['as_of'])
+        return sign(**kwargs)
+    def observed_balance(**kwargs):
+        financial_calls.append(bool(execution.lp_auto_state()['active_plan']))
+        return balance(**kwargs)
+    account.create_limit_order, account.get_balance_allowance = observed_sign, observed_balance
     with ThreadPoolExecutor(max_workers=1) as worker:
         pending = worker.submit(execution.lp_auto_run_once, round_id='unknown-history-three-to-five')
         try:
@@ -728,6 +802,13 @@ def test_current_api_buys_replace_unknown_history_once_and_refill_after_restart(
     assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (4, 5)], state['last_round']
     assert state['slots']['occupied'] == 5
     assert Decimal(state['funds']['buy_reserved_usd']) == 40
+    assert planning_as_of and planning_as_of[-1]
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+    assert state['funds']['spendable_usd'] is None and state['funds']['available_usd'] is None
+    assert not any(financial_calls), 'Approved plan must not read balance/allowance'
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = execution.lp_auto_state()
     assert Decimal(state['funds']['spendable_usd']) == 0
     assert [i for i in state['intents'] if i['intent_id'].startswith('historical-')] == originals
     assert all(store.lp_actions(i['session_id']) == audit[i['session_id']] for i in originals)
@@ -968,10 +1049,26 @@ def test_current_api_buy_replaces_ended_history_and_unknown_report_amounts(runti
     if history == 'accepted-legacy-sending':
         assert store.lp_session(original['session_id'])['submit_stage'] == 'sending'
         assert not execution._lp.entry_send_inflight(original['session_id'])
+    planning_as_of, financial_calls = [], []
+    sign, balance = account.create_limit_order, account.get_balance_allowance
+    def observed_sign(**kwargs):
+        planning_as_of.append(execution.lp_auto_state()['funds']['as_of'])
+        return sign(**kwargs)
+    def observed_balance(**kwargs):
+        financial_calls.append(bool(execution.lp_auto_state()['active_plan']))
+        return balance(**kwargs)
+    account.create_limit_order, account.get_balance_allowance = observed_sign, observed_balance
     state = execution.lp_auto_run_once(round_id=f'ended-history-{history}')
     assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (4, 5)], state['last_round']
     assert state['slots']['occupied'] == 5
     assert Decimal(state['funds']['buy_reserved_usd']) == 40
+    assert planning_as_of and planning_as_of[-1]
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+    assert state['funds']['spendable_usd'] is None and state['funds']['available_usd'] is None
+    assert not any(financial_calls), 'Approved plan must not read balance/allowance'
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = execution.lp_auto_state()
     assert Decimal(state['funds']['spendable_usd']) == 0
     assert [i for i in state['intents'] if i['intent_id'].startswith('historical-')] == audit_intents
     assert store.lp_actions(original['session_id']) == audit_actions
@@ -1010,6 +1107,15 @@ def test_known_matching_intent_with_accepted_idless_extra_action_blocks_new_buys
         assert not state['admission_block_reasons']
     assert state['slots']['occupied'] == (4 if side == 'BUY' else 3)
     assert state['intents'] == audit_intents
+    planning_as_of, financial_calls = [], []
+    sign, balance = account.create_limit_order, account.get_balance_allowance
+    def observed_sign(**kwargs):
+        planning_as_of.append(execution.lp_auto_state()['funds']['as_of'])
+        return sign(**kwargs)
+    def observed_balance(**kwargs):
+        financial_calls.append(bool(execution.lp_auto_state()['active_plan']))
+        return balance(**kwargs)
+    account.create_limit_order, account.get_balance_allowance = observed_sign, observed_balance
     state = execution.lp_auto_run_once(round_id=f'known-idless-extra-{side}')
     if side == 'BUY':
         assert 'unbounded_financial_uncertainty' in state['admission_block_reasons']
@@ -1021,6 +1127,13 @@ def test_known_matching_intent_with_accepted_idless_extra_action_blocks_new_buys
         assert account.cancels == []
         assert state['slots']['occupied'] == 5
         assert Decimal(state['funds']['buy_reserved_usd']) == 40
+        assert planning_as_of and planning_as_of[-1]
+        assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+        assert state['funds']['spendable_usd'] is None and state['funds']['available_usd'] is None
+        assert not any(financial_calls), 'Approved plan must not read balance/allowance'
+        _advance(runtime)
+        assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+        state = execution.lp_auto_state()
         assert Decimal(state['funds']['spendable_usd']) == 0
         assert state['funds']['status'] == 'known'
         assert not state['admission_block_reasons']

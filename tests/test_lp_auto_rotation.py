@@ -785,7 +785,10 @@ def test_cancel_recovery_uses_known_owned_receipts_and_preserves_fills(tmp_path,
     else:
         assert len(exchange.posts) == 1
         assert state['slots']['occupied'] == 1
-        assert Decimal(state['funds']['buy_reserved_usd']) == 8
+        assert Decimal(state['funds']['buy_reserved_usd']) == (Decimal('4.80') if receipt == 'partial' else Decimal('8'))
+        if receipt == 'partial':
+            assert Decimal(state['funds']['inventory_cost_usd']) == Decimal('3.20')
+            assert Decimal(state['funds']['buy_reserved_usd']) + Decimal(state['funds']['inventory_cost_usd']) == 8
         assert state['funds']['status'] == 'unknown'
         assert state['funds']['available_usd'] is None
     if receipt in ('unknown', 'incomplete', 'stale'):
