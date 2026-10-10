@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One manual standalone process; credentials are paths/backend references only.
+# Standalone manual commands or launcher-supplied self-test; references only.
 set -euo pipefail
 : "${OPEN_TRADER_PYTHON:?Set OPEN_TRADER_PYTHON to the absolute locked Python executable}"
 if [[ "$OPEN_TRADER_PYTHON" != /* || ! -x "$OPEN_TRADER_PYTHON" ]]; then
