@@ -376,6 +376,9 @@ def run(client, args, config, account, book, server, price, quantity, report, st
             data['selected_market'] = report['selected_market']
             data['outcome'] = report['outcome']
         receipt.save(data)
+        if args.command == 'self-test':
+            report['evidence_path'] = str(args.record)
+            report['stage'] = 'order_preparation'
         with deadline():
             signed = client.lp_create_limit_order(token_id=args.token, price=price, quantity=quantity,
                     side='BUY', post_only=True, expiration=expiration)
@@ -390,6 +393,9 @@ def run(client, args, config, account, book, server, price, quantity, report, st
             raise ProbeError('signed_order_mismatch', 'BLOCKED')
         with deadline():
             now = client._client._ctx.clob.get_json('/time')
+        if args.command == 'self-test':
+            report['stage'] = 'pre_submit'
+            market_diagnostics(report, book, now)
         if type(now) is not int or expiration - now < 180:
             raise ProbeError('expiration_too_close', 'BLOCKED')
         if not 0 <= now - book.timestamp.timestamp() <= 10:
@@ -400,6 +406,8 @@ def run(client, args, config, account, book, server, price, quantity, report, st
             raise ProbeError('cleanup_budget_unavailable', 'BLOCKED')
         data['attempted'] = True
         receipt.save(data)  # Durable before POST. Failure prevents submission.
+        if args.command == 'self-test':
+            report.update(submission_state='attempted', stage='submission')
         submit_facts = {}
         def observe(response):
             if response.request.method != 'POST' or response.request.url.path != '/order':
@@ -437,6 +445,8 @@ def run(client, args, config, account, book, server, price, quantity, report, st
                 # Keep the accepted ID in memory and clean it up even when audit storage fails.
                 write_failed = True
             try:
+                if args.command == 'self-test':
+                    report['stage'] = 'reconciliation'
                 reconcile(client, data, report, cancel=True)
             finally:
                 if write_failed:
@@ -474,7 +484,44 @@ def parser():
     return root
 
 
-def discover(client, account):
+def market_diagnostics(report, book, server):
+    """Numeric freshness facts only; never persist raw venue payloads."""
+    if report is None:
+        return
+    stamp = book.timestamp.timestamp() if book.timestamp is not None else None
+    report.update(server_time=server if type(server) is int else None,
+                  book_timestamp=stamp, book_age_seconds=(
+                      float(Decimal(str(server)) - Decimal(str(stamp)))
+                      if type(server) is int and stamp is not None else None))
+
+
+def save_self_diagnostic(args, report):
+    """Best-effort private sidecar, separate from the recovery receipt."""
+    if not hasattr(args, 'record'):
+        return
+    if report.get('evidence_path'):
+        try:
+            if not Receipt.private_file(Path(report['evidence_path']).lstat()):
+                raise ValueError
+        except (OSError, ValueError):
+            report.pop('evidence_path', None)
+    path = args.record.parent / ('diagnostic-' + uuid.uuid4().hex + '.json')
+    data = {key: report[key] for key in (
+        'result', 'reason', 'stage', 'submission_state', 'server_time',
+        'book_timestamp', 'book_age_seconds') if key in report}
+    try:
+        with Receipt(path) as diagnostic:
+            if diagnostic.data is not None:
+                return
+            diagnostic.save(data)
+        report['diagnostic_path'] = str(path)
+        report.setdefault('evidence_path', str(path))
+    except Exception:
+        # Diagnostic storage cannot prevent cleanup of an accepted order.
+        report['diagnostic_status'] = 'unavailable'
+
+
+def discover(client, account, report=None):
     """Bounded public catalog; fresh CLOB facts decide eligibility, never ranking."""
     stop = time.monotonic() + 30
     used = {row['token_id'] for row in account['open_orders']}
@@ -511,6 +558,7 @@ def discover(client, account):
                         server = client._client._ctx.clob.get_json('/time')
                     if time.monotonic() >= stop:
                         raise ProbeError('discovery_deadline')
+                    market_diagnostics(report, book, server)
                     price = book.tick_size
                     quantity = book.min_order_size.quantize(Decimal('0.01'), rounding=ROUND_CEILING)
                     if price * quantity > Decimal('1'):
@@ -518,7 +566,7 @@ def discover(client, account):
                     try:
                         validate_market(price, quantity, book, market, server, account)
                     except ProbeError as error:
-                        if error.result == 'BLOCKED' or error.reason == 'market_unknown':
+                        if error.result == 'BLOCKED' or error.reason in ('market_unknown', 'market_stale'):
                             continue
                         raise
                     return token, price, quantity, candidate.question or str(candidate.id), outcome.label
@@ -581,7 +629,8 @@ def self_test(args):
 
 def self_test_bounded(args):
     report = dict(result='UNKNOWN', order_validation='UNVERIFIED',
-                  credential_backend=args.credential_backend, single_writer='not_claimed')
+                  credential_backend=args.credential_backend, single_writer='not_claimed',
+                  stage='receipt', submission_state='unknown')
     client = None
     try:
         args.overall_stop = time.monotonic() + args.budget_seconds
@@ -590,9 +639,16 @@ def self_test_bounded(args):
             config = load_trading_config(args.config)
             identity = hashlib.sha256(config.wallet_address.lower().encode()).hexdigest()[:24]
             args.record = args.receipt_dir / ('probe-' + identity + '.json')
-            report['evidence_path'] = str(args.record)
             with Receipt(args.record) as receipt:
                 data = receipt.data
+                if data is None:
+                    report['submission_state'] = 'not_attempted'
+                else:
+                    report['evidence_path'] = str(args.record)
+                    report['stage'] = 'recovery'
+                    report['submission_state'] = ('attempted' if data.get('attempted') is True
+                                                  else 'not_attempted' if data.get('attempted') is False
+                                                  else 'unknown')
                 if data is not None:
                     if (data.get('wallet', '').lower() != config.wallet_address.lower()
                             or data.get('signer', '').lower() != config.signer_address.lower()
@@ -604,10 +660,15 @@ def self_test_bounded(args):
                         os.rename(args.record.name, archive, src_dir_fd=receipt.dirfd, dst_dir_fd=receipt.dirfd)
                         os.fsync(receipt.dirfd)
                         receipt.data = None
+                        report.pop('evidence_path', None)
+                        report['submission_state'] = 'not_attempted'
                     elif not data.get('order_id'):
                         raise ProbeError('order_id_unknown')
+                report['stage'] = 'authentication' if receipt.data is None else 'recovery'
                 with deadline():
                     client = PolymarketTradingClient.from_keychain(config, read_only=True)
+                if receipt.data is None:
+                    report['stage'] = 'region'
                 report['region'] = region()
                 if receipt.data is not None:
                     report.update(recovered_previous=True, order_id=data['order_id'], token=data['token'],
@@ -623,14 +684,20 @@ def self_test_bounded(args):
                     data.update(report)
                     receipt.save(data)
                     return finish_self_report(report)
+                report['stage'] = 'account'
                 with deadline():
                     account = client._lp_account_facts(include_raw_trades=True)
                 if not all(account.get(key) is True for key in (
                     'authenticated', 'balance_complete', 'open_orders_complete', 'positions_complete', 'trades_complete')):
                     raise ProbeError('account_incomplete')
-                args.token, price, quantity, market_name, outcome = discover(client, account)
+                report['stage'] = 'discovery'
+                args.token, price, quantity, market_name, outcome = discover(client, account, report)
+                report['stage'] = 'pre_submit'
+                for key in ('server_time', 'book_timestamp', 'book_age_seconds'):
+                    report.pop(key, None)
                 started = time.monotonic()
                 account, book, market, server = facts(client, args.token)
+                market_diagnostics(report, book, server)
                 if (any(row.get('token_id') == args.token for row in account['open_orders'])
                         or target_position(account, args.token) != 0):
                     raise ProbeError('selected_token_now_in_use', 'BLOCKED')
@@ -653,6 +720,7 @@ def self_test_bounded(args):
                     client.close()
             except Exception:
                 pass
+    save_self_diagnostic(args, report)
     return finish_self_report(report)
 
 
@@ -661,6 +729,10 @@ def finish_self_report(report):
         'BLOCKED': '阻断：未满足诊断前提。', 'REJECTED': '拒绝：交易场所拒绝提交。',
         'PARTIAL': '部分成交：请核查证据。', 'FILLED': '全部成交：请核查证据。',
         'UNKNOWN': '未知：不能确认订单或资金状态；请保留证据。'}[report['result']]
+    if report.get('submission_state') == 'not_attempted':
+        report['summary_zh'] = '本次诊断未提交订单：未满足诊断前提；请核查诊断证据。'
+    elif report.get('submission_state') == 'attempted' and report['result'] == 'UNKNOWN':
+        report['summary_zh'] = '未知：已有提交尝试，不能确认订单或资金状态；请保留恢复回执。'
     print(json.dumps(report, sort_keys=True, ensure_ascii=False))
     return 0 if report['result'] == 'PASS' else 2
 

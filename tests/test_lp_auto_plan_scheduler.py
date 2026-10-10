@@ -102,6 +102,99 @@ def test_ranking_generation_change_uses_api_wait(tmp_path, monkeypatch, initial)
     assert state['funds']['status'] == 'known' and state['last_round']['completed_at']
 
 
+def test_precancel_generation_change_uses_api_wait(tmp_path, monkeypatch):
+    engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch, ('A', 'B', 'C', 'D', 'I'))
+    engine.lp_auto_configure(dict(round_interval_seconds=300,
+        api_retry_interval_seconds=60, order_check_interval_seconds=1))
+    original_orders = live_orders(exchange)
+    original_generation = store.lp_trade_generation()
+    reads = dict(account=0, shared=0, metadata=0, reward=0, books=0)
+    reward_tokens, invalidated_at, before_invalidation = [], [], []
+    race_enabled = [True]
+    for name, counter in [('lp_account_snapshot', 'account'),
+                          ('lp_account_snapshot_shared', 'shared'),
+                          ('lp_market_metadata_fresh', 'metadata'),
+                          ('lp_reward_catalog', 'reward'), ('lp_order_books', 'books')]:
+        external = getattr(exchange, name)
+        def observed(*args, _read=external, _counter=counter, **kwargs):
+            reads[_counter] += 1
+            result = _read(*args, **kwargs)
+            if _counter == 'reward':
+                reward_tokens.append(kwargs['condition_ids'])
+                if (race_enabled[0] and not invalidated_at
+                        and reward_tokens.count(('A',)) == 2):
+                    assert reads['shared'] == 1
+                    before_invalidation.append(engine.lp_auto_state()['active_plan'])
+                    assert store.lp_advance_trade_generation(original_generation)
+                    invalidated_at.append(pool.NOW)
+            return result
+        monkeypatch.setattr(exchange, name, observed)
+    scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
+    assert scheduler.run_due()
+    state = engine.lp_auto_state()
+    assert len(invalidated_at) == 1 and reward_tokens.count(('A',)) == 2
+    plan = before_invalidation[0]
+    assert plan is not None, 'second A recheck occurs after durable ranking selection'
+    assert [row['condition_id'] for row in plan['targets']] == ['B', 'C', 'E', 'F', 'G']
+    assert all(Decimal(row['price']) == Decimal('.39') and Decimal(row['quantity']) == 20
+               for row in plan['targets'])
+    assert [(action['kind'], action['condition_id']) for action in plan['actions']] == [
+        ('cancel', 'A'), ('cancel', 'D'), ('cancel', 'I'), ('buy', 'E'), ('buy', 'F'), ('buy', 'G')]
+    assert [action['order_id'] for action in plan['actions'][:3]] == ['original-A', 'original-D', 'original-I']
+    assert all(action['state'] == 'pending' for action in state['active_plan']['actions'])
+    assert state['active_plan']['targets'] == plan['targets']
+    action_ids = [action['action_id'] for action in plan['actions']]
+    assert [action['action_id'] for action in state['active_plan']['actions']] == action_ids
+    assert not state['last_round']['completed_at']
+    assert state['last_round']['reason'] == 'account_financial_facts_changed'
+    assert exchange.cancels == exchange.posts == []
+    assert live_orders(exchange) == original_orders
+    assert state['slots']['occupied'] == 5
+    assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('39.00')
+    assert all(not store.lp_actions(session['session_id']) for session in store.lp_sessions())
+    assert state['plan_wait']['kind'] == 'api', state['plan_wait']
+    started = datetime.fromisoformat(state['plan_wait']['started_at'])
+    deadline = datetime.fromisoformat(state['plan_wait']['deadline'])
+    assert started == invalidated_at[0] and deadline == started + timedelta(seconds=60)
+    stopped_reads = dict(reads)
+    for elapsed in (1, 59):
+        monkeypatch.setattr(pool, 'NOW', started + timedelta(seconds=elapsed))
+        scheduler.request_check()
+        assert not scheduler.run_due()
+        assert reads == stopped_reads and exchange.cancels == exchange.posts == []
+        waiting = engine.lp_auto_state()['active_plan']
+        assert waiting['round_id'] == plan['round_id']
+        assert waiting['targets'] == plan['targets']
+        assert [action['action_id'] for action in waiting['actions']] == action_ids
+    race_enabled[0] = False
+    monkeypatch.setattr(pool, 'NOW', deadline)
+    publish_candidates(exchange, lp, store, tuple('ABCDEFGHI'))
+    assert scheduler.run_due()
+    state = engine.lp_auto_state()
+    if state['active_plan']:
+        assert state['plan_wait']['kind'] == 'order'
+        at_deadline(monkeypatch, engine)
+        assert scheduler.run_due()
+        state = engine.lp_auto_state()
+    assert state['last_round']['round_id'] == plan['round_id']
+    assert state['last_round']['targets'] == [
+        {key: row.get(key) for key in ('condition_id', 'token_id', 'price', 'quantity',
+            'minimum_order_estimate', 'order_id', 'session_id', 'retained_constraint')}
+        for row in plan['targets']]
+    assert [action['action_id'] for action in state['last_round']['actions']] == action_ids
+    assert exchange.cancels == ['original-A', 'original-D', 'original-I']
+    assert [post['token_id'] for post in exchange.posts] == ['E', 'F', 'G']
+    assert live_orders(exchange)['B'] == 'original-B' and live_orders(exchange)['C'] == 'original-C'
+    assert set(live_orders(exchange)) == {'B', 'C', 'E', 'F', 'G'}
+    assert state['slots']['occupied'] == 5 and state['funds']['status'] == 'known'
+    assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('39.00')
+    assert len([action for session in store.lp_sessions() for action in store.lp_actions(session['session_id'])
+                if action.get('role') == 'reconciliation_cancel']) == 3
+    assert state['last_round']['completed_at'] and state['plan_wait']['kind'] == 'round'
+    assert datetime.fromisoformat(state['plan_wait']['deadline']) == (
+        datetime.fromisoformat(state['last_round']['completed_at']) + timedelta(seconds=300))
+
+
 @pytest.mark.parametrize('window', ['initial_account', 'pre_send_account'])
 def test_api_failure_pauses_and_recovers_the_same_plan(tmp_path, monkeypatch, window):
     initial = ('A', 'B', 'C', 'D', 'I') if window == 'initial_account' else ('B', 'C')

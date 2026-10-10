@@ -274,6 +274,10 @@ open、accepting，bid/ask、tick、最小份额齐全；已有挂单或非零�
 例如 tick=0.01、最小份额=5、ask=0.12，价格为 0.01、份额为 5，名义金额
 为 0.05 USDC；最小份额=200 对应 2 USDC，超过不变的 1 USDC 上限而跳过。
 选择后重新读取账户、盘口、市场和时间；旧扫描事实不计作提交前的新鲜事实。
+扫描时盘口年龄必须处于闭区间 `[0,10]` 秒；过旧或未来时间的候选被跳过，
+在原 3 页/20 盘口/30 秒边界内继续寻找。没有合格候选时返回
+`BLOCKED/no_eligible_candidate`，不提交或撤单；下次调用可以重新扫描。
+已选候选刷新后不新鲜时仍为 `UNKNOWN/market_stale`，不放宽提交门禁。
 
 保留本地事实/盘口 10 秒、GTD +240 秒、SDK 至少 180 秒及精确签名金额检查。
 后端硬上限 120 秒；提交前须余下至少 40 秒，覆盖一次有界提交、既有 30 秒
@@ -284,6 +288,23 @@ transport 等待上限 130 秒，不抢先中止正常清理窗口。仅一 POST
 选定市场/outcome、名义金额、order ID、独立 region 和机器可读 evidence_path；
 一命令实盘模式仅 PASS 退出 0，其余 REJECTED/BLOCKED/PARTIAL/FILLED/UNKNOWN
 保持不同分类并退出 2。
+
+结果中的 `stage` 标识失败或完成阶段；`server_time`、`book_timestamp` 均为
+Unix 秒，`book_age_seconds` 为服务器时间减盘口时间，缺少有效时间时为 null
+或未提供。`submission_state=not_attempted` 表示本次尚未尝试提交，中文结论
+明确写出“本次诊断未提交订单”；`attempted` 表示当前或待恢复回执已有提交
+尝试；无法读取可信历史时为 `unknown`，不能由缺少 ID 推定此前没有提交。
+已有 attempted/未知 ID 回执仍为 `UNKNOWN/order_id_unknown`，保留原回执且
+不重发，不使用“未提交订单”的结论掩盖旧订单不确定性。
+
+提交前失败可写入独立 `diagnostic-<随机标识>.json`，记录有界的分类、阶段和
+时间事实；文件须为运行用户所有的普通单 link 0600 文件，父目录为 0700，
+拒绝符号链接。`diagnostic_path` 仅在写入成功后提供；`evidence_path` 仅指向
+实际存在的私有回执或诊断文件，存储不可用时可省略。诊断 sidecar 不代替或
+改写订单恢复回执，写入失败不阻止已接受 ID 的精确清理。文件不包含凭据或
+原始 SDK 错误负载。2026-10-10 合成 HTTP 回归覆盖候选跳过、旧/未来盘口耗尽、
+选择后过期及真实合成提交后的未知 ID 恢复；这些结果不证明实盘 PASS，也不
+补写此前人工时效用例的有序 RED 缺口或下述恢复 fixture 的历史证据限制。
 
 `single_writer=not_claimed` 不声称全钱包或跨主机互斥，不要求人工单写者证明。
 在 runtime 内自动创建 service-owned 0700 的 `order-probe` 目录，并使用

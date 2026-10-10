@@ -2670,7 +2670,8 @@ class LPAutoPool:
                 for action, result in zip(cancels, results):
                     action.update(result)
             except ValueError as exc:
-                self._save_plan(plan, reason=str(exc), blocked=plan['blocked'], wait_kind='order')
+                wait_kind = 'api' if str(exc) == 'account_financial_facts_changed' else 'order'
+                self._save_plan(plan, reason=str(exc), blocked=plan['blocked'], wait_kind=wait_kind)
                 return self.state()
         document = self._read()
         account, buys, reasons = self._account_projection_facts(document)
