@@ -4064,3 +4064,283 @@ def test_already_bound_buy_receipt_settles_plan_once(tmp_path, monkeypatch, outc
             posts=exchange.posts, cancels=exchange.cancels, state=engine.lp_auto_state())
         (tmp_path/'already-bound-receipt-diagnostics.json').write_text(
             json.dumps(diagnostics, indent=2, default=str) + '\n')
+
+
+def test_bound_terminal_receipt_recovers_with_unavailable_exact_lookup(runtime, monkeypatch, tmp_path):
+    """Durable canceled-zero authority survives a real SDK wrapped null."""
+    import json
+    from polymarket.models.clob.account import OpenOrder
+    from polymarket.models.clob.cancel import CancelOrdersResponse
+    from polymarket.models.clob.order_response import AcceptedOrder
+    from tests.test_lp_auto_refill_contract import RefillPublic, prepare
+    from tests.test_lp_account_reservation_reconciliation import _refill_identity
+    from tests.test_lp_order_registration_contract import _open_order
+
+    public = RefillPublic(runtime.clock)
+    public.rates = {1: '48', 2: '24'}
+    store, adapter, account, lp, engine, _ = prepare(
+        runtime, budget='16', target=2, count=2, public=public)
+    scheduler = LPAutoScheduler(engine, clock=lambda: runtime.clock[0])
+    venue, receipts, packets, lookups, finances = {}, [], [], [], []
+    posts, cancels = account.posts, account.cancels
+    sign = account.create_limit_order
+    held, sid, original = None, None, None
+    unavailable, incomplete = [False], [False]
+    phase, diagnostics = ['setup'], {}
+
+    def install_external_carriers(current_adapter, current_account, current_engine):
+        balance = current_account.get_balance_allowance
+        reader = current_adapter.lp_order_result_snapshot
+        current_account.posts, current_account.cancels = posts, cancels
+
+        def observed_balance(**kwargs):
+            finances.append(dict(phase=phase[0], at=runtime.clock[0],
+                active_plan=bool(current_engine.lp_auto_state()['active_plan'])))
+            return balance(**kwargs)
+
+        def open_orders(**kwargs):
+            current_account.order_reads += 1
+            if incomplete[0]:
+                return None
+            return tuple(order for order in venue.values() if order.status == 'LIVE')
+
+        def exact(*, order_id):
+            lookups.append(dict(phase=phase[0], order_id=order_id))
+            if unavailable[0] and order_id == 'terminal-receipt-1':
+                return OpenOrder.parse_response(None)
+            return venue[order_id]
+
+        def post(signed):
+            nonlocal held
+            runtime.clock[0] += timedelta(seconds=1)
+            posts.append(signed)
+            index = next(i for i in (1, 2) if signed.token_id == _refill_identity(i)[2])
+            oid = f'terminal-receipt-{len(posts)}'
+            quantity = Decimal(signed.taker_amount) / 1000000
+            price = Decimal(signed.maker_amount) / signed.taker_amount
+            venue[oid] = _open_order(oid, 'BUY', price=str(price), original=str(quantity),
+                token_id=signed.token_id, order_type='GTD', expiration=signed.expiration).model_copy(
+                    update={'market': _refill_identity(index)[1], 'condition_id': _refill_identity(index)[1]})
+            current_account.orders = tuple(o for o in venue.values() if o.status == 'LIVE')
+            result = AcceptedOrder(order_id=oid, status='live',
+                making_amount=Decimal('8'), taking_amount=Decimal('20'),
+                trade_ids=(), transactions_hashes=())
+            receipts.append(result)
+            if len(posts) == 1:
+                # Separate real handle, acquired after the send-preparation lock.
+                held = current_engine._lock_path.open('a+')
+                fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return result
+
+        def cancel(*, order_ids):
+            cancels.append(order_ids)
+            for oid in order_ids:
+                assert venue[oid].size_matched == 0
+                venue[oid] = venue[oid].model_copy(update={'status': 'CANCELED'})
+            current_account.orders = tuple(o for o in venue.values() if o.status == 'LIVE')
+            return CancelOrdersResponse(canceled=order_ids, not_canceled={})
+
+        def observed_results(request):
+            result = reader(request)
+            packets.append(dict(phase=phase[0], request=deepcopy(request), result=deepcopy(result)))
+            return result
+
+        monkeypatch.setattr(current_account, 'get_balance_allowance', observed_balance)
+        monkeypatch.setattr(current_account, 'list_open_orders', open_orders)
+        monkeypatch.setattr(current_account, 'get_order', exact, raising=False)
+        monkeypatch.setattr(current_account, 'create_limit_order', sign, raising=False)
+        monkeypatch.setattr(current_account, 'post_order', post)
+        monkeypatch.setattr(current_account, 'cancel_orders', cancel)
+        monkeypatch.setattr(current_adapter, 'lp_order_result_snapshot', observed_results)
+
+    install_external_carriers(adapter, account, engine)
+    preserved_fields = ('state', 'stop_requested', 'stop_loss_latched', 'entry_cancel_requested',
+        'review_status', 'queue_protection', 'order_history', 'owned_order_ids',
+        'reservation_coverage', 'account_coverage_retired', 'position_reconciled',
+        'buy_filled_quantity', 'buy_cost', 'buy_fees', 'sold_quantity', 'sold_revenue',
+        'sell_fees', 'residual_quantity', 'orders_terminal', 'fee_status', 'fees',
+        'account_checked_at', 'facts_checked_at', 'financial_block_reason', 'trade_events',
+        'verified_order_fills')
+    try:
+        diagnostics['stage'] = 'original_real_receipt'
+        assert scheduler.run_due()
+        sent = engine.lp_auto_state()
+        original = deepcopy(sent['active_plan'])
+        targets = deepcopy(sent['last_round']['targets'])
+        first, second = original['actions']
+        assert [target['token_id'] for target in targets] == [_refill_identity(i)[2] for i in (1, 2)]
+        assert all(Decimal(target['price']) == Decimal('.40') and Decimal(target['quantity']) == 20
+            for target in targets)
+        request_id = first.get('request_id', first['action_id'])
+        session, = [s for s in store.lp_sessions() if s['idempotency_key'] == 'lp-auto:' + request_id]
+        sid = session['session_id']
+        audit, = store.lp_actions(sid)
+        assert audit['state'] == 'accepted' and audit['post_started'] is True
+        assert audit['order_id'] == receipts[0].order_id == 'terminal-receipt-1'
+        assert audit['submit_stage'] == 'receipt_received'
+        assert audit['submit_receipt_at'] and audit['submit_finished_at']
+        assert session['submit_stage'] == 'sending' and session.get('submit_status') is None
+        assert not session.get('entry_order_id') and len(posts) == 1 and cancels == []
+        accepted_audit = deepcopy(audit)
+
+        diagnostics['stage'] = 'public_registration_and_terminal_proof'
+        runtime.clock[0] += timedelta(seconds=1)
+        bundle = adapter.lp_account_snapshot_shared(max_age_seconds=-1,
+            trade_generation_provider=store.lp_trade_generation)
+        assert bundle['read_started_at'] > datetime.fromisoformat(audit['submit_finished_at'])
+        assert lp.register_account_snapshot(bundle)['state'] == 'registered'
+        bound = deepcopy(store.lp_session(sid))
+        assert bound['entry_order_id'] == receipts[0].order_id
+        assert bound.get('submit_status') is None and bound['submit_stage'] == 'sending'
+        assert bound['reservation_coverage']['state'] == 'covered'
+        assert bound['order_history']['terminal-receipt-1']['status'] == 'LIVE'
+        assert store.lp_actions(sid) == [accepted_audit]
+        fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+        held.close()
+        held = None
+        assert engine.lp_stop(sid)['state'] == 'review'
+        assert cancels == [('terminal-receipt-1',)]
+        assert venue['terminal-receipt-1'].status == 'CANCELED'
+        assert venue['terminal-receipt-1'].size_matched == 0
+        runtime.clock[0] += timedelta(seconds=1)
+        bundle = adapter.lp_account_snapshot_shared(max_age_seconds=-1,
+            trade_generation_provider=store.lp_trade_generation)
+        assert lp.register_account_snapshot(bundle)['state'] == 'registered'
+        lp.reconcile_facts(sid)
+        terminal = deepcopy(store.lp_session(sid))
+        assert terminal['state'] == 'complete' and terminal['orders_terminal'] is True
+        assert terminal['position_reconciled'] is True and terminal['fee_status'] == 'known'
+        assert terminal['entry_order_id'] == receipts[0].order_id
+        assert terminal['stop_requested'] is True
+        assert terminal.get('submit_status') is None and terminal['submit_stage'] == 'sending'
+        history = terminal['order_history']['terminal-receipt-1']
+        assert history['status'] == 'CANCELED' and Decimal(history['size_matched']) == 0
+        assert history['side'] == 'BUY' and history['token_id'] == _refill_identity(1)[2]
+        assert Decimal(history['price']) == Decimal('.40') and Decimal(history['original_size']) == 20
+        for key in ('buy_filled_quantity', 'sold_quantity', 'residual_quantity', 'buy_cost', 'fees'):
+            assert Decimal(terminal[key]) == 0, key
+        assert not terminal.get('facts_error') and not terminal.get('financial_block_reason')
+        assert datetime.fromisoformat(terminal['facts_checked_at']) > datetime.fromisoformat(audit['submit_finished_at'])
+        immutable_audits = deepcopy(store.lp_actions(sid))
+        assert accepted_audit in immutable_audits
+        financial_asof = engine.lp_auto_state()['funds']['as_of']
+        assert financial_asof
+
+        diagnostics['stage'] = 'incomplete_current_negative'
+        phase[0] = 'auto_recovery'
+        unavailable[0], incomplete[0] = True, True
+        runtime.clock[0] = datetime.fromisoformat(engine.lp_auto_state()['plan_wait']['deadline'])
+        assert scheduler.run_due()
+        waiting = engine.lp_auto_state()
+        original_action = next(a for a in waiting['active_plan']['actions'] if a['action_id'] == first['action_id'])
+        assert original_action['state'] == 'unknown'
+        assert store.lp_session(sid).get('submit_status') is None
+        assert len(posts) == 1 and cancels == [('terminal-receipt-1',)]
+        assert waiting['plan_wait']['kind'] == 'api'
+        failed_at = runtime.clock[0]
+        assert datetime.fromisoformat(waiting['plan_wait']['deadline']) == failed_at + timedelta(seconds=60)
+        reads = (len(packets), len(lookups), account.order_reads, account.trade_reads, account.position_reads)
+        for seconds in (1, 59):
+            runtime.clock[0] = failed_at + timedelta(seconds=seconds)
+            scheduler.request_check()
+            assert not scheduler.run_due()
+            engine.lp_auto_run_once()
+            assert (len(packets), len(lookups), account.order_reads, account.trade_reads, account.position_reads) == reads
+            assert len(posts) == 1 and cancels == [('terminal-receipt-1',)]
+            assert store.lp_session(sid).get('submit_status') is None
+
+        diagnostics['stage'] = 'complete_current_null_positive'
+        incomplete[0] = False
+        runtime.clock[0] = failed_at + timedelta(seconds=60)
+        assert scheduler.run_due()
+        state = engine.lp_auto_state()
+        packet = packets[-1]
+        assert 'terminal-receipt-1' in packet['request']['owned_order_ids']
+        result = packet['result']
+        assert result['order_read_errors']['terminal-receipt-1'] == 'order_read_failed'
+        assert not any(row['order_id'] == 'terminal-receipt-1' for row in result['orders'] + result['open_orders'])
+        assert all(result[key] is True for key in ('authenticated', 'open_orders_complete',
+            'pagination_complete', 'trades_complete', 'positions_complete'))
+        original_action = next(a for a in state['last_round']['actions'] if a['action_id'] == first['action_id'])
+        assert original_action['state'] == 'success', state['last_round']
+        assert original_action['session_id'] == sid and original_action['order_id'] == receipts[0].order_id
+        assert original_action.get('request_id', original_action['action_id']) == request_id
+        assert original_action['confirmed_at'] == accepted_audit['submit_receipt_at']
+        assert state['last_round']['round_id'] == original['round_id']
+        assert state['last_round']['targets'] == targets
+        assert [a['action_id'] for a in state['last_round']['actions']] == [first['action_id'], second['action_id']]
+        assert all(a['state'] == 'success' for a in state['last_round']['actions'])
+        assert state['last_round']['completed_at'] and state['active_plan'] is None
+        assert [p.token_id for p in posts] == [_refill_identity(i)[2] for i in (1, 2)]
+        assert all(p.maker_amount == 8000000 and p.taker_amount == 20000000 for p in posts)
+        recovered = store.lp_session(sid)
+        assert recovered['submit_status'] == 'accepted' and recovered['submit_stage'] == 'receipt_received'
+        assert recovered['submit_receipt_at'] == accepted_audit['submit_receipt_at']
+        assert recovered['submit_finished_at'] == accepted_audit['submit_finished_at']
+        for key in preserved_fields:
+            assert recovered.get(key) == terminal.get(key), key
+        assert store.lp_actions(sid) == immutable_audits and cancels == [('terminal-receipt-1',)]
+        assert state['funds']['as_of'] == financial_asof
+        assert not [call for call in finances if call['phase'] == 'auto_recovery']
+
+        diagnostics['stage'] = 'duplicate_wakes_and_public_restart'
+        completed = deepcopy(state['last_round'])
+        for _ in range(2):
+            scheduler.request_check()
+            assert not scheduler.run_due()
+            engine.lp_auto_run_once()
+        restart_store, restart_adapter, restart_account, restart_lp, restarted = runtime(
+            orders=tuple(o for o in venue.values() if o.status == 'LIVE'), public_client=public)
+        install_external_carriers(restart_adapter, restart_account, restarted)
+        restored_scheduler = LPAutoScheduler(restarted, clock=lambda: runtime.clock[0])
+        restored_scheduler.request_check()
+        restored_scheduler.run_due()
+        restarted.lp_auto_run_once()
+        assert restarted.lp_auto_state()['last_round'] == completed
+        assert len(posts) == 2 and cancels == [('terminal-receipt-1',)]
+        assert restart_store.lp_actions(sid) == immutable_audits
+        for key in preserved_fields:
+            assert restart_store.lp_session(sid).get(key) == terminal.get(key), key
+        assert restart_store.lp_session(sid)['submit_receipt_at'] == accepted_audit['submit_receipt_at']
+
+        diagnostics['stage'] = 'full_interval_and_new_identity'
+        completed_at = datetime.fromisoformat(completed['completed_at'])
+        assert datetime.fromisoformat(restarted.lp_auto_state()['plan_wait']['deadline']) == completed_at + timedelta(seconds=60)
+        runtime.clock[0] = completed_at + timedelta(seconds=59)
+        restored_scheduler.request_check()
+        assert not restored_scheduler.run_due()
+        assert len(posts) == 2 and restarted.lp_auto_state()['last_round'] == completed
+        runtime.clock[0] = completed_at + timedelta(seconds=60)
+        phase[0] = 'next_round_setup'
+        for i in (1, 2):
+            market, condition, token = _refill_identity(i)
+            facts = restart_lp._read_candidate_facts(dict(market_id=market, condition_id=condition,
+                token_id=token, outcome='YES'))
+            restart_lp._candidate_pool_record_success(condition, dict(condition_id=condition), judged_at=restart_lp._now(),
+                facts=dict(directions=[facts['direction']], account=facts['account']))
+        phase[0] = 'next_round'
+        assert restored_scheduler.run_due()
+        new_state = restarted.lp_auto_state()
+        assert new_state['last_round']['round_id'] != original['round_id']
+        new_action, = [a for a in new_state['last_round']['actions'] if a['kind'] == 'buy']
+        assert new_action['state'] == 'success' and new_action['action_id'] != first['action_id']
+        assert new_action.get('request_id', new_action['action_id']) != request_id
+        assert new_action['session_id'] != sid and new_action['order_id'] == 'terminal-receipt-3'
+        assert new_state['last_round']['completed_at'] and new_state['active_plan'] is None
+        assert [p.token_id for p in posts] == [_refill_identity(i)[2] for i in (1, 2, 1)]
+        assert all(p.maker_amount == 8000000 and p.taker_amount == 20000000 for p in posts)
+        assert {o.id for o in venue.values() if o.status == 'LIVE'} == {'terminal-receipt-2', 'terminal-receipt-3'}
+        assert new_state['slots']['occupied'] == 2 and Decimal(new_state['funds']['buy_reserved_usd']) == 16
+        assert cancels == [('terminal-receipt-1',)] and venue['terminal-receipt-1'].status == 'CANCELED'
+        assert restart_store.lp_actions(sid) == immutable_audits
+        for key in preserved_fields:
+            assert restart_store.lp_session(sid).get(key) == terminal.get(key), key
+        diagnostics['stage'] = 'complete'
+    finally:
+        if held is not None:
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+            held.close()
+        diagnostics.update(clock=runtime.clock[0], original=original, packets=packets, lookups=lookups,
+            finances=finances, posts=posts, cancels=cancels, session=store.lp_session(sid) if sid else None,
+            audits=store.lp_actions(sid) if sid else [], state=engine.lp_auto_state())
+        (tmp_path/'bound-terminal-null-diagnostics.json').write_text(json.dumps(diagnostics, indent=2, default=str) + '\n')
