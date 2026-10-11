@@ -25,11 +25,14 @@ def test_immediate_minute_checks_cross_midnight_and_retry_after_failure():
     assert scheduler.snapshot()["last_check_error"] is None
     assert len(calls) == 3
     scheduler.request_check()
+    assert not scheduler.run_due()
+    now += timedelta(seconds=60)
     assert scheduler.run_due()
     assert len(calls) == 4
 
 
 def test_cycles_do_not_overlap_and_wakeup_during_cycle_is_not_lost():
+    now = datetime(2026, 9, 27, 8, tzinfo=UTC)
     entered, release = threading.Event(), threading.Event()
     calls = []
 
@@ -39,7 +42,7 @@ def test_cycles_do_not_overlap_and_wakeup_during_cycle_is_not_lost():
             entered.set()
             assert release.wait(2)
 
-    scheduler = LPAutoScheduler(Execution())
+    scheduler = LPAutoScheduler(Execution(), clock=lambda: now)
     worker = threading.Thread(target=scheduler.run_due)
     worker.start()
     try:
@@ -50,6 +53,9 @@ def test_cycles_do_not_overlap_and_wakeup_during_cycle_is_not_lost():
     finally:
         release.set()
         worker.join(2)
+    assert not scheduler.run_due()
+    assert len(calls) == 1
+    now += timedelta(seconds=60)
     assert scheduler.run_due()
     assert len(calls) == 2
 

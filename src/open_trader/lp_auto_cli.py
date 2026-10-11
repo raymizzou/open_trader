@@ -16,6 +16,7 @@ from urllib.request import HTTPRedirectHandler, HTTPCookieProcessor, ProxyHandle
 
 ROOT = '/api/prediction-arbitrage/lp/auto/'
 _STATUS_ADVICE = 'Run open-trader prediction-arb lp-auto status with the same --url to verify the service state.'
+_TIMING_DEFAULTS = dict(round_interval_seconds=60, api_retry_interval_seconds=60, order_check_interval_seconds=10)
 
 
 def _finite_json_float(value: str) -> float:
@@ -117,7 +118,7 @@ def _emit(result: str, state: dict[str, object] | None, reason: str | None, json
         return
     desired = state.get('desired_running')
     print('desired_running: ' + ('ON' if desired is True else 'OFF' if desired is False else 'UNKNOWN'))
-    for key in ('runtime_state', 'budget_usd', 'target_buy_count', 'buy_price_level', 'config_version'):
+    for key in ('runtime_state', 'budget_usd', 'target_buy_count', 'buy_price_level', 'config_version', *_TIMING_DEFAULTS):
         value = state.get(key)
         if key == 'runtime_state' and isinstance(value, str) and result != 'UNKNOWN':
             value = value.upper()
@@ -190,6 +191,15 @@ def _pause_confirmed(state: dict[str, object]) -> bool:
 
 
 def _config_confirmed(state: dict[str, object], payload: dict[str, object], previous: dict[str, object]) -> bool:
+    if 'budget_usd' not in payload:
+        return (type(state.get('config_version')) is int
+            and state['config_version'] == payload['expected_config_version'] + 1
+            and type(state.get('desired_running')) is bool
+            and state['desired_running'] is previous.get('desired_running')
+            and all(type(state.get(key)) is type(previous.get(key)) and state.get(key) == previous.get(key)
+                    for key in ('budget_usd', 'target_buy_count', 'buy_price_level', 'pause_confirmed'))
+            and all(type(state.get(key)) is int and state[key] == payload.get(key, previous.get(key, default))
+                    for key, default in _TIMING_DEFAULTS.items()))
     budget = state.get('budget_usd')
     try:
         amount = Decimal(budget) if isinstance(budget, str) else Decimal('NaN')
@@ -204,11 +214,15 @@ def _config_confirmed(state: dict[str, object], payload: dict[str, object], prev
         and type(state.get('buy_price_level')) is int and state['buy_price_level'] == level
         and type(state.get('config_version')) is int
         and state['config_version'] == payload['expected_config_version'] + 1
+        and all(type(state.get(key)) is int and state[key] == value
+                for key, value in payload.items() if key in _TIMING_DEFAULTS)
     )
 
 
 def run(action: str, url: str, timeout: float | str, *, json_output: bool = False,
-        budget: str | None = None, target_buys: str | None = None, bid_level: str | None = None) -> int:
+        budget: str | None = None, target_buys: str | None = None, bid_level: str | None = None,
+        round_interval_seconds: str | None = None, api_retry_interval_seconds: str | None = None,
+        order_check_interval_seconds: str | None = None) -> int:
     state = None
     client = None
     try:
@@ -216,7 +230,24 @@ def run(action: str, url: str, timeout: float | str, *, json_output: bool = Fals
             timeout = float(timeout)
         except (TypeError, ValueError) as exc:
             raise ValueError('timeout must be finite and positive') from exc
-        payload = _config_payload(budget, target_buys, bid_level) if action == 'config' else None
+        payload = None
+        if action == 'config':
+            payload = _config_payload(budget, target_buys, bid_level) if any(
+                value is not None for value in (budget, target_buys, bid_level)) else {}
+            for key, value in dict(round_interval_seconds=round_interval_seconds,
+                    api_retry_interval_seconds=api_retry_interval_seconds,
+                    order_check_interval_seconds=order_check_interval_seconds).items():
+                if value is None:
+                    continue
+                try:
+                    seconds = int(value)
+                except (ValueError, TypeError) as exc:
+                    raise ValueError('timing intervals must be positive integer seconds') from exc
+                if seconds <= 0:
+                    raise ValueError('timing intervals must be positive integer seconds')
+                payload[key] = seconds
+            if not payload:
+                raise ValueError('provide trading configuration or at least one timing interval')
         client = _Client(url, timeout)
         if action == 'config':
             previous = client.request(ROOT + 'state')

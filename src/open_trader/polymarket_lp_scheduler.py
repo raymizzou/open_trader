@@ -22,21 +22,33 @@ class LPAutoScheduler:
         self._next_check_at = self.clock()
         self._checking = False
         self._error: str | None = None
+        self._restore_deadline()
         register = getattr(execution, "set_lp_auto_wakeup", None)
         if callable(register):
             register(self.request_check)
+
+    def _core_state(self):
+        read = getattr(self.execution, 'lp_auto_state', None)
+        return read(include_intents=False) if callable(read) else {}
+
+    def _restore_deadline(self, *, future_only=False):
+        waiting = self._core_state().get('plan_wait')
+        if waiting:
+            deadline = datetime.fromisoformat(waiting['deadline'])
+            if not future_only or deadline > self.clock():
+                self._next_check_at = deadline
 
     def snapshot(self) -> dict[str, object]:
         with self._state:
             return {
                 "last_check_at": self._last_check_at.isoformat() if self._last_check_at else None,
                 "next_check_at": None if self._checking else (
-                    self.clock() if self._wake.is_set() else self._next_check_at
+                    self._next_check_at
                 ).isoformat(),
                 "check_in_progress": self._checking,
                 "last_check_error": self._error,
                 "scheduler_running": self._thread is not None and self._thread.is_alive(),
-                "check_interval_seconds": 60,
+                "check_interval_seconds": self._core_state().get('round_interval_seconds', 60),
             }
 
     def request_check(self) -> None:
@@ -47,9 +59,7 @@ class LPAutoScheduler:
             return False
         try:
             with self._state:
-                if self._stop.is_set() or (
-                    not self._wake.is_set() and self.clock() < self._next_check_at
-                ):
+                if self._stop.is_set() or self.clock() < self._next_check_at:
                     return False
                 self._wake.clear()
                 self._checking = True
@@ -70,13 +80,11 @@ class LPAutoScheduler:
                 with self._state:
                     self._checking = False
                     now = self.clock()
-                    # The 60-second budget starts when the check starts. A
-                    # slower check becomes due immediately rather than adding
-                    # its own latency on top of another full interval.
-                    self._next_check_at = max(
-                        now,
-                        (self._last_check_at or now) + timedelta(seconds=60),
-                    )
+                    field = 'api_retry_interval_seconds' if self._error else 'round_interval_seconds'
+                    self._next_check_at = now + timedelta(seconds=self._core_state().get(field, 60))
+                    # An exception cannot keep restoring an expired deadline
+                    # and spin. Preserve an already begun future wait instead.
+                    self._restore_deadline(future_only=self._error is not None)
             return True
         finally:
             self._cycle.release()
@@ -92,6 +100,11 @@ class LPAutoScheduler:
                 self.run_due()
                 with self._state:
                     delay = max(0, (self._next_check_at - self.clock()).total_seconds())
+                # A wake requests future progress, never bypasses a deadline.
+                # Clear it here to avoid spinning on an already-set Event.
+                self._wake.clear()
+                if self._stop.is_set():
+                    break
                 self._wake.wait(min(delay, 60))
 
         self._thread = threading.Thread(target=run, name="prediction-lp-auto", daemon=True)

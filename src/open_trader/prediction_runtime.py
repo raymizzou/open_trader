@@ -1081,12 +1081,13 @@ class PredictionRuntime:
     def lp_auto_state(self, *, include_intents: bool = True) -> dict[str, object]:
         if self.execution is None:
             raise RuntimeError("LP automatic execution service is unavailable")
+        state = self.execution.lp_auto_state(include_intents=include_intents)
         return {
-            **self.execution.lp_auto_state(include_intents=include_intents),
+            **state,
             **(self._lp_auto_scheduler.snapshot() if self._lp_auto_scheduler else {
                 "scheduler_running": False, "last_check_at": None,
                 "next_check_at": None, "check_in_progress": False,
-                "last_check_error": None, "check_interval_seconds": 60,
+                "last_check_error": None, "check_interval_seconds": state.get('round_interval_seconds', 60),
             }),
         }
 

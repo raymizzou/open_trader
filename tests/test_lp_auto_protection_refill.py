@@ -4,6 +4,7 @@ from decimal import Decimal
 from threading import Event, local
 import time
 from types import SimpleNamespace
+from datetime import datetime
 
 import pytest
 from polymarket.models.clob.order_book import OrderBookLevel
@@ -54,6 +55,8 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
     def observed_shared_reader(*args, **kwargs):
         record = request_record(args, kwargs)
         if active_trace is not None:
+            if execution.lp_auto_state()['active_plan'] and not getattr(read_role, 'publisher', False):
+                active_trace['active_finance'].append(record)
             destination = 'publishers' if getattr(read_role, 'publisher', False) else 'requests'
             active_trace[destination].append(record)
         try:
@@ -66,47 +69,47 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
     adapter.lp_account_snapshot_shared = observed_shared_reader
 
     def start_trace():
-        return dict(requests=[], publishers=[], posts=[], posts_before=len(account.posts),
+        return dict(requests=[], publishers=[], posts=[], active_finance=[], active_balance=[], posts_before=len(account.posts),
                     sdk_before=account.position_reads)
 
-    def assert_fence_accounting(trace, *, invalidated=False):
+    def advance_to_due():
+        waiting = execution.lp_auto_state().get('plan_wait')
+        if waiting:
+            runtime.clock[0] = max(runtime.clock[0], datetime.fromisoformat(waiting['deadline']))
+        _advance(runtime)
+
+    def assert_fence_accounting(trace):
         requests = trace['requests']
         posts_before = trace['posts_before']
-        assert len(requests) == 6, 'Initial, two mandatory fresh requests per BUY, final refresh'
-        assert all(r['max_age'] == 0 and r['generation_provider_matches'] for r in requests)
-        assert [r['posts_before'] for r in requests] == [
-            posts_before, posts_before, posts_before, posts_before + 1, posts_before + 1, posts_before + 2]
-        assert [p['request_count'] for p in trace['posts']] == [3, 5]
+        assert len(requests) == 1, 'One required complete financial publication approves the new plan'
+        assert requests[0]['max_age'] == 0 and requests[0]['generation_provider_matches']
+        assert requests[0]['successful'] and requests[0]['sdk_after'] - requests[0]['sdk_before'] == 1
+        assert requests[0]['posts_before'] == posts_before
+        assert [p['request_count'] for p in trace['posts']] == [1, 1]
         assert [p['posts_before'] for p in trace['posts']] == [posts_before, posts_before + 1]
-        assert [p['sdk_reads'] for p in trace['posts']] == [requests[2]['sdk_after'], requests[4]['sdk_after']]
-        successful = requests[1:] if invalidated else requests
-        assert all(r.get('successful') is True and r['sdk_after'] - r['sdk_before'] == 1 for r in successful), (
-            'Every successful mandatory age-zero request reads current SDK facts once')
-        if invalidated:
-            assert requests[0].get('invalidated') is True and not requests[0].get('successful')
-            assert len(trace['publishers']) == 1
-            publisher = trace['publishers'][0]
-            assert publisher['sdk_after'] - publisher['sdk_before'] == 1
-            assert requests[0]['sdk_after'] - requests[0]['sdk_before'] == 1, (
-                'Only the independent publisher reads while the initial request waits')
-        else:
-            assert not trace['publishers']
-        # Extra observations may inspect three existing orders before admission.
-        # They cannot replace either mandatory fence, occur between BUY fences,
-        # or substitute for the final refresh.
-        extra = requests[1]['sdk_before'] - requests[0]['sdk_after']
-        assert 0 <= extra <= 3
-        for previous, current in zip(requests[1:], requests[2:]):
-            assert current['sdk_before'] == previous['sdk_after']
-        baseline = requests[0]['sdk_after'] if invalidated else trace['sdk_before']
-        mandatory = 5 if invalidated else 6
-        assert account.position_reads - baseline == mandatory + extra
-        assert mandatory <= account.position_reads - baseline <= mandatory + 3
+        assert trace['posts'][0]['sdk_reads'] == trace['posts'][1]['sdk_reads']
+        extra = trace['posts'][0]['sdk_reads'] - requests[0]['sdk_after']
+        assert 0 <= extra <= 3, 'Existing order observations before plan approval remain permitted'
+        assert account.position_reads - trace['sdk_before'] == 1 + extra
+        assert trace['active_finance'] == trace['active_balance'] == []
+        assert not trace['publishers']
+        as_of = trace['posts'][0]['as_of']
+        assert as_of and datetime.fromisoformat(as_of) <= runtime.clock[0]
+        state = execution.lp_auto_state()
+        assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == as_of
+        assert 'account_financial_facts_changed' in state['admission_block_reasons']
+
+    balance = account.get_balance_allowance
+    def observed_balance(**kwargs):
+        if active_trace is not None and execution.lp_auto_state()['active_plan']:
+            active_trace['active_balance'].append(runtime.clock[0])
+        return balance(**kwargs)
+    account.get_balance_allowance = observed_balance
 
     def venue_post(signed):
         if active_trace is not None:
             active_trace['posts'].append(dict(posts_before=len(account.posts), sdk_reads=account.position_reads,
-                                              request_count=len(active_trace['requests'])))
+                                              request_count=len(active_trace['requests']), as_of=execution.lp_auto_state()['funds']['as_of']))
         receipt = post(signed)
         order = account.orders[-1].model_copy(update={'id': f'cycle-{len(account.posts)}'})
         account.orders = (*account.orders[:-1], order)
@@ -229,15 +232,31 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
                         result = pending.result(timeout=5)
                 assert result['funds']['status'] == 'known', result
                 assert result['admission_block_reasons'] == [], result
+                assert len(account.orders) == 3 and len(account.posts) == trace['posts_before']
+                assert result['plan_wait']['kind'] == 'api'
+                assert len(calls) == 1
+                assert len(trace['requests']) == len(trace['publishers']) == 1
+                assert trace['requests'][0]['invalidated'] is True
+                assert trace['requests'][0]['sdk_after'] == trace['requests'][0]['sdk_before'] + 1
+                assert account.position_reads == after_publication
+                early = execution.lp_auto_scheduled_check()
+                assert early['plan_wait'] == result['plan_wait']
+                assert len(account.posts) == trace['posts_before']
+                active_trace = None
+                advance_to_due()
+                publish_qualification()
+                lp.refresh_candidate_recommendations()
+                trace = start_trace()
+                active_trace = trace
+                result = execution.lp_auto_scheduled_check()
                 assert len(account.orders) == 5, result['last_round']
-                assert len(calls) == 6, 'Invalidated initial read, two per BUY, final read'
-                assert_fence_accounting(trace, invalidated=True)
-                assert 5 <= account.position_reads - after_publication <= 8
+                assert_fence_accounting(trace)
                 active_trace = None
                 assert result['slots']['occupied'] == 5
                 assert len(account.posts) == 7 + 2 * cycle
                 continue
             if dependency != 'healthy':
+                advance_to_due()
                 with monkeypatch.context() as blocked:
                     if dependency == 'timeout':
                         def unavailable(**kwargs):
@@ -263,16 +282,23 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
                 if dependency == 'qualification':
                     publish_qualification()
                 lp.refresh_candidate_recommendations()
+            advance_to_due()
+            # This fixture has no background candidate scanner. The added
+            # business waits can expire its initially published candidate pool.
+            publish_qualification()
             before = account.position_reads
             trace = start_trace()
             active_trace = trace
             result = execution.lp_auto_run_once(round_id=f'refill-{cycle}')
-            assert len(account.orders) == 5, result['last_round']
+            assert len(account.orders) == 5, dict(reason=result['last_round']['reason'],
+                candidates=result['last_round']['candidate_count'],
+                filters={key: result['last_round']['candidate_filter'].get(key) for key in
+                         ('counts', 'reasons', 'recheck_reasons')})
             assert len(account.posts) == 7 + 2 * cycle
             assert result['slots']['occupied'] == 5
-            assert result['funds']['status'] == 'known'
+            assert result['funds']['status'] == 'unknown'
             assert_fence_accounting(trace)
-            assert 6 <= account.position_reads - before <= 9
+            assert 1 <= account.position_reads - before <= 4
             active_trace = None
     finally:
         try:

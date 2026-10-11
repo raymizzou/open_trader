@@ -1,5 +1,7 @@
 """Shared LP facts must recover without weakening the automatic funds fence."""
 
+from tests.test_lp_auto_pool import advance_auto_wait
+
 import pytest
 
 from decimal import Decimal
@@ -237,6 +239,8 @@ def test_fresh_funds_survive_refresh_but_expire_and_recovery_wakes_scheduler(tmp
     execution.lp_auto_set_desired_running(False)
     scheduler_now = venue.NOW
     scheduler = LPAutoScheduler(execution, clock=lambda: scheduler_now)
+    advance_auto_wait(execution, monkeypatch)
+    scheduler_now = venue.NOW
     assert scheduler.run_due()
     assert not scheduler.run_due()
     entered, release = Event(), Event()
@@ -260,7 +264,8 @@ def test_fresh_funds_survive_refresh_but_expire_and_recovery_wakes_scheduler(tmp
             release.set()
         tick.result(timeout=5)
     assert execution.lp_auto_state()['funds']['status'] == 'known'
-    assert scheduler.run_due(), 'recovery should not wait another polling interval'
+    scheduler_now = venue.NOW
+    assert scheduler.run_due(), 'recovery runs after the persisted deadline has elapsed'
     assert not scheduler.run_due(), 'one recovery produces a coalesced wake'
     assert len(exchange.posts) == 1
 
@@ -733,26 +738,39 @@ def test_partial_fill_collects_remaining_buy_before_scoring(tmp_path):
     assert len(exchange.posts) == 1
 
 
-def test_scheduler_reuses_published_facts_and_leaves_settled_history_alone(tmp_path):
+def test_scheduler_reuses_published_facts_and_leaves_settled_history_alone(tmp_path, monkeypatch):
     execution, exchange, _, _ = setup(tmp_path)
+    exchange.get_order_scoring = lambda order_id: True
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
     execution.lp_auto_run_once()
     execution.lp_auto_set_desired_running(False)
     execution.lp_tick()
     from open_trader.polymarket_lp_scheduler import LPAutoScheduler
-    from tests.test_lp_auto_pool import NOW
-    scheduler = LPAutoScheduler(execution, clock=lambda: NOW)
+    from tests import test_lp_auto_pool as venue
+    scheduler = LPAutoScheduler(execution, clock=lambda: venue.NOW)
     read = exchange.lp_snapshot
     calls = []
     exchange.lp_snapshot = lambda request: calls.append(request['token_id']) or read(request)
+    advance_auto_wait(execution, monkeypatch)
+    published = execution.lp_tick()
+    assert published['facts_error'] is None
+    assert venue._maybe_datetime(published['facts_checked_at']) == venue.NOW
+    assert execution.lp_auto_state()['intents'][0]['financial_status'] == 'known'
+    calls.clear()
     assert scheduler.run_due()
     assert calls == [], 'scheduler must reuse the facts tick just published'
     exchange.orders[0]['status'] = 'CANCELED'
     execution.lp_tick()
     calls.clear()
+    advance_auto_wait(execution, monkeypatch)
+    execution.lp_tick()
+    calls.clear()
     assert scheduler.run_due()
     scheduler.request_check()
+    advance_auto_wait(execution, monkeypatch)
+    execution.lp_tick()
+    calls.clear()
     assert scheduler.run_due()
     assert calls == [], 'settled history must leave high-frequency account reads'
     assert execution.lp_auto_state()['funds']['status'] == 'known'
@@ -778,7 +796,7 @@ def test_session_and_funds_publication_roll_back_together(tmp_path):
     assert Decimal(execution.lp_auto_state()['funds']['buy_reserved_usd']) == 0
 
 
-def test_missing_submitted_session_keeps_reservation(tmp_path):
+def test_missing_submitted_session_keeps_reservation(tmp_path, monkeypatch):
     import sqlite3
     execution, exchange, _, store = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
@@ -786,6 +804,7 @@ def test_missing_submitted_session_keeps_reservation(tmp_path):
     sid = execution.lp_auto_run_once()['intents'][0]['session_id']
     with sqlite3.connect(store.path) as connection:
         connection.execute('DELETE FROM lp_sessions WHERE session_id=?', (sid,))
+    advance_auto_wait(execution, monkeypatch)
     result = execution.lp_auto_run_once()
     assert result['funds']['status'] == 'unknown'
     assert Decimal(result['funds']['buy_reserved_usd']) == 8
@@ -1279,7 +1298,7 @@ def test_filled_receipt_uses_current_positions_only_when_complete(tmp_path, posi
     assert len(exchange.posts) == 1
 
 
-def test_slow_settled_report_does_not_block_active_recovery_or_new_buy(tmp_path):
+def test_slow_settled_report_does_not_block_active_recovery_or_new_buy(tmp_path, monkeypatch):
     from datetime import timedelta
     from tests.test_lp_auto_pool import NOW
     execution, exchange, _, store = setup(tmp_path, 2)
@@ -1301,6 +1320,7 @@ def test_slow_settled_report_does_not_block_active_recovery_or_new_buy(tmp_path)
             assert release.wait(5)
         return read(request)
     exchange.lp_snapshot = delayed
+    advance_auto_wait(execution, monkeypatch)
     with ThreadPoolExecutor(2) as workers:
         assert execution.lp_generate_due_auto_reports() == []
         assert not entered.is_set()
@@ -1404,7 +1424,7 @@ def test_slow_dashboard_does_not_block_session_and_funds_publication(tmp_path):
         dashboard.result(timeout=5)
 
 
-def test_slow_session_does_not_block_another_market_buy(tmp_path):
+def test_slow_session_does_not_block_another_market_buy(tmp_path, monkeypatch):
     execution, exchange, lp, _ = setup(tmp_path, 2)
     second = lp._candidate_pool.pop('m01')
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=2))
@@ -1423,6 +1443,7 @@ def test_slow_session_does_not_block_another_market_buy(tmp_path):
         return read(request)
 
     exchange.lp_snapshot = delayed
+    advance_auto_wait(execution, monkeypatch)
     with ThreadPoolExecutor(1) as workers:
         result = workers.submit(execution.lp_auto_run_once)
         try:
@@ -1437,7 +1458,7 @@ def test_slow_session_does_not_block_another_market_buy(tmp_path):
         result.result(timeout=5)
 
 
-def test_failed_session_keeps_capital_but_allows_other_market_buy(tmp_path):
+def test_failed_session_keeps_capital_but_allows_other_market_buy(tmp_path, monkeypatch):
     execution, exchange, lp, _ = setup(tmp_path, 2)
     second = lp._candidate_pool.pop('m01')
     execution.lp_auto_configure(dict(budget_usd='16', target_buy_count=2))
@@ -1452,6 +1473,7 @@ def test_failed_session_keeps_capital_but_allows_other_market_buy(tmp_path):
         return read(request)
 
     exchange.lp_snapshot = failed
+    advance_auto_wait(execution, monkeypatch)
     state = execution.lp_auto_run_once()
     assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01']
     assert Decimal(state['funds']['buy_reserved_usd']) >= 16
@@ -1580,7 +1602,7 @@ def test_market_read_timeout_discards_late_result_and_preserves_other_capacity(t
     assert calls == ['m00', 'm00'], 'late abandoned result must not become fresh facts'
 
 
-def test_order_identity_mismatch_cannot_use_isolated_funds(tmp_path):
+def test_order_identity_mismatch_cannot_use_isolated_funds(tmp_path, monkeypatch):
     execution, exchange, lp, _ = setup(tmp_path, 2)
     second = lp._candidate_pool.pop('m01')
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=2))
@@ -1595,6 +1617,7 @@ def test_order_identity_mismatch_cannot_use_isolated_funds(tmp_path):
         return snapshot
 
     exchange.lp_snapshot = conflict
+    advance_auto_wait(execution, monkeypatch)
     state = execution.lp_auto_run_once()
     assert len(exchange.posts) == 1
     assert 'unbounded_financial_uncertainty' in state['admission_block_reasons']

@@ -1,8 +1,11 @@
 """Focused public contracts for Issue #288."""
 
+from tests.test_lp_auto_pool import advance_auto_wait
+
 from datetime import timedelta
 from decimal import Decimal
 import json
+import sys
 from types import SimpleNamespace
 
 from polymarket.models.clob.account import OpenOrder
@@ -114,10 +117,25 @@ def test_sell_unknown_does_not_block_configuration_or_buy_refill(tmp_path):
     assert configured["funds"]["realized_pnl_usd"] is None
     assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
 
+    planning_as_of, financial_calls = [], []
+    sign, read = exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared
+    def observed_sign(**kwargs):
+        planning_as_of.append(e.lp_auto_state()['funds']['as_of'])
+        return sign(**kwargs)
+    def observed_read(**kwargs):
+        financial_calls.append(bool(e.lp_auto_state()['active_plan']))
+        return read(**kwargs)
+    exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared = observed_sign, observed_read
     e.lp_auto_set_desired_running(True)
     state = e.lp_auto_run_once(round_id="issue288-a")
     assert exchange.posts
     assert all(post["side"] == "BUY" for post in exchange.posts)
+    assert planning_as_of[-1] and not any(financial_calls)
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+    assert state['funds']['available_usd'] is None and state['funds']['spendable_usd'] is None
+    assert e.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = e.lp_auto_state()
+    assert state['funds']['status'] == 'known'
     assert Decimal(state["funds"]["available_usd"]) == Decimal("80") - Decimal("8") * len(exchange.posts)
     assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
 
@@ -149,10 +167,25 @@ def test_sell_unknown_does_not_block_configuration_with_represented_buys(tmp_pat
     assert Decimal(configured["funds"]["available_usd"]) == Decimal("56")
     assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
 
+    planning_as_of, financial_calls = [], []
+    sign, read = exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared
+    def observed_sign(**kwargs):
+        planning_as_of.append(e.lp_auto_state()['funds']['as_of'])
+        return sign(**kwargs)
+    def observed_read(**kwargs):
+        financial_calls.append(bool(e.lp_auto_state()['active_plan']))
+        return read(**kwargs)
+    exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared = observed_sign, observed_read
     e.lp_auto_set_desired_running(True)
     state = e.lp_auto_run_once(round_id="issue288-a-represented")
     assert len(exchange.posts) == 2
     assert state["slots"]["occupied"] == 5
+    assert planning_as_of[-1] and not any(financial_calls)
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+    assert state['funds']['available_usd'] is None and state['funds']['spendable_usd'] is None
+    assert e.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = e.lp_auto_state()
+    assert state['funds']['status'] == 'known'
     assert Decimal(state["funds"]["available_usd"]) == Decimal("40")
     assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
 
@@ -542,7 +575,7 @@ def test_auto_second_bid_requires_depth_and_budget(tmp_path):
     assert shallow_exchange.posts == []
     assert shallow_state["last_round"]["candidate_filter"]["reasons"] == {
         "second_bid_insufficient": 1
-    }
+    }, shallow_state["last_round"]
 
     budget, budget_exchange, budget_lp, budget_store = setup(tmp_path / "budget", 1)
     _install_level2_books(
@@ -558,12 +591,13 @@ def test_auto_second_bid_requires_depth_and_budget(tmp_path):
     budget.lp_auto_set_desired_running(True)
     budget_state = budget.lp_auto_run_once(round_id="issue288-f-budget")
     assert budget_exchange.posts == []
-    assert budget_state["last_round"]["actions"] == [
-        {"condition_id": "m00", "state": "rejected", "reason": "strategy_funds_insufficient"}
+    assert budget_state["last_round"]["actions"] == []
+    assert budget_state["last_round"]["blocked"] == [
+        {"condition_id": "m00", "token_id": "m00", "reason": "rotation_budget_insufficient"}
     ]
 
 
-def test_auto_rechecks_second_bid_before_post(tmp_path):
+def test_auto_rechecks_second_bid_before_post(tmp_path, monkeypatch):
     e, exchange, lp, store = setup(tmp_path, 1)
     bids = [("0.40", "1000"), ("0.37", "1000")]
     _install_level2_books(exchange, lp, store, bids=bids, count=1)
@@ -579,12 +613,16 @@ def test_auto_rechecks_second_bid_before_post(tmp_path):
     stale = e.lp_auto_run_once(round_id="issue288-g-stale")
     assert exchange.posts == []
     assert stale["slots"]["occupied"] == 0
+    assert stale["last_round"]["actions"], stale["last_round"]
     stale_action = stale["last_round"]["actions"][0]
     assert stale_action["condition_id"] == "m00"
-    assert stale_action["state"] == "entry_rejected"
-    assert stale_action["reason"] == "candidate_changed"
+    assert stale_action["state"] == "rejected"
+    assert stale_action["request_state"] == "entry_rejected"
+    assert stale_action["reason"] == "candidate_bid_level_changed"
 
     exchange.before_sign = None
+    advance_auto_wait(e, monkeypatch, refresh=False)
+    monkeypatch.setattr(sys.modules[__name__], 'NOW', e._lp._now())
     lp._candidate_pool_record_success(
         "m00",
         dict(condition_id="m00"),

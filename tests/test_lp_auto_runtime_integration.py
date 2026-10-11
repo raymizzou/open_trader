@@ -1,5 +1,7 @@
 """#196 runs the actual #195 pool, SQLite state and LP order lifecycle."""
 
+from tests.test_lp_auto_pool import advance_auto_wait
+
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -60,6 +62,7 @@ def test_restart_reconciles_before_refill_and_preserves_manual_intent(tmp_path, 
 
     exchange.lp_snapshot = unavailable
     after_restart = LPAutoScheduler(restored, clock=lambda: pool.NOW)
+    advance_auto_wait(restored, monkeypatch)
     assert after_restart.run_due()
     assert len(exchange.posts) == (1 if paused else 2)
     assert restored.lp_auto_state()["desired_running"] is (not paused)
@@ -67,17 +70,19 @@ def test_restart_reconciles_before_refill_and_preserves_manual_intent(tmp_path, 
     exchange.lp_snapshot = read_snapshot
     monkeypatch.setattr(pool, "NOW", pool.NOW + timedelta(seconds=60))
     refresh_candidates(restored_lp, exchange)
+    advance_auto_wait(restored, monkeypatch)
     assert after_restart.run_due()
     assert len(exchange.posts) == (1 if paused else 2)
     assert restored.lp_auto_state()["run_id"] == execution.lp_auto_state()["run_id"]
     if paused:
         restored.lp_auto_set_desired_running(True)
         after_restart.request_check()
+        advance_auto_wait(restored, monkeypatch)
         assert after_restart.run_due()
         assert len(exchange.posts) == 2
 
 
-def test_pause_during_reconciliation_survives_late_result(tmp_path):
+def test_pause_during_reconciliation_survives_late_result(tmp_path, monkeypatch):
     execution, exchange, lp, store = pool.setup(tmp_path, 2)
     execution.lp_auto_configure({"budget_usd": "100", "target_buy_count": 2})
     second = lp._candidate_qualification_facts.pop("m01")
@@ -93,6 +98,7 @@ def test_pause_during_reconciliation_survives_late_result(tmp_path):
         return read_snapshot(request)
 
     exchange.lp_snapshot = delayed
+    advance_auto_wait(execution, monkeypatch)
     scheduler = LPAutoScheduler(execution, clock=lambda: pool.NOW)
     worker = threading.Thread(target=scheduler.run_due)
     worker.start()
@@ -118,6 +124,7 @@ def test_midnight_gtd_termination_refills_from_fresh_candidates(tmp_path, monkey
     assert not exchange.posts
     execution.lp_auto_set_desired_running(True)
     scheduler.request_check()
+    advance_auto_wait(execution, monkeypatch)
     assert scheduler.run_due()
     assert len(exchange.posts) == 1
     identity = execution.lp_auto_state()["run_id"]
@@ -136,7 +143,7 @@ def test_midnight_gtd_termination_refills_from_fresh_candidates(tmp_path, monkey
     assert state["slots"]["occupied"] == 1
 
 
-def test_terminal_pause_confirmation_blocks_unsigned_remainder_and_keeps_buy(tmp_path, capsys):
+def test_terminal_pause_confirmation_blocks_unsigned_remainder_and_keeps_buy(tmp_path, monkeypatch, capsys):
     from open_trader import cli
     from tests.test_lp_auto_control import runtime_for
     from tests.test_prediction_service import _server
@@ -154,6 +161,7 @@ def test_terminal_pause_confirmation_blocks_unsigned_remainder_and_keeps_buy(tmp
         assert release.wait(3)
 
     exchange.before_sign = before_sign
+    advance_auto_wait(execution, monkeypatch)
     scheduler = LPAutoScheduler(execution, clock=lambda: pool.NOW)
     runtime = runtime_for(tmp_path)
     runtime.execution = execution
@@ -243,6 +251,7 @@ def test_paused_inventory_exit_continues_and_confirmed_proceeds_fund_next_buy(tm
     assert len(exchange.posts) == 2
     assert exchange.posts[-1]["side"] == "SELL"
     scheduler.request_check()
+    advance_auto_wait(execution, monkeypatch)
     scheduler.run_due()
     assert Decimal(execution.lp_auto_state()["funds"]["inventory_cost_usd"]) == 8
     assert Decimal(execution.lp_auto_state()["funds"]["available_usd"]) == 0

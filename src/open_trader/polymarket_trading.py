@@ -5472,6 +5472,83 @@ class PolymarketTradingClient:
             "reward_max_spread": normalized_reward_spread,
         }
 
+    def lp_order_result_snapshot(self, request: Mapping[str, object]) -> dict[str, object]:
+        """Read authenticated execution results without financial transport/publication.
+
+        The SDK list methods exhaust their pagination. Missing/malformed lists
+        and exact receipts remain unknown, even when the open-order list is empty.
+        This result deliberately contains no balance, allowance or account bundle.
+        """
+        started = datetime.now(UTC)
+        open_snapshot = self.lp_open_orders_snapshot()
+        complete = open_snapshot.get('open_orders_complete') is True
+        wallet = str(self.config.wallet_address or '').strip().casefold()
+        orders = list(open_snapshot.get('open_orders', ()))
+        known_ids = {str(row['order_id']) for row in orders}
+        exact_ids = {str(value) for value in _collect(request.get('owned_order_ids')) if value}
+        errors = {}
+        for order_id in sorted(exact_ids - known_ids):
+            lookup = getattr(self._client, 'get_order', None)
+            try:
+                raw = lookup(order_id=order_id) if callable(lookup) else None
+                row = _lp_order(raw)
+                identity = _model_dict(raw) or {}
+                if row is None:
+                    errors[order_id] = 'order_lookup_unavailable' if raw is None else 'order_response_invalid'
+                    continue
+                # SDK owner is a credential identifier. maker_address is the wallet.
+                maker = str(identity.get('maker_address') or '').strip().casefold()
+                if (row['order_id'] != order_id or not maker or maker != wallet
+                        or not row.get('condition_id') or not row.get('token_id')
+                        or row.get('side') not in ('BUY', 'SELL') or not row.get('status')
+                        or row.get('price') is None or row.get('fill_quantity_known') is not True):
+                    errors[order_id] = 'order_response_invalid'
+                    complete = False
+                    continue
+                orders.append(row)
+            except Exception:
+                errors[order_id] = 'order_read_failed'
+        trades, positions = [], []
+        trades_complete = positions_complete = True
+        try:
+            raw_trades = self._client.list_account_trades()
+            if raw_trades is None:
+                trades_complete = False
+            else:
+                for raw in _collect(raw_trades):
+                    row = _lp_trade(raw)
+                    if row is None:
+                        trades_complete = False
+                        continue
+                    if isinstance(row.get('maker_orders'), list):
+                        row['maker_orders'] = [maker for maker in row['maker_orders']
+                            if _lp_maker_order_is_self(maker, wallet)]
+                    trades.append(row)
+        except Exception:
+            trades_complete = False
+        try:
+            raw_positions = self._client.list_positions()
+            if raw_positions is None:
+                positions_complete = False
+            else:
+                for raw in _collect(raw_positions):
+                    row = _lp_position(raw)
+                    if (row is None or not row.get('condition_id') or row.get('size') is None
+                            or row['size'] < 0):
+                        positions_complete = False
+                        continue
+                    positions.append(row)
+        except Exception:
+            positions_complete = False
+        ended = datetime.now(UTC)
+        return dict(result_only=True, authenticated=open_snapshot.get('authenticated') is True,
+            wallet_address=self.config.wallet_address, read_started_at=started,
+            read_ended_at=ended, checked_at=ended,
+            open_orders=list(open_snapshot.get('open_orders', ())), open_orders_complete=complete,
+            pagination_complete=complete and trades_complete and positions_complete,
+            orders=orders, order_read_errors=errors, trades=trades, positions=positions,
+            trades_complete=trades_complete, positions_complete=positions_complete)
+
     def lp_snapshot(self, request: Mapping[str, object]) -> dict[str, object]:
         """Read the authenticated and public facts used by one LP session.
 

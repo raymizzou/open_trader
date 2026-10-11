@@ -5246,17 +5246,26 @@ class PredictionArbitrageStore:
         *,
         state: str | None = None,
         patch: Mapping[str, object] | None = None,
+        patch_builder: Callable[[dict[str, object], sqlite3.Connection], Mapping[str, object]] | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, object]:
+        if patch is not None and patch_builder is not None:
+            raise ValueError("lp_session_patch_ambiguous")
         now = _utc_now()
-        with self._transaction() as connection:
+        with self._transaction() if connection is None else nullcontext(connection) as connection:
             row = connection.execute(
                 "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
             ).fetchone()
             if row is None:
                 raise ValueError("lp_session_not_found")
             payload = _load_payload(str(row["payload"]))
-            if patch:
-                payload.update(patch)
+            current_patch = patch
+            if patch_builder is not None:
+                current_patch = patch_builder(self._lp_row_result(row), connection)
+                if not isinstance(current_patch, Mapping):
+                    raise TypeError("lp_session_patch_invalid")
+            if current_patch:
+                payload.update(current_patch)
             next_state = self._lp_manual_retirement_state(connection, session_id, payload, str(state or row["state"]))
             try:
                 revision = int(payload.get("_lp_revision", 0))
@@ -7156,6 +7165,10 @@ class PredictionArbitrageStore:
             ).fetchone()
             session = self._lp_row_result(row)
             changed = publish(session, connection=connection, error=error) if publish else False
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            session = self._lp_row_result(row)
         return session, changed
 
     def lp_register_fenced_actions(

@@ -1,5 +1,7 @@
 """A failed order import is visible and cannot authorize another BUY."""
-from datetime import timedelta
+
+from tests.test_lp_auto_pool import advance_auto_wait
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -44,29 +46,52 @@ def test_failed_registration_keeps_dashboard_stale_until_success(tmp_path, monke
 
 
 @pytest.mark.parametrize("during_sign", [False, True])
-def test_failed_registration_blocks_auto_buy_before_or_during_sign(tmp_path, during_sign):
+def test_financial_registration_failure_fences_planning_but_preserves_approved_send(tmp_path, monkeypatch, during_sign):
     execution, exchange, lp, store = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd="100", target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
-
+    captured = []
     def incomplete_registration():
+        if during_sign:
+            captured.append(execution.lp_auto_state())
         snapshot = _fresh_registration_bundle(exchange, lp)
         snapshot["pagination_complete"] = False
         assert lp.register_account_snapshot(snapshot)["state"] == "skipped"
-
     if during_sign:
         exchange.before_sign = incomplete_registration
     else:
         incomplete_registration()
-    blocked = execution.lp_auto_run_once()
-    assert exchange.posts == []
-    assert "account_order_sync_unknown" in blocked["admission_block_reasons"]
-    assert blocked["slots"]["occupied"] == 0
-    assert Decimal(blocked["funds"]["buy_reserved_usd"]) == 0
-
+    result = execution.lp_auto_run_once()
+    assert "account_order_sync_unknown" in result["admission_block_reasons"]
+    if during_sign:
+        assert len(captured) == 1 and captured[0]['active_plan']
+        original_plan = captured[0]['active_plan']
+        action, = result['last_round']['actions']
+        assert action['action_id'] == original_plan['actions'][0]['action_id']
+        assert result['last_round']['targets'] == captured[0]['last_round']['targets']
+        assert action['state'] == 'success' and action['request_state'] == 'entry_open'
+        session = store.lp_session(action['session_id'])
+        assert session['idempotency_key'] == 'lp-auto:' + action['action_id']
+        assert session['state'] == 'entry_open' and session['entry_order_id'] == action['order_id']
+        audit, = store.lp_actions(action['session_id'])
+        assert audit['state'] == 'accepted' and audit['post_started'] is True
+        assert 'attempts' not in action and action.get('request_id', action['action_id']) == action['action_id']
+        assert len(exchange.posts) == 1 and exchange.posts[0]['token_id'] == 'm00'
+        assert exchange.posts[0]['price'] == Decimal('.40') and exchange.posts[0]['quantity'] == 20
+        assert result['slots']['occupied'] == 1 and result['funds']['status'] == 'unknown'
+        assert result['last_round']['completed_at'] and result['plan_wait']['kind'] == 'round'
+        assert datetime.fromisoformat(result['plan_wait']['deadline']) == datetime.fromisoformat(result['last_round']['completed_at']) + timedelta(seconds=60)
+        execution.lp_auto_run_once()
+        from tests.test_lp_auto_plan_scheduler import restart_engine
+        restarted = restart_engine(execution, exchange)
+        restarted.lp_auto_run_once()
+        assert len(exchange.posts) == 1 and store.lp_actions(action['session_id']) == [audit]
+    else:
+        assert exchange.posts == []
+        assert result['slots']['occupied'] == 0 and Decimal(result['funds']['buy_reserved_usd']) == 0
+        assert result['plan_wait']['kind'] == 'api' and not result['last_round'].get('completed_at')
+        assert result['active_plan'] is None and result['last_round']['actions'] == []
     exchange.before_sign = None
-    # Recovery and the subsequent send each need a new complete, fenced
-    # account round. The old test adapter had only an unfenced display read.
     now = [lp._now()]
     lp.clock = lambda: now[0]
     def complete_account_round(*, max_age_seconds=0, trade_generation_provider=None):
@@ -79,5 +104,17 @@ def test_failed_registration_blocks_auto_buy_before_or_during_sign(tmp_path, dur
         return snapshot
     exchange.lp_account_snapshot_shared = complete_account_round
     assert lp.register_account_snapshot(complete_account_round())["state"] == "registered"
+    assert "account_order_sync_unknown" not in execution.lp_auto_state()['admission_block_reasons']
+    if during_sign:
+        assert execution.lp_auto_state()['funds']['status'] == 'known'
+        assert store.lp_actions(action['session_id']) == [audit] and len(exchange.posts) == 1
+        return
+    now[0] = datetime.fromisoformat(execution.lp_auto_state()['plan_wait']['deadline'])
+    advance_auto_wait(execution, monkeypatch)
+    recovered = execution.lp_auto_run_once()
+    assert recovered['last_round']['round_id'] != result['last_round']['round_id']
+    assert len(exchange.posts) == 1 and exchange.posts[0]['token_id'] == 'm00'
+    assert exchange.posts[0]['price'] == Decimal('.40') and exchange.posts[0]['quantity'] == 20
+    assert recovered['last_round']['completed_at'] and recovered['plan_wait']['kind'] == 'round'
     execution.lp_auto_run_once()
     assert len(exchange.posts) == 1
