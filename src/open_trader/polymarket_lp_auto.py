@@ -1994,9 +1994,31 @@ class LPAutoPool:
             owners.pop(oid)
         patch = {'yield_rotation_cancel_owners': owners}
         levels = self.lp._queue_protection_levels(session)
-        controls = {str(target) for bucket in levels.values()
+        # Native monitoring may already have persisted this own ended yield
+        # bucket while an independent request still blocked restoration.
+        # Ordinary canceled controls do not receive this terminal authority.
+        terminal_yields = set()
+        for key, bucket in levels.items():
+            oid = bucket.get('order_id')
+            targets = set(bucket.get('cancel_targets') or ())
+            baseline = ((saved.get(oid) or {}).get('levels') or {}).get(key, {})
+            quantity = _maybe_decimal(history.get(oid, {}).get('original_size', history.get(oid, {}).get('quantity')))
+            matched = _maybe_decimal(rows.get(oid, {}).get('size_matched'))
+            if (bucket.get('state') == 'canceled' and bucket.get('cancel_reason') == 'yield_rotation'
+                    and oid in terminal and oid in batch_ids and oid not in obsolete
+                    and targets and oid in targets and targets <= terminal & batch_ids
+                    and prices.get(oid) == _maybe_decimal(key) and prices.get(oid) is not None
+                    and quantity is not None and quantity > ZERO and matched is not None and ZERO <= matched <= quantity
+                    and baseline.get('order_id') == oid and baseline.get('state') in ('registered', 'monitoring')
+                    and _maybe_decimal(baseline.get('baseline_price')) == prices[oid]
+                    and all(bucket.get(field) == baseline.get(field) for field in
+                        ('baseline_front', 'baseline_price', 'baseline_source', 'baseline_source_timestamp',
+                         'baseline_book_received_at', 'baseline_book_hash', 'baseline_version'))):
+                terminal_yields.add(key)
+        controls = {str(target) for key, bucket in levels.items()
             if bucket.get('state') not in ('registered', 'monitoring')
             and not (bucket.get('state') == 'canceling' and bucket.get('cancel_reason') == 'yield_rotation')
+            and key not in terminal_yields
             for target in (*bucket.get('cancel_targets', ()), bucket.get('order_id')) if target}
         # Refusal ends only its own yield episode, just as a proved terminal
         # receipt ends an accepted one. Other prices remain independently owned.
@@ -2023,7 +2045,8 @@ class LPAutoPool:
                         continue
                     current = levels.get(key, {})
                     if not (current.get('state') in ('registered', 'monitoring') or
-                            current.get('state') == 'canceling' and current.get('cancel_reason') == 'yield_rotation'):
+                            current.get('state') == 'canceling' and current.get('cancel_reason') == 'yield_rotation'
+                            or key in terminal_yields):
                         continue
                     provenance = ('baseline_front', 'baseline_price', 'baseline_source',
                         'baseline_source_timestamp', 'baseline_book_received_at',
@@ -2853,9 +2876,36 @@ class LPAutoPool:
                     matched = _maybe_decimal(receipt.get('size_matched'))
                     own_audits = [a for a in audits if a.get('order_id') == oid
                         or oid in (a.get('targets') or ())]
-                    bound_requests = [a for a in own_audits if a.get('rotation_round_id') == round_id
-                        and a.get('order_id') == oid and a.get('session_id') == session['session_id']]
-                    request = bound_requests[0] if len(bound_requests) == 1 else {}
+                    bound_requests = [a for a in own_audits if a.get('rotation_round_id') == round_id]
+                    # A business action may have several immutable attempts.
+                    # Prove every bound attempt before the helper may regard
+                    # its round as ended; an ACK alone does not end a LIVE order.
+                    request_ids, request_keys = set(), set()
+                    requests_valid = bool(bound_requests)
+                    matching_rejection = False
+                    for request in bound_requests:
+                        request_id = str(request.get('action_id') or '')
+                        request_key = str(request.get('action_key') or '')
+                        targets = request.get('targets') or ()
+                        try:
+                            uuid.UUID(request_id)
+                        except (ValueError, TypeError, AttributeError):
+                            requests_valid = False
+                        if (not request_id or request_id in request_ids or request_key in request_keys
+                                or not request_key.startswith(session['session_id'] + ':reconciliation-cancel:')
+                                or request.get('session_id') != session['session_id'] or request.get('order_id') != oid
+                                or request.get('role') != 'reconciliation_cancel' or submission_action_kind(request) != 'cancel'
+                                or not isinstance(targets, (list, tuple)) or any(str(target) != oid for target in targets)
+                                or request.get('state') not in ('rejected', 'accepted')
+                                or request.get('state') == 'rejected' and not request.get('reason')
+                                or request.get('state') == 'accepted'
+                                    and str(receipt.get('status')).upper() not in TERMINAL_ORDER_STATES):
+                            requests_valid = False
+                        request_ids.add(request_id)
+                        request_keys.add(request_key)
+                        if (request.get('state') == 'rejected' and request.get('reason')
+                                and request.get('reason') == rotation.get('rotation_rejection_reason')):
+                            matching_rejection = True
                     bucket = next((b for k, b in levels.items() if _maybe_decimal(k) == price), {})
                     saved_levels = baseline.get('levels') if isinstance(baseline, Mapping) else None
                     if not isinstance(saved_levels, Mapping) or any(not isinstance(b, Mapping) for b in saved_levels.values()):
@@ -2881,20 +2931,18 @@ class LPAutoPool:
                             or receipt.get('fill_quantity_known') is False
                             or fill.get('quantity_known') is not True or _maybe_decimal(fill.get('quantity')) != matched
                             or fill.get('side') != 'BUY' or _maybe_decimal(fill.get('fee')) is None
-                            or request.get('state') != 'rejected' or request.get('rotation_round_id') != round_id
-                            or request.get('reason') != rotation.get('rotation_rejection_reason')
-                            or not request.get('reason') or request.get('role') != 'reconciliation_cancel'
-                            or submission_action_kind(request) != 'cancel' or request.get('session_id') != session['session_id']
-                            or not request.get('action_id')
-                            or not str(request.get('action_key') or '').startswith(session['session_id'] + ':reconciliation-cancel:')
+                            or not requests_valid or not matching_rejection
                             or old_bucket.get('order_id') != oid
                             or old_bucket.get('state') not in ('registered', 'monitoring')
                             or _maybe_decimal(old_bucket.get('baseline_price')) != price
                             or _maybe_decimal(old_bucket.get('baseline_front')) is None
                             or _maybe_decimal(old_bucket['baseline_front']) < ZERO
                             or not (bucket.get('state') in ('registered', 'monitoring')
-                                or bucket.get('state') == 'canceling' and bucket.get('cancel_reason') == 'yield_rotation'
-                                and oid in (bucket.get('cancel_targets') or ()))
+                                or bucket.get('state') in ('canceling', 'canceled')
+                                    and bucket.get('cancel_reason') == 'yield_rotation'
+                                    and oid in (bucket.get('cancel_targets') or ())
+                                    and (bucket.get('state') != 'canceled' or bucket.get('order_id') == oid
+                                        and str(receipt.get('status')).upper() in TERMINAL_ORDER_STATES))
                             or not all(bucket.get(k) == old_bucket.get(k) for k in provenance)):
                         continue
                     request_rounds[oid] = round_id
