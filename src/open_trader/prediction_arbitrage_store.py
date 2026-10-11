@@ -5247,11 +5247,12 @@ class PredictionArbitrageStore:
         state: str | None = None,
         patch: Mapping[str, object] | None = None,
         patch_builder: Callable[[dict[str, object], sqlite3.Connection], Mapping[str, object]] | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, object]:
         if patch is not None and patch_builder is not None:
             raise ValueError("lp_session_patch_ambiguous")
         now = _utc_now()
-        with self._transaction() as connection:
+        with self._transaction() if connection is None else nullcontext(connection) as connection:
             row = connection.execute(
                 "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
             ).fetchone()
@@ -7164,6 +7165,10 @@ class PredictionArbitrageStore:
             ).fetchone()
             session = self._lp_row_result(row)
             changed = publish(session, connection=connection, error=error) if publish else False
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            session = self._lp_row_result(row)
         return session, changed
 
     def lp_register_fenced_actions(

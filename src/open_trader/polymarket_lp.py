@@ -12096,12 +12096,16 @@ class PolymarketLPService:
                         targets = action.get('targets') or [action.get('order_id')]
                         if targets and all(statuses.get(oid) in TERMINAL_ORDER_STATES for oid in targets):
                             resolved_cancels.append(action['action_id'])
+                def publish_normal(current, *, connection, error):
+                    return self._facts_publisher(current, connection=connection, error=error,
+                        normal_facts=snapshot if not error else None)
                 try:
                     with _lp_read_stage("facts_publish", timings):
                         current, changed = self.store.lp_publish_facts(
                             session_id, revision, patch=patch, state=state,
                             trade_generation=observed_trade_generation,
-                            publish=self._facts_publisher, error=error, resolved_cancels=resolved_cancels,
+                            publish=publish_normal if self._facts_publisher else None,
+                            error=error, resolved_cancels=resolved_cancels,
                         )
                 except ValueError as exc:
                     if str(exc) == 'account_round_invalid':
