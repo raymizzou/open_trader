@@ -4004,8 +4004,34 @@ class LPAutoPool:
             if (audit.get('state') == 'accepted' and audit.get('post_started') is True and oid
                     and audit.get('side') == 'BUY' and audit.get('token_id') == target['token_id']):
                 action.update(session_id=session['session_id'], order_id=oid)
+                def same_send_unknown_receipt(current):
+                    # Public late-receipt reconciliation may bind this accepted
+                    # order while leaving only its session metadata unknown.
+                    # That is authority only for the same ended send and a
+                    # current exact LIVE result, never an absent terminal row.
+                    row = (rows or {}).get(oid)
+                    if (not snapshot or row is None or str(row.get('status')).upper() != 'LIVE'
+                            or current.get('entry_order_id') != oid or current.get('submit_status') != 'unknown'
+                            or current.get('submit_stage') != 'sending' or current.get('post_started') is not True
+                            or audit.get('submit_stage') != 'receipt_received'
+                            or self.lp.entry_send_inflight(current['session_id'])
+                            or has_independent_unresolved_action(current, self.store.lp_actions(current['session_id']))):
+                        return False
+                    keys = ('submit_requested_at', 'submit_post_started_at', 'submit_receipt_at', 'submit_finished_at')
+                    original = [_maybe_datetime(audit.get(k)) for k in keys]
+                    primary = [_maybe_datetime(current.get(k)) for k in keys[:2]]
+                    started, ended = [_maybe_datetime(snapshot.get(k)) for k in ('read_started_at', 'read_ended_at')]
+                    if (any(at is None for at in [*original, *primary, started, ended])
+                            or primary != original[:2]
+                            or not original[0] <= original[1] <= original[2] <= original[3] <= started <= ended <= self._now()
+                            or any(current.get(k) not in (None, '') and _maybe_datetime(current.get(k)) != at
+                                for k, at in zip(keys[2:], original[2:]))):
+                        return False
+                    return True
+
+                unknown_receipt_pending = same_send_unknown_receipt(session)
                 bound_receipt_pending = (session.get('entry_order_id') == oid
-                    and session.get('submit_status') is None)
+                    and (session.get('submit_status') is None or unknown_receipt_pending))
                 if not session.get('entry_order_id') or bound_receipt_pending:
                     action.update(state='unknown', reason='receipt_apply_pending')
                     row = (rows or {}).get(oid)
@@ -4122,7 +4148,9 @@ class LPAutoPool:
                                             or _maybe_decimal(audit.get(k)) != _decimal(target[k])
                                             for k in ('price', 'quantity'))):
                                     raise ValueError('owned_order_identity_mismatch')
-                                if current.get('submit_status') not in (None, 'accepted'):
+                                if (unknown_receipt_pending and not same_send_unknown_receipt(current)
+                                        or current.get('submit_status') not in (None, 'accepted')
+                                        and not same_send_unknown_receipt(current)):
                                     action.update(state='unknown', reason='submission_unknown')
                                     continue
                                 if durable_terminal and not bound_terminal_zero(current):
