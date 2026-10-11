@@ -4004,7 +4004,9 @@ class LPAutoPool:
             if (audit.get('state') == 'accepted' and audit.get('post_started') is True and oid
                     and audit.get('side') == 'BUY' and audit.get('token_id') == target['token_id']):
                 action.update(session_id=session['session_id'], order_id=oid)
-                if not session.get('entry_order_id'):
+                bound_receipt_pending = (session.get('entry_order_id') == oid
+                    and session.get('submit_status') is None)
+                if not session.get('entry_order_id') or bound_receipt_pending:
                     action.update(state='unknown', reason='receipt_apply_pending')
                     row = (rows or {}).get(oid)
                     matched = _maybe_decimal((row or {}).get('size_matched'))
@@ -4039,18 +4041,48 @@ class LPAutoPool:
                             current = self.store.lp_session(session['session_id'])
                             if not current or current.get('entry_order_id') not in (None, '', oid):
                                 raise ValueError('owned_order_identity_mismatch')
-                            session, _ = self.lp._register_direct_receipt(current, order_id=oid, response=row,
-                                side='BUY', price=target['price'], quantity=target['quantity'], expiration=audit.get('expiration'))
+                            if bound_receipt_pending:
+                                current_entries = [a for a in self.store.lp_actions(current['session_id'])
+                                    if a.get('action_key') == audit['action_key']]
+                                if (current.get('entry_order_id') != oid
+                                        or current.get('idempotency_key') != f'lp-auto:{request_id}'
+                                        or current.get('order_identity_conflict')
+                                        or hashlib.sha256(str(current.get('account_id') or '').strip().casefold().encode()).hexdigest() != plan['account_id']
+                                        or len(current_entries) != 1 or current_entries[0] != audit
+                                        or audit.get('submit_stage') != 'receipt_received'
+                                        or not audit.get('submit_receipt_at') or not audit.get('submit_finished_at')
+                                        or any(str(current.get(k)) != str(target[k])
+                                            or str(audit.get(k)) != str(target[k])
+                                            for k in ('market_id', 'condition_id', 'token_id', 'outcome'))
+                                        or any(_maybe_decimal(current.get(k)) != _decimal(target[k])
+                                            or _maybe_decimal(audit.get(k)) != _decimal(target[k])
+                                            for k in ('price', 'quantity'))):
+                                    raise ValueError('owned_order_identity_mismatch')
+                                if current.get('submit_status') not in (None, 'accepted'):
+                                    action.update(state='unknown', reason='submission_unknown')
+                                    continue
+                                # Account registration already owns this exact ID.
+                                # Repair its original receipt, without replaying
+                                # registration or replacing later management state.
+                                session = current
+                            else:
+                                session, _ = self.lp._register_direct_receipt(current, order_id=oid, response=row,
+                                    side='BUY', price=target['price'], quantity=target['quantity'], expiration=audit.get('expiration'))
                             if session['session_id'] != intent['session_id']:
                                 raise ValueError('owned_order_identity_mismatch')
-                            if fill_facts is not None:
+                            if fill_facts is not None and not bound_receipt_pending:
                                 history = self.lp._order_history_patch(session, fill_facts)
                                 patch = self.lp._fill_patch({**session, **history}, fill_facts)
                                 patch.pop('account_checked_at', None)
                                 patch.update(history, order_result_checked_at=snapshot['read_ended_at'])
                                 session = self.store.lp_update_session(session['session_id'], patch=patch)
-                            session = self.store.lp_update_session(session['session_id'],
-                                state='review' if session.get('stop_requested') or session.get('entry_cancel_requested') else 'entry_open',
+                            state = session['state'] if bound_receipt_pending else (
+                                'review' if session.get('stop_requested') or session.get('entry_cancel_requested') else 'entry_open')
+                            if bound_receipt_pending and state == 'entry_submit_pending':
+                                state = ('review' if session.get('stop_requested') or session.get('entry_cancel_requested')
+                                    or session.get('stop_loss_latched') or str(row.get('status')).upper() != 'LIVE'
+                                    else 'entry_open')
+                            session = self.store.lp_update_session(session['session_id'], state=state,
                                 patch=dict(submit_status='accepted', submit_stage='receipt_received',
                                     submit_receipt_at=audit.get('submit_receipt_at'), submit_finished_at=audit.get('submit_finished_at')))
                     finally:
