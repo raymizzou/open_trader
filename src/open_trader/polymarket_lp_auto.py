@@ -357,10 +357,10 @@ class LPAutoPool:
         return not any(a.get('side') == 'BUY' and a.get('role') != 'entry'
                        for a in self.store.lp_actions(intent['session_id']))
 
-    def _account_projection_facts(self, d):
+    def _account_projection_facts(self, d, *, planning=False):
         """A covered reservation never returns, including after facts expire."""
         facts = d.get('account_financial_facts')
-        waiting = self._account_facts_wait
+        waiting = None if planning else self._account_facts_wait
         wait_reason = waiting['reason'] if waiting else None
         reasons = []
         if facts is None:
@@ -487,12 +487,12 @@ class LPAutoPool:
                 result.append(intent)
         return result, independent_unknown
 
-    def _projection(self, d, *, include_intents=True):
+    def _projection(self, d, *, include_intents=True, planning=False):
         audit_intents = list(d['intents'].values())
         # Coverage is a one-way replacement, not a new interpretation of the
         # original submission. Its audit survives late callbacks unchanged.
         intents = [i for i in audit_intents if not reservation_is_released(i, d['account_id'])]
-        account, account_buys, account_reasons = self._account_projection_facts(d)
+        account, account_buys, account_reasons = self._account_projection_facts(d, planning=planning)
         results = d.get('execution_order_facts') or {}
         terminal_ids, terminal_inventory, partial_principal = set(), {}, {}
         if (results.get('account_id') == d['account_id'] == self.execution._lp_account_id()
@@ -650,7 +650,7 @@ class LPAutoPool:
         reasons = list(account_reasons)
         if inventory_unknown:
             reasons.append('inventory_cost_unknown')
-        sync_error = getattr(self.lp, '_account_order_sync_error', None)
+        sync_error = None if planning else getattr(self.lp, '_account_order_sync_error', None)
         if sync_error:
             reasons.append(sync_error)
         if not self.execution.lp_mutation_allowed():
@@ -1046,7 +1046,7 @@ class LPAutoPool:
                 return True
         return False
 
-    def candidates(self, *, releasing=(), diagnostics=None, bid_level=None):
+    def candidates(self, *, releasing=(), diagnostics=None, bid_level=None, observation=None):
         """Consume the entire qualified pool before exclusion, never the UI top ten."""
         from .polymarket_lp import _candidate_pool_row_expired, _candidate_yield_sort_key
         if bid_level is None:
@@ -1137,14 +1137,15 @@ class LPAutoPool:
             for direction in cached.get('directions',[]):
                 if not self.lp._candidate_allowed(((condition_id, str(direction.get('market', {}).get('token_id') or '')),)):
                     continue
-                current_account = self._current_account
+                current_account = observation['account'] if observation is not None else self._current_account
                 account = current_account or cached.get('account') or {}
                 source = 'current' if current_account else 'candidate' if account else 'unknown'
                 ranking_account = self._ranking_account(account, releasing)
                 now = self._now()
-                reservations = self._ranking_reservations(releasing)
+                reservations = self._ranking_reservations(releasing, observation=observation)
                 evaluated=evaluate_lp_entry(direction,account=ranking_account,
-                    now=now,reservations=reservations,candidate=True,bid_level=bid_level)
+                    now=now,reservations=reservations,candidate=True,bid_level=bid_level,
+                    _account_observed_at=observation['validated_at'] if observation is not None else None)
                 if diagnostics is not None:
                     counts['evaluated_directions'] += 1
                     diagnostics['account_sources'][source] += 1
@@ -1188,9 +1189,10 @@ class LPAutoPool:
         return {**account, 'open_orders': [o for o in account.get('open_orders', [])
                 if self.lp._order_id(o) not in ids]}
 
-    def _ranking_reservations(self, releasing):
+    def _ranking_reservations(self, releasing, *, observation=None):
         ids = {i['order_id'] for i in releasing}
-        return tuple(r for r in self.lp._candidate_reservations() if r['order_id'] not in ids)
+        reservations = observation['reservations'] if observation is not None else self.lp._candidate_reservations()
+        return tuple(r for r in reservations if r['order_id'] not in ids)
 
     @staticmethod
     def _buy_identity(row):
@@ -1354,9 +1356,18 @@ class LPAutoPool:
             raise ValueError('book_invalid')
         return True
 
-    def _ranked_buys(self, state, *, diagnostics=None):
+    def _ranked_buys(self, state, *, diagnostics=None, observation=None):
         """Rank actual BUY IDs and candidates on the same yield basis."""
-        account, account_buys, account_reasons = self._account_projection_facts(self._read())
+        if observation is None:
+            account, account_buys, account_reasons = self._account_projection_facts(self._read())
+            source_account = self._current_account
+            account_observed_at = None
+        else:
+            account = observation['document'].get('account_financial_facts')
+            account_buys = state['account_buys']
+            account_reasons = state['admission_block_reasons']
+            source_account = observation['account']
+            account_observed_at = observation['validated_at']
         account_facts = account
         intents, _ = self._unrepresented_intents(state['intents'], account_buys,
             account_valid=account is not None and account.get('financial_status') == 'known' and not account_reasons)
@@ -1386,7 +1397,7 @@ class LPAutoPool:
                     inputs={'financial_status_known': False})
                 continue
             try:
-                _freshness(intent.get('checked_at'), self._now(), 'financial_facts', max_age=Decimal(60))
+                _freshness(intent.get('checked_at'), account_observed_at or self._now(), 'financial_facts', max_age=Decimal(60))
             except ValueError as exc:
                 blocked.append({'condition_id': intent['condition_id'], 'token_id': intent['token_id'],
                                 'reason': str(exc)})
@@ -1401,7 +1412,7 @@ class LPAutoPool:
         for intent in active:
             try:
                 self._rotation_session(intent, diagnostics=diagnostics, account=account_facts)
-                facts = self.lp._read_candidate_facts(intent, account=self._current_account, wait_for_capacity=True)
+                facts = self.lp._read_candidate_facts(intent, account=source_account, wait_for_capacity=True)
                 account, direction = facts['account'], facts['direction']
                 wallet = str(account.get('wallet_address') or '').strip().casefold()
                 if not wallet or hashlib.sha256(wallet.encode()).hexdigest() != state['account_id']:
@@ -1419,13 +1430,13 @@ class LPAutoPool:
                     # require a reward estimate or authorize a replacement.
                     row = {**intent, 'ranking_account': {k: v for k, v in account.items() if not k.startswith('raw_')},
                            'ranking_book_at': direction['book']['received_at'], 'configuration_drift': True}
-                    self._ranking_fresh(row)
+                    self._ranking_fresh(row, observation=observation)
                     rows.append(row)
                     drifted.append(row)
                     continue
                 evaluated = evaluate_lp_entry(direction, account=self._ranking_account(account, active),
-                    now=self._now(), reservations=self._ranking_reservations(active), candidate=True,
-                    bid_level=bid_level)
+                    now=self._now(), reservations=self._ranking_reservations(active, observation=observation), candidate=True,
+                    bid_level=bid_level, _account_observed_at=account_observed_at)
                 if evaluated.get('state') != 'eligible':
                     raise ValueError('rotation_yield_unknown')
                 estimate = minimum_order_estimate(direction, intent, self._now(), resting_quantity=_decimal(intent['quantity']))
@@ -1434,7 +1445,7 @@ class LPAutoPool:
                 row = {**intent, 'minimum_order_estimate': estimate,
                        'ranking_account': {k: v for k, v in account.items() if not k.startswith('raw_')}, 'ranking_book_at': direction['book']['received_at'],
                        'ranking_reward_at': direction['reward_checked_at']}
-                self._ranking_fresh(row)
+                self._ranking_fresh(row, observation=observation)
                 rows.append(row)
             except ValueError as exc:
                 if str(exc) == 'account_financial_facts_changed' or 'identity' in str(exc):
@@ -1454,7 +1465,7 @@ class LPAutoPool:
                 # exact-ID rotation lane even with no replacement capacity.
                 return retained, rows, [], blocked
             return retained, [], [], blocked
-        candidates = self.candidates(releasing=active, diagnostics=diagnostics, bid_level=bid_level)
+        candidates = self.candidates(releasing=active, diagnostics=diagnostics, bid_level=bid_level, observation=observation)
         rows = [r for r in rows if not r.get('configuration_drift')]
         rows.extend(candidates)
         refreshed = {(r['condition_id'], r['token_id']) for r in rows if self._resting_buy(r)}
@@ -1478,7 +1489,7 @@ class LPAutoPool:
                 if 'ranking_account' not in row:
                     continue
                 account = _account_after_reservations(self._ranking_account(row['ranking_account'], active),
-                                                     self._ranking_reservations(active))
+                                                     self._ranking_reservations(active, observation=observation))
                 if account is None:
                     raise ValueError('account_facts_unknown')
                 available = min(available, _decimal(account['balance']), _decimal(account['allowance']))
@@ -1499,11 +1510,11 @@ class LPAutoPool:
             if pending is None:
                 break
             try:
-                facts = self.lp._read_candidate_facts(pending, account=self._current_account, wait_for_capacity=True)
+                facts = self.lp._read_candidate_facts(pending, account=source_account, wait_for_capacity=True)
                 account, direction = facts['account'], facts['direction']
                 evaluated = evaluate_lp_entry(direction, account=self._ranking_account(account, active),
-                    now=self._now(), reservations=self._ranking_reservations(active), candidate=True,
-                    bid_level=bid_level)
+                    now=self._now(), reservations=self._ranking_reservations(active, observation=observation), candidate=True,
+                    bid_level=bid_level, _account_observed_at=account_observed_at)
                 if evaluated.get('state') != 'eligible':
                     if evaluated.get('state') == 'rejected':
                         rows.remove(pending)
@@ -1520,7 +1531,7 @@ class LPAutoPool:
                 pending.update(evaluated['guidance'], minimum_order_estimate=estimate,
                                ranking_account={k: v for k, v in account.items() if not k.startswith('raw_')},
                                ranking_book_at=direction['book']['received_at'], ranking_reward_at=direction['reward_checked_at'])
-                self._ranking_fresh(pending)
+                self._ranking_fresh(pending, observation=observation)
                 refreshed.add((pending['condition_id'], pending['token_id']))
             except ValueError as exc:
                 if (str(exc) == 'account_financial_facts_changed'
@@ -1534,7 +1545,7 @@ class LPAutoPool:
                     _candidate_filter_reasons(diagnostics, [str(exc)], field='recheck_reasons')
         blocked.extend(budget_skipped)
         for row in targets:
-            self._ranking_fresh(row)
+            self._ranking_fresh(row, observation=observation)
         selected = {self._buy_identity(t) for t in targets if self._resting_buy(t)}
         victims = drifted + [r for r in rows if self._resting_buy(r) and self._buy_identity(r) not in selected]
         if victims:
@@ -1542,7 +1553,7 @@ class LPAutoPool:
             available = _decimal(state['funds']['spendable_usd']) + sum((_decimal(i['reserved_usd']) for i in active), ZERO)
             for row in targets:
                 account = _account_after_reservations(self._ranking_account(row['ranking_account'], active),
-                                                     self._ranking_reservations(active))
+                                                     self._ranking_reservations(active, observation=observation))
                 if account is None:
                     raise ValueError('account_facts_unknown')
                 available = min(available, _decimal(account['balance']), _decimal(account['allowance']))
@@ -1551,14 +1562,16 @@ class LPAutoPool:
         candidates.sort(key=lambda r: (-_decimal(r['minimum_order_estimate']['yield_pct_per_hour']), str(r['condition_id']), str(r['token_id'])))
         return [*retained, *targets], victims, candidates, blocked
 
-    def _ranking_fresh(self, row):
+    def _ranking_fresh(self, row, *, observation=None):
         wallet = str(row['ranking_account'].get('wallet_address') or '').strip().casefold()
         if not wallet or hashlib.sha256(wallet.encode()).hexdigest() != self.execution._lp_account_id():
             raise ValueError('account_identity_mismatch')
         generation = row['ranking_account'].get('trade_generation')
-        if generation is not None and generation != self.store.lp_trade_generation():
+        if observation is None and generation is not None and generation != self.store.lp_trade_generation():
             raise ValueError('account_financial_facts_changed')
-        stamps = [row['ranking_account'].get('checked_at'), row['ranking_book_at']]
+        stamps = [row['ranking_book_at']]
+        if observation is None:
+            stamps.append(row['ranking_account'].get('checked_at'))
         if not row.get('configuration_drift'):
             stamps.append(row['ranking_reward_at'])
         for stamp in stamps:
@@ -2964,7 +2977,7 @@ class LPAutoPool:
         intent=updated['intents'][intent['intent_id']]
         return restored or not error and before != identity(intent)
 
-    def _refresh_account_facts(self, *, account_round=None):
+    def _refresh_account_facts(self, *, account_round=None, planning=False):
         from .polymarket_lp import LpAccountRoundInvalid, LpObservationWait
         reader = getattr(self.lp.exchange, 'lp_account_snapshot_shared', None)
         if not callable(reader):
@@ -2989,7 +3002,10 @@ class LPAutoPool:
             return False
 
         try:
-            snapshot = (self.lp.exchange.lp_account_snapshot(account_round=account_round)
+            planning_reader = getattr(self.lp.exchange, '_lp_planning_account_snapshot', None)
+            snapshot = (planning_reader(trade_generation_provider=self.store.lp_trade_generation)
+                        if planning and callable(planning_reader) else
+                        self.lp.exchange.lp_account_snapshot(account_round=account_round)
                         if account_round is not None else
                         reader(max_age_seconds=0, trade_generation_provider=self.store.lp_trade_generation))
             with self._account_refresh_lock:
@@ -2997,12 +3013,37 @@ class LPAutoPool:
                     return False
                 # Serialize publication with attempt admission, not the account
                 # read. A late old read cannot publish over a newer wait.
-                result = self.lp.register_account_snapshot(snapshot)
+                current_only = planning and snapshot.get('trades_complete') is not True
+                result = (self.lp._register_planning_account_snapshot(snapshot) if current_only
+                          else self.lp.register_account_snapshot(snapshot))
                 if result.get('state') != 'registered':
                     reason = result.get('reason') or 'account_order_sync_unknown'
                     return failed(reason, waiting=reason in ('account_round_invalid', 'session_changed'))
                 self._account_facts_wait = None
                 self._current_account = snapshot
+                if planning:
+                    # Bind the acquired response to its registered economics
+                    # once. Later publications remain current diagnostics,
+                    # not a replacement source for this round's funding.
+                    with self.lp._first_seen_apply_lock:
+                        document = self._read()
+                        if current_only:
+                            # This private projection retains local holds. It
+                            # never replaces the published financial document.
+                            document['account_financial_facts'] = deepcopy(result['planning_facts'])
+                        facts = document.get('account_financial_facts') or {}
+                        if (facts.get('trade_generation') != snapshot.get('trade_generation')
+                                or any(_timestamp(facts.get(key)) != _timestamp(snapshot.get(key))
+                                       for key in ('checked_at', 'read_started_at', 'read_ended_at'))):
+                            return failed('account_round_invalid', waiting=True)
+                        validated_at = self._now()
+                        state = self._projection(document, planning=current_only)
+                        reservations = self.lp._candidate_reservations()
+                        if snapshot.get('trade_generation') != self.store.lp_trade_generation():
+                            return failed('account_round_invalid', waiting=True)
+                        return dict(document=deepcopy(document), account=deepcopy(snapshot),
+                            state=deepcopy(state), reservations=deepcopy(reservations),
+                            validated_at=validated_at)
                 return True
         except (LpAccountRoundInvalid, LpObservationWait) as exc:
             # The next scheduled read or a newer valid dashboard publication
@@ -3511,12 +3552,14 @@ class LPAutoPool:
         if plan is not None:
             return self._execute_plan(plan)
         if callable(getattr(self.lp.exchange, 'lp_account_snapshot_shared', None)):
-            refreshed = self._refresh_account_facts()
+            refreshed = self._refresh_account_facts(planning=True)
         else:
             self._reconcile_unknown(reuse=reuse_facts, bounded=True)
             refreshed = None
-        state = self.state()
-        _lp_causal_event('auto_account_use', account=self._read().get('account_financial_facts'), used_at=self._now())
+        observation = refreshed if isinstance(refreshed, Mapping) else None
+        state = observation['state'] if observation is not None else self.state()
+        source_document = observation['document'] if observation is not None else self._read()
+        _lp_causal_event('auto_account_use', account=source_document.get('account_financial_facts'), used_at=self._now())
         round_id = plan['round_id'] if plan else round_id or uuid.uuid4().hex
         diagnostics = dict(round_id=round_id, state='not_evaluated', counts={}, reasons={},
             recheck_reasons={}, facts={}, account_sources=dict(current=0, candidate=0, unknown=0),
@@ -3541,7 +3584,7 @@ class LPAutoPool:
             else:
                 self._plan_wait('api')
             return self.state()
-        d = self._read()
+        d = observation['document'] if observation is not None else self._read()
         if not state['desired_running'] or not self.execution.lp_mutation_allowed():
             def paused(doc):
                 if not plan:
@@ -3557,8 +3600,18 @@ class LPAutoPool:
             if round_id in d['rounds']:
                 return self.state()
             planning_generation = self.store.lp_trade_generation()
+            retired_session_facts = {session['session_id']: {key: deepcopy(session.get(key)) for key in
+                ('session_id', 'idempotency_key', 'account_id', 'market_id', 'condition_id', 'token_id',
+                 'entry_order_id', 'owned_order_ids', 'reservation_coverage', 'manual_reservation_release',
+                 'account_coverage_retired')}
+                for session in self.store.lp_sessions() if session.get('state') == 'complete'
+                and session.get('account_coverage_retired')
+                and reservation_is_released(session, d['account_id'])
+                and self._manual_current_account_empty(d, session)}
             try:
-                targets, victims, candidates, blocked = self._ranked_buys(self.state(), diagnostics=diagnostics)
+                targets, victims, candidates, blocked = self._ranked_buys(
+                    state if observation is not None else self.state(),
+                    diagnostics=diagnostics, observation=observation)
             except ValueError as exc:
                 self._update(lambda doc: doc.update(last_round=dict(round_id=round_id,
                     checked_at=self._stamp(), actions=[], targets=[], blocked=[],
@@ -3567,15 +3620,9 @@ class LPAutoPool:
                 return self.state()
             plan = dict(version=2, account_id=d['account_id'],
                 approval_account_facts=deepcopy(d.get('account_financial_facts')),
-                retired_session_facts={session['session_id']: {key: deepcopy(session.get(key)) for key in
-                    ('session_id', 'idempotency_key', 'account_id', 'market_id', 'condition_id', 'token_id',
-                     'entry_order_id', 'owned_order_ids', 'reservation_coverage', 'manual_reservation_release',
-                     'account_coverage_retired')}
-                    for session in self.store.lp_sessions() if session.get('state') == 'complete'
-                    and session.get('account_coverage_retired')
-                    and reservation_is_released(session, d['account_id'])
-                    and self._manual_current_account_empty(d, session)},
-                live_buy_ids=sorted({r['order_id'] for r in self._account_projection_facts(d)[1]}
+                retired_session_facts=retired_session_facts,
+                live_buy_ids=sorted({r['order_id'] for r in (state['account_buys'] if observation is not None
+                    else self._account_projection_facts(d)[1])}
                     | {r['order_id'] for r in targets + victims if self._resting_buy(r) and r.get('order_id')
                         and (r.get('account_order') or d['intents'].get(r.get('intent_id'), {}).get('state') in ('active', 'canceling'))}),
                 round_id=round_id, started_at=self._stamp(), config_version=d['config_version'],
@@ -3591,7 +3638,8 @@ class LPAutoPool:
                 with ExitStack() as guards, self.store._transaction() as connection:
                     # Registration takes its apply lane before SQLite. Never
                     # wait on that lane while holding the first approval writer.
-                    for lock in (self._account_refresh_lock, self.lp._first_seen_apply_lock):
+                    for lock in (() if observation is not None else
+                                 (self._account_refresh_lock, self.lp._first_seen_apply_lock)):
                         if not lock.acquire(blocking=False):
                             raise ValueError('account_round_invalid')
                         guards.callback(lock.release)
@@ -3601,10 +3649,15 @@ class LPAutoPool:
 
                     def approve(document):
                         self._plan_controls(document, plan)
-                        if document.get('active_plan') is not None:
+                        if document.get('active_plan') is not None or round_id in document['rounds']:
                             raise ValueError('plan_authorization_invalid')
                         approval = plan.get('approval_account_facts')
-                        if approval is not None:
+                        if observation is not None:
+                            # Funding and occupancy were validated together
+                            # at acquisition. Only current execution controls
+                            # authorize this atomic fixed-plan publication.
+                            pass
+                        elif approval is not None:
                             if (document.get('account_financial_facts') != approval
                                     or type(approval.get('trade_generation')) is not int
                                     or approval['trade_generation'] != current_generation):
@@ -3627,10 +3680,10 @@ class LPAutoPool:
                                 if row.get('ranking_account') is not None:
                                     self._ranking_fresh(row)
                         sync_error = getattr(self.lp, '_account_order_sync_error', None)
-                        if sync_error:
+                        if observation is None and sync_error:
                             raise ValueError(sync_error)
                         waiting = self._account_facts_wait
-                        if waiting:
+                        if observation is None and waiting:
                             reasons = self._account_projection_facts(document)[2]
                             if reasons and reasons[0] == waiting['reason']:
                                 raise ValueError(waiting['reason'])

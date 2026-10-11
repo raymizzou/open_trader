@@ -34,16 +34,18 @@ def install_order_result_reader(exchange, monkeypatch):
 @pytest.mark.parametrize('invalidation', ['generation', 'ttl', 'timing_only',
     'incomplete_publication', 'registration_inflight'])
 def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch, invalidation):
+    """#329 commits controls atomically without revoking acquired finances."""
     import json
     import sqlite3
     from pathlib import Path
     from threading import get_ident
 
     engine, exchange, _, store = plan_setup(tmp_path, monkeypatch, budget='39')
+    install_order_result_reader(exchange, monkeypatch)
     entered, release = Event(), Event()
     caller, armed, intercepted = [], [False], []
     barrier_errors, signed, account_reads, market_reads = [], [], [], []
-    incomplete, financial_reads = [False], []
+    incomplete, financial_reads, signed_plans = [False], [], []
     registration_entered, registration_release = Event(), Event()
     registration_caller, registration_armed, registration_intercepted = [], [False], []
     connect = sqlite3.connect
@@ -94,6 +96,7 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
         return result
 
     def observed_sign(**kwargs):
+        signed_plans.append(deepcopy(engine.lp_auto_state()['active_plan']))
         signed.append(deepcopy(kwargs))
         return sign(**kwargs)
 
@@ -160,26 +163,27 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
                 try:
                     assert registration_entered.wait(5), 'Real registration reaches its own writer in its apply lane'
                     assert registration_caller[0] != caller[0]
-                    refusal_at = pool.NOW
                     release.set()
-                    assert pending.result(timeout=5), 'First approval rolls back without waiting for registration'
-                    refused = engine.lp_auto_state()
-                    assert refused['active_plan'] is None and refused['intents'] == []
-                    assert refused['last_round']['reason'] == 'account_round_invalid'
-                    assert signed == exchange.posts == exchange.cancels == []
-                    assert store.lp_sessions() == []
-                    with connect(store.path) as connection:
-                        assert connection.execute('SELECT COUNT(*) FROM lp_actions').fetchone()[0] == 0
+                    assert pending.result(timeout=5), 'Original plan progresses without the background apply lane'
+                    progressed = engine.lp_auto_state()
+                    assert progressed['active_plan'] is None and progressed['last_round']['completed_at']
+                    assert [p['token_id'] for p in exchange.posts] == ['B', 'C', 'E', 'F', 'G']
+                    assert exchange.cancels == []
+                    assert len(store.lp_sessions()) == 5
                 finally:
                     registration_release.set()
                 published = publishing.result(timeout=5)
-                assert published['state'] == 'ready', published
                 assert registration_intercepted == [dict(thread=registration_caller[0], statement='BEGIN IMMEDIATE')]
                 with connect(store.path) as connection:
                     current = json.loads(connection.execute(
                         'SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
-                assert current['account_financial_facts']['financial_status'] == 'known'
-                assert Decimal(current['account_financial_facts']['inventory_cost_usd']) == Decimal('7.80')
+                if published.get('state') == 'ready':
+                    assert current['account_financial_facts']['financial_status'] == 'known'
+                    assert Decimal(current['account_financial_facts']['inventory_cost_usd']) == Decimal('7.80')
+                else:
+                    assert published['reason'] == 'account_round_invalid', published
+                    assert current['account_financial_facts'] == approval
+                assert engine.lp_auto_state()['last_round']['round_id'] == progressed['last_round']['round_id']
             else:
                 configured = engine.lp_auto_configure(dict(round_interval_seconds=90))
                 assert configured['config_version'] == before['config_version'] + 1
@@ -193,62 +197,58 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
                     current = json.loads(connection.execute(
                         'SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
                 assert current['account_financial_facts'] == approval
-            if invalidation != 'registration_inflight':
-                refusal_at = pool.NOW
         finally:
             release.set()
         assert pending.result(timeout=5)
     assert intercepted == ['BEGIN IMMEDIATE'] and barrier_errors == []
     state = engine.lp_auto_state()
-    if invalidation == 'timing_only':
-        assert [p['token_id'] for p in exchange.posts] == ['B', 'C', 'E', 'F', 'G'], state['last_round']
-        assert all(p['price'] == Decimal('.39') and p['quantity'] == 20 for p in exchange.posts)
-        assert [r['token_id'] for r in state['last_round']['targets']] == ['B', 'C', 'E', 'F', 'G']
-        assert all(a['state'] == 'success' for a in state['last_round']['actions'])
-        assert state['last_round']['completed_at'] and state['active_plan'] is None
-        assert state['plan_wait']['kind'] == 'round'
-        assert datetime.fromisoformat(state['plan_wait']['deadline']) == datetime.fromisoformat(
-            state['last_round']['completed_at']) + timedelta(seconds=90)
-        assert len(account_reads) == 1 and exchange.cancels == []
-        return
-    assert signed == exchange.posts == exchange.cancels == []
-    assert state['active_plan'] is None and state['intents'] == []
-    assert store.lp_sessions() == []
-    with connect(store.path) as connection:
-        assert connection.execute('SELECT COUNT(*) FROM lp_actions').fetchone()[0] == 0
-    assert state['last_round']['actions'] == []
-    assert not state['last_round'].get('completed_at')
-    assert state['last_round']['reason'] == dict(generation='account_financial_facts_changed',
-        ttl='account_financial_facts_stale', incomplete_publication='account_order_sync_unknown',
-        registration_inflight='account_round_invalid')[invalidation]
-    assert state['plan_wait']['kind'] == 'api'
-    started = datetime.fromisoformat(state['plan_wait']['started_at'])
-    deadline = datetime.fromisoformat(state['plan_wait']['deadline'])
-    assert started == refusal_at and deadline == started + timedelta(seconds=60)
+    assert [p['token_id'] for p in exchange.posts] == ['B', 'C', 'E', 'F', 'G'], state['last_round']
+    assert all(p['price'] == Decimal('.39') and p['quantity'] == 20 for p in exchange.posts)
+    assert [r['token_id'] for r in state['last_round']['targets']] == ['B', 'C', 'E', 'F', 'G']
+    assert all(a['state'] == 'success' for a in state['last_round']['actions'])
+    assert state['last_round']['completed_at'] and state['active_plan'] is None
+    assert exchange.cancels == []
     original_round = state['last_round']['round_id']
+    assert signed_plans and all(plan['round_id'] == original_round for plan in signed_plans)
+    assert all(plan['approval_account_facts'] == approval for plan in signed_plans)
+    original_requests = [(session['session_id'], session['idempotency_key']) for session in store.lp_sessions()]
+    completed = datetime.fromisoformat(state['last_round']['completed_at'])
+    interval = 90 if invalidation == 'timing_only' else 60
+    assert state['plan_wait']['kind'] == 'round'
+    deadline = datetime.fromisoformat(state['plan_wait']['deadline'])
+    assert deadline == completed + timedelta(seconds=interval)
     read_counts = (len(account_reads), len(market_reads))
-    for elapsed in (1, 59):
-        monkeypatch.setattr(pool, 'NOW', started + timedelta(seconds=elapsed))
+    for elapsed in (1, interval - 1):
+        monkeypatch.setattr(pool, 'NOW', completed + timedelta(seconds=elapsed))
         scheduler.request_check()
         assert not scheduler.run_due()
         assert (len(account_reads), len(market_reads)) == read_counts
-        assert engine.lp_auto_state()['active_plan'] is None
-        assert signed == exchange.posts == exchange.cancels == []
+        assert engine.lp_auto_state()['last_round']['round_id'] == original_round
+        assert len(exchange.posts) == 5 and exchange.cancels == []
+    assert not any(financial_reads)
+    if invalidation in ('timing_only', 'ttl'):
+        assert len(account_reads) == 1
+        return
     monkeypatch.setattr(pool, 'NOW', deadline)
     assert scheduler.run_due()
     state = engine.lp_auto_state()
-    expected = ['B', 'C', 'E', 'F'] if invalidation in ('generation', 'incomplete_publication', 'registration_inflight') else ['B', 'C', 'E', 'F', 'G']
-    assert [p['token_id'] for p in exchange.posts] == expected, state['last_round']
-    assert all(p['price'] == Decimal('.39') and p['quantity'] == 20 for p in exchange.posts)
-    assert [r['token_id'] for r in state['last_round']['targets']] == expected
+    assert [r['token_id'] for r in state['last_round']['targets']] == ['B', 'C', 'E', 'F'], state['last_round']
     assert state['last_round']['round_id'] != original_round
+    next_round = state['last_round']['round_id']
+    assert exchange.cancels == ['o5'] and len(exchange.posts) == 5
+    assert state['active_plan']['round_id'] == next_round and state['plan_wait']['kind'] == 'order'
+    monkeypatch.setattr(pool, 'NOW', datetime.fromisoformat(state['plan_wait']['deadline']))
+    assert scheduler.run_due()
+    state = engine.lp_auto_state()
+    assert state['last_round']['round_id'] == next_round
     assert state['last_round']['completed_at'] and state['active_plan'] is None
-    assert exchange.cancels == [] and state['slots']['occupied'] == len(expected)
+    assert live_orders(exchange) == {'B': 'o1', 'C': 'o2', 'E': 'o3', 'F': 'o4'}
+    assert exchange.cancels == ['o5'] and len(exchange.posts) == 5
+    assert [(session['session_id'], session['idempotency_key']) for session in store.lp_sessions()] == original_requests
     assert Decimal(state['funds']['total_usd']) == 39
-    assert Decimal(state['funds']['inventory_cost_usd']) == (Decimal('7.80')
-        if invalidation in ('generation', 'incomplete_publication', 'registration_inflight') else Decimal(0))
-    assert len(account_reads) > read_counts[0]
-    assert not any(financial_reads)
+    assert Decimal(state['funds']['inventory_cost_usd']) == Decimal('7.80')
+    assert state['slots']['occupied'] == 4
+    assert len(account_reads) > read_counts[0] and not any(financial_reads)
 
 
 @pytest.mark.parametrize('window', ['before_prepare', 'after_sign'])
@@ -654,11 +654,12 @@ def test_entry_audit_registration_failure_prevents_post(tmp_path, monkeypatch):
     'generation_during_read', 'generation_during_planning',
 ])
 def test_planning_requires_valid_account_facts(tmp_path, monkeypatch, invalid):
+    """Initial invalidity fails closed; later planning generation does not revoke the read."""
     engine, exchange, _, store = plan_setup(tmp_path, monkeypatch)
     read = exchange.lp_account_snapshot_shared
     reward = exchange.lp_reward_catalog
     armed = [True]
-    reads, failed_at = [], []
+    reads, failed_at, observations = [], [], []
 
     def account(**kwargs):
         reads.append(pool.NOW)
@@ -680,7 +681,12 @@ def test_planning_requires_valid_account_facts(tmp_path, monkeypatch, invalid):
     def catalog(**kwargs):
         result = reward(**kwargs)
         if armed[0] and invalid == 'generation_during_planning' and not failed_at:
-            assert store.lp_advance_trade_generation(store.lp_trade_generation())
+            import json, sqlite3
+            with sqlite3.connect(store.path) as connection:
+                facts = json.loads(connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])['account_financial_facts']
+            assert facts['financial_status'] == 'known' and len(reads) == 1
+            observations.append(facts)
+            assert store.lp_advance_trade_generation(facts['trade_generation'])
             failed_at.append(pool.NOW)
         return result
 
@@ -690,6 +696,19 @@ def test_planning_requires_valid_account_facts(tmp_path, monkeypatch, invalid):
     assert scheduler.run_due()
     state = engine.lp_auto_state()
     assert len(failed_at) == 1
+    if invalid == 'generation_during_planning':
+        assert [p['token_id'] for p in exchange.posts] == ['B', 'C', 'E', 'F', 'G']
+        assert all(p['price'] == Decimal('.39') and p['quantity'] == 20 for p in exchange.posts)
+        assert exchange.cancels == [] and len(reads) == 1
+        assert set(live_orders(exchange)) == {'B', 'C', 'E', 'F', 'G'}
+        assert state['active_plan'] is None and state['last_round']['completed_at']
+        assert state['funds']['as_of'] == observations[0]['checked_at']
+        assert state['funds']['status'] == 'unknown'
+        assert 'account_financial_facts_changed' in state['admission_block_reasons']
+        assert state['plan_wait']['kind'] == 'round'
+        assert datetime.fromisoformat(state['plan_wait']['deadline']) == datetime.fromisoformat(
+            state['last_round']['completed_at']) + timedelta(seconds=60)
+        return
     assert exchange.posts == exchange.cancels == []
     assert state['active_plan'] is None
     assert not state['last_round'].get('completed_at')

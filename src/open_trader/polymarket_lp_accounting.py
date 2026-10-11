@@ -221,6 +221,21 @@ def _account_trade_report(snapshot, orders, positions, *, wallet, now):
 def build_account_financial_facts(
     snapshot: Mapping[str, object], *, now: datetime, expected_account_id: str | None = None,
 ) -> dict[str, object]:
+    return _build_account_exposure_facts(snapshot, now=now, expected_account_id=expected_account_id)
+
+
+def build_planning_account_facts(
+    snapshot: Mapping[str, object], *, now: datetime, expected_account_id: str | None = None,
+) -> dict[str, object]:
+    """Price complete current exposure without claiming full historical authority."""
+    return _build_account_exposure_facts(snapshot, now=now,
+        expected_account_id=expected_account_id, planning=True)
+
+
+def _build_account_exposure_facts(
+    snapshot: Mapping[str, object], *, now: datetime, expected_account_id: str | None = None,
+    planning: bool = False,
+) -> dict[str, object]:
     """Validate an authenticated round and price actual account exposure once.
 
     Current positions and open orders are authoritative for exposure. Trade
@@ -229,7 +244,7 @@ def build_account_financial_facts(
     if snapshot.get('authenticated') is not True:
         raise ValueError('account_snapshot_unknown')
     required = ('balance_complete', 'open_orders_complete', 'positions_complete',
-                'trades_complete', 'pagination_complete')
+                *(('current_pagination_complete',) if planning else ('trades_complete', 'pagination_complete')))
     if any(snapshot.get(key) is not True for key in required):
         raise ValueError('account_snapshot_incomplete')
     wallet = str(snapshot.get('wallet_address') or '').strip().casefold()
@@ -246,7 +261,7 @@ def build_account_financial_facts(
         raise ValueError('account_read_order_invalid')
     _freshness(checked, now, 'account_freshness')
     _freshness(ended, now, 'account_freshness')
-    for name in ('open_orders', 'positions', 'raw_trades'):
+    for name in ('open_orders', 'positions', *(('raw_trades',) if not planning else ())):
         if not isinstance(snapshot.get(name), (tuple, list)):
             raise ValueError('account_' + name + '_unknown')
     balance = _number(snapshot.get('balance'), 'account_balance_unknown')
@@ -316,6 +331,8 @@ def build_account_financial_facts(
         positions[token] = quantity
         position_costs[token] = cost
     try:
+        if planning and snapshot.get('trades_complete') is not True:
+            raise ValueError('account_trade_history_unavailable')
         report = _account_trade_report(snapshot, orders, positions, wallet=wallet, now=now)
     except ValueError as exc:
         report = dict(realized_pnl_usd=None, report_status='unknown',
@@ -344,6 +361,8 @@ def build_account_financial_facts(
         positions=[dict(token_id=token, quantity=str(positions[token]),
             inventory_cost_usd=str(position_costs[token]) if position_costs[token] is not None else None)
             for token in sorted(positions)])
+    if planning:
+        result.update(publication_scope='planning', trades_complete=snapshot.get('trades_complete') is True)
     result['snapshot_id'] = hashlib.sha256(json.dumps(result, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     return result
 
