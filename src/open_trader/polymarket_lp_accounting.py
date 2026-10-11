@@ -221,6 +221,21 @@ def _account_trade_report(snapshot, orders, positions, *, wallet, now):
 def build_account_financial_facts(
     snapshot: Mapping[str, object], *, now: datetime, expected_account_id: str | None = None,
 ) -> dict[str, object]:
+    return _build_account_exposure_facts(snapshot, now=now, expected_account_id=expected_account_id)
+
+
+def build_planning_account_facts(
+    snapshot: Mapping[str, object], *, now: datetime, expected_account_id: str | None = None,
+) -> dict[str, object]:
+    """Price complete current exposure without claiming full historical authority."""
+    return _build_account_exposure_facts(snapshot, now=now,
+        expected_account_id=expected_account_id, planning=True)
+
+
+def _build_account_exposure_facts(
+    snapshot: Mapping[str, object], *, now: datetime, expected_account_id: str | None = None,
+    planning: bool = False,
+) -> dict[str, object]:
     """Validate an authenticated round and price actual account exposure once.
 
     Current positions and open orders are authoritative for exposure. Trade
@@ -229,7 +244,7 @@ def build_account_financial_facts(
     if snapshot.get('authenticated') is not True:
         raise ValueError('account_snapshot_unknown')
     required = ('balance_complete', 'open_orders_complete', 'positions_complete',
-                'trades_complete', 'pagination_complete')
+                *(('current_pagination_complete',) if planning else ('trades_complete', 'pagination_complete')))
     if any(snapshot.get(key) is not True for key in required):
         raise ValueError('account_snapshot_incomplete')
     wallet = str(snapshot.get('wallet_address') or '').strip().casefold()
@@ -246,7 +261,7 @@ def build_account_financial_facts(
         raise ValueError('account_read_order_invalid')
     _freshness(checked, now, 'account_freshness')
     _freshness(ended, now, 'account_freshness')
-    for name in ('open_orders', 'positions', 'raw_trades'):
+    for name in ('open_orders', 'positions', *(('raw_trades',) if not planning else ())):
         if not isinstance(snapshot.get(name), (tuple, list)):
             raise ValueError('account_' + name + '_unknown')
     balance = _number(snapshot.get('balance'), 'account_balance_unknown')
@@ -316,6 +331,8 @@ def build_account_financial_facts(
         positions[token] = quantity
         position_costs[token] = cost
     try:
+        if planning and snapshot.get('trades_complete') is not True:
+            raise ValueError('account_trade_history_unavailable')
         report = _account_trade_report(snapshot, orders, positions, wallet=wallet, now=now)
     except ValueError as exc:
         report = dict(realized_pnl_usd=None, report_status='unknown',
@@ -344,6 +361,8 @@ def build_account_financial_facts(
         positions=[dict(token_id=token, quantity=str(positions[token]),
             inventory_cost_usd=str(position_costs[token]) if position_costs[token] is not None else None)
             for token in sorted(positions)])
+    if planning:
+        result.update(publication_scope='planning', trades_complete=snapshot.get('trades_complete') is True)
     result['snapshot_id'] = hashlib.sha256(json.dumps(result, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     return result
 
@@ -429,6 +448,74 @@ def buy_action_is_covered(session, action):
     return (isinstance(marker, Mapping) and action.get('side') == 'BUY'
         and marker.get('attempt_identity') == buy_attempt_identity(action)
         and reservation_is_covered({**session, 'reservation_coverage': marker}))
+
+
+def project_planning_buy_holds(sessions, actions_by_session, intents, current_buys, *,
+                               account_id, checked_at, read_started_at):
+    """Project local requests without assigning coverage or changing their audit."""
+    bindings = {}
+    for intent in intents.values():
+        bindings.setdefault(str(intent.get('session_id') or ''), []).append(intent)
+    current = {(b['order_id'], b['token_id'], b['side'], b.get('session_id'))
+               for b in current_buys}
+    holds, isolation, inflight = [], {}, False
+    independent_sell = False
+    for session in sessions:
+        sid = session['session_id']
+        bound = bindings.get(sid, ())
+        explicit = str(session.get('account_id') or '').strip().casefold()
+        legacy_owned = (not explicit and len(bound) == 1 and
+            session['idempotency_key'] == 'lp-auto:' + str(bound[0].get('intent_id') or ''))
+        if explicit != account_id and not legacy_owned:
+            continue
+        actions = actions_by_session[sid]
+        independent_sell |= has_independent_unresolved_action(session,
+            [a for a in actions if a.get('side') == 'SELL'])
+
+        def isolatable(row):
+            try:
+                _number(row.get('inventory_cost_usd', 0), 'inventory_cost_usd')
+                _number(row.get('reserved_usd'), 'reserved_usd')
+            except ValueError:
+                return False
+            return bool(row.get('condition_id') and row.get('token_id')
+                and row.get('inventory_cost_usd', 0) is not None and row.get('reserved_usd') is not None
+                and not session.get('order_identity_conflict') and not row.get('order_identity_conflict')
+                and 'identity' not in str(row.get('reconcile_reason') or '')
+                and row.get('reconcile_reason') not in {'owned_order_token_mismatch', 'owned_order_side_mismatch'}
+                and not any(a.get('side') == 'BUY' and a.get('role') != 'entry' for a in actions))
+
+        for intent in bound:
+            isolation[intent['intent_id']] = isolatable(intent)
+        for action in actions:
+            if not unresolved_buy_action(action) or buy_action_is_covered(session, action):
+                continue
+            is_entry = submission_action_kind(action) == 'entry'
+            identity_valid = (not session.get('order_identity_conflict')
+                and action.get('token_id') == session.get('token_id'))
+            if identity_valid and (action.get('order_id'), action.get('token_id'), 'BUY', sid) in current:
+                continue
+            if (is_entry and len(bound) == 1 and identity_valid
+                    and session['idempotency_key'] == 'lp-auto:' + str(bound[0].get('intent_id') or '')):
+                continue
+            try:
+                price = _number(action.get('price', session.get('price') if is_entry else None), 'price', positive=True)
+                quantity = _number(action.get('quantity', session.get('quantity') if is_entry else None), 'quantity', positive=True)
+            except ValueError:
+                price = quantity = None
+            hold = dict(intent_id='action:' + str(action['action_id']), action_id=action['action_id'],
+                session_id=sid, order_id=action.get('order_id'), token_id=action.get('token_id'), side='BUY',
+                condition_id=session.get('condition_id'), state='unknown', financial_status='unknown',
+                inventory_cost_usd='0', reserved_usd=str(price * quantity) if price is not None else None,
+                checked_at=checked_at, price=str(price) if price is not None else None,
+                quantity=str(quantity) if quantity is not None else None)
+            if not identity_valid:
+                hold['order_identity_conflict'] = True
+            holds.append(hold)
+            isolation[hold['intent_id']] = isolatable(hold)
+            inflight |= ended_buy_action_evidence(session, action, read_started_at=read_started_at) is None
+    return dict(pending_buy_actions=holds, independent_sell_unknown=independent_sell,
+                isolation=isolation, account_send_inflight=inflight)
 
 
 def ended_reservation_evidence(intent, session, actions, *, account_id, pool_account_id, read_started_at):

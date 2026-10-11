@@ -939,6 +939,7 @@ def evaluate_lp_entry(
     reservations: object = (),
     candidate: bool = False,
     bid_level: int = 1,
+    _account_observed_at: datetime | None = None,
 ) -> dict[str, object]:
     """Return a manual LP entry guide when current input facts pass risk checks."""
 
@@ -1043,7 +1044,7 @@ def evaluate_lp_entry(
         )
         _freshness(
             account.get("checked_at"),
-            checked_at,
+            _account_observed_at if _account_observed_at is not None else checked_at,
             "account_freshness",
             max_age=(candidate_max_age or BOOK_FRESHNESS_SECONDS),
         )

@@ -46,6 +46,7 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
     active_trace = None
     read_role = local()
     shared_reader = adapter.lp_account_snapshot_shared
+    planning_reader = adapter._lp_planning_account_snapshot
 
     def request_record(args, kwargs):
         return dict(max_age=args[0] if args else kwargs.get('max_age_seconds'),
@@ -57,7 +58,7 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
         if active_trace is not None:
             if execution.lp_auto_state()['active_plan'] and not getattr(read_role, 'publisher', False):
                 active_trace['active_finance'].append(record)
-            destination = 'publishers' if getattr(read_role, 'publisher', False) else 'requests'
+            destination = 'publishers' if getattr(read_role, 'publisher', False) else 'shared'
             active_trace[destination].append(record)
         try:
             result = shared_reader(*args, **kwargs)
@@ -68,8 +69,24 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
 
     adapter.lp_account_snapshot_shared = observed_shared_reader
 
+    def observed_planning_reader(*args, **kwargs):
+        record = request_record(args, kwargs)
+        if active_trace is not None:
+            active_trace['requests'].append(record)
+            if execution.lp_auto_state()['active_plan']:
+                active_trace['active_finance'].append(record)
+        try:
+            result = planning_reader(*args, **kwargs)
+            record.update(successful=True, read_started_at=result['read_started_at'],
+                          checked_at=result['checked_at'], read_ended_at=result['read_ended_at'])
+            return result
+        finally:
+            record['sdk_after'] = account.position_reads
+
+    adapter._lp_planning_account_snapshot = observed_planning_reader
+
     def start_trace():
-        return dict(requests=[], publishers=[], posts=[], active_finance=[], active_balance=[], posts_before=len(account.posts),
+        return dict(requests=[], publishers=[], shared=[], posts=[], active_finance=[], active_balance=[], posts_before=len(account.posts),
                     sdk_before=account.position_reads)
 
     def advance_to_due():
@@ -82,7 +99,9 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
         requests = trace['requests']
         posts_before = trace['posts_before']
         assert len(requests) == 1, 'One required complete financial publication approves the new plan'
-        assert requests[0]['max_age'] == 0 and requests[0]['generation_provider_matches']
+        assert requests[0]['generation_provider_matches']
+        assert requests[0]['read_started_at'] <= requests[0]['checked_at'] <= requests[0]['read_ended_at']
+        assert requests[0]['read_ended_at'] <= runtime.clock[0]
         assert requests[0]['successful'] and requests[0]['sdk_after'] - requests[0]['sdk_before'] == 1
         assert requests[0]['posts_before'] == posts_before
         assert [p['request_count'] for p in trace['posts']] == [1, 1]
@@ -193,7 +212,8 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
                 # Real candidate maintenance publishes fresh ranking facts.
                 _advance(runtime, 61)
                 lp.refresh_candidate_recommendations()
-                reader = adapter.lp_account_snapshot_shared
+                reader = adapter._lp_planning_account_snapshot
+                publisher = adapter.lp_account_snapshot_shared
                 entered, release = Event(), Event()
                 calls = []
                 before_publication = account.position_reads
@@ -210,7 +230,7 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
                         raise LpObservationWait('account_round_invalid')
                     return reader(*args, **kwargs)
                 with monkeypatch.context() as race:
-                    race.setattr(adapter, 'lp_account_snapshot_shared', interrupted)
+                    race.setattr(adapter, '_lp_planning_account_snapshot', interrupted)
                     with ThreadPoolExecutor(1) as workers:
                         pending = workers.submit(execution.lp_auto_run_once, round_id=f'refill-{cycle}')
                         try:
@@ -221,7 +241,7 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
                             # public registration seam used by the dashboard.
                             read_role.publisher = True
                             try:
-                                fresh = reader(max_age_seconds=0, trade_generation_provider=store.lp_trade_generation)
+                                fresh = publisher(max_age_seconds=0, trade_generation_provider=store.lp_trade_generation)
                             finally:
                                 read_role.publisher = False
                             assert account.position_reads - before_publication == 1, 'Independent publisher reads the SDK once'

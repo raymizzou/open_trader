@@ -50,8 +50,9 @@ from .polymarket_lp_risk import (
     first_observation_baseline,
 )
 from .polymarket_lp_accounting import (
-    build_account_financial_facts, reservation_is_manually_released, reservation_is_released,
+    build_account_financial_facts, build_planning_account_facts, reservation_is_manually_released, reservation_is_released,
     buy_action_is_covered, unresolved_buy_action, submission_action_kind,
+    project_planning_buy_holds,
 )
 from .polymarket_lp_errors import LpObservationWait
 from .polymarket_lp_notification_batches import (
@@ -9380,7 +9381,7 @@ class PolymarketLPService:
         )
         return result["session"], bool(result["changed"])
 
-    def _register_account_snapshot(self, snapshot: Mapping[str, object]) -> dict[str, object]:
+    def _register_account_snapshot(self, snapshot: Mapping[str, object], *, _planning_only=False) -> dict[str, object]:
         """Register every account-owned order in one complete sync bundle.
 
         One LP session owns one token; a newly discovered SELL joins that
@@ -9393,7 +9394,8 @@ class PolymarketLPService:
             return {"state": "skipped", "reason": "account_snapshot_unknown"}
         required = (
             "balance_complete", "open_orders_complete",
-            "positions_complete", "trades_complete", "pagination_complete",
+            "positions_complete", *(("current_pagination_complete",) if _planning_only
+                                    else ("trades_complete", "pagination_complete")),
         )
         if any(snapshot.get(key) is not True for key in required):
             return {"state": "skipped", "reason": "account_snapshot_incomplete"}
@@ -9446,10 +9448,10 @@ class PolymarketLPService:
                     "state": "failed",
                     "reason": "account_order_identity_unknown",
                 }
-        if "raw_trades" not in snapshot or not isinstance(snapshot["raw_trades"], (list, tuple)):
+        if not _planning_only and ("raw_trades" not in snapshot or not isinstance(snapshot["raw_trades"], (list, tuple))):
             return {"state": "failed", "reason": "account_raw_trades_unknown"}
         raw_orders = [row for row in open_orders if isinstance(row, Mapping)]
-        owned_fills = self._owned_sync_order_rows(snapshot["raw_trades"], wallet)
+        owned_fills = ([] if _planning_only else self._owned_sync_order_rows(snapshot["raw_trades"], wallet))
         known_ids = {
             str(_field(row, "order_id", _field(row, "id", "")) or "") for row in raw_orders
         }
@@ -9510,10 +9512,12 @@ class PolymarketLPService:
 
             # Validate current exposure before publication. Historical report
             # gaps cannot veto API positions or create additional reservations.
-            financial_facts = build_account_financial_facts(
+            builder = build_planning_account_facts if _planning_only else build_account_financial_facts
+            financial_facts = builder(
                 snapshot, now=self._now(), expected_account_id=account_id,
             )
             token_results = []
+            registered_sessions = {}
             created = joined = 0
             prepare_seconds = monotonic() - prepared_at
             _lp_causal_event("account_publish_ready", account=snapshot, prepare_seconds=prepare_seconds)
@@ -9542,20 +9546,58 @@ class PolymarketLPService:
                         joined += int(not result["created"])
                         token_results.append({"token_id": token, "state": state,
                                               "session_id": result["session"]["session_id"]})
+                        registered_sessions[token] = result['session']
                     # The empty-account case uses the same fenced transaction:
                     # it is evidence of zero occupancy, not an early return.
-                    self.store.lp_publish_account_financial_facts(
-                        financial_facts, connection=connection,
-                        expected_generation=generation, diagnostics=diagnostics,
-                    )
+                    if _planning_only:
+                        # Register proven current IDs, without account-wide
+                        # coverage, historical conclusions or full publication.
+                        for buy in financial_facts['buys']:
+                            session = registered_sessions[buy['token_id']]
+                            buy['session_id'] = session['session_id']
+                            for key in ('condition_id', 'market_id', 'outcome'):
+                                if not buy.get(key):
+                                    buy[key] = session.get(key)
+                    else:
+                        self.store.lp_publish_account_financial_facts(
+                            financial_facts, connection=connection,
+                            expected_generation=generation, diagnostics=diagnostics,
+                        )
+                    # Carry this transaction's exact source through the public
+                    # registration return. A later publisher is not its owner.
+                    row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+                    planning_document = json.loads(row['payload']) if row else {}
+                    if _planning_only:
+                        sessions = [self.store._lp_row_result(row) for row in
+                            connection.execute('SELECT * FROM lp_sessions ORDER BY session_id').fetchall()]
+                        holds = project_planning_buy_holds(sessions,
+                            {s['session_id']: self.store.lp_actions(s['session_id'], connection=connection)
+                             for s in sessions}, planning_document.get('intents') or {}, financial_facts['buys'],
+                            account_id=financial_facts['account_id'], checked_at=financial_facts['checked_at'],
+                            read_started_at=_timestamp(financial_facts['read_started_at'], name='read_started_at'))
+                        financial_facts.update({key: holds[key] for key in
+                            ('pending_buy_actions', 'independent_sell_unknown')})
+                        if holds['account_send_inflight']:
+                            financial_facts['financial_status'] = 'unknown'
+                            financial_facts['reason_codes'] = sorted(set(financial_facts.get('reason_codes') or ())
+                                | {'account_send_inflight'})
+                        planning_document['_planning_buy_isolation'] = holds['isolation']
+                        planning_document['account_financial_facts'] = deepcopy(financial_facts)
+                    planning_capture = dict(document=planning_document, validated_at=self._now())
             return {"state": "registered", "tokens": token_results,
-                    "created": created, "joined": joined}
+                    "created": created, "joined": joined,
+                    '_planning_capture': planning_capture,
+                    **({'planning_facts': financial_facts} if _planning_only else {})}
         except ValueError as exc:
             if isinstance(exc, LpObservationWait):
                 return {"state": "skipped", "reason": "account_round_invalid",
                         "wait_reason": str(exc), "tokens": [], "created": 0, "joined": 0}
             return {"state": "failed", "reason": str(exc),
                     "tokens": [], "created": 0, "joined": 0}
+
+    def _register_planning_account_snapshot(self, snapshot):
+        """Current-only registration cannot clear or replace full-publication diagnostics."""
+        return self._register_account_snapshot(snapshot, _planning_only=True)
 
     def register_account_snapshot(
         self, snapshot: Mapping[str, object]

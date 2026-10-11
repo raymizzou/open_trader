@@ -2536,14 +2536,15 @@ class PolymarketTradingClient:
         except Exception:
             return False
 
-    def _account_read_facts(self):
+    def _account_read_facts(self, *, _planning: bool = False):
         with _lp_read_task("account_read_facts"), _lp_read_lock(self._lp_account_read_lock, "account_lock_wait"):
             retry = self._lp_account_read_retry
             if retry is not None and time.monotonic() < retry[0]:
                 raise PolymarketTradingError("network", response_facts=self._lp_public_retry_projection(retry))
             self._lp_account_read_retry = None
             try:
-                return self._account_read_facts_once()
+                return (self._account_read_facts_once(_planning=True) if _planning
+                        else self._account_read_facts_once())
             except PolymarketTradingError as exc:
                 deadline = self._lp_public_retry_after(exc.response_facts)
                 if deadline is not None:
@@ -2552,7 +2553,7 @@ class PolymarketTradingClient:
                 raise
 
     def _account_read_facts_once(
-        self,
+        self, *, _planning: bool = False,
     ) -> tuple[
         Decimal,
         Decimal,
@@ -2596,12 +2597,22 @@ class PolymarketTradingClient:
                 _lp_read_count(records=len(orders))
             # This read is intentionally performed even though the snapshot only
             # formerly discarded it; the round now preserves the complete list.
-            with _lp_read_stage("account_trades"):
-                raw_trades = self._client.list_account_trades()
-                if raw_trades is None:
-                    raise ValueError("account_trades_unknown")
-                trades = tuple(_collect(raw_trades))
-                _lp_read_count(records=len(trades))
+            trades_complete = True
+            try:
+                with _lp_read_stage("account_trades"):
+                    raw_trades = self._client.list_account_trades()
+                    if raw_trades is None:
+                        raise ValueError("account_trades_unknown")
+                    trades = tuple(_collect(raw_trades))
+                    _lp_read_count(records=len(trades))
+            except Exception as exc:
+                # Only the private planning read can proceed without a
+                # historical transport. Authentication and invalid carriers
+                # still fail; None means unavailable, never a complete empty list.
+                if (not _planning or _safe_error_code(exc) not in {"timeout", "network", "unavailable"}
+                        or _safe_history_response_facts(exc).get("status") in {401, 403}):
+                    raise
+                trades, trades_complete = None, False
             with _lp_read_stage("account_positions"):
                 raw_positions = self._client.list_positions()
                 if raw_positions is None:
@@ -2616,7 +2627,7 @@ class PolymarketTradingClient:
                 positions,
                 checked_at,
                 trades,
-                True,
+                trades_complete,
                 read_started_at,
                 read_ended_at,
             )
@@ -2730,10 +2741,26 @@ class PolymarketTradingClient:
                 account = self._lp_account_facts(include_raw_trades=True)
             else:
                 account = dict(self._lp_account_snapshot_for_round(account_round)[0])
+            return self._enrich_lp_account_snapshot(account, keep_raw=account_round is not None)
+
+    def _lp_planning_account_snapshot(self, *, trade_generation_provider) -> dict[str, object]:
+        """Read one current planning observation without sharing partial cache data."""
+        with _lp_read_task("planning_account_snapshot"):
+            before = trade_generation_provider()
+            account = self._lp_account_facts(include_raw_trades=True, _planning=True)
+            after = trade_generation_provider()
+            if before != after:
+                raise LpAccountRoundInvalid("lp_account_round_invalid")
+            account['trade_generation'] = after
+            return self._enrich_lp_account_snapshot(account, keep_raw=True)
+
+    def _enrich_lp_account_snapshot(self, account, *, keep_raw):
+        """Display enrichment never upgrades the completeness of a source read."""
+        with _lp_read_stage("account_enrichment"):
             raw_trades = account.get("raw_trades", ())
             normalized_trades = []
             complete = account.get("trades_complete") is True
-            for raw in raw_trades:
+            for raw in raw_trades or ():
                 row = _lp_trade(raw)
                 if row is None:
                     complete = False
@@ -2744,9 +2771,9 @@ class PolymarketTradingClient:
                     complete = False
                     continue
                 normalized_trades.append(row)
-            account.update(account_trades=tuple(normalized_trades),
-                display_trades_complete=complete, account_trades_total=len(raw_trades))
-            if account_round is None:
+            account.update(account_trades=tuple(normalized_trades) if raw_trades is not None else None,
+                display_trades_complete=complete, account_trades_total=len(raw_trades) if raw_trades is not None else None)
+            if not keep_raw:
                 # Raw own-fill evidence is internal to a fenced registration round.
                 account.pop("raw_trades", None)
             order_rows, position_rows = account['open_orders'], account['positions']
@@ -2888,12 +2915,12 @@ class PolymarketTradingClient:
             raise ValueError("open_orders_unknown")
         return deepcopy(list(account.get("open_orders", ())))
 
-    def _lp_account_facts(self, *, include_raw_trades: bool = False) -> dict[str, object]:
+    def _lp_account_facts(self, *, include_raw_trades: bool = False, _planning: bool = False) -> dict[str, object]:
         """Normalize complete authenticated lists before any display enrichment."""
 
         lp_checked_at = datetime.now(UTC)
         try:
-            facts = tuple(self._account_read_facts())
+            facts = tuple(self._account_read_facts(_planning=True) if _planning else self._account_read_facts())
             balance, allowance, orders, positions, account_checked_at, raw_trades, trades_complete = facts[:7]
             read_started_at = facts[7] if len(facts) > 7 else account_checked_at
             read_ended_at = facts[8] if len(facts) > 8 else datetime.now(UTC)
@@ -2978,6 +3005,7 @@ class PolymarketTradingClient:
             "trades": (),
             "trades_complete": trades_complete,
             "raw_trades": raw_trades,
+            **({"current_pagination_complete": open_orders_complete and positions_complete} if _planning else {}),
         }
 
     def lp_open_orders_snapshot(self) -> dict[str, object]:
