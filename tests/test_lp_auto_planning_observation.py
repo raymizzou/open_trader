@@ -4,10 +4,14 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import json
 import sqlite3
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 
 from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.polymarket_trading import PolymarketTradingError
 from tests import test_lp_auto_pool as pool
 from tests.test_lp_auto_plan_execution import install_order_result_reader
@@ -37,6 +41,99 @@ def economics(value):
     if isinstance(value, list):
         return [economics(item) for item in value]
     return value
+
+
+def test_equivalent_publication_after_registration_keeps_observation(tmp_path, monkeypatch):
+    engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch, budget='39')
+    install_order_result_reader(exchange, monkeypatch)
+    reached, release = Event(), Event()
+    errors, registrations, reads, signed_plans = [], [], [], []
+    shared, sign = exchange.lp_account_snapshot_shared, exchange.lp_create_limit_order
+
+    def observed_account(**kwargs):
+        snapshot = shared(**kwargs)
+        reads.append(deepcopy(snapshot))
+        return snapshot
+
+    def observed_sign(**kwargs):
+        signed_plans.append(deepcopy(engine.lp_auto_state()['active_plan']))
+        return sign(**kwargs)
+
+    monkeypatch.setattr(exchange, 'lp_account_snapshot_shared', observed_account)
+    monkeypatch.setattr(exchange, 'lp_create_limit_order', observed_sign)
+    code = PolymarketLPService.register_account_snapshot.__code__
+    scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
+
+    def run_auto():
+        previous = sys.getprofile()
+
+        def observer(frame, event, result):
+            if (event != 'return' or frame.f_code is not code
+                    or frame.f_locals.get('self') is not lp or registrations):
+                return
+            try:
+                assert result['state'] == 'registered'
+                response = frame.f_locals['snapshot']
+                assert response == reads[0]
+                assert lp.store.path == store.path
+                document = pool_document(store)
+                assert document.get('active_plan') is None and document.get('intents', {}) == {}
+                with sqlite3.connect(store.path) as connection:
+                    assert connection.execute('SELECT COUNT(*) FROM lp_actions').fetchone()[0] == 0
+                original = deepcopy(document['account_financial_facts'])
+                assert original['financial_status'] == 'known'
+                assert original['trade_generation'] == response['trade_generation']
+                assert original['checked_at'] == response['checked_at'].isoformat()
+                registrations.append((original, response, deepcopy(response), deepcopy(result)))
+                reached.set()
+                if not release.wait(5):
+                    errors.append('Independent registration-return watchdog expired')
+            except BaseException as exc:
+                errors.append(repr(exc))
+                reached.set()
+
+        sys.setprofile(observer)
+        try:
+            return scheduler.run_due()
+        finally:
+            sys.setprofile(previous)
+
+    with ThreadPoolExecutor(2) as workers:
+        pending = workers.submit(run_auto)
+        publishing = None
+        try:
+            assert reached.wait(5), 'Actual public registration reaches its return boundary'
+            assert errors == []
+            assert len(registrations) == 1
+            original = registrations[0][0]
+            monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(microseconds=1))
+            publishing = workers.submit(engine.refresh_lp_dashboard_snapshot)
+            published = publishing.result(timeout=5)
+            assert published['state'] == 'ready', published
+            newer = account_packet(store)
+            assert newer['trade_generation'] == original['trade_generation']
+            assert newer['checked_at'] != original['checked_at']
+            assert newer['snapshot_id'] != original['snapshot_id']
+            assert economics(newer) == economics(original)
+        finally:
+            release.set()
+            if publishing is not None:
+                publishing.result(timeout=5)
+            assert pending.result(timeout=5)
+    assert errors == []
+    assert len(reads) == 2
+    assert registrations[0][1] == registrations[0][2], 'Original SDK object is unchanged'
+    state = engine.lp_auto_state()
+    assert [post['token_id'] for post in exchange.posts] == ['B', 'C', 'E', 'F', 'G'], state['last_round']
+    assert all(post['price'] == Decimal('.39') and post['quantity'] == 20 for post in exchange.posts)
+    assert exchange.cancels == []
+    assert len(signed_plans) == 5
+    assert all(plan['approval_account_facts'] == original for plan in signed_plans)
+    assert account_packet(store) == newer
+    assert state['active_plan'] is None and state['last_round']['completed_at']
+    assert state['plan_wait']['kind'] == 'round'
+    assert datetime.fromisoformat(state['plan_wait']['deadline']) == datetime.fromisoformat(
+        state['last_round']['completed_at']) + timedelta(seconds=60)
 
 
 @pytest.mark.parametrize('initial', [(), ('A', 'B', 'C', 'D', 'I')],
@@ -196,15 +293,183 @@ def test_round_observation_survives_later_financial_churn(tmp_path, monkeypatch,
         assert [row['token_id'] for row in state['last_round']['targets']] == ['B', 'C', 'E', 'F']
 
 
-def sdk_planning_setup(runtime):
+def sdk_planning_setup(runtime, *, budget='39'):
     public = RefillPublic(runtime.clock)
     public.rates = {1: '48', 2: '24', 3: '12', 4: '6', 5: '3', 6: '1'}
-    result = prepare(runtime, budget='39', target=5, count=5, public=public)
+    result = prepare(runtime, budget=budget, target=5, count=5, public=public)
     execution = result[4]
     execution.lp_auto_set_desired_running(False)
-    execution.lp_auto_configure(dict(budget_usd='39', target_buy_count=5, buy_price_level=2))
+    execution.lp_auto_configure(dict(budget_usd=budget, target_buy_count=5, buy_price_level=2))
     execution.lp_auto_set_desired_running(True)
     return result
+
+
+def manual_sdk_preview(runtime, store, execution, *, price):
+    market, condition, token = _refill_identity(6)
+    now = runtime.clock[0]
+    store.lp_save_price_history(condition, token, [], dict(state='known', amplitude=Decimal('.005'),
+        checked_at=now, valid_until=now + timedelta(days=1)))
+    preview = execution.lp_preview(dict(market_id=market, condition_id=condition, token_id=token,
+        outcome='YES', price=price, quantity='20', review_at=now + timedelta(minutes=10)))
+    assert preview['state'] == 'previewed', preview
+    return preview
+
+
+@pytest.mark.parametrize('budget', ['39', '100'], ids=['budget39', 'budget100'])
+def test_history_fallback_keeps_manual_unknown_budget_and_slot(runtime, budget):
+    store, _, account, _, execution, _ = sdk_planning_setup(runtime, budget=budget)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    published = deepcopy(account_packet(store))
+    preview = manual_sdk_preview(runtime, store, execution, price='.39')
+    post, history = account.post_order, account.list_account_trades
+    manual_posts, plans = [], []
+
+    def unknown_post(signed):
+        runtime.clock[0] += timedelta(seconds=1)
+        manual_posts.append(signed)
+        raise TimeoutError('actual manual BUY POST has unknown result')
+
+    account.post_order = unknown_post
+    key = 'manual-unknown-' + budget
+    started = execution.lp_start(preview['preview_id'], key)
+    assert started['state'] == 'needs_attention', started
+    sid = started['session_id']
+    original = deepcopy(store.lp_session(sid))
+    audit = deepcopy(store.lp_actions(sid))
+    assert original['idempotency_key'] == key and original['submit_stage'] == 'send_unknown'
+    assert original.get('entry_order_id') is None and original['submit_status'] == 'unknown'
+    assert len(manual_posts) == 1 and audit[0]['state'] == 'unknown'
+    assert original['submit_finished_at'] == audit[0]['submit_finished_at']
+    assert execution.lp_auto_state()['intents'] == []
+    assert account.orders == account.positions == ()
+    account.post_order = post
+    runtime.clock[0] += timedelta(seconds=1)
+
+    def missing_history(**kwargs):
+        raise TimeoutError('history-only account failure after original send ended')
+
+    sign = account.create_limit_order
+    def capture_sign(**kwargs):
+        plans.append(deepcopy(execution.lp_auto_state()['active_plan']))
+        return sign(**kwargs)
+    account.list_account_trades, account.create_limit_order = missing_history, capture_sign
+    scheduler = LPAutoScheduler(execution, clock=lambda: runtime.clock[0])
+    assert scheduler.run_due()
+    state = execution.lp_auto_state()
+    assert_sdk_buys(account, range(1, 5))
+    assert account.cancels == [] and len(manual_posts) == 1
+    assert plans and all(plan['round_id'] == plans[0]['round_id'] for plan in plans)
+    source = plans[0]['approval_account_facts']
+    hold, = source['pending_buy_actions']
+    assert hold['session_id'] == sid and hold['action_id'] == audit[0]['action_id']
+    assert hold['order_id'] is None and hold['state'] == 'unknown'
+    assert Decimal(hold['reserved_usd']) == Decimal('7.80')
+    assert source['publication_scope'] == 'planning' and source['report_status'] == 'unknown'
+    assert [row['token_id'] for row in plans[0]['targets'] if not row.get('retained_constraint')] == [
+        _refill_identity(i)[2] for i in range(1, 5)]
+    retained, = [row for row in plans[0]['targets'] if row.get('retained_constraint')]
+    assert retained['session_id'] == sid and Decimal(retained['reserved_usd']) == Decimal('7.80')
+    assert len(plans[0]['targets']) == 5 and len(plans[0]['actions']) == 4
+    assert sum((Decimal(row['price']) * Decimal(row['quantity']) for row in plans[0]['targets']), Decimal(0)) == Decimal('39')
+    assert Decimal(budget) - Decimal(hold['reserved_usd']) == (Decimal('31.20') if budget == '39' else Decimal('92.20'))
+    assert store.lp_actions(sid) == audit
+    assert store.lp_session(sid)['idempotency_key'] == key
+    assert not store.lp_session(sid).get('reservation_coverage')
+    assert account_packet(store) == published and state['funds']['as_of'] == published['checked_at']
+    assert state['active_plan'] is None and state['last_round']['completed_at']
+    completed = datetime.fromisoformat(state['last_round']['completed_at'])
+    assert datetime.fromisoformat(state['plan_wait']['deadline']) == completed + timedelta(seconds=60)
+    saved = deepcopy(state['last_round'])
+    runtime.clock[0] = completed + timedelta(seconds=1)
+    scheduler.request_check()
+    assert not scheduler.run_due()
+    assert execution.lp_auto_state()['last_round'] == saved
+    assert_sdk_buys(account, range(1, 5))
+    assert store.lp_actions(sid) == audit
+    account.list_account_trades = history
+    runtime.clock[0] += timedelta(seconds=1)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    assert store.lp_actions(sid) == audit and store.lp_session(sid)['submit_status'] == 'unknown'
+    assert_sdk_buys(account, range(1, 5))
+
+
+@pytest.mark.parametrize('case', ['augment', 'legacy_unbounded'])
+def test_history_fallback_keeps_independent_or_unbounded_buy_blocked(runtime, case):
+    store, _, account, _, execution, _ = sdk_planning_setup(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    published = deepcopy(account_packet(store))
+    market, condition, token = _refill_identity(6)
+    unknown_posts = []
+    if case == 'augment':
+        preview = manual_sdk_preview(runtime, store, execution, price='.40')
+        parent = execution.lp_start(preview['preview_id'], 'manual-parent')
+        assert parent['state'] == 'entry_open', parent
+        sid = parent['session_id']
+        parent_id = store.lp_session(sid)['entry_order_id']
+        assert len(account.orders) == len(account.posts) == 1
+        preview = execution.lp_augment_preview(dict(session_id=sid, price='.39', quantity='20'))
+        assert preview['state'] == 'previewed', preview
+        post = account.post_order
+        def unknown_post(signed):
+            runtime.clock[0] += timedelta(seconds=1)
+            unknown_posts.append(signed)
+            raise TimeoutError('independent augment POST has unknown result')
+        account.post_order = unknown_post
+        result = execution.lp_augment(sid, preview['preview_id'], 'manual-augment')
+        account.post_order = post
+        assert result['state'] == 'needs_attention', result
+        actions = store.lp_actions(sid)
+        augment, = [a for a in actions if a.get('role') == 'augment']
+        assert augment['state'] == 'unknown' and augment.get('order_id') is None
+        assert Decimal(augment['price']) * Decimal(augment['quantity']) == Decimal('7.80')
+        assert store.lp_session(sid)['entry_order_id'] == parent_id
+        assert len(account.orders) == 1 and account.orders[0].id == parent_id
+        assert Decimal(str(account.orders[0].price)) * Decimal(str(account.orders[0].original_size)) + Decimal('7.80') == Decimal('15.80')
+        assert len(unknown_posts) == 1
+    else:
+        # Historical durable shape: modern public producers reject missing bounds.
+        session = store.lp_create_session('legacy-independent', 'legacy-independent', state='needs_attention', payload=dict(
+            account_id=published['account_id'], market_id=market, condition_id=condition,
+            token_id=token, outcome='YES', price='.40', quantity='20'))
+        sid = session['session_id']
+        store.lp_upsert_action(sid, sid + ':augment', state='unknown', payload=dict(
+            role='augment', side='BUY', token_id=token, submit_stage='send_unknown',
+            submit_finished_at=(runtime.clock[0] - timedelta(seconds=1)).isoformat()))
+        actions = store.lp_actions(sid)
+        assert len(actions) == 1 and actions[0].get('price') is actions[0].get('quantity') is None
+    original = deepcopy(store.lp_session(sid))
+    audit = deepcopy(store.lp_actions(sid))
+    posts = deepcopy(account.posts)
+    assert execution.lp_auto_state()['intents'] == []
+    runtime.clock[0] += timedelta(seconds=1)
+    def missing_history(**kwargs):
+        raise TimeoutError('history-only failure with independent local BUY uncertainty')
+    account.list_account_trades = missing_history
+    scheduler = LPAutoScheduler(execution, clock=lambda: runtime.clock[0])
+    assert scheduler.run_due()
+    state = execution.lp_auto_state()
+    assert account.posts == posts and account.cancels == []
+    assert state['active_plan'] is None
+    assert state['last_round']['reason'] == 'unbounded_financial_uncertainty'
+    assert state['plan_wait']['kind'] == 'api'
+    assert datetime.fromisoformat(state['plan_wait']['deadline']) - datetime.fromisoformat(state['plan_wait']['started_at']) == timedelta(seconds=60)
+    assert store.lp_actions(sid) == audit
+    current = store.lp_session(sid)
+    if case == 'augment':
+        assert {k: v for k, v in current.items() if k not in {'updated_at', 'order_history'}} == {
+            k: v for k, v in original.items() if k not in {'updated_at', 'order_history'}}
+        assert set(current['order_history']) == set(original['order_history']) == {parent_id}
+        for oid, old in original['order_history'].items():
+            observed = current['order_history'][oid]
+            for key in ('order_id', 'token_id', 'side', 'price', 'original_size'):
+                assert observed.get(key) == old.get(key)
+            physical, = [o for o in account.orders if o.id == oid]
+            assert physical.id == parent_id and physical.token_id == token and physical.side == 'BUY'
+            assert physical.status == 'LIVE' and physical.size_matched == Decimal('0')
+            assert physical.price == Decimal('.40') and physical.original_size == Decimal('20')
+    else:
+        assert current == original
+    assert account_packet(store) == published
 
 
 def assert_sdk_buys(account, indices):

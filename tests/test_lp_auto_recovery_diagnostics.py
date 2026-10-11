@@ -46,25 +46,37 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
         facts=lp._read_candidate_facts(dict(market_id=market,condition_id=condition,token_id=token,outcome='YES'))
         lp._candidate_pool_record_success(condition,dict(condition_id=condition),judged_at=lp._now(),
                                          facts=dict(directions=[facts['direction']],account=facts['account']))
-    real_reader=adapter.lp_account_snapshot_shared
+    real_reader=adapter._lp_planning_account_snapshot
+    publisher=adapter.lp_account_snapshot_shared
+    shared_reads=[]
+    def observed_shared(**kwargs):
+        shared_reads.append(dict(kwargs))
+        if execution.lp_auto_state()['active_plan']:
+            active_finance.append(runtime.clock[0])
+        return publisher(**kwargs)
+    adapter.lp_account_snapshot_shared=observed_shared
     entered,release=Event(),Event();reads=[];failed_once=False
     def reader(*args,**kwargs):
         nonlocal failed_once
-        reads.append(dict(kwargs))
+        record=dict(kwargs)
+        reads.append(record)
         if not failed_once:
             failed_once = True
             entered.set()
             assert release.wait(5), 'controlled read watchdog'
             raise LpObservationWait('account_round_invalid')
-        return real_reader(*args,**kwargs)
-    adapter.lp_account_snapshot_shared=reader
+        result=real_reader(*args,**kwargs)
+        record.update(read_started_at=result['read_started_at'], checked_at=result['checked_at'],
+                      read_ended_at=result['read_ended_at'])
+        return result
+    adapter._lp_planning_account_snapshot=reader
     try:
         with ThreadPoolExecutor(1) as workers:
             pending=workers.submit(execution.lp_auto_run_once,round_id='three-to-five-recovery')
             try:
                 assert entered.wait(3)
                 _advance(runtime)
-                snapshot=real_reader(max_age_seconds=0,trade_generation_provider=store.lp_trade_generation)
+                snapshot=publisher(max_age_seconds=0,trade_generation_provider=store.lp_trade_generation)
                 assert lp.register_account_snapshot(snapshot)['state']=='registered'
             finally:
                 release.set()
@@ -81,6 +93,7 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
         assert early['funds']['status'] == 'known'
         advance_api_wait(runtime, execution)
         reads.clear()
+        shared_reads.clear()
         result = execution.lp_auto_run_once(round_id='three-to-five-recovery')
     finally:
         # Executor exit reclaims the controlled worker before attention cleanup.
@@ -103,11 +116,11 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
     assert planning_as_of and planning_as_of[0]
     assert result['funds']['status']=='unknown' and result['funds']['as_of']==planning_as_of[0]
     assert active_finance == []
-    assert len(reads) in (1, 2), 'one forced planning read and at most one existing maintenance reuse'
-    forced = [read for read in reads if read.get('max_age_seconds') == 0
-              and read.get('trade_generation_provider') == store.lp_trade_generation]
-    assert len(forced)==1, 'the complete planning publication stays fresh and forced'
-    assert sum('max_age_seconds' not in read for read in reads) == len(reads) - 1, 'only the existing optional maintenance call'
+    assert len(reads)==1, 'Exactly one fresh automatic planning read'
+    assert reads[0]['trade_generation_provider'] == store.lp_trade_generation
+    assert reads[0]['read_started_at'] <= reads[0]['checked_at'] <= reads[0]['read_ended_at'] <= runtime.clock[0]
+    assert len(shared_reads) <= 1, 'At most one existing optional maintenance reuse'
+    assert all('max_age_seconds' not in read for read in shared_reads)
 
 
 def test_recovered_account_can_refill_three_to_five(runtime):
@@ -189,14 +202,14 @@ def test_failed_attempt_still_blocks_without_current_durable_facts(runtime, boun
         reads.append(True)
         if boundary != 'no_new_publication':
             _advance(runtime)
-            fresh = real_reader(**kwargs)
+            fresh = real_reader(max_age_seconds=0, **kwargs)
             assert lp.register_account_snapshot(fresh)['state'] == 'registered'
             if boundary == 'generation_changed':
                 store.lp_advance_trade_generation(store.lp_trade_generation())
             else:
                 _advance(runtime, 61)
         raise LpObservationWait('account_round_invalid')
-    adapter.lp_account_snapshot_shared = invalidated
+    adapter._lp_planning_account_snapshot = invalidated
     state = execution.lp_auto_run_once(round_id='counterfactual-' + boundary)
     assert len(reads) == 1
     assert account.posts == account.cancels == []
@@ -339,7 +352,7 @@ def test_candidate_diagnostics_does_not_add_reads_clocks_or_re_evaluate(tmp_path
             patch.setattr(engine._auto_pool, '_submit', lambda *args, **kwargs: ({'state': 'rejected', 'reason': 'strategy_funds_insufficient'}, None))
             if not enabled:
                 ranked = engine._auto_pool._ranked_buys
-                patch.setattr(engine._auto_pool, '_ranked_buys', lambda state, *, diagnostics=None: ranked(state))
+                patch.setattr(engine._auto_pool, '_ranked_buys', lambda state, *, diagnostics=None, observation=None: ranked(state, observation=observation))
             state = engine.lp_auto_run_once(round_id='counted')
         results.append((calls, state))
     assert results[0][0] == results[1][0]

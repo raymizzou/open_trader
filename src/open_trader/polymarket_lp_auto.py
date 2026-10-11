@@ -357,7 +357,7 @@ class LPAutoPool:
         return not any(a.get('side') == 'BUY' and a.get('role') != 'entry'
                        for a in self.store.lp_actions(intent['session_id']))
 
-    def _account_projection_facts(self, d, *, planning=False):
+    def _account_projection_facts(self, d, *, planning=False, observed_at=None, observed_generation=None):
         """A covered reservation never returns, including after facts expire."""
         facts = d.get('account_financial_facts')
         waiting = None if planning else self._account_facts_wait
@@ -373,11 +373,12 @@ class LPAutoPool:
                 or facts.get('pool_account_id') != d['account_id']):
             reasons.append('account_identity_mismatch')
         try:
-            _freshness(facts.get('checked_at'), self._now(), 'account_financial_facts', max_age=60)
+            _freshness(facts.get('checked_at'), observed_at or self._now(), 'account_financial_facts', max_age=60)
         except (TypeError, ValueError) as exc:
             reasons.append(str(exc))
         if (type(facts.get('trade_generation')) is not int
-                or facts['trade_generation'] != self.store.lp_trade_generation()):
+                or facts['trade_generation'] != (observed_generation if observed_generation is not None
+                                                else self.store.lp_trade_generation())):
             reasons.append('account_financial_facts_changed')
         if facts.get('financial_status') != 'known':
             reasons.extend(facts.get('reason_codes') or ['account_financial_facts_unknown'])
@@ -487,12 +488,13 @@ class LPAutoPool:
                 result.append(intent)
         return result, independent_unknown
 
-    def _projection(self, d, *, include_intents=True, planning=False):
+    def _projection(self, d, *, include_intents=True, planning=False, observed_at=None, observed_generation=None):
         audit_intents = list(d['intents'].values())
         # Coverage is a one-way replacement, not a new interpretation of the
         # original submission. Its audit survives late callbacks unchanged.
         intents = [i for i in audit_intents if not reservation_is_released(i, d['account_id'])]
-        account, account_buys, account_reasons = self._account_projection_facts(d, planning=planning)
+        account, account_buys, account_reasons = self._account_projection_facts(d, planning=planning,
+            observed_at=observed_at, observed_generation=observed_generation)
         results = d.get('execution_order_facts') or {}
         terminal_ids, terminal_inventory, partial_principal = set(), {}, {}
         if (results.get('account_id') == d['account_id'] == self.execution._lp_account_id()
@@ -639,7 +641,10 @@ class LPAutoPool:
         uncertain = [i for i in intents if i.get('financial_status') == 'unknown'
                      or not self._funds_fresh(i) or i['state'] == 'unknown' or i.get('submission_unknown')]
         financial_unknown = bool(uncertain or account_reasons or inventory_unknown or independent_unknown)
-        isolated = [i for i in uncertain if self._isolatable(i)]
+        captured_isolation = d.get('_planning_buy_isolation') if planning else None
+        isolated = [i for i in uncertain if
+            (captured_isolation.get(i['intent_id'], False) if captured_isolation is not None
+             else self._isolatable(i))]
         # Hold the entire original principal even if old receipts released it.
         # Unconfirmed proceeds/profits cannot increase the spendable lower bound.
         extra_hold = sum((max(ZERO, _decimal(i['price']) * _decimal(i['quantity'])
@@ -1371,6 +1376,8 @@ class LPAutoPool:
         account_facts = account
         intents, _ = self._unrepresented_intents(state['intents'], account_buys,
             account_valid=account is not None and account.get('financial_status') == 'known' and not account_reasons)
+        if account is not None:
+            intents += account.get('pending_buy_actions') or []
         active = [i for i in intents if not reservation_is_released(i, state['account_id'])
                   and i['state'] not in ('terminal', 'rejected', 'aborted')]
         active += state.get('account_buys', [])
@@ -3025,25 +3032,15 @@ class LPAutoPool:
                     # Bind the acquired response to its registered economics
                     # once. Later publications remain current diagnostics,
                     # not a replacement source for this round's funding.
-                    with self.lp._first_seen_apply_lock:
-                        document = self._read()
-                        if current_only:
-                            # This private projection retains local holds. It
-                            # never replaces the published financial document.
-                            document['account_financial_facts'] = deepcopy(result['planning_facts'])
-                        facts = document.get('account_financial_facts') or {}
-                        if (facts.get('trade_generation') != snapshot.get('trade_generation')
-                                or any(_timestamp(facts.get(key)) != _timestamp(snapshot.get(key))
-                                       for key in ('checked_at', 'read_started_at', 'read_ended_at'))):
-                            return failed('account_round_invalid', waiting=True)
-                        validated_at = self._now()
-                        state = self._projection(document, planning=current_only)
-                        reservations = self.lp._candidate_reservations()
-                        if snapshot.get('trade_generation') != self.store.lp_trade_generation():
-                            return failed('account_round_invalid', waiting=True)
-                        return dict(document=deepcopy(document), account=deepcopy(snapshot),
-                            state=deepcopy(state), reservations=deepcopy(reservations),
-                            validated_at=validated_at)
+                    capture = result['_planning_capture']
+                    document = {**self._default(), **deepcopy(capture['document'])}
+                    validated_at = capture['validated_at']
+                    state = self._projection(document, planning=True, observed_at=validated_at,
+                        observed_generation=snapshot['trade_generation'])
+                    reservations = self.lp._candidate_reservations()
+                    return dict(document=document, account=deepcopy(snapshot),
+                        state=deepcopy(state), reservations=deepcopy(reservations),
+                        validated_at=validated_at)
                 return True
         except (LpAccountRoundInvalid, LpObservationWait) as exc:
             # The next scheduled read or a newer valid dashboard publication

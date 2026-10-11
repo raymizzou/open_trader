@@ -450,6 +450,74 @@ def buy_action_is_covered(session, action):
         and reservation_is_covered({**session, 'reservation_coverage': marker}))
 
 
+def project_planning_buy_holds(sessions, actions_by_session, intents, current_buys, *,
+                               account_id, checked_at, read_started_at):
+    """Project local requests without assigning coverage or changing their audit."""
+    bindings = {}
+    for intent in intents.values():
+        bindings.setdefault(str(intent.get('session_id') or ''), []).append(intent)
+    current = {(b['order_id'], b['token_id'], b['side'], b.get('session_id'))
+               for b in current_buys}
+    holds, isolation, inflight = [], {}, False
+    independent_sell = False
+    for session in sessions:
+        sid = session['session_id']
+        bound = bindings.get(sid, ())
+        explicit = str(session.get('account_id') or '').strip().casefold()
+        legacy_owned = (not explicit and len(bound) == 1 and
+            session['idempotency_key'] == 'lp-auto:' + str(bound[0].get('intent_id') or ''))
+        if explicit != account_id and not legacy_owned:
+            continue
+        actions = actions_by_session[sid]
+        independent_sell |= has_independent_unresolved_action(session,
+            [a for a in actions if a.get('side') == 'SELL'])
+
+        def isolatable(row):
+            try:
+                _number(row.get('inventory_cost_usd', 0), 'inventory_cost_usd')
+                _number(row.get('reserved_usd'), 'reserved_usd')
+            except ValueError:
+                return False
+            return bool(row.get('condition_id') and row.get('token_id')
+                and row.get('inventory_cost_usd', 0) is not None and row.get('reserved_usd') is not None
+                and not session.get('order_identity_conflict') and not row.get('order_identity_conflict')
+                and 'identity' not in str(row.get('reconcile_reason') or '')
+                and row.get('reconcile_reason') not in {'owned_order_token_mismatch', 'owned_order_side_mismatch'}
+                and not any(a.get('side') == 'BUY' and a.get('role') != 'entry' for a in actions))
+
+        for intent in bound:
+            isolation[intent['intent_id']] = isolatable(intent)
+        for action in actions:
+            if not unresolved_buy_action(action) or buy_action_is_covered(session, action):
+                continue
+            is_entry = submission_action_kind(action) == 'entry'
+            identity_valid = (not session.get('order_identity_conflict')
+                and action.get('token_id') == session.get('token_id'))
+            if identity_valid and (action.get('order_id'), action.get('token_id'), 'BUY', sid) in current:
+                continue
+            if (is_entry and len(bound) == 1 and identity_valid
+                    and session['idempotency_key'] == 'lp-auto:' + str(bound[0].get('intent_id') or '')):
+                continue
+            try:
+                price = _number(action.get('price', session.get('price') if is_entry else None), 'price', positive=True)
+                quantity = _number(action.get('quantity', session.get('quantity') if is_entry else None), 'quantity', positive=True)
+            except ValueError:
+                price = quantity = None
+            hold = dict(intent_id='action:' + str(action['action_id']), action_id=action['action_id'],
+                session_id=sid, order_id=action.get('order_id'), token_id=action.get('token_id'), side='BUY',
+                condition_id=session.get('condition_id'), state='unknown', financial_status='unknown',
+                inventory_cost_usd='0', reserved_usd=str(price * quantity) if price is not None else None,
+                checked_at=checked_at, price=str(price) if price is not None else None,
+                quantity=str(quantity) if quantity is not None else None)
+            if not identity_valid:
+                hold['order_identity_conflict'] = True
+            holds.append(hold)
+            isolation[hold['intent_id']] = isolatable(hold)
+            inflight |= ended_buy_action_evidence(session, action, read_started_at=read_started_at) is None
+    return dict(pending_buy_actions=holds, independent_sell_unknown=independent_sell,
+                isolation=isolation, account_send_inflight=inflight)
+
+
 def ended_reservation_evidence(intent, session, actions, *, account_id, pool_account_id, read_started_at):
     """Return durable ended-send evidence; missing timing never means absent."""
     explicit_account = str(session.get('account_id') or '').strip().casefold()

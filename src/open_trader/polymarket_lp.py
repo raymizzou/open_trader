@@ -52,6 +52,7 @@ from .polymarket_lp_risk import (
 from .polymarket_lp_accounting import (
     build_account_financial_facts, build_planning_account_facts, reservation_is_manually_released, reservation_is_released,
     buy_action_is_covered, unresolved_buy_action, submission_action_kind,
+    project_planning_buy_holds,
 )
 from .polymarket_lp_errors import LpObservationWait
 from .polymarket_lp_notification_batches import (
@@ -9562,8 +9563,30 @@ class PolymarketLPService:
                             financial_facts, connection=connection,
                             expected_generation=generation, diagnostics=diagnostics,
                         )
+                    # Carry this transaction's exact source through the public
+                    # registration return. A later publisher is not its owner.
+                    row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+                    planning_document = json.loads(row['payload']) if row else {}
+                    if _planning_only:
+                        sessions = [self.store._lp_row_result(row) for row in
+                            connection.execute('SELECT * FROM lp_sessions ORDER BY session_id').fetchall()]
+                        holds = project_planning_buy_holds(sessions,
+                            {s['session_id']: self.store.lp_actions(s['session_id'], connection=connection)
+                             for s in sessions}, planning_document.get('intents') or {}, financial_facts['buys'],
+                            account_id=financial_facts['account_id'], checked_at=financial_facts['checked_at'],
+                            read_started_at=_timestamp(financial_facts['read_started_at'], name='read_started_at'))
+                        financial_facts.update({key: holds[key] for key in
+                            ('pending_buy_actions', 'independent_sell_unknown')})
+                        if holds['account_send_inflight']:
+                            financial_facts['financial_status'] = 'unknown'
+                            financial_facts['reason_codes'] = sorted(set(financial_facts.get('reason_codes') or ())
+                                | {'account_send_inflight'})
+                        planning_document['_planning_buy_isolation'] = holds['isolation']
+                        planning_document['account_financial_facts'] = deepcopy(financial_facts)
+                    planning_capture = dict(document=planning_document, validated_at=self._now())
             return {"state": "registered", "tokens": token_results,
                     "created": created, "joined": joined,
+                    '_planning_capture': planning_capture,
                     **({'planning_facts': financial_facts} if _planning_only else {})}
         except ValueError as exc:
             if isinstance(exc, LpObservationWait):
