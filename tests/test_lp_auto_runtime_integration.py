@@ -184,7 +184,11 @@ def test_terminal_pause_confirmation_blocks_unsigned_remainder_and_keeps_buy(tmp
 
 @pytest.mark.parametrize("pause_while_blocked", [False, True])
 def test_durable_receipt_reconciles_after_interrupted_submit_without_overriding_pause(tmp_path, monkeypatch, pause_while_blocked):
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+
+    monkeypatch.setattr(pool, 'NOW', pool.NOW)
     execution, exchange, lp, store = pool.setup(tmp_path, 2)
+    install_order_result_reader(exchange, monkeypatch)
     execution.lp_auto_configure({"budget_usd": "100", "target_buy_count": 2})
     execution.lp_auto_set_desired_running(True)
     update = store.lp_update_session

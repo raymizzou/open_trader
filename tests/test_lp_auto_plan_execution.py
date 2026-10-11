@@ -3871,3 +3871,196 @@ def test_same_round_cancel_retry_set_restores_survivor_protection(runtime, monke
             finances=finances,observations=observations,calls=account.cancels,posts=account.posts,
             sessions=store.lp_sessions(),audits=store.lp_actions(sid)if sid else [])
         (tmp_path/'request-set-publication-diagnostics.json').write_text(json.dumps(diagnostics,indent=2,default=str)+'\n')
+
+
+@pytest.mark.parametrize('outcome', ['live', 'terminal_zero'])
+def test_already_bound_buy_receipt_settles_plan_once(tmp_path, monkeypatch, outcome):
+    """An original SDK receipt survives normal account binding before apply."""
+    import json
+    from polymarket.models.clob.order_response import AcceptedOrder
+    from tests.test_lp_auto_plan_scheduler import restart_engine
+
+    # Restore the business clock even when the result-reader fixture advances it.
+    monkeypatch.setattr(pool, 'NOW', pool.NOW)
+    engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch)
+    install_order_result_reader(exchange, monkeypatch)
+    scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
+    post = exchange.lp_post_order
+    held, sid, original = None, None, None
+    diagnostics = dict(outcome=outcome, stage='defer_original_receipt')
+    receipt = []
+
+    def accepted_before_apply(signed):
+        nonlocal held
+        response = post(signed)
+        if signed['token_id'] == 'B' and not receipt:
+            held = engine._lock_path.open('a+')
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = AcceptedOrder(order_id=response['order_id'], status='live',
+                making_amount=Decimal('7.80'), taking_amount=Decimal('20'),
+                trade_ids=(), transactions_hashes=())
+            receipt.append(result)
+            return result
+        return response
+
+    monkeypatch.setattr(exchange, 'lp_post_order', accepted_before_apply)
+    try:
+        assert scheduler.run_due()
+        before = engine.lp_auto_state()
+        original = deepcopy(before['active_plan'])
+        original_targets = deepcopy(before['last_round']['targets'])
+        assert original and not before['last_round'].get('completed_at')
+        first = original['actions'][0]
+        request_id = first.get('request_id', first['action_id'])
+        session, = [s for s in store.lp_sessions()
+            if s['idempotency_key'] == 'lp-auto:' + request_id]
+        sid = session['session_id']
+        audit, = store.lp_actions(sid)
+        assert audit['state'] == 'accepted' and audit['post_started'] is True
+        assert audit['order_id'] == receipt[0].order_id == 'o1'
+        assert audit['submit_stage'] == 'receipt_received'
+        assert session['submit_stage'] == 'sending' and 'submit_status' not in session
+        assert not session.get('entry_order_id')
+        assert [p['token_id'] for p in exchange.posts] == ['B']
+        immutable_audit = deepcopy(store.lp_actions(sid))
+
+        diagnostics['stage'] = 'normal_public_account_binding'
+        monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(microseconds=1))
+        bundle = pool._fresh_registration_bundle(exchange, lp)
+        assert bundle['read_started_at'] > datetime.fromisoformat(audit['submit_finished_at'])
+        assert lp.register_account_snapshot(bundle)['state'] == 'registered'
+        bound = deepcopy(store.lp_session(sid))
+        assert bound['entry_order_id'] == receipt[0].order_id
+        assert 'submit_status' not in bound and bound['submit_stage'] == 'sending'
+        assert bound['reservation_coverage']['state'] == 'covered'
+        assert bound['order_history']['o1']['status'] == 'LIVE'
+        assert store.lp_actions(sid) == immutable_audit
+        original_protection = deepcopy(bound['queue_protection'])
+        fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+        held.close()
+        held = None
+
+        terminal_before, original_intent = None, None
+        if outcome == 'terminal_zero':
+            diagnostics['stage'] = 'normal_public_cancel_and_terminal_reconciliation'
+            assert engine.lp_stop(sid)['state'] == 'review'
+            assert exchange.cancels == ['o1']
+            exact, = [o for o in exchange.orders if o['order_id'] == 'o1']
+            assert exact['status'] == 'CANCELED' and Decimal(exact['size_matched']) == 0
+            monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(microseconds=1))
+            terminal_bundle = pool._fresh_registration_bundle(exchange, lp)
+            assert not any(o['order_id'] == 'o1' for o in terminal_bundle['open_orders'])
+            assert lp.register_account_snapshot(terminal_bundle)['state'] == 'registered'
+            assert store.lp_session(sid)['state'] == 'complete'
+            lp.reconcile_facts(sid)
+            terminal_before = deepcopy(store.lp_session(sid))
+            assert terminal_before['state'] == 'complete'
+            assert terminal_before['entry_order_id'] == 'o1'
+            assert terminal_before['order_history']['o1']['status'] == 'CANCELED'
+            assert Decimal(terminal_before['order_history']['o1']['size_matched']) == 0
+            assert terminal_before['position_reconciled'] is True
+            assert terminal_before['stop_requested'] is True
+            assert 'submit_status' not in terminal_before and terminal_before['submit_stage'] == 'sending'
+            assert all(a in store.lp_actions(sid) for a in immutable_audit)
+            immutable_audit = deepcopy(store.lp_actions(sid))
+            original_intent, = [i for i in engine.lp_auto_state()['intents'] if i['intent_id'] == request_id]
+            original_intent = deepcopy(original_intent)
+
+        diagnostics['stage'] = 'recover_original_action'
+        monkeypatch.setattr(pool, 'NOW', datetime.fromisoformat(engine.lp_auto_state()['plan_wait']['deadline']))
+        scheduler.request_check()
+        assert scheduler.run_due()
+        state = engine.lp_auto_state()
+        completed_action = next(a for a in state['last_round']['actions']
+            if a['action_id'] == first['action_id'])
+        assert completed_action['state'] == 'success', state['last_round']
+        assert completed_action['session_id'] == sid and completed_action['order_id'] == 'o1'
+        assert completed_action.get('request_id', completed_action['action_id']) == request_id
+        assert completed_action['confirmed_at'] == audit['submit_receipt_at']
+        assert state['last_round']['round_id'] == original['round_id']
+        assert state['last_round']['targets'] == original_targets
+        assert state['last_round']['completed_at'] and state['active_plan'] is None
+        assert [p['token_id'] for p in exchange.posts] == ['B', 'C', 'E', 'F', 'G']
+        assert all(Decimal(p['price']) == Decimal('.39') and Decimal(p['quantity']) == 20
+            for p in exchange.posts)
+        recovered = store.lp_session(sid)
+        assert recovered['submit_status'] == 'accepted' and recovered['submit_stage'] == 'receipt_received'
+        assert recovered['reservation_coverage'] == bound['reservation_coverage']
+        preserved_fields = ('state', 'stop_requested', 'stop_loss_latched', 'entry_cancel_requested',
+            'review_status', 'queue_protection', 'order_history', 'owned_order_ids',
+            'reservation_coverage', 'account_coverage_retired', 'position_reconciled',
+            'buy_filled_quantity', 'buy_cost', 'buy_fees', 'sold_quantity', 'sold_revenue',
+            'sell_fees', 'residual_quantity', 'orders_terminal', 'fee_status')
+        if outcome == 'live':
+            assert recovered['state'] == 'entry_open'
+            assert recovered['queue_protection'] == original_protection
+            assert live_orders(exchange)['B'] == 'o1' and exchange.cancels == []
+        else:
+            for key in preserved_fields:
+                assert recovered.get(key) == terminal_before.get(key), key
+            assert set(live_orders(exchange)) == {'C', 'E', 'F', 'G'}
+            assert exchange.cancels == ['o1']
+            assert next(i for i in state['intents'] if i['intent_id'] == request_id) == original_intent
+        assert store.lp_actions(sid) == immutable_audit
+
+        diagnostics['stage'] = 'duplicate_wakes_and_restart'
+        completed_round = deepcopy(state['last_round'])
+        posts = deepcopy(exchange.posts)
+        cancels = deepcopy(exchange.cancels)
+        for _ in range(2):
+            scheduler.request_check()
+            assert not scheduler.run_due()
+            engine.lp_auto_run_once()
+        restarted = restart_engine(engine, exchange)
+        restored_scheduler = LPAutoScheduler(restarted, clock=lambda: pool.NOW)
+        restored_scheduler.request_check()
+        restored_scheduler.run_due()
+        assert restarted.lp_auto_state()['last_round'] == completed_round
+        assert exchange.posts == posts and exchange.cancels == cancels
+        assert store.lp_actions(sid) == immutable_audit
+        if outcome == 'live':
+            assert store.lp_session(sid)['queue_protection'] == original_protection
+        else:
+            for key in preserved_fields:
+                assert store.lp_session(sid).get(key) == terminal_before.get(key), key
+        assert len([s for s in store.lp_sessions() if s['token_id'] == 'B']) == 1
+
+        if outcome == 'terminal_zero':
+            from tests.test_lp_auto_target_convergence import publish_candidates, REWARDS
+            diagnostics['stage'] = 'fresh_next_round_after_full_interval'
+            completed = datetime.fromisoformat(completed_round['completed_at'])
+            assert datetime.fromisoformat(restarted.lp_auto_state()['plan_wait']['deadline']) == completed + timedelta(seconds=60)
+            monkeypatch.setattr(pool, 'NOW', completed + timedelta(seconds=59))
+            restored_scheduler.request_check()
+            assert not restored_scheduler.run_due()
+            assert restarted.lp_auto_state()['last_round'] == completed_round
+            assert exchange.posts == posts and exchange.cancels == cancels
+            monkeypatch.setattr(pool, 'NOW', completed + timedelta(seconds=60))
+            publish_candidates(exchange, restarted._lp, store, REWARDS)
+            assert restored_scheduler.run_due()
+            new_state = restarted.lp_auto_state()
+            assert new_state['last_round']['round_id'] != original['round_id']
+            assert new_state['last_round']['completed_at'] and new_state['active_plan'] is None
+            new_action, = [a for a in new_state['last_round']['actions'] if a['kind'] == 'buy']
+            assert new_action['state'] == 'success' and new_action['action_id'] != first['action_id']
+            assert new_action.get('request_id', new_action['action_id']) != request_id
+            assert new_action['session_id'] != sid and new_action['order_id'] == 'o6'
+            assert [p['token_id'] for p in exchange.posts] == ['B', 'C', 'E', 'F', 'G', 'B']
+            assert all(Decimal(p['price']) == Decimal('.39') and Decimal(p['quantity']) == 20
+                for p in exchange.posts)
+            assert live_orders(exchange)['B'] == 'o6' and exchange.cancels == ['o1']
+            assert next(o for o in exchange.orders if o['order_id'] == 'o1')['status'] == 'CANCELED'
+            assert store.lp_actions(sid) == immutable_audit
+            for key in preserved_fields:
+                assert store.lp_session(sid).get(key) == terminal_before.get(key), key
+        diagnostics['stage'] = 'complete'
+    finally:
+        if held is not None:
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+            held.close()
+        diagnostics.update(clock=pool.NOW.isoformat(), original=original,
+            session=store.lp_session(sid) if sid else None,
+            audits=store.lp_actions(sid) if sid else [],
+            posts=exchange.posts, cancels=exchange.cancels, state=engine.lp_auto_state())
+        (tmp_path/'already-bound-receipt-diagnostics.json').write_text(
+            json.dumps(diagnostics, indent=2, default=str) + '\n')
