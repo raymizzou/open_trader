@@ -4004,13 +4004,94 @@ class LPAutoPool:
             if (audit.get('state') == 'accepted' and audit.get('post_started') is True and oid
                     and audit.get('side') == 'BUY' and audit.get('token_id') == target['token_id']):
                 action.update(session_id=session['session_id'], order_id=oid)
+                def bound_terminal_zero(current):
+                    row = (rows or {}).get(oid)
+                    # An unavailable lookup is not terminal evidence. Only
+                    # the already reconciled exact owned receipt supplies it;
+                    # current authenticated facts must still corroborate zero.
+                    if (rows is None or not snapshot
+                            or current.get('state') != 'complete' or current.get('submit_status') not in (None, 'unknown')
+                            or current.get('entry_order_id') != oid
+                            or current.get('orders_terminal') is not True
+                            or current.get('position_reconciled') is not True
+                            or current.get('fee_status') != 'known'
+                            or current.get('order_identity_conflict') or current.get('facts_error')
+                            or current.get('financial_block_reason') or current.get('reconciliation')
+                            or has_independent_unresolved_action(current, self.store.lp_actions(current['session_id']))
+                            or any(snapshot.get(k) is not True for k in ('authenticated', 'open_orders_complete',
+                                'pagination_complete', 'trades_complete', 'positions_complete'))
+                            or any(not isinstance(snapshot.get(k), (list, tuple))
+                                for k in ('orders', 'open_orders', 'trades', 'positions'))
+                            or hashlib.sha256(str(snapshot.get('wallet_address') or '').strip().casefold().encode()).hexdigest()
+                                != plan['account_id']
+                            or any(self.lp._order_id(r) == oid for r in snapshot['open_orders'])):
+                        return False
+                    present = [r for r in snapshot['orders'] if self.lp._order_id(r) == oid]
+                    if current.get('submit_status') is None:
+                        # Preserve the existing missing-row None recovery seam.
+                        if row is not None or present:
+                            return False
+                    elif row is not None or present:
+                        # Current rows outrank history. Every occurrence must
+                        # corroborate the same exact known-zero terminal order.
+                        if row is None or any(not isinstance(r, Mapping)
+                                or str(r.get('status')).upper() not in TERMINAL_ORDER_STATES
+                                or r.get('fill_quantity_known') is not True
+                                or _maybe_decimal(r.get('size_matched')) != ZERO
+                                or r.get('side') != 'BUY' or r.get('token_id') != target['token_id']
+                                or str(r.get('condition_id', r.get('market'))) != str(target['condition_id'])
+                                or _maybe_decimal(r.get('price')) != _decimal(target['price'])
+                                or _maybe_decimal(r.get('original_size')) != _decimal(target['quantity'])
+                                for r in [row, *present]):
+                            return False
+                    history = self.lp._order_history(current)
+                    receipt = history.get(oid, {})
+                    if (oid not in self.lp._session_order_ids(current)
+                            or receipt.get('order_id') != oid or receipt.get('side') != 'BUY'
+                            or receipt.get('token_id') != target['token_id']
+                            or str(receipt.get('status')).upper() not in TERMINAL_ORDER_STATES
+                            or receipt.get('fill_quantity_known') is False
+                            or _maybe_decimal(receipt.get('size_matched')) != ZERO
+                            or _maybe_decimal(receipt.get('price')) != _decimal(target['price'])
+                            or _maybe_decimal(receipt.get('original_size')) != _decimal(target['quantity'])):
+                        return False
+                    received, finished = (_maybe_datetime(audit.get(k))
+                        for k in ('submit_receipt_at', 'submit_finished_at'))
+                    started, ended = (_maybe_datetime(snapshot.get(k)) for k in ('read_started_at', 'read_ended_at'))
+                    checked = [_maybe_datetime(current.get(k)) for k in ('account_checked_at', 'facts_checked_at')]
+                    if (received is None or finished is None or started is None or ended is None
+                            or not received <= finished <= started <= ended <= self._now()
+                            or any(at is None or not finished < at <= started for at in checked)):
+                        return False
+                    zero_fields = ('buy_filled_quantity', 'sold_quantity', 'residual_quantity',
+                        'buy_cost', 'sold_revenue', 'buy_fees', 'sell_fees', 'fees')
+                    if any(_maybe_decimal(current.get(k)) != ZERO for k in zero_fields):
+                        return False
+                    try:
+                        owned = self.lp._session_order_ids(current)
+                        if any(r['order_id'] in owned for r in self.lp._owned_sync_order_rows(
+                                snapshot['trades'], snapshot['wallet_address'])):
+                            return False
+                        facts = {**snapshot, 'account': dict(positions=snapshot['positions'],
+                            positions_complete=True, open_orders=snapshot['open_orders'], open_orders_complete=True)}
+                        # Sending metadata alone blocks the existing pure
+                        # completion check. Observe the proved original receipt
+                        # locally; none of this computed finance is published.
+                        observed = {**current, 'submit_status': 'accepted', 'submit_stage': 'receipt_received'}
+                        observed.update(self.lp._fill_patch(observed, facts))
+                        return (all(_maybe_decimal(observed.get(k)) == ZERO for k in zero_fields)
+                            and not observed.get('financial_block_reason')
+                            and self.lp._completion_patch(observed) is not None)
+                    except (ValueError, TypeError, KeyError):
+                        return False
+
                 def same_send_unknown_receipt(current):
                     # Public late-receipt reconciliation may bind this accepted
                     # order while leaving only its session metadata unknown.
-                    # That is authority only for the same ended send and a
-                    # current exact LIVE result, never an absent terminal row.
+                    # That is authority only for the same ended send with a
+                    # current LIVE result or independently proved complete zero.
                     row = (rows or {}).get(oid)
-                    if (not snapshot or row is None or str(row.get('status')).upper() != 'LIVE'
+                    if (not snapshot or rows is None
                             or current.get('entry_order_id') != oid or current.get('submit_status') != 'unknown'
                             or current.get('submit_stage') != 'sending' or current.get('post_started') is not True
                             or audit.get('submit_stage') != 'receipt_received'
@@ -4027,7 +4108,8 @@ class LPAutoPool:
                             or any(current.get(k) not in (None, '') and _maybe_datetime(current.get(k)) != at
                                 for k, at in zip(keys[2:], original[2:]))):
                         return False
-                    return True
+                    return (row is not None and str(row.get('status')).upper() == 'LIVE'
+                        or bound_terminal_zero(current))
 
                 unknown_receipt_pending = same_send_unknown_receipt(session)
                 bound_receipt_pending = (session.get('entry_order_id') == oid
@@ -4036,68 +4118,6 @@ class LPAutoPool:
                     action.update(state='unknown', reason='receipt_apply_pending')
                     row = (rows or {}).get(oid)
                     matched = _maybe_decimal((row or {}).get('size_matched'))
-
-                    def bound_terminal_zero(current):
-                        # An unavailable lookup is not terminal evidence. Only
-                        # the already reconciled exact owned receipt supplies it;
-                        # current authenticated facts must still corroborate zero.
-                        if (not bound_receipt_pending or row is not None or rows is None or not snapshot
-                                or current.get('state') != 'complete' or current.get('submit_status') is not None
-                                or current.get('entry_order_id') != oid
-                                or current.get('orders_terminal') is not True
-                                or current.get('position_reconciled') is not True
-                                or current.get('fee_status') != 'known'
-                                or current.get('order_identity_conflict') or current.get('facts_error')
-                                or current.get('financial_block_reason') or current.get('reconciliation')
-                                or has_independent_unresolved_action(current, self.store.lp_actions(current['session_id']))
-                                or any(snapshot.get(k) is not True for k in ('authenticated', 'open_orders_complete',
-                                    'pagination_complete', 'trades_complete', 'positions_complete'))
-                                or any(not isinstance(snapshot.get(k), (list, tuple))
-                                    for k in ('orders', 'open_orders', 'trades', 'positions'))
-                                or hashlib.sha256(str(snapshot.get('wallet_address') or '').strip().casefold().encode()).hexdigest()
-                                    != plan['account_id']
-                                or any(self.lp._order_id(r) == oid for r in [*snapshot['orders'], *snapshot['open_orders']])):
-                            return False
-                        history = self.lp._order_history(current)
-                        receipt = history.get(oid, {})
-                        if (oid not in self.lp._session_order_ids(current)
-                                or receipt.get('order_id') != oid or receipt.get('side') != 'BUY'
-                                or receipt.get('token_id') != target['token_id']
-                                or str(receipt.get('status')).upper() not in TERMINAL_ORDER_STATES
-                                or receipt.get('fill_quantity_known') is False
-                                or _maybe_decimal(receipt.get('size_matched')) != ZERO
-                                or _maybe_decimal(receipt.get('price')) != _decimal(target['price'])
-                                or _maybe_decimal(receipt.get('original_size')) != _decimal(target['quantity'])):
-                            return False
-                        received, finished = (_maybe_datetime(audit.get(k))
-                            for k in ('submit_receipt_at', 'submit_finished_at'))
-                        started, ended = (_maybe_datetime(snapshot.get(k)) for k in ('read_started_at', 'read_ended_at'))
-                        checked = [_maybe_datetime(current.get(k)) for k in ('account_checked_at', 'facts_checked_at')]
-                        if (received is None or finished is None or started is None or ended is None
-                                or not received <= finished <= started <= ended <= self._now()
-                                or any(at is None or not finished < at <= started for at in checked)):
-                            return False
-                        zero_fields = ('buy_filled_quantity', 'sold_quantity', 'residual_quantity',
-                            'buy_cost', 'sold_revenue', 'buy_fees', 'sell_fees', 'fees')
-                        if any(_maybe_decimal(current.get(k)) != ZERO for k in zero_fields):
-                            return False
-                        try:
-                            owned = self.lp._session_order_ids(current)
-                            if any(r['order_id'] in owned for r in self.lp._owned_sync_order_rows(
-                                    snapshot['trades'], snapshot['wallet_address'])):
-                                return False
-                            facts = {**snapshot, 'account': dict(positions=snapshot['positions'],
-                                positions_complete=True, open_orders=snapshot['open_orders'], open_orders_complete=True)}
-                            # Sending metadata alone blocks the existing pure
-                            # completion check. Observe the proved original receipt
-                            # locally; none of this computed finance is published.
-                            observed = {**current, 'submit_status': 'accepted', 'submit_stage': 'receipt_received'}
-                            observed.update(self.lp._fill_patch(observed, facts))
-                            return (all(_maybe_decimal(observed.get(k)) == ZERO for k in zero_fields)
-                                and not observed.get('financial_block_reason')
-                                and self.lp._completion_patch(observed) is not None)
-                        except (ValueError, TypeError, KeyError):
-                            return False
 
                     durable_terminal = row is None and bound_terminal_zero(session)
                     if not durable_terminal and (row is None or not (str(row.get('status')).upper() == 'LIVE'

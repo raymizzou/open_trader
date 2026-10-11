@@ -3,6 +3,13 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-12
+
+- #331 补齐原 accepted BUY 从 LIVE 自然结束后仍为 unknown 的回执恢复：仅在原发送身份与时间戳一致、会话已完成且精确终态零成交、当前账户事实完整并无矛盾时补齐原回执。
+  精确查询不可用或返回真实终态零成交均使用既有证明；当前订单优先，空值不证明完成，不扩展原 UNKNOWN、无 ID 或正成交请求权限。
+  保留停止、撤单、保护、覆盖、零账本、原审计与财务时间戳；真实 SDK 公共回归已有 RED/GREEN，当前终态结果保持不变、重启及完整 60 秒后新身份补位通过，一次受影响检查共 40 项通过。
+  新 PR、独立评审、CI 与现场原请求恢复仍由交付流程分别确认。
+
 ## 2026-10-11
 
 - #331 补齐 LP 自动计划中已绑定 LIVE 订单的显式 unknown 提交元数据恢复：仅在唯一原 accepted 审计、精确当前订单及原发送时间戳一致时补齐回执，写入前在既有锁内重新核对。
