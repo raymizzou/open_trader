@@ -123,6 +123,8 @@ def test_current_account_replaces_stale_candidate_account(runtime):
 
 @pytest.mark.parametrize('change', ['rank', 'price-same-rank'])
 def test_presend_relative_rank_change_skips_only_this_candidate(runtime, change):
+    from collections import Counter
+
     public = RefillPublic(runtime.clock)
     public.rates = {1: '48', 2: '24', 3: '12'}
     _, _, account, lp, execution, _ = prepare(runtime, count=3, target=2, public=public)
@@ -133,12 +135,13 @@ def test_presend_relative_rank_change_skips_only_this_candidate(runtime, change)
         public.prices[1] = '.39'
     state = execution.lp_auto_run_once(round_id='relative-rank')
     tokens = [p.token_id for p in account.posts]
-    assert tokens == [_refill_identity(i)[2] for i in ([2, 3] if change == 'rank' else [1, 2])], state['last_round']
+    assert Counter(tokens) == Counter(_refill_identity(i)[2] for i in ([2, 3] if change == 'rank' else [1, 2])), state['last_round']
     if change == 'rank':
         assert [r['token_id'] for r in state['last_round']['targets']] == [_refill_identity(i)[2] for i in [2, 3]]
         assert _refill_identity(1)[2] not in tokens
     else:
-        assert account.posts[0].maker_amount == 7800000
+        intended, = [p for p in account.posts if p.token_id == _refill_identity(1)[2]]
+        assert intended.maker_amount == 7800000
     assert state['slots']['occupied'] == 2
     assert Decimal(state['funds']['buy_reserved_usd']) <= 16
 
@@ -151,6 +154,8 @@ def test_presend_relative_rank_change_skips_only_this_candidate(runtime, change)
     ('identity', 'history_identity_mismatch'),
 ])
 def test_selected_price_history_rejects_only_this_candidate(runtime, phase, invalid, reason):
+    from copy import deepcopy
+    from datetime import datetime
     public = RefillPublic(runtime.clock)
     public.rates = {1: '48', 2: '24'}
     store, _, account, lp, execution, _ = prepare(runtime, count=2, target=1, public=public)
@@ -170,11 +175,14 @@ def test_selected_price_history_rejects_only_this_candidate(runtime, phase, inva
         else:
             summary['token_id'] = _refill_identity(2)[2]
         store.lp_save_price_history(condition, token, [], summary)
-    planning_as_of = []
+    planning_as_of, captured, signed_objects = [], [], []
     original_sign = account.create_limit_order
     def sign(**kwargs):
-        planning_as_of.append(execution.lp_auto_state()['funds']['as_of'])
+        approved = execution.lp_auto_state()
+        planning_as_of.append(approved['funds']['as_of'])
+        captured.append(deepcopy(approved))
         signed = original_sign(**kwargs)
+        signed_objects.append(signed)
         if phase == 'signing' and kwargs['token_id'] == token:
             invalidate()
         return signed
@@ -190,26 +198,58 @@ def test_selected_price_history_rejects_only_this_candidate(runtime, phase, inva
         assert state['last_round']['actions'][0]['token_id'] == _refill_identity(2)[2]
         assert state['last_round']['actions'][0]['state'] == 'success'
     else:
-        assert account.posts == []
-        action = state['last_round']['actions'][0]
-        assert action['reason'] == reason
-        assert action['state'] == 'rejected' and action['request_state'] == 'entry_rejected'
-        assert state['slots']['occupied'] == 0
-        assert Decimal(state['funds']['buy_reserved_usd']) == 0
-        assert state['funds']['status'] == 'unknown'
-        assert state['funds']['as_of'] == planning_as_of[-1]
-        assert 'account_financial_facts_changed' in state['admission_block_reasons']
-        advance_api_wait(runtime, execution)
-        state = execution.lp_auto_run_once(round_id='next-history-round')
-        assert [p.token_id for p in account.posts] == [_refill_identity(2)[2]], state['last_round']
-    assert state['slots']['occupied'] == 1
-    assert Decimal(state['funds']['buy_reserved_usd']) == 8
-    assert planning_as_of and planning_as_of[-1]
-    from datetime import datetime
-    assert datetime.fromisoformat(planning_as_of[-1]) <= runtime.clock[0]
-    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+        assert [p.token_id for p in account.posts] == [token], state['last_round']
+        action, = state['last_round']['actions']
+        assert action['token_id'] == token and action['state'] == 'success'
+        assert action['request_state'] == 'entry_open'
+    original = deepcopy(state['last_round'])
+    assert len(captured) == len(signed_objects) == 1 and captured[0]['active_plan']
+    assert original['round_id'] == captured[0]['last_round']['round_id']
+    assert original['targets'] == captured[0]['last_round']['targets']
+    assert [a['action_id'] for a in original['actions']] == [a['action_id'] for a in captured[0]['active_plan']['actions']]
+    signed, = signed_objects
+    assert account.posts == [signed] and isinstance(signed, SignedOrder)
+    assert signed.maker_amount == 8000000 and signed.taker_amount == 20000000 and signed.post_only is True
+    action, = original['actions']
+    target = original['targets'][action['index']]
+    assert target['token_id'] == action['token_id'] and target['condition_id'] == action['condition_id']
+    assert Decimal(target['price']) == Decimal('.40') and Decimal(target['quantity']) == 20
+    audit, = store.lp_actions(action['session_id'])
+    assert audit['state'] == 'accepted' and audit['post_started'] is True
+    assert audit['token_id'] == action['token_id'] and audit['condition_id'] == action['condition_id']
+    assert Decimal(audit['price']) == Decimal('.40') and Decimal(audit['quantity']) == 20
+    original_audits = deepcopy(store.lp_actions(action['session_id']))
+    assert state['slots']['occupied'] == 1 and Decimal(state['funds']['buy_reserved_usd']) == 8
+    assert planning_as_of and planning_as_of[0]
+    assert datetime.fromisoformat(planning_as_of[0]) <= runtime.clock[0]
+    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[0]
     assert state['funds']['available_usd'] is None and state['funds']['spendable_usd'] is None
     assert 'account_financial_facts_changed' in state['admission_block_reasons']
+    assert original['completed_at'] and state['active_plan'] is None
+    deadline = datetime.fromisoformat(state['plan_wait']['deadline'])
+    assert state['plan_wait']['kind'] == 'round' and deadline == datetime.fromisoformat(original['completed_at']) + timedelta(seconds=30)
+    runtime.clock[0] = deadline - timedelta(seconds=1)
+    execution.lp_auto_run_once()
+    assert len(signed_objects) == 1 and account.posts == [signed] and account.cancels == []
+    assert store.lp_actions(action['session_id']) == original_audits
+    if phase == 'signing':
+        # Current history affects new admission. The real superior LIVE token1
+        # still occupies the sole slot, so it is retained without replay.
+        advance_api_wait(runtime, execution)
+        next_state = execution.lp_auto_run_once(round_id='next-history-round')
+        assert next_state['last_round']['round_id'] != original['round_id']
+        assert next_state['last_round']['completed_at'] and next_state['active_plan'] is None
+        assert [t['token_id'] for t in next_state['last_round']['targets']] == [token]
+        assert next_state['last_round']['actions'] == []
+        assert account.posts == [signed] and account.cancels == [] and len(signed_objects) == 1
+        current, = account.orders
+        assert current.id == 'refill-1' and current.token_id == token and current.status == 'LIVE'
+        assert Decimal(current.price) == Decimal('.40') and Decimal(current.original_size) == 20
+        assert Decimal(current.size_matched) == 0
+        assert next_state['slots']['occupied'] == 1 and Decimal(next_state['funds']['buy_reserved_usd']) == 8
+        assert store.lp_actions(action['session_id']) == original_audits
+        assert datetime.fromisoformat(next_state['plan_wait']['deadline']) == datetime.fromisoformat(
+            next_state['last_round']['completed_at']) + timedelta(seconds=30)
 
 
 def test_unknown_unrelated_account_report_history_does_not_block_new_buys(runtime):
@@ -334,102 +374,241 @@ def test_yield_priority_skips_only_unaffordable_candidates(runtime, budget, size
 
 @pytest.mark.parametrize('failure', ['rejected', 'prepare', 'timeout', 'account-unknown', 'pause'])
 def test_candidate_failures_and_unknown_account_have_distinct_scope(runtime, failure):
+    from dataclasses import asdict
+    from collections import Counter
+    from concurrent.futures import ThreadPoolExecutor
+    from copy import deepcopy
+    from datetime import datetime
+    from pathlib import Path
+    from threading import Event
+    from time import monotonic
+    import json
+    import uuid
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+
     public = RefillPublic(runtime.clock)
     public.rates = {1: '48', 2: '24', 3: '12'}
-    store, _, account, _, execution, _ = prepare(runtime, count=3, target=2, budget='16', public=public)
-    original_sign, original_post = account.create_limit_order, account.post_order
-    original_positions = account.list_positions
+    store, adapter, account, lp, execution, _ = prepare(runtime, count=3, target=2, budget='16', public=public)
+    tokens = [_refill_identity(i)[2] for i in (1, 2)]
+    original_sign, original_post, original_positions = account.create_limit_order, account.post_order, account.list_positions
+    phase = ['original_selected_attempts']
+    evidence = dict(parameter=failure, reads=[], faults=[], states=[], signer_observations=[])
+    first_unknown, release = Event(), Event()
+    entered = {t: Event() for t in tokens}; finished = {t: Event() for t in tokens}
+    scheduler = LPAutoScheduler(execution, clock=lambda: runtime.clock[0])
     planning_as_of, active_finance = [], []
-    if failure in ('timeout', 'account-unknown'):
-        balance = account.get_balance_allowance
-        def funds(**kwargs):
-            if execution.lp_auto_state()['active_plan']:
-                active_finance.append(runtime.clock[0])
-            return balance(**kwargs)
-        account.get_balance_allowance = funds
-
+    balance = account.get_balance_allowance
+    def funds(**kwargs):
+        active = bool(execution.lp_auto_state()['active_plan'])
+        evidence['reads'].append(dict(kind='balance', phase=phase[0], active=active, at=runtime.clock[0]))
+        if active:
+            active_finance.append(runtime.clock[0])
+        return balance(**kwargs)
+    account.get_balance_allowance = funds
+    for name in ('lp_account_snapshot', 'lp_account_snapshot_shared', 'lp_order_result_snapshot'):
+        original = getattr(adapter, name)
+        def observed(*args, _method=original, _name=name, **kwargs):
+            row = dict(kind=_name, phase=phase[0], at=runtime.clock[0], active=bool(execution.lp_auto_state()['active_plan']))
+            evidence['reads'].append(row)
+            try:
+                value = _method(*args, **kwargs)
+            except Exception as exc:
+                row['actual_error'] = dict(type=type(exc).__name__, message=str(exc)); raise
+            row['packet'] = deepcopy(value)
+            return value
+        setattr(adapter, name, observed)
+    def capture(label):
+        state = deepcopy(execution.lp_auto_state())
+        evidence['states'].append(dict(label=label, state=state, sessions=store.lp_sessions(),
+            audits={s['session_id']: store.lp_actions(s['session_id']) for s in store.lp_sessions()}))
+        return state
+    def positions_failure(**kwargs):
+        row = dict(endpoint='list_positions', phase=phase[0], at=runtime.clock[0])
+        evidence['faults'].append(row)
+        try:
+            raise TimeoutError('offline account read')
+        except TimeoutError as exc:
+            row['actual_error'] = dict(type=type(exc).__name__, message=str(exc)); raise
     def sign(**kwargs):
-        if failure in ('timeout', 'account-unknown'):
+        token = kwargs['token_id']; entered[token].set()
+        try:
             planning_as_of.append(execution.lp_auto_state()['funds']['as_of'])
-        if kwargs['token_id'] == _refill_identity(1)[2]:
-            if failure == 'prepare':
+            if token == tokens[0] and failure == 'prepare':
+                evidence['faults'].append(dict(endpoint='create_limit_order', type='RuntimeError', message='offline prepare failure'))
                 raise RuntimeError('offline prepare failure')
             if failure == 'pause':
-                execution.lp_auto_set_desired_running(False)
-        if failure == 'timeout' and kwargs['token_id'] == _refill_identity(2)[2]:
-            pending = execution.lp_auto_state()
-            first = next(i for i in pending['intents'] if i['token_id'] == _refill_identity(1)[2])
-            assert first['state'] == 'unknown' and not first.get('reservation_coverage')
-            assert pending['slots']['occupied'] == 2
-            assert Decimal(pending['funds']['buy_reserved_usd']) == 16
-        return original_sign(**kwargs)
-
+                assert release.wait(5), 'Real signer/public-pause watchdog'
+            if failure == 'timeout' and token == tokens[1]:
+                assert first_unknown.wait(5), 'First actual POST must return its unknown outcome'
+                deadline = monotonic() + 5
+                while True:
+                    pending = execution.lp_auto_state()
+                    first = next(i for i in pending['intents'] if i['token_id'] == tokens[0])
+                    if first['state'] == 'unknown':
+                        break
+                    assert monotonic() < deadline, 'Public original UNKNOWN outcome watchdog'
+                    Event().wait(.01)
+                assert not first.get('reservation_coverage')
+                assert pending['slots']['occupied'] == 2 and Decimal(pending['funds']['buy_reserved_usd']) == 16
+                evidence['signer_observations'].append(deepcopy(pending))
+            return original_sign(**kwargs)
+        finally:
+            finished[token].set()
     def post(signed):
-        if signed.token_id == _refill_identity(1)[2]:
+        if signed.token_id == tokens[0]:
             if failure == 'rejected':
                 account.posts.append(signed)
-                return {'accepted': False, 'status': 'REJECTED', 'error': 'offline rejection'}
+                response = {'accepted': False, 'status': 'REJECTED', 'error': 'offline rejection'}
+                evidence['faults'].append(dict(endpoint='post_order', response=deepcopy(response)))
+                return response
             if failure in ('timeout', 'account-unknown'):
                 account.posts.append(signed)
                 if failure == 'account-unknown':
-                    account.list_positions = lambda **kwargs: (_ for _ in ()).throw(TimeoutError('offline account read'))
-                raise TimeoutError('offline lost receipt')
+                    account.list_positions = positions_failure
+                try:
+                    raise TimeoutError('offline lost receipt')
+                except TimeoutError as exc:
+                    evidence['faults'].append(dict(endpoint='post_order', type=type(exc).__name__, message=str(exc)))
+                    raise
+                finally:
+                    first_unknown.set()
         return original_post(signed)
-
     account.create_limit_order, account.post_order = sign, post
-    state = execution.lp_auto_run_once(round_id='failure-scope')
-    if failure in ('rejected', 'prepare'):
-        assert [o.id for o in account.orders] == ['refill-2'], state['last_round']
-        assert state['slots']['occupied'] == 1
-        assert Decimal(state['funds']['buy_reserved_usd']) == 8
-    elif failure == 'pause':
-        assert account.posts == []
-        assert state['pause_confirmed']
-        assert state['slots']['occupied'] == 0
-    else:
-        assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (1, 2)], state['last_round']
-        first = next(i for i in state['intents'] if i['token_id'] == _refill_identity(1)[2])
-        sid = first['session_id']
-        original_plan = state['active_plan']
-        assert store.lp_session(sid)['submit_status'] == 'unknown'
-        assert store.lp_actions(sid)[0]['state'] == 'unknown'
-        assert not first.get('reservation_coverage') and not first.get('order_id')
-        assert state['slots']['pending'] == state['slots']['active'] == 1
-        assert state['slots']['occupied'] == 2
-        assert Decimal(state['funds']['buy_reserved_usd']) == 16
-        assert planning_as_of and planning_as_of[0]
-        assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[0]
-        audit = store.lp_actions(sid)
-        execution.lp_auto_run_once(round_id='failure-scope')
-        assert len(account.posts) == 2
-        if failure == 'account-unknown':
-            from datetime import datetime
-            advance_api_wait(runtime, execution, refresh=False)
-            failed = execution.lp_auto_run_once(round_id='failure-scope')
-            assert failed['last_round']['reason'] == 'order_result_incomplete'
-            assert failed['plan_wait']['kind'] == 'api'
-            assert datetime.fromisoformat(failed['plan_wait']['deadline']) - datetime.fromisoformat(failed['plan_wait']['started_at']) == timedelta(seconds=60)
-            assert failed['active_plan']['round_id'] == original_plan['round_id']
-            assert failed['funds']['status'] == 'unknown' and failed['funds']['as_of'] == planning_as_of[0]
-            assert len(account.posts) == 2 and store.lp_actions(sid) == audit
-            account.list_positions = original_positions
+    def quiet(state, elapsed):
+        counts = (len(evidence['reads']), len(evidence['faults']), len(account.posts))
+        waiting = deepcopy(state['plan_wait']); last = deepcopy(state['last_round'])
+        runtime.clock[0] = datetime.fromisoformat(waiting['started_at']) + timedelta(seconds=elapsed)
+        assert runtime.clock[0] < datetime.fromisoformat(waiting['deadline'])
+        scheduler.request_check(); scheduler.run_due(); execution.lp_auto_run_once(round_id='failure-scope')
+        assert counts == (len(evidence['reads']), len(evidence['faults']), len(account.posts))
+        assert execution.lp_auto_state()['last_round'] == last and execution.lp_auto_state()['plan_wait'] == waiting
+    try:
+        if failure == 'pause':
+            with ThreadPoolExecutor(max_workers=1) as worker:
+                cycle = worker.submit(execution.lp_auto_run_once, round_id='failure-scope')
+                try:
+                    assert all(e.wait(5) for e in entered.values()), 'Both selected actual signers must enter'
+                    assert execution.lp_auto_set_desired_running(False)['pause_confirmed']
+                    state = cycle.result(timeout=5)
+                    capture('public_local_closure_while_signatures_still_held')
+                    assert account.posts == [] and all(not e.is_set() for e in finished.values())
+                finally:
+                    release.set()
+                assert all(e.wait(5) for e in finished.values()), 'Actual returned-signature watchdog'
+                deadline = monotonic() + 5
+                while True:
+                    current = execution.lp_auto_state()
+                    if current['slots']['occupied'] == 0:
+                        break
+                    assert monotonic() < deadline, 'Public physical unsent-cleanup watchdog'
+                    Event().wait(.01)
+            physical = capture('both_original_unsent_preparations_physically_finished')
+            assert physical['pause_confirmed'] and physical['desired_running'] is False
+            assert account.posts == [] and physical['slots']['occupied'] == 0
+            assert Decimal(physical['funds']['buy_reserved_usd']) == 0
+            sessions = store.lp_sessions(); assert len(sessions) == 2
+            assert all(s['post_started'] is False and not s.get('entry_order_id') for s in sessions)
+            assert all(a['post_started'] is False and not a.get('order_id') for s in sessions for a in store.lp_actions(s['session_id']))
+        else:
+            state = execution.lp_auto_run_once(round_id='failure-scope')
+            capture('original_selected_attempts_locally_complete')
+        original_round = deepcopy(state['last_round'])
+        assert state['active_plan'] is None and original_round['completed_at']
+        assert [r['token_id'] for r in original_round['targets']] == tokens
+        assert all(Decimal(r['price']) == Decimal('.40') and Decimal(r['quantity']) == 20 for r in original_round['targets'])
+        assert len(original_round['actions']) == 2 and all(a['state'] != 'pending' for a in original_round['actions'])
+        assert state['plan_wait']['kind'] == 'round'
+        assert datetime.fromisoformat(state['plan_wait']['deadline']) == datetime.fromisoformat(original_round['completed_at']) + timedelta(seconds=30)
+        assert all(p.side == 'BUY' and p.post_only is True and Decimal(p.maker_amount) / p.taker_amount == Decimal('.40')
+            and Decimal(p.taker_amount) / 1000000 == 20 for p in account.posts)
+        evidence['original_round'] = original_round
+        if failure in ('rejected', 'prepare'):
+            assert [o.id for o in account.orders] == ['refill-2']
+            assert state['slots']['occupied'] == 1 and Decimal(state['funds']['buy_reserved_usd']) == 8
+            assert Counter(p.token_id for p in account.posts) == Counter(tokens if failure == 'rejected' else [tokens[1]])
+            first = next(a for a in original_round['actions'] if a['token_id'] == tokens[0])
+            assert first['state'] == 'rejected'
+            native, = store.lp_actions(first['session_id'])
+            assert native['state'] == 'rejected' and not native.get('order_id')
+            if failure == 'prepare':
+                assert first['reason'] == native['reason'] == 'prepare_failed'
+                assert native['submit_stage'] == 'prepare_failed' and native['error'] == 'RuntimeError'
+                assert native['submit_error_chain'] == ['RuntimeError'] and native['post_started'] is False
+            else:
+                assert first['reason'] == native['reason'] == 'exchange_rejected'
+                assert native['submit_stage'] == 'exchange_rejected' and native['post_started'] is True
+        elif failure != 'pause':
+            assert Counter(p.token_id for p in account.posts) == Counter(tokens)
+            first = next(i for i in state['intents'] if i['token_id'] == tokens[0]); sid = first['session_id']
+            original_session = deepcopy(store.lp_session(sid)); audit = deepcopy(store.lp_actions(sid))
+            native, = audit; uuid.UUID(native['action_id'])
+            assert original_session['submit_status'] == 'unknown' and not original_session.get('entry_order_id')
+            assert native['state'] == 'unknown' and native['post_started'] is True and native['error'] == 'TimeoutError'
+            assert native['submit_error_chain'] == ['TimeoutError'] and native['submit_timeout'] is True
+            assert not first.get('reservation_coverage') and not first.get('order_id')
+            assert state['slots']['pending'] == state['slots']['active'] == 1 and state['slots']['occupied'] == 2
+            assert Decimal(state['funds']['buy_reserved_usd']) == 16
+            assert planning_as_of and planning_as_of[0]
+            assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[0]
+            evidence.update(original_session=original_session, original_audit=audit, unknown_sid=sid)
+            for elapsed in (1, 29):
+                quiet(state, elapsed); assert store.lp_actions(sid) == audit
+            if failure == 'account-unknown':
+                phase[0] = 'actual_next_current_positions_failure'
+                runtime.clock[0] = datetime.fromisoformat(state['plan_wait']['deadline'])
+                before = len(evidence['faults'])
+                failed = execution.lp_auto_run_once()
+                capture('actual_current_required_positions_failure')
+                assert len(evidence['faults']) == before + 1 and evidence['faults'][-1]['endpoint'] == 'list_positions'
+                assert failed['last_round']['reason'] == 'account_order_sync_unknown'
+                assert failed['active_plan'] is None and failed['last_round']['actions'] == []
+                assert failed['last_round']['round_id'] != original_round['round_id']
+                assert failed['plan_wait']['kind'] == 'round'
+                assert datetime.fromisoformat(failed['plan_wait']['deadline']) == datetime.fromisoformat(failed['last_round']['completed_at']) + timedelta(seconds=30)
+                assert failed['funds']['status'] == 'unknown' and failed['funds']['as_of'] == planning_as_of[0]
+                assert failed['slots']['occupied'] == 2 and Decimal(failed['funds']['buy_reserved_usd']) == 16
+                assert len(account.posts) == 2 and store.lp_actions(sid) == audit
+                for elapsed in (1, 29):
+                    quiet(failed, elapsed); assert store.lp_actions(sid) == audit
+                account.list_positions = original_positions
+            assert active_finance == []
+            phase[0] = 'genuine_complete_public_dashboard'
+            assert execution.lp_auto_set_desired_running(False)['pause_confirmed']
+            _advance(runtime)
+            packet = adapter.lp_account_snapshot_shared(max_age_seconds=-1, trade_generation_provider=store.lp_trade_generation)
+            evidence['healthy_full_packet'] = deepcopy(packet)
+            assert packet['authenticated'] is True and all(packet[k] is True for k in
+                ('open_orders_complete', 'positions_complete', 'trades_complete', 'balance_complete', 'pagination_complete'))
+            assert len(packet['open_orders']) == 1 and packet['open_orders'][0]['order_id'] == 'refill-2' and not packet['positions']
+            assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+            repaired = capture('complete_public_dashboard_covered_unknown_one_actual_live')
+            first = next(i for i in repaired['intents'] if i['session_id'] == sid)
+            assert first['reservation_coverage']['state'] == 'covered'
+            assert repaired['slots']['occupied'] == repaired['slots']['active'] == 1
+            assert Decimal(repaired['funds']['buy_reserved_usd']) == 8 and Decimal(repaired['funds']['spendable_usd']) == 8
+            assert repaired['funds']['status'] == 'known' and datetime.fromisoformat(repaired['funds']['as_of']) == packet['checked_at']
+            assert repaired['active_plan'] is None and original_round['completed_at']
+            assert not first.get('order_id') and first['state'] == 'unknown' and first.get('settled') is not True
+            assert Decimal(first['reserved_usd']) == 8 and store.lp_session(sid)['submit_status'] == 'unknown'
+            assert not store.lp_session(sid).get('entry_order_id') and store.lp_actions(sid) == audit
+            assert len(account.posts) == 2
+        if failure in ('rejected', 'prepare', 'pause'):
+            locally_ended = execution.lp_auto_state()
+            originals = {s['session_id']: deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
+            for elapsed in (1, 29):
+                quiet(locally_ended, elapsed)
+                assert all(store.lp_actions(sid) == rows for sid, rows in originals.items())
         assert active_finance == []
-        _advance(runtime)
-        assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
-        repaired = execution.lp_auto_state()
-        first = next(i for i in repaired['intents'] if i['session_id'] == sid)
-        assert first['reservation_coverage']['state'] == 'covered'
-        assert repaired['slots']['occupied'] == repaired['slots']['active'] == 1
-        assert Decimal(repaired['funds']['buy_reserved_usd']) == 8
-        assert Decimal(repaired['funds']['spendable_usd']) == 8
-        assert repaired['funds']['status'] == 'known'
-        assert repaired['active_plan']['round_id'] == original_plan['round_id']
-        assert not repaired['last_round']['completed_at']
-        assert not first.get('order_id') and store.lp_session(sid)['submit_status'] == 'unknown'
-        assert store.lp_actions(sid) == audit and store.lp_actions(sid)[0]['state'] == 'unknown'
-        assert len(account.posts) == 2
-    assert all(p.token_id != _refill_identity(3)[2] for p in account.posts)
-    assert account.cancels == account.market_orders == []
+        assert all(p.token_id != _refill_identity(3)[2] for p in account.posts)
+        assert account.cancels == account.market_orders == []
+        evidence['completed'] = 'full'
+    finally:
+        release.set()
+        evidence.update(phase=phase[0],clock=runtime.clock[0],state=execution.lp_auto_state(),sessions=store.lp_sessions(),
+            audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()},
+            posts=[asdict(p) for p in account.posts],orders=[o.model_dump(mode='json') for o in account.orders],
+            entered={t:e.is_set() for t,e in entered.items()},finished={t:e.is_set() for t,e in finished.items()})
+        (Path(store.path).parent/'RC-candidate-diagnostics.json').write_text(json.dumps(evidence,indent=2,default=str)+'\n')
 
 
 def test_three_to_five_is_one_round_and_concurrent_replay_and_restart_do_not_resend(runtime):
@@ -473,6 +652,8 @@ def test_three_to_five_is_one_round_and_concurrent_replay_and_restart_do_not_res
 
 
 def test_later_candidate_cannot_jump_a_processed_rank_inside_the_round(runtime):
+    from collections import Counter
+
     public = RefillPublic(runtime.clock)
     public.rates = {1: '48', 2: '24', 3: '12'}
     _, _, account, _, execution, _ = prepare(runtime, count=3, target=2, public=public)
@@ -484,68 +665,130 @@ def test_later_candidate_cannot_jump_a_processed_rank_inside_the_round(runtime):
         return result
     account.post_order = post
     state = execution.lp_auto_run_once(round_id='rank-jump')
-    assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in [1, 2]], state['last_round']
+    assert Counter(p.token_id for p in account.posts) == Counter(_refill_identity(i)[2] for i in [1, 2]), state['last_round']
     assert _refill_identity(3)[2] not in [p.token_id for p in account.posts]
     assert all(a.get('reason') != 'candidate_rank_changed' for a in state['last_round']['actions'])
 
 
 @pytest.mark.parametrize('invalid', ['stale', 'identity', 'incomplete', 'generation'])
 def test_planned_entry_keeps_real_market_and_identity_fences(runtime, invalid):
+    from copy import deepcopy
+    from datetime import datetime
+    from threading import Barrier, BrokenBarrierError, Event, Lock
     from open_trader.polymarket_trading import TradingConfig
     store, adapter, account, _, execution, public = prepare(runtime, count=2, target=2)
     original_sign = account.create_limit_order
-    balance = account.get_balance_allowance
-    forbidden, captured = [], []
+    balance, positions = account.get_balance_allowance, account.list_positions
+    forbidden, captured, signed_objects, account_reads, barrier_errors, mutations = [], [], [], [], [], []
+    fixture_lock, mutation_complete = Lock(), Event()
     def account_balance(**kwargs):
-        if execution.lp_auto_state()['active_plan']:
+        active = bool(execution.lp_auto_state()['active_plan'])
+        account_reads.append(('balance',runtime.clock[0],active))
+        if active:
             forbidden.append(runtime.clock[0])
             raise TimeoutError('approved action must not reread financial transport')
         return balance(**kwargs)
-    account.get_balance_allowance = account_balance
-    def sign(**kwargs):
-        signed = original_sign(**kwargs)
-        if not captured:
-            captured.append(execution.lp_auto_state())
+    def account_positions(**kwargs):
+        active = bool(execution.lp_auto_state()['active_plan'])
+        account_reads.append(('positions',runtime.clock[0],active))
+        if active:
+            forbidden.append(runtime.clock[0])
+        if invalid == 'incomplete' and mutation_complete.is_set():
+            return (object(),)
+        return positions(**kwargs)
+    account.get_balance_allowance, account.list_positions = account_balance, account_positions
+    def mutate_after_both_signed():
+        assert len(signed_objects) == 2 and len(captured) == 1
+        before = runtime.clock[0]
+        generation = store.lp_trade_generation()
+        advanced = None
         if invalid == 'identity':
             adapter.config = TradingConfig('0x' + 'b' * 40, '0x' + 'b' * 40)
-        elif invalid == 'incomplete':
-            account.list_positions = lambda **kwargs: (object(),)
         elif invalid == 'stale':
-            # Account facts read before the slow market response must expire.
-            original_book = public.get_order_book
-            def delayed_book(**kwargs):
-                _advance(runtime, 61)
-                return original_book(**kwargs)
-            public.get_order_book = delayed_book
-        else:
-            assert store.lp_advance_trade_generation(store.lp_trade_generation())
+            _advance(runtime, 61)
+        elif invalid == 'generation':
+            advanced = store.lp_advance_trade_generation(generation)
+            assert store.lp_trade_generation() > generation
+        mutations.append(dict(at=before,after=runtime.clock[0],generation=generation,
+            resulting_generation=store.lp_trade_generation(),cas_won=advanced))
+        mutation_complete.set()
+    both_signed = Barrier(2,action=mutate_after_both_signed)
+    def sign(**kwargs):
+        signed = original_sign(**kwargs)
+        with fixture_lock:
+            signed_objects.append(signed)
+            if not captured:
+                captured.append(deepcopy(execution.lp_auto_state()))
+        try:
+            both_signed.wait(timeout=5)
+        except BrokenBarrierError:
+            with fixture_lock:
+                barrier_errors.append(kwargs['token_id'])
+            raise
+        assert mutation_complete.is_set(), 'Both genuine signatures precede the one external mutation'
         return signed
     account.create_limit_order = sign
     state = execution.lp_auto_run_once(round_id=f'invalid-{invalid}')
+    assert barrier_errors == [] and len(signed_objects) == 2, 'Both real signatures must reach the external seam within the independent 5s watchdog'
     assert len(captured) == 1 and captured[0]['active_plan'] and forbidden == []
+    assert len(mutations) == 1 and mutation_complete.is_set()
+    assert all(isinstance(s,SignedOrder) and s.maker_amount == 8000000 and s.taker_amount == 20000000
+        and s.post_only is True for s in signed_objects)
+    assert {s.token_id for s in signed_objects} == {_refill_identity(i)[2] for i in (1,2)}
+    if invalid == 'stale':
+        assert mutations[0]['after'] == mutations[0]['at'] + timedelta(seconds=61)
+    elif invalid == 'generation':
+        assert mutations[0]['resulting_generation'] > mutations[0]['generation']
     assert state['last_round']['round_id'] == captured[0]['last_round']['round_id']
     assert state['last_round']['targets'] == captured[0]['last_round']['targets']
     assert [a['action_id'] for a in state['last_round']['actions']] == [a['action_id'] for a in captured[0]['active_plan']['actions']]
+    for action in state['last_round']['actions']:
+        target = state['last_round']['targets'][action['index']]
+        assert target['token_id'] == action['token_id'] and target['condition_id'] == action['condition_id']
+        assert Decimal(target['price']) == Decimal('.40') and Decimal(target['quantity']) == 20
     action = state['last_round']['actions'][0]
-    if invalid in ('stale', 'identity'):
+    if invalid == 'identity':
         assert account.posts == []
         assert state['slots']['occupied'] == 0 and Decimal(state['funds']['buy_reserved_usd']) == 0
-        assert action['request_state'] == 'entry_rejected' and action['state'] == 'rejected'
-        assert action['reason'] == ('market_metadata_stale' if invalid == 'stale' else 'account_identity_mismatch')
+        assert all(a['request_state'] == 'entry_rejected' and a['state'] == 'rejected' for a in state['last_round']['actions'])
+        assert all(a['reason'] == 'prepare_failed' and a.get('order_id') is None for a in state['last_round']['actions'])
+        assert account.orders == ()
     else:
         assert len(account.posts) == 2
         assert {p.token_id for p in account.posts} == {_refill_identity(i)[2] for i in (1, 2)}
-        assert all(p.maker_amount == 8000000 and p.taker_amount == 20000000 for p in account.posts)
-        assert state['slots']['occupied'] == 2
+        assert all(p.maker_amount == 8000000 and p.taker_amount == 20000000 and p.post_only is True for p in account.posts)
+        assert state['slots']['occupied'] == 2 and Decimal(state['funds']['buy_reserved_usd']) == 16
         assert all(a['state'] == 'success' for a in state['last_round']['actions'])
     assert state['last_round']['completed_at'] and state['active_plan'] is None
     assert state['plan_wait']['kind'] == 'round'
+    deadline = datetime.fromisoformat(state['plan_wait']['deadline'])
+    assert deadline == datetime.fromisoformat(state['last_round']['completed_at']) + timedelta(seconds=30)
     assert forbidden == []
+    original_audits = {}
     for action in state['last_round']['actions']:
-        if action.get('session_id'):
-            audit = store.lp_actions(action['session_id'])
-            assert len(audit) == 1
-            assert audit[0]['post_started'] is (invalid not in ('stale', 'identity'))
+        assert action.get('session_id')
+        audit, = store.lp_actions(action['session_id'])
+        assert audit['post_started'] is (invalid != 'identity')
+        assert audit['state'] == ('rejected' if invalid == 'identity' else 'accepted')
+        assert audit['token_id'] == action['token_id'] and audit['condition_id'] == action['condition_id']
+        assert Decimal(audit['price']) == Decimal('.40') and Decimal(audit['quantity']) == 20
+        if invalid == 'identity':
+            assert audit['reason'] == audit['submit_stage'] == 'prepare_failed'
+            assert audit['error'] == 'ValueError' and audit['submit_error_chain'] == ['ValueError']
+            assert audit.get('order_id') is None and audit['submit_post_started_at'] is None
+            session = store.lp_session(action['session_id'])
+            assert session['submit_status'] == 'rejected' and session['submit_stage'] == 'prepare_failed'
+            assert session['submit_error_chain'] == ['ValueError']
+            assert session.get('entry_order_id') is None and session['submit_post_started_at'] is None
+            assert session['token_id'] == action['token_id'] and session['condition_id'] == action['condition_id']
+            assert session['account_id'] == WALLET
+            assert Decimal(session['price']) == Decimal('.40') and Decimal(session['quantity']) == 20
+        original_audits[action['session_id']] = deepcopy(store.lp_actions(action['session_id']))
+    before = (len(account_reads),len(signed_objects),len(account.posts),len(account.cancels))
+    runtime.clock[0] = deadline - timedelta(seconds=1)
+    execution.lp_auto_run_once()
+    assert (len(account_reads),len(signed_objects),len(account.posts),len(account.cancels)) == before
+    assert {sid:store.lp_actions(sid) for sid in original_audits} == original_audits
 
 
 def test_definite_allowance_refusal_continues_fixed_plan_then_replans(runtime):
@@ -625,9 +868,10 @@ def test_restart_never_labels_a_saved_five_percent_estimate_as_minimum_order(run
 def test_newer_dashboard_publication_preserves_original_plan_authorization(runtime):
     store, _, account, _, execution, public = prepare(runtime, count=2, target=1)
     public.rates = {1: '24', 2: '24'}
-    original_sign, original_book = account.create_limit_order, public.get_order_book
+    original_sign = account.create_limit_order
     changed, captured, published = [False], [], []
-    def book(**kwargs):
+    def sign(**kwargs):
+        signed = original_sign(**kwargs)
         if not changed[0]:
             captured.append(execution.lp_auto_state())
             changed[0] = True
@@ -635,14 +879,12 @@ def test_newer_dashboard_publication_preserves_original_plan_authorization(runti
             assert store.lp_advance_trade_generation(store.lp_trade_generation())
             assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
             published.append(execution.lp_auto_state()['funds']['as_of'])
-        return original_book(**kwargs)
-    def sign(**kwargs):
-        signed = original_sign(**kwargs)
-        public.get_order_book = book
         return signed
     account.create_limit_order = sign
     state = execution.lp_auto_run_once(round_id='presend-generation')
     assert len(account.posts) == 1 and account.posts[0].token_id == _refill_identity(2)[2]
+    assert account.posts[0].maker_amount == 8000000 and account.posts[0].taker_amount == 20000000
+    assert account.posts[0].post_only is True
     action = state['last_round']['actions'][0]
     assert action['state'] == 'success' and action['request_state'] == 'entry_open'
     assert len(captured) == 1 and captured[0]['active_plan']
@@ -654,20 +896,23 @@ def test_newer_dashboard_publication_preserves_original_plan_authorization(runti
     assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == published[0]
     assert Decimal(state['last_round']['targets'][0]['price']) == Decimal('.40')
     assert Decimal(state['last_round']['targets'][0]['quantity']) == 20
-    assert state['last_round']['completed_at']
+    assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('8')
+    assert state['slots']['occupied'] == 1
+    assert state['active_plan'] is None and state['last_round']['completed_at']
     original_round = state['last_round']['round_id']
     original_action = dict(action)
     original_audit = store.lp_actions(action['session_id'])
     waiting = state['plan_wait']
     from datetime import datetime
     deadline = datetime.fromisoformat(waiting['deadline'])
-    assert deadline - datetime.fromisoformat(waiting['started_at']) == timedelta(seconds=60)
+    assert deadline - datetime.fromisoformat(waiting['started_at']) == timedelta(seconds=30)
     runtime.clock[0] = deadline - timedelta(seconds=1)
-    before = account.position_reads
+    before = (account.position_reads, account.balance_reads, account.order_reads)
     execution.lp_auto_run_once(round_id=original_round)
-    assert account.position_reads == before and len(account.posts) == 1
+    assert (account.position_reads, account.balance_reads, account.order_reads) == before
+    assert len(account.posts) == 1 and store.lp_actions(action['session_id']) == original_audit
     assert action['token_id'] == _refill_identity(2)[2]
-    advance_api_wait(runtime, execution)
+    runtime.clock[0] = deadline
     next_state = execution.lp_auto_run_once(round_id='next-generation-round')
     assert next_state['last_round']['round_id'] != original_round
     assert store.lp_actions(action['session_id']) == original_audit
@@ -677,6 +922,10 @@ def test_newer_dashboard_publication_preserves_original_plan_authorization(runti
     assert not next_state['last_round']['actions']
     assert original_action['state'] == 'success'
     assert original_audit[0]['state'] == 'accepted' and original_audit[0]['post_started'] is True
+
+    assert next_state['active_plan'] is None and next_state['last_round']['completed_at']
+    assert next_state['slots']['occupied'] == 1
+    assert Decimal(next_state['funds']['buy_reserved_usd']) == Decimal('8')
 
 
 def test_ui_and_auto_both_reject_the_only_candidate_with_adverse_price_history(runtime):
@@ -1142,72 +1391,168 @@ def test_known_matching_intent_with_accepted_idless_extra_action_blocks_new_buys
     assert store.lp_actions(original['session_id']) == audit_actions
 
 
-def test_order_result_failures_preserve_original_unknown_cause_and_audit(runtime):
+def test_current_read_failures_preserve_original_unknown_cause_and_audit(runtime):
+    from dataclasses import asdict
+    from collections import Counter
     from copy import deepcopy
     from datetime import datetime
+    from pathlib import Path
+    import json
+    import uuid
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+
     public = RefillPublic(runtime.clock)
     public.rates = {1: '48', 2: '24'}
-    store, _, account, _, execution, _ = prepare(runtime, count=2, target=2, public=public)
+    store, adapter, account, lp, execution, _ = prepare(runtime, count=2, target=2, public=public)
+    tokens = [_refill_identity(i)[2] for i in (1, 2)]
     balance, post, sign = account.get_balance_allowance, account.post_order, account.create_limit_order
+    phase = ['original_selected_attempts']
+    evidence = dict(reads=[],faults=[],states=[])
     financial, forbidden = [], []
     def balances(**kwargs):
-        if execution.lp_auto_state()['active_plan']:
+        active = bool(execution.lp_auto_state()['active_plan'])
+        evidence['reads'].append(dict(kind='balance',phase=phase[0],active=active,at=runtime.clock[0]))
+        if active:
             forbidden.append(runtime.clock[0])
             raise TimeoutError('financial transport cannot approve execution')
         return balance(**kwargs)
     account.get_balance_allowance = balances
+    for name in ('lp_account_snapshot', 'lp_account_snapshot_shared', 'lp_order_result_snapshot'):
+        original = getattr(adapter, name)
+        def observed(*args, _method=original, _name=name, **kwargs):
+            row = dict(kind=_name, phase=phase[0], at=runtime.clock[0],active=bool(execution.lp_auto_state()['active_plan']))
+            evidence['reads'].append(row)
+            try:
+                value = _method(*args, **kwargs)
+            except Exception as exc:
+                row['actual_error']=dict(type=type(exc).__name__,message=str(exc));raise
+            row['packet']=deepcopy(value);row['ended_at']=runtime.clock[0]
+            return value
+        setattr(adapter,name,observed)
+    def capture(label):
+        state=deepcopy(execution.lp_auto_state())
+        evidence['states'].append(dict(label=label,state=state,sessions=store.lp_sessions(),
+            audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()}))
+        return state
     def signing(**kwargs):
-        if not financial:
-            financial.append(execution.lp_auto_state()['funds']['as_of'])
+        financial.append(execution.lp_auto_state()['funds']['as_of'])
         return sign(**kwargs)
-    account.create_limit_order = signing
+    account.create_limit_order=signing
     def unknown(signed):
-        if signed.token_id == _refill_identity(1)[2]:
+        if signed.token_id==tokens[0]:
             account.posts.append(signed)
-            raise TimeoutError('original actual POST outcome unknown')
+            try:
+                raise TimeoutError('original actual POST outcome unknown')
+            except TimeoutError as exc:
+                evidence['original_post_error']=dict(type=type(exc).__name__,message=str(exc),at=runtime.clock[0]);raise
         return post(signed)
-    account.post_order = unknown
-    state = execution.lp_auto_run_once(round_id='latched-result-failure')
-    original_plan = deepcopy(state['active_plan'])
-    first = original_plan['actions'][0]
-    assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (1, 2)]
-    assert first['state'] == 'unknown' and original_plan['actions'][1]['state'] == 'success'
-    audit = store.lp_actions(first['session_id'])
-    assert len(audit) == 1 and audit[0]['state'] == 'unknown' and audit[0]['post_started'] is True
-    assert financial[0] and datetime.fromisoformat(financial[0]) <= runtime.clock[0]
-    open_orders = account.list_open_orders
-    failed_at = []
-    def failure(**kwargs):
-        _advance(runtime, 3)
-        failed_at.append(runtime.clock[0])
-        if len(failed_at) == 1:
-            raise TimeoutError('first actual result read failure')
-        return tuple(o.model_copy(update={'token_id': 'wrong-owned-token'}) for o in open_orders(**kwargs))
-    account.list_open_orders = failure
-    for cause in ('order_result_incomplete', 'owned_order_identity_mismatch'):
-        runtime.clock[0] = datetime.fromisoformat(execution.lp_auto_state()['plan_wait']['deadline'])
-        state = execution.lp_auto_run_once()
-        assert state['reason'] == state['last_round']['reason'] == cause
-        assert state['active_plan']['round_id'] == original_plan['round_id']
-        assert state['active_plan']['targets'] == original_plan['targets']
-        assert state['active_plan']['actions'][0] == first
-        assert store.lp_actions(first['session_id']) == audit and len(account.posts) == 2
-        assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == financial[0]
-        waiting = state['plan_wait']
-        assert waiting['kind'] == 'api'
-        assert datetime.fromisoformat(waiting['started_at']) == failed_at[-1]
-        assert datetime.fromisoformat(waiting['deadline']) == failed_at[-1] + timedelta(seconds=60)
-        count = len(failed_at)
-        for elapsed in (1, 59):
-            runtime.clock[0] = failed_at[-1] + timedelta(seconds=elapsed)
-            execution.lp_auto_run_once()
-            assert len(failed_at) == count and len(account.posts) == 2
-            assert store.lp_actions(first['session_id']) == audit
-    account.list_open_orders = open_orders
-    runtime.clock[0] = datetime.fromisoformat(state['plan_wait']['deadline'])
-    recovered = execution.lp_auto_run_once()
-    assert recovered['active_plan']['actions'][0] == first
-    assert recovered['plan_wait']['kind'] == 'order' and not recovered['last_round']['completed_at']
-    assert len(account.posts) == 2 and store.lp_actions(first['session_id']) == audit
-    assert recovered['funds']['status'] == 'unknown' and recovered['funds']['as_of'] == financial[0]
-    assert forbidden == [] and len(failed_at) == 2
+    account.post_order=unknown
+    scheduler=LPAutoScheduler(execution,clock=lambda:runtime.clock[0])
+    failed_at=[]
+    try:
+        state=execution.lp_auto_run_once(round_id='latched-result-failure')
+        capture('original_selected_attempts_locally_complete')
+        original_round=deepcopy(state['last_round'])
+        assert state['active_plan'] is None and original_round['completed_at']
+        assert state['plan_wait']['kind']=='round'
+        assert datetime.fromisoformat(state['plan_wait']['deadline'])==datetime.fromisoformat(original_round['completed_at'])+timedelta(seconds=30)
+        assert [r['token_id'] for r in original_round['targets']]==tokens
+        assert all(Decimal(r['price'])==Decimal('.40') and Decimal(r['quantity'])==20 for r in original_round['targets'])
+        assert Counter(p.token_id for p in account.posts)==Counter(tokens)
+        assert all(p.side=='BUY' and p.post_only is True and Decimal(p.maker_amount)/p.taker_amount==Decimal('.40')
+            and Decimal(p.taker_amount)/1000000==20 for p in account.posts)
+        first=next(a for a in original_round['actions'] if a['token_id']==tokens[0])
+        sibling=next(a for a in original_round['actions'] if a['token_id']==tokens[1])
+        assert first['state']=='unknown' and sibling['state']=='success'
+        sid=first['session_id'];session=deepcopy(store.lp_session(sid));audit=deepcopy(store.lp_actions(sid))
+        row,=audit;uuid.UUID(row['action_id'])
+        assert row['state']=='unknown' and row['post_started'] is True and row['error']=='TimeoutError'
+        assert row['submit_error_chain']==['TimeoutError'] and row['submit_timeout'] is True
+        assert session['submit_status']=='unknown' and not session.get('entry_order_id')
+        assert state['slots']['occupied']==2 and Decimal(state['funds']['buy_reserved_usd'])==16
+        assert financial[0] and datetime.fromisoformat(financial[0])<=runtime.clock[0]
+        assert state['funds']['status']=='unknown' and state['funds']['as_of']==financial[0]
+        originals={s['session_id']:deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
+        evidence.update(original_round=original_round,original_action=first,original_session=session,original_audits=originals,unknown_sid=sid)
+        open_orders=account.list_open_orders
+        def failure(**kwargs):
+            _advance(runtime,3);failed_at.append(runtime.clock[0])
+            observed=dict(endpoint='list_open_orders',at=runtime.clock[0],phase=phase[0],kwargs=deepcopy(kwargs))
+            evidence['faults'].append(observed)
+            if len(failed_at)==1:
+                try:
+                    raise TimeoutError('first actual result read failure')
+                except TimeoutError as exc:
+                    observed['actual_error']=dict(type=type(exc).__name__,message=str(exc));raise
+            actual=open_orders(**kwargs)
+            returned=tuple(o.model_copy(update={'token_id':'wrong-owned-token'}) for o in actual)
+            observed.update(original_sdk=[o.model_dump(mode='json') for o in actual],returned_sdk=[o.model_dump(mode='json') for o in returned])
+            assert len(returned)==1 and returned[0].id==actual[0].id==sibling['order_id']
+            assert returned[0].token_id=='wrong-owned-token' and actual[0].token_id==tokens[1]
+            return returned
+        account.list_open_orders=failure
+        for cause in ('account_order_sync_unknown','order_identity_conflict'):
+            phase[0]='actual_required_current_'+cause
+            prior=state['last_round']['round_id'];before=len(failed_at)
+            runtime.clock[0]=datetime.fromisoformat(state['plan_wait']['deadline'])
+            state=execution.lp_auto_run_once()
+            capture(cause)
+            assert len(failed_at)==before+1
+            assert state['last_round']['reason']==cause
+            assert state['active_plan'] is None and state['last_round']['actions']==[]
+            assert state['last_round']['round_id'] not in (prior,original_round['round_id'])
+            assert state['last_round']['completed_at']
+            assert store.lp_actions(sid)==audit and len(account.posts)==2
+            assert store.lp_session(sid)['submit_status']=='unknown' and not store.lp_session(sid).get('entry_order_id')
+            assert all(store.lp_actions(original_sid)==rows for original_sid,rows in originals.items())
+            assert state['funds']['status']=='unknown' and state['funds']['as_of']==financial[0]
+            assert state['slots']['occupied']==2 and Decimal(state['funds']['buy_reserved_usd'])==16
+            waiting=deepcopy(state['plan_wait']);last=deepcopy(state['last_round'])
+            assert waiting['kind']=='round'
+            assert datetime.fromisoformat(waiting['started_at'])==datetime.fromisoformat(last['completed_at'])
+            assert datetime.fromisoformat(waiting['started_at'])>=failed_at[-1]
+            assert datetime.fromisoformat(waiting['deadline'])==datetime.fromisoformat(waiting['started_at'])+timedelta(seconds=30)
+            for elapsed in (1,29):
+                counts=(len(evidence['reads']),len(failed_at),len(account.posts))
+                runtime.clock[0]=datetime.fromisoformat(waiting['started_at'])+timedelta(seconds=elapsed)
+                assert runtime.clock[0]<datetime.fromisoformat(waiting['deadline'])
+                scheduler.request_check();scheduler.run_due();execution.lp_auto_run_once()
+                assert counts==(len(evidence['reads']),len(failed_at),len(account.posts))
+                assert execution.lp_auto_state()['last_round']==last and execution.lp_auto_state()['plan_wait']==waiting
+                assert store.lp_actions(sid)==audit
+        assert len(failed_at)==2 and forbidden==[]
+        account.list_open_orders=open_orders
+        phase[0]='paused_healthy_current_check'
+        assert execution.lp_auto_set_desired_running(False)['pause_confirmed']
+        runtime.clock[0]=datetime.fromisoformat(state['plan_wait']['deadline'])
+        checked=execution.lp_auto_run_once()
+        capture('actual_paused_healthy_private_observation_before_dashboard')
+        assert checked['active_plan'] is None and checked['last_round']['actions']==[] and checked['last_round']['checked_at']
+        assert checked['desired_running'] is False and len(account.posts)==2
+        assert store.lp_actions(sid)==audit
+        phase[0]='genuine_complete_public_dashboard'
+        packet=adapter.lp_account_snapshot_shared(max_age_seconds=-1,trade_generation_provider=store.lp_trade_generation)
+        evidence['healthy_full_packet']=deepcopy(packet)
+        assert packet['authenticated'] is True and all(packet[k] is True for k in
+            ('open_orders_complete','positions_complete','trades_complete','balance_complete','pagination_complete'))
+        assert len(packet['open_orders'])==1 and packet['open_orders'][0]['order_id']==sibling['order_id'] and not packet['positions']
+        assert execution.refresh_lp_dashboard_snapshot()['state']=='ready'
+        recovered=capture('actual_public_healthy_publication_clears_sync_error')
+        assert recovered['active_plan'] is None and recovered['desired_running'] is False
+        assert recovered['funds']['status']=='known' and datetime.fromisoformat(recovered['funds']['as_of'])==packet['checked_at']
+        assert Decimal(recovered['funds']['buy_reserved_usd'])==8 and recovered['slots']['occupied']==recovered['slots']['active']==1
+        assert not any(r in ('account_order_sync_unknown','order_identity_conflict') for r in recovered['block_reasons'])
+        first_intent=next(i for i in recovered['intents'] if i['session_id']==sid)
+        assert first_intent['reservation_coverage']['state']=='covered'
+        assert first_intent['state']=='unknown' and first_intent.get('settled') is not True and not first_intent.get('order_id')
+        assert Decimal(first_intent['reserved_usd'])==8 and store.lp_session(sid)['submit_status']=='unknown'
+        assert not store.lp_session(sid).get('entry_order_id') and store.lp_actions(sid)==audit
+        assert all(store.lp_actions(original_sid)==rows for original_sid,rows in originals.items())
+        assert len(account.posts)==2 and account.cancels==account.market_orders==[]
+        assert forbidden==[] and len(failed_at)==2
+        evidence['completed']='full'
+    finally:
+        evidence.update(phase=phase[0],clock=runtime.clock[0],state=execution.lp_auto_state(),sessions=store.lp_sessions(),
+            audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()},
+            posts=[asdict(p) for p in account.posts],orders=[o.model_dump(mode='json') for o in account.orders],failed_at=failed_at)
+        (Path(store.path).parent/'RC-causal-diagnostics.json').write_text(json.dumps(evidence,indent=2,default=str)+'\n')

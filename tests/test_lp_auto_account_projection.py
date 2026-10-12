@@ -181,68 +181,148 @@ def test_overcapacity_same_token_buys_use_two_slots_and_exact_rotation_victim(tm
 
 
 def test_account_rotation_fill_keeps_inventory_budget_without_sale(tmp_path, monkeypatch):
-    monkeypatch.setattr(pool, 'NOW', pool.NOW)
+    import json
+    import sqlite3
+    from copy import deepcopy
+    from collections import Counter
+    monkeypatch.setattr(pool,'NOW',pool.NOW)
     from tests import test_lp_auto_rotation as rotation
-    engine, exchange, lp, store = rotation.setup(tmp_path, monkeypatch, count=3, target=1)
-    pool.NOW += timedelta(microseconds=1)
-    assert lp.register_account_snapshot(pool._fresh_registration_bundle(exchange, lp))['state'] == 'registered'
-    registered = engine.lp_auto_state()
-    assert [r['order_id'] for r in registered['account_buys']] == ['o1']
-    original = registered['intents'][0]
-    assert original['reservation_coverage']['state'] == 'covered'
-    assert registered['slots']['occupied'] == 1 and Decimal(registered['funds']['buy_reserved_usd']) == 8
-    assert registered['account_buys'][0]['session_id'] == original['session_id']
+    engine,exchange,lp,store=rotation.setup(tmp_path,monkeypatch,count=3,target=1)
+    pool.NOW+=timedelta(microseconds=1)
+    assert lp.register_account_snapshot(pool._fresh_registration_bundle(exchange,lp))['state']=='registered'
+    registered=engine.lp_auto_state()
+    assert [r['order_id'] for r in registered['account_buys']]==['o1']
+    original=deepcopy(registered['intents'][0])
+    assert original['reservation_coverage']['state']=='covered'
+    assert registered['slots']['occupied']==1 and Decimal(registered['funds']['buy_reserved_usd'])==8
+    assert registered['account_buys'][0]['session_id']==original['session_id']
+    entry_round=deepcopy(registered['last_round']);sid=original['session_id']
+    original_order=deepcopy(next(o for o in exchange.orders if o['order_id']==original['order_id']))
     from tests.test_lp_auto_plan_execution import install_order_result_reader
-    result_reader = install_order_result_reader(exchange, monkeypatch)
-    advance_auto_wait(engine, monkeypatch)
-    exchange.rewards['m01'] = Decimal('25')
-    rotation.refresh(lp, exchange, 3)
-    engine.lp_auto_run_once()
-    assert exchange.cancels == ['o1']
-    assert engine.lp_auto_state()['active_plan']['victims'][0]['account_order'] is True
-    assert engine.lp_auto_state()['active_plan']['victims'][0]['order_id'] == 'o1'
-    original_as_of = engine.lp_auto_state()['funds']['as_of']
-    exchange.orders[0].update(status='CANCELED', size_matched='8')
-    exchange.positions = [dict(token_id='m00', condition_id='m00', size='8', average_price='.40')]
-    exchange.trades = [dict(trade_id='actual-o1-fill', status='CONFIRMED', trader_side='MAKER',
-        taker_order_id='external-taker', token_id='m00', condition_id='m00', side='BUY', size='8', price='.40',
-        fee='0', timestamp=pool.NOW, match_time=pool.NOW, maker_orders=[dict(order_id='o1', token_id='m00', side='BUY',
-            price='.40', matched_amount='8', fee='0', maker_address='test-wallet')])]
-    advance_auto_wait(engine, monkeypatch)
-    state = engine.lp_auto_run_once()
-    assert state['last_round']['completed_at'] and state['active_plan'] is None
-    assert state['slots']['occupied'] == 1
-    assert Decimal(state['funds']['inventory_cost_usd']) == Decimal('3.2')
-    assert Decimal(state['funds']['buy_reserved_usd']) == 8
-    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == original_as_of
-    assert state['funds']['available_usd'] is None
-    assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01']
-    assert exchange.posts[-1]['price'] == Decimal('.40') and exchange.posts[-1]['quantity'] == 20
-    assert all(p['side'] == 'BUY' for p in exchange.posts)
-    def complete_account_round(*, max_age_seconds=0, trade_generation_provider=None):
-        del max_age_seconds
-        pool.NOW += timedelta(microseconds=1)
-        packet = pool._fresh_registration_bundle(exchange, lp)
-        packet['open_orders'] = [o for o in exchange.orders if o['status'] == 'LIVE']
-        if trade_generation_provider is not None:
-            packet['trade_generation'] = trade_generation_provider()
+    result_reader=install_order_result_reader(exchange,monkeypatch)
+    exchange.rewards['m01']=Decimal('25')
+    phase, evidence = ['setup'], dict(states=[],full_reads=[],result_reads=[],financial_reads=[],signed=[])
+    def document():
+        with sqlite3.connect(store.path.as_uri()+'?mode=ro',uri=True) as connection:
+            return json.loads(connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
+    def capture(label):
+        state=deepcopy(engine.lp_auto_state())
+        evidence['states'].append(dict(label=label,state=state,document=document(),sessions=store.lp_sessions(),
+            audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()},
+            orders=deepcopy(exchange.orders),positions=deepcopy(exchange.positions),trades=deepcopy(exchange.trades),
+            posts=deepcopy(exchange.posts),cancels=list(exchange.cancels)))
+        return state
+    def exact_quantities(rows):
+        for row in rows:
+            if (row.get('side')=='BUY' and row.get('token_id')==row.get('condition_id')
+                    and row.get('status') in ('LIVE','CANCELED') and row.get('fill_quantity_known') in (None,True)
+                    and Decimal(str(row['price']))==Decimal('.40') and Decimal(str(row['original_size']))==20
+                    and Decimal(str(row['size_matched'])) in (Decimal(0),Decimal(8))):
+                row['fill_quantity_known']=True
+        return rows
+    account=exchange.lp_account_snapshot
+    def financial():
+        packet=account()
+        evidence['financial_reads'].append(dict(phase=phase[0],active_plan=bool(engine.lp_auto_state()['active_plan']),at=pool.NOW))
         return packet
-    exchange.lp_account_snapshot_shared = complete_account_round
-    registration = lp.register_account_snapshot
-    publication_results = []
-    def observed_publication(snapshot):
-        result = registration(snapshot)
-        publication_results.append(result)
-        return result
-    monkeypatch.setattr(lp, 'register_account_snapshot', observed_publication)
-    published = engine.refresh_lp_dashboard_snapshot()
-    assert published['state'] == 'ready', (published, publication_results)
-    financial = engine.lp_auto_state()
-    assert financial['funds']['status'] == 'known'
-    assert Decimal(financial['funds']['buy_reserved_usd']) == 8
-    assert Decimal(financial['funds']['inventory_cost_usd']) == Decimal('3.2')
-    assert Decimal(financial['funds']['available_usd']) == Decimal('88.8')
-
+    monkeypatch.setattr(exchange,'lp_account_snapshot',financial)
+    def complete_account_round(*,max_age_seconds=0,trade_generation_provider=None):
+        del max_age_seconds
+        started=pool.NOW
+        packet=pool._fresh_registration_bundle(exchange,engine._lp)
+        pool.NOW+=timedelta(microseconds=1)
+        packet.update(read_started_at=started,read_ended_at=pool.NOW,checked_at=pool.NOW,
+            open_orders=exact_quantities(deepcopy([o for o in exchange.orders if o['status']=='LIVE'])),
+            positions=deepcopy(exchange.positions),raw_trades=deepcopy(exchange.trades))
+        if trade_generation_provider is not None:packet['trade_generation']=trade_generation_provider()
+        evidence['full_reads'].append(deepcopy(dict(phase=phase[0],active_plan=bool(engine.lp_auto_state()['active_plan']),packet=packet)))
+        return packet
+    monkeypatch.setattr(exchange,'lp_account_snapshot_shared',complete_account_round,raising=False)
+    def results(request):
+        packet=result_reader(request)
+        for field in ('orders','open_orders'):exact_quantities(packet[field])
+        evidence['result_reads'].append(deepcopy(dict(phase=phase[0],request=request,packet=packet)))
+        return packet
+    monkeypatch.setattr(exchange,'lp_order_result_snapshot',results)
+    def signed():
+        state=engine.lp_auto_state()
+        evidence['signed'].append(deepcopy(dict(phase=phase[0],at=pool.NOW,as_of=state['funds']['as_of'],
+            round=state['active_plan']['round_id'],account=state['account_buys'])))
+    exchange.before_sign=signed
+    def closed(state):
+        assert state['active_plan'] is None and state['last_round']['completed_at']
+        assert state['plan_wait']['kind']=='round'
+        assert pool.datetime.fromisoformat(state['plan_wait']['deadline'])==pool.datetime.fromisoformat(state['last_round']['completed_at'])+timedelta(seconds=30)
+    def save(name):
+        evidence.update(phase=phase[0],clock=pool.NOW,state=engine.lp_auto_state(),document=document(),
+            sessions=store.lp_sessions(),audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()},
+            orders=exchange.orders,positions=exchange.positions,trades=exchange.trades,posts=exchange.posts,cancels=exchange.cancels)
+        (tmp_path/name).write_text(json.dumps(evidence,indent=2,default=str)+'\n')
+    evidence['public_original_account_row']=deepcopy(registered['account_buys'][0])
+    evidence['original_registered_coverage']=deepcopy(original['reservation_coverage'])
+    try:
+        phase[0]='new_current_original_cancel'
+        advance_auto_wait(engine,monkeypatch)
+        rotation.refresh(lp,exchange,3)
+        sent=engine.lp_auto_run_once();closed(sent);cancel_round=capture('original_cancel_locally_complete')
+        assert exchange.cancels==[original_order['order_id']] and len(exchange.posts)==1
+        cancel_action,=[a for a in cancel_round['last_round']['actions'] if a['kind']=='cancel']
+        assert cancel_action['session_id']==sid and cancel_action['order_id']==original_order['order_id']
+        assert [t['token_id'] for t in cancel_round['last_round']['targets']]==['m01']
+        old_audits=deepcopy(store.lp_actions(sid))
+        original_cancel,=[a for a in old_audits if a.get('role')=='reconciliation_cancel']
+        assert original_cancel['state']=='accepted' and original_cancel['order_id']==original_order['order_id']
+        assert original_cancel['rotation_round_id']==cancel_round['last_round']['round_id']
+        live_original=next(o for o in exchange.orders if o['order_id']==original_order['order_id'])
+        live_original.update(status='CANCELED',size_matched='8')
+        exchange.positions=[dict(token_id='m00',condition_id='m00',size='8',average_price='.40')]
+        exchange.trades=[dict(trade_id='actual-o1-fill',status='CONFIRMED',trader_side='MAKER',
+            taker_order_id='external-taker',token_id='m00',condition_id='m00',side='BUY',size='8',price='.40',
+            fee='0',timestamp=pool.NOW,match_time=pool.NOW,maker_orders=[dict(order_id=original_order['order_id'],token_id='m00',side='BUY',
+                price='.40',matched_amount='8',fee='0',maker_address='test-wallet')])]
+        phase[0]='following_current_owned_positive_fill'
+        advance_auto_wait(engine,monkeypatch)
+        state=engine.lp_auto_run_once();closed(state);replacement=capture('new_current_m01_with_inventory')
+        assert replacement['last_round']['round_id']!=cancel_round['last_round']['round_id']
+        assert exchange.cancels==[original_order['order_id']]
+        assert Counter(p['token_id'] for p in exchange.posts)==Counter(['m00','m01'])
+        assert all(p['side']=='BUY' and Decimal(p['price'])==Decimal('.40') and Decimal(p['quantity'])==20 and p['post_only'] is True for p in exchange.posts)
+        action,=[a for a in replacement['last_round']['actions'] if a['kind']=='buy']
+        assert action['state']=='success' and action['token_id']=='m01' and action['session_id']!=sid
+        assert action['action_id'] not in {a['action_id'] for a in cancel_round['last_round']['actions']+entry_round['actions']}
+        assert state['slots']['occupied']==1 and Decimal(state['funds']['buy_reserved_usd'])==8
+        assert Decimal(state['funds']['inventory_cost_usd'])==Decimal('3.20')
+        planning,=[x for x in evidence['signed'] if x['round']==replacement['last_round']['round_id']]
+        assert state['funds']['status']=='unknown' and state['funds']['as_of']==planning['as_of'] and state['funds']['available_usd'] is None
+        owned=store.lp_session(sid)
+        assert Decimal(owned['buy_filled_quantity'])==Decimal(owned['residual_quantity'])==8
+        assert Decimal(owned['buy_cost'])==Decimal('3.20') and Decimal(owned['buy_fees'])==0
+        assert owned['position_reconciled'] is True
+        assert store.lp_actions(sid)==old_audits
+        evidence['ledger']={k:deepcopy(owned.get(k)) for k in ('buy_filled_quantity','residual_quantity','buy_cost','buy_fees','fee_status','position_reconciled','verified_order_fills')}
+        registration=lp.register_account_snapshot;publication_results=[]
+        def observed_publication(snapshot):
+            result=registration(snapshot);publication_results.append(deepcopy(result));return result
+        monkeypatch.setattr(lp,'register_account_snapshot',observed_publication)
+        phase[0]='explicit_complete_fill_publication'
+        pool.NOW+=timedelta(microseconds=1)
+        published=engine.refresh_lp_dashboard_snapshot()
+        assert published['state']=='ready',(published,publication_results)
+        financial=capture('complete_fill_finance_88_80')
+        assert financial['funds']['status']=='known' and financial['slots']['occupied']==1
+        assert Decimal(financial['funds']['buy_reserved_usd'])==8 and Decimal(financial['funds']['inventory_cost_usd'])==Decimal('3.20')
+        assert Decimal(financial['funds']['available_usd'])==Decimal('88.80')
+        assert store.lp_actions(sid)==old_audits and exchange.cancels==[original_order['order_id']] and len(exchange.posts)==2
+        assert not any(p['side']=='SELL' for p in exchange.posts)
+        engine.lp_auto_set_desired_running(False)
+        counts=(len(evidence['financial_reads']),len(evidence['result_reads']),len(evidence['full_reads']))
+        pool.NOW=pool.datetime.fromisoformat(financial['plan_wait']['deadline'])-timedelta(seconds=1)
+        engine.lp_auto_run_once()
+        assert counts==(len(evidence['financial_reads']),len(evidence['result_reads']),len(evidence['full_reads']))
+        assert len(exchange.posts)==2 and exchange.cancels==[original_order['order_id']] and store.lp_actions(sid)==old_audits
+        assert not any(x['active_plan'] for x in evidence['financial_reads'])
+        evidence['publication_results']=publication_results;evidence['completed']='full'
+    finally:save('KF-account-partial-diagnostics.json')
 
 def test_late_known_receipt_cannot_reattribute_covered_unknown_request(tmp_path):
     engine, _, _, store = covered_pool(tmp_path, buys=[buy('account-order')])
@@ -386,52 +466,163 @@ def test_covered_request_attention_is_inactive_but_audit_is_preserved(tmp_path, 
     assert auto._read()['intents']['old'] == intent
 
 
-def test_covered_unknown_session_keeps_its_unbound_original_plan(tmp_path, monkeypatch):
-    from tests import test_lp_auto_rotation as rotation
-    monkeypatch.setattr(pool, 'Exchange', rotation.RotationExchange)
-    engine, exchange, lp, store = pool.setup(tmp_path, 2)
-    from tests.test_lp_auto_plan_execution import install_order_result_reader
-    result_reader = install_order_result_reader(exchange, monkeypatch)
-    engine.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
-    engine.lp_auto_set_desired_running(True)
-    exchange.fail = True
-    engine.lp_auto_run_once()
-    original = engine.lp_auto_state()['intents'][0]
+def test_covered_unknown_session_keeps_its_original_request_unbound(tmp_path, monkeypatch):
+    import json
+    import sqlite3
     from copy import deepcopy
-    original_audit = deepcopy(store.lp_actions(original['session_id']))
-    original_plan = deepcopy(engine.lp_auto_state()['active_plan'])
-    assert original['state'] == 'unknown'
-    exchange.fail = False
-    exchange.orders = [dict(order_id='manual-late', token_id='m00', condition_id='m00',
-        market_id='m00', outcome='YES', side='BUY', status='LIVE', price='.4',
-        original_size='20', size_matched='0')]
-    monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(seconds=1))
-    result = lp.register_account_snapshot(pool._fresh_registration_bundle(exchange, lp))
-    assert result['state'] == 'registered', result
-    managed = store.lp_session(original['session_id'])
-    assert managed['state'] == 'entry_open'
-    assert managed['submit_status'] == 'unknown'
-    advance_auto_wait(engine, monkeypatch)
+    from collections import Counter
+    monkeypatch.setattr(pool,'NOW',pool.NOW)
+    from tests import test_lp_auto_rotation as rotation
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    from tests.test_lp_auto_plan_scheduler import restart_engine
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+    monkeypatch.setattr(pool,'Exchange',rotation.RotationExchange)
+    engine,exchange,lp,store=pool.setup(tmp_path,2)
+    result_reader=install_order_result_reader(exchange,monkeypatch)
+    engine.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    engine.lp_auto_set_desired_running(True)
+    exchange.fail=True
     engine.lp_auto_run_once()
-    advance_auto_wait(engine, monkeypatch)
-    exchange.rewards['m01'] = Decimal('25')
-    rotation.refresh(lp, exchange, 2)
-    advance_auto_wait(engine, monkeypatch)
-    assert lp.register_account_snapshot(pool._fresh_registration_bundle(exchange, lp))['state'] == 'registered'
-    state = engine.lp_auto_run_once()
-    assert exchange.cancels == [], str(state['last_round'])
-    assert state['active_plan']['round_id'] == original_plan['round_id']
-    assert not state['last_round']['completed_at']
-    assert [(a['action_id'], a.get('request_id')) for a in state['active_plan']['actions']] == [
-        (a['action_id'], a.get('request_id')) for a in original_plan['actions']]
-    assert store.lp_actions(original['session_id']) == original_audit
-    assert [o['order_id'] for o in exchange.orders if o['status'] == 'LIVE'] == ['manual-late']
-    assert len(exchange.posts) == 1  # Only the original timed-out POST occurred.
-    audit = state['intents'][0]
-    assert audit['state'] == 'unknown' and audit['order_id'] is None
-    assert state['slots']['occupied'] == 1
-    assert state['slots']['canceling'] == 0
-
+    original=deepcopy(engine.lp_auto_state()['intents'][0]);sid=original['session_id']
+    original_audit=deepcopy(store.lp_actions(sid));original_round=deepcopy(engine.lp_auto_state()['last_round'])
+    assert original['state']=='unknown' and original['order_id'] is None
+    assert len(original_audit)==1 and original_audit[0]['state']=='unknown' and original_audit[0]['post_started'] is True and not original_audit[0].get('order_id')
+    assert original_round['completed_at'] and engine.lp_auto_state()['active_plan'] is None
+    exchange.fail=False
+    phase, evidence = ['setup'], dict(states=[],full_reads=[],result_reads=[],financial_reads=[],signed=[])
+    def document():
+        with sqlite3.connect(store.path.as_uri()+'?mode=ro',uri=True) as connection:
+            return json.loads(connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
+    def capture(label):
+        state=deepcopy(engine.lp_auto_state())
+        evidence['states'].append(dict(label=label,state=state,document=document(),sessions=store.lp_sessions(),
+            audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()},
+            orders=deepcopy(exchange.orders),positions=deepcopy(exchange.positions),trades=deepcopy(exchange.trades),
+            posts=deepcopy(exchange.posts),cancels=list(exchange.cancels)))
+        return state
+    def exact_quantities(rows):
+        for row in rows:
+            if (row.get('side')=='BUY' and row.get('token_id')==row.get('condition_id')
+                    and row.get('status') in ('LIVE','CANCELED') and row.get('fill_quantity_known') in (None,True)
+                    and Decimal(str(row['price']))==Decimal('.40') and Decimal(str(row['original_size']))==20
+                    and Decimal(str(row['size_matched'])) in (Decimal(0),Decimal(8))):
+                row['fill_quantity_known']=True
+        return rows
+    account=exchange.lp_account_snapshot
+    def financial():
+        packet=account()
+        evidence['financial_reads'].append(dict(phase=phase[0],active_plan=bool(engine.lp_auto_state()['active_plan']),at=pool.NOW))
+        return packet
+    monkeypatch.setattr(exchange,'lp_account_snapshot',financial)
+    def complete_account_round(*,max_age_seconds=0,trade_generation_provider=None):
+        del max_age_seconds
+        started=pool.NOW
+        packet=pool._fresh_registration_bundle(exchange,engine._lp)
+        pool.NOW+=timedelta(microseconds=1)
+        packet.update(read_started_at=started,read_ended_at=pool.NOW,checked_at=pool.NOW,
+            open_orders=exact_quantities(deepcopy([o for o in exchange.orders if o['status']=='LIVE'])),
+            positions=deepcopy(exchange.positions),raw_trades=deepcopy(exchange.trades))
+        if trade_generation_provider is not None:packet['trade_generation']=trade_generation_provider()
+        evidence['full_reads'].append(deepcopy(dict(phase=phase[0],active_plan=bool(engine.lp_auto_state()['active_plan']),packet=packet)))
+        return packet
+    monkeypatch.setattr(exchange,'lp_account_snapshot_shared',complete_account_round,raising=False)
+    def results(request):
+        packet=result_reader(request)
+        for field in ('orders','open_orders'):exact_quantities(packet[field])
+        evidence['result_reads'].append(deepcopy(dict(phase=phase[0],request=request,packet=packet)))
+        return packet
+    monkeypatch.setattr(exchange,'lp_order_result_snapshot',results)
+    def signed():
+        state=engine.lp_auto_state()
+        evidence['signed'].append(deepcopy(dict(phase=phase[0],at=pool.NOW,as_of=state['funds']['as_of'],
+            round=state['active_plan']['round_id'],account=state['account_buys'])))
+    exchange.before_sign=signed
+    def closed(state):
+        assert state['active_plan'] is None and state['last_round']['completed_at']
+        assert state['plan_wait']['kind']=='round'
+        assert pool.datetime.fromisoformat(state['plan_wait']['deadline'])==pool.datetime.fromisoformat(state['last_round']['completed_at'])+timedelta(seconds=30)
+    def save(name):
+        evidence.update(phase=phase[0],clock=pool.NOW,state=engine.lp_auto_state(),document=document(),
+            sessions=store.lp_sessions(),audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()},
+            orders=exchange.orders,positions=exchange.positions,trades=exchange.trades,posts=exchange.posts,cancels=exchange.cancels)
+        (tmp_path/name).write_text(json.dumps(evidence,indent=2,default=str)+'\n')
+    original_event=deepcopy(document()['events'].get(original['intent_id']+':unknown'))
+    def assert_original_request():
+        current=document()['intents'][original['intent_id']]
+        for key in ('intent_id','session_id','created_at','state','order_id','market_id','condition_id','token_id','price','quantity','reserved_usd'):
+            assert current.get(key)==original.get(key),key
+        assert current['settled'] is False and Decimal(current['reserved_usd'])==8
+        assert next(a for a in store.lp_actions(sid) if a['action_key']==original_audit[0]['action_key'])==original_audit[0]
+        assert document()['events'].get(original['intent_id']+':unknown')==original_event
+        assert not current.get('order_id') and current['state']=='unknown'
+    try:
+        phase[0]='actual_unrelated_manual_late_coverage'
+        exchange.orders=[dict(order_id='manual-late',token_id='m00',condition_id='m00',market_id='m00',outcome='YES',
+            side='BUY',status='LIVE',price='.40',original_size='20',size_matched='0')]
+        pool.NOW+=timedelta(seconds=1)
+        result=lp.register_account_snapshot(pool._fresh_registration_bundle(exchange,lp))
+        assert result['state']=='registered',result
+        managed=store.lp_session(sid)
+        assert managed['state']=='entry_open' and managed['submit_status']=='unknown'
+        assert_original_request()
+        covered=capture('public_manual_late_coverage_original_request_unknown')
+        marker=document()['intents'][original['intent_id']]['reservation_coverage']
+        assert marker['state']=='covered' and marker['intent_id']==original['intent_id'] and marker['session_id']==sid
+        assert covered['slots']['occupied']==1 and Decimal(covered['funds']['buy_reserved_usd'])==8 and len(exchange.posts)==1
+        engine.lp_auto_set_desired_running(False)
+        phase[0]='paused_current_coverage_no_new_authority'
+        advance_auto_wait(engine,monkeypatch)
+        state=engine.lp_auto_run_once()
+        assert state['active_plan'] is None and state['last_round']['actions']==[] and state['last_round']['checked_at']
+        assert pool.datetime.fromisoformat(state['plan_wait']['deadline'])==pool.datetime.fromisoformat(state['plan_wait']['started_at'])+timedelta(seconds=30)
+        assert_original_request();assert exchange.cancels==[] and len(exchange.posts)==1
+        exchange.rewards['m01']=Decimal('25')
+        rotation.refresh(lp,exchange,2)
+        phase[0]='new_current_manual_late_cancel'
+        advance_auto_wait(engine,monkeypatch)
+        assert lp.register_account_snapshot(pool._fresh_registration_bundle(exchange,lp))['state']=='registered'
+        engine.lp_auto_set_desired_running(True)
+        state=engine.lp_auto_run_once();closed(state);new_round=capture('distinct_current_manual_late_request_not_original_receipt')
+        assert new_round['last_round']['round_id']!=original_round['round_id']
+        assert exchange.cancels==['manual-late'] and len(exchange.posts)==1
+        cancel_action,=[a for a in new_round['last_round']['actions'] if a['kind']=='cancel']
+        assert cancel_action['order_id']=='manual-late' and cancel_action['state']=='canceling'
+        new_audit,=[a for a in store.lp_actions(cancel_action['session_id']) if a.get('rotation_round_id')==new_round['last_round']['round_id']]
+        assert new_audit['order_id']=='manual-late' and new_audit['state']=='accepted' and new_audit['role']=='reconciliation_cancel'
+        assert new_audit['action_id']!=original_audit[0]['action_id'] and new_audit['action_key']!=original_audit[0]['action_key']
+        assert new_audit['rotation_round_id']!=original_round['round_id']
+        target,=[t for t in new_round['last_round']['targets'] if t['token_id']=='m01']
+        assert Decimal(target['price'])==Decimal('.40') and Decimal(target['quantity'])==20
+        dependent,=[a for a in new_round['last_round']['actions'] if a['kind']=='buy']
+        assert dependent['token_id']=='m01' and dependent['state']=='not_sent' and dependent['reason']=='next_round_capacity'
+        assert not any(s.get('token_id')=='m01' for s in store.lp_sessions())
+        assert [o['order_id'] for o in exchange.orders if o['status']=='LIVE']==['manual-late']
+        assert state['slots']['occupied']==1 and Decimal(state['funds']['buy_reserved_usd'])==8
+        assert_original_request()
+        evidence['original_round']=original_round;evidence['original_entry_audit']=original_audit;evidence['current_cancel_audit']=new_audit
+        engine.lp_auto_set_desired_running(False)
+        audits=deepcopy({s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()})
+        counts=(len(evidence['financial_reads']),len(evidence['full_reads']),len(evidence['result_reads']))
+        completed=pool.datetime.fromisoformat(new_round['last_round']['completed_at'])
+        scheduler=LPAutoScheduler(engine,clock=lambda:pool.NOW)
+        for elapsed in (1,29):
+            pool.NOW=completed+timedelta(seconds=elapsed)
+            scheduler.request_check();scheduler.run_due();engine.lp_auto_run_once()
+            assert counts==(len(evidence['financial_reads']),len(evidence['full_reads']),len(evidence['result_reads']))
+            assert {s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()}==audits
+            assert exchange.cancels==['manual-late'] and len(exchange.posts)==1
+            assert_original_request()
+        phase[0]='full_cold_before_common_deadline'
+        engine=restart_engine(engine,exchange)
+        state=engine.lp_auto_run_once()
+        assert counts==(len(evidence['financial_reads']),len(evidence['full_reads']),len(evidence['result_reads']))
+        assert exchange.cancels==['manual-late'] and len(exchange.posts)==1
+        assert state['slots']['occupied']==1 and Decimal(state['funds']['buy_reserved_usd'])==8
+        assert {s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()}==audits
+        assert_original_request()
+        assert not any(x['active_plan'] for x in evidence['financial_reads'])
+        evidence['completed']='full'
+    finally:save('KF-covered-unknown-diagnostics.json')
 
 def test_account_row_fill_blocks_rotation_even_before_session_fill_updates(tmp_path, monkeypatch):
     engine, exchange, lp, store, rotation = rotation_pool(tmp_path, monkeypatch)

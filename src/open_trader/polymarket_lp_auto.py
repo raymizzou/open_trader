@@ -15,7 +15,7 @@ import threading
 from time import monotonic
 from contextlib import ExitStack, contextmanager, nullcontext
 from collections import Counter
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_CEILING
@@ -40,7 +40,7 @@ from .polymarket_lp_notification_batches import (
 from .polymarket_trading import _lp_capture_read_log, _lp_causal_event, _lp_read_task
 
 logger = logging.getLogger(__name__)
-TIMING_DEFAULTS = dict(round_interval_seconds=60, api_retry_interval_seconds=60,
+TIMING_DEFAULTS = dict(round_interval_seconds=30, api_retry_interval_seconds=60,
                        order_check_interval_seconds=10)
 _PLAN_TRANSIENT_WAITS = {'execution_lock', 'market_read_capacity', 'market_read_timeout',
                          'market_read_in_progress', 'market_read_cooling_down', 'target_filled'}
@@ -238,6 +238,11 @@ class LPAutoPool:
         self._attention_delivery_lock = threading.Lock()
         self._attention_delivery_results = {}
         self._account_refresh_lock = threading.RLock()
+        self._plan_mutation_lock = threading.Lock()
+        self._plan_progress_lock = threading.RLock()
+        self._cycle_stop = threading.Event()
+        self._attempt_jobs = {}
+        self._attempt_jobs_lock = threading.Lock()
         self._account_refresh_attempt = 0
         self._account_facts_wait = None
         self._current_account = None
@@ -268,7 +273,9 @@ class LPAutoPool:
         return self._now().isoformat()
 
     def _default(self):
-        return default_account_pool_document(self.store.path, self.execution._lp_account_id(), self._now())
+        document = default_account_pool_document(self.store.path, self.execution._lp_account_id(), self._now())
+        document['round_interval_seconds'] = 30
+        return document
 
     def _read(self):
         with self.store._read_connection() as c:
@@ -488,7 +495,8 @@ class LPAutoPool:
                 result.append(intent)
         return result, independent_unknown
 
-    def _projection(self, d, *, include_intents=True, planning=False, observed_at=None, observed_generation=None):
+    def _projection(self, d, *, include_intents=True, planning=False, observed_at=None, observed_generation=None,
+                    terminal_intent_bindings=None):
         audit_intents = list(d['intents'].values())
         # Coverage is a one-way replacement, not a new interpretation of the
         # original submission. Its audit survives late callbacks unchanged.
@@ -543,6 +551,11 @@ class LPAutoPool:
                         partial_principal[oid] = (_decimal(proof['original_size']) - matched) * _decimal(proof['price'])
                     else:
                         terminal_ids.add(oid)
+                        if terminal_intent_bindings is not None:
+                            for intent in represented:
+                                request_id = intent.get('intent_id')
+                                if d['intents'].get(request_id) is intent:
+                                    terminal_intent_bindings[request_id] = deepcopy(intent)
                     if matched:
                         terminal_inventory[session['session_id']] = proof
             # Owned results refine only the witnessed principal and inventory.
@@ -707,7 +720,9 @@ class LPAutoPool:
 
     def state(self, *, include_intents=True):
         document = self._read()
-        state = self._projection(document, include_intents=include_intents)
+        terminal_intent_bindings = {}
+        state = self._projection(document, include_intents=include_intents,
+            terminal_intent_bindings=terminal_intent_bindings)
         results = document.get('execution_order_facts')
         financial = document.get('account_financial_facts') or {}
         if (results and results.get('account_id') == document['account_id']
@@ -766,6 +781,11 @@ class LPAutoPool:
             terminal_cancels = {a['order_id'] for a in actions if a['kind'] == 'cancel' and a['state'] == 'success'}
             holds = []
             for intent in list(document['intents'].values()) + list(financial.get('pending_buy_actions') or ()):
+                # Reuse the projection's validated original binding, never a
+                # raw result ID or an unmatched pending action's identity.
+                if (document['intents'].get(intent.get('intent_id')) is intent
+                        and terminal_intent_bindings.get(intent.get('intent_id')) == intent):
+                    continue
                 if (intent['state'] in ('terminal', 'rejected', 'aborted')
                         or intent.get('order_id') in live_ids
                         or reservation_is_released(intent, document['account_id'])):
@@ -1017,6 +1037,8 @@ class LPAutoPool:
                 d['enabled_at']=d['enabled_at'] or self._stamp()
         with self._send_barrier():
             self._update(apply)
+            if not running:
+                self._cycle_stop.set()
         return self.state()
 
     def _excluded(self, condition_id, *, ignore=None, plan=None):
@@ -1207,11 +1229,83 @@ class LPAutoPool:
     def _resting_buy(row):
         return bool(row.get('intent_id') or row.get('account_order'))
 
+    def _ended_rotation_cancel_keys(self, intent, session, actions):
+        """Recognize durable closed responsibility under current caller facts."""
+        document = self._read()
+        oid = intent.get('order_id')
+        rotation = document.get('account_rotations', {}).get(oid) or next(
+            (i for i in document['intents'].values() if i.get('order_id') == oid), {})
+        owner = rotation.get('rotation_round_id')
+        settled = _maybe_datetime(rotation.get('rotation_settled_at'))
+        requested = _maybe_datetime(rotation.get('rotation_requested_at'))
+        history = self.lp._order_history(session).get(oid, {})
+        price = _maybe_decimal(rotation.get('price'))
+        quantity = _maybe_decimal(rotation.get('original_quantity', rotation.get('quantity')))
+        if (not owner or settled is None or requested is None or not requested <= settled <= self._now()
+                or rotation.get('state') != 'active'
+                or rotation.get('rotation_cancel_outcome') not in ('acknowledged', 'rejected', 'not_sent', 'unknown')
+                or (document.get('active_plan') or {}).get('round_id') == owner
+                or session.get('order_identity_conflict') or self.lp.entry_send_inflight(session['session_id'])
+                or hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest()
+                    != document['account_id'] or document['account_id'] != self.execution._lp_account_id()
+                or any(str(rotation.get(k)) != str(intent.get(k)) for k in
+                    ('session_id', 'order_id', 'token_id', 'condition_id'))
+                or rotation.get('session_id') != session['session_id']
+                or any(str(session.get(k)) != str(rotation.get(k)) for k in ('token_id', 'condition_id'))
+                or oid not in self.lp._session_order_ids(session)
+                or history.get('status') != 'LIVE' or history.get('side') != 'BUY'
+                or str(history.get('token_id')) != str(session['token_id'])
+                or _maybe_decimal(history.get('size_matched')) != ZERO
+                or price is None or price <= ZERO or _maybe_decimal(history.get('price')) != price
+                or _maybe_decimal(intent.get('price')) != price
+                or quantity is None or quantity <= ZERO
+                or _maybe_decimal(intent.get('original_quantity', intent.get('quantity'))) != quantity
+                or _maybe_decimal(history.get('original_size', history.get('quantity'))) != quantity
+                or _maybe_decimal(session.get('buy_filled_quantity')) != ZERO):
+            return set()
+        bound = [a for a in actions if a.get('rotation_round_id') == owner
+            and (a.get('order_id') == oid or oid in (a.get('targets') or ()))]
+        if (not bound or any(a.get('session_id') != session['session_id'] or a.get('order_id') != oid
+                or a.get('role') != 'reconciliation_cancel' or submission_action_kind(a) != 'cancel'
+                or not str(a.get('action_key') or '').startswith(session['session_id'] + ':reconciliation-cancel:')
+                or a.get('state') != {'unknown': 'unknown', 'acknowledged': 'accepted',
+                    'rejected': 'rejected', 'not_sent': 'rejected'}[rotation['rotation_cancel_outcome']]
+                for a in bound)):
+            return set()
+        keys = set()
+        for audit in actions:
+            registered = _maybe_datetime((document.get('rounds', {}).get(audit.get('rotation_round_id')) or {}).get('started_at'))
+            sent = _maybe_datetime(audit.get('submit_post_started_at'))
+            began = _maybe_datetime(audit.get('submit_requested_at'))
+            if (audit.get('state') != 'unknown' or audit.get('post_started') is not True
+                    or audit.get('submit_stage') != 'sending' or registered is None or sent is None or began is None
+                    or not registered <= began <= sent <= settled
+                    or (audit.get('rotation_round_id') == owner and not registered <= requested <= began)
+                    or (audit.get('rotation_round_id') != owner and sent > requested)
+                    or (document.get('active_plan') or {}).get('round_id') == audit.get('rotation_round_id')
+                    or audit.get('session_id') != session['session_id'] or audit.get('order_id') != oid
+                    or audit.get('role') != 'reconciliation_cancel' or submission_action_kind(audit) != 'cancel'
+                    or not str(audit.get('action_key') or '').startswith(session['session_id'] + ':reconciliation-cancel:')
+                    or any(str(target) != oid for target in (audit.get('targets') or ()))):
+                continue
+            with self._attempt_jobs_lock:
+                sender = self._attempt_jobs.get(f"{audit['rotation_round_id']}:cancel:{oid}")
+            if sender is not None and not sender.done():
+                continue
+            try:
+                uuid.UUID(audit['action_id'])
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+            keys.add(audit['action_key'])
+        return keys
+
     def _rotation_submission_evidence(self, intent, session, *, unused_cancel_keys=()):
         if not session:
             return True, {}
-        actions = [a for a in self.store.lp_actions(session['session_id'])
-            if a.get('action_key') not in unused_cancel_keys]
+        original_actions = self.store.lp_actions(session['session_id'])
+        ended_keys = self._ended_rotation_cancel_keys(intent, session, original_actions)
+        actions = [a for a in original_actions
+            if a.get('action_key') not in {*unused_cancel_keys, *ended_keys}]
         inputs = dict(
             entry_send_inflight=self.lp.entry_send_inflight(session['session_id']),
             independent_unresolved_action=has_independent_unresolved_action(session, actions),
@@ -1363,6 +1457,7 @@ class LPAutoPool:
 
     def _ranked_buys(self, state, *, diagnostics=None, observation=None):
         """Rank actual BUY IDs and candidates on the same yield basis."""
+        from .polymarket_lp_views import _next_review_at
         if observation is None:
             account, account_buys, account_reasons = self._account_projection_facts(self._read())
             source_account = self._current_account
@@ -1373,6 +1468,37 @@ class LPAutoPool:
             account_reasons = state['admission_block_reasons']
             source_account = observation['account']
             account_observed_at = observation['validated_at']
+            # Request recovery follows acquisition. Update only its proved
+            # ended yield control; the acquired financial rows stay fixed.
+            latest = self._read()
+            current_buys = []
+            for row in account_buys:
+                rotation = latest.get('account_rotations', {}).get(row['order_id'], {})
+                settled = _maybe_datetime(rotation.get('rotation_settled_at'))
+                if (latest['account_id'] == state['account_id'] == self.execution._lp_account_id()
+                        and row.get('state') == 'canceling' and rotation.get('state') == 'active'
+                        and settled is not None and settled <= self._now()
+                        and rotation.get('rotation_cancel_outcome') in ('acknowledged', 'rejected', 'not_sent', 'unknown')
+                        and all(str(rotation.get(k)) == str(row.get(k)) for k in
+                            ('session_id', 'order_id', 'token_id', 'condition_id'))
+                        and _maybe_decimal(rotation.get('price')) == _maybe_decimal(row.get('price'))
+                        and _maybe_decimal(rotation.get('original_quantity', rotation.get('quantity'))) ==
+                            _maybe_decimal(row.get('original_quantity', row.get('quantity')))
+                        and _maybe_decimal(row.get('filled_quantity')) == ZERO):
+                    acquired_owner = row.get('rotation_round_id')
+                    control_bound = bool(rotation.get('rotation_round_id')) and acquired_owner == rotation['rotation_round_id']
+                    if acquired_owner in (None, '') and row.get('side') == 'BUY' and row.get('status') == 'LIVE':
+                        # Fresh financial rows need not carry historical control
+                        # tags. Bind only their exact durable ended requests.
+                        session = self.store.lp_session(row.get('session_id')) if row.get('session_id') else None
+                        if session is not None:
+                            control_bound = bool(self._ended_rotation_cancel_keys(row, session,
+                                self.store.lp_actions(session['session_id'])))
+                    if control_bound:
+                        row = {**row, 'state': 'active', 'rotation_settled_at': rotation['rotation_settled_at']}
+                current_buys.append(row)
+            account_buys = current_buys
+            state = {**state, 'account_buys': current_buys}
         account_facts = account
         intents, _ = self._unrepresented_intents(state['intents'], account_buys,
             account_valid=account is not None and account.get('financial_status') == 'known' and not account_reasons)
@@ -1538,6 +1664,15 @@ class LPAutoPool:
                 pending.update(evaluated['guidance'], minimum_order_estimate=estimate,
                                ranking_account={k: v for k, v in account.items() if not k.startswith('raw_')},
                                ranking_book_at=direction['book']['received_at'], ranking_reward_at=direction['reward_checked_at'])
+                # The selected observation is also the entry protection baseline.
+                # Freeze complete market validation here, before approval.
+                snapshot = dict(account=deepcopy(account), market=deepcopy(direction['market']),
+                    book=deepcopy(direction['book']), candidate_direction=deepcopy(direction))
+                request = self.lp._normalize_request({**pending, 'candidate_policy': 'best_bid_minimum',
+                    'candidate_bid_level': bid_level, 'review_at': _next_review_at(self._now())})
+                pending['planning_entry_facts'] = self.lp._validate_market_snapshot(request, snapshot, now=self._now())
+                pending['planning_snapshot'] = snapshot
+                pending['planning_request'] = request
                 self._ranking_fresh(pending, observation=observation)
                 refreshed.add((pending['condition_id'], pending['token_id']))
             except ValueError as exc:
@@ -1606,6 +1741,87 @@ class LPAutoPool:
                     ('role', 'order_id', 'submit_requested_at', 'rotation_round_id')})
         return attempts
 
+    def _finish_unsent_cancel_registration(self, plan, actions, future, error):
+        """Retire only an ended sender's exact incomplete registration batch."""
+        with self._attempt_jobs_lock:
+            if not future.done() or any(self._attempt_jobs.get(a['action_id']) is not future for a in actions):
+                return False
+        lock = self._acquire_plan_apply_lock()
+        if lock is None:
+            return False
+        try:
+            with self.lp._mutex, self._plan_progress_lock:
+                document = self._read()
+                current = document.get('active_plan') or {}
+                registration = current.get('cancel_registration') or {}
+                bindings = {r['order_id']: r['session_id'] for r in plan['victims']}
+                current_actions = {a['action_id']: a for a in current.get('actions', ())}
+                if (current.get('round_id') != plan['round_id']
+                        or current.get('account_id') != plan['account_id']
+                        or document.get('account_id') != plan['account_id']
+                        or self.execution._lp_account_id() != plan['account_id']
+                        or registration.get('round_id') != plan['round_id']
+                        or registration.get('account_id') != plan['account_id']
+                        or registration.get('completed') is not False
+                        or registration.get('sessions') != bindings
+                        or {a['order_id']: a['session_id'] for a in actions} != bindings
+                        or any(current_actions.get(a['action_id'], {}).get('state') != 'pending'
+                            or any(current_actions[a['action_id']].get(k) != a.get(k)
+                                for k in ('kind', 'order_id', 'session_id')) for a in actions)):
+                    return False
+                try:
+                    unused = self._unused_plan_cancel_attempts(current)
+                except ValueError:
+                    return False
+                if unused is None:
+                    return False
+                originals = []
+                for victim in plan['victims']:
+                    session = self.store.lp_session(victim['session_id'])
+                    rotation = self._rotation_record(document, victim)
+                    if (not session or session.get('order_identity_conflict')
+                            or hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest() != plan['account_id']
+                            or rotation.get('rotation_round_id') != plan['round_id']
+                            or rotation.get('session_id') != victim['session_id']
+                            or rotation.get('order_id') != victim['order_id']
+                            or any(str(session.get(k)) != str(victim[k]) for k in ('token_id', 'condition_id'))):
+                        return False
+                    attempt = unused.get(victim['order_id'])
+                    if attempt is None:
+                        continue
+                    sid, key, _ = attempt
+                    audit = next(a for a in self.store.lp_actions(sid) if a['action_key'] == key)
+                    try:
+                        uuid.UUID(audit['action_id'])
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        return False
+                    if (audit.get('post_started') not in (None, False)
+                            or audit.get('submit_post_started_at')
+                            or audit.get('submit_stage') == 'sending'
+                            or not key.startswith(sid + ':reconciliation-cancel:')):
+                        return False
+                    originals.append((sid, key, audit))
+                reason = str(error)
+                for sid, key, audit in originals:
+                    payload = {k: deepcopy(v) for k, v in audit.items()
+                        if k not in ('action_id', 'session_id', 'action_key', 'state', 'created_at', 'updated_at')}
+                    payload.update(post_started=False, submit_stage='pre_send_rejected',
+                        submit_finished_at=self._stamp(), reason=reason,
+                        error_type=type(error).__name__, error_code=getattr(error, 'sqlite_errorname', None))
+                    self.store.lp_finish_cancel(sid, key, state='rejected', payload=payload)
+                def ended(d):
+                    # Preserve the original failed registration as history;
+                    # it never grants another attempt authority.
+                    d['rounds'][plan['round_id']]['cancel_registration'] = deepcopy(registration)
+                    for victim in plan['victims']:
+                        self._rotation_record(d, victim).update(state='active',
+                            rotation_cancel_outcome='not_sent', rotation_rejection_reason=reason,
+                            rotation_settled_at=self._stamp())
+                self._update(ended)
+                return True
+        finally:
+            self._release_plan_apply_lock(lock)
+
     def _rotate_out(self, victims, targets, version, *, diagnostics=None, plan=None, result_snapshot=None):
         """Validate and fence the whole batch before any exact-ID cancel."""
         from .polymarket_lp import expiration_for_review
@@ -1614,11 +1830,14 @@ class LPAutoPool:
         validated, refused = [], {}
         for row in victims:
             try:
-                # A frozen selection may wait longer than its observation TTL.
-                # Revalidate current safety facts without changing its quote/ID.
-                facts = self.lp._read_candidate_facts(row,
-                    account=result_snapshot if plan is not None else self._current_account, wait_for_capacity=True)
-                account, direction = facts['account'], facts['direction']
+                if plan is None:
+                    facts = self.lp._read_candidate_facts(row,
+                        account=self._current_account, wait_for_capacity=True)
+                    account, direction = facts['account'], facts['direction']
+                else:
+                    # Planning already qualified the fixed victim. Execution
+                    # observes its exact current order, not its market again.
+                    account = result_snapshot
                 orders = [o for o in (account.get('open_orders') or []) if self.lp._order_id(o) == row['order_id']]
                 if (len(orders) != 1 or orders[0].get('side') != 'BUY'
                         or orders[0].get('status') != 'LIVE' or orders[0].get('token_id') != row['token_id']
@@ -1626,12 +1845,13 @@ class LPAutoPool:
                         or _maybe_decimal(orders[0].get('size_matched')) != ZERO
                         or self.lp._queue_row_remaining(orders[0]) != _decimal(row['quantity'])):
                     raise ValueError('rotation_order_changed')
-                _freshness(direction['market'].get('metadata_checked_at'), self._now(), 'metadata_freshness', max_age=60)
-                _freshness(direction['market'].get('fees_checked_at'), self._now(), 'fees_freshness', max_age=60)
+                if plan is None:
+                    _freshness(direction['market'].get('metadata_checked_at'), self._now(), 'metadata_freshness', max_age=60)
+                    _freshness(direction['market'].get('fees_checked_at'), self._now(), 'fees_freshness', max_age=60)
                 validated.append({**row, 'plan_round_id': plan['round_id'] if plan is not None else None,
                     'ranking_account': account,
-                    'ranking_book_at': direction['book']['received_at'],
-                    'ranking_reward_at': direction.get('reward_checked_at')})
+                    'ranking_book_at': direction['book']['received_at'] if plan is None else row['ranking_book_at'],
+                    'ranking_reward_at': direction.get('reward_checked_at') if plan is None else row.get('ranking_reward_at')})
             except ValueError as exc:
                 if plan is None or str(exc) in _PLAN_TRANSIENT_WAITS or 'identity' in str(exc):
                     raise
@@ -1640,12 +1860,14 @@ class LPAutoPool:
         if not validated:
             return [refused[row['order_id']] for row in original_victims]
         victims = validated
-        with self._send_barrier():
-            lock = self.execution._acquire_global_lock()
+        cancel_proofs = {}
+        with ExitStack() as send_guard:
+            send_guard.enter_context(self._send_barrier())
+            lock = self._acquire_plan_apply_lock() if plan is not None else self.execution._acquire_global_lock()
             if lock is None:
                 raise ValueError('execution_lock')
             try:
-                with self.lp._mutex:
+                with self.lp._mutex, (self._plan_progress_lock if plan is not None else nullcontext()):
                     state = self.state()
                     if not state['desired_running'] or (plan is None and state['admission_block_reasons']) or state['trading_config_version'] != version:
                         raise ValueError(state['reason'] or 'config_version_changed')
@@ -1657,12 +1879,25 @@ class LPAutoPool:
                         if plan is None:
                             self._ranking_fresh(target)
                         else:
-                            self._plan_controls(self._read(), plan)
-                            _freshness(target['ranking_book_at'], self._now(), 'book_freshness', max_age=60)
+                            current = self._read()
+                            self._plan_controls(current, plan)
+                            if (current.get('active_plan') or {}).get('round_id') != plan['round_id']:
+                                raise ValueError('plan_authorization_invalid')
                         if self._resting_buy(target):
                             own_keys = (unused[target['order_id']][1],) if unused is not None and target['order_id'] in unused else ()
-                            self._rotation_session(target, diagnostics=diagnostics, account=target['ranking_account'],
+                            current_session = self._rotation_session(target, diagnostics=diagnostics, account=target['ranking_account'],
                                 unused_cancel_keys=own_keys)
+                            if plan is not None:
+                                # Freeze already-proved closed request authority
+                                # before this registration replaces its rotation.
+                                audits = self.store.lp_actions(target['session_id'])
+                                ended_keys = self._ended_rotation_cancel_keys(target, current_session, audits)
+                                binding = {k: target[k] for k in ('session_id', 'order_id', 'token_id', 'condition_id', 'price')}
+                                binding['quantity'] = target.get('original_quantity', target['quantity'])
+                                for audit in audits:
+                                    if audit['action_key'] in ended_keys:
+                                        cancel_proofs[(target['session_id'], audit['action_key'])] = dict(
+                                            binding=deepcopy(binding), audit=deepcopy(audit), basis='ended')
                     if plan is None:
                         capital = sum((_decimal(t['minimum_order_estimate']['capital_usd']) for t in targets
                                        if not t.get('retained_constraint')), ZERO)
@@ -1699,6 +1934,20 @@ class LPAutoPool:
                             plan_round_id=plan['round_id'])
                     else:
                         attempts = self.lp.begin_order_cancel([r['order_id'] for r in victims])
+                    if plan is not None:
+                        for sid, key, payload in attempts:
+                            registered = [a for a in self.store.lp_actions(sid) if a['action_key'] == key]
+                            bound = [r for r in victims if r['session_id'] == sid and r['order_id'] == payload['order_id']]
+                            if len(registered) != 1 or len(bound) != 1:
+                                raise ValueError('rotation_cancel_dispatch_unknown')
+                            audit, target = registered[0], bound[0]
+                            if (audit.get('state') != 'pending' or audit.get('post_started')
+                                    or audit.get('role') != 'reconciliation_cancel'
+                                    or audit.get('rotation_round_id') != plan['round_id']):
+                                raise ValueError('rotation_cancel_dispatch_unknown')
+                            binding = {k: target[k] for k in ('session_id', 'order_id', 'token_id', 'condition_id', 'price')}
+                            binding['quantity'] = target.get('original_quantity', target['quantity'])
+                            cancel_proofs[(sid, key)] = dict(binding=deepcopy(binding), audit=deepcopy(audit), basis='current')
                     for row in victims:
                         self._mark_rotation_cancel_requested(row)
                     if plan is not None:
@@ -1709,12 +1958,25 @@ class LPAutoPool:
                         plan['cancel_registration']['completed'] = True
                         self._save_plan(plan, blocked=plan.get('blocked', ()))
             finally:
-                self.execution._release_global_lock(lock)
+                (self._release_plan_apply_lock if plan is not None else self.execution._release_global_lock)(lock)
+            if plan is not None:
+                send_guard.close()
             actions = []
             for row in victims:
-                acknowledged = self._send_rotation_cancel(row, [a for a in attempts if a[2]['order_id'] == row['order_id']])
-                actions.append(dict(condition_id=row['condition_id'], order_id=row['order_id'], state='canceling',
-                                    reason='yield_rotation' if acknowledged else 'rotation_cancel_unknown'))
+                current_attempts = [a for a in attempts if a[2]['order_id'] == row['order_id']]
+                if plan is not None:
+                    not_sent = self._prepare_plan_cancel_dispatch(row, current_attempts, plan, cancel_proofs=cancel_proofs)
+                    if not_sent:
+                        actions.append(dict(condition_id=row['condition_id'], order_id=row['order_id'],
+                            state='not_sent', reason=not_sent))
+                        continue
+                acknowledged = self._send_rotation_cancel(row, current_attempts)
+                rotation = self._rotation_record(self._read(), row) if plan is not None else {}
+                rejected = plan is not None and rotation.get('rotation_cancel_outcome') == 'rejected'
+                actions.append(dict(condition_id=row['condition_id'], order_id=row['order_id'],
+                    state='rejected' if rejected else 'canceling',
+                    reason=rotation.get('rotation_rejection_reason') if rejected else
+                        'yield_rotation' if acknowledged else 'rotation_cancel_unknown'))
             outcomes = {**refused, **{a['order_id']: a for a in actions}}
             return [outcomes[row['order_id']] for row in original_victims]
 
@@ -1798,6 +2060,116 @@ class LPAutoPool:
                 'acknowledged' if acknowledged else 'unknown',
             rotation_rejection_reason=rejection))
         return acknowledged
+
+    def _prepare_plan_cancel_dispatch(self, row, attempts, plan, *, cancel_proofs=None):
+        """Commit one original cancel's dispatch while its cycle is still open."""
+        with self._send_barrier():
+            lock = self._acquire_plan_apply_lock()
+            if lock is None:
+                raise ValueError('execution_lock')
+            try:
+                with self.lp._mutex:
+                    document = self._read()
+                    active = document.get('active_plan') or {}
+                    reason = None
+                    if (active.get('round_id') != plan['round_id'] or active.get('completed_at')
+                            or not document['desired_running']):
+                        reason = 'cycle_ended'
+                    else:
+                        try:
+                            self._plan_controls(document, plan)
+                        except ValueError as exc:
+                            reason = str(exc)
+                    session = self.store.lp_session(row['session_id'])
+                    audits = {a['action_key']: a for a in self.store.lp_actions(row['session_id'])}
+                    own_keys = set()
+                    if session:
+                        for (sid, key), proof in (cancel_proofs or {}).items():
+                            binding, original = proof['binding'], proof['audit']
+                            audit = audits.get(key)
+                            history = self.lp._order_history(session).get(binding['order_id'], {})
+                            if (sid != row['session_id'] or binding['session_id'] != sid or not audit
+                                    or any(audit.get(k) != original.get(k) for k in
+                                        ('action_id', 'action_key', 'session_id', 'created_at', 'order_id', 'role',
+                                         'rotation_round_id', 'submit_requested_at'))
+                                    or audit.get('session_id') != sid or audit.get('order_id') != binding['order_id']
+                                    or audit.get('role') != 'reconciliation_cancel'
+                                    or audit.get('state') not in ('pending', 'unknown', 'accepted', 'rejected')
+                                    or any(str(session.get(k)) != str(binding[k]) for k in ('token_id', 'condition_id'))
+                                    or binding['order_id'] not in self.lp._session_order_ids(session)
+                                    or history.get('status') != 'LIVE' or history.get('side') != 'BUY'
+                                    or str(history.get('token_id')) != str(binding['token_id'])
+                                    or _maybe_decimal(history.get('price')) != _decimal(binding['price'])
+                                    or _maybe_decimal(history.get('original_size', history.get('quantity'))) != _decimal(binding['quantity'])
+                                    or _maybe_decimal(history.get('size_matched')) != ZERO):
+                                continue
+                            if proof['basis'] == 'ended':
+                                # The closed-authority proof was captured under
+                                # the registration locks; its old audit must
+                                # still be byte-identical and have no live sender.
+                                if (audit != original or audit.get('state') != 'unknown'
+                                        or not audit.get('rotation_round_id')
+                                        or audit['rotation_round_id'] == plan['round_id']):
+                                    continue
+                                with self._attempt_jobs_lock:
+                                    sender = self._attempt_jobs.get(f"{audit['rotation_round_id']}:cancel:{binding['order_id']}")
+                                if sender is not None and not sender.done():
+                                    continue
+                            elif (proof['basis'] != 'current' or original.get('state') != 'pending'
+                                    or audit.get('rotation_round_id') != plan['round_id']
+                                    or (session.get('yield_rotation_cancel_owners') or {}).get(binding['order_id']) != plan['round_id']):
+                                continue
+                            own_keys.add(key)
+                    if not reason and (not session or session.get('stop_requested')
+                            or session.get('stop_loss_latched') or session.get('order_identity_conflict')
+                            or hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest() != plan['account_id']
+                            or any(str(session.get(k)) != str(row[k]) for k in ('condition_id', 'token_id'))
+                            or self.lp.entry_send_inflight(row['session_id'])
+                            or (_maybe_decimal(session.get('buy_filled_quantity')) or ZERO) > ZERO
+                            or row['order_id'] not in self.lp._session_order_ids(session)
+                            or (session.get('yield_rotation_cancel_owners') or {}).get(row['order_id']) != plan['round_id']
+                            or has_independent_unresolved_action(session, [a for key, a in audits.items() if key not in own_keys])
+                            or any(bucket.get('state') not in ('registered', 'monitoring')
+                                and not (bucket.get('state') == 'canceling' and bucket.get('cancel_reason') == 'yield_rotation')
+                                for bucket in self.lp._queue_protection_levels(session).values())):
+                        reason = 'rotation_protection_active'
+                    if not reason:
+                        current_order = self.lp._order_history(session).get(row['order_id'], {})
+                        if (current_order.get('status') != 'LIVE' or current_order.get('side') != 'BUY'
+                                or str(current_order.get('token_id')) != str(row['token_id'])
+                                or _maybe_decimal(current_order.get('price')) != _decimal(row['price'])
+                                or _maybe_decimal(current_order.get('original_size', current_order.get('quantity'))) !=
+                                    _decimal(row.get('original_quantity', row['quantity']))
+                                or _maybe_decimal(current_order.get('size_matched')) != ZERO):
+                            reason = 'rotation_order_changed'
+                    if not attempts or any(sid != row['session_id'] or key not in audits
+                            or audits[key]['state'] != 'pending' or audits[key].get('post_started')
+                            or audits[key].get('role') != 'reconciliation_cancel'
+                            or audits[key].get('order_id') != row['order_id']
+                            or audits[key].get('rotation_round_id') != plan['round_id']
+                            for sid, key, _ in attempts):
+                        raise ValueError('rotation_cancel_dispatch_unknown')
+                    for sid, key, payload in attempts:
+                        payload.update(post_started=reason is None,
+                            submit_stage='pre_send_rejected' if reason else 'sending')
+                        if reason:
+                            payload.update(reason=reason, submit_finished_at=self._stamp())
+                        else:
+                            payload['submit_post_started_at'] = self._stamp()
+                        self.store.lp_finish_cancel(sid, key, state='rejected' if reason else 'pending', payload=payload)
+                    if reason:
+                        def ended(d):
+                            self._rotation_record(d, row).update(rotation_cancel_acknowledged=False,
+                                rotation_cancel_outcome='not_sent', rotation_rejection_reason=reason)
+                            last = d.get('last_round') or {}
+                            if last.get('round_id') == plan['round_id']:
+                                for action in last.get('actions', ()):
+                                    if action.get('kind') == 'cancel' and action.get('order_id') == row['order_id']:
+                                        action.update(state='not_sent', reason=reason)
+                        self._update(ended)
+                    return reason
+            finally:
+                self._release_plan_apply_lock(lock)
 
     def _finish_rejected_plan_cancel(self, plan, action, rows):
         """Remove only this round's yield intent; protection/stop retain ownership."""
@@ -1937,7 +2309,7 @@ class LPAutoPool:
                 state='active', rotation_settled_at=self._stamp()))
 
     def _yield_protection_restoration_patch(self, session, rows, audits, *, account_id,
-                                           request_rounds, obsolete=frozenset()):
+                                           request_rounds, obsolete=frozenset(), ended_live=frozenset(), request_keys=None):
         """Compute ended price recovery from real request bindings and current rows."""
         # Registration is already intent, even before its bucket merge or an
         # accepted ACK becomes terminal. Read it from this same writer image.
@@ -1973,7 +2345,10 @@ class LPAutoPool:
                 targets.add(str(audit['order_id']))
             for target in targets & owned_ids:
                 owner = audit.get('rotation_round_id')
-                if owner and owner in (request_rounds.get(target), (session.get('yield_rotation_cancel_owners') or {}).get(target)):
+                if request_keys is not None:
+                    if audit.get('action_key') in request_keys.get(target, ()):
+                        continue
+                elif owner and owner in (request_rounds.get(target), (session.get('yield_rotation_cancel_owners') or {}).get(target)):
                     continue
                 original = history.get(target, {})
                 # Current results always outrank history. An accepted owned
@@ -2008,6 +2383,7 @@ class LPAutoPool:
             and rows[oid].get('fill_quantity_known') is not False
             and _maybe_decimal(rows[oid].get('size_matched')) is not None}
         finished = {oid for oid in terminal if owners.get(oid) == request_rounds.get(oid)}
+        finished |= {oid for oid in ended_live if owners.get(oid) == request_rounds.get(oid)}
         finished |= obsolete
         terminal |= obsolete
         for oid in finished:
@@ -2218,7 +2594,7 @@ class LPAutoPool:
         except (ValueError, RuntimeError, OSError):
             return
 
-    def _settle_rotations(self):
+    def _settle_rotations(self, *, retry=True):
         retries = []
         def apply(d):
             reason = None
@@ -2271,7 +2647,7 @@ class LPAutoPool:
                     reason = 'rotation_filled'
             return reason
         reason = self._update(apply)
-        for intent in retries:
+        for intent in retries if retry else ():
             self._retry_rotation_cancel(intent)
         return reason
 
@@ -3020,8 +3396,7 @@ class LPAutoPool:
                     return False
                 # Serialize publication with attempt admission, not the account
                 # read. A late old read cannot publish over a newer wait.
-                current_only = planning and snapshot.get('trades_complete') is not True
-                result = (self.lp._register_planning_account_snapshot(snapshot) if current_only
+                result = (self.lp._register_planning_account_snapshot(snapshot) if planning
                           else self.lp.register_account_snapshot(snapshot))
                 if result.get('state') != 'registered':
                     reason = result.get('reason') or 'account_order_sync_unknown'
@@ -3036,7 +3411,7 @@ class LPAutoPool:
                     document = {**self._default(), **deepcopy(capture['document'])}
                     validated_at = capture['validated_at']
                     state = self._projection(document, planning=True, observed_at=validated_at,
-                        observed_generation=snapshot['trade_generation'])
+                        observed_generation=capture.get('validated_generation', snapshot['trade_generation']))
                     reservations = self.lp._candidate_reservations()
                     return dict(document=document, account=deepcopy(snapshot),
                         state=deepcopy(state), reservations=deepcopy(reservations),
@@ -3216,18 +3591,80 @@ class LPAutoPool:
         if self.store.active_execution() is not None:
             raise ValueError('active_execution')
 
+    def _acquire_plan_apply_lock(self):
+        # Serialize only this pool's short writers, never external preparation
+        # or HTTP. Another process still gets the real native lock refusal.
+        self._plan_mutation_lock.acquire()
+        lock = self.execution._acquire_global_lock()
+        if lock is None:
+            self._plan_mutation_lock.release()
+        return lock
+
+    def _release_plan_apply_lock(self, lock):
+        try:
+            self.execution._release_global_lock(lock)
+        finally:
+            self._plan_mutation_lock.release()
+
+    def _launch_plan_attempt(self, row, plan, action):
+        request_id = action.get('request_id', action['action_id'])
+        with self._attempt_jobs_lock:
+            self._attempt_jobs = {key: job for key, job in self._attempt_jobs.items() if not job.done()}
+            future = Future()
+            if len(self._attempt_jobs) >= 5:
+                future.set_exception(ValueError('submission_capacity'))
+                return future
+            self._attempt_jobs[request_id] = future
+        def attempt():
+            try:
+                result = self._submit(row, plan['round_id'],
+                    action.get('request_index', action['index']),
+                    plan.get('trading_config_version', plan['config_version']))
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+        threading.Thread(target=attempt, name='lp-auto-attempt', daemon=True).start()
+        return future
+
+    def _launch_plan_cancels(self, plan, actions, snapshot):
+        with self._attempt_jobs_lock:
+            self._attempt_jobs = {key: job for key, job in self._attempt_jobs.items() if not job.done()}
+            available = max(0, 5 - len(self._attempt_jobs))
+            selected = actions[:available]
+            for action in actions[available:]:
+                action.update(state='not_sent', reason='submission_capacity')
+            future = Future()
+            for action in selected:
+                self._attempt_jobs[action['action_id']] = future
+        def attempt():
+            try:
+                ids = {a['order_id'] for a in selected}
+                victims = [r for r in plan['victims'] if r['order_id'] in ids]
+                outcomes = self._rotate_out(victims, plan['targets'],
+                    plan.get('trading_config_version', plan['config_version']),
+                    diagnostics=plan.get('diagnostics'), plan=plan, result_snapshot=snapshot)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(outcomes)
+        if selected:
+            threading.Thread(target=attempt, name='lp-auto-cancel-attempt', daemon=True).start()
+        else:
+            future.set_result([])
+        return future, selected
+
     def _submit_planned(self, row, round_id, index, version):
+        import sqlite3
         from .polymarket_lp import AutoEntryNotSent, expiration_for_review
         from .polymarket_lp_views import _next_review_at
         intent_id = f'{round_id}:{index}'
         authorization = _PlanEntryAuthorization(self, round_id, intent_id)
         authorization.validate(row)
-        snapshot = self.lp._read_plan_market_snapshot(row)
-        request = self.lp._normalize_request({**row, 'candidate_policy': 'best_bid_minimum',
-            'candidate_bid_level': row.get('bid_level', 1), 'review_at': _next_review_at(self._now())})
-        facts = self.lp._validate_market_snapshot(request, snapshot, now=self._now())
-        self.lp._require_lp_history(request, now=self._now())
-        lock = self.execution._acquire_global_lock()
+        snapshot = deepcopy(row['planning_snapshot'])
+        request = deepcopy(row['planning_request'])
+        facts = deepcopy(row['planning_entry_facts'])
+        lock = self._acquire_plan_apply_lock()
         if lock is None:
             raise ValueError('execution_lock')
         self.lp._mutex.acquire()
@@ -3237,7 +3674,7 @@ class LPAutoPool:
             if not released:
                 released = True
                 self.lp._mutex.release()
-                self.execution._release_global_lock(lock)
+                self._release_plan_apply_lock(lock)
         session_id = uuid.uuid4().hex
         try:
             authorization.validate(request)
@@ -3258,34 +3695,53 @@ class LPAutoPool:
                     quantity=intent['quantity'], price=intent['price'])
             self._update(reserve)
             def post(signed, mark_post_started):
-                try:
-                    latest = self.lp._read_plan_market_snapshot(request)
-                    self.lp._validate_market_snapshot(request, latest, now=self._now())
-                    self.lp._require_lp_history(request, now=self._now())
-                except ValueError as exc:
-                    raise AutoEntryNotSent(str(exc)) from exc
-                with self._send_barrier():
-                    send_lock = self.execution._acquire_global_lock()
-                    if send_lock is None:
-                        raise AutoEntryNotSent('execution_lock')
-                    try:
-                        with self.lp._mutex:
-                            try:
-                                authorization.validate(request)
-                            except ValueError as exc:
-                                raise AutoEntryNotSent(str(exc)) from exc
-                            self._update(lambda d: d['intents'][intent_id].update(state='sending',
-                                financial_status='unknown', reconcile_reason='submission_pending'))
-                    finally:
-                        self.execution._release_global_lock(send_lock)
-                    return self.lp._post_limit(signed, side='BUY', on_post_started=mark_post_started,
-                        plan_authorization=authorization)
-            result = self.lp._entry_execute(request=request, snapshot=snapshot, facts=facts,
-                now=self._now(), key=f'lp-auto:{intent_id}',
-                expiration=expiration_for_review(request['review_at'], now=self._now()),
-                session_id=session_id, post=post, release_preparation_lock=release,
-                apply_lock=(self.execution._acquire_global_lock, self.execution._release_global_lock),
-                plan_authorization=authorization)
+                def begin_post():
+                    with self._send_barrier():
+                        send_lock = self._acquire_plan_apply_lock()
+                        if send_lock is None:
+                            raise AutoEntryNotSent('execution_lock')
+                        try:
+                            with self.lp._mutex:
+                                try:
+                                    authorization.validate(request)
+                                except ValueError as exc:
+                                    raise AutoEntryNotSent(str(exc)) from exc
+                                self._update(lambda d: d['intents'][intent_id].update(state='sending',
+                                    financial_status='unknown', reconcile_reason='submission_pending'))
+                                mark_post_started()
+                        finally:
+                            self._release_plan_apply_lock(send_lock)
+                return self.lp._post_limit(signed, side='BUY', on_post_started=begin_post,
+                    plan_authorization=authorization)
+            try:
+                result = self.lp._entry_execute(request=request, snapshot=snapshot, facts=facts,
+                    now=self._now(), key=f'lp-auto:{intent_id}',
+                    expiration=expiration_for_review(request['review_at'], now=self._now()),
+                    session_id=session_id, post=post, release_preparation_lock=release,
+                    apply_lock=(self._acquire_plan_apply_lock, self._release_plan_apply_lock),
+                    plan_authorization=authorization)
+            except AutoEntryNotSent as exc:
+                if str(exc) != 'entry_audit_registration_failed' or not isinstance(exc.__cause__, sqlite3.Error):
+                    raise
+                current = self._read()['intents'].get(intent_id)
+                session = self.store.lp_session(session_id)
+                if (not current or current.get('session_id') != session_id or current.get('state') != 'reserved'
+                        or not session or session.get('idempotency_key') != f'lp-auto:{intent_id}'
+                        or session.get('state') != 'entry_submit_pending' or session.get('submit_stage') != 'preparing'
+                        or session.get('post_started') is not False or session.get('entry_order_id')
+                        or self.lp.entry_send_inflight(session_id) or self.lp._session_order_ids(session)
+                        or self.store.lp_actions(session_id)
+                        or any(str(session.get(k)) != str(request[k]) for k in ('market_id', 'condition_id', 'token_id', 'outcome'))
+                        or any(_maybe_decimal(session.get(k)) != request[k] for k in ('price', 'quantity'))
+                        or hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest() != self._read()['account_id']):
+                    raise
+                # No audit was registered and this original sender has exited.
+                # A failed cleanup write propagates and keeps its real hold.
+                result = self.store.lp_update_session(session_id, state='entry_rejected', patch=dict(
+                    reason='entry_audit_registration_failed', submit_status='rejected',
+                    submit_stage='pre_send_rejected', post_started=False,
+                    submit_finished_at=self._stamp(), submit_error_type=exc.error_type,
+                    submit_error_code=exc.error_code))
             session = self.store.lp_session(session_id)
             if session:
                 self._record_session(intent_id, session)
@@ -3491,12 +3947,10 @@ class LPAutoPool:
         self._update(lambda d: self._set_plan_wait(d, kind))
 
     def _set_plan_wait(self, d, kind, *, started_at=None):
-        fields = {'round': ('round_interval_seconds', 60),
-                  'api': ('api_retry_interval_seconds', 60),
-                  'order': ('order_check_interval_seconds', 10)}
-        field, default = fields[kind]
+        # Yield attempts and failed current observations share one cycle clock.
+        field, default = 'round_interval_seconds', 30
         now = _maybe_datetime(started_at) or self._now()
-        d['plan_wait'] = dict(kind=kind, started_at=now.isoformat(),
+        d['plan_wait'] = dict(kind='round', started_at=now.isoformat(),
             deadline=(now + timedelta(seconds=d.get(field, default))).isoformat())
 
     def _save_plan(self, plan, *, reason=None, blocked=(), wait_kind=None, connection=None):
@@ -3526,17 +3980,15 @@ class LPAutoPool:
                     else 'candidates_or_funds_insufficient'))
             if wait_kind:
                 self._set_plan_wait(d, wait_kind, started_at=plan.get('completed_at'))
-        self._update(apply, connection=connection)
+        with self._plan_progress_lock:
+            self._update(apply, connection=connection)
 
     @staticmethod
     def _defer_unsent(plan, action, reason, session_id):
         attempts = action.setdefault('attempts', [])
         attempts.append(dict(request_id=action.get('request_id', action['action_id']),
             session_id=session_id, state='not_sent', reason=reason))
-        action.update(state='pending', wait_reason=reason,
-            request_index=f'{action["index"]}:retry:{len(attempts)}',
-            request_id=f'{plan["round_id"]}:{action["index"]}:retry:{len(attempts)}')
-        action.pop('session_id', None)
+        action.update(state='not_sent', reason=reason, session_id=session_id)
         action.pop('order_id', None)
 
     def _run_once(self, *, round_id=None, reuse_facts=False):
@@ -3547,13 +3999,24 @@ class LPAutoPool:
             return self.state()
         plan = d.get('active_plan')
         if plan is not None:
-            return self._execute_plan(plan)
+            self._restore_plan_buy_progress(plan)
+            # A durable plan is history, never a new cycle's send permission.
+            # Keep sent requests in their existing sessions/audits for recovery.
+            for action in plan['actions']:
+                if action['state'] == 'pending':
+                    action.update(state='not_sent', reason='cycle_ended')
+            plan['completed_at'] = self._stamp()
+            self._save_plan(plan, reason='cycle_ended')
+            plan = None
         if callable(getattr(self.lp.exchange, 'lp_account_snapshot_shared', None)):
             refreshed = self._refresh_account_facts(planning=True)
         else:
             self._reconcile_unknown(reuse=reuse_facts, bounded=True)
             refreshed = None
         observation = refreshed if isinstance(refreshed, Mapping) else None
+        # Exact ended cancellation recovery is independent of balance admission.
+        self._recover_cancel_requests()
+        self._recover_entry_requests()
         state = observation['state'] if observation is not None else self.state()
         source_document = observation['document'] if observation is not None else self._read()
         _lp_causal_event('auto_account_use', account=source_document.get('account_financial_facts'), used_at=self._now())
@@ -3568,13 +4031,14 @@ class LPAutoPool:
             else:
                 def pause_planning(doc):
                     doc['last_round'] = dict(round_id=round_id, checked_at=self._stamp(),
+                        completed_at=self._stamp(),
                         targets=[], actions=[], blocked=[], candidates=[], candidate_count=0,
                         candidate_filter=diagnostics, reason=reason)
                     self._set_plan_wait(doc, 'api')
                 self._update(pause_planning)
             return self.state()
         try:
-            rotation_reason = self._settle_rotations()
+            rotation_reason = self._settle_rotations(retry=False)
         except LpAccountRoundInvalid as exc:
             if plan:
                 self._save_plan(plan, reason=str(exc), wait_kind='api')
@@ -3631,6 +4095,20 @@ class LPAutoPool:
                     + [dict(kind='buy', action_id=f'{round_id}:{index}', index=index,
                         condition_id=r['condition_id'], token_id=r['token_id'], state='pending')
                        for index, r in enumerate(targets) if not self._resting_buy(r)])
+            # The desired combination may depend on cancellation. Only capacity
+            # already free in this observation authorizes this cycle's BUYs.
+            free_slots = max(0, state['target_buy_count'] - state['slots']['occupied'])
+            free_capital = _decimal(state['funds']['spendable_usd'])
+            for action in plan['actions']:
+                if action['kind'] != 'buy':
+                    continue
+                target = targets[action['index']]
+                capital = _decimal(target['price']) * _decimal(target['quantity'])
+                if free_slots and capital <= free_capital:
+                    free_slots -= 1
+                    free_capital -= capital
+                else:
+                    action.update(state='not_sent', reason='next_round_capacity')
             try:
                 with ExitStack() as guards, self.store._transaction() as connection:
                     # Registration takes its apply lane before SQLite. Never
@@ -3695,6 +4173,359 @@ class LPAutoPool:
                 self._plan_wait('api')
                 return self.state()
         return self._execute_plan(plan)
+
+    def _recover_cancel_requests(self):
+        """End original yield responsibilities from owned requests and exact results."""
+        document = self._read()
+        account_id = document['account_id']
+        originals = {}
+        for session in self.store.lp_sessions():
+            saved = session.get('yield_rotation_protection_before') or {}
+            owners = session.get('yield_rotation_cancel_owners') or {}
+            if (not saved or session.get('order_identity_conflict')
+                    or hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest() != account_id):
+                continue
+            history = self.lp._order_history(session)
+            audits = self.store.lp_actions(session['session_id'])
+            requests = {}
+            for oid in saved:
+                rotation = document.get('account_rotations', {}).get(oid) or next(
+                    (i for i in document['intents'].values() if i.get('order_id') == oid), {})
+                owner = rotation.get('rotation_round_id')
+                bound = [a for a in audits if a.get('rotation_round_id') == owner
+                    and (a.get('order_id') == oid or oid in (a.get('targets') or ()))]
+                original = history.get(oid, {})
+                quantity = _maybe_decimal(rotation.get('original_quantity', rotation.get('quantity')))
+                price = _maybe_decimal(rotation.get('price'))
+                if (not owner or owners.get(oid) not in (None, owner)
+                        or rotation.get('session_id') != session['session_id'] or rotation.get('order_id') != oid
+                        or any(str(rotation.get(k)) != str(session.get(k)) for k in ('token_id', 'condition_id'))
+                        or rotation.get('side', 'BUY') != 'BUY' or oid not in self.lp._session_order_ids(session)
+                        or quantity is None or quantity <= ZERO or price is None or price <= ZERO
+                        or self.lp._order_id(original) != oid or original.get('side') != 'BUY'
+                        or str(original.get('token_id')) != str(session.get('token_id'))
+                        or _maybe_decimal(original.get('price')) != price
+                        or _maybe_decimal(original.get('original_size', original.get('quantity'))) != quantity
+                        or not bound or any(a.get('session_id') != session['session_id'] or a.get('order_id') != oid
+                            or a.get('role') != 'reconciliation_cancel' or submission_action_kind(a) != 'cancel'
+                            or not str(a.get('action_key') or '').startswith(session['session_id'] + ':reconciliation-cancel:')
+                            or any(str(target) != oid for target in (a.get('targets') or ()))
+                            or a.get('state') not in ('accepted', 'rejected', 'unknown') for a in bound)):
+                    continue
+                try:
+                    ids = [str(uuid.UUID(a['action_id'])) for a in bound]
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    continue
+                if len(set(ids)) != len(ids) or len({a['action_key'] for a in bound}) != len(bound):
+                    continue
+                refused = all(a['state'] == 'rejected' and a.get('reason')
+                    and a['reason'] == rotation.get('rotation_rejection_reason') for a in bound)
+                if refused and rotation.get('rotation_cancel_outcome') not in ('rejected', 'not_sent'):
+                    continue
+                if (rotation.get('rotation_cancel_outcome') == 'not_sent'
+                        and any(a.get('post_started') is not False or a.get('submit_stage') != 'pre_send_rejected'
+                            for a in bound)):
+                    continue
+                unknown = any(a['state'] == 'unknown' for a in bound)
+                if unknown:
+                    with self._attempt_jobs_lock:
+                        sender = self._attempt_jobs.get(f'{owner}:cancel:{oid}')
+                    if sender is not None and not sender.done():
+                        continue
+                    registered = _maybe_datetime((document.get('rounds', {}).get(owner) or {}).get('started_at'))
+                    active = document.get('active_plan') or {}
+                    requested = _maybe_datetime(rotation.get('rotation_requested_at'))
+                    if (rotation.get('rotation_cancel_outcome') != 'unknown'
+                            or active.get('round_id') == owner or registered is None or requested is None
+                            or any(a['state'] != 'unknown' or a.get('post_started') is not True
+                                or a.get('submit_stage') != 'sending'
+                                or _maybe_datetime(a.get('submit_requested_at')) is None
+                                or _maybe_datetime(a.get('submit_post_started_at')) is None
+                                or not registered <= requested <= _maybe_datetime(a['submit_requested_at']) <=
+                                    _maybe_datetime(a['submit_post_started_at']) for a in bound)):
+                        continue
+                older = []
+                for audit in audits:
+                    prior_round = audit.get('rotation_round_id')
+                    registered = (document.get('rounds', {}).get(prior_round) or {}).get('started_at')
+                    requested = _maybe_datetime(audit.get('submit_requested_at'))
+                    posted = _maybe_datetime(audit.get('submit_post_started_at'))
+                    if (not prior_round or prior_round == owner or not _maybe_datetime(registered)
+                            or audit.get('session_id') != session['session_id'] or audit.get('order_id') != oid
+                            or audit.get('role') != 'reconciliation_cancel' or submission_action_kind(audit) != 'cancel'
+                            or audit.get('state') not in ('accepted', 'unknown') or audit.get('post_started') is not True
+                            or not str(audit.get('action_key') or '').startswith(session['session_id'] + ':reconciliation-cancel:')
+                            or any(str(target) != oid for target in (audit.get('targets') or ()))
+                            or requested is None or posted is None or not _maybe_datetime(registered) <= requested <= posted
+                            or audit.get('state') == 'unknown' and (audit.get('submit_stage') != 'sending'
+                                or (document.get('active_plan') or {}).get('round_id') == prior_round
+                                or _maybe_datetime(rotation.get('rotation_requested_at')) is None
+                                or posted > _maybe_datetime(rotation['rotation_requested_at']))):
+                        continue
+                    try:
+                        uuid.UUID(audit['action_id'])
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        continue
+                    older.append(deepcopy(audit))
+                all_requests = [*bound, *older]
+                if (len({a['action_id'] for a in all_requests}) != len(all_requests)
+                        or len({a['action_key'] for a in all_requests}) != len(all_requests)):
+                    continue
+                requests[oid] = dict(rotation=deepcopy(rotation), audits=deepcopy(bound),
+                    older_audits=older, price=price, quantity=quantity, refused=refused, unknown=unknown)
+            if requests:
+                originals[session['session_id']] = requests
+        reader = getattr(self.lp.exchange, 'lp_order_result_snapshot', None)
+        if not originals or not callable(reader):
+            return
+        generation = self.store.lp_trade_generation()
+        try:
+            snapshot = self.lp._market_read({'condition_id': 'lp-order-results:' + account_id},
+                lambda: reader(dict(owned_order_ids=sorted({oid for requests in originals.values() for oid in requests}),
+                    condition_ids=sorted({proof['rotation']['condition_id']
+                        for requests in originals.values() for proof in requests.values()}))))
+            if (not isinstance(snapshot, Mapping) or snapshot.get('authenticated') is not True
+                    or any(snapshot.get(k) is not True for k in ('open_orders_complete', 'pagination_complete'))
+                    or any(not isinstance(snapshot.get(k), (list, tuple)) for k in ('orders', 'open_orders'))
+                    or hashlib.sha256(str(snapshot.get('wallet_address') or '').strip().casefold().encode()).hexdigest() != account_id):
+                return
+            started, ended = (_timestamp(snapshot.get(k)) for k in ('read_started_at', 'read_ended_at'))
+            _freshness(ended, self._now(), 'order_result', max_age=60)
+            if started > ended or ended > self._now() or generation != self.store.lp_trade_generation():
+                return
+            rows = {}
+            for receipt in [*snapshot['orders'], *snapshot['open_orders']]:
+                if not isinstance(receipt, Mapping) or not self.lp._order_id(receipt):
+                    return
+                oid = self.lp._order_id(receipt)
+                if oid in rows and rows[oid] != receipt:
+                    return
+                rows[oid] = receipt
+            lock = self.execution._acquire_global_lock()
+            if lock is None:
+                return
+            try:
+                with self.lp._mutex:
+                    if (generation != self.store.lp_trade_generation() or account_id != self.execution._lp_account_id()
+                            or not self.execution.lp_mutation_allowed() or self.store.active_execution() is not None):
+                        return
+                    for sid, requests in originals.items():
+                        def build_patch(session, connection):
+                            pool_row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+                            current = {**self._default(), **json.loads(pool_row[0])} if pool_row else self._default()
+                            if (current['account_id'] != account_id or session.get('order_identity_conflict')
+                                    or hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest() != account_id
+                                    or self.lp.entry_send_inflight(sid)):
+                                return {}
+                            audits = self.store.lp_actions(sid, connection=connection)
+                            if has_independent_unresolved_buy_action(session, audits):
+                                return {}
+                            history = self.lp._order_history(session)
+                            fill_updates = {}
+                            current_session = session
+                            request_rounds, request_keys, ended_live = {}, {}, set()
+                            terminal_results = {}
+                            for oid, proof in requests.items():
+                                rotation = current.get('account_rotations', {}).get(oid) or next(
+                                    (i for i in current['intents'].values() if i.get('order_id') == oid), {})
+                                original = proof['rotation']
+                                owner = original['rotation_round_id']
+                                bound = [a for a in audits if a.get('rotation_round_id') == owner
+                                    and (a.get('order_id') == oid or oid in (a.get('targets') or ()))]
+                                older_keys = {a['action_key'] for a in proof['older_audits']}
+                                older = [a for a in audits if a.get('action_key') in older_keys]
+                                receipt = rows.get(oid, {})
+                                matched = _maybe_decimal(receipt.get('size_matched'))
+                                old = history.get(oid, {})
+                                if (bound != proof['audits'] or older != proof['older_audits']
+                                        or any(_maybe_datetime(a.get('submit_post_started_at')) > started for a in older)
+                                        or oid in snapshot.get('order_read_errors', {})
+                                        or any(rotation.get(k) != original.get(k) for k in
+                                            ('rotation_round_id', 'rotation_cancel_outcome', 'rotation_rejection_reason',
+                                             'rotation_requested_at', 'session_id', 'order_id', 'token_id', 'condition_id',
+                                             'price', 'quantity', 'original_quantity'))
+                                        or (session.get('yield_rotation_cancel_owners') or {}).get(oid) not in (None, owner)
+                                        or oid not in self.lp._session_order_ids(session)
+                                        or any(str(session.get(k)) != str(original[k]) for k in ('token_id', 'condition_id'))
+                                        or any(self.lp._order_id(r) != oid or r.get('side') != 'BUY'
+                                            or str(r.get('token_id')) != str(original['token_id'])
+                                            or _maybe_decimal(r.get('price')) != proof['price']
+                                            or _maybe_decimal(r.get('original_size', r.get('quantity'))) != proof['quantity']
+                                            for r in (receipt, old))
+                                        or str(receipt.get('condition_id', receipt.get('market'))) != str(original['condition_id'])
+                                        or any(_maybe_datetime(a.get('submit_requested_at')) is None
+                                            or _maybe_datetime(a.get('submit_requested_at')) > started
+                                            or a.get('post_started') is True and (_maybe_datetime(a.get('submit_post_started_at')) is None
+                                                or _maybe_datetime(a.get('submit_post_started_at')) > started)
+                                            or a.get('post_started') is False and (_maybe_datetime(a.get('submit_finished_at')) is None
+                                                or _maybe_datetime(a.get('submit_finished_at')) > started) for a in bound)
+                                        or receipt.get('fill_quantity_known') is not True
+                                        or matched is None or not ZERO <= matched <= proof['quantity']):
+                                    continue
+                                if proof['unknown'] and (
+                                        (current.get('active_plan') or {}).get('round_id') == owner
+                                        or rotation.get('rotation_cancel_outcome') != 'unknown'
+                                        or any(_maybe_datetime(a['submit_post_started_at']) >= started for a in bound)):
+                                    continue
+                                terminal = str(receipt.get('status')).upper() in TERMINAL_ORDER_STATES
+                                live_refusal = proof['refused'] and receipt.get('status') == 'LIVE' and matched == ZERO
+                                live_ack = (receipt.get('status') == 'LIVE' and matched == ZERO
+                                    and rotation.get('rotation_cancel_outcome') == 'acknowledged'
+                                    and all(a.get('state') == 'accepted' and a.get('post_started') is True for a in bound))
+                                live_unknown = proof['unknown'] and receipt.get('status') == 'LIVE' and matched == ZERO
+                                if matched > ZERO:
+                                    if (not terminal and receipt.get('status') != 'LIVE'
+                                            or snapshot.get('positions_complete') is not True
+                                            or snapshot.get('trades_complete') is not True
+                                            or not isinstance(snapshot.get('positions'), (list, tuple))
+                                            or not isinstance(snapshot.get('trades'), (list, tuple))):
+                                        continue
+                                    try:
+                                        owned = next((r for r in self.lp._owned_sync_order_rows(snapshot['trades'],
+                                            str(snapshot['wallet_address'])) if r['order_id'] == oid), {})
+                                        if (owned.get('side') != 'BUY' or owned.get('token_id') != original['token_id']
+                                                or owned.get('condition_id') != original['condition_id']
+                                                or _maybe_decimal(owned.get('size_matched')) != matched
+                                                or _maybe_decimal(owned.get('price')) != proof['price']):
+                                            continue
+                                        fact_patch = self._order_result_fill_patch(current_session, snapshot)
+                                        observed_session = {**current_session, **fact_patch}
+                                        fill = (observed_session.get('verified_order_fills') or {}).get(oid, {})
+                                        if (fill.get('quantity_known') is not True
+                                                or _maybe_decimal(fill.get('quantity')) != matched
+                                                or fill.get('side') != 'BUY' or _maybe_decimal(fill.get('fee')) is None
+                                                or _maybe_decimal(fill.get('value')) != matched * proof['price']
+                                                or observed_session.get('position_reconciled') is not True
+                                                or _maybe_decimal(observed_session.get('buy_fees')) is None
+                                                or _maybe_decimal(observed_session.get('residual_quantity')) !=
+                                                    _decimal(observed_session['buy_filled_quantity']) -
+                                                    _decimal(observed_session['sold_quantity'])):
+                                            continue
+                                    except (ValueError, TypeError, KeyError):
+                                        continue
+                                    fill_updates.update(fact_patch)
+                                    current_session = observed_session
+                                    if not terminal:
+                                        # Factual LIVE fills retain the original yield
+                                        # owner; they never authorize another cancel.
+                                        continue
+                                if not (terminal or live_refusal or live_ack or live_unknown):
+                                    continue
+                                request_rounds[oid] = owner
+                                request_keys[oid] = {a['action_key'] for a in [*bound, *older]}
+                                if live_refusal or live_ack or live_unknown:
+                                    ended_live.add(oid)
+                                elif terminal:
+                                    # Refine only the exact witnessed original principal.
+                                    terminal_results[oid] = dict(session_id=sid, side='BUY',
+                                        token_id=original['token_id'], condition_id=original['condition_id'],
+                                        price=str(proof['price']), original_size=str(proof['quantity']),
+                                        size_matched=str(matched), read_ended_at=ended.isoformat())
+                                    if matched > ZERO:
+                                        terminal_results[oid]['inventory_cost_usd'] = str(
+                                            _decimal(current_session['buy_cost']) + _decimal(current_session['buy_fees']))
+                            if not request_rounds:
+                                return fill_updates
+                            patch = self._yield_protection_restoration_patch(current_session, rows, audits,
+                                account_id=account_id, request_rounds=request_rounds,
+                                ended_live=ended_live, request_keys=request_keys)
+                            def settle(d):
+                                for oid in request_rounds:
+                                    rotation = self._rotation_record(d, requests[oid]['rotation'])
+                                    rotation.update(rotation_settled_at=self._stamp())
+                                    if oid in ended_live:
+                                        rotation['state'] = 'active'
+                                if terminal_results:
+                                    results = d.get('execution_order_facts') or {}
+                                    if results.get('account_id') != account_id:
+                                        results = dict(account_id=account_id)
+                                    if not results.get('as_of') or _timestamp(results['as_of']) <= ended:
+                                        results['terminal_buy_results'] = {
+                                            **(results.get('terminal_buy_results') or {}), **terminal_results}
+                                        results['live_buy_ids'] = sorted(set(results.get('live_buy_ids', ())) - terminal_results.keys())
+                                        results['as_of'] = ended.isoformat()
+                                        d['execution_order_facts'] = results
+                            self._update(settle, connection=connection)
+                            return {**fill_updates, **patch}
+                        # Pin each actual write and its resulting generation in
+                        # one native transaction; a competing change is not ours.
+                        with self.store._transaction() as connection:
+                            before = connection.execute('SELECT generation FROM lp_trade_generation WHERE singleton=1').fetchone()
+                            if before is None or int(before[0]) != generation:
+                                return
+                            self.store.lp_update_session(sid, patch_builder=build_patch, connection=connection)
+                            generation = int(connection.execute(
+                                'SELECT generation FROM lp_trade_generation WHERE singleton=1').fetchone()[0])
+                    return generation
+            finally:
+                self.execution._release_global_lock(lock)
+        except (ValueError, TypeError, KeyError, RuntimeError, OSError):
+            # Missing/conflicting results preserve the original owner and hold.
+            return
+
+    def _recover_entry_requests(self):
+        """Use request/session/audit ownership, independently of any round record."""
+        document = self._read()
+        account_id = document['account_id']
+        requests = []
+        for intent in document['intents'].values():
+            session = self.store.lp_session(intent['session_id'])
+            if not session or session.get('submit_status') == 'accepted' or self.lp.entry_send_inflight(intent['session_id']):
+                continue
+            entries = [a for a in self.store.lp_actions(intent['session_id'])
+                if a['action_key'] == self.lp._action_key(intent['session_id'], 'entry-submit')]
+            if len(entries) != 1:
+                continue
+            audit = entries[0]
+            if (audit.get('state') != 'accepted' or audit.get('post_started') is not True
+                    or audit.get('side') != 'BUY' or not audit.get('order_id')
+                    or session.get('order_identity_conflict')
+                    or session.get('idempotency_key') != 'lp-auto:' + intent['intent_id']
+                    or hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest() != account_id):
+                continue
+            target = {key: intent[key] for key in ('market_id', 'condition_id', 'token_id', 'outcome', 'price', 'quantity')}
+            if (any(str(session.get(k)) != str(target[k]) or str(audit.get(k)) != str(target[k])
+                    for k in ('market_id', 'condition_id', 'token_id', 'outcome'))
+                    or any(_maybe_decimal(session.get(k)) != _decimal(target[k])
+                        or _maybe_decimal(audit.get(k)) != _decimal(target[k]) for k in ('price', 'quantity'))):
+                continue
+            requests.append((intent, target, session, audit))
+        if not requests:
+            return
+        reader = getattr(self.lp.exchange, 'lp_order_result_snapshot', None)
+        if not callable(reader):
+            return
+        generation = self.store.lp_trade_generation()
+        snapshot = self.lp._market_read({'condition_id': 'lp-order-results:' + account_id},
+            lambda: reader(dict(owned_order_ids=sorted({a['order_id'] for _, _, _, a in requests}),
+                condition_ids=sorted({t['condition_id'] for _, t, _, _ in requests}))))
+        if (not isinstance(snapshot, Mapping) or snapshot.get('authenticated') is not True
+                or any(snapshot.get(k) is not True for k in ('open_orders_complete', 'pagination_complete'))
+                or any(not isinstance(snapshot.get(k), (list, tuple)) for k in ('orders', 'open_orders'))):
+            return
+        started, ended = (_timestamp(snapshot.get(k)) for k in ('read_started_at', 'read_ended_at'))
+        _freshness(ended, self._now(), 'order_result', max_age=60)
+        if started > ended or generation != self.store.lp_trade_generation():
+            return
+        if hashlib.sha256(str(snapshot.get('wallet_address') or '').strip().casefold().encode()).hexdigest() != account_id:
+            return
+        rows = {self.lp._order_id(r): r for r in [*snapshot['orders'], *snapshot['open_orders']]}
+        def controls():
+            if (account_id != self.execution._lp_account_id() or not self.execution.lp_mutation_allowed()
+                    or self.store.active_execution() is not None):
+                raise ValueError('receipt_recovery_control_changed')
+        for intent, target, session, audit in requests:
+            row = rows.get(audit['order_id'])
+            if row is not None and (row.get('side') != 'BUY' or row.get('token_id') != target['token_id']
+                    or str(row.get('condition_id', row.get('market'))) != str(target['condition_id'])
+                    or _maybe_decimal(row.get('price')) != _decimal(target['price'])
+                    or _maybe_decimal(row.get('original_size')) != _decimal(target['quantity'])):
+                continue
+            generation_after = []
+            self._recover_accepted_entry_receipt(intent, target, session, audit, rows=rows,
+                generation=generation, snapshot=snapshot, account_id=account_id, validate_controls=controls,
+                generation_after=generation_after)
+            generation = generation_after[0] if generation_after else self.store.lp_trade_generation()
 
     def _read_plan_order_results(self, plan):
         reader = getattr(self.lp.exchange, 'lp_order_result_snapshot', None)
@@ -3880,6 +4711,21 @@ class LPAutoPool:
         self._retry_planned_cancels(plan, snapshot, rows, generation)
         return snapshot
 
+    def _order_result_fill_patch(self, session, snapshot):
+        """Compute owned ledger facts without a plan or financial publication."""
+        if (snapshot.get('positions_complete') is not True or snapshot.get('trades_complete') is not True
+                or not isinstance(snapshot.get('positions'), (list, tuple))
+                or not isinstance(snapshot.get('trades'), (list, tuple))):
+            raise ValueError('order_result_fill_incomplete')
+        facts = {**snapshot, 'account': dict(positions=snapshot['positions'],
+            positions_complete=True, open_orders=snapshot['open_orders'], open_orders_complete=True)}
+        history = self.lp._order_history_patch(session, facts)
+        patch = self.lp._fill_patch({**session, **history}, facts)
+        # Execution facts do not replace the full account publication's time.
+        patch.pop('account_checked_at', None)
+        patch.update(history, order_result_checked_at=snapshot['read_ended_at'])
+        return patch
+
     def _apply_plan_order_fills(self, plan, snapshot, rows, generation):
         affected = {r['session_id'] for r in plan['victims'] + plan['targets']
             if r.get('session_id') and r.get('order_id') in rows
@@ -3890,10 +4736,6 @@ class LPAutoPool:
                 or not isinstance(snapshot.get('positions'), (list, tuple))
                 or not isinstance(snapshot.get('trades'), (list, tuple))):
             raise ValueError('order_result_fill_incomplete')
-        # This account-shaped input contains only actual position/order facts;
-        # it never enters the full financial publisher or BUY funds validator.
-        facts = {**snapshot, 'account': dict(positions=snapshot['positions'],
-            positions_complete=True, open_orders=snapshot['open_orders'], open_orders_complete=True)}
         lock = self.execution._acquire_global_lock()
         if lock is None:
             raise ValueError('execution_lock')
@@ -3906,15 +4748,362 @@ class LPAutoPool:
                     session = self.store.lp_session(sid)
                     if not session or session.get('order_identity_conflict'):
                         raise ValueError('owned_order_identity_mismatch')
-                    history = self.lp._order_history_patch(session, facts)
-                    patch = self.lp._fill_patch({**session, **history}, facts)
-                    # A result read is not a new full-account read timestamp.
-                    patch.pop('account_checked_at', None)
-                    patch.update(history, order_result_checked_at=snapshot['read_ended_at'])
+                    patch = self._order_result_fill_patch(session, snapshot)
                     self.store.lp_update_session(sid, patch=patch)
                 return self.store.lp_trade_generation()
         finally:
             self.execution._release_global_lock(lock)
+
+    def _recover_accepted_entry_receipt(self, intent, target, session, audit, *,
+                                        rows, generation, snapshot, account_id, validate_controls, generation_after=None):
+        """Repair one immutable accepted request; this grants no send authority."""
+        request_id, oid = intent['intent_id'], audit['order_id']
+        action = dict(state='unknown')
+        action.update(session_id=session['session_id'], order_id=oid)
+        def bound_terminal_zero(current):
+            row = (rows or {}).get(oid)
+            # An unavailable lookup is not terminal evidence. Only
+            # the already reconciled exact owned receipt supplies it;
+            # current authenticated facts must still corroborate zero.
+            if (rows is None or not snapshot
+                    or current.get('state') != 'complete' or current.get('submit_status') not in (None, 'unknown')
+                    or current.get('entry_order_id') != oid
+                    or current.get('orders_terminal') is not True
+                    or current.get('position_reconciled') is not True
+                    or current.get('fee_status') != 'known'
+                    or current.get('order_identity_conflict') or current.get('facts_error')
+                    or current.get('financial_block_reason') or current.get('reconciliation')
+                    or has_independent_unresolved_action(current, self.store.lp_actions(current['session_id']))
+                    or any(snapshot.get(k) is not True for k in ('authenticated', 'open_orders_complete',
+                        'pagination_complete', 'trades_complete', 'positions_complete'))
+                    or any(not isinstance(snapshot.get(k), (list, tuple))
+                        for k in ('orders', 'open_orders', 'trades', 'positions'))
+                    or hashlib.sha256(str(snapshot.get('wallet_address') or '').strip().casefold().encode()).hexdigest()
+                        != account_id
+                    or any(self.lp._order_id(r) == oid for r in snapshot['open_orders'])):
+                return False
+            present = [r for r in snapshot['orders'] if self.lp._order_id(r) == oid]
+            if current.get('submit_status') is None:
+                # Preserve the existing missing-row None recovery seam.
+                if row is not None or present:
+                    return False
+            elif row is not None or present:
+                # Current rows outrank history. Every occurrence must
+                # corroborate the same exact known-zero terminal order.
+                if row is None or any(not isinstance(r, Mapping)
+                        or str(r.get('status')).upper() not in TERMINAL_ORDER_STATES
+                        or r.get('fill_quantity_known') is not True
+                        or _maybe_decimal(r.get('size_matched')) != ZERO
+                        or r.get('side') != 'BUY' or r.get('token_id') != target['token_id']
+                        or str(r.get('condition_id', r.get('market'))) != str(target['condition_id'])
+                        or _maybe_decimal(r.get('price')) != _decimal(target['price'])
+                        or _maybe_decimal(r.get('original_size')) != _decimal(target['quantity'])
+                        for r in [row, *present]):
+                    return False
+            history = self.lp._order_history(current)
+            receipt = history.get(oid, {})
+            if (oid not in self.lp._session_order_ids(current)
+                    or receipt.get('order_id') != oid or receipt.get('side') != 'BUY'
+                    or receipt.get('token_id') != target['token_id']
+                    or str(receipt.get('status')).upper() not in TERMINAL_ORDER_STATES
+                    or receipt.get('fill_quantity_known') is False
+                    or _maybe_decimal(receipt.get('size_matched')) != ZERO
+                    or _maybe_decimal(receipt.get('price')) != _decimal(target['price'])
+                    or _maybe_decimal(receipt.get('original_size')) != _decimal(target['quantity'])):
+                return False
+            received, finished = (_maybe_datetime(audit.get(k))
+                for k in ('submit_receipt_at', 'submit_finished_at'))
+            started, ended = (_maybe_datetime(snapshot.get(k)) for k in ('read_started_at', 'read_ended_at'))
+            checked = [_maybe_datetime(current.get(k)) for k in ('account_checked_at', 'facts_checked_at')]
+            if (received is None or finished is None or started is None or ended is None
+                    or not received <= finished <= started <= ended <= self._now()
+                    or any(at is None or not finished < at <= started for at in checked)):
+                return False
+            zero_fields = ('buy_filled_quantity', 'sold_quantity', 'residual_quantity',
+                'buy_cost', 'sold_revenue', 'buy_fees', 'sell_fees', 'fees')
+            if any(_maybe_decimal(current.get(k)) != ZERO for k in zero_fields):
+                return False
+            try:
+                owned = self.lp._session_order_ids(current)
+                if any(r['order_id'] in owned for r in self.lp._owned_sync_order_rows(
+                        snapshot['trades'], snapshot['wallet_address'])):
+                    return False
+                facts = {**snapshot, 'account': dict(positions=snapshot['positions'],
+                    positions_complete=True, open_orders=snapshot['open_orders'], open_orders_complete=True)}
+                # Sending metadata alone blocks the existing pure
+                # completion check. Observe the proved original receipt
+                # locally; none of this computed finance is published.
+                observed = {**current, 'submit_status': 'accepted', 'submit_stage': 'receipt_received'}
+                observed.update(self.lp._fill_patch(observed, facts))
+                return (all(_maybe_decimal(observed.get(k)) == ZERO for k in zero_fields)
+                    and not observed.get('financial_block_reason')
+                    and self.lp._completion_patch(observed) is not None)
+            except (ValueError, TypeError, KeyError):
+                return False
+
+        def same_send_unknown_receipt(current):
+            # Public late-receipt reconciliation may bind this accepted
+            # order while leaving only its session metadata unknown.
+            # That is authority only for the same ended send with a
+            # current LIVE result or independently proved complete zero.
+            row = (rows or {}).get(oid)
+            if (not snapshot or rows is None
+                    or current.get('entry_order_id') != oid or current.get('submit_status') != 'unknown'
+                    or current.get('submit_stage') != 'sending' or current.get('post_started') is not True
+                    or audit.get('submit_stage') != 'receipt_received'
+                    or self.lp.entry_send_inflight(current['session_id'])
+                    or has_independent_unresolved_action(current, self.store.lp_actions(current['session_id']))):
+                return False
+            keys = ('submit_requested_at', 'submit_post_started_at', 'submit_receipt_at', 'submit_finished_at')
+            original = [_maybe_datetime(audit.get(k)) for k in keys]
+            primary = [_maybe_datetime(current.get(k)) for k in keys[:2]]
+            started, ended = [_maybe_datetime(snapshot.get(k)) for k in ('read_started_at', 'read_ended_at')]
+            if (any(at is None for at in [*original, *primary, started, ended])
+                    or primary != original[:2]
+                    or not original[0] <= original[1] <= original[2] <= original[3] <= started <= ended <= self._now()
+                    or any(current.get(k) not in (None, '') and _maybe_datetime(current.get(k)) != at
+                        for k, at in zip(keys[2:], original[2:]))):
+                return False
+            return (row is not None and str(row.get('status')).upper() == 'LIVE'
+                or bound_terminal_zero(current))
+
+        unknown_receipt_pending = same_send_unknown_receipt(session)
+        bound_receipt_pending = (session.get('entry_order_id') == oid
+            and (session.get('submit_status') is None or unknown_receipt_pending))
+        row = (rows or {}).get(oid)
+        matched = _maybe_decimal((row or {}).get('size_matched'))
+        terminal_packet = bool(row is not None and snapshot and str(row.get('status')).upper() in TERMINAL_ORDER_STATES
+            and row.get('fill_quantity_known') is True and matched is not None
+            and ZERO <= matched <= _decimal(target['quantity'])
+            and all(snapshot.get(k) is True for k in ('authenticated', 'open_orders_complete',
+                'pagination_complete', 'positions_complete', 'trades_complete'))
+            and all(isinstance(snapshot.get(k), (list, tuple)) for k in ('orders', 'open_orders', 'positions', 'trades')))
+        if terminal_packet and not session.get('entry_order_id'):
+            occurrences = [r for r in [*snapshot['orders'], *snapshot['open_orders']]
+                if isinstance(r, Mapping) and self.lp._order_id(r) == oid]
+            started, ended = (_timestamp(snapshot[k]) for k in ('read_started_at', 'read_ended_at'))
+            wallet = str(snapshot.get('wallet_address') or '').strip().casefold()
+            finished = _maybe_datetime(audit.get('submit_finished_at'))
+            if (not occurrences or hashlib.sha256(wallet.encode()).hexdigest() != account_id
+                    or finished is None or not finished <= started <= ended <= self._now()
+                    or any(self.lp._order_id(r) == oid for r in snapshot['open_orders'])
+                    or oid in (snapshot.get('order_read_errors') or {})
+                    or any(not isinstance(r, Mapping) or not self.lp._order_id(r)
+                        for r in [*snapshot['orders'], *snapshot['open_orders']])
+                    or any(r.get('side') != 'BUY' or r.get('token_id') != target['token_id']
+                        or str(r.get('condition_id', r.get('market'))) != str(target['condition_id'])
+                        or _maybe_decimal(r.get('price')) != _decimal(target['price'])
+                        or _maybe_decimal(r.get('original_size')) != _decimal(target['quantity'])
+                        or str(r.get('status')).upper() != str(row['status']).upper()
+                        or r.get('fill_quantity_known') is not True or _maybe_decimal(r.get('size_matched')) != matched
+                        for r in occurrences)):
+                return action
+            owned = next((r for r in self.lp._owned_sync_order_rows(snapshot['trades'], wallet)
+                if r['order_id'] == oid), {})
+            if ((matched == ZERO and owned) or matched > ZERO and (
+                    owned.get('side') != 'BUY' or owned.get('token_id') != target['token_id']
+                    or owned.get('condition_id') != target['condition_id']
+                    or _maybe_decimal(owned.get('size_matched')) != matched
+                    or _maybe_decimal(owned.get('price')) != _decimal(target['price']))):
+                return action
+            lock = self.execution._acquire_global_lock()
+            if lock is None:
+                raise ValueError('execution_lock')
+            try:
+                with self.lp._mutex, self.store._transaction() as connection:
+                    validate_controls()
+                    before = connection.execute('SELECT generation FROM lp_trade_generation WHERE singleton=1').fetchone()
+                    if before is None or int(before[0]) != generation:
+                        raise ValueError('order_result_changed')
+                    pool_row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+                    document = json.loads(pool_row[0]) if pool_row else {}
+                    current_intent = document.get('intents', {}).get(request_id, {})
+                    native_row = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?', (session['session_id'],)).fetchone()
+                    current = self.store._lp_row_result(native_row) if native_row else {}
+                    entries = [a for a in self.store.lp_actions(session['session_id'], connection=connection)
+                        if a.get('action_key') == audit['action_key']]
+                    if (document.get('account_id') != account_id or not current
+                            or current_intent.get('session_id') != session['session_id']
+                            or current_intent.get('order_id') not in (None, '', oid)
+                            or current.get('idempotency_key') != f'lp-auto:{request_id}'
+                            or current.get('entry_order_id') not in (None, '')
+                            or current.get('order_identity_conflict') or self.lp.entry_send_inflight(current['session_id'])
+                            or hashlib.sha256(str(current.get('account_id') or '').strip().casefold().encode()).hexdigest() != account_id
+                            or len(entries) != 1 or entries[0] != audit or audit.get('state') != 'accepted'
+                            or audit.get('post_started') is not True or audit.get('side') != 'BUY' or audit.get('order_id') != oid
+                            or has_independent_unresolved_action(current, self.store.lp_actions(current['session_id'], connection=connection))
+                            or any(str(current.get(k)) != str(target[k]) or str(audit.get(k)) != str(target[k])
+                                or str(current_intent.get(k)) != str(target[k]) for k in ('market_id', 'condition_id', 'token_id', 'outcome'))
+                            or any(_maybe_decimal(current.get(k)) != _decimal(target[k])
+                                or _maybe_decimal(audit.get(k)) != _decimal(target[k])
+                                or _maybe_decimal(current_intent.get(k)) != _decimal(target[k]) for k in ('price', 'quantity'))
+                            or any(current.get(k) != session.get(k) for k in
+                                ('submit_status', 'submit_stage', 'post_started', 'stop_requested', 'entry_cancel_requested',
+                                 'stop_loss_latched', 'passive_cancel_requested', 'queue_protection_cancel_requested'))):
+                        raise ValueError('owned_order_identity_mismatch')
+                    results = document.get('execution_order_facts') or dict(account_id=account_id)
+                    financial = document.get('account_financial_facts') or {}
+                    if (results.get('account_id') != account_id
+                            or results.get('as_of') and _timestamp(results['as_of']) > ended
+                            or financial.get('checked_at') and _timestamp(financial['checked_at']) > ended
+                            or current.get('order_result_checked_at') and _timestamp(current['order_result_checked_at']) > ended):
+                        return action
+                    # Use the existing canonical registration seam under this
+                    # writer, so only our own changes advance its generation.
+                    record = dict(order_id=oid, token_id=target['token_id'], side='BUY', status=row['status'],
+                        price=target['price'], original_size=target['quantity'], size_matched=matched,
+                        expiration=audit.get('expiration'), order_type=row.get('order_type') or (
+                            'GTD' if audit.get('expiration') is not None else None))
+                    current = self.store.lp_register_exchange_orders(wallet, target['token_id'], [record],
+                        session=current, connection=connection, expected_generation=generation)['session']
+                    if current['session_id'] != intent['session_id'] or current.get('entry_order_id') != oid:
+                        raise ValueError('owned_order_identity_mismatch')
+                    history = self.lp._order_history(current).get(oid, {})
+                    if (oid not in self.lp._session_order_ids(current)
+                            or str(history.get('status')).upper() not in TERMINAL_ORDER_STATES
+                            or _maybe_decimal(history.get('size_matched')) != matched):
+                        raise ValueError('order_result_changed')
+                    proof = dict(session_id=current['session_id'], side='BUY', token_id=target['token_id'],
+                        condition_id=target['condition_id'], price=str(target['price']),
+                        original_size=str(target['quantity']), size_matched=str(matched), read_ended_at=ended.isoformat())
+                    if matched > ZERO:
+                        current = self.store.lp_update_session(current['session_id'],
+                            patch=self._order_result_fill_patch(current, snapshot), connection=connection)
+                        fill = (current.get('verified_order_fills') or {}).get(oid, {})
+                        if (fill.get('quantity_known') is not True or fill.get('side') != 'BUY'
+                                or _maybe_decimal(fill.get('quantity')) != matched
+                                or _maybe_decimal(fill.get('value')) != matched * _decimal(target['price'])
+                                or _maybe_decimal(fill.get('price')) != _decimal(target['price'])
+                                or _maybe_decimal(fill.get('fee')) is None
+                                or current.get('position_reconciled') is not True
+                                or _maybe_decimal(current.get('buy_filled_quantity')) != matched
+                                or _maybe_decimal(current.get('residual_quantity')) != matched
+                                or _maybe_decimal(current.get('sold_quantity')) != ZERO
+                                or _maybe_decimal(current.get('buy_cost')) != _maybe_decimal(fill.get('value'))
+                                or _maybe_decimal(current.get('buy_fees')) != _maybe_decimal(fill.get('fee'))
+                                or self.lp._position_quantity({'positions': snapshot['positions']}, target['token_id']) != matched):
+                            raise ValueError('order_result_fill_incomplete')
+                        proof['inventory_cost_usd'] = str(_decimal(current['buy_cost']) + _decimal(current['buy_fees']))
+                    elif any((_maybe_decimal(current.get(k)) or ZERO) != ZERO
+                            for k in ('buy_filled_quantity', 'buy_cost', 'residual_quantity', 'sold_quantity')):
+                        raise ValueError('order_result_fill_incomplete')
+                    state = 'review' if current.get('stop_requested') or current.get('entry_cancel_requested') else 'entry_open'
+                    session = self.store.lp_update_session(current['session_id'], state=state,
+                        patch=dict(submit_status='accepted', submit_stage='receipt_received',
+                            submit_receipt_at=audit.get('submit_receipt_at'), submit_finished_at=audit.get('submit_finished_at')),
+                        connection=connection)
+                    self._record_session(request_id, session, connection=connection)
+                    def publish(d):
+                        results['terminal_buy_results'] = {**(results.get('terminal_buy_results') or {}), oid: proof}
+                        results['live_buy_ids'] = sorted(set(results.get('live_buy_ids', ())) - {oid})
+                        for name in ('partial_buy_results', 'live_buy_results'):
+                            if oid in (results.get(name) or {}):
+                                results[name] = {key: value for key, value in results[name].items() if key != oid}
+                        results['as_of'] = ended.isoformat()
+                        d['execution_order_facts'] = results
+                    self._update(publish, connection=connection)
+                    committed_generation = int(connection.execute(
+                        'SELECT generation FROM lp_trade_generation WHERE singleton=1').fetchone()[0])
+                # Metadata and its proof have committed together. A competing
+                # later change cannot be adopted as this request's generation.
+                if generation_after is not None:
+                    generation_after.append(committed_generation)
+                self.lp._schedule_session_attention(str(session['session_id']))
+                action.update(state='success', reason=None, confirmed_at=audit.get('submit_receipt_at'))
+                return action
+            finally:
+                self.execution._release_global_lock(lock)
+        if not session.get('entry_order_id') or bound_receipt_pending:
+            action.update(state='unknown', reason='receipt_apply_pending')
+            row = (rows or {}).get(oid)
+            matched = _maybe_decimal((row or {}).get('size_matched'))
+
+            durable_terminal = row is None and bound_terminal_zero(session)
+            if not durable_terminal and (row is None or not (str(row.get('status')).upper() == 'LIVE'
+                    or str(row.get('status')).upper() in TERMINAL_ORDER_STATES
+                    and row.get('fill_quantity_known') is not False
+                    and matched is not None and matched >= ZERO)):
+                return action
+            fill_facts = None
+            if matched and str(row.get('status')).upper() in TERMINAL_ORDER_STATES:
+                if (not snapshot or snapshot.get('positions_complete') is not True
+                        or snapshot.get('trades_complete') is not True
+                        or not isinstance(snapshot.get('positions'), (list, tuple))
+                        or not isinstance(snapshot.get('trades'), (list, tuple))):
+                    return action
+                owned = next((r for r in self.lp._owned_sync_order_rows(snapshot['trades'], snapshot['wallet_address'])
+                    if r['order_id'] == oid), {})
+                if (owned.get('token_id') != target['token_id'] or owned.get('condition_id') != target['condition_id']
+                        or owned.get('side') != 'BUY' or _maybe_decimal(owned.get('size_matched')) != matched
+                        or _maybe_decimal(owned.get('price')) != _decimal(target['price'])):
+                    return action
+                fill_facts = {**snapshot, 'account': dict(positions=snapshot['positions'],
+                    positions_complete=True, open_orders=snapshot['open_orders'], open_orders_complete=True)}
+            lock = self.execution._acquire_global_lock()
+            if lock is None:
+                raise ValueError('execution_lock')
+            try:
+                with self.lp._mutex:
+                    validate_controls()
+                    if generation != self.store.lp_trade_generation():
+                        raise ValueError('order_result_changed')
+                    current = self.store.lp_session(session['session_id'])
+                    if not current or current.get('entry_order_id') not in (None, '', oid):
+                        raise ValueError('owned_order_identity_mismatch')
+                    if bound_receipt_pending:
+                        current_entries = [a for a in self.store.lp_actions(current['session_id'])
+                            if a.get('action_key') == audit['action_key']]
+                        if (current.get('entry_order_id') != oid
+                                or current.get('idempotency_key') != f'lp-auto:{request_id}'
+                                or current.get('order_identity_conflict')
+                                or hashlib.sha256(str(current.get('account_id') or '').strip().casefold().encode()).hexdigest() != account_id
+                                or len(current_entries) != 1 or current_entries[0] != audit
+                                or audit.get('submit_stage') != 'receipt_received'
+                                or not audit.get('submit_receipt_at') or not audit.get('submit_finished_at')
+                                or any(str(current.get(k)) != str(target[k])
+                                    or str(audit.get(k)) != str(target[k])
+                                    for k in ('market_id', 'condition_id', 'token_id', 'outcome'))
+                                or any(_maybe_decimal(current.get(k)) != _decimal(target[k])
+                                    or _maybe_decimal(audit.get(k)) != _decimal(target[k])
+                                    for k in ('price', 'quantity'))):
+                            raise ValueError('owned_order_identity_mismatch')
+                        if (unknown_receipt_pending and not same_send_unknown_receipt(current)
+                                or current.get('submit_status') not in (None, 'accepted')
+                                and not same_send_unknown_receipt(current)):
+                            action.update(state='unknown', reason='submission_unknown')
+                            return action
+                        if durable_terminal and not bound_terminal_zero(current):
+                            return action
+                        # Account registration already owns this exact ID.
+                        # Repair its original receipt, without replaying
+                        # registration or replacing later management state.
+                        session = current
+                    else:
+                        session, _ = self.lp._register_direct_receipt(current, order_id=oid, response=row,
+                            side='BUY', price=target['price'], quantity=target['quantity'], expiration=audit.get('expiration'))
+                    if session['session_id'] != intent['session_id']:
+                        raise ValueError('owned_order_identity_mismatch')
+                    if fill_facts is not None and not bound_receipt_pending:
+                        history = self.lp._order_history_patch(session, fill_facts)
+                        patch = self.lp._fill_patch({**session, **history}, fill_facts)
+                        patch.pop('account_checked_at', None)
+                        patch.update(history, order_result_checked_at=snapshot['read_ended_at'])
+                        session = self.store.lp_update_session(session['session_id'], patch=patch)
+                    state = session['state'] if bound_receipt_pending else (
+                        'review' if session.get('stop_requested') or session.get('entry_cancel_requested') else 'entry_open')
+                    if bound_receipt_pending and state == 'entry_submit_pending':
+                        state = ('review' if session.get('stop_requested') or session.get('entry_cancel_requested')
+                            or session.get('stop_loss_latched') or str(row.get('status')).upper() != 'LIVE'
+                            else 'entry_open')
+                    session = self.store.lp_update_session(session['session_id'], state=state,
+                        patch=dict(submit_status='accepted', submit_stage='receipt_received',
+                            submit_receipt_at=audit.get('submit_receipt_at'), submit_finished_at=audit.get('submit_finished_at')))
+            finally:
+                self.execution._release_global_lock(lock)
+        if session.get('entry_order_id') == oid and session.get('submit_status') == 'accepted':
+            self._record_session(request_id, session)
+            action.update(state='success', reason=None, confirmed_at=audit.get('submit_receipt_at'))
+        return action
 
     def _restore_plan_buy_progress(self, plan, *, rows=None, generation=None, snapshot=None):
         """Recover only outcomes owned by this original persisted request."""
@@ -3931,7 +5120,7 @@ class LPAutoPool:
             if (not session or session.get('idempotency_key') != f'lp-auto:{request_id}'
                     or any(str(session.get(k)) != str(target[k]) for k in ('condition_id', 'token_id'))
                     or any(_maybe_decimal(session.get(k)) != _decimal(target[k]) for k in ('price', 'quantity'))
-                    or hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest() != plan['account_id']
+                    or hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest() != plan.get('account_id')
                     or session.get('order_identity_conflict')):
                 action.update(state='unknown', reason='plan_request_identity_unknown')
                 continue
@@ -4003,210 +5192,13 @@ class LPAutoPool:
                 continue
             if (audit.get('state') == 'accepted' and audit.get('post_started') is True and oid
                     and audit.get('side') == 'BUY' and audit.get('token_id') == target['token_id']):
-                action.update(session_id=session['session_id'], order_id=oid)
-                def bound_terminal_zero(current):
-                    row = (rows or {}).get(oid)
-                    # An unavailable lookup is not terminal evidence. Only
-                    # the already reconciled exact owned receipt supplies it;
-                    # current authenticated facts must still corroborate zero.
-                    if (rows is None or not snapshot
-                            or current.get('state') != 'complete' or current.get('submit_status') not in (None, 'unknown')
-                            or current.get('entry_order_id') != oid
-                            or current.get('orders_terminal') is not True
-                            or current.get('position_reconciled') is not True
-                            or current.get('fee_status') != 'known'
-                            or current.get('order_identity_conflict') or current.get('facts_error')
-                            or current.get('financial_block_reason') or current.get('reconciliation')
-                            or has_independent_unresolved_action(current, self.store.lp_actions(current['session_id']))
-                            or any(snapshot.get(k) is not True for k in ('authenticated', 'open_orders_complete',
-                                'pagination_complete', 'trades_complete', 'positions_complete'))
-                            or any(not isinstance(snapshot.get(k), (list, tuple))
-                                for k in ('orders', 'open_orders', 'trades', 'positions'))
-                            or hashlib.sha256(str(snapshot.get('wallet_address') or '').strip().casefold().encode()).hexdigest()
-                                != plan['account_id']
-                            or any(self.lp._order_id(r) == oid for r in snapshot['open_orders'])):
-                        return False
-                    present = [r for r in snapshot['orders'] if self.lp._order_id(r) == oid]
-                    if current.get('submit_status') is None:
-                        # Preserve the existing missing-row None recovery seam.
-                        if row is not None or present:
-                            return False
-                    elif row is not None or present:
-                        # Current rows outrank history. Every occurrence must
-                        # corroborate the same exact known-zero terminal order.
-                        if row is None or any(not isinstance(r, Mapping)
-                                or str(r.get('status')).upper() not in TERMINAL_ORDER_STATES
-                                or r.get('fill_quantity_known') is not True
-                                or _maybe_decimal(r.get('size_matched')) != ZERO
-                                or r.get('side') != 'BUY' or r.get('token_id') != target['token_id']
-                                or str(r.get('condition_id', r.get('market'))) != str(target['condition_id'])
-                                or _maybe_decimal(r.get('price')) != _decimal(target['price'])
-                                or _maybe_decimal(r.get('original_size')) != _decimal(target['quantity'])
-                                for r in [row, *present]):
-                            return False
-                    history = self.lp._order_history(current)
-                    receipt = history.get(oid, {})
-                    if (oid not in self.lp._session_order_ids(current)
-                            or receipt.get('order_id') != oid or receipt.get('side') != 'BUY'
-                            or receipt.get('token_id') != target['token_id']
-                            or str(receipt.get('status')).upper() not in TERMINAL_ORDER_STATES
-                            or receipt.get('fill_quantity_known') is False
-                            or _maybe_decimal(receipt.get('size_matched')) != ZERO
-                            or _maybe_decimal(receipt.get('price')) != _decimal(target['price'])
-                            or _maybe_decimal(receipt.get('original_size')) != _decimal(target['quantity'])):
-                        return False
-                    received, finished = (_maybe_datetime(audit.get(k))
-                        for k in ('submit_receipt_at', 'submit_finished_at'))
-                    started, ended = (_maybe_datetime(snapshot.get(k)) for k in ('read_started_at', 'read_ended_at'))
-                    checked = [_maybe_datetime(current.get(k)) for k in ('account_checked_at', 'facts_checked_at')]
-                    if (received is None or finished is None or started is None or ended is None
-                            or not received <= finished <= started <= ended <= self._now()
-                            or any(at is None or not finished < at <= started for at in checked)):
-                        return False
-                    zero_fields = ('buy_filled_quantity', 'sold_quantity', 'residual_quantity',
-                        'buy_cost', 'sold_revenue', 'buy_fees', 'sell_fees', 'fees')
-                    if any(_maybe_decimal(current.get(k)) != ZERO for k in zero_fields):
-                        return False
-                    try:
-                        owned = self.lp._session_order_ids(current)
-                        if any(r['order_id'] in owned for r in self.lp._owned_sync_order_rows(
-                                snapshot['trades'], snapshot['wallet_address'])):
-                            return False
-                        facts = {**snapshot, 'account': dict(positions=snapshot['positions'],
-                            positions_complete=True, open_orders=snapshot['open_orders'], open_orders_complete=True)}
-                        # Sending metadata alone blocks the existing pure
-                        # completion check. Observe the proved original receipt
-                        # locally; none of this computed finance is published.
-                        observed = {**current, 'submit_status': 'accepted', 'submit_stage': 'receipt_received'}
-                        observed.update(self.lp._fill_patch(observed, facts))
-                        return (all(_maybe_decimal(observed.get(k)) == ZERO for k in zero_fields)
-                            and not observed.get('financial_block_reason')
-                            and self.lp._completion_patch(observed) is not None)
-                    except (ValueError, TypeError, KeyError):
-                        return False
-
-                def same_send_unknown_receipt(current):
-                    # Public late-receipt reconciliation may bind this accepted
-                    # order while leaving only its session metadata unknown.
-                    # That is authority only for the same ended send with a
-                    # current LIVE result or independently proved complete zero.
-                    row = (rows or {}).get(oid)
-                    if (not snapshot or rows is None
-                            or current.get('entry_order_id') != oid or current.get('submit_status') != 'unknown'
-                            or current.get('submit_stage') != 'sending' or current.get('post_started') is not True
-                            or audit.get('submit_stage') != 'receipt_received'
-                            or self.lp.entry_send_inflight(current['session_id'])
-                            or has_independent_unresolved_action(current, self.store.lp_actions(current['session_id']))):
-                        return False
-                    keys = ('submit_requested_at', 'submit_post_started_at', 'submit_receipt_at', 'submit_finished_at')
-                    original = [_maybe_datetime(audit.get(k)) for k in keys]
-                    primary = [_maybe_datetime(current.get(k)) for k in keys[:2]]
-                    started, ended = [_maybe_datetime(snapshot.get(k)) for k in ('read_started_at', 'read_ended_at')]
-                    if (any(at is None for at in [*original, *primary, started, ended])
-                            or primary != original[:2]
-                            or not original[0] <= original[1] <= original[2] <= original[3] <= started <= ended <= self._now()
-                            or any(current.get(k) not in (None, '') and _maybe_datetime(current.get(k)) != at
-                                for k, at in zip(keys[2:], original[2:]))):
-                        return False
-                    return (row is not None and str(row.get('status')).upper() == 'LIVE'
-                        or bound_terminal_zero(current))
-
-                unknown_receipt_pending = same_send_unknown_receipt(session)
-                bound_receipt_pending = (session.get('entry_order_id') == oid
-                    and (session.get('submit_status') is None or unknown_receipt_pending))
-                if not session.get('entry_order_id') or bound_receipt_pending:
-                    action.update(state='unknown', reason='receipt_apply_pending')
-                    row = (rows or {}).get(oid)
-                    matched = _maybe_decimal((row or {}).get('size_matched'))
-
-                    durable_terminal = row is None and bound_terminal_zero(session)
-                    if not durable_terminal and (row is None or not (str(row.get('status')).upper() == 'LIVE'
-                            or str(row.get('status')).upper() in TERMINAL_ORDER_STATES
-                            and row.get('fill_quantity_known') is not False
-                            and matched is not None and matched >= ZERO)):
-                        continue
-                    fill_facts = None
-                    if matched and str(row.get('status')).upper() in TERMINAL_ORDER_STATES:
-                        if (not snapshot or snapshot.get('positions_complete') is not True
-                                or snapshot.get('trades_complete') is not True
-                                or not isinstance(snapshot.get('positions'), (list, tuple))
-                                or not isinstance(snapshot.get('trades'), (list, tuple))):
-                            continue
-                        owned = next((r for r in self.lp._owned_sync_order_rows(snapshot['trades'], snapshot['wallet_address'])
-                            if r['order_id'] == oid), {})
-                        if (owned.get('token_id') != target['token_id'] or owned.get('condition_id') != target['condition_id']
-                                or owned.get('side') != 'BUY' or _maybe_decimal(owned.get('size_matched')) != matched
-                                or _maybe_decimal(owned.get('price')) != _decimal(target['price'])):
-                            continue
-                        fill_facts = {**snapshot, 'account': dict(positions=snapshot['positions'],
-                            positions_complete=True, open_orders=snapshot['open_orders'], open_orders_complete=True)}
-                    lock = self.execution._acquire_global_lock()
-                    if lock is None:
-                        raise ValueError('execution_lock')
-                    try:
-                        with self.lp._mutex:
-                            self._plan_controls(self._read(), plan)
-                            if generation != self.store.lp_trade_generation():
-                                raise ValueError('order_result_changed')
-                            current = self.store.lp_session(session['session_id'])
-                            if not current or current.get('entry_order_id') not in (None, '', oid):
-                                raise ValueError('owned_order_identity_mismatch')
-                            if bound_receipt_pending:
-                                current_entries = [a for a in self.store.lp_actions(current['session_id'])
-                                    if a.get('action_key') == audit['action_key']]
-                                if (current.get('entry_order_id') != oid
-                                        or current.get('idempotency_key') != f'lp-auto:{request_id}'
-                                        or current.get('order_identity_conflict')
-                                        or hashlib.sha256(str(current.get('account_id') or '').strip().casefold().encode()).hexdigest() != plan['account_id']
-                                        or len(current_entries) != 1 or current_entries[0] != audit
-                                        or audit.get('submit_stage') != 'receipt_received'
-                                        or not audit.get('submit_receipt_at') or not audit.get('submit_finished_at')
-                                        or any(str(current.get(k)) != str(target[k])
-                                            or str(audit.get(k)) != str(target[k])
-                                            for k in ('market_id', 'condition_id', 'token_id', 'outcome'))
-                                        or any(_maybe_decimal(current.get(k)) != _decimal(target[k])
-                                            or _maybe_decimal(audit.get(k)) != _decimal(target[k])
-                                            for k in ('price', 'quantity'))):
-                                    raise ValueError('owned_order_identity_mismatch')
-                                if (unknown_receipt_pending and not same_send_unknown_receipt(current)
-                                        or current.get('submit_status') not in (None, 'accepted')
-                                        and not same_send_unknown_receipt(current)):
-                                    action.update(state='unknown', reason='submission_unknown')
-                                    continue
-                                if durable_terminal and not bound_terminal_zero(current):
-                                    continue
-                                # Account registration already owns this exact ID.
-                                # Repair its original receipt, without replaying
-                                # registration or replacing later management state.
-                                session = current
-                            else:
-                                session, _ = self.lp._register_direct_receipt(current, order_id=oid, response=row,
-                                    side='BUY', price=target['price'], quantity=target['quantity'], expiration=audit.get('expiration'))
-                            if session['session_id'] != intent['session_id']:
-                                raise ValueError('owned_order_identity_mismatch')
-                            if fill_facts is not None and not bound_receipt_pending:
-                                history = self.lp._order_history_patch(session, fill_facts)
-                                patch = self.lp._fill_patch({**session, **history}, fill_facts)
-                                patch.pop('account_checked_at', None)
-                                patch.update(history, order_result_checked_at=snapshot['read_ended_at'])
-                                session = self.store.lp_update_session(session['session_id'], patch=patch)
-                            state = session['state'] if bound_receipt_pending else (
-                                'review' if session.get('stop_requested') or session.get('entry_cancel_requested') else 'entry_open')
-                            if bound_receipt_pending and state == 'entry_submit_pending':
-                                state = ('review' if session.get('stop_requested') or session.get('entry_cancel_requested')
-                                    or session.get('stop_loss_latched') or str(row.get('status')).upper() != 'LIVE'
-                                    else 'entry_open')
-                            session = self.store.lp_update_session(session['session_id'], state=state,
-                                patch=dict(submit_status='accepted', submit_stage='receipt_received',
-                                    submit_receipt_at=audit.get('submit_receipt_at'), submit_finished_at=audit.get('submit_finished_at')))
-                    finally:
-                        self.execution._release_global_lock(lock)
-                if session.get('entry_order_id') == oid and session.get('submit_status') == 'accepted':
-                    self._record_session(request_id, session)
-                    action.update(state='success', reason=None, confirmed_at=audit.get('submit_receipt_at'))
-                    if rows is None and oid not in plan.setdefault('live_buy_ids', []):
-                        plan['live_buy_ids'].append(oid)
-                        plan['order_result_as_of'] = audit.get('submit_receipt_at')
+                outcome = self._recover_accepted_entry_receipt(intent, target, session, audit,
+                    rows=rows, generation=generation, snapshot=snapshot, account_id=plan['account_id'],
+                    validate_controls=lambda: self._plan_controls(self._read(), plan))
+                action.update(outcome)
+                if outcome['state'] == 'success' and rows is None and oid not in plan.setdefault('live_buy_ids', []):
+                    plan['live_buy_ids'].append(oid)
+                    plan['order_result_as_of'] = audit.get('submit_receipt_at')
             elif (session.get('state') == 'entry_rejected' and audit.get('state') == 'rejected'
                     and audit.get('side') == 'BUY' and audit.get('token_id') == target['token_id']
                     and session.get('reason') == audit.get('reason')):
@@ -4290,8 +5282,75 @@ class LPAutoPool:
             for row in retries:
                 self._send_rotation_cancel(row, [a for a in attempts if a[2]['order_id'] == row['order_id']])
 
+    def _completed_buy_receipt_binding(self, plan, action, future):
+        """Attribute an ended metadata write to its original accepted request."""
+        if (not future.done() or future.cancelled() or action.get('kind') != 'buy'
+                or action.get('state') != 'pending'):
+            return None
+        index = action.get('index')
+        if not isinstance(index, int) or not 0 <= index < len(plan.get('targets', ())):
+            return None
+        request = action.get('request_id', action['action_id'])
+        if request != f"{plan['round_id']}:{action.get('request_index', index)}":
+            return None
+        target = plan['targets'][index]
+        document = self._read()
+        intent = document['intents'].get(request, {})
+        sid = intent.get('session_id')
+        session = self.store.lp_session(sid) if sid else None
+        if (document.get('account_id') != plan.get('account_id')
+                or intent.get('intent_id') != request or not session
+                or session.get('session_id') != sid
+                or session.get('idempotency_key') != f'lp-auto:{request}'
+                or hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest()
+                    != plan.get('account_id')
+                or sum(i.get('session_id') == sid for i in document['intents'].values()) != 1
+                or action.get('session_id') not in (None, sid)
+                or action.get('token_id') != target.get('token_id')
+                or action.get('condition_id') != target.get('condition_id')
+                or session.get('order_identity_conflict')
+                or session.get('submit_status') is not None
+                or session.get('submit_stage') != 'sending' or session.get('post_started') is not True):
+            return None
+        receipts = [a for a in self.store.lp_actions(sid)
+            if a.get('role') == 'entry' and a.get('action_key') == self.lp._action_key(sid, 'entry-submit')]
+        if len(receipts) != 1:
+            return None
+        receipt = receipts[0]
+        oid = receipt.get('order_id')
+        if (receipt.get('session_id') != sid or receipt.get('side') != 'BUY'
+                or receipt.get('state') != 'accepted' or receipt.get('post_started') is not True
+                or receipt.get('submit_stage') != 'receipt_received' or not receipt.get('action_id')
+                or not oid or session.get('entry_order_id') != oid
+                or oid not in (session.get('owned_order_ids') or ())
+                or action.get('order_id') not in (None, oid)
+                or intent.get('order_id') not in (None, oid)):
+            return None
+        for field in ('market_id', 'condition_id', 'token_id', 'outcome'):
+            if not target.get(field) or any(str(row.get(field)) != str(target[field])
+                    for row in (intent, session, receipt)):
+                return None
+        for field in ('price', 'quantity'):
+            value = _maybe_decimal(target.get(field))
+            if value is None or value <= ZERO or any(_maybe_decimal(row.get(field)) != value
+                    for row in (intent, session, receipt)):
+                return None
+        try:
+            uuid.UUID(receipt['action_id'])
+            times = [_timestamp(receipt.get(field)) for field in
+                ('submit_requested_at', 'submit_post_started_at', 'submit_receipt_at', 'submit_finished_at')]
+            if (any(left > right for left, right in zip(times, times[1:]))
+                    or _timestamp(session.get('submit_requested_at')) != times[0]
+                    or _timestamp(session.get('submit_post_started_at')) != times[1]):
+                return None
+        except (TypeError, ValueError):
+            return None
+        return dict(request_id=request, session_id=sid, order_id=oid, request_state=session.get('state'))
+
     def _execute_plan(self, plan):
         """Advance approved fixed actions. Financial facts belong to the next plan."""
+        import sqlite3
+        native_authority = plan.get('version') == 2
         try:
             if plan.get('version') != 2:
                 document = self._read()
@@ -4312,6 +5371,92 @@ class LPAutoPool:
             self._restore_plan_buy_progress(plan)
         except ValueError as exc:
             reason = str(exc)
+            local_closure_authority = False
+            if native_authority and reason in ('manually_paused', 'mutation_blocked', 'account_identity_mismatch',
+                    'config_version_changed', 'active_execution'):
+                document = self._read()
+                current = document.get('active_plan') or {}
+                registered = document.get('rounds', {}).get(plan['round_id']) or {}
+                if (current.get('version') == 2 and current.get('round_id') == plan['round_id']
+                        and current.get('account_id') == document.get('account_id') == plan.get('account_id')
+                        and registered.get('started_at') == current.get('started_at') == plan.get('started_at')):
+                    local_closure_authority = True
+                    original_actions = {a['action_id']: a for a in current.get('actions', ())}
+                    sessions = {s['session_id']: s for s in self.store.lp_sessions()}
+                    session_keys = {s.get('idempotency_key') for s in sessions.values()}
+                    with self._attempt_jobs_lock:
+                        request_jobs = set(self._attempt_jobs)
+                    for action in plan['actions']:
+                        if action['state'] != 'pending':
+                            continue
+                        original = original_actions.get(action['action_id'], {})
+                        if action['kind'] == 'cancel':
+                            oid, sid = action.get('order_id'), action.get('session_id')
+                            request = action.get('request_id', action['action_id'])
+                            victims = [r for r in plan.get('victims', ()) if r.get('order_id') == oid]
+                            originals = [r for r in current.get('victims', ()) if r.get('order_id') == oid]
+                            session = sessions.get(sid, {})
+                            if (not oid or not sid or request != f"{plan['round_id']}:cancel:{oid}"
+                                    or original.get('state') != 'pending' or action.get('attempts')
+                                    or any(original.get(k) != action.get(k) for k in
+                                        ('kind', 'condition_id', 'session_id', 'order_id', 'request_id', 'attempts'))
+                                    or request in request_jobs or action['action_id'] in request_jobs
+                                    or current.get('cancel_registration') is not None
+                                    or plan.get('cancel_registration') is not None
+                                    or registered.get('cancel_registration') is not None
+                                    or len(victims) != 1 or len(originals) != 1 or not session):
+                                continue
+                            victim, original_victim = victims[0], originals[0]
+                            history = (session.get('order_history') or {}).get(oid, {})
+                            rotation = ((document.get('account_rotations') or {}).get(oid, {})
+                                if victim.get('account_order') else document['intents'].get(victim.get('intent_id'), {}))
+                            if (any(str(victim.get(k)) != str(original_victim.get(k)) for k in
+                                        ('condition_id', 'market_id', 'token_id', 'outcome', 'session_id', 'order_id', 'intent_id'))
+                                    or any(_maybe_decimal(victim.get(k)) != _maybe_decimal(original_victim.get(k))
+                                        for k in ('price', 'quantity'))
+                                    or victim.get('session_id') != sid or victim.get('condition_id') != action.get('condition_id')
+                                    or any(str(session.get(k)) != str(victim.get(k)) for k in
+                                        ('condition_id', 'market_id', 'token_id', 'outcome'))
+                                    or hashlib.sha256(str(session.get('account_id') or '').strip().casefold().encode()).hexdigest()
+                                        != plan['account_id']
+                                    or history.get('order_id') != oid or history.get('side') != 'BUY'
+                                    or history.get('token_id') != victim.get('token_id')
+                                    or _maybe_decimal(history.get('price')) != _maybe_decimal(victim.get('price'))
+                                    or rotation.get('rotation_round_id') == plan['round_id']
+                                    or plan['round_id'] in (session.get('yield_rotation_cancel_owners') or {}).values()
+                                    or any(a.get('rotation_round_id') == plan['round_id']
+                                        for a in self.store.lp_actions(sid))):
+                                continue
+                            # No original cancel Future, registration, typed
+                            # owner or native audit exists. End local authority
+                            # only; the order and its controls remain untouched.
+                            action.update(state='not_sent', reason=reason)
+                            continue
+                        if (action['kind'] != 'buy' or reason not in
+                                ('manually_paused', 'mutation_blocked', 'account_identity_mismatch')):
+                            continue
+                        request = action.get('request_id', action['action_id'])
+                        index = action['index']
+                        if (request != f"{plan['round_id']}:{index}" or action.get('session_id')
+                                or action.get('order_id') or action.get('attempts')
+                                or original.get('state') != 'pending'
+                                or any(original.get(k) != action.get(k) for k in
+                                    ('kind', 'index', 'token_id', 'request_id', 'session_id', 'order_id', 'attempts'))
+                                or request in request_jobs or request in document['intents']
+                                or 'lp-auto:' + request in session_keys
+                                or any(e.get('intent_id') == request for e in document.get('events', {}).values())
+                                or not 0 <= index < len(current.get('targets', ()))):
+                            continue
+                        target, original_target = plan['targets'][index], current['targets'][index]
+                        if (any(str(target.get(k)) != str(original_target.get(k)) for k in
+                                ('condition_id', 'market_id', 'token_id', 'outcome'))
+                                or any(_maybe_decimal(target.get(k)) != _maybe_decimal(original_target.get(k))
+                                    for k in ('price', 'quantity'))):
+                            continue
+                        # Native authority is still pending and no original
+                        # request entered its Future, intent, session/audit or
+                        # event lifecycle. Refusal ends only this local action.
+                        action.update(state='not_sent', reason=reason)
             if reason == 'config_version_changed':
                 document = self._read()
                 for action in plan['actions']:
@@ -4325,77 +5470,107 @@ class LPAutoPool:
                         action.update(state='rejected', reason=reason)
                 if all(a['state'] in ('success', 'rejected') for a in plan['actions']):
                     plan['completed_at'] = self._stamp()
+            if local_closure_authority and all(
+                    a['state'] in ('success', 'rejected', 'not_sent', 'unknown', 'canceling') for a in plan['actions']):
+                plan['completed_at'] = plan.get('completed_at') or self._stamp()
             self._save_plan(plan, reason=reason, blocked=plan.get('blocked', ()),
                 wait_kind='round' if plan.get('completed_at') else 'order')
             return self.state()
         cancels = [a for a in plan['actions'] if a['kind'] == 'cancel' and a['state'] not in ('success', 'rejected')]
-        unknown_buys = any(a['kind'] == 'buy' and a['state'] == 'unknown' for a in plan['actions'])
-        if cancels or unknown_buys:
+        cancel_jobs = {}
+        if cancels:
             try:
-                unused = self._unused_plan_cancel_attempts(plan)
-                if unused is None:
-                    document = self._read()
-                    for action in cancels:
-                        victim = next(r for r in plan['victims'] if r['order_id'] == action['order_id'])
-                        rotation = (document.get('account_rotations', {}).get(action['order_id'])
-                            if victim.get('account_order') else document['intents'].get(victim['intent_id'])) or {}
-                        if action['state'] == 'pending' and rotation.get('rotation_round_id') == plan['round_id']:
-                            action.update(state='canceling', reason='rotation_cancel_unknown')
                 snapshot = self._read_plan_order_results(plan)
-                pending = [a for a in cancels if a['state'] == 'pending']
-                if pending:
-                    pending_ids = {a['order_id'] for a in pending}
-                    victims = [r for r in plan['victims'] if r['order_id'] in pending_ids]
-                    results = self._rotate_out(victims, plan['targets'],
-                        plan.get('trading_config_version', plan['config_version']),
-                        diagnostics=plan.get('diagnostics'), plan=plan, result_snapshot=snapshot)
-                    for action, result in zip(pending, results):
-                        action.update(result)
-                    self._save_plan(plan, blocked=plan.get('blocked', ()))
             except ValueError as exc:
-                reason = str(exc)
-                self._save_plan(plan, reason=reason, blocked=plan.get('blocked', ()),
-                    wait_kind='order' if reason in _PLAN_TRANSIENT_WAITS else 'api')
-                return self.state()
-        for action in plan['actions']:
-            if action['kind'] != 'buy' or action['state'] in ('success', 'rejected'):
-                continue
-            if action['state'] == 'unknown':
-                continue
-            live_ids = set(plan.get('live_buy_ids', ()))
-            unresolved_requests = {a.get('request_id', a['action_id']) for a in plan['actions']
-                if a['kind'] == 'buy' and a['state'] == 'unknown' and a.get('order_id') not in live_ids}
-            if len(live_ids) + len(unresolved_requests) >= self._read()['target_buy_count']:
-                if not any(a['kind'] == 'cancel' and a['state'] == 'canceling' for a in plan['actions']):
-                    action.update(state='rejected', reason='target_filled')
-                continue
-            row = plan['targets'][action['index']]
+                for action in cancels:
+                    action.update(state='not_sent', reason=str(exc))
+            else:
+                pending_cancels = [a for a in cancels if a['state'] == 'pending']
+                if pending_cancels:
+                    future, selected = self._launch_plan_cancels(plan, pending_cancels, snapshot)
+                    cancel_jobs[future] = selected
+        pending_buys = [a for a in plan['actions'] if a['kind'] == 'buy' and a['state'] == 'pending']
+        if pending_buys or cancel_jobs:
+            self._cycle_stop.clear()
             self._save_plan(plan, blocked=plan.get('blocked', ()))
-            try:
-                result, _ = self._submit(row, plan['round_id'], action.get('request_index', action['index']),
-                    plan.get('trading_config_version', plan['config_version']))
-                action.update(session_id=result.get('session_id'), order_id=result.get('entry_order_id'),
-                    request_state=result.get('state'))
-                reason = result.get('reason') or result.get('submit_error')
-                if result.get('state') == 'entry_rejected':
-                    if result.get('submit_stage') == 'pre_send_rejected' and reason in _PLAN_TRANSIENT_WAITS:
-                        self._defer_unsent(plan, action, reason, result.get('session_id'))
-                    else:
-                        action.update(state='rejected', reason=reason)
-                elif result.get('state') == 'entry_open' and result.get('entry_order_id'):
-                    action.update(state='success', confirmed_at=self._stamp())
-                    plan.setdefault('live_buy_ids', []).append(result['entry_order_id'])
-                    plan['order_result_as_of'] = result.get('submit_receipt_at') or self._stamp()
-                else:
-                    action.update(state='unknown', reason=reason)
-            except ValueError as exc:
-                reason = str(exc)
-                if reason in _PLAN_TRANSIENT_WAITS:
-                    action['wait_reason'] = reason
-                else:
-                    action.update(state='rejected', reason=reason)
-            self._save_plan(plan, blocked=plan.get('blocked', ()))
-        complete = all(a['state'] in ('success', 'rejected') for a in plan['actions'])
+            jobs = {self._launch_plan_attempt(plan['targets'][action['index']], plan, action): action
+                for action in pending_buys}
+            jobs.update(cancel_jobs)
+            while jobs:
+                done, _ = wait(jobs, timeout=.05, return_when=FIRST_COMPLETED)
+                for future in done:
+                    assigned = jobs[future]
+                    if isinstance(assigned, list):
+                        try:
+                            outcomes = future.result()
+                        except sqlite3.Error as exc:
+                            if not self._finish_unsent_cancel_registration(plan, assigned, future, exc):
+                                raise
+                            outcomes = [dict(state='not_sent', reason=str(exc),
+                                error_type=type(exc).__name__, error_code=getattr(exc, 'sqlite_errorname', None))
+                                for _ in assigned]
+                        except ValueError as exc:
+                            outcomes = [dict(state='not_sent', reason=str(exc)) for _ in assigned]
+                        with self._plan_progress_lock:
+                            for action, outcome in zip(assigned, outcomes):
+                                action.update(outcome)
+                            self._save_plan(plan, blocked=plan.get('blocked', ()))
+                        del jobs[future]
+                        continue
+                    action = assigned
+                    with self._plan_progress_lock:
+                        try:
+                            result, _ = future.result()
+                            action.update(session_id=result.get('session_id'), order_id=result.get('entry_order_id'),
+                                request_state=result.get('state'))
+                            reason = result.get('reason') or result.get('submit_error')
+                            if result.get('state') == 'entry_rejected':
+                                if (result.get('submit_stage') == 'pre_send_rejected' and result.get('post_started') is False
+                                        and reason == 'entry_audit_registration_failed'):
+                                    self._defer_unsent(plan, action, reason, result.get('session_id'))
+                                    action.update(error_type=result.get('submit_error_type'), error_code=result.get('submit_error_code'))
+                                elif result.get('submit_stage') == 'pre_send_rejected' and reason in _PLAN_TRANSIENT_WAITS:
+                                    self._defer_unsent(plan, action, reason, result.get('session_id'))
+                                else:
+                                    action.update(state='rejected', reason=reason)
+                            elif result.get('state') == 'entry_open' and result.get('entry_order_id'):
+                                action.update(state='success', confirmed_at=self._stamp())
+                                plan.setdefault('live_buy_ids', []).append(result['entry_order_id'])
+                                plan['order_result_as_of'] = result.get('submit_receipt_at') or self._stamp()
+                            else:
+                                action.update(state='unknown', reason=reason)
+                        except ValueError as exc:
+                            reason = str(exc)
+                            if reason in _PLAN_TRANSIENT_WAITS:
+                                action.update(state='not_sent', reason=reason)
+                            else:
+                                action.update(state='rejected', reason=reason)
+                        except OSError as exc:
+                            binding = self._completed_buy_receipt_binding(plan, action, future)
+                            if binding is None:
+                                raise
+                            # The sender ended after a durable accepted receipt.
+                            # Preserve exposure; later exact result proof applies
+                            # missing metadata independently of this round.
+                            action.update(binding, state='unknown', reason=str(exc), error_type=type(exc).__name__)
+                        self._save_plan(plan, blocked=plan.get('blocked', ()))
+                    del jobs[future]
+                if self._cycle_stop.is_set() or not self._read()['desired_running']:
+                    # Close permission now; actual jobs remain counted until
+                    # they finish. Sent requests keep their own real exposure.
+                    document = self._read()
+                    for action in [a for assigned in jobs.values()
+                                   for a in (assigned if isinstance(assigned, list) else [assigned])]:
+                        if action['kind'] == 'cancel':
+                            action.update(state='unknown' if action['state'] == 'canceling' else 'not_sent',
+                                reason='cycle_ended')
+                            continue
+                        intent = document['intents'].get(action.get('request_id', action['action_id']))
+                        session = self.store.lp_session(intent['session_id']) if intent else None
+                        action.update(state='unknown' if session and session.get('post_started') else 'not_sent',
+                            reason='cycle_ended', session_id=session.get('session_id') if session else None)
+                    break
+        complete = all(a['state'] in ('success', 'rejected', 'not_sent', 'unknown', 'canceling') for a in plan['actions'])
         if complete:
             plan['completed_at'] = self._stamp()
         reason = next((a.get('wait_reason') for a in plan['actions']
