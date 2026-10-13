@@ -96,6 +96,8 @@ def _assert_actual_sender_retains_reservation(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize('block', [None, 'independent-buy', 'independent-sell', 'identity', 'receipt-token', 'receipt-side', 'inflight'])
 def test_verified_receipt_recovery_restores_rotation_without_erasing_audit(tmp_path, monkeypatch, block):
+    from uuid import UUID
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     if block == 'inflight':
         _assert_actual_sender_retains_reservation(tmp_path, monkeypatch)
         return
@@ -119,6 +121,15 @@ def test_verified_receipt_recovery_restores_rotation_without_erasing_audit(tmp_p
     exchange.rewards['m01'] = Decimal('30')
     rotation.refresh(lp, exchange, 2)
     state = engine.lp_auto_run_once(round_id='recovery-rotation')
+    if block is None:
+        cancel, = _wait_round_cancels(store, state)
+        assert cancel['order_id'] == 'o1' and cancel['session_id'] == session_id
+        assert cancel['rotation_round_id'] == 'recovery-rotation' and cancel['state'] == 'accepted'
+        assert cancel['post_started'] is True and UUID(cancel['action_id'])
+        assert cancel['action_key'].startswith(session_id + ':reconciliation-cancel:')
+        assert next(a for a in store.lp_actions(session_id) if a['action_key'] == cancel['action_key']) == cancel
+    else:
+        assert not state['last_round'].get('cancel_registration')
     assert exchange.cancels == ([] if block else ['o1']), state['last_round']
     if block == 'independent-sell':
         records = state['last_round']['candidate_filter']['rotation_guards']

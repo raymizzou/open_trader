@@ -225,6 +225,8 @@ def test_equivalent_publication_after_registration_keeps_observation(tmp_path, m
                          ids=['refill', 'rotation'])
 def test_equivalent_refresh_does_not_discard_fixed_plan(tmp_path, monkeypatch, initial):
     from collections import Counter
+    from uuid import UUID
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     from dataclasses import asdict, is_dataclass
     from pathlib import Path
     import json
@@ -267,6 +269,16 @@ def test_equivalent_refresh_does_not_discard_fixed_plan(tmp_path, monkeypatch, i
                  for row in state['last_round']['targets']]
         assert terms == [(token, Decimal('.39'), Decimal('20')) for token in ('B', 'C', 'E', 'F', 'G')]
         old_round = deepcopy(state['last_round'])
+        cancel_requests = _wait_round_cancels(store, state) if initial else []
+        if initial:
+            assert len(cancel_requests) == 3
+            assert {a['order_id'] for a in cancel_requests} == {'original-A','original-D','original-I'}
+            assert len({a['action_id'] for a in cancel_requests}) == len({a['action_key'] for a in cancel_requests}) == 3
+            for request in cancel_requests:
+                assert request['rotation_round_id'] == round_id and request['state'] == 'accepted'
+                assert request['post_started'] is True and request['session_id']
+                assert request['action_key'].startswith(request['session_id'] + ':reconciliation-cancel:')
+                assert UUID(request['action_id'])
         old_audits = {s['session_id']:deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
         assert state['active_plan'] is None and old_round['completed_at']
         assert state['plan_wait']['kind'] == 'round'
@@ -281,10 +293,11 @@ def test_equivalent_refresh_does_not_discard_fixed_plan(tmp_path, monkeypatch, i
             dependent = [a for a in old_round['actions'] if a['kind']=='buy']
             assert {a['token_id'] for a in dependent} == {'E','F','G'}
             assert all(a['state']=='not_sent' and a['reason']=='next_round_capacity' for a in dependent)
-            for a in old_round['actions']:
-                if a['kind']=='cancel':
-                    audit, = [row for row in old_audits[a['session_id']] if row['role']=='reconciliation_cancel']
-                    assert audit['state']=='accepted' and audit['post_started'] is True and audit['order_id']==a['order_id']
+            for request in cancel_requests:
+                audit, = [row for row in old_audits[request['session_id']]
+                    if row['role']=='reconciliation_cancel' and row['action_key']==request['action_key']]
+                assert audit == request
+                assert audit['state']=='accepted' and audit['post_started'] is True and audit['order_id']==request['order_id']
             counts = (len(exchange.reads),len(exchange.posts),len(exchange.cancels))
             for elapsed in (1,29):
                 monkeypatch.setattr(pool,'NOW',completed+timedelta(seconds=elapsed))

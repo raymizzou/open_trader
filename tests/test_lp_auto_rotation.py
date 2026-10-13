@@ -1964,6 +1964,7 @@ def test_cancel_recovery_waits_when_session_is_missing(tmp_path, monkeypatch):
 
 def test_failed_market_does_not_block_healthy_market_rotation(tmp_path, monkeypatch):
     from collections import Counter
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     from copy import deepcopy
     import json
     monkeypatch.setattr(pool, 'NOW', pool.NOW)
@@ -2014,6 +2015,11 @@ def test_failed_market_does_not_block_healthy_market_rotation(tmp_path, monkeypa
         advance_auto_wait(engine, monkeypatch)
         state = engine.lp_auto_run_once()
         observations.append(deepcopy(state))
+        cancel, = _wait_round_cancels(store, state)
+        assert cancel['order_id'] == healthy_id and cancel['session_id'] == originals['m01']['session']['session_id']
+        assert cancel['rotation_round_id'] == state['last_round']['round_id'] and cancel['state'] == 'accepted'
+        assert cancel['post_started'] is True and cancel['action_id'] and cancel['action_key']
+        assert next(a for a in store.lp_actions(cancel['session_id']) if a['action_key'] == cancel['action_key']) == cancel
         assert exchange.cancels == [healthy_id], 'Only the exact original healthy m01 may rotate'
         assert failed_id not in exchange.cancels
         assert len(exchange.posts) == 2

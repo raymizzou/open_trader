@@ -988,6 +988,7 @@ class _FiveMarketPublic(_CandidateSDKPublic):
 @pytest.mark.parametrize('history', ['matching', 'missing', 'different-quantity'])
 def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runtime, budget, expected_buys, history):
     from polymarket.models.clob import SignedOrder
+    from threading import Lock
 
     _, inventory_condition, inventory_token = _refill_identity(6)
     historical_quantity = '10' if history == 'different-quantity' else '20'
@@ -1026,9 +1027,11 @@ def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runti
     assert len(execution._auto_pool.candidates()) == 5
 
     planning_as_of = []
+    planning_capture = Lock()
     def signed_order(**kwargs):
-        if not planning_as_of:
-            planning_as_of.append(execution.lp_auto_state()["funds"]["as_of"])
+        with planning_capture:
+            if not planning_as_of:
+                planning_as_of.append(execution.lp_auto_state()["funds"]["as_of"])
         assert kwargs["price"] == Decimal(".40")
         assert kwargs["size"] == Decimal("20")
         _advance(runtime)
@@ -1060,11 +1063,12 @@ def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runti
         assert len(account.posts) == 5
         assert repeated["slots"]["occupied"] == 5
     if expected_buys:
-        assert planning_as_of and planning_as_of[0]
+        assert len(planning_as_of) == 1 and planning_as_of[0]
         assert datetime.fromisoformat(planning_as_of[0]) <= runtime.clock[0]
         assert refilled["funds"]["status"] == "unknown", refilled
         assert refilled["funds"]["as_of"] == planning_as_of[0]
     else:
+        assert planning_as_of == []
         assert refilled["funds"]["status"] == "known", refilled
     assert refilled["slots"]["active"] == expected_buys
     assert refilled["slots"]["occupied"] == expected_buys

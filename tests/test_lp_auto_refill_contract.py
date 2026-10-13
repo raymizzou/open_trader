@@ -1178,6 +1178,7 @@ def test_matching_api_buy_deduplicates_unknown_submission_lifecycle(runtime, lif
     ('SELL', 'unknown'), ('SELL', 'accepted_without_order_id'), ('SELL', 'accepted')])
 def test_matching_api_buy_keeps_independent_unresolved_action_risk(runtime, side, action_state):
     from collections import Counter
+    from threading import Barrier
     store, _, account, _, execution, _, originals = _historical_api_buy_intents(runtime)
     original = originals[0]
     store.lp_upsert_action(original['session_id'], f"{original['session_id']}:extra-submit",
@@ -1206,16 +1207,24 @@ def test_matching_api_buy_keeps_independent_unresolved_action_risk(runtime, side
         assert Decimal(state['funds']['inventory_cost_usd']) == 0
         assert not state['admission_block_reasons']
     assert not next(i for i in state['intents'] if i['intent_id'] == original['intent_id']).get('reservation_coverage')
-    planning_as_of = []
-    if side == 'SELL':
-        sign = account.create_limit_order
-        def capture(**kwargs):
-            if not planning_as_of:
-                planning_as_of.append(execution.lp_auto_state()['funds']['as_of'])
-            return sign(**kwargs)
-        account.create_limit_order = capture
-    state = execution.lp_auto_run_once(round_id=f'independent-{side}-{action_state}')
+    planning_as_of = {}
+    intended_tokens = {_refill_identity(i)[2] for i in (4, 5)}
+    signers = Barrier(2)
+    sign = account.create_limit_order
+    def capture(**kwargs):
+        token = kwargs['token_id']
+        planning_as_of.setdefault(token, []).append(execution.lp_auto_state()['funds']['as_of'])
+        if side == 'SELL':
+            assert token in intended_tokens
+            signers.wait(timeout=5)
+        return sign(**kwargs)
+    account.create_limit_order = capture
+    try:
+        state = execution.lp_auto_run_once(round_id=f'independent-{side}-{action_state}')
+    finally:
+        signers.abort()
     if side == 'BUY':
+        assert planning_as_of == {}
         assert account.posts == account.cancels == []
     else:
         assert Counter(p.token_id for p in account.posts) == Counter(_refill_identity(i)[2] for i in (4, 5)), state['last_round']
@@ -1224,10 +1233,13 @@ def test_matching_api_buy_keeps_independent_unresolved_action_risk(runtime, side
         assert state['slots']['occupied'] == 5
         assert Decimal(state['funds']['buy_reserved_usd']) == 40
         from datetime import datetime
-        assert len(planning_as_of) == 1 and planning_as_of[0]
-        assert datetime.fromisoformat(planning_as_of[0]) <= runtime.clock[0]
+        assert set(planning_as_of) == intended_tokens
+        assert sum(len(observations) for observations in planning_as_of.values()) == 2
+        for observations in planning_as_of.values():
+            as_of, = observations
+            assert as_of and datetime.fromisoformat(as_of) <= runtime.clock[0]
+            assert state['funds']['as_of'] == as_of
         assert state['funds']['spendable_usd'] is None and state['funds']['status'] == 'unknown'
-        assert state['funds']['as_of'] == planning_as_of[0]
         assert 'account_financial_facts_changed' in state['admission_block_reasons']
         assert state['last_round']['completed_at'] and state['active_plan'] is None
         assert store.lp_actions(original['session_id']) == audit_actions

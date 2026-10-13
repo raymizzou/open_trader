@@ -36,6 +36,7 @@ def install_order_result_reader(exchange, monkeypatch):
 def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch, invalidation):
     """#329 commits controls atomically without revoking acquired finances."""
     from collections import Counter
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     import json
     import sqlite3
     from pathlib import Path
@@ -237,6 +238,12 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
     assert [r['token_id'] for r in state['last_round']['targets']] == ['B', 'C', 'E', 'F'], state['last_round']
     assert state['last_round']['round_id'] != original_round
     next_round = state['last_round']['round_id']
+    cancel, = _wait_round_cancels(store, state)
+    assert cancel['order_id'] == original_orders['G'] and cancel['state'] == 'accepted'
+    assert cancel['rotation_round_id'] == next_round and cancel['post_started'] is True
+    assert cancel['session_id'] == state['last_round']['cancel_registration']['sessions'][original_orders['G']]
+    assert cancel['action_id'] and cancel['action_key']
+    assert next(a for a in store.lp_actions(cancel['session_id']) if a['action_key'] == cancel['action_key']) == cancel
     assert exchange.cancels == [original_orders['G']] and len(exchange.posts) == 5
     canceled_round = deepcopy(state['last_round'])
     canceled_audits = {session['session_id']: deepcopy(store.lp_actions(session['session_id']))

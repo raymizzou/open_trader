@@ -229,6 +229,7 @@ from open_trader.polymarket_lp_scheduler import LPAutoScheduler
 
 @pytest.mark.parametrize('cancel_outcome', ['terminal_zero', 'ack_live'])
 def test_capacity_dependent_replacement_uses_next_round_candidates(tmp_path, monkeypatch, cancel_outcome):
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch, ('A', 'B', 'C', 'D', 'E'),
         tokens=('A', 'B', 'C', 'D', 'E', 'F', 'G'))
     exchange.rewards.update({k: Decimal(v) for k, v in dict(A=1000, B=900, C=800, D=700, E=1, F=100, G='.5').items()})
@@ -238,6 +239,12 @@ def test_capacity_dependent_replacement_uses_next_round_candidates(tmp_path, mon
     scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
     assert scheduler.run_due()
     first = engine.lp_auto_state()
+    cancel, = _wait_round_cancels(store, first)
+    assert cancel['order_id'] == 'original-E' and cancel['state'] == 'accepted'
+    assert cancel['rotation_round_id'] == first['last_round']['round_id'] and cancel['post_started'] is True
+    assert cancel['session_id'] == first['last_round']['cancel_registration']['sessions']['original-E']
+    assert cancel['action_id'] and cancel['action_key']
+    assert next(a for a in store.lp_actions(cancel['session_id']) if a['action_key'] == cancel['action_key']) == cancel
     assert exchange.cancels == ['original-E'], first['last_round']
     assert exchange.posts == [], 'No BUY can spend E before the next observation'
     assert first['active_plan'] is None and first['last_round']['completed_at']
