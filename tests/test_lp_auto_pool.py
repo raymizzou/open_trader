@@ -1093,6 +1093,7 @@ def test_new_external_buy_is_absorbed_by_next_plan(tmp_path, monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], 'NOW', NOW)
     e,x,lp,s=setup(tmp_path,2)
     from copy import deepcopy
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     from tests.test_lp_auto_plan_execution import install_order_result_reader
     result_reader = install_order_result_reader(x, monkeypatch)
     def current_result(request):
@@ -1144,6 +1145,7 @@ def test_new_external_buy_is_absorbed_by_next_plan(tmp_path, monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], 'NOW', completed + timedelta(seconds=30))
     state = e.lp_auto_run_once()
     assert len(financial_reads) > 1
+    _wait_round_cancels(s, state)
     assert cancels == ['o1'] and len(x.posts) == 1
     assert state['slots']['occupied'] == 2
     next(o for o in x.orders if o['order_id'] == 'o1')['status'] = 'CANCELED'

@@ -12396,13 +12396,14 @@ class PolymarketLPService:
             and self._queue_row_remaining(row) is not None and self._queue_row_remaining(row) > 0}
         if not buys:
             return
-        now = self._now()
         direction = None
         try:
             direction = self._market_read(session, lambda: self._fetch_market_direction(session))
+            now = self._now()
             _freshness(direction.get('reward_checked_at'), now, 'reward_data', max_age=60)
             _freshness(direction['book'].get('received_at'), now, 'book_freshness', max_age=60)
         except Exception:
+            now = self._now()
             direction = None
         with self._mutex:
             current = self.store.lp_session(session_id)
@@ -12424,18 +12425,38 @@ class PolymarketLPService:
                 self.store.lp_update_session(session_id, patch={'buy_yield_unknown': timers})
         for oid in buys:
             timer = timers.get(oid)
-            if (not timer or timer.get('account_id') != wallet or timer.get('cancel_request_key')
+            if (not timer or timer.get('account_id') != wallet
                     or now - _timestamp(timer['unknown_since']) < timedelta(seconds=600)):
                 continue
             with self._mutex:
                 if not self._mutation_allowed():
                     continue
                 current = self.store.lp_session(session_id)
-                if not current or current.get('order_identity_conflict'):
+                if (not current or current.get('order_identity_conflict')
+                        or str(current.get('account_id') or '').casefold() != wallet):
                     continue
                 actual_timer = (current.get('buy_yield_unknown') or {}).get(oid)
                 if actual_timer != timer:
                     continue
+                current_order = self._order_history(current).get(oid)
+                remaining = self._queue_row_remaining(current_order)
+                if (not current_order or current_order.get('side') != 'BUY'
+                        or current_order.get('status') != 'LIVE'
+                        or current_order.get('token_id') != current.get('token_id')
+                        or remaining is None or remaining <= 0):
+                    continue
+                previous_key = actual_timer.get('cancel_request_key')
+                if previous_key:
+                    previous = next((a for a in self.store.lp_actions(session_id)
+                        if a.get('action_key') == previous_key), None)
+                    if (not previous or previous.get('session_id') != session_id
+                            or previous.get('order_id') != oid
+                            or previous.get('role') != 'reconciliation_cancel'
+                            or previous.get('reason') != 'buy_yield_unknown_timeout'
+                            or previous.get('state') != 'rejected'
+                            or previous.get('post_started') is not False
+                            or previous.get('submit_stage') != 'pre_send_rejected'):
+                        continue
                 attempts = self.begin_order_cancel((oid,))
                 own = [(sid, key, {**payload, 'reason': 'buy_yield_unknown_timeout'})
                     for sid, key, payload in attempts if sid == session_id]
@@ -12448,6 +12469,20 @@ class PolymarketLPService:
                 self.store.lp_update_session(session_id, patch={'buy_yield_unknown': saved})
             try:
                 self._cancel_order(oid, attempts=own)
+            except _MutationBlocked:
+                # The lane's guard rejected this exact owned intent before
+                # venue I/O. Preserve its identity and record explicit proof
+                # so a later authorized check can create a distinct request.
+                with self._mutex:
+                    rejected = next((a for a in self.store.lp_actions(sid)
+                        if a.get('action_key') == key), None)
+                    if (rejected and rejected.get('state') == 'rejected'
+                            and rejected.get('order_id') == oid
+                            and rejected.get('role') == 'reconciliation_cancel'
+                            and rejected.get('reason') == 'buy_yield_unknown_timeout'
+                            and rejected.get('post_started') is not True):
+                        self.store.lp_upsert_action(sid, key, state='rejected', payload={**payload,
+                            'post_started': False, 'submit_stage': 'pre_send_rejected'})
             except Exception:
                 logger.exception('lp_buy_yield_unknown_cancel_failed')
 

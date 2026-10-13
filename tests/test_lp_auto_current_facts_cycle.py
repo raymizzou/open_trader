@@ -485,7 +485,11 @@ def test_ended_round_cannot_send_late_preparation(runtime, preparation):
                     assert original_round['actions'] == []
                     assert set(original_round['cancel_registration']['sessions']) == {'rank-a','rank-b'}
                     assert Counter(a['order_id'] for a in original_audits) == Counter({'rank-a':1,'rank-b':1})
-                    assert all(a['state']=='pending' and a['rotation_round_id']==original_round['round_id'] for a in original_audits)
+                    a_original, = [a for a in original_audits if a['order_id']=='rank-a']
+                    b_original, = [a for a in original_audits if a['order_id']=='rank-b']
+                    assert a_original['state']=='pending'
+                    assert b_original['state'] in ('pending','accepted')
+                    assert all(a['rotation_round_id']==original_round['round_id'] for a in original_audits)
                     capture('auto_A_held_original_batch_registered')
                     evidence['stage']='manual_public_reachability'
                     controller = workers.submit(manual_control)

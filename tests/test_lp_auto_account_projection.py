@@ -402,9 +402,12 @@ def test_first_account_coverage_preserves_inflight_rotation_fill_stop(tmp_path, 
     advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 2)
-    engine.lp_auto_run_once()
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    rotation_state = engine.lp_auto_run_once()
+    requests = _wait_round_cancels(store, rotation_state)
+    assert len(requests) == 1 and requests[0]['order_id'] == 'o1' and requests[0]['state'] == 'accepted'
     intent = engine.lp_auto_state()['intents'][0]
-    assert intent['state'] == 'canceling'
+    assert intent['state'] == 'active'
     assert exchange.cancels == ['o1']
     original_audit = deepcopy(store.lp_actions(intent['session_id']))
     exchange.orders[0].update(status='CANCELED', size_matched='8')
@@ -420,7 +423,7 @@ def test_first_account_coverage_preserves_inflight_rotation_fill_stop(tmp_path, 
     assert lp.register_account_snapshot(packet)['state'] == 'registered'
     covered = engine.lp_auto_state()['intents'][0]
     assert covered['reservation_coverage']['state'] == 'covered'
-    assert covered['state'] == 'canceling'
+    assert covered['state'] == 'active'
     original_as_of = engine.lp_auto_state()['funds']['as_of']
     state = engine.lp_auto_run_once()
     assert state['last_round']['completed_at'] and state['active_plan'] is None
@@ -432,7 +435,7 @@ def test_first_account_coverage_preserves_inflight_rotation_fill_stop(tmp_path, 
     assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == original_as_of
     assert store.lp_actions(intent['session_id']) == original_audit
     original = next(i for i in state['intents'] if i['intent_id'] == intent['intent_id'])
-    assert original['state'] == 'canceling'  # Original audit stays frozen after coverage.
+    assert original['state'] == 'active'  # Original audit stays frozen after coverage.
     assert original['reservation_coverage'] == covered['reservation_coverage']
     assert all(p['side'] == 'BUY' for p in exchange.posts)
 
@@ -592,9 +595,9 @@ def test_covered_unknown_session_keeps_its_original_request_unbound(tmp_path, mo
         engine.lp_auto_set_desired_running(True)
         state=engine.lp_auto_run_once();closed(state);new_round=capture('distinct_current_manual_late_request_not_original_receipt')
         assert new_round['last_round']['round_id']!=original_round['round_id']
-        assert exchange.cancels==['manual-late'] and len(exchange.posts)==1
         from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
         cancel_action,=_wait_round_cancels(store,new_round)
+        assert exchange.cancels==['manual-late'] and len(exchange.posts)==1
         assert cancel_action['order_id']=='manual-late' and cancel_action['state']=='accepted'
         assert all(a['kind']=='buy' for a in new_round['last_round']['actions'])
         new_audit,=[a for a in store.lp_actions(cancel_action['session_id']) if a.get('rotation_round_id')==new_round['last_round']['round_id']]

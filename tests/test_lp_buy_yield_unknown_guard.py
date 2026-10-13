@@ -213,3 +213,205 @@ def test_sell_and_unknown_historical_pnl_do_not_use_buy_yield_timer(runtime):
     assert after['status']=='unknown' and after['reason']=='account_historical_boundary_unavailable'
     assert after['realized_pnl_usd'] is None and after['inventory_cost_usd'] is None and after['inventory_quantity'] is None
     lp.drain_submissions()
+
+
+@pytest.mark.parametrize('scenario', ['initially_known', 'recovers_unknown'])
+def test_current_buy_yield_uses_completed_market_read_time(runtime, scenario):
+    from copy import deepcopy
+
+    store, account, lp, engine, public, order = _managed_buy(runtime, 'manual')
+    sid = next(s['session_id'] for s in store.lp_sessions() if order.id in s['owned_order_ids'])
+    original_audits = deepcopy(store.lp_actions(sid))
+    started = runtime.clock[0]
+    if scenario == 'recovers_unknown':
+        rewards = _unknown_rewards(public)
+        engine.lp_tick()
+        timer = dict(_timer(store, order.id))
+        started = datetime.fromisoformat(timer['unknown_since'].replace('Z', '+00:00'))
+        public.list_market_rewards = rewards
+
+    read = public.get_order_book
+    progresses = []
+    def advancing_book(*, token_id):
+        before = runtime.clock[0]
+        runtime.clock[0] += timedelta(seconds=1)
+        book = read(token_id=token_id)
+        progresses.append((token_id, before, runtime.clock[0], book))
+        return book
+    public.get_order_book = advancing_book
+    engine.lp_tick()
+    assert progresses and all(after > before for _, before, after, _ in progresses)
+    assert any(token == order.token_id for token, _, _, _ in progresses)
+    assert _timer(store, order.id) is None, 'A healthy book received after read start has known current yield'
+    runtime.clock[0] = started + timedelta(seconds=601)
+    engine.lp_tick()
+    assert _timer(store, order.id) is None
+    assert account.cancels == account.posts == account.market_orders == []
+    assert account.orders == (order,)
+    current = store.lp_session(sid)
+    owned = current['order_history'][order.id]
+    assert owned['status'] == 'LIVE' and owned['side'] == 'BUY' and owned['token_id'] == order.token_id
+    assert Decimal(owned['price']) == Decimal('.40') and Decimal(owned['size_matched']) == 0
+    assert Decimal(owned.get('original_size', owned.get('quantity'))) == 20
+    assert Decimal(owned['price']) * 20 == 8
+    assert store.lp_actions(sid) == original_audits
+    lp.drain_submissions()
+
+
+def test_expired_buy_yield_recovers_after_definitely_unsent_cancel(runtime, tmp_path, monkeypatch):
+    import json
+    import sqlite3
+    from concurrent.futures import ThreadPoolExecutor
+    from copy import deepcopy
+    from pathlib import Path
+    from threading import get_ident
+    from open_trader import polymarket_trading, prediction_arbitrage_execution
+    from open_trader.notifications import CompositeNotifier
+    from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+    from tests.test_prediction_arbitrage_execution import ChannelNotifier
+
+    store, account, lp, _, public, order = _managed_buy(runtime, 'manual')
+    # Startup and adapter facts share isolated business time; Event watchdogs
+    # keep the real threading/time primitives used by the existing runtime.
+    monkeypatch.setattr(prediction_arbitrage_execution, 'datetime', polymarket_trading.datetime)
+
+    def public_owner(current_store, current_account, current_lp):
+        current_account.is_gasless_ready = lambda: True
+        def unused_merge(**kwargs):
+            raise AssertionError('The exact unfilled account has no inventory to merge')
+        current_account.merge_positions = unused_merge
+        return PredictionExecutionService(store=current_store, monitor=SimpleNamespace(),
+            trading=current_lp.exchange, lp=current_lp, lock_path=tmp_path / 'public-startup.lock',
+            notifier=CompositeNotifier([ChannelNotifier('macos'), ChannelNotifier('feishu')]))
+
+    engine = public_owner(store, account, lp)
+    ready = engine.reconcile_startup()
+    assert ready['state'] == 'ready' and engine.lp_mutation_allowed() is True, ready
+    sid = next(s['session_id'] for s in store.lp_sessions() if order.id in s['owned_order_ids'])
+    original_entry = deepcopy(store.lp_actions(sid))
+    controls = ('stop_requested', 'loss_requested', 'entry_cancel_requested', 'queue_protection')
+    original_controls = {key: deepcopy(store.lp_session(sid).get(key)) for key in controls}
+    _unknown_rewards(public)
+    engine.lp_tick()
+    original_timer = deepcopy(_timer(store, order.id))
+    since = datetime.fromisoformat(original_timer['unknown_since'].replace('Z', '+00:00'))
+    runtime.clock[0] = since + timedelta(seconds=600)
+
+    entered, release = Event(), Event()
+    startup_thread, startup_jobs, commits, errors = [], [], [], []
+    read_orders = account.list_open_orders
+    def startup_orders(**kwargs):
+        if startup_thread and get_ident() == startup_thread[0]:
+            entered.set()
+            assert release.wait(5), 'Genuine startup account SDK read watchdog'
+        return read_orders(**kwargs)
+    account.list_open_orders = startup_orders
+    native_connect = sqlite3.connect
+    with ThreadPoolExecutor(2) as workers:
+        def startup():
+            startup_thread.append(get_ident())
+            return engine.reconcile_startup()
+
+        class ObservedConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=(), /):
+                result = super().execute(sql, parameters)
+                if sql.strip().upper() != 'COMMIT' or commits:
+                    return result
+                row = super().execute('SELECT payload FROM lp_sessions WHERE session_id=?', (sid,)).fetchone()
+                if row is None:
+                    return result
+                timer = (json.loads(row[0]).get('buy_yield_unknown') or {}).get(order.id) or {}
+                key = timer.get('cancel_request_key')
+                if not key:
+                    return result
+                action = super().execute('SELECT * FROM lp_actions WHERE session_id=? AND action_key=?',
+                    (sid, key)).fetchone()
+                if action is None:
+                    return result
+                payload = json.loads(action['payload'])
+                if (action['state'] != 'pending' or payload.get('role') != 'reconciliation_cancel'
+                        or payload.get('reason') != 'buy_yield_unknown_timeout'
+                        or payload.get('order_id') != order.id):
+                    return result
+                try:
+                    assert not self.in_transaction, 'Actual risk timer/key COMMIT completed before permission change'
+                    assert timer['unknown_since'] == original_timer['unknown_since']
+                    original_row = dict(action)
+                    commits.append(dict(action_key=key, action_id=action['action_id'],
+                        session_id=sid, order_id=order.id, timer=deepcopy(timer),
+                        native_row=original_row, native_commit_returned=True, in_transaction=False))
+                    startup_jobs.append(workers.submit(startup))
+                    assert entered.wait(5), 'Public startup reached genuine account SDK read'
+                    assert engine.lp_mutation_allowed() is False
+                    assert dict(super().execute('SELECT * FROM lp_actions WHERE action_key=?',
+                        (key,)).fetchone()) == original_row, 'Observer never changes native request bytes'
+                    assert account.cancels == []
+                except BaseException as exc:
+                    errors.append(repr(exc))
+                    raise
+                return result
+
+        def observed_connect(database, *args, **kwargs):
+            if Path(database).resolve() == store.path.resolve():
+                kwargs['factory'] = ObservedConnection
+            return native_connect(database, *args, **kwargs)
+        monkeypatch.setattr(sqlite3, 'connect', observed_connect)
+        monitoring = workers.submit(engine.lp_tick)
+        try:
+            monitoring.result(timeout=5)
+            assert len(commits) == len(startup_jobs) == 1 and not errors, (commits, errors)
+            assert entered.is_set() and not startup_jobs[0].done()
+            first, = [a for a in store.lp_actions(sid) if a.get('reason') == 'buy_yield_unknown_timeout']
+            assert first['action_key'] == commits[0]['action_key'] and first['action_id'] == commits[0]['action_id']
+            assert first['state'] == 'rejected' and first.get('post_started') is not True
+            assert first['order_id'] == order.id and first['session_id'] == sid
+            assert _timer(store, order.id)['unknown_since'] == original_timer['unknown_since']
+            assert account.cancels == [] and account.orders == (order,)
+        finally:
+            release.set()
+            if startup_jobs:
+                ready = startup_jobs[0].result(timeout=5)
+        assert ready['state'] == 'ready' and engine.lp_mutation_allowed() is True, ready
+
+    rejected = deepcopy(first)
+    engine.lp_tick()
+    assert account.cancels == [(order.id,)], 'Restored actual permission creates one distinct authorized risk request'
+    assert rejected['post_started'] is False and rejected['submit_stage'] == 'pre_send_rejected'
+    risks = [a for a in store.lp_actions(sid) if a.get('reason') == 'buy_yield_unknown_timeout']
+    assert len(risks) == 2
+    accepted, = [a for a in risks if a['state'] == 'accepted']
+    assert accepted['action_id'] != rejected['action_id'] and accepted['action_key'] != rejected['action_key']
+    assert next(a for a in risks if a['action_key'] == rejected['action_key']) == rejected
+    assert accepted['order_id'] == order.id and accepted['session_id'] == sid
+    assert _timer(store, order.id)['cancel_request_key'] == accepted['action_key']
+    assert _timer(store, order.id)['unknown_since'] == original_timer['unknown_since']
+    current = store.lp_session(sid)
+    exact = current['order_history'][order.id]
+    assert current['account_id'] == WALLET and current['token_id'] == order.token_id
+    assert exact['status'] == 'LIVE' and exact['side'] == 'BUY' and exact['token_id'] == order.token_id
+    assert Decimal(exact['price']) == Decimal('.40') and Decimal(exact['size_matched']) == 0
+    assert Decimal(exact.get('original_size', exact.get('quantity'))) == 20
+    assert Decimal(exact['price']) * Decimal(exact.get('original_size', exact.get('quantity'))) == 8
+    assert Decimal(current['buy_filled_quantity']) == Decimal(current['residual_quantity']) == 0
+    assert {key: current.get(key) for key in controls} == original_controls
+    assert all(a in store.lp_actions(sid) for a in original_entry)
+    assert account.posts == account.market_orders == [] and account.orders == (order,)
+    original_risks = deepcopy(risks)
+    engine.lp_tick()
+    assert account.cancels == [(order.id,)]
+    assert [a for a in store.lp_actions(sid) if a.get('reason') == 'buy_yield_unknown_timeout'] == original_risks
+    lp.drain_submissions()
+    lp.exchange.close()
+    cold_store, adapter, cold_account, cold_lp, _ = runtime(public_client=public, orders=(order,))
+    cold_account.get_order = lambda *, order_id: order
+    cold_account.get_balance_allowance = account.get_balance_allowance
+    cold_engine = public_owner(cold_store, cold_account, cold_lp)
+    cold_ready = cold_engine.reconcile_startup()
+    assert cold_ready['state'] == 'ready' and cold_engine.lp_mutation_allowed() is True, cold_ready
+    cold_engine.lp_tick()
+    assert cold_account.cancels == cold_account.posts == cold_account.market_orders == []
+    assert cold_account.orders == (order,)
+    assert [a for a in cold_store.lp_actions(sid) if a.get('reason') == 'buy_yield_unknown_timeout'] == original_risks
+    assert _timer(cold_store, order.id)['unknown_since'] == original_timer['unknown_since']
+    assert _timer(cold_store, order.id)['cancel_request_key'] == accepted['action_key']
+    cold_lp.drain_submissions()

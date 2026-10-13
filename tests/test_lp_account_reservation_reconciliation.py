@@ -831,6 +831,7 @@ def test_late_same_generation_snapshot_waits_without_overwriting_newer_account_t
 @pytest.mark.parametrize("reverse_input", [False, True], ids=["survivor-is-anchor", "victim-is-anchor"])
 def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_account(runtime, reverse_input):
     import json
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     orders = (
         _open_order("rank-a", "BUY", price="0.40", original="20"),
         _open_order("rank-b", "BUY", price="0.40", original="20"),
@@ -868,13 +869,15 @@ def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_acco
     _advance(runtime)
     rotating = execution.lp_auto_run_once(round_id="real-overcapacity")
     # Same yield, condition and token: the stable exchange-ID tie-break keeps A.
+    requests = _wait_round_cancels(store, rotating)
+    assert len(requests) == 1 and requests[0]['order_id'] == 'rank-b' and requests[0]['state'] == 'accepted'
     assert account.cancels == [("rank-b",)], rotating["last_round"]
     assert rotating["slots"]["occupied"] == 2
-    assert rotating["slots"]["canceling"] == 1
+    assert rotating["slots"]["canceling"] == 0
     assert _amount(rotating, "buy_reserved_usd") == 16
     assert account.posts == account.market_orders == []
     assert rotating["intents"] == []
-    assert_survivor_protected()
+    assert next(iter(lp._queue_protection_levels(store.lp_session(sid)).values())) == initial_bucket
 
     # Current complete account facts release the absent order's slot without
     # inventing a terminal receipt for the historical cancel audit.
@@ -914,7 +917,7 @@ def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_acco
     assert account.cancels == [("rank-b",)]
     assert account.posts == account.market_orders == []
     assert absent["intents"] == []
-    assert_survivor_protected()
+    assert next(iter(lp._queue_protection_levels(store.lp_session(sid)).values())) == initial_bucket
 
     receipt_reads = []
 
