@@ -12470,19 +12470,8 @@ class PolymarketLPService:
             try:
                 self._cancel_order(oid, attempts=own)
             except _MutationBlocked:
-                # The lane's guard rejected this exact owned intent before
-                # venue I/O. Preserve its identity and record explicit proof
-                # so a later authorized check can create a distinct request.
-                with self._mutex:
-                    rejected = next((a for a in self.store.lp_actions(sid)
-                        if a.get('action_key') == key), None)
-                    if (rejected and rejected.get('state') == 'rejected'
-                            and rejected.get('order_id') == oid
-                            and rejected.get('role') == 'reconciliation_cancel'
-                            and rejected.get('reason') == 'buy_yield_unknown_timeout'
-                            and rejected.get('post_started') is not True):
-                        self.store.lp_upsert_action(sid, key, state='rejected', payload={**payload,
-                            'post_started': False, 'submit_stage': 'pre_send_rejected'})
+                # The lane committed the exact unsent rejection and its proof.
+                pass
             except Exception:
                 logger.exception('lp_buy_yield_unknown_cancel_failed')
 
@@ -18260,8 +18249,12 @@ class PolymarketLPService:
         except _MutationBlocked:
             # The guard ran before any venue call: a preclaimed intent was
             # definitely not sent and must not suppress the next cancel.
-            for session_id, key, _payload in attempts or ():
-                self.store.lp_reject_pending_cancel(session_id, key)
+            for session_id, key, payload in attempts or ():
+                if (payload.get('role') == 'reconciliation_cancel'
+                        and payload.get('reason') == 'buy_yield_unknown_timeout'):
+                    self.store.lp_reject_pending_cancel(session_id, key, record_unsent=True)
+                else:
+                    self.store.lp_reject_pending_cancel(session_id, key)
             raise
         # Cancel intent/receipt persistence is serialized with strategy and
         # generation fences; the venue request between those short sections is

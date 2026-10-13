@@ -82,15 +82,24 @@ def _wait_audits(store, predicate):
         Event().wait(.01)
 
 
-def _wait_round_cancels(store, state):
+def _wait_round_cancels(store, state, *, expected_states=None):
     round_id = state['last_round']['round_id']
     registration = state['last_round'].get('cancel_registration')
     if not registration or not registration.get('completed'):
+        assert not expected_states, 'Explicit receipt expectations require completed registration'
         return []
     expected = set(registration['sessions'])
+    expected_states = dict(expected_states or {})
+    assert set(expected_states) <= expected, 'Typed expectations must identify registered orders'
+    assert all(value in ('accepted', 'rejected', 'unknown') for value in expected_states.values())
     rows = _wait_audits(store, lambda rows: {a['order_id'] for a in rows
         if a.get('rotation_round_id') == round_id} == expected
-        and all(a['state'] != 'pending' for a in rows if a.get('rotation_round_id') == round_id))
+        and len([a for a in rows if a.get('rotation_round_id') == round_id]) == len(expected)
+        and all(a['session_id'] == registration['sessions'][a['order_id']]
+            and a['action_id'] and a['action_key']
+            and a['state'] in ((expected_states[a['order_id']],) if a['order_id'] in expected_states
+                else ('accepted', 'rejected'))
+            for a in rows if a.get('rotation_round_id') == round_id))
     return [a for a in rows if a.get('rotation_round_id') == round_id]
 
 

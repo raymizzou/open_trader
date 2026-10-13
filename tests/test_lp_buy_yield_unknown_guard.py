@@ -258,10 +258,12 @@ def test_current_buy_yield_uses_completed_market_read_time(runtime, scenario):
     lp.drain_submissions()
 
 
-def test_expired_buy_yield_recovers_after_definitely_unsent_cancel(runtime, tmp_path, monkeypatch):
+@pytest.mark.parametrize('scenario', ['normal', 'interrupted_after_rejection'])
+def test_expired_buy_yield_recovers_after_definitely_unsent_cancel(runtime, tmp_path, monkeypatch, scenario):
     import json
     import sqlite3
     from concurrent.futures import ThreadPoolExecutor
+    from contextlib import closing
     from copy import deepcopy
     from pathlib import Path
     from threading import get_ident
@@ -298,7 +300,9 @@ def test_expired_buy_yield_recovers_after_definitely_unsent_cancel(runtime, tmp_
     runtime.clock[0] = since + timedelta(seconds=600)
 
     entered, release = Event(), Event()
-    startup_thread, startup_jobs, commits, errors = [], [], [], []
+    startup_thread, startup_jobs, commits, errors, rejections = [], [], [], [], []
+    class NativeInterruption(BaseException):
+        pass
     read_orders = account.list_open_orders
     def startup_orders(**kwargs):
         if startup_thread and get_ident() == startup_thread[0]:
@@ -315,7 +319,7 @@ def test_expired_buy_yield_recovers_after_definitely_unsent_cancel(runtime, tmp_
         class ObservedConnection(sqlite3.Connection):
             def execute(self, sql, parameters=(), /):
                 result = super().execute(sql, parameters)
-                if sql.strip().upper() != 'COMMIT' or commits:
+                if sql.strip().upper() != 'COMMIT':
                     return result
                 row = super().execute('SELECT payload FROM lp_sessions WHERE session_id=?', (sid,)).fetchone()
                 if row is None:
@@ -329,6 +333,27 @@ def test_expired_buy_yield_recovers_after_definitely_unsent_cancel(runtime, tmp_
                 if action is None:
                     return result
                 payload = json.loads(action['payload'])
+                if (commits and key == commits[0]['action_key'] and action['state'] == 'rejected'
+                        and payload.get('reason') == 'buy_yield_unknown_timeout' and not rejections):
+                    assert not self.in_transaction
+                    # Read the first real committed rejection independently,
+                    # before returning to the caller or allowing another writer.
+                    with closing(native_connect(store.path)) as reader:
+                        reader.row_factory = sqlite3.Row
+                        committed = dict(reader.execute('SELECT * FROM lp_actions WHERE session_id=? AND action_key=?',
+                            (sid, key)).fetchone())
+                        committed_session = json.loads(reader.execute('SELECT payload FROM lp_sessions WHERE session_id=?',
+                            (sid,)).fetchone()[0])
+                    assert committed == dict(action)
+                    assert committed_session['buy_yield_unknown'][order.id]['unknown_since'] == original_timer['unknown_since']
+                    assert committed_session['buy_yield_unknown'][order.id]['cancel_request_key'] == key
+                    assert committed['action_id'] == commits[0]['action_id'] and account.cancels == []
+                    rejections.append(dict(row=committed, payload=json.loads(committed['payload']),
+                        native_commit_returned=True, in_transaction=False))
+                    if scenario == 'interrupted_after_rejection':
+                        raise NativeInterruption('Original caller ends after first real rejection COMMIT')
+                if commits:
+                    return result
                 if (action['state'] != 'pending' or payload.get('role') != 'reconciliation_cancel'
                         or payload.get('reason') != 'buy_yield_unknown_timeout'
                         or payload.get('order_id') != order.id):
@@ -358,7 +383,12 @@ def test_expired_buy_yield_recovers_after_definitely_unsent_cancel(runtime, tmp_
         monkeypatch.setattr(sqlite3, 'connect', observed_connect)
         monitoring = workers.submit(engine.lp_tick)
         try:
-            monitoring.result(timeout=5)
+            if scenario == 'interrupted_after_rejection':
+                with pytest.raises(NativeInterruption, match='first real rejection COMMIT'):
+                    monitoring.result(timeout=5)
+                assert len(rejections) == 1
+            else:
+                monitoring.result(timeout=5)
             assert len(commits) == len(startup_jobs) == 1 and not errors, (commits, errors)
             assert entered.is_set() and not startup_jobs[0].done()
             first, = [a for a in store.lp_actions(sid) if a.get('reason') == 'buy_yield_unknown_timeout']
@@ -374,9 +404,23 @@ def test_expired_buy_yield_recovers_after_definitely_unsent_cancel(runtime, tmp_
         assert ready['state'] == 'ready' and engine.lp_mutation_allowed() is True, ready
 
     rejected = deepcopy(first)
+    if scenario == 'interrupted_after_rejection':
+        lp.drain_submissions()
+        lp.exchange.close()
+        balance_read = account.get_balance_allowance
+        store, adapter, account, lp, _ = runtime(public_client=public, orders=(order,))
+        account.get_order = lambda *, order_id: order
+        account.get_balance_allowance = balance_read
+        engine = public_owner(store, account, lp)
+        cold_ready = engine.reconcile_startup()
+        assert cold_ready['state'] == 'ready' and engine.lp_mutation_allowed() is True, cold_ready
+        assert next(a for a in store.lp_actions(sid) if a['action_key'] == rejected['action_key']) == rejected
+        assert _timer(store, order.id)['unknown_since'] == original_timer['unknown_since']
     engine.lp_tick()
     assert account.cancels == [(order.id,)], 'Restored actual permission creates one distinct authorized risk request'
     assert rejected['post_started'] is False and rejected['submit_stage'] == 'pre_send_rejected'
+    assert len(rejections) == 1 and rejections[0]['payload']['post_started'] is False
+    assert rejections[0]['payload']['submit_stage'] == 'pre_send_rejected'
     risks = [a for a in store.lp_actions(sid) if a.get('reason') == 'buy_yield_unknown_timeout']
     assert len(risks) == 2
     accepted, = [a for a in risks if a['state'] == 'accepted']
@@ -393,7 +437,30 @@ def test_expired_buy_yield_recovers_after_definitely_unsent_cancel(runtime, tmp_
     assert Decimal(exact.get('original_size', exact.get('quantity'))) == 20
     assert Decimal(exact['price']) * Decimal(exact.get('original_size', exact.get('quantity'))) == 8
     assert Decimal(current['buy_filled_quantity']) == Decimal(current['residual_quantity']) == 0
-    assert {key: current.get(key) for key in controls} == original_controls
+    (tmp_path / 'native-control-observation.json').write_text(json.dumps(dict(
+        original=original_controls, current={key: current.get(key) for key in controls},
+        first_rejection=rejections[0], scenario=scenario), default=str, indent=2))
+    if scenario == 'normal':
+        assert {key: current.get(key) for key in controls} == original_controls
+    else:
+        assert {key: current.get(key) for key in controls if key != 'queue_protection'} == {
+            key: original_controls[key] for key in controls if key != 'queue_protection'}
+        original_queue = original_controls['queue_protection']
+        current_queue = current['queue_protection']
+        assert {key: value for key, value in current_queue.items() if key != 'levels'} == {
+            key: value for key, value in original_queue.items() if key != 'levels'}
+        assert current_queue['levels'].keys() == original_queue['levels'].keys()
+        observed_fields = {'state', 'data_time', 'reason_codes', 'front_estimate', 'level_total', 'ratio'}
+        for level, baseline in original_queue['levels'].items():
+            observed = current_queue['levels'][level]
+            assert {key: value for key, value in observed.items() if key not in observed_fields} == {
+                key: value for key, value in baseline.items() if key not in observed_fields}
+            # A genuine cold monitor acquired the healthy SDK book:1000 at
+            # .40 contains our20, leaving980 ahead. Only observation changes.
+            assert observed['state'] == 'monitoring' and observed['reason_codes'] == []
+            assert Decimal(level) == Decimal('.40') and Decimal(observed['level_total']) == 1000
+            assert Decimal(observed['front_estimate']) == 980 and Decimal(observed['ratio']) == Decimal('.98')
+            assert datetime.fromisoformat(observed['data_time'].replace('Z', '+00:00')) == runtime.clock[0]
     assert all(a in store.lp_actions(sid) for a in original_entry)
     assert account.posts == account.market_orders == [] and account.orders == (order,)
     original_risks = deepcopy(risks)

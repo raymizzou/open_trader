@@ -80,9 +80,29 @@ def test_ranking_generation_change_uses_api_wait(tmp_path, monkeypatch, initial)
     completed = datetime.fromisoformat(original['completed_at'])
     assert datetime.fromisoformat(state['plan_wait']['deadline']) == completed + timedelta(seconds=1)
     assert reads['shared'] == reads['account'] == 1
-    _wait_round_cancels(store, state)
-    original_audits = {a['session_id']: deepcopy(store.lp_actions(a['session_id']))
-        for a in original['actions'] if a.get('session_id')}
+    original_cancels = _wait_round_cancels(store, state)
+    if initial:
+        assert len(original_cancels) == 3
+        assert {a['order_id'] for a in original_cancels} == {'original-A', 'original-D', 'original-I'}
+        assert all(a['rotation_round_id'] == original_round and a['state'] == 'accepted'
+            and a['session_id'] and a['action_key'] and a['action_id'] for a in original_cancels)
+        assert len({a['action_key'] for a in original_cancels}) == len({a['action_id'] for a in original_cancels}) == 3
+        audited_actions = original_cancels
+    else:
+        assert original_cancels == [] and len(original['actions']) == 5
+        assert all(a['kind'] == 'buy' and a['state'] == 'success' and a['session_id'] for a in original['actions'])
+        audited_actions = original['actions']
+    original_audits = {a['session_id']: deepcopy(store.lp_actions(a['session_id'])) for a in audited_actions}
+    assert len(original_audits) == (3 if initial else 5) and all(original_audits.values())
+    for action in audited_actions:
+        if initial:
+            assert any(a['action_id'] == action['action_id'] and a['action_key'] == action['action_key']
+                for a in original_audits[action['session_id']])
+        else:
+            assert any(a['role'] == 'entry' and a['side'] == 'BUY' and a['state'] == 'accepted'
+                and a['order_id'] == action['order_id'] and a['token_id'] == action['token_id']
+                and a['condition_id'] == action['condition_id'] and a['action_id'] and a['action_key']
+                for a in original_audits[action['session_id']])
     if initial:
         assert exchange.posts == [] and Counter(exchange.cancels) == Counter(['original-A', 'original-D', 'original-I'])
         assert live_orders(exchange) == {k: v for k, v in original_orders.items() if k in {'B', 'C'}}
@@ -140,6 +160,8 @@ def test_ranking_generation_change_uses_api_wait(tmp_path, monkeypatch, initial)
     scheduler.request_check()
     assert not scheduler.run_due()
     assert reads == stopped_reads and exchange.posts == stopped_posts and exchange.cancels == stopped_cancels
+    for sid, audits in original_audits.items():
+        assert store.lp_actions(sid) == audits
 
 
 @pytest.mark.parametrize('window', ['first_cancel_result', 'unknown_POST_result'])
@@ -511,13 +533,46 @@ def test_live_after_cancel_automatically_reconciles_and_retries(tmp_path, monkey
             owned={s['session_id']:deepcopy(s.get('yield_rotation_cancel_owners')) for s in store.lp_sessions()}
             at_deadline(monkeypatch,engine);ns=len(evidence['narrow_reads'])
             assert scheduler.run_due();failed=capture('fresh_check_no_current_cancel_authority');interval(failed)
-            assert len(evidence['narrow_reads'])==ns+1 and Counter(exchange.cancels)==Counter(victims) and exchange.posts==[]
+            assert len(evidence['narrow_reads'])==ns+2 and Counter(exchange.cancels)==Counter(victims) and exchange.posts==[]
+            recovery, predispatch = evidence['narrow_reads'][ns:]
+            assert recovery['request'] == dict(owned_order_ids=['original-A','original-D','original-I'],
+                condition_ids=['A','D','I'])
+            assert predispatch['request'] == dict(owned_order_ids=['original-A','original-B','original-C','original-D','original-I'],
+                condition_ids=['A','B','C','D','E','F','G','I'])
+            for read in (recovery, predispatch):
+                assert read['phase'] == phase[0] and read['mode'] == narrow_mode[0]
+                packet = read['packet']
+                assert packet['wallet_address'] == 'test-wallet' and packet['order_read_errors'] == {}
+                assert read['started'] == packet['read_started_at'] <= packet['read_ended_at'] == packet['checked_at'] == read['ended']
+                exact = {row['order_id']: row for row in packet['orders']}
+                assert set(exact) == {'original-A','original-B','original-C','original-D','original-I'}
+                assert {row['order_id'] for row in packet['open_orders']} == set(exact)
+                for oid in read['request']['owned_order_ids']:
+                    row = exact[oid]
+                    assert row['token_id'] == row['condition_id'] == oid.removeprefix('original-')
+                    assert row['side'] == 'BUY' and row['status'] == 'LIVE' and row['fill_quantity_known'] is True
+                    assert Decimal(row['price']) == Decimal('.39') and Decimal(row['original_size']) == 20 and Decimal(row['size_matched']) == 0
+                    prior = [a for rows in audits.values() for a in rows
+                        if a.get('role') == 'reconciliation_cancel' and a.get('order_id') == oid]
+                    if oid in victims:
+                        audit, = prior
+                        assert audit['rotation_round_id'] == original['round_id'] and audit['state'] == 'accepted'
+                        assert packet['read_started_at'] > datetime.fromisoformat(audit['submit_post_started_at'])
+            assert recovery['ended'] <= predispatch['started'] < predispatch['ended']
             assert failed['slots']['occupied']==5 and Decimal(failed['funds']['buy_reserved_usd'])==39
             assert {s['session_id']:s.get('yield_rotation_cancel_owners') for s in store.lp_sessions()}==owned
             if receipt=='ACK-retry-api-failure':
-                packet=evidence['narrow_reads'][-1]['packet'];assert packet['authenticated'] is False and packet['open_orders_complete'] is False
-                assert datetime.fromisoformat(failed['plan_wait']['started_at'])==evidence['narrow_reads'][-1]['ended']
-            else:assert evidence['narrow_reads'][-1]['generation_after']==evidence['narrow_reads'][-1]['generation_before']+1
+                for read in (recovery, predispatch):
+                    assert read['packet']['authenticated'] is False and read['packet']['open_orders_complete'] is False
+                    assert read['packet']['pagination_complete'] is False
+                    assert read['ended'] == read['started'] + timedelta(seconds=3, microseconds=1)
+                assert datetime.fromisoformat(failed['plan_wait']['started_at'])==predispatch['ended']
+            else:
+                for read in (recovery, predispatch):
+                    assert read['generation_after']==read['generation_before']+1
+                    assert all(read['packet'][field] is True for field in ('authenticated','open_orders_complete','pagination_complete'))
+                assert predispatch['generation_before'] >= recovery['generation_after']
+                assert store.lp_trade_generation() >= predispatch['generation_after']
             quiet(failed,29);immutable(audits);narrow_mode[0]='normal'
         phase[0]='new_current_three_separate_requests'
         at_deadline(monkeypatch,engine);prepare(engine._lp)

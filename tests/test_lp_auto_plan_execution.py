@@ -1877,14 +1877,88 @@ def test_definite_cancel_rejection_is_not_retried_in_this_round(tmp_path, monkey
         engine.lp_auto_configure(dict(budget_usd='39',target_buy_count=1,buy_price_level=2))
         engine.lp_auto_set_desired_running(True)
         evidence=dict(carrier=carrier)
+        import sqlite3
+        from pathlib import Path
+        from threading import Event, Thread, get_ident
+        intermediate, release_sender, sender_finished = Event(), Event(), Event()
+        helper_observed, helper_returned, helper_progress = Event(), Event(), Event()
+        identity, helper_identity, helper_results, helper_errors = {}, {}, [], []
+        native_connect = sqlite3.connect
+        class RefusalConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=(), /):
+                cursor = super().execute(sql, parameters)
+                command = sql.strip().upper()
+                if (command.startswith('UPDATE LP_ACTIONS SET STATE=') and len(parameters) == 6
+                        and parameters[3:5] == (identity.get('session_id'), identity.get('action_key'))
+                        and get_ident() == identity.get('sender')):
+                    self.refusal_state = parameters[0]
+                elif command == 'COMMIT' and getattr(self, 'refusal_state', None):
+                    outcome, self.refusal_state = self.refusal_state, None
+                    assert not self.in_transaction, 'Actual receipt COMMIT succeeds before observation'
+                    row = super().execute('SELECT * FROM lp_actions WHERE action_key=?',
+                        (identity['action_key'],)).fetchone()
+                    assert row['action_id'] == identity['action_id'] and row['state'] == outcome
+                    if outcome == 'unknown':
+                        evidence['intermediate'] = dict(row)
+                        intermediate.set()
+                        assert release_sender.wait(5), 'Native refusal sender release watchdog'
+                    elif outcome == 'rejected':
+                        evidence['final_commit'] = dict(row)
+                        sender_finished.set()
+                elif (command.startswith('SELECT * FROM LP_ACTIONS WHERE SESSION_ID=')
+                        and parameters == (identity.get('session_id'),)
+                        and get_ident() == helper_identity.get('thread')):
+                    helper_identity['reads'] = helper_identity.get('reads', 0) + 1
+                    if helper_identity['reads'] >= 2:
+                        # A second native read proves the caller rejected the first UNKNOWN.
+                        helper_observed.set()
+                        helper_progress.set()
+                return cursor
+        def observed_connect(database, *args, **kwargs):
+            if Path(database).resolve() == store.path.resolve():
+                kwargs.setdefault('factory', RefusalConnection)
+            return native_connect(database, *args, **kwargs)
+        monkeypatch.setattr(sqlite3, 'connect', observed_connect)
         def venue(*,order_ids):
             account.cancels.append(order_ids);assert order_ids==('rank-b',)
+            registered = [a for s in store.lp_sessions() for a in store.lp_actions(s['session_id'])
+                if a.get('role') == 'reconciliation_cancel' and a.get('order_id') == 'rank-b']
+            pending, = registered
+            assert pending['state'] == 'pending' and pending['post_started']
+            identity.update(session_id=pending['session_id'], action_key=pending['action_key'],
+                action_id=pending['action_id'], round_id=pending['rotation_round_id'], sender=get_ident())
             return CancelOrdersResponse(canceled=(),not_canceled={'rank-b':'venue_denied'})
         monkeypatch.setattr(account,'cancel_orders',venue)
         scheduler=LPAutoScheduler(engine,clock=lambda:sdk_runtime.clock[0])
+        helper_thread = None
         try:
             assert scheduler.run_due()
-            state=engine.lp_auto_state();original=deepcopy(state['last_round']);action,=_wait_round_cancels(store,state)
+            state=engine.lp_auto_state();original=deepcopy(state['last_round'])
+            assert intermediate.wait(5), 'Exact SDK refusal intermediate native COMMIT watchdog'
+            assert identity['round_id'] == original['round_id']
+            assert state['last_round']['cancel_registration']['sessions'] == {'rank-b': identity['session_id']}
+            def wait_for_final():
+                helper_identity['thread'] = get_ident()
+                try:
+                    helper_results.extend(_wait_round_cancels(store, state))
+                except BaseException as exc:
+                    helper_errors.append(exc)
+                finally:
+                    helper_returned.set()
+                    helper_progress.set()
+            helper_thread = Thread(target=wait_for_final, name='final-refusal-receipt-caller')
+            helper_thread.start()
+            assert helper_progress.wait(5), 'Actual helper caller progress watchdog'
+            assert helper_observed.is_set() and not helper_returned.is_set(), \
+                'Final receipt helper must keep waiting while genuine intermediate UNKNOWN is held'
+            release_sender.set()
+            assert sender_finished.wait(5), 'Actual SDK refusal final REJECTED COMMIT watchdog'
+            assert helper_returned.wait(5), 'Final receipt helper completion watchdog'
+            helper_thread.join(5)
+            assert not helper_thread.is_alive() and not helper_errors
+            action, = helper_results
+            assert (action['session_id'], action['action_key'], action['action_id']) == \
+                (identity['session_id'], identity['action_key'], identity['action_id'])
             assert original['actions']==[]
             assert action['order_id']=='rank-b' and action['state']=='rejected' and action['reason']=='venue_denied'
             assert account.cancels==[('rank-b',)] and account.posts==[] and account.orders==orders
@@ -1899,6 +1973,12 @@ def test_definite_cancel_rejection_is_not_retried_in_this_round(tmp_path, monkey
             assert [a for a in store.lp_actions(action['session_id']) if a.get('order_id')=='rank-b']==audit
             evidence['stage']='complete'
         finally:
+            release_sender.set()
+            if helper_thread is not None:
+                helper_thread.join(5)
+                assert not helper_thread.is_alive(), 'Actual helper caller cleanup watchdog'
+            if identity:
+                assert sender_finished.wait(5), 'Actual refusal sender cleanup watchdog'
             evidence.update(state=engine.lp_auto_state(),orders=account.orders,cancels=account.cancels,posts=account.posts,
                 audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()})
             (tmp_path/'RF-refusal-sdk-diagnostics.json').write_text(json.dumps(evidence,default=str,indent=2)+'\n')

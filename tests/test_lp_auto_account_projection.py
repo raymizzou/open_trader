@@ -164,21 +164,33 @@ def test_account_rotation_ranks_and_cancels_real_id_without_fake_intent(tmp_path
 
 
 def test_overcapacity_same_token_buys_use_two_slots_and_exact_rotation_victim(tmp_path, monkeypatch):
-    engine, exchange, lp, _, rotation = rotation_pool(tmp_path, monkeypatch, same_token=True)
+    engine, exchange, lp, store, rotation = rotation_pool(tmp_path, monkeypatch, same_token=True)
     from tests.test_lp_auto_plan_execution import install_order_result_reader
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m00'] = Decimal('30')
     rotation.refresh(lp, exchange, 3)
     state = engine.lp_auto_state()
     assert state['slots']['occupied'] == 2
+    assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('16')
     targets, victims, _, blocked = engine._auto_pool._ranked_buys(state)
     assert not blocked
     assert len(targets) == 1
     assert len(victims) == 1
     assert targets[0]['order_id'] != victims[0]['order_id']
     assert {targets[0]['order_id'], victims[0]['order_id']} == {'o1', 'manual-second'}
-    engine.lp_auto_run_once()
+    completed = engine.lp_auto_run_once()
+    assert completed['active_plan'] is None and completed['last_round']['completed_at']
+    receipt, = _wait_round_cancels(store, completed)
+    assert receipt['state'] == 'accepted' and receipt['order_id'] == victims[0]['order_id']
+    assert receipt['session_id'] == victims[0]['session_id']
+    assert receipt['rotation_round_id'] == completed['last_round']['round_id']
+    assert receipt['action_id'] and receipt['action_key']
+    assert any(a['action_id'] == receipt['action_id'] and a['action_key'] == receipt['action_key']
+        for a in store.lp_actions(receipt['session_id']))
+    assert completed['last_round']['targets'][0]['order_id'] == targets[0]['order_id']
+    assert exchange.cancels == [victims[0]['order_id']]
     assert len(exchange.cancels) == 1
     assert len(exchange.posts) == 1
 

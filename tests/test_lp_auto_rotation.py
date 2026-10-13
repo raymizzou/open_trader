@@ -914,7 +914,7 @@ def test_cancel_timeout_survives_restart_and_reselects_latest_leader_after_termi
     exchange.cancel_order = timeout
     first = engine.lp_auto_run_once()
     original = deepcopy(first['last_round'])
-    old_action, = _wait_round_cancels(store,first)
+    old_action, = _wait_round_cancels(store, first, expected_states={'o1': 'unknown'})
     assert all(a['kind']=='buy' and a['state']=='not_sent' and a['reason']=='next_round_capacity' for a in original['actions'])
     assert old_action['order_id'] == 'o1' and old_action['session_id'] == original_sid
     assert old_action['state'] == 'unknown'
@@ -1256,7 +1256,7 @@ def test_failed_cancel_retries_only_after_a_new_known_live_receipt(tmp_path, mon
     expected_state = 'unknown' if failure == 'timeout' else 'rejected'
     receipt_deadline = monotonic() + 5
     while True:
-        cancel, = _wait_round_cancels(store,state)
+        cancel, = _wait_round_cancels(store, state, expected_states={'o1': expected_state})
         if cancel['state'] == expected_state:
             break
         assert monotonic() < receipt_deadline, 'Exact final typed cancel receipt watchdog'
@@ -1511,7 +1511,7 @@ def test_cancel_recovery_uses_known_owned_receipts_and_preserves_fills(tmp_path,
     exchange.cancel_order = lambda oid: (exchange.cancels.append(oid) or {})
     first = engine.lp_auto_run_once()
     original = deepcopy(first['last_round'])
-    original_cancel, = _wait_round_cancels(store, first)
+    original_cancel, = _wait_round_cancels(store, first, expected_states={'o1': 'unknown'})
     assert all(a['kind'] == 'buy' for a in original['actions'])
     assert original_cancel['order_id'] == 'o1' and original_cancel['session_id'] == sid
     assert first['active_plan'] is None and original['completed_at']
@@ -1545,7 +1545,7 @@ def test_cancel_recovery_uses_known_owned_receipts_and_preserves_fills(tmp_path,
     assert not any(r['active'] for r in financial_reads)
     assert state['last_round']['round_id'] != original['round_id'] and state['last_round']['completed_at']
     assert state['active_plan'] is None and state['plan_wait']['kind'] == 'round'
-    fresh_requests = _wait_round_cancels(store, state)
+    fresh_requests = _wait_round_cancels(store, state, expected_states={'o1': 'unknown'} if receipt == 'partial' else {})
     expected_cancels = ['o1','o1'] if receipt == 'partial' else ['o1']
     assert exchange.cancels == expected_cancels
     if receipt == 'partial':
@@ -1611,10 +1611,10 @@ def test_cancel_recovery_uses_known_owned_receipts_and_preserves_fills(tmp_path,
         state = engine.lp_auto_run_once()
         assert packets[-1]['orders'][0]['status'] == 'LIVE' and packets[-1]['orders'][0]['fill_quantity_known'] is True
         assert packets[-1]['read_started_at'] > pool.datetime.fromisoformat(unknown['submit_post_started_at'])
-        _wait_round_cancels(store, state)
+        _wait_round_cancels(store, state, expected_states={'o1': 'unknown'})
         assert exchange.cancels == ['o1', 'o1'] and len(exchange.posts) == 1
         assert state['last_round']['round_id'] not in (original['round_id'], old_round)
-        fresh_cancel, = _wait_round_cancels(store, state)
+        fresh_cancel, = _wait_round_cancels(store, state, expected_states={'o1': 'unknown'})
         assert all(a['kind'] == 'buy' for a in state['last_round']['actions'])
         assert fresh_cancel['action_id'] != original_cancel['action_id'] and fresh_cancel['session_id'] == sid
         audits = store.lp_actions(sid)
@@ -1775,7 +1775,7 @@ def test_rotation_retry_uses_real_adapter_account_completeness(tmp_path, monkeyp
     first = engine.lp_auto_run_once()
     original = deepcopy(first['last_round'])
     assert original['completed_at'] and first['active_plan'] is None
-    old, = _wait_round_cancels(store, first)
+    old, = _wait_round_cancels(store, first, expected_states={'o1': 'unknown'})
     original_audits = deepcopy(store.lp_actions(sid))
     unknown, = [a for a in original_audits if a['role']=='reconciliation_cancel']
     assert unknown['state']=='unknown' and unknown['post_started'] is True and unknown['order_id']=='o1'
@@ -1847,7 +1847,7 @@ def test_rotation_retry_uses_real_adapter_account_completeness(tmp_path, monkeyp
     assert state['active_plan'] is None and state['slots']['occupied']==1
     packet = accounts[-1]
     if raw_facts == 'complete':
-        fresh, = _wait_round_cancels(store, state)
+        fresh, = _wait_round_cancels(store, state, expected_states={'o1': 'unknown'})
         packet = packets[-1]
     if raw_facts == 'complete':
         assert all(packet[k] is True for k in ('authenticated','open_orders_complete','positions_complete','trades_complete','pagination_complete'))
@@ -1947,7 +1947,7 @@ def test_cancel_recovery_waits_when_session_is_missing(tmp_path, monkeypatch):
     exchange.cancel_order = lambda oid: (exchange.cancels.append(oid) or {})
     from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     original = engine.lp_auto_run_once()
-    _wait_round_cancels(store, original)
+    _wait_round_cancels(store, original, expected_states={'o1': 'unknown'})
     monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(seconds=60))
     monkeypatch.setattr(store, 'lp_session', lambda session_id: None)
     advance_auto_wait(engine, monkeypatch)

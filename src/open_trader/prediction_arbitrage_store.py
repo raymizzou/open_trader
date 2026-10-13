@@ -7591,14 +7591,29 @@ class PredictionArbitrageStore:
         if changed:
             self._notify_lp_trade_change(session_id)
 
-    def lp_reject_pending_cancel(self, session_id: str, action_key: str) -> None:
+    def lp_reject_pending_cancel(self, session_id: str, action_key: str, *, record_unsent: bool = False) -> None:
         """Reject a definitely unsent cancel without overwriting receipt facts."""
         with self._transaction() as connection:
-            changed = connection.execute(
-                "UPDATE lp_actions SET state='rejected',updated_at=? "
-                "WHERE session_id=? AND action_key=? AND state='pending'",
-                (_utc_now(), str(session_id), str(action_key)),
-            ).rowcount
+            if record_unsent:
+                row = connection.execute(
+                    "SELECT payload FROM lp_actions WHERE session_id=? AND action_key=? AND state='pending'",
+                    (str(session_id), str(action_key)),
+                ).fetchone()
+                changed = 0
+                if row is not None:
+                    payload = {**_load_payload(str(row['payload'])),
+                        'post_started': False, 'submit_stage': 'pre_send_rejected'}
+                    changed = connection.execute(
+                        "UPDATE lp_actions SET state='rejected',payload=?,updated_at=? "
+                        "WHERE session_id=? AND action_key=? AND state='pending'",
+                        (_dump_execution_payload(payload), _utc_now(), str(session_id), str(action_key)),
+                    ).rowcount
+            else:
+                changed = connection.execute(
+                    "UPDATE lp_actions SET state='rejected',updated_at=? "
+                    "WHERE session_id=? AND action_key=? AND state='pending'",
+                    (_utc_now(), str(session_id), str(action_key)),
+                ).rowcount
             if changed:
                 self._lp_register_trade_change(connection, session_id)
         if changed:
