@@ -815,6 +815,7 @@ def test_cached_recovery_ack_is_fenced_by_original_fault_channels(tmp_path, monk
 @pytest.mark.parametrize('automatic', [False, True])
 @pytest.mark.parametrize('failure', [False, True])
 def test_terminal_monitor_verification_does_not_block_or_abort_active_session(tmp_path, monkeypatch, request, automatic, failure):
+    import json
     from concurrent.futures import ThreadPoolExecutor
     from copy import deepcopy
     from threading import Event
@@ -832,10 +833,21 @@ def test_terminal_monitor_verification_does_not_block_or_abort_active_session(tm
     rows = engine.lp_auto_run_once()['intents']
     terminal, active = rows
     pool = engine._auto_pool
-    exchange.orders[0]['status'] = 'CANCELED'
+    terminal_order_id = terminal['order_id']
+    selected = store.lp_session(terminal['session_id'])
+    assert selected['entry_order_id'] == terminal_order_id
+    assert terminal_order_id in selected['owned_order_ids']
+    assert selected['token_id'] == terminal['token_id']
+    audit, = [a for a in store.lp_actions(terminal['session_id']) if a.get('role') == 'entry']
+    assert audit['state'] == 'accepted' and audit['order_id'] == terminal_order_id
+    assert active['session_id'] != terminal['session_id'] and active['order_id'] != terminal_order_id
+    (tmp_path / 'CI-B-native-binding.json').write_text(json.dumps(dict(
+        terminal=terminal, active=active, session=selected, audit=audit), default=str, indent=2))
+    next(o for o in exchange.orders if o['order_id'] == terminal_order_id)['status'] = 'CANCELED'
     engine.lp_tick()
     wait_attention(service)
     sid, iid = terminal['session_id'], terminal['intent_id']
+    (tmp_path / 'CI-B-native-terminal-public-proof.json').write_text(json.dumps(store.lp_session(sid), default=str, indent=2))
     assert store.lp_session(sid)['state'] == 'complete'
     first = current[0]
     if automatic:

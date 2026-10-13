@@ -9535,14 +9535,17 @@ class PolymarketLPService:
                         raise LpObservationWait("account_round_invalid")
                     current_generation = int(observed['generation'])
                     if current_generation != generation or current_revisions != expected_revisions:
-                        if not _automatic_observation:
+                        if not _automatic_observation or current_generation != generation:
                             raise LpObservationWait("account_round_invalid")
                         # Monitoring may publish the very IDs in this read.
                         # Accept that narrow change only after checking every
                         # changed owner and actual new BUY request/exposure.
                         buys = {buy['order_id']: buy for buy in financial_facts['buys']}
-                        for sid, revision in current_revisions.items():
-                            if expected_revisions.get(sid) == revision:
+                        positions = {position['token_id']: position for position in financial_facts['positions']}
+                        fills = financial_facts.get('order_fills') or {}
+                        owned_fill_rows = {str(fill['order_id']): fill for fill in owned_fills}
+                        for sid in expected_revisions.keys() | current_revisions.keys():
+                            if expected_revisions.get(sid) == current_revisions.get(sid):
                                 continue
                             row = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?', (sid,)).fetchone()
                             session = self.store._lp_row_result(row) if row else None
@@ -9556,16 +9559,42 @@ class PolymarketLPService:
                                         and audit.get('state') in ('pending', 'accepted', 'unknown')):
                                     raise LpObservationWait('account_round_invalid')
                             for oid, fact in self._order_history(session).items():
-                                if fact.get('side') != 'BUY' or fact.get('status') != 'LIVE':
+                                if fact.get('side') != 'BUY':
                                     continue
                                 buy = buys.get(oid)
-                                if (not buy or str(buy['token_id']) != str(session['token_id'])
+                                matched = _maybe_decimal(fact.get('size_matched'))
+                                if (fact.get('status') == 'LIVE' or buy is not None) and (
+                                        not buy or fact.get('status') != 'LIVE'
+                                        or str(buy['token_id']) != str(session['token_id'])
+                                        or str(fact.get('token_id')) != str(buy['token_id'])
                                         or _maybe_decimal(fact.get('price')) != _maybe_decimal(buy['price'])
-                                        or _maybe_decimal(fact.get('quantity', fact.get('original_size'))) != _maybe_decimal(buy['original_quantity'])
-                                        or _maybe_decimal(fact.get('size_matched')) != _maybe_decimal(buy['filled_quantity'])):
+                                        or _maybe_decimal(fact.get('original_size', fact.get('quantity'))) != _maybe_decimal(buy['original_quantity'])
+                                        or matched != _maybe_decimal(buy['filled_quantity'])
+                                        or _maybe_decimal(fact.get('remaining_size')) != _maybe_decimal(buy['quantity'])):
                                     raise LpObservationWait('account_round_invalid')
-                        generation = current_generation
-                        financial_facts['trade_generation'] = generation
+                                if matched is None or matched < Decimal('0'):
+                                    raise LpObservationWait('account_round_invalid')
+                                if matched > Decimal('0'):
+                                    fill = owned_fill_rows.get(oid, {})
+                                    position = positions.get(str(session['token_id']), {})
+                                    quantity = _maybe_decimal(fact.get('original_size', fact.get('quantity')))
+                                    remaining = _maybe_decimal(fact.get('remaining_size'))
+                                    average = _maybe_decimal(fact.get('average_price'))
+                                    if (fill.get('side') != 'BUY'
+                                            or str(fill.get('token_id')) != str(session['token_id'])
+                                            or str(fill.get('condition_id')) != str(session.get('condition_id'))
+                                            or _maybe_decimal(fills.get(oid)) != matched
+                                            or _maybe_decimal(fill.get('size_matched')) != matched
+                                            or average is None or average <= Decimal('0')
+                                            or _maybe_decimal(fill.get('average_price')) != average
+                                            or quantity is None or quantity < matched
+                                            or remaining is None or remaining != quantity - matched
+                                            or str(fact.get('token_id')) != str(session['token_id'])
+                                            or (_maybe_decimal(fact.get('price')) or Decimal('0')) <= Decimal('0')
+                                            or _maybe_decimal(position.get('quantity')) != _maybe_decimal(session.get('residual_quantity'))
+                                            or _maybe_decimal(position.get('inventory_cost_usd')) is None
+                                            or _maybe_decimal(position['inventory_cost_usd']) != _maybe_decimal(session.get('buy_cost'))):
+                                        raise LpObservationWait('account_round_invalid')
                     _freshness(read_ended, self._now(), "account_freshness")
                     pool_row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
                     published = (json.loads(pool_row['payload']).get('account_financial_facts') or {}) if pool_row else {}
@@ -9636,9 +9665,19 @@ class PolymarketLPService:
 
     def _register_planning_account_snapshot(self, snapshot):
         """Current-only registration cannot clear or replace full-publication diagnostics."""
-        return self._register_account_snapshot(snapshot,
-            _planning_only=snapshot.get('trades_complete') is not True,
-            _automatic_observation=True)
+        _lp_causal_event('account_publish_wait', account=snapshot)
+        outcome = 'failed'
+        try:
+            result = self._register_account_snapshot(snapshot,
+                _planning_only=snapshot.get('trades_complete') is not True,
+                _automatic_observation=True)
+            outcome = result.get('state', 'failed')
+            return result
+        except LpAccountRoundInvalid:
+            outcome = 'skipped'
+            raise
+        finally:
+            _lp_causal_event('account_publish_end', account=snapshot, outcome=outcome)
 
     def register_account_snapshot(
         self, snapshot: Mapping[str, object]

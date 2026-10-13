@@ -1191,3 +1191,349 @@ def test_common_interval_starts_after_attempts_and_cycles_do_not_overlap(runtime
     assert stopped['last_round']['round_id'] != failed['last_round']['round_id']
     assert stopped['last_round']['actions'] == []
     assert len(account.posts) == 1 and account.cancels == []
+@pytest.mark.parametrize('limited', ['balance', 'allowance'])
+def test_same_round_buys_use_wallet_net_free_capital(runtime, tmp_path, limited):
+    import uuid
+
+    public = RefillPublic(runtime.clock)
+    public.sizes = {i: '50' for i in range(1, 7)}
+    public.rates = dict(enumerate(('100', '90', '80', '1000', '900', '800'), 1))
+    store, adapter, account, lp, engine, _ = prepare(runtime, count=6, public=public)
+    original_orders = tuple(_open_order(f'original-{i}', 'BUY', price='.40', original='50',
+        token_id=_refill_identity(i)[2], outcome='YES').model_copy(update={
+            'market': _refill_identity(i)[1], 'condition_id': _refill_identity(i)[1]})
+        for i in range(1, 4))
+    account.orders = original_orders
+    balance = account.get_balance_allowance
+    finance_calls, signed_tokens = [], []
+
+    def limited_wallet(**kwargs):
+        native = balance(**kwargs)
+        finance_calls.append(dict(active=engine.lp_auto_state()['active_plan'] is not None,
+            original_balance=native.balance))
+        return SimpleNamespace(balance='60000000' if limited == 'balance' else '100000000',
+            allowances={account.environment.standard_exchange:
+                '60000000' if limited == 'allowance' else '100000000'})
+
+    account.get_balance_allowance = limited_wallet
+    sign = account.create_limit_order
+
+    def observed_sign(**kwargs):
+        signed_tokens.append(kwargs['token_id'])
+        return sign(**kwargs)
+
+    account.create_limit_order = observed_sign
+    assert engine.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    initial = engine.lp_auto_state()
+    assert initial['slots']['occupied'] == 3
+    assert Decimal(initial['funds']['buy_reserved_usd']) == 60
+    assert Decimal(initial['funds']['spendable_usd']) == 40
+    original_sessions = {s['session_id']: deepcopy(s) for s in store.lp_sessions()
+        if set(s.get('owned_order_ids', ())) & {o.id for o in original_orders}}
+    assert len(original_sessions) == 3
+    original_audits = {sid: deepcopy(store.lp_actions(sid)) for sid in original_sessions}
+    entered, release, finished = Event(), Event(), Event()
+    pending_audits, errors = [], []
+    cancel = account.cancel_orders
+
+    def blocked_cancel(*, order_ids):
+        try:
+            current = engine.lp_auto_state()['active_plan']
+            assert current is not None
+            victims = {a['order_id']: a for a in current['actions'] if a['kind'] == 'cancel'}
+            assert set(order_ids) <= set(victims) <= {o.id for o in original_orders}
+            for oid in order_ids:
+                action = victims[oid]
+                session = store.lp_session(action['session_id'])
+                assert session['account_id'].casefold() == WALLET.casefold()
+                assert oid in session['owned_order_ids']
+                index = int(oid.removeprefix('original-'))
+                assert session['token_id'] == _refill_identity(index)[2]
+                audits = [a for a in store.lp_actions(session['session_id'])
+                    if a.get('order_id') == oid and a.get('rotation_round_id') == current['round_id']]
+                assert audits and all(a['state'] == 'pending' for a in audits)
+                for audit in audits:
+                    assert uuid.UUID(audit['action_id'])
+                    assert audit['session_id'] == session['session_id']
+                    assert audit['action_key'].startswith(session['session_id'] + ':reconciliation-cancel:')
+                    pending_audits.append(deepcopy(audit))
+            entered.set()
+            assert release.wait(5), 'Actual cancel I/O watchdog'
+            return cancel(order_ids=order_ids)
+        except BaseException as exc:
+            errors.append(repr(exc))
+            entered.set()
+            raise
+        finally:
+            finished.set()
+
+    account.cancel_orders = blocked_cancel
+    with ThreadPoolExecutor(1) as workers:
+        running = workers.submit(engine.lp_auto_run_once, round_id=f'wallet-net-{limited}')
+        try:
+            assert entered.wait(5), 'Real registered cancel reaches SDK'
+            assert not errors, errors
+            deadline = monotonic() + 5
+            while True:
+                held = engine.lp_auto_state()
+                buys = [a for a in held['last_round']['actions'] if a['kind'] == 'buy']
+                if buys and all(a['state'] != 'pending' for a in buys):
+                    break
+                assert monotonic() < deadline, 'Fixed local BUY dispositions watchdog'
+                Event().wait(.01)
+            (tmp_path / 'R1-held-public-proof.json').write_text(json.dumps(dict(
+                state=held, signed_tokens=signed_tokens, posts=[p.token_id for p in account.posts],
+                pending_audits=pending_audits, finance_calls=finance_calls), default=str, indent=2))
+            assert not finished.is_set()
+            assert signed_tokens == [] and account.posts == []
+            assert all(a['state'] == 'not_sent' for a in buys)
+            assert held['slots']['occupied'] == 3
+            assert Decimal(held['funds']['buy_reserved_usd']) == 60
+            assert account.orders == original_orders
+        finally:
+            release.set()
+            state = running.result(timeout=5)
+            (tmp_path / 'R1-completed-public-proof.json').write_text(json.dumps(dict(
+                state=state, signed_tokens=signed_tokens, posts=[p.token_id for p in account.posts],
+                cancels=account.cancels, errors=errors, pending_audits=pending_audits,
+                sessions=store.lp_sessions(), audits={sid: store.lp_actions(sid) for sid in original_sessions},
+                finance_calls=finance_calls), default=str, indent=2))
+    assert not errors, errors
+    assert finished.is_set() and pending_audits
+    assert signed_tokens == [] and account.posts == account.market_orders == []
+    assert account.orders == original_orders
+    assert state['slots']['occupied'] == 3
+    assert Decimal(state['funds']['buy_reserved_usd']) == 60
+    assert state['active_plan'] is None and state['last_round']['completed_at']
+    cancel_actions = [a for a in state['last_round']['actions'] if a['kind'] == 'cancel']
+    assert Counter(oid for batch in account.cancels for oid in batch) == Counter(a['order_id'] for a in cancel_actions)
+    assert all(a['state'] == 'canceling' for a in cancel_actions)
+    buy_actions = [a for a in state['last_round']['actions'] if a['kind'] == 'buy']
+    assert buy_actions and all(a['state'] == 'not_sent' for a in buy_actions)
+    for action in buy_actions:
+        target = state['last_round']['targets'][action['index']]
+        assert target['token_id'] == action['token_id']
+        assert Decimal(target['price']) == Decimal('.40') and Decimal(target['quantity']) == 50
+    for sid, before in original_audits.items():
+        current = store.lp_actions(sid)
+        assert all(a in current for a in before)
+    completed_audits = {sid: deepcopy(store.lp_actions(sid)) for sid in original_sessions}
+    assert all(any(a['action_id'] == pending['action_id'] and a['action_key'] == pending['action_key']
+        and a['order_id'] == pending['order_id'] and a['state'] == 'accepted'
+        for a in completed_audits[pending['session_id']]) for pending in pending_audits)
+    completed = datetime.fromisoformat(state['last_round']['completed_at'])
+    assert state['plan_wait']['kind'] == 'round'
+    assert datetime.fromisoformat(state['plan_wait']['deadline']) == completed + timedelta(seconds=30)
+    reads = (account.balance_reads, account.order_reads, account.trade_reads, account.position_reads)
+    for elapsed in (1, 29):
+        runtime.clock[0] = completed + timedelta(seconds=elapsed)
+        quiet = engine.lp_auto_run_once()
+        assert quiet['last_round'] == state['last_round']
+        assert signed_tokens == [] and account.posts == []
+        assert (account.balance_reads, account.order_reads, account.trade_reads, account.position_reads) == reads
+        assert {sid: store.lp_actions(sid) for sid in original_sessions} == completed_audits
+    assert finance_calls and not any(call['active'] for call in finance_calls)
+
+
+@pytest.mark.parametrize('schedule', ['generation_only', 'filled_owner_publication'])
+def test_invalidated_observation_cannot_authorize_new_round(runtime, tmp_path, monkeypatch, schedule):
+    import sqlite3
+    from pathlib import Path
+    from tests.test_lp_account_reservation_reconciliation import _position
+    from tests.test_lp_order_registration_contract import _maker_order, _trade
+
+    public = RefillPublic(runtime.clock)
+    public.rates = {1: '48', 2: '24'}
+    store, adapter, account, lp, engine, _ = prepare(runtime, count=2, target=2, budget='16', public=public)
+    _entry_sdk(account, runtime.clock)
+    original_order = _open_order('original-monitor', 'BUY', price='.40', original='20',
+        token_id=_refill_identity(1)[2], outcome='YES').model_copy(update={
+            'market': _refill_identity(1)[1], 'condition_id': _refill_identity(1)[1]})
+    account.orders = (original_order,)
+    assert engine.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    original, = [s for s in store.lp_sessions() if 'original-monitor' in s.get('owned_order_ids', ())]
+    sid = original['session_id']
+    assert original['account_id'].casefold() == WALLET.casefold()
+    assert original['token_id'] == _refill_identity(1)[2]
+    assert original['order_history']['original-monitor']['status'] == 'LIVE'
+    assert Decimal(original['order_history']['original-monitor']['size_matched']) == 0
+    assert original.get('queue_protection'), 'Public original protection baseline exists'
+    original_audits = deepcopy(store.lp_actions(sid))
+    initial_generation = store.lp_trade_generation()
+    reached, release = Event(), Event()
+    automatic_thread, rows_observed, generations_committed, errors = [], [], [], []
+    armed = [True]
+    wire_reads, lookups, publication = [], [], {}
+    balance, positions, orders = account.get_balance_allowance, account.list_positions, account.list_open_orders
+
+    def observed_balance(**kwargs):
+        started = runtime.clock[0]
+        result = balance(**kwargs)
+        wire_reads.append(dict(stage='balance', started_at=started, ended_at=runtime.clock[0],
+            balance=result.balance, allowance=dict(result.allowances)))
+        return result
+
+    def observed_positions(**kwargs):
+        result = positions(**kwargs)
+        wire_reads.append(dict(stage='positions', ended_at=runtime.clock[0], quantity=[str(p.size) for p in result]))
+        return result
+
+    def observed_orders(**kwargs):
+        result = orders(**kwargs)
+        wire_reads.append(dict(stage='orders', at=runtime.clock[0], ids=[o.id for o in result],
+            matched=[str(o.size_matched) for o in result]))
+        return result
+
+    account.get_balance_allowance = observed_balance
+    account.list_positions = observed_positions
+    account.list_open_orders = observed_orders
+    native_connect = sqlite3.connect
+    revision_sql = ("SELECT session_id,json_extract(payload,'$._lp_trade_revision') AS revision "
+        "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?)")
+
+    class ObservedCursor(sqlite3.Cursor):
+        def execute(self, sql, parameters=()):
+            self.sql, self.parameters = sql, parameters
+            return super().execute(sql, parameters)
+
+        def fetchall(self):
+            rows = super().fetchall()
+            if (self.sql == revision_sql and self.parameters == (WALLET.casefold(),)
+                    and automatic_thread == [get_ident()] and armed[0]):
+                armed[0] = False
+                apply_free = lp._first_seen_apply_lock.acquire(blocking=False)
+                if apply_free:
+                    lp._first_seen_apply_lock.release()
+                record = dict(thread=get_ident(), sql=self.sql, account=self.parameters[0],
+                    in_transaction=self.connection.in_transaction, apply_free=apply_free,
+                    native_rows=[dict(row) for row in rows], native_rows_identity=id(rows),
+                    generation=store.lp_trade_generation(), wire_reads=deepcopy(wire_reads))
+                rows_observed.append(record)
+                reached.set()
+                try:
+                    assert not record['in_transaction'] and record['apply_free']
+                    assert sid in {row['session_id'] for row in rows}
+                    assert release.wait(5), 'Native outside-writer fetchall delivery watchdog'
+                except BaseException as exc:
+                    errors.append(repr(exc))
+                    raise
+                finally:
+                    record['returned_rows_identity'] = id(rows)
+            return rows
+
+    class ObservedConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            result = self.cursor(factory=ObservedCursor).execute(sql, parameters)
+            if sql.startswith('UPDATE lp_trade_generation SET generation=generation+1') and result.rowcount == 1:
+                self.generation_advance = dict(sql=sql, parameters=list(parameters), thread=get_ident())
+            if sql == 'COMMIT' and getattr(self, 'generation_advance', None):
+                generations_committed.append({**self.generation_advance, 'successful_commit': True,
+                    'in_transaction_after': self.in_transaction})
+                self.generation_advance = None
+            return result
+
+    def observed_connect(database, *args, **kwargs):
+        if Path(database).resolve() == store.path.resolve():
+            kwargs['factory'] = ObservedConnection
+        return native_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, 'connect', observed_connect)
+
+    def run_original_observation():
+        automatic_thread.append(get_ident())
+        return engine.lp_auto_run_once(round_id=f'invalidated-{schedule}')
+
+    with ThreadPoolExecutor(1) as workers:
+        running = workers.submit(run_original_observation)
+        try:
+            assert reached.wait(5), 'Native first original automatic revision SELECT'
+            assert not errors and len(rows_observed) == 1, (errors, rows_observed)
+            frozen = rows_observed[0]
+            assert frozen['generation'] == initial_generation
+            old_map = {row['session_id']: int(row['revision'] or 0) for row in frozen['native_rows']}
+            assert any(r['stage'] == 'orders' and r['ids'] == ['original-monitor']
+                and r['matched'] == ['0'] for r in frozen['wire_reads'])
+            assert any(r['stage'] == 'positions' and r['quantity'] == [] for r in frozen['wire_reads'])
+            assert account.trades == () and account.positions == ()
+            runtime.clock[0] += timedelta(microseconds=1)
+            account.orders = ()
+            receipt = original_order.model_copy(update={'status': 'CANCELED', 'size_matched': Decimal('8')})
+            if schedule == 'filled_owner_publication':
+                trade = _trade('owned-eight', _maker_order('original-monitor', 'BUY', '8', '.40'), size='8')
+                trade = trade.model_copy(update={'match_time': runtime.clock[0], 'last_update': runtime.clock[0]})
+                account.trades = (trade,)
+                account.positions = (_position('8'),)
+                receipt = receipt.model_copy(update={'associate_trades': ('owned-eight',)})
+
+            def exact_original_result(*, order_id):
+                assert order_id == 'original-monitor'
+                lookups.append(dict(order_id=order_id, matched=str(receipt.size_matched),
+                    original=str(receipt.original_size), price=str(receipt.price), status=receipt.status))
+                return receipt
+
+            account.get_order = exact_original_result
+            newer = adapter.lp_account_snapshot_shared(max_age_seconds=-1,
+                trade_generation_provider=store.lp_trade_generation)
+            publication['newer_packet'] = deepcopy(newer)
+            assert tuple(newer['open_orders']) == () and newer['trade_generation'] == initial_generation
+            if schedule == 'generation_only':
+                assert tuple(newer['positions']) == () and tuple(newer['raw_trades']) == ()
+                publication['tick'] = engine.lp_tick()
+                current_map = {s['session_id']: store.lp_session_revision(s['session_id'], trading=True)
+                    for s in store.lp_sessions()}
+                publication['current_trade_revision_map'] = current_map
+                publication['current_generation'] = store.lp_trade_generation()
+                assert lookups and all(r['matched'] == '8' and r['original'] == '20' for r in lookups)
+                assert any(g['successful_commit'] and g['parameters'] == [initial_generation]
+                    and 'AND generation=?' in g['sql'] for g in generations_committed)
+                assert publication['current_generation'] > initial_generation
+                assert current_map == old_map, 'Required native generation-only premise; metadata changes may differ'
+            else:
+                publication['dashboard'] = engine.refresh_lp_dashboard_snapshot()
+                assert publication['dashboard']['state'] == 'ready', publication
+                publication['tick'] = engine.lp_tick()
+                current = store.lp_session(sid)
+                publication['current_owned_session'] = deepcopy(current)
+                publication['current_trade_revision'] = store.lp_session_revision(sid, trading=True)
+                assert publication['current_trade_revision'] != old_map[sid], 'Required changed-owner premise'
+                history = current['order_history']['original-monitor']
+                assert history['status'] in ('UNKNOWN', 'CANCELED', 'CANCELLED', 'FILLED', 'MATCHED')
+                assert Decimal(history['size_matched']) == 8
+                assert Decimal(current['buy_filled_quantity']) == Decimal(current['residual_quantity']) == 8
+                assert Decimal(current['buy_cost']) == Decimal('3.20')
+                assert current['position_reconciled'] is True
+                assert Decimal(newer['positions'][0]['size']) == 8
+                assert Decimal(newer['positions'][0]['average_price']) == Decimal('.40')
+                assert Decimal(newer['positions'][0]['size']) * Decimal(newer['positions'][0]['average_price']) == Decimal('3.20')
+            publication['before_release_session'] = deepcopy(store.lp_session(sid))
+            publication['before_release_audits'] = deepcopy(store.lp_actions(sid))
+            publication['before_release_public'] = deepcopy(engine.lp_auto_state())
+        finally:
+            release.set()
+            try:
+                state = running.result(timeout=5)
+            finally:
+                (tmp_path / 'R2-native-public-proof.json').write_text(json.dumps(dict(
+                    rows=rows_observed, wire_reads=wire_reads, lookups=lookups,
+                    generation_commits=generations_committed, publication=publication,
+                    state=engine.lp_auto_state(), sessions=store.lp_sessions(),
+                    audits={s['session_id']: store.lp_actions(s['session_id']) for s in store.lp_sessions()},
+                    posts=[p.token_id for p in account.posts], cancels=account.cancels,
+                    market_orders=account.market_orders, errors=errors), default=str, indent=2))
+    assert not errors, errors
+    assert rows_observed[0]['returned_rows_identity'] == rows_observed[0]['native_rows_identity']
+    assert account.posts == [] and account.cancels == []
+    assert store.lp_actions(sid) == publication['before_release_audits'] == original_audits
+    assert state['active_plan'] is None
+    assert state['last_round']['actions'] == []
+    assert state['last_round']['completed_at'] and state['last_round']['reason'] == 'account_round_invalid'
+    completed = datetime.fromisoformat(state['last_round']['completed_at'])
+    assert state['plan_wait']['kind'] == 'round'
+    assert datetime.fromisoformat(state['plan_wait']['deadline']) == completed + timedelta(seconds=30)
+    after = store.lp_session(sid)
+    assert after['account_id'] == original['account_id'] and after['owned_order_ids'] == original['owned_order_ids']
+    if schedule == 'filled_owner_publication':
+        assert after['order_history'] == publication['before_release_session']['order_history']
+        assert Decimal(after['buy_filled_quantity']) == Decimal(after['residual_quantity']) == 8
+        assert Decimal(after['buy_cost']) == Decimal('3.20') and after['position_reconciled'] is True
+    assert state['funds']['as_of'] == publication['before_release_public']['funds']['as_of']

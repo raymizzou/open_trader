@@ -1666,7 +1666,9 @@ class LPAutoPool:
                                ranking_book_at=direction['book']['received_at'], ranking_reward_at=direction['reward_checked_at'])
                 # The selected observation is also the entry protection baseline.
                 # Freeze complete market validation here, before approval.
-                snapshot = dict(account=deepcopy(account), market=deepcopy(direction['market']),
+                snapshot = dict(account={key: deepcopy(account.get(key)) for key in
+                    ('wallet_address', 'account_id', 'authenticated', 'trade_generation',
+                     'checked_at', 'read_started_at', 'read_ended_at')}, market=deepcopy(direction['market']),
                     book=deepcopy(direction['book']), candidate_direction=deepcopy(direction))
                 request = self.lp._normalize_request({**pending, 'candidate_policy': 'best_bid_minimum',
                     'candidate_bid_level': bid_level, 'review_at': _next_review_at(self._now())})
@@ -3376,9 +3378,9 @@ class LPAutoPool:
             with self._account_refresh_lock:
                 if attempt == self._account_refresh_attempt:
                     self._current_account = None
-                    if waiting:
-                        # Immutable state lets read-only projections compare
-                        # durable publication without waiting for network I/O.
+                    if waiting or planning:
+                        # Automatic planning owns its attempt-local failure;
+                        # healthy planning clears this wait, not shared diagnostics.
                         self._account_facts_wait = dict(attempt=attempt, baseline=baseline, baseline_times=baseline_times, reason=reason)
                     else:
                         self.lp._account_order_sync_error = reason
@@ -4099,6 +4101,18 @@ class LPAutoPool:
             # already free in this observation authorizes this cycle's BUYs.
             free_slots = max(0, state['target_buy_count'] - state['slots']['occupied'])
             free_capital = _decimal(state['funds']['spendable_usd'])
+            original_accounts = ([observation['account']] if observation is not None else
+                [row['ranking_account'] for row in targets + victims if row.get('ranking_account') is not None])
+            reservations = self._ranking_reservations((), observation=observation)
+            if not original_accounts:
+                free_capital = ZERO
+            for account in original_accounts:
+                wallet = _account_after_reservations(account, reservations)
+                if wallet is None:
+                    free_capital = ZERO
+                    break
+                free_capital = max(ZERO, min(free_capital,
+                    _decimal(wallet['balance']), _decimal(wallet['allowance'])))
             for action in plan['actions']:
                 if action['kind'] != 'buy':
                     continue

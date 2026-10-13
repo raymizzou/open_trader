@@ -158,40 +158,73 @@ def test_default_configure_enable_and_idempotent_round(tmp_path):
         e.lp_auto_configure(dict(budget_usd='120',target_buy_count=5))
 
 
-@pytest.mark.parametrize('reasons, expected', [
-    (['market_read_capacity'], 'market_read_capacity'),
-    (['market_read_timeout'], 'market_read_timeout'),
-    (['market_read_cooling_down'], 'market_read_cooling_down'),
-    (['market_read_in_progress'], 'market_read_in_progress'),
-    (['market_read_capacity', 'market_read_timeout'], 'market_read_capacity'),
-    (['market_read_capacity', 'strategy_funds_insufficient'], 'market_read_capacity'),
-    (['market_read_capacity', None], 'market_read_capacity'),
-    (['market_read_capacity', None, 'market_read_timeout'], 'market_read_capacity'),
-])
-def test_round_summary_preserves_read_refusals_without_hiding_other_outcomes(tmp_path, monkeypatch, reasons, expected):
-    e, exchange, _, _ = setup(tmp_path, len(reasons))
-    e.lp_auto_configure(dict(budget_usd='100', target_buy_count=1 if reasons == ['market_read_capacity', None] else len(reasons)))
-    e.lp_auto_set_desired_running(True)
-    pool = e._lp_auto_pool()
-    submit = pool._submit
-    attempted = []
-
-    def controlled(row, *args, **kwargs):
-        reason = reasons[len(attempted)]
-        attempted.append(row['condition_id'])
-        if reason is not None:
-            raise ValueError(reason)
-        return submit(row, *args, **kwargs)
-
-    monkeypatch.setattr(pool, '_submit', controlled)
-    state = e.lp_auto_run_once(round_id='read-summary')
-    planned = reasons[:state['target_buy_count']]
-    assert len(attempted) == len(planned)
-    assert state['last_round']['reason'] == expected
-    assert [a.get('wait_reason') or a.get('reason') for a in state['last_round']['actions']] == planned
-    assert [a['state'] for a in state['last_round']['actions']] == [('pending' if r and r.startswith('market_read_') else 'rejected' if r else 'success') for r in planned]
-    assert not state['last_round']['completed_at']
-    assert len(exchange.posts) == planned.count(None)
+@pytest.mark.parametrize('refusal', ['capacity','timeout','cooling_down','in_progress'])
+def test_planning_read_refusals_preserve_native_worker_lifetime(tmp_path, monkeypatch, refusal):
+    import json,threading
+    from copy import deepcopy
+    monkeypatch.setitem(globals(),'NOW',NOW)
+    e,exchange,lp,store=setup(tmp_path,1)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1));e.lp_auto_set_desired_running(True)
+    tokens=('Y','Z') if refusal=='capacity' else ('m00',)
+    entered={t:Event() for t in tokens};completed={t:Event() for t in tokens};release=Event()
+    native_threads,calls,signatures,posts,cancels={},[],[],[],[]
+    metadata,sign,post=exchange.lp_market_metadata_fresh,exchange.lp_create_limit_order,exchange.lp_post_order
+    def blocked(ids,**kwargs):
+        for token in tokens:
+            if token in ids:
+                native_threads[token]=threading.current_thread();calls.append(dict(token=token,thread=threading.get_ident()))
+                try:
+                    entered[token].set();assert release.wait(5),'Independent actual external read watchdog'
+                    return metadata(ids,**kwargs)
+                finally:completed[token].set()
+        return metadata(ids,**kwargs)
+    def signer(**kwargs):signatures.append(deepcopy(kwargs));return sign(**kwargs)
+    def poster(value):posts.append(deepcopy(value));return post(value)
+    monkeypatch.setattr(exchange,'lp_market_metadata_fresh',blocked)
+    monkeypatch.setattr(exchange,'lp_create_limit_order',signer);monkeypatch.setattr(exchange,'lp_post_order',poster)
+    monkeypatch.setattr(exchange,'cancel_order',lambda oid:cancels.append(oid),raising=False)
+    timeout=lp._market_read_timeout;lp._market_read_timeout=.25
+    preview_results=[];observations=[]
+    try:
+        with ThreadPoolExecutor(2) as workers:
+            if refusal!='timeout':
+                previews=[workers.submit(e.lp_candidate_preview,dict(market_id=t,condition_id=t,token_id=t,outcome='YES')) for t in tokens]
+                assert all(x.wait(3) for x in entered.values())
+                preview_results=[f.result(timeout=3) for f in previews]
+                assert all(x['state']=='rejected' for x in preview_results)
+                assert not any(x.is_set() for x in completed.values()) and all(t.is_alive() for t in native_threads.values())
+                if refusal=='cooling_down':
+                    release.set()
+                    assert completed['m00'].wait(3)
+                    native_threads['m00'].join(5);assert not native_threads['m00'].is_alive()
+            state=e.lp_auto_run_once(round_id='actual-planning-'+refusal);observations.append(deepcopy(state))
+            expected='market_read_'+refusal
+            assert state['last_round']['candidate_filter']['recheck_reasons']=={expected:1}
+            assert state['last_round']['blocked']==[dict(condition_id='m00',token_id='m00',reason=expected)]
+            assert state['last_round']['reason']=='candidates_or_funds_insufficient'
+            assert state['active_plan'] is None and state['last_round']['completed_at'] and state['last_round']['actions']==[]
+            assert store.lp_sessions()==[] and state['intents']==[] and state['slots']['occupied']==0
+            assert Decimal(state['funds']['buy_reserved_usd'])==0 and signatures==posts==exchange.posts==cancels==[]
+            assert [x['token'] for x in calls]==list(tokens) if refusal!='capacity' else sorted(x['token'] for x in calls)==sorted(tokens)
+            assert all(x.is_set() for x in entered.values())
+            if refusal!='cooling_down':
+                assert not any(x.is_set() for x in completed.values()) and all(t.is_alive() for t in native_threads.values())
+            end=datetime.fromisoformat(state['last_round']['completed_at'])
+            assert state['plan_wait']['kind']=='round' and datetime.fromisoformat(state['plan_wait']['deadline'])==end+timedelta(seconds=30)
+            counts=len(calls)
+            for elapsed in (1,29):
+                monkeypatch.setitem(globals(),'NOW',end+timedelta(seconds=elapsed))
+                assert e.lp_auto_run_once()['last_round']==state['last_round']
+                assert len(calls)==counts and signatures==posts==exchange.posts==cancels==[]
+    finally:
+        release.set();lp._market_read_timeout=timeout
+        for token in tokens:
+            if token in native_threads:
+                assert completed[token].wait(3);native_threads[token].join(5);assert not native_threads[token].is_alive()
+        (tmp_path/'CI-H-read-native-proof.json').write_text(json.dumps(dict(refusal=refusal,preview_results=preview_results,
+            observations=observations,current=e.lp_auto_state(),calls=calls,
+            threads={k:dict(ident=t.ident,alive=t.is_alive()) for k,t in native_threads.items()},
+            signatures=signatures,posts=posts,cancels=cancels,sessions=store.lp_sessions()),default=str,indent=2))
 
 
 @pytest.mark.parametrize('case, expected', [
@@ -216,76 +249,88 @@ def test_round_summary_keeps_existing_admission_and_empty_reasons(tmp_path, monk
         assert state['last_round']['blocked'] == [dict(condition_id='m00', token_id='m00', reason='rotation_budget_insufficient')]
 
 
-def test_resource_wait_keeps_summary_priority_over_background_financial_failure(tmp_path, monkeypatch):
-    import fcntl
+def test_current_read_failure_does_not_reopen_ended_resource_attempt(tmp_path, monkeypatch):
+    import fcntl,json,threading
     from copy import deepcopy
-    e, exchange, lp, _ = setup(tmp_path, 2)
-    e.lp_auto_configure(dict(budget_usd='100', target_buy_count=2))
+    monkeypatch.setitem(globals(),'NOW',NOW)
+    e,exchange,lp,store=setup(tmp_path,2)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
     e.lp_auto_set_desired_running(True)
     with e._lock_path.open('a+') as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        e.lp_auto_run_once()
-    original = deepcopy(e.lp_auto_state()['active_plan'])
-    assert len(original['targets']) == len(original['actions']) == 2
-    metadata = exchange.lp_market_metadata_fresh
-    blockers = ('Y', 'Z')
-    entered = {token: Event() for token in blockers}
-    completed = {token: Event() for token in blockers}
-    release = Event()
-    def blocked(ids, **kwargs):
+        fcntl.flock(handle.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+        first=e.lp_auto_run_once()
+    original=deepcopy(first['last_round'])
+    assert len(original['targets'])==len(original['actions'])==2
+    assert all(Decimal(t['price'])==Decimal('.40') and Decimal(t['quantity'])==20 for t in original['targets'])
+    assert first['active_plan'] is None and original['completed_at']
+    assert all(a['state']=='not_sent' and a['reason']=='execution_lock' for a in original['actions'])
+    audits={s['session_id']:deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
+    assert all(a['post_started'] is False for rows in audits.values() for a in rows)
+    completed_at=datetime.fromisoformat(original['completed_at'])
+    assert datetime.fromisoformat(first['plan_wait']['deadline'])==completed_at+timedelta(seconds=30)
+    metadata=exchange.lp_market_metadata_fresh
+    blockers=('Y','Z');entered={t:Event() for t in blockers};completed={t:Event() for t in blockers};release=Event()
+    native_threads,calls,financial_reads={ },[],[]
+    def blocked(ids,**kwargs):
         for token in blockers:
             if token in ids:
+                native_threads[token]=threading.current_thread();calls.append(dict(token=token,thread=threading.get_ident()))
                 try:
-                    entered[token].set()
-                    assert release.wait(5), 'Independent underlying resource watchdog'
-                    return metadata(ids, **kwargs)
-                finally:
-                    completed[token].set()
-        return metadata(ids, **kwargs)
-    monkeypatch.setattr(exchange, 'lp_market_metadata_fresh', blocked)
-    lp._market_read_timeout = .25
-    with ThreadPoolExecutor(2) as workers:
-        previews = [workers.submit(e.lp_candidate_preview,
-            dict(market_id=token, condition_id=token, token_id=token, outcome='YES')) for token in blockers]
-        try:
-            for token in blockers:
-                assert entered[token].wait(3)
-            for preview in previews:
-                assert preview.result(timeout=3)['state'] == 'rejected'
-            assert not any(event.is_set() for event in completed.values())
-            failed = lp.register_account_snapshot({**_fresh_registration_bundle(exchange, lp), 'open_orders_complete': False})
-            assert failed['state'] == 'skipped' and failed['reason'] == 'account_snapshot_incomplete', failed
-            assert 'account_order_sync_unknown' in e.lp_auto_state()['admission_block_reasons']
-            forbidden = []
-            account = exchange.lp_account_snapshot
-            def no_execution_finance():
-                forbidden.append(NOW)
-                return account()
-            monkeypatch.setattr(exchange, 'lp_account_snapshot', no_execution_finance)
-            lp._market_read_timeout = 10
-            advance_auto_wait(e, monkeypatch, refresh=False)
-            state = e.lp_auto_run_once()
-            assert state['last_round']['round_id'] == original['round_id']
-            assert state['active_plan']['targets'] == original['targets']
-            assert state['last_round']['reason'] == 'market_read_capacity'
-            assert state['plan_wait']['kind'] == 'order'
-            actions = state['last_round']['actions']
-            assert [a['action_id'] for a in actions] == [a['action_id'] for a in original['actions']]
-            assert all(a['state'] == 'pending' and not a.get('request_state') for a in actions)
-            assert actions[0]['wait_reason'] == 'market_read_capacity'
-            assert exchange.posts == [] and forbidden == []
-            assert not any(event.is_set() for event in completed.values())
-        finally:
-            lp._market_read_timeout = 10
-            release.set()
-            for token in blockers:
-                assert completed[token].wait(3)
-            for preview in previews:
-                preview.result(timeout=3)
+                    entered[token].set();assert release.wait(5),'Independent underlying resource watchdog'
+                    return metadata(ids,**kwargs)
+                finally:completed[token].set()
+        return metadata(ids,**kwargs)
+    monkeypatch.setattr(exchange,'lp_market_metadata_fresh',blocked)
+    timeout=lp._market_read_timeout;lp._market_read_timeout=.25
+    previews=[];evidence={}
+    try:
+        with ThreadPoolExecutor(2) as workers:
+            previews=[workers.submit(e.lp_candidate_preview,dict(market_id=t,condition_id=t,token_id=t,outcome='YES')) for t in blockers]
+            try:
+                assert all(event.wait(3) for event in entered.values())
+                preview_results=[f.result(timeout=3) for f in previews]
+                assert all(x['state']=='rejected' for x in preview_results)
+                assert not any(event.is_set() for event in completed.values()) and all(t.is_alive() for t in native_threads.values())
+                failed=lp.register_account_snapshot({**_fresh_registration_bundle(exchange,lp),'open_orders_complete':False})
+                assert failed['state']=='skipped' and failed['reason']=='account_snapshot_incomplete'
+                assert 'account_order_sync_unknown' in e.lp_auto_state()['admission_block_reasons']
+                def unavailable():
+                    financial_reads.append(dict(at=NOW,active=bool(e.lp_auto_state()['active_plan'])))
+                    raise TimeoutError('new current financial observation unavailable')
+                monkeypatch.setattr(exchange,'lp_account_snapshot',unavailable)
+                def current(**kwargs):return exchange.lp_account_snapshot()
+                monkeypatch.setattr(exchange,'lp_account_snapshot_shared',current,raising=False)
+                advance_auto_wait(e,monkeypatch,refresh=False)
+                state=e.lp_auto_run_once()
+                evidence.update(previews=preview_results,incomplete=failed,current=deepcopy(state))
+                assert len(financial_reads)==1 and financial_reads[0]['active'] is False
+                assert state['last_round']['round_id']!=original['round_id']
+                assert state['last_round']['reason']=='account_order_sync_unknown'
+                assert state['active_plan'] is None and state['last_round']['actions']==[] and state['last_round']['completed_at']
+                end=datetime.fromisoformat(state['last_round']['completed_at'])
+                assert state['plan_wait']['kind']=='round' and datetime.fromisoformat(state['plan_wait']['deadline'])==end+timedelta(seconds=30)
+                assert exchange.posts==[] and {sid:store.lp_actions(sid) for sid in audits}==audits
+                assert not any(event.is_set() for event in completed.values())
+                for elapsed in (1,29):
+                    monkeypatch.setitem(globals(),'NOW',end+timedelta(seconds=elapsed))
+                    assert e.lp_auto_run_once()['last_round']==state['last_round']
+                    assert len(financial_reads)==1 and exchange.posts==[] and {sid:store.lp_actions(sid) for sid in audits}==audits
+            finally:
+                release.set()
+                for token in blockers:assert completed[token].wait(3)
+                for preview in previews:preview.result(timeout=3)
+                for thread in native_threads.values():thread.join(5);assert not thread.is_alive()
+    finally:
+        lp._market_read_timeout=timeout
+        release.set()
+        (tmp_path/'CI-H-resource-native-proof.json').write_text(json.dumps(dict(evidence=evidence,original=original,
+            original_audits=audits,current=e.lp_auto_state(),calls=calls,financial_reads=financial_reads,
+            threads={k:dict(ident=t.ident,alive=t.is_alive()) for k,t in native_threads.items()},posts=exchange.posts),default=str,indent=2))
 
 
 
 def test_full_pool_manual_exclusion_unknown_isolated_and_restart(tmp_path):
+    from collections import Counter
     e,x,lp,s=setup(tmp_path,13)
     x.orders=[dict(order_id=f'manual{i}',condition_id=f'm{i:02}',token_id=f'm{i:02}',side='BUY',
                    status='LIVE',price='.4',original_size='1',size_matched='0') for i in range(11)]
@@ -294,7 +339,7 @@ def test_full_pool_manual_exclusion_unknown_isolated_and_restart(tmp_path):
     x.fail=True
     r=e.lp_auto_run_once()
     assert len(x.posts)==2, r['last_round']
-    assert [p['token_id'] for p in x.posts] == ['m11', 'm12']
+    assert Counter(p['token_id'] for p in x.posts) == Counter(['m11', 'm12'])
     assert r['slots']['occupied']==2
     assert 'submission_unknown' in r['block_reasons']
     e.lp_auto_run_once()
@@ -394,63 +439,63 @@ def test_pause_during_signing_prevents_post(tmp_path):
     sid=r['intents'][0]['session_id']
     session=s.lp_session(sid)
     action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    assert action['state'] == 'rejected'
+    assert action['session_id'] == sid and action['token_id'] == session['token_id']
     for fact in (session,action):
-        assert fact['submit_stage']=='pre_send_rejected'
+        assert fact['submit_stage']=='prepare_failed'
         assert fact['post_started'] is False
         assert fact['submit_post_started_at'] is None
 
 
-def test_callback_read_failure_before_post_releases_reservation(tmp_path, monkeypatch):
+def test_planning_book_failure_creates_no_send_reservation(tmp_path, monkeypatch):
+    import json
     from copy import deepcopy
-    e,x,lp,s=setup(tmp_path)
+    monkeypatch.setitem(globals(),'NOW',NOW)
+    e,x,lp,s=setup(tmp_path,1)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
-    sign,books=x.lp_create_limit_order,x.lp_order_books
-    signed_objects,failures=[],[]
+    sign,post,account=x.lp_create_limit_order,x.lp_post_order,x.lp_account_snapshot
+    signatures,posts,reads,failures,cancels=[],[],[],[],[]
     def signed(**kwargs):
-        value=sign(**kwargs)
-        signed_objects.append(value)
-        return value
+        signatures.append(deepcopy(kwargs));return sign(**kwargs)
+    def posted(value):
+        posts.append(deepcopy(value));return post(value)
     def read(ids,**kwargs):
-        if signed_objects:
-            failures.append(tuple(ids))
-            raise RuntimeError('external final market read failed')
-        return books(ids,**kwargs)
+        try: raise RuntimeError('external planning market read failed')
+        except RuntimeError as exc:
+            failures.append(dict(ids=tuple(ids),type=type(exc).__name__,message=str(exc)));raise
+    def financial():
+        packet=account();reads.append(dict(packet=deepcopy(packet),active=bool(e.lp_auto_state()['active_plan'])));return packet
     monkeypatch.setattr(x,'lp_create_limit_order',signed)
+    monkeypatch.setattr(x,'lp_post_order',posted)
     monkeypatch.setattr(x,'lp_order_books',read)
-    observed=[]
-    account=x.lp_account_snapshot
-    def planning_account():
-        value=account()
-        observed.append(e.lp_auto_state()['funds']['as_of'])
-        return value
-    monkeypatch.setattr(x,'lp_account_snapshot',planning_account)
-    cancels=[]
-    monkeypatch.setattr(x,'cancel_order',lambda oid: cancels.append(oid),raising=False)
-    r=e.lp_auto_run_once()
-    sid=r['intents'][0]['session_id']
-    session=s.lp_session(sid)
-    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
-    assert len(signed_objects)==1 and failures and not x.posts
-    assert session['state']=='entry_rejected'
-    assert session['submit_stage']=='pre_send_rejected'
-    assert session['reason']=='book_unknown'
-    assert session['submit_error_chain']==['AutoEntryNotSent','ValueError','RuntimeError']
-    assert session['post_started'] is False
-    assert action['submit_stage']=='pre_send_rejected' and action['reason']=='book_unknown'
-    assert action['post_started'] is False and action['submit_error_chain']==['AutoEntryNotSent','ValueError','RuntimeError']
-    assert action['token_id']==session['token_id']=='m00'
-    assert not action.get('order_id') and not session.get('entry_order_id')
-    assert x.posts==[] and r['last_round']['reason']=='book_unknown' and r['last_round']['completed_at']
-    assert r['slots']['occupied']==0
-    assert r['funds']['status']=='known'
-    assert r['funds']['as_of']==observed[-1] and observed[-1]
-    assert Decimal(r['funds']['buy_reserved_usd'])==0 and cancels==[]
-    original_audit=deepcopy(s.lp_actions(sid))
-    r=e.lp_auto_reconcile_unknown()
-    assert r['funds']['status']=='known'
-    e.lp_auto_run_once()
-    assert s.lp_actions(sid)==original_audit and x.posts==cancels==[]
+    monkeypatch.setattr(x,'lp_account_snapshot',financial)
+    monkeypatch.setattr(x,'cancel_order',lambda oid:cancels.append(oid),raising=False)
+    try:
+        state=e.lp_auto_run_once(round_id='planning-book-failure')
+        assert len(failures)==1 and failures[0]['ids']==('m00',) and failures[0]['type']=='RuntimeError'
+        assert state['last_round']['candidate_filter']['recheck_reasons']=={'book_unknown':1}
+        assert state['last_round']['blocked']==[dict(condition_id='m00',token_id='m00',reason='book_unknown')]
+        assert state['active_plan'] is None and state['last_round']['completed_at']
+        assert state['last_round']['actions']==[] and s.lp_sessions()==[] and state['intents']==[]
+        assert state['slots']['occupied']==0 and Decimal(state['funds']['buy_reserved_usd'])==0
+        assert state['funds']['status']=='known' and state['funds']['as_of']
+        assert reads and all(not x['active'] for x in reads)
+        assert state['funds']['as_of']==reads[-1]['packet']['checked_at'].isoformat()
+        assert signatures==posts==x.posts==cancels==[]
+        completed=datetime.fromisoformat(state['last_round']['completed_at'])
+        assert state['plan_wait']['kind']=='round' and datetime.fromisoformat(state['plan_wait']['deadline'])==completed+timedelta(seconds=30)
+        original=deepcopy(state['last_round'])
+        e.lp_auto_reconcile_unknown()
+        counts=(len(reads),len(failures))
+        for elapsed in (1,29):
+            monkeypatch.setitem(globals(),'NOW',completed+timedelta(seconds=elapsed))
+            current=e.lp_auto_run_once()
+            assert current['last_round']==original and counts==(len(reads),len(failures))
+            assert signatures==posts==x.posts==cancels==[] and s.lp_sessions()==[]
+    finally:
+        (tmp_path/'CI-H-book-native-proof.json').write_text(json.dumps(dict(state=e.lp_auto_state(),reads=reads,
+            failures=failures,signatures=signatures,posts=posts,cancels=cancels,sessions=s.lp_sessions()),default=str,indent=2))
 
 
 def test_callback_lock_failure_before_post_releases_reservation(tmp_path):
@@ -709,24 +754,37 @@ def test_sync_manages_exchange_ids_without_precomputed_match(tmp_path, monkeypat
 
 
 def test_full_verified_sell_releases_slot_and_wakes_refill_beside_missing_identity(tmp_path, monkeypatch):
+    import json
     e,x,lp,s=setup(tmp_path,5)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=5))
     e.lp_auto_set_desired_running(True)
     initial=e.lp_auto_run_once()
-    completed=[i for i in initial['intents'] if i['order_id']=='o1'][0]
-    unknown=[i for i in initial['intents'] if i['order_id']=='o2'][0]
+    completed, = [i for i in initial['intents'] if i['token_id']=='m00']
+    unknown, = [i for i in initial['intents'] if i['token_id']=='m01']
+    completed_id = completed['order_id']
+    native_binding = {}
+    for intent in (completed, unknown):
+        session = s.lp_session(intent['session_id'])
+        assert session['entry_order_id'] == intent['order_id']
+        assert intent['order_id'] in session['owned_order_ids']
+        assert session['token_id'] == intent['token_id']
+        audit, = [a for a in s.lp_actions(intent['session_id']) if a.get('role') == 'entry']
+        assert audit['state'] == 'accepted' and audit['order_id'] == intent['order_id']
+        native_binding[intent['token_id']] = dict(intent=intent, session=session, audit=audit)
+    (tmp_path / 'CI-B-native-binding.json').write_text(json.dumps(native_binding, default=str, indent=2))
 
-    x.orders[0].update(status='FILLED',size_matched='20')
+    next(o for o in x.orders if o['order_id'] == completed_id).update(status='FILLED',size_matched='20')
     x.orders.append(dict(order_id='sell-full',token_id='m00',condition_id='m00',side='SELL',
                          status='FILLED',price='.25',original_size='20',size_matched='20'))
     x.trades=[dict(trade_id=f't{side}',status='CONFIRMED',matched_at=NOW.isoformat(),
                maker_orders=[dict(order_id=oid,token_id='m00',side=side,matched_amount='20',price=price,fee='0')])
-              for side,oid,price in [('BUY','o1','.40'),('SELL','sell-full','.25')]]
+              for side,oid,price in [('BUY',completed_id,'.40'),('SELL','sell-full','.25')]]
     s.lp_update_session(completed['session_id'],patch=dict(
-        passive_exit_order_id='sell-full',owned_order_ids=['o1','sell-full']))
+        passive_exit_order_id='sell-full',owned_order_ids=[completed_id,'sell-full']))
     lp.tick()
     x.orders[:] = [row for row in x.orders if row['order_id'] != 'sell-full']
     session=s.lp_session(completed['session_id'])
+    (tmp_path / 'CI-B-native-sell-public-proof.json').write_text(json.dumps(session, default=str, indent=2))
     receipt=session['order_history']['sell-full']
     s.lp_update_session(completed['session_id'],state='needs_attention',patch={
         'orders_terminal': False,
@@ -1030,11 +1088,11 @@ def test_new_external_buy_is_absorbed_by_next_plan(tmp_path, monkeypatch):
     original_plan = deepcopy(r['last_round'])
     assert {o['order_id'] for o in x.orders if o['status'] == 'LIVE'} == {'manual', 'o1'}
     completed = datetime.fromisoformat(r['last_round']['completed_at'])
-    monkeypatch.setattr(sys.modules[__name__], 'NOW', completed + timedelta(seconds=59))
+    monkeypatch.setattr(sys.modules[__name__], 'NOW', completed + timedelta(seconds=29))
     e.lp_auto_run_once()
     assert len(financial_reads) == 1 and len(x.posts) == 1 and cancels == []
     assert e.lp_auto_state()['last_round'] == original_plan
-    monkeypatch.setattr(sys.modules[__name__], 'NOW', completed + timedelta(seconds=60))
+    monkeypatch.setattr(sys.modules[__name__], 'NOW', completed + timedelta(seconds=30))
     state = e.lp_auto_run_once()
     assert len(financial_reads) > 1
     assert cancels == ['o1'] and len(x.posts) == 1
@@ -1335,16 +1393,26 @@ def test_signed_id_does_not_quarantine_venue_order_in_public_tick_and_stop(tmp_p
 
 
 def test_slow_deadline_cancel_does_not_block_other_fact_publication(tmp_path):
+    import json
     e,x,lp,s=setup(tmp_path,2)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
     e.lp_auto_set_desired_running(True)
     created=e.lp_auto_run_once()
     rows=created['intents']
     sid_a,sid_b=rows[0]['session_id'],rows[1]['session_id']
+    assert sid_a != sid_b
+    selected = s.lp_session(sid_a)
+    oid_a = selected['entry_order_id']
+    assert oid_a == rows[0]['order_id'] and oid_a in selected['owned_order_ids']
+    audit, = [a for a in s.lp_actions(sid_a) if a.get('role') == 'entry']
+    assert audit['state'] == 'accepted' and audit['order_id'] == oid_a
+    assert selected['token_id'] == rows[0]['token_id']
+    (tmp_path / 'CI-B-native-binding.json').write_text(json.dumps(dict(
+        selected=selected, audit=audit, original_intent=rows[0], independent=rows[1]), default=str, indent=2))
     s.lp_update_session(sid_a,patch=dict(review_at=NOW))
     entered,release=Event(),Event()
     def slow_cancel(order_id):
-        if order_id == 'o1':
+        if order_id == oid_a:
             entered.set()
             assert release.wait(5)
         return {'canceled':[order_id]}
@@ -1364,14 +1432,24 @@ def test_slow_deadline_cancel_does_not_block_other_fact_publication(tmp_path):
 
 
 def test_slow_public_lp_stop_does_not_block_other_fact_publication(tmp_path):
+    import json
     e,x,lp,s=setup(tmp_path,2)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
     e.lp_auto_set_desired_running(True)
     rows=e.lp_auto_run_once()['intents']
     sid_a,sid_b=rows[0]['session_id'],rows[1]['session_id']
+    assert sid_a != sid_b
+    selected = s.lp_session(sid_a)
+    oid_a = selected['entry_order_id']
+    assert oid_a == rows[0]['order_id'] and oid_a in selected['owned_order_ids']
+    audit, = [a for a in s.lp_actions(sid_a) if a.get('role') == 'entry']
+    assert audit['state'] == 'accepted' and audit['order_id'] == oid_a
+    assert selected['token_id'] == rows[0]['token_id']
+    (tmp_path / 'CI-B-native-binding.json').write_text(json.dumps(dict(
+        selected=selected, audit=audit, original_intent=rows[0], independent=rows[1]), default=str, indent=2))
     entered,release=Event(),Event()
     def slow_cancel(order_id):
-        if order_id == 'o1':
+        if order_id == oid_a:
             entered.set()
             assert release.wait(5)
         return {'canceled':[order_id]}

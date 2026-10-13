@@ -48,6 +48,7 @@ def test_timing_config_reaches_persistent_runtime_scheduler(tmp_path, monkeypatc
     from tests.test_lp_auto_plan_scheduler import restart_engine, at_deadline
     from datetime import datetime, timedelta
 
+    monkeypatch.setattr(pool, 'NOW', pool.NOW)
     runtime = runtime_for(tmp_path)
     engine, exchange, _, _ = plan_setup(tmp_path, monkeypatch, ('A', 'B', 'C', 'D', 'I'))
     from tests.test_lp_auto_plan_execution import install_order_result_reader
@@ -89,7 +90,7 @@ def test_timing_config_reaches_persistent_runtime_scheduler(tmp_path, monkeypatc
         at_deadline(monkeypatch, runtime.execution)
         assert runtime._lp_auto_scheduler.run_due()
         waiting = _response(base + root + 'state')[1]['plan_wait']
-        assert datetime.fromisoformat(waiting['deadline']) - datetime.fromisoformat(waiting['started_at']) == timedelta(seconds=5)
+        assert datetime.fromisoformat(waiting['deadline']) - datetime.fromisoformat(waiting['started_at']) == timedelta(seconds=90)
         runtime._lp_auto_scheduler = None
         assert runtime.lp_auto_state()['check_interval_seconds'] == 90
 

@@ -802,6 +802,126 @@ def test_older_pool_success_cannot_clear_newer_concurrent_wait(tmp_path, monkeyp
     ids=['known', 'unknown', 'original-size-mismatch'])
 def test_account_overcapacity_cancels_only_unfilled_extra_beside_partial_buy(
         tmp_path, monkeypatch, partial_status, mismatched_original_size):
+    import json
+    from datetime import datetime
+    monkeypatch.setattr(pool,'NOW',pool.NOW)
+    if partial_status == 'known':
+        from tests import test_lp_auto_rotation as rotation
+        from tests.test_lp_auto_plan_execution import install_order_result_reader
+        engine,exchange,lp,store = rotation.setup(tmp_path,monkeypatch,count=3,target=1)
+        result_reader = install_order_result_reader(exchange,monkeypatch)
+        original_order = deepcopy(next(o for o in exchange.orders if o['order_id'] == 'o1'))
+        original_sid = engine.lp_auto_state()['intents'][0]['session_id']
+        entry_audits = deepcopy(store.lp_actions(original_sid))
+        partial = dict(order_id='partial-buy',token_id='m01',condition_id='m01',side='BUY',status='LIVE',
+            price='.4',original_size='20',size_matched='1',fill_quantity_known=True)
+        exchange.orders.append(partial)
+        exchange.positions=[dict(token_id='m01',condition_id='m01',size='1',average_price='.40')]
+        for row in exchange.orders: row['fill_quantity_known']=True
+        exchange.trades=[dict(trade_id='partial-maker-fill',status='CONFIRMED',trader_side='MAKER',
+            taker_order_id='outside-taker',token_id='m01',condition_id='m01',side='BUY',size='1',price='.40',
+            fee='0',timestamp=pool.NOW,match_time=pool.NOW,maker_orders=[dict(order_id='partial-buy',
+                token_id='m01',side='BUY',price='.40',matched_amount='1',fee='0',maker_address='test-wallet')])]
+        store.lp_create_session('partial-session','manual-partial',state='entry_open',payload=dict(
+            account_id='test-wallet',condition_id='m01',token_id='m01',market_id='m01',outcome='YES',
+            price='.4',quantity='20',entry_order_id='partial-buy',owned_order_ids=['partial-buy'],
+            order_history={'partial-buy':partial},buy_filled_quantity='1',residual_quantity='1'))
+        evidence=dict(full_packets=[],result_packets=[],plans=[],states=[],publications=[])
+        def full(*,max_age_seconds=0,trade_generation_provider=None):
+            started=pool.NOW
+            pool.NOW += timedelta(microseconds=1)
+            packet=pool._fresh_registration_bundle(exchange,lp)
+            packet.update(read_started_at=started,read_ended_at=pool.NOW,checked_at=pool.NOW,
+                open_orders=deepcopy([o for o in exchange.orders if o['status']=='LIVE']),
+                positions=deepcopy(exchange.positions),raw_trades=deepcopy(exchange.trades))
+            if trade_generation_provider is not None: packet['trade_generation']=trade_generation_provider()
+            evidence['full_packets'].append(deepcopy(packet))
+            return packet
+        def results(request):
+            evidence['plans'].append(deepcopy(engine.lp_auto_state()['active_plan']))
+            packet=result_reader(request)
+            if mismatched_original_size:
+                for row in packet['orders']+packet['open_orders']:
+                    if row['order_id']=='partial-buy': row['original_size']='21'
+            evidence['result_packets'].append(deepcopy(dict(request=request,packet=packet)))
+            return packet
+        monkeypatch.setattr(exchange,'lp_account_snapshot_shared',full,raising=False)
+        monkeypatch.setattr(exchange,'lp_order_result_snapshot',results)
+        def capture(label):
+            state=engine.lp_auto_state();evidence['states'].append(deepcopy(dict(label=label,state=state)));return state
+        try:
+            pool.NOW += timedelta(microseconds=1)
+            packet=full(trade_generation_provider=store.lp_trade_generation)
+            publication=lp.register_account_snapshot(packet);evidence['publications'].append(deepcopy(publication))
+            assert publication['state']=='registered',publication
+            before=capture('truthful-first-public-authority')
+            assert before['slots']['occupied']==2 and before['target_buy_count']==1
+            assert Decimal(before['funds']['buy_reserved_usd'])==Decimal('15.60')
+            assert Decimal(before['funds']['inventory_cost_usd'])==Decimal('.40')
+            partial_fact,=[o for o in before['account_buys'] if o['order_id']=='partial-buy']
+            assert Decimal(partial_fact['original_quantity'])==20 and Decimal(partial_fact['filled_quantity'])==1
+            assert Decimal(partial_fact['quantity'])==19 and Decimal(partial_fact['reserved_usd'])==Decimal('7.60')
+            assert len(exchange.posts)==1 and store.lp_actions(original_sid)==entry_audits
+            advance_auto_wait(engine,monkeypatch)
+            state=engine.lp_auto_run_once();capture('overcapacity-original-attempt-complete')
+            assert state['slots']['occupied']==2 and Decimal(state['funds']['inventory_cost_usd'])==Decimal('.40')
+            assert len(exchange.posts)==1 and not store.lp_session('partial-session').get('entry_cancel_requested')
+            assert state['active_plan'] is None and state['last_round']['completed_at']
+            assert state['plan_wait']['kind']=='round'
+            assert datetime.fromisoformat(state['plan_wait']['deadline'])==datetime.fromisoformat(state['last_round']['completed_at'])+timedelta(seconds=30)
+            if mismatched_original_size:
+                assert exchange.cancels==[] and state['last_round']['reason']=='target_filled'
+                assert Decimal(state['funds']['buy_reserved_usd'])==Decimal('15.60')
+                cancel,=[a for a in state['last_round']['actions'] if a['kind']=='cancel']
+                assert cancel['order_id']=='o1' and cancel['state']=='not_sent' and cancel['reason']=='owned_order_identity_mismatch'
+                retained,=[t for t in evidence['plans'][0]['targets'] if t['token_id']=='m01']
+                assert Decimal(retained['original_quantity'])==20 and Decimal(retained['quantity'])==19
+                assert any(Decimal(o['original_size'])==21 for x in evidence['result_packets'] for o in x['packet']['orders'] if o['order_id']=='partial-buy')
+                assert store.lp_actions(original_sid)==entry_audits
+            else:
+                assert exchange.cancels==['o1'] and state['slots']['canceling']==state['slots']['active']==1
+                cancel_audits=deepcopy(store.lp_actions(original_sid))
+                cancel,=[a for a in cancel_audits if a.get('role')=='reconciliation_cancel']
+                assert cancel['state']=='accepted' and cancel['order_id']=='o1'
+                original_live=next(o for o in exchange.orders if o['order_id']=='o1')
+                original_live.update(status='CANCELED',size_matched='0')
+                advance_auto_wait(engine,monkeypatch)
+                later=full(trade_generation_provider=store.lp_trade_generation)
+                assert later['read_started_at']>packet['read_ended_at']
+                publication=lp.register_account_snapshot(later);evidence['publications'].append(deepcopy(publication))
+                assert publication['state']=='registered',publication
+                settled=engine.lp_auto_run_once();capture('later-current-terminal-authority')
+                assert settled['slots']['occupied']==1
+                assert Decimal(settled['funds']['buy_reserved_usd'])==Decimal('7.60')
+                assert Decimal(settled['funds']['inventory_cost_usd'])==Decimal('.40')
+                assert exchange.cancels==['o1'] and len(exchange.posts)==1
+                assert store.lp_actions(original_sid)==cancel_audits
+                assert not store.lp_session('partial-session').get('entry_cancel_requested')
+                terminal_result, = [x for x in evidence['result_packets'] if any(
+                    o['order_id']=='o1' and o['status']=='CANCELED' for o in x['packet']['orders'])]
+                assert set(terminal_result['request']['owned_order_ids'])=={'o1'}
+                current_packet=terminal_result['packet']
+                assert current_packet['authenticated'] is True and current_packet['wallet_address']=='test-wallet'
+                assert all(current_packet[k] is True for k in ('open_orders_complete','positions_complete','trades_complete','pagination_complete'))
+                terminal, = [o for o in current_packet['orders'] if o['order_id']=='o1']
+                assert terminal['token_id']==terminal['condition_id']=='m00' and terminal['side']=='BUY'
+                assert terminal['status']=='CANCELED' and terminal['fill_quantity_known'] is True
+                assert Decimal(terminal['original_size'])==20 and Decimal(terminal['size_matched'])==0
+                assert Decimal(terminal['price'])==Decimal('.40')
+                assert current_packet['read_started_at']>evidence['result_packets'][0]['packet']['read_ended_at']
+                assert current_packet['read_started_at']<=current_packet['read_ended_at']
+                assert [o['order_id'] for o in settled['account_buys']]==['partial-buy']
+                owned=store.lp_session(original_sid)
+                assert owned['state']=='complete' and owned.get('yield_rotation_cancel_owners')=={}
+                assert owned.get('entry_cancel_requested') is False
+                evidence['historical_order_history_after_current_proof']=deepcopy(owned['order_history'])
+            assert not any(p['side']=='SELL' for p in exchange.posts)
+        finally:
+            evidence.update(current=engine.lp_auto_state(),original_order=original_order,entry_audits=entry_audits,
+                sessions=store.lp_sessions(),audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()},
+                posts=exchange.posts,cancels=exchange.cancels,orders=exchange.orders)
+            (tmp_path/'CI-G-partial-native-proof.json').write_text(json.dumps(evidence,default=str,indent=2))
+        return
     engine, exchange, lp, store, _ = rotation_pool(tmp_path, monkeypatch)
     from tests.test_lp_auto_plan_execution import install_order_result_reader
     result_reader = install_order_result_reader(exchange, monkeypatch)

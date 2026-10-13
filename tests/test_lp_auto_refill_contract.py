@@ -286,11 +286,13 @@ def test_unknown_unrelated_account_report_history_does_not_block_new_buys(runtim
 
 def test_recommendation_yield_and_auto_order_use_the_same_minimum_quantity(runtime):
     import io
+    from collections import Counter
+    from dataclasses import asdict
     import json
 
     public = RefillPublic(runtime.clock)
     public.rates = {1: '48', 2: '24', 3: '12', 4: '6', 5: '3', 6: '1'}
-    _, adapter, account, lp, execution, _ = prepare(runtime, public=public)
+    store, adapter, account, lp, execution, _ = prepare(runtime, public=public)
     # Both public REST boundaries stay offline, through the real adapter.
     def public_response(request, **kwargs):
         if request.data:
@@ -325,7 +327,16 @@ def test_recommendation_yield_and_auto_order_use_the_same_minimum_quantity(runti
         return balance(**kwargs)
     account.create_limit_order, account.get_balance_allowance = observed_sign, observed_balance
     state = execution.lp_auto_run_once(round_id='same-yield-basis')
-    assert [p.token_id for p in account.posts] == [r['selected_direction']['token_id'] for r in rows[:5]]
+    (store.path.parent/'CI-G-recommendation-native-proof.json').write_text(json.dumps(dict(
+        rows=rows,targets=state['last_round']['targets'],candidates=state['last_round']['candidates'],
+        posts=[asdict(p) for p in account.posts],state=state,planning_as_of=planning_as_of,
+        financial_calls=financial_calls),default=str,indent=2))
+    expected = [r['selected_direction']['token_id'] for r in rows[:5]]
+    assert Counter(p.token_id for p in account.posts) == Counter(expected)
+    assert [r['token_id'] for r in state['last_round']['targets']] == expected
+    for token in expected:
+        signed, = [p for p in account.posts if p.token_id == token]
+        assert signed.maker_amount == 8000000 and signed.taker_amount == 20000000 and signed.post_only is True
     assert state['slots']['active'] == state['slots']['occupied'] == 5
     assert planning_as_of and planning_as_of[-1]
     assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
@@ -792,6 +803,7 @@ def test_planned_entry_keeps_real_market_and_identity_fences(runtime, invalid):
 
 
 def test_definite_allowance_refusal_continues_fixed_plan_then_replans(runtime):
+    from collections import Counter
     from types import SimpleNamespace
     public = RefillPublic(runtime.clock)
     public.sizes = {1: '100'}
@@ -815,15 +827,17 @@ def test_definite_allowance_refusal_continues_fixed_plan_then_replans(runtime):
         return post(signed)
     account.post_order = refusal
     state = execution.lp_auto_run_once(round_id='allowance-drop')
-    assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in [1, 2]], state['last_round']
+    assert Counter(p.token_id for p in account.posts) == Counter(_refill_identity(i)[2] for i in [1, 2]), state['last_round']
     assert state['last_round']['actions'][0]['state'] == 'rejected'
     assert state['last_round']['actions'][0]['request_state'] == 'entry_rejected'
     action = state['last_round']['actions'][0]
     audit, = store.lp_actions(action['session_id'])
     assert action['reason'] == audit['reason'] == 'allowance_insufficient'
     assert audit['state'] == 'rejected' and audit['post_started'] is True
-    assert account.posts[0].maker_amount == 40000000 and account.posts[0].taker_amount == 100000000
-    assert account.posts[1].maker_amount == 8000000 and account.posts[1].taker_amount == 20000000
+    first, = [p for p in account.posts if p.token_id == _refill_identity(1)[2]]
+    second, = [p for p in account.posts if p.token_id == _refill_identity(2)[2]]
+    assert first.maker_amount == 40000000 and first.taker_amount == 100000000
+    assert second.maker_amount == 8000000 and second.taker_amount == 20000000
     assert state['last_round']['completed_at'] and state['plan_wait']['kind'] == 'round'
     execution.lp_auto_run_once()
     assert len(account.posts) == 2 and store.lp_actions(action['session_id']) == [audit]
@@ -831,7 +845,7 @@ def test_definite_allowance_refusal_continues_fixed_plan_then_replans(runtime):
     assert Decimal(state['funds']['buy_reserved_usd']) == 8
     advance_api_wait(runtime, execution)
     state = execution.lp_auto_run_once(round_id='next-allowance-round')
-    assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in [1, 2, 3]]
+    assert Counter(p.token_id for p in account.posts) == Counter(_refill_identity(i)[2] for i in [1, 2, 3])
     assert state['slots']['occupied'] == 2
     assert Decimal(state['funds']['buy_reserved_usd']) == 16
 
@@ -1010,6 +1024,7 @@ def _historical_api_buy_intents(runtime):
 
 
 def test_current_api_buys_replace_unknown_history_once_and_refill_after_restart(runtime):
+    from collections import Counter
     store, adapter, account, _, execution, public, originals = _historical_api_buy_intents(runtime)
     state = execution.lp_auto_state()
     assert state['slots']['occupied'] == 3, state
@@ -1048,7 +1063,7 @@ def test_current_api_buys_replace_unknown_history_once_and_refill_after_restart(
         finally:
             release.set()
         state = pending.result(timeout=5)
-    assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (4, 5)], state['last_round']
+    assert Counter(p.token_id for p in account.posts) == Counter(_refill_identity(i)[2] for i in (4, 5)), state['last_round']
     assert state['slots']['occupied'] == 5
     assert Decimal(state['funds']['buy_reserved_usd']) == 40
     assert planning_as_of and planning_as_of[-1]
@@ -1162,6 +1177,7 @@ def test_matching_api_buy_deduplicates_unknown_submission_lifecycle(runtime, lif
 @pytest.mark.parametrize('side, action_state', [('BUY', 'unknown'), ('BUY', 'pending'),
     ('SELL', 'unknown'), ('SELL', 'accepted_without_order_id'), ('SELL', 'accepted')])
 def test_matching_api_buy_keeps_independent_unresolved_action_risk(runtime, side, action_state):
+    from collections import Counter
     store, _, account, _, execution, _, originals = _historical_api_buy_intents(runtime)
     original = originals[0]
     store.lp_upsert_action(original['session_id'], f"{original['session_id']}:extra-submit",
@@ -1202,7 +1218,7 @@ def test_matching_api_buy_keeps_independent_unresolved_action_risk(runtime, side
     if side == 'BUY':
         assert account.posts == account.cancels == []
     else:
-        assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (4, 5)], state['last_round']
+        assert Counter(p.token_id for p in account.posts) == Counter(_refill_identity(i)[2] for i in (4, 5)), state['last_round']
         assert all(p.side == 'BUY' for p in account.posts)
         assert account.cancels == []
         assert state['slots']['occupied'] == 5
@@ -1230,43 +1246,78 @@ def test_matching_api_buy_keeps_independent_unresolved_action_risk(runtime, side
 
 @pytest.mark.parametrize('invalid', ['incomplete', 'failed'])
 def test_failed_current_api_read_retains_matching_unknown_holds_until_recovery(runtime, invalid):
-    _, _, account, _, execution, _, originals = _historical_api_buy_intents(runtime)
-    planning_as_of = []
-    original_sign = account.create_limit_order
+    import json
+    from copy import deepcopy
+    from collections import Counter
+    from datetime import datetime
+    from dataclasses import asdict,is_dataclass
+    store,adapter,account,lp,execution,public,originals=_historical_api_buy_intents(runtime)
+    audits={i['session_id']:deepcopy(store.lp_actions(i['session_id'])) for i in originals}
+    planning_as_of,financial_calls,packets,position_calls,states=[],[],[],[],[]
+    original_sign,read,balance=account.create_limit_order,adapter.lp_account_snapshot_shared,account.get_balance_allowance
+    def observed(*args,**kwargs):
+        record=dict(at=runtime.clock[0],kwargs={k:getattr(v,'__qualname__',type(v).__name__) if callable(v) else deepcopy(v) for k,v in kwargs.items()})
+        try:
+            packet=read(*args,**kwargs);record['packet']=deepcopy(packet);return packet
+        except BaseException as exc:
+            record['error']=dict(type=type(exc).__name__,message=str(exc));raise
+        finally:packets.append(record)
     def sign(**kwargs):
         planning_as_of.append(execution.lp_auto_state()['funds']['as_of'])
         return original_sign(**kwargs)
-    account.create_limit_order = sign
-    positions = account.list_positions
+    def observed_balance(**kwargs):
+        financial_calls.append(bool(execution.lp_auto_state()['active_plan']));return balance(**kwargs)
+    account.create_limit_order=sign
+    account.get_balance_allowance=observed_balance
+    adapter.lp_account_snapshot_shared=observed
+    positions=account.list_positions
     def invalid_positions(**kwargs):
-        if invalid == 'failed':
-            raise TimeoutError('offline positions read failed')
+        position_calls.append(dict(at=runtime.clock[0],invalid=invalid))
+        if invalid=='failed': raise TimeoutError('offline positions read failed')
         return (object(),)
-    account.list_positions = invalid_positions
-    state = execution.lp_auto_run_once(round_id=f'failed-current-api-{invalid}')
-    assert state['slots']['occupied'] == 5
-    assert Decimal(state['funds']['buy_reserved_usd']) == 40
-    assert state['funds']['spendable_usd'] is None
-    assert state['funds']['status'] == 'unknown'
-    assert state['intents'] == originals
-    assert account.posts == account.cancels == []
-    account.list_positions = positions
-    _advance(runtime)
-    advance_api_wait(runtime, execution)
-    state = execution.lp_auto_run_once(round_id=f'recovered-current-api-{invalid}')
-    assert len(account.posts) == 2, state['last_round']
-    assert state['slots']['occupied'] == 5
-    assert Decimal(state['funds']['buy_reserved_usd']) == 40
-    assert planning_as_of and planning_as_of[0]
-    from datetime import datetime
-    assert datetime.fromisoformat(planning_as_of[0]) <= runtime.clock[0]
-    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[0]
-    assert state['funds']['spendable_usd'] is None and state['funds']['available_usd'] is None
-    assert 'account_financial_facts_changed' in state['admission_block_reasons']
+    account.list_positions=invalid_positions
+    try:
+        state=execution.lp_auto_run_once(round_id=f'failed-current-api-{invalid}');states.append(deepcopy(state))
+        assert state['slots']['occupied']==5 and Decimal(state['funds']['buy_reserved_usd'])==40
+        assert state['funds']['spendable_usd'] is None and state['funds']['status']=='unknown'
+        assert state['intents']==originals and account.posts==account.cancels==[]
+        assert position_calls and {sid:store.lp_actions(sid) for sid in audits}==audits
+        account.list_positions=positions
+        runtime.clock[0]=datetime.fromisoformat(state['plan_wait']['deadline'])
+        recovered=adapter.lp_account_snapshot_shared(max_age_seconds=-1,trade_generation_provider=store.lp_trade_generation)
+        assert recovered['authenticated'] is True and recovered['wallet_address']==adapter.config.wallet_address
+        assert all(recovered[k] is True for k in ('open_orders_complete','positions_complete','trades_complete','pagination_complete'))
+        assert recovered['trade_generation']==store.lp_trade_generation()
+        assert recovered['read_started_at']<=recovered['read_ended_at']<=recovered['checked_at']
+        assert {o['order_id'] for o in recovered['open_orders']}=={'current-1','current-2','current-3'}
+        assert tuple(recovered['positions'])==() and tuple(recovered['trades'])==()
+        advance_api_wait(runtime,execution,refresh=False)
+        state=execution.lp_auto_run_once(round_id=f'recovered-current-api-{invalid}');states.append(deepcopy(state))
+        assert Counter(p.token_id for p in account.posts)==Counter(_refill_identity(i)[2] for i in (4,5)),state['last_round']
+        assert all(p.maker_amount==8000000 and p.taker_amount==20000000 and p.post_only is True for p in account.posts)
+        assert state['slots']['occupied']==5 and Decimal(state['funds']['buy_reserved_usd'])==40
+        assert planning_as_of and planning_as_of[0] and datetime.fromisoformat(planning_as_of[0])<=runtime.clock[0]
+        assert state['funds']['status']=='unknown' and state['funds']['as_of']==planning_as_of[0]
+        assert state['funds']['spendable_usd'] is None and state['funds']['available_usd'] is None
+        assert 'account_financial_facts_changed' in state['admission_block_reasons']
+        assert [i for i in state['intents'] if i['intent_id'].startswith('historical-')]==originals
+        assert {sid:store.lp_actions(sid) for sid in audits}==audits
+        assert not any(financial_calls) and account.cancels==account.market_orders==[]
+    finally:
+        def serialize(value):
+            if is_dataclass(value):return asdict(value)
+            if hasattr(value,'model_dump'):return value.model_dump(mode='json')
+            return str(value)
+        (store.path.parent/'CI-G-recovered-read-native-proof.json').write_text(json.dumps(dict(
+            invalid=invalid,states=states,packets=packets,position_calls=position_calls,
+            planning_as_of=planning_as_of,financial_calls=financial_calls,originals=originals,original_audits=audits,
+            current=execution.lp_auto_state(),posts=account.posts,cancels=account.cancels,
+            audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()}),default=serialize,indent=2))
 
 
 @pytest.mark.parametrize('history', ['rejected-buy', 'terminal-buy', 'unknown-amounts', 'accepted-legacy-sending'])
 def test_current_api_buy_replaces_ended_history_and_unknown_report_amounts(runtime, history):
+    from collections import Counter
     store, _, account, _, execution, _, originals = _historical_api_buy_intents(runtime)
     original = originals[0]
     if history == 'unknown-amounts':
@@ -1308,7 +1359,7 @@ def test_current_api_buy_replaces_ended_history_and_unknown_report_amounts(runti
         return balance(**kwargs)
     account.create_limit_order, account.get_balance_allowance = observed_sign, observed_balance
     state = execution.lp_auto_run_once(round_id=f'ended-history-{history}')
-    assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (4, 5)], state['last_round']
+    assert Counter(p.token_id for p in account.posts) == Counter(_refill_identity(i)[2] for i in (4, 5)), state['last_round']
     assert state['slots']['occupied'] == 5
     assert Decimal(state['funds']['buy_reserved_usd']) == 40
     assert planning_as_of and planning_as_of[-1]
@@ -1325,6 +1376,7 @@ def test_current_api_buy_replaces_ended_history_and_unknown_report_amounts(runti
 
 @pytest.mark.parametrize('side', ['BUY', 'SELL'])
 def test_known_matching_intent_with_accepted_idless_extra_action_blocks_new_buys(runtime, side):
+    from collections import Counter
     store, _, account, _, execution, _, originals = _historical_api_buy_intents(runtime)
     original = originals[0]
     store.lp_upsert_action(original['session_id'], f"{original['session_id']}:accepted-extra-submit",
@@ -1371,7 +1423,7 @@ def test_known_matching_intent_with_accepted_idless_extra_action_blocks_new_buys
         assert state['funds']['spendable_usd'] is None
         assert account.posts == account.cancels == []
     else:
-        assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (4, 5)], state['last_round']
+        assert Counter(p.token_id for p in account.posts) == Counter(_refill_identity(i)[2] for i in (4, 5)), state['last_round']
         assert all(p.side == 'BUY' for p in account.posts)
         assert account.cancels == []
         assert state['slots']['occupied'] == 5

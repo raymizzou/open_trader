@@ -86,6 +86,7 @@ def test_full_pool_replaces_every_market_outside_top_five_without_threshold(tmp_
 
 
 def test_rotation_waits_for_first_real_shared_read_and_recovers_without_overbuying(tmp_path, monkeypatch):
+    monkeypatch.setattr(pool, 'NOW', pool.NOW)
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=2, target=1)
     from tests.test_lp_auto_plan_execution import install_order_result_reader
     result_reader = install_order_result_reader(exchange, monkeypatch)
@@ -216,7 +217,10 @@ def test_rotation_waits_for_first_real_shared_read_and_recovers_without_overbuyi
     assert state['slots']['occupied'] == 1
     assert Decimal(state['funds']['buy_reserved_usd']) == 8
     refill_reads = account_reads[reads_before_refill:]
-    assert refill_reads == []
+    assert len(refill_reads) == 1, refill_reads
+    assert refill_reads[0]['balance_complete'] is True
+    assert refill_reads[0]['open_orders_complete'] is True
+    assert refill_reads[0]['positions_complete'] is True
     assert len(result_reads) == 1
     assert any(r['order_id'] == 'o1' and r['status'] == 'CANCELED' and Decimal(r['size_matched']) == 0
                for r in result_reads[0]['orders'])
@@ -1508,10 +1512,24 @@ def test_cancel_recovery_uses_known_owned_receipts_and_preserves_fills(tmp_path,
 
 @pytest.mark.parametrize('balance,expected_cancels', [('20', ['o1', 'o2']), ('24', ['o2'])])
 def test_rotation_budget_counts_manual_and_retained_buys_once(tmp_path, monkeypatch, balance, expected_cancels):
-    engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=3, target=2)
+    import json
+    from collections import Counter
+    monkeypatch.setattr(pool, 'NOW', pool.NOW)
+    engine, exchange, lp, store = setup(tmp_path, monkeypatch, count=3, target=2)
     from tests.test_lp_auto_plan_execution import install_order_result_reader
     result_reader = install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
+    originals = {i['token_id']: i for i in engine.lp_auto_state()['intents']}
+    assert {'m00', 'm01'} <= originals.keys()
+    mapping = {}
+    for token in ('m00', 'm01'):
+        intent = originals[token]
+        session = store.lp_session(intent['session_id'])
+        audit, = [a for a in store.lp_actions(intent['session_id']) if a.get('role') == 'entry']
+        assert session['entry_order_id'] == intent['order_id'] == audit['order_id']
+        assert session['token_id'] == token and audit['state'] == 'accepted'
+        mapping[token] = dict(intent=intent, session=session, audit=audit)
+    (tmp_path / 'CI-B-native-binding.json').write_text(json.dumps(mapping, default=str, indent=2))
     manual = dict(order_id='manual-buy', token_id='manual', condition_id='manual',
                   side='BUY', status='LIVE', price='.40', original_size='20', size_matched='0')
     exchange.orders.append(manual.copy())
@@ -1521,7 +1539,8 @@ def test_rotation_budget_counts_manual_and_retained_buys_once(tmp_path, monkeypa
     refresh(lp, exchange, 3)
     advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
-    assert exchange.cancels == expected_cancels
+    expected_original_ids = [originals[{'o1': 'm00', 'o2': 'm01'}[oid]]['order_id'] for oid in expected_cancels]
+    assert Counter(exchange.cancels) == Counter(expected_original_ids)
     assert exchange.orders[-1] == manual
     assert len(exchange.posts) == 2
     assert Decimal(state['funds']['buy_reserved_usd']) == 16

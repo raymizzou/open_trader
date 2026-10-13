@@ -20,6 +20,11 @@ from tests.test_lp_order_registration_contract import _open_order
 from open_trader.polymarket_lp import LpObservationWait
 
 def _exercise_recovered_account(runtime, *, cleanup_release=None):
+    import sqlite3
+    from pathlib import Path
+    from dataclasses import asdict,is_dataclass
+    from datetime import datetime
+    evidence={}
     store, adapter, account, lp, execution, public=prepare(runtime,count=5,target=5)
     original_orders=[]
     for i in (1,2,3):
@@ -38,8 +43,10 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
         return sign(**kwargs)
     account.get_balance_allowance, account.create_limit_order = observed_balance, observed_sign
     auto=execution._auto_pool
-    assert auto._refresh_account_facts() is True
-    assert auto.state()['slots']['occupied']==3
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state']=='ready'
+    assert execution.lp_auto_state()['slots']['occupied']==3
+    assert Decimal(execution.lp_auto_state()['funds']['buy_reserved_usd'])==24
     _advance(runtime,61)
     for i in (4,5):
         market,condition,token=_refill_identity(i)
@@ -55,46 +62,116 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
             active_finance.append(runtime.clock[0])
         return publisher(**kwargs)
     adapter.lp_account_snapshot_shared=observed_shared
-    entered,release=Event(),Event();reads=[];failed_once=False
+    reads=[]
     def reader(*args,**kwargs):
-        nonlocal failed_once
-        record=dict(kwargs)
-        reads.append(record)
-        if not failed_once:
-            failed_once = True
-            entered.set()
-            assert release.wait(5), 'controlled read watchdog'
-            raise LpObservationWait('account_round_invalid')
-        result=real_reader(*args,**kwargs)
-        record.update(read_started_at=result['read_started_at'], checked_at=result['checked_at'],
-                      read_ended_at=result['read_ended_at'])
-        return result
+        record=dict(kwargs);record['sdk_before']=account.position_reads;reads.append(record)
+        try:
+            result=real_reader(*args,**kwargs)
+            record.update(packet=deepcopy(result),read_started_at=result['read_started_at'],checked_at=result['checked_at'],read_ended_at=result['read_ended_at'])
+            return result
+        finally:record['sdk_after']=account.position_reads
     adapter._lp_planning_account_snapshot=reader
+    def native_barrier(request_records):
+        native_connect=sqlite3.connect
+        reached,release=Event(),Event()
+        original_thread,records,commits,errors=[],[],[],[]
+        armed=[True]
+        revision_sql=("SELECT session_id,json_extract(payload,'$._lp_trade_revision') AS revision "
+            "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?)")
+        class NativeCursor(sqlite3.Cursor):
+            def execute(self,sql,parameters=()):
+                self.sql,self.parameters=sql,parameters
+                return super().execute(sql,parameters)
+            def fetchall(self):
+                rows=super().fetchall()
+                if (self.sql==revision_sql and self.parameters==(adapter.config.wallet_address.casefold(),)
+                        and original_thread==[threading.get_ident()] and armed[0]):
+                    armed[0]=False
+                    apply_free=lp._first_seen_apply_lock.acquire(blocking=False)
+                    if apply_free:lp._first_seen_apply_lock.release()
+                    record=dict(thread=threading.get_ident(),sql=self.sql,account=self.parameters[0],
+                        rows=[dict(row) for row in rows],rows_identity=id(rows),
+                        in_transaction=self.connection.in_transaction,apply_free=apply_free,
+                        generation=store.lp_trade_generation(),sdk_reads=account.position_reads,
+                        original_packet=deepcopy(request_records[0]['packet']) if request_records else None)
+                    records.append(record);reached.set()
+                    try:
+                        assert not record['in_transaction'] and record['apply_free']
+                        assert len(request_records)==1 and request_records[0]['sdk_after']-request_records[0]['sdk_before']==1
+                        assert record['original_packet'] is not None
+                        assert release.wait(5),'Native unchanged row delivery independent watchdog'
+                    except BaseException as exc:errors.append(repr(exc));raise
+                    finally:record['returned_rows_identity']=id(rows)
+                return rows
+        class NativeConnection(sqlite3.Connection):
+            def execute(self,sql,parameters=()):
+                result=self.cursor(factory=NativeCursor).execute(sql,parameters)
+                if sql.startswith('UPDATE lp_trade_generation SET generation=generation+1') and result.rowcount==1:
+                    self.generation_advance=dict(sql=sql,parameters=list(parameters),thread=threading.get_ident())
+                if sql=='COMMIT' and getattr(self,'generation_advance',None):
+                    commits.append({**self.generation_advance,'successful_commit':True,'in_transaction_after':self.in_transaction})
+                    self.generation_advance=None
+                return result
+        def observed_connect(database,*args,**kwargs):
+            if Path(database).resolve()==store.path.resolve():kwargs['factory']=NativeConnection
+            return native_connect(database,*args,**kwargs)
+        def run_original(round_id):
+            original_thread.append(threading.get_ident())
+            return execution.lp_auto_run_once(round_id=round_id)
+        return dict(connect=observed_connect,reached=reached,release=release,run=run_original,
+            records=records,commits=commits,errors=errors)
+    gate=native_barrier(reads)
+    release=gate['release']
     try:
-        with ThreadPoolExecutor(1) as workers:
-            pending=workers.submit(execution.lp_auto_run_once,round_id='three-to-five-recovery')
-            try:
-                assert entered.wait(3)
-                _advance(runtime)
-                snapshot=publisher(max_age_seconds=0,trade_generation_provider=store.lp_trade_generation)
-                assert lp.register_account_snapshot(snapshot)['state']=='registered'
-            finally:
-                release.set()
-            result=pending.result(timeout=5)
-        assert account.posts == [] and len(reads) == 1
-        assert result['funds']['status'] == 'known'
-        assert result['plan_wait']['kind'] == 'api'
-        from datetime import datetime
-        deadline = datetime.fromisoformat(result['plan_wait']['deadline'])
-        assert deadline - datetime.fromisoformat(result['plan_wait']['started_at']) == timedelta(seconds=60)
-        runtime.clock[0] = deadline - timedelta(seconds=1)
-        early = execution.lp_auto_run_once(round_id='three-to-five-recovery')
-        assert len(reads) == 1 and account.posts == []
-        assert early['funds']['status'] == 'known'
-        advance_api_wait(runtime, execution)
-        reads.clear()
-        shared_reads.clear()
-        result = execution.lp_auto_run_once(round_id='three-to-five-recovery')
+        with pytest.MonkeyPatch.context() as native:
+            native.setattr(sqlite3,'connect',gate['connect'])
+            with ThreadPoolExecutor(1) as workers:
+                pending=workers.submit(gate['run'],'three-to-five-invalidated')
+                try:
+                    assert gate['reached'].wait(3),'Original native outside-writer rows reached'
+                    assert len(gate['records'])==1 and gate['errors']==[]
+                    before=execution.lp_auto_state()
+                    assert before['active_plan'] is None and account.posts==[] and len(account.orders)==3
+                    acquired=reads[0]['packet'];generation=gate['records'][0]['generation']
+                    assert acquired['trade_generation']==generation
+                    assert {o['order_id'] for o in acquired['open_orders']}=={o.id for o in original_orders}
+                    assert store.lp_advance_trade_generation(generation) is True
+                    assert store.lp_trade_generation()==generation+1
+                    assert len(gate['commits'])==1 and gate['commits'][0]['successful_commit'] and not gate['commits'][0]['in_transaction_after']
+                    _advance(runtime)
+                    before_publication=account.position_reads
+                    snapshot=publisher(max_age_seconds=-1,trade_generation_provider=store.lp_trade_generation)
+                    assert account.position_reads==before_publication+1
+                    assert snapshot['read_started_at']>acquired['read_ended_at'] and snapshot['trade_generation']==generation+1
+                    assert {o['order_id'] for o in snapshot['open_orders']}=={o.id for o in original_orders}
+                    publication=lp.register_account_snapshot(snapshot)
+                    assert publication['state']=='registered'
+                    current_facts=publication['_planning_capture']['document']['account_financial_facts']
+                    assert current_facts['snapshot_id'] and current_facts['trade_generation']==snapshot['trade_generation']
+                    evidence.update(acquired=deepcopy(acquired),public_packet=deepcopy(snapshot),public_facts=deepcopy(current_facts))
+                finally:release.set()
+                result=pending.result(timeout=5)
+        assert account.posts==[] and len(reads)==1
+        assert gate['records'][0]['rows_identity']==gate['records'][0]['returned_rows_identity'] and gate['errors']==[]
+        assert result['funds']['status']=='known' and Decimal(result['funds']['buy_reserved_usd'])==24
+        assert result['active_plan'] is None and result['last_round']['actions']==[]
+        assert result['last_round']['completed_at'] and result['last_round']['reason']=='account_round_invalid'
+        assert result['plan_wait']['kind']=='round'
+        deadline=datetime.fromisoformat(result['plan_wait']['deadline'])
+        completed=datetime.fromisoformat(result['last_round']['completed_at'])
+        assert deadline==completed+timedelta(seconds=30)
+        evidence['invalidated']=deepcopy(result)
+        counts=(len(reads),account.position_reads,len(account.posts))
+        for elapsed in (1,29):
+            runtime.clock[0]=completed+timedelta(seconds=elapsed)
+            early=execution.lp_auto_run_once(round_id='three-to-five-invalidated')
+            assert early['last_round']==result['last_round'] and counts==(len(reads),account.position_reads,len(account.posts))
+            assert early['funds']['status']=='known'
+        advance_api_wait(runtime,execution)
+        evidence['original_reads']=list(reads)
+        reads.clear();shared_reads.clear()
+        result=execution.lp_auto_run_once(round_id='three-to-five-fresh-current')
+        assert result['last_round']['round_id']!=evidence['invalidated']['last_round']['round_id']
     finally:
         # Executor exit reclaims the controlled worker before attention cleanup.
         release.set()
@@ -109,6 +186,15 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
                     failure.add_note('attention cleanup watchdog')
                 else:
                     raise AssertionError('attention cleanup watchdog')
+        def serialize(value):
+            if is_dataclass(value):return asdict(value)
+            if hasattr(value,'model_dump'):return value.model_dump(mode='json')
+            return str(value)
+        (store.path.parent/'IJ-recovery-native-proof.json').write_text(json.dumps(dict(
+            evidence=evidence,rows=gate['records'],commits=gate['commits'],errors=gate['errors'],
+            reads=reads,shared_reads=shared_reads,active_finance=active_finance,planning_as_of=planning_as_of,
+            failure_type=type(failure).__name__ if failure else None,current=execution.lp_auto_state(),
+            sessions=store.lp_sessions(),posts=account.posts,cancels=account.cancels),default=serialize,indent=2))
     assert len(account.posts)==2, 'fresh planning publication and two frozen candidates must execute once: ' + str(result['last_round'])
     assert len(account.orders)==5
     assert result['slots']['occupied']==5
@@ -121,6 +207,12 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
     assert reads[0]['read_started_at'] <= reads[0]['checked_at'] <= reads[0]['read_ended_at'] <= runtime.clock[0]
     assert len(shared_reads) <= 1, 'At most one existing optional maintenance reuse'
     assert all('max_age_seconds' not in read for read in shared_reads)
+    from collections import Counter
+    assert Counter(p.token_id for p in account.posts)==Counter(_refill_identity(i)[2] for i in (4,5))
+    assert all(p.maker_amount==8000000 and p.taker_amount==20000000 and p.post_only is True for p in account.posts)
+    assert Decimal(result['funds']['buy_reserved_usd'])==40 and account.cancels==account.market_orders==[]
+    assert result['active_plan'] is None and result['last_round']['completed_at']
+    assert datetime.fromisoformat(result['plan_wait']['deadline'])==datetime.fromisoformat(result['last_round']['completed_at'])+timedelta(seconds=30)
 
 
 def test_recovered_account_can_refill_three_to_five(runtime):
