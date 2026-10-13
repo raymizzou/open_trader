@@ -103,6 +103,8 @@ def test_unified_selection_for_zero_three_four_five_buys(tmp_path, monkeypatch, 
     missing = {'B', 'C', 'E', 'F', 'G'} - set(initial) - immediate
     victims = [f'original-{key}' for key in initial if key not in {'B', 'C'}]
     assert Counter(p['token_id'] for p in exchange.posts) == Counter(immediate)
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    _wait_round_cancels(store, state)
     assert Counter(exchange.cancels) == Counter(victims)
     physical = {'B', 'C'} | immediate if initial else immediate
     assert set(live_orders(exchange)) == physical
@@ -151,6 +153,9 @@ def test_unified_selection_for_zero_three_four_five_buys(tmp_path, monkeypatch, 
 def test_triggered_protection_retains_order_but_monitoring_does_not(tmp_path, monkeypatch, protection):
     tokens = ('A', 'B', 'C', 'D', 'I') if protection == 'all-triggered' else ('A', 'B', 'C', 'D')
     engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch, tokens=tokens)
+    from copy import deepcopy
+    from collections import Counter
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     from tests.test_lp_auto_plan_execution import install_order_result_reader
     result_reader = install_order_result_reader(exchange, monkeypatch)
     engine.lp_auto_run_once()
@@ -182,17 +187,27 @@ def test_triggered_protection_retains_order_but_monitoring_does_not(tmp_path, mo
         protection_cancels = list(exchange.cancels)
         assert set(protection_cancels) == set(original.values())
         posts = list(exchange.posts)
+    protection_cancels = list(exchange.cancels)
+    protection_audits = {session['session_id']:deepcopy(store.lp_actions(session['session_id'])) for session in store.lp_sessions()}
     publish_candidates(exchange, lp, store, REWARDS)
     state = engine.lp_auto_run_once()
+    requests = _wait_round_cancels(store, state)
+    expected = {'B', 'C', 'E', 'F', 'G'}
+    assert all(a['kind']=='buy' for a in state['last_round']['actions'])
+    assert state['slots']['occupied']==5 and Decimal(state['funds']['buy_reserved_usd'])==Decimal('39.00')
+    victims = {original[key] for key in ('A','D','I') if key in original}
+    assert {a['order_id'] for a in requests}==victims
+    assert all(a['state']=='accepted' for a in requests)
+    assert Counter(exchange.cancels)==Counter(protection_cancels)+Counter(victims)
+    assert len(exchange.posts)==5
+    assert all(p['side']=='BUY' for p in exchange.posts)
+    for sid, audits in protection_audits.items():
+        for old in audits:
+            assert next(row for row in store.lp_actions(sid) if row['action_key']==old['action_key'])==old
     if protection == 'all-triggered':
-        assert {r['condition_id'] for r in state['last_round']['targets']} == set(tokens), state['last_round']
-        assert {r['condition_id']: r['order_id'] for r in state['last_round']['targets']} == original
-        assert live_orders(exchange) == original
-        assert state['slots']['occupied'] == 5
-        assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('39.00')
-        assert exchange.cancels == protection_cancels and exchange.posts == posts
+        assert live_orders(exchange)==original and exchange.posts==posts
+        assert {r['condition_id'] for r in state['last_round']['targets']}==expected
         return
-    expected = {'A', 'B', 'C', 'E', 'F'} if protection == 'triggered' else {'B', 'C', 'E', 'F', 'G'}
     assert {r['condition_id'] for r in state['last_round']['targets']} == expected, state['last_round']
     if protection == 'triggered':
         assert live_orders(exchange)['A'] == original['A']
@@ -214,6 +229,7 @@ def test_triggered_protection_retains_order_but_monitoring_does_not(tmp_path, mo
 def test_independent_exits_keep_exact_survivors_and_reservations(tmp_path, monkeypatch):
     from collections import Counter
     from copy import deepcopy
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     from tests.test_lp_auto_plan_execution import install_order_result_reader
     import json
     engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch, ('A', 'B', 'C', 'D', 'I'))
@@ -230,6 +246,14 @@ def test_independent_exits_keep_exact_survivors_and_reservations(tmp_path, monke
         requested_packets.append((deepcopy(request), deepcopy(packet)))
         return packet
     monkeypatch.setattr(exchange, 'lp_order_result_snapshot', results)
+    owned_snapshots = []
+    snapshot = exchange.lp_snapshot
+    def owned_snapshot(request):
+        packet = snapshot(request)
+        packet['account'].update(trades_complete=True, pagination_complete=True)
+        owned_snapshots.append((deepcopy(request), deepcopy(packet)))
+        return packet
+    monkeypatch.setattr(exchange, 'lp_snapshot', owned_snapshot)
     sign = exchange.lp_create_limit_order
     def signer(**kwargs):
         signed = sign(**kwargs)
@@ -238,6 +262,7 @@ def test_independent_exits_keep_exact_survivors_and_reservations(tmp_path, monke
     monkeypatch.setattr(exchange, 'lp_create_limit_order', signer)
     exchange.cancel_terminal = False
     state = engine.lp_auto_run_once()
+    _wait_round_cancels(store, state)
     first = deepcopy(state['last_round'])
     assert Counter(exchange.cancels) == Counter(['original-A', 'original-D', 'original-I'])
     assert live_orders(exchange) == {key: f'original-{key}' for key in ('A', 'B', 'C', 'D', 'I')}
@@ -280,22 +305,23 @@ def test_independent_exits_keep_exact_survivors_and_reservations(tmp_path, monke
         and p['post_only'] is True and p['side'] == 'BUY' for p in exchange.posts)
     assert state['slots']['occupied'] == 5 and Decimal(state['funds']['buy_reserved_usd']) == Decimal('39.00')
     assert Decimal(state['funds']['inventory_cost_usd']) == Decimal('3.12')
-    proofs = [(request, packet) for request, packet in requested_packets
-        if 'original-I' in request['owned_order_ids'] and any(o['order_id'] == 'original-I'
+    lp.reconcile_facts(original_i['session_id'])
+    proofs = [(request, packet) for request, packet in owned_snapshots
+        if request['token_id'] == 'I' and any(o['order_id'] == 'original-I'
             and o['status'] == 'CANCELED' for o in packet['orders'])]
-    assert proofs, 'Owned terminal I must be actually requested on the current result route'
+    assert proofs, 'Normal public owned reconciliation must observe actual terminal I'
     request, packet = proofs[-1]
     # Persist the actual unmodified external carrier before any ledger assertion.
     (tmp_path / 'V1-I-terminal-result-proof.json').write_text(json.dumps(
         dict(request=request, packet=packet), default=str, indent=2) + '\n')
-    assert packet['authenticated'] is True and packet['wallet_address'] == 'test-wallet'
-    assert all(packet[key] is True for key in ('open_orders_complete', 'pagination_complete', 'trades_complete', 'positions_complete'))
-    assert packet['read_started_at'] <= packet['read_ended_at'] <= pool.NOW
+    assert packet['account']['authenticated'] is True and packet['account']['wallet_address'] == 'test-wallet'
+    assert all(packet['account'][key] is True for key in ('open_orders_complete', 'pagination_complete', 'trades_complete', 'positions_complete'))
+    assert packet['account']['checked_at'] <= pool.NOW
     exact_i, = [o for o in packet['orders'] if o['order_id'] == 'original-I']
     assert exact_i['status'] == 'CANCELED' and exact_i['fill_quantity_known'] is True
     assert exact_i['side'] == 'BUY' and exact_i['token_id'] == exact_i['condition_id'] == 'I'
     assert Decimal(exact_i['size_matched']) == 8 and Decimal(exact_i['original_size']) == 20 and Decimal(exact_i['price']) == Decimal('.39')
-    assert packet['positions'] == exchange.positions and packet['trades'] == exchange.trades
+    assert packet['account']['positions'] == exchange.positions and packet['trades'] == exchange.trades
     trade, = packet['trades']
     maker, = trade['maker_orders']
     assert trade['trade_id'] == 'original-I-owned-fill' and trade['trader_side'] == 'MAKER'
@@ -305,7 +331,7 @@ def test_independent_exits_keep_exact_survivors_and_reservations(tmp_path, monke
     assert Decimal(session['buy_filled_quantity']) == Decimal(session['residual_quantity']) == 8
     assert Decimal(session['buy_cost']) == Decimal('3.12') and Decimal(session['buy_fees']) == 0
     assert session['position_reconciled'] is True
-    assert session['fee_status'] == 'unknown' and session['projected_exit_fee'] is None
+    assert session['fee_status'] == 'known' and Decimal(session['projected_exit_fee']) == 0
     assert not store.lp_session(original_i['session_id']).get('yield_rotation_cancel_owners')
     assert planning and state['funds']['status'] == 'unknown'
     assert state['funds']['as_of'] == planning[0]['funds']['as_of']
@@ -314,7 +340,7 @@ def test_independent_exits_keep_exact_survivors_and_reservations(tmp_path, monke
     assert {a['token_id'] for a in buys} == {'E', 'F'}
     assert all(a['session_id'] not in old_audits for a in buys)
     assert {a['action_id'] for a in current['actions']}.isdisjoint({a['action_id'] for a in first['actions']})
-    d_cancels = [a for a in current['actions'] if a['kind'] == 'cancel' and a['order_id'] == 'original-D']
+    d_cancels = [a for a in _wait_round_cancels(store, state) if a['order_id'] == 'original-D']
     assert Counter(exchange.cancels) == Counter(['original-A', 'original-D', 'original-I'] + ['original-D'] * len(d_cancels))
     assert len(d_cancels) <= 1
     for sid, audits in old_audits.items():
@@ -343,6 +369,8 @@ def test_round_plan_survives_better_ranking_until_next_round(tmp_path, monkeypat
     scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
     assert scheduler.run_due()
     state = engine.lp_auto_state()
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    _wait_round_cancels(store, state)
     first = deepcopy(state['last_round'])
     assert {r['condition_id'] for r in first['targets']} == {'B', 'C', 'E', 'F', 'G'}
     assert exchange.posts == [] and Counter(exchange.cancels) == Counter(['original-A', 'original-D', 'original-I'])
@@ -386,6 +414,7 @@ def test_round_plan_survives_better_ranking_until_next_round(tmp_path, monkeypat
 @pytest.mark.parametrize('phase', ['planning_refresh', 'after_sign'])
 def test_changed_price_rejects_only_that_planned_action(tmp_path, monkeypatch, phase):
     from collections import Counter
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     from copy import deepcopy
     from tests.test_lp_auto_plan_execution import install_order_result_reader
     engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch, ('B', 'C'))
@@ -494,6 +523,7 @@ def test_changed_price_rejects_only_that_planned_action(tmp_path, monkeypatch, p
     monkeypatch.setattr(pool, 'NOW', completed + timedelta(seconds=30))
     publish_candidates(exchange, lp, store, REWARDS)
     state = engine.lp_auto_run_once()
+    _wait_round_cancels(store, state)
     second = deepcopy(state['last_round'])
     assert second['round_id'] != first['round_id'] and second['completed_at'] and state['active_plan'] is None
     assert Counter(exchange.cancels) == Counter([original['E']]) and len(exchange.posts) == 3
@@ -551,14 +581,23 @@ def test_changed_price_rejects_only_that_planned_action(tmp_path, monkeypatch, p
     assert all(p['post_only'] is True and p['side'] == 'BUY' for p in exchange.posts)
     assert Counter(exchange.cancels) == Counter([original['E']])
     assert state['slots']['occupied'] == 5 and Decimal(state['funds']['buy_reserved_usd']) == Decimal('38.80')
-    terminal_packets = [(request, packet) for request, packet in requested_packets
-        if original['E'] in request['owned_order_ids'] and any(o['order_id'] == original['E']
+    owned_packets = []
+    snapshot = exchange.lp_snapshot
+    def owned_snapshot(request):
+        packet = snapshot(request)
+        packet['account'].update(trades_complete=True, pagination_complete=True)
+        owned_packets.append((deepcopy(request), deepcopy(packet)))
+        return packet
+    monkeypatch.setattr(exchange, 'lp_snapshot', owned_snapshot)
+    lp.reconcile_facts(old_e['session_id'])
+    terminal_packets = [(request, packet) for request, packet in owned_packets
+        if request['token_id'] == 'E' and any(o['order_id'] == original['E']
             and o['status'] == 'CANCELED' for o in packet['orders'])]
     assert terminal_packets
     terminal_request, terminal_packet = terminal_packets[-1]
     terminal_e, = [o for o in terminal_packet['orders'] if o['order_id'] == original['E']]
-    assert terminal_packet['authenticated'] is True and terminal_packet['wallet_address'] == 'test-wallet'
-    assert all(terminal_packet[k] is True for k in ('open_orders_complete', 'pagination_complete', 'trades_complete', 'positions_complete'))
+    assert terminal_packet['account']['authenticated'] is True and terminal_packet['account']['wallet_address'] == 'test-wallet'
+    assert all(terminal_packet['account'][k] is True for k in ('open_orders_complete', 'pagination_complete', 'trades_complete', 'positions_complete'))
     assert terminal_e['fill_quantity_known'] is True and Decimal(terminal_e['size_matched']) == 0
     assert terminal_e['side'] == 'BUY' and terminal_e['token_id'] == 'E' and Decimal(terminal_e['price']) == Decimal('.39') and Decimal(terminal_e['original_size']) == 20
     assert [Decimal(level['price']) for level in departure_books[-1]['bids']] == [Decimal('.39'), Decimal('.38')]

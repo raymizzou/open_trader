@@ -36,6 +36,7 @@ def install_order_result_reader(exchange, monkeypatch):
 def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch, invalidation):
     """#329 commits controls atomically without revoking acquired finances."""
     from collections import Counter
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     import json
     import sqlite3
     from pathlib import Path
@@ -237,6 +238,12 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
     assert [r['token_id'] for r in state['last_round']['targets']] == ['B', 'C', 'E', 'F'], state['last_round']
     assert state['last_round']['round_id'] != original_round
     next_round = state['last_round']['round_id']
+    cancel, = _wait_round_cancels(store, state)
+    assert cancel['order_id'] == original_orders['G'] and cancel['state'] == 'accepted'
+    assert cancel['rotation_round_id'] == next_round and cancel['post_started'] is True
+    assert cancel['session_id'] == state['last_round']['cancel_registration']['sessions'][original_orders['G']]
+    assert cancel['action_id'] and cancel['action_key']
+    assert next(a for a in store.lp_actions(cancel['session_id']) if a['action_key'] == cancel['action_key']) == cancel
     assert exchange.cancels == [original_orders['G']] and len(exchange.posts) == 5
     canceled_round = deepcopy(state['last_round'])
     canceled_audits = {session['session_id']: deepcopy(store.lp_actions(session['session_id']))
@@ -375,6 +382,8 @@ def test_frozen_buy_keeps_current_stress_exit_gate(tmp_path, monkeypatch, window
 @pytest.mark.parametrize('outcome', ['all_refused', 'mixed', 'refused_A_late_B',
     'late_A_refused_B', 'late_terminal_with_stop', 'late_terminal_with_protection'])
 def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkeypatch, outcome):
+    from collections import Counter
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels, _wait_audits
     from time import monotonic
     from polymarket.models.clob.cancel import CancelOrdersResponse
     from polymarket.models.clob.order_book import OrderBookLevel
@@ -446,19 +455,28 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
     engine.lp_auto_set_desired_running(True)
     scheduler = LPAutoScheduler(engine, clock=lambda: runtime.clock[0])
     assert scheduler.run_due()
+    def requests(state, expected):
+        round_id=state['last_round']['round_id']
+        rows=_wait_audits(store,lambda rows:{a['order_id']:a['state'] for a in rows
+            if a.get('rotation_round_id')==round_id}==expected)
+        return sorted([a for a in rows if a.get('rotation_round_id')==round_id],key=lambda a:a['order_id'])
+    expected_states={'rank-a':'accepted' if outcome=='mixed' or late and acknowledged_id=='rank-a' else 'rejected',
+        'rank-b':'accepted' if late and acknowledged_id=='rank-b' else 'rejected'}
     saved = engine.lp_auto_state()
+    initial_requests=requests(saved,expected_states)
     if outcome in ('all_refused', 'mixed'):
         original = deepcopy(saved['last_round'])
         assert saved['active_plan'] is None and original['completed_at']
+        assert original['actions']==[]
         assert saved['plan_wait']['kind'] == 'round'
         assert datetime.fromisoformat(saved['plan_wait']['deadline']) == datetime.fromisoformat(
             original['completed_at']) + timedelta(seconds=30)
-        assert [a['order_id'] for a in original['actions']] == ['rank-a', 'rank-b']
+        assert [a['order_id'] for a in initial_requests] == ['rank-a', 'rank-b']
         assert [r['order_id'] for r in original['targets']] == ['rank-c']
-        assert all(a['session_id'] == session['session_id'] for a in original['actions'])
-        assert [a['state'] for a in original['actions']] == (
-            ['rejected', 'rejected'] if outcome == 'all_refused' else ['canceling', 'rejected'])
-        assert account.cancels == [('rank-a',), ('rank-b',)] and account.posts == []
+        assert all(a['session_id'] == session['session_id'] for a in initial_requests)
+        assert [a['state'] for a in initial_requests] == (
+            ['rejected', 'rejected'] if outcome == 'all_refused' else ['accepted', 'rejected'])
+        assert Counter(account.cancels) == Counter([('rank-a',), ('rank-b',)]) and account.posts == []
         audits = deepcopy(store.lp_actions(session['session_id']))
         assert len(audits) == 2 and len({a['action_key'] for a in audits}) == 2
         for oid in ('rank-a', 'rank-b'):
@@ -487,8 +505,14 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
         assert state['slots']['occupied'] == (3 if outcome == 'all_refused' else 2)
         assert Decimal(state['funds']['buy_reserved_usd']) == (
             Decimal('23.80') if outcome == 'all_refused' else Decimal('15.80'))
+        monitor_phase[0]=True
+        try:
+            reconciled=lp.reconcile_facts(session['session_id'])
+            assert reconciled[3] is None,reconciled[3]
+        finally:
+            monitor_phase[0]=False
         restored = store.lp_session(session['session_id'])
-        assert restored.get('yield_rotation_cancel_owners') == {}
+        assert not restored.get('yield_rotation_cancel_owners')
         assert not restored.get('entry_cancel_requested')
         assert restored.get('augment_cancel_requested', []) == []
         if outcome == 'all_refused':
@@ -567,7 +591,7 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
                 monitor_pause.wait(min(.01, max(0, monitor_watchdog - monotonic())))
             assert normal_books and all({level.price: level.size for level in model.bids} == {
                 Decimal('.40'): Decimal('1000'), Decimal('.39'): Decimal('1000')} for model in normal_books)
-            assert healthy.get('yield_rotation_cancel_owners') == {}
+            assert not healthy.get('yield_rotation_cancel_owners')
             assert not healthy.get('entry_cancel_requested') and healthy.get('augment_cancel_requested', []) == []
             assert account.cancels == first_calls and account.posts == []
             assert store.lp_actions(session['session_id']) == audits
@@ -585,10 +609,12 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
             assert scheduler.run_due()
             waiting = engine.lp_auto_state()
             retried = deepcopy(waiting['last_round'])
+            retry_requests=requests(waiting,expected_states)
+            assert retried['actions']==[]
             assert waiting['active_plan'] is None and retried['completed_at']
             assert retried['round_id'] != original['round_id']
-            assert [a['state'] for a in retried['actions']] == ['rejected', 'rejected']
-            assert account.cancels == first_calls + [('rank-a',), ('rank-b',)]
+            assert [a['state'] for a in retry_requests] == ['rejected', 'rejected']
+            assert Counter(account.cancels) == Counter(first_calls + [('rank-a',), ('rank-b',)])
             retry_audits = deepcopy(store.lp_actions(session['session_id']))
             assert len(retry_audits) == 4 and len({a['action_key'] for a in retry_audits}) == 4
             for old in audits:
@@ -597,11 +623,17 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
             runtime.clock[0] = datetime.fromisoformat(waiting['plan_wait']['deadline'])
             state = engine.lp_auto_run_once()
             assert state['active_plan'] is None and state['desired_running'] is False
+            monitor_phase[0]=True
+            try:
+                reconciled=lp.reconcile_facts(session['session_id'])
+                assert reconciled[3] is None,reconciled[3]
+            finally:
+                monitor_phase[0]=False
             restored = store.lp_session(session['session_id'])
-            assert restored.get('yield_rotation_cancel_owners') == {}
+            assert not restored.get('yield_rotation_cancel_owners')
             assert restored['queue_protection'] == retry_baseline and lp._queue_protection_gate_open(restored)
             assert store.lp_actions(session['session_id']) == retry_audits
-            assert account.cancels == first_calls + [('rank-a',), ('rank-b',)] and account.posts == []
+            assert Counter(account.cancels) == Counter(first_calls + [('rank-a',), ('rank-b',)]) and account.posts == []
             audits = retry_audits
             engine.lp_auto_set_desired_running(True)
         calls = list(account.cancels)
@@ -624,15 +656,16 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
             'late_terminal_with_stop', 'late_terminal_with_protection'):
         original = deepcopy(saved['last_round'])
         assert saved['active_plan'] is None and original['completed_at']
-        assert [a['order_id'] for a in original['actions']] == ['rank-a', 'rank-b']
-        assert all(a['session_id'] == session['session_id'] for a in original['actions'])
+        assert original['actions']==[]
+        assert [a['order_id'] for a in initial_requests] == ['rank-a', 'rank-b']
+        assert all(a['session_id'] == session['session_id'] for a in initial_requests)
         assert [r['order_id'] for r in original['targets']] == ['rank-c']
-        original_states = ['canceling', 'rejected'] if acknowledged_id == 'rank-a' else ['rejected', 'canceling']
-        assert [a['state'] for a in original['actions']] == original_states
+        original_states = ['accepted', 'rejected'] if acknowledged_id == 'rank-a' else ['rejected', 'accepted']
+        assert [a['state'] for a in initial_requests] == original_states
         assert saved['plan_wait']['kind'] == 'round'
         first_deadline = datetime.fromisoformat(saved['plan_wait']['deadline'])
         assert first_deadline == datetime.fromisoformat(original['completed_at']) + timedelta(seconds=30)
-        assert account.cancels == [('rank-a',), ('rank-b',)] and account.posts == []
+        assert Counter(account.cancels) == Counter([('rank-a',), ('rank-b',)]) and account.posts == []
         assert saved['slots']['occupied'] == 3 and Decimal(saved['funds']['buy_reserved_usd']) == Decimal('23.80')
         original_audits = deepcopy(store.lp_actions(session['session_id']))
         assert len(original_audits) == 2 and len({a['action_key'] for a in original_audits}) == 2
@@ -659,21 +692,23 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
         assert (len(financial_reads), len(result_calls)) == before_read_counts
         assert store.lp_session(session['session_id']).get('yield_rotation_cancel_owners') == owners_before
         assert engine.lp_auto_state()['last_round'] == original
-        assert account.cancels == [('rank-a',), ('rank-b',)] and account.posts == []
+        assert Counter(account.cancels) == Counter([('rank-a',), ('rank-b',)]) and account.posts == []
         assert store.lp_actions(session['session_id']) == original_audits
         runtime.clock[0] = first_deadline
         assert scheduler.run_due()
         second = engine.lp_auto_state()
         current_round = deepcopy(second['last_round'])
+        current_requests=requests(second,expected_states)
+        assert current_round['actions']==[]
         assert second['active_plan'] is None and current_round['completed_at']
         assert current_round['round_id'] != original['round_id']
-        assert [a['order_id'] for a in current_round['actions']] == ['rank-a', 'rank-b']
-        assert [a['state'] for a in current_round['actions']] == original_states
-        assert all(a['action_id'] != old['action_id'] for a, old in zip(current_round['actions'], original['actions']))
+        assert [a['order_id'] for a in current_requests] == ['rank-a', 'rank-b']
+        assert [a['state'] for a in current_requests] == original_states
+        assert all(a['action_id'] != old['action_id'] for a, old in zip(current_requests, initial_requests))
         assert [{k: r.get(k) for k in ('condition_id', 'token_id', 'order_id', 'session_id', 'price', 'quantity')}
             for r in current_round['targets']] == [{k: r.get(k) for k in
                 ('condition_id', 'token_id', 'order_id', 'session_id', 'price', 'quantity')} for r in original['targets']]
-        assert account.cancels == [('rank-a',), ('rank-b',), ('rank-a',), ('rank-b',)]
+        assert Counter(account.cancels) == Counter([('rank-a',), ('rank-b',), ('rank-a',), ('rank-b',)])
         assert account.posts == [] and {o.id for o in account.orders} == {'rank-a', 'rank-b', 'rank-c'}
         assert second['slots']['occupied'] == 3 and Decimal(second['funds']['buy_reserved_usd']) == Decimal('23.80')
         assert second['plan_wait']['kind'] == 'round'
@@ -730,7 +765,7 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
         if control is not None:
             control_audits = deepcopy(store.lp_actions(session['session_id']))
             control_calls = list(account.cancels)
-            assert control.get('yield_rotation_cancel_owners', {}).get(acknowledged_id) == current_round['round_id']
+            assert not control.get('yield_rotation_cancel_owners')
         terminal[acknowledged_id] = original_ids[acknowledged_id].model_copy(update={'status': 'CANCELED'})
         account.orders = tuple(o for o in account.orders if o.id != acknowledged_id)
         runtime.clock[0] = second_deadline
@@ -741,6 +776,12 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
         assert state['last_round']['actions'] == []
         if control is None:
             assert state['slots']['occupied'] == 2 and Decimal(state['funds']['buy_reserved_usd']) == Decimal('15.80')
+        monitor_phase[0]=True
+        try:
+            reconciled=lp.reconcile_facts(session['session_id'])
+            assert reconciled[3] is None,reconciled[3]
+        finally:
+            monitor_phase[0]=False
         restored = store.lp_session(session['session_id'])
         if control is not None:
             if outcome == 'late_terminal_with_protection':
@@ -750,17 +791,25 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
                 assert {key:value for key,value in restored['queue_protection'].items() if key != 'levels'} == {
                     key:value for key,value in control['queue_protection'].items() if key != 'levels'}
                 assert restored['queue_protection']['levels'][high_key] == {
-                    **baseline['levels'][high_key], 'order_id': refused_id}
+                    **control['queue_protection']['levels'][high_key], 'order_id': refused_id,
+                    'state':'registered','reason_codes':[],'blocked_notified':False}
+                for field in ('baseline_front','baseline_price','baseline_source','baseline_source_timestamp',
+                        'baseline_book_received_at','baseline_book_hash','baseline_version','threshold','cancel_scope'):
+                    assert restored['queue_protection']['levels'][high_key][field]==baseline['levels'][high_key][field],field
                 assert not restored.get('entry_cancel_requested')
                 assert restored.get('augment_cancel_requested', []) == [
                     oid for oid in control.get('augment_cancel_requested', []) if oid not in (acknowledged_id, refused_id)]
                 assert 'rank-c' in restored['augment_cancel_requested']
             else:
-                for key in ('state', 'stop_requested', 'stop_loss_latched', 'entry_cancel_requested',
+                assert restored['state'] in ('review','needs_attention') and restored['stop_requested'] is True
+                for key in ('stop_requested', 'stop_loss_latched', 'entry_cancel_requested',
                         'augment_cancel_requested', 'owned_cancel_requested', 'queue_protection'):
                     assert restored.get(key) == control.get(key), (key, control, restored)
-            assert restored.get('yield_rotation_cancel_owners') == {}
-            assert restored['queue_protection'] != baseline
+            assert not restored.get('yield_rotation_cancel_owners')
+            if outcome=='late_terminal_with_protection':
+                assert restored['queue_protection'] != baseline
+            else:
+                assert restored['stop_requested'] is True and restored['queue_protection']==control['queue_protection']
             assert store.lp_actions(session['session_id']) == control_audits
             assert account.cancels == control_calls and account.posts == []
             before_read_counts = (len(financial_reads), len(result_calls))
@@ -775,7 +824,7 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
             assert store.lp_actions(session['session_id']) == control_audits
             assert not any(row['phase'] == 'planned_auto' for row in financial_reads)
             return
-        assert restored.get('yield_rotation_cancel_owners') == {}
+        assert not restored.get('yield_rotation_cancel_owners')
         assert not restored.get('entry_cancel_requested') and restored.get('augment_cancel_requested', []) == []
         assert restored['queue_protection']['levels'][high_key] == {
             **baseline['levels'][high_key], 'order_id': refused_id}
@@ -784,7 +833,7 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
         assert {o.id for o in account.orders} == {refused_id, 'rank-c'}
         assert store.lp_actions(session['session_id']) == audits
         calls = list(account.cancels)
-        assert calls == [('rank-a',), ('rank-b',), ('rank-a',), ('rank-b',)] and account.posts == []
+        assert Counter(calls) == Counter([('rank-a',), ('rank-b',), ('rank-a',), ('rank-b',)]) and account.posts == []
         before_read_counts = (len(financial_reads), len(result_calls))
         scheduler.request_check()
         assert not scheduler.run_due()
@@ -825,7 +874,7 @@ def test_rejected_cancel_batch_restores_real_protection_baseline(runtime, monkey
     assert [a['order_id'] for a in original['actions']] == ['rank-a', 'rank-b']
     assert [r['order_id'] for r in original['targets']] == ['rank-c']
     assert all(a['session_id'] == session['session_id'] for a in original['actions'])
-    assert account.cancels == [('rank-a',), ('rank-b',)] and account.posts == []
+    assert Counter(account.cancels) == Counter([('rank-a',), ('rank-b',)]) and account.posts == []
     original_audits = deepcopy(store.lp_actions(session['session_id']))
     runtime.clock[0] = datetime.fromisoformat(saved['plan_wait']['deadline'])
     assert scheduler.run_due()
@@ -1225,6 +1274,7 @@ def test_planning_requires_valid_account_facts(tmp_path, monkeypatch, invalid):
 def test_approved_plan_does_not_reapprove_account_finances(
     tmp_path, monkeypatch, window, financial_change,
 ):
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     from collections import Counter
     from pathlib import Path
     from threading import Lock, get_ident
@@ -1273,10 +1323,10 @@ def test_approved_plan_does_not_reapprove_account_finances(
                     assert not self.in_transaction
                     assert [t['token_id'] for t in plan['targets']] == ['B','C','E','F','G']
                     if initial:
-                        cancels = [a for a in plan['actions'] if a['kind'] == 'cancel']
+                        cancels = plan['victims']
                         dependent = [a for a in plan['actions'] if a['kind'] == 'buy']
                         assert {a['order_id'] for a in cancels} == {'original-A','original-D','original-I'}
-                        assert all(a['state'] == 'pending' for a in cancels)
+                        assert all(a['kind']=='buy' for a in plan['actions'])
                         assert all(a['state'] == 'not_sent' and a['reason'] == 'next_round_capacity' for a in dependent)
                     else:
                         assert all(a['kind'] == 'buy' and a['state'] == 'pending' for a in plan['actions'])
@@ -1336,10 +1386,10 @@ def test_approved_plan_does_not_reapprove_account_finances(
     def current_results(request):
         active = engine.lp_auto_state()['active_plan']
         if window == 'before_cancel' and active is not None and not saved:
-            cancels = [a for a in active['actions'] if a['kind'] == 'cancel']
+            cancels = active['victims']
             dependent = [a for a in active['actions'] if a['kind'] == 'buy']
             assert {a['order_id'] for a in cancels} == {'original-A','original-D','original-I'}
-            assert all(a['state'] == 'pending' for a in cancels)
+            assert all(a['kind']=='buy' for a in active['actions'])
             assert all(a['state'] == 'not_sent' and a['reason'] == 'next_round_capacity' for a in dependent)
             assert exchange.posts == exchange.cancels == []
             assert not any(a['role'] == 'reconciliation_cancel' for row in store.lp_sessions() for a in store.lp_actions(row['session_id']))
@@ -1351,6 +1401,7 @@ def test_approved_plan_does_not_reapprove_account_finances(
     try:
         assert scheduler.run_due()
         first = engine.lp_auto_state()
+        independent_audits=_wait_round_cancels(store,first)
         assert len(saved) == len(mutations) == 1 and forbidden_reads == []
         if window in ('before_prepare','long_lock') or native_generation:
             assert len(native_commits) == 1 and native_commits[0]['in_transaction'] is False
@@ -1381,8 +1432,8 @@ def test_approved_plan_does_not_reapprove_account_finances(
             dependent = [a for a in original['actions'] if a['kind'] == 'buy']
             assert {a['token_id'] for a in dependent} == {'E','F','G'}
             assert all(a['state'] == 'not_sent' and a['reason'] == 'next_round_capacity' for a in dependent)
-            for action in original['actions']:
-                if action['kind'] == 'cancel':
+            for action in independent_audits:
+                if action['role'] == 'reconciliation_cancel':
                     audit, = [a for a in old_audits[action['session_id']] if a['role'] == 'reconciliation_cancel']
                     assert audit['state'] == 'accepted' and audit['post_started'] is True and audit['order_id'] == action['order_id']
             assert packets and packets[0]['read_started_at'] >= mutations[0]['after']
@@ -1524,6 +1575,7 @@ def test_unavailable_planned_market_keeps_existing_order_and_continues(
     tmp_path, monkeypatch, unavailable, planned_action,
 ):
     import json
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     from collections import Counter
 
     initial = ('A', 'B', 'C', 'D', 'I') if planned_action == 'old_A' else ()
@@ -1584,6 +1636,7 @@ def test_unavailable_planned_market_keeps_existing_order_and_continues(
     assert any(row['condition_id'] == token and row['reason'] == reason for row in current['blocked']) or reason in current['candidate_filter']['recheck_reasons'], current
     assert failures and not any(failure_phases)
     if initial:
+        _wait_round_cancels(store, state)
         assert Counter(exchange.cancels) == Counter(['original-D', 'original-I'])
         assert exchange.posts == [], 'Original full occupancy cannot fund dependent E/F this round'
         assert live_orders(exchange)['A'] == 'original-A'
@@ -1625,6 +1678,7 @@ def test_unavailable_planned_market_keeps_existing_order_and_continues(
 def test_retained_order_skips_only_the_buy_without_a_slot(tmp_path, monkeypatch, first_buy_result):
     import json
     import sqlite3
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels, _wait_audits
     from collections import Counter
     from tests.test_lp_auto_plan_scheduler import restart_engine
     monkeypatch.setattr(pool, 'NOW', pool.NOW)
@@ -1717,15 +1771,17 @@ def test_retained_order_skips_only_the_buy_without_a_slot(tmp_path, monkeypatch,
         lp.refresh_candidate_recommendations()
         assert scheduler.run_due()
         canceling=capture('new_current_DI_only')
+        requests = _wait_round_cancels(store, canceling)
         second=deepcopy(canceling['last_round'])
         assert canceling['active_plan'] is None and second['completed_at'] and second['round_id']!=original['round_id']
-        assert exchange.cancels==['original-D','original-I'] and exchange.posts==[]
+        assert Counter(exchange.cancels)==Counter(['original-D','original-I']) and exchange.posts==[]
         assert live_orders(exchange)['A']=='original-A'
-        assert {a['order_id'] for a in second['actions'] if a['kind']=='cancel'}=={'original-D','original-I'}
-        assert not [a for a in second['actions'] if a['kind']=='cancel' and a['order_id']=='original-A']
+        assert {a['order_id'] for a in requests}=={'original-D','original-I'}
+        assert not [a for a in requests if a['order_id']=='original-A']
+        assert all(a['kind']=='buy' for a in second['actions'])
         original_keys={a['action_id'] for a in original['actions']}
         assert all(a['action_id'] not in original_keys for a in second['actions'])
-        di_audits={a['session_id']:deepcopy(store.lp_actions(a['session_id'])) for a in second['actions'] if a['kind']=='cancel'}
+        di_audits={a['session_id']:deepcopy(store.lp_actions(a['session_id'])) for a in requests}
         assert datetime.fromisoformat(canceling['plan_wait']['deadline'])==datetime.fromisoformat(second['completed_at'])+timedelta(seconds=30)
         phase[0]='following_current_two_free_BUYs'
         monkeypatch.setattr(pool,'NOW',datetime.fromisoformat(canceling['plan_wait']['deadline']))
@@ -1735,7 +1791,7 @@ def test_retained_order_skips_only_the_buy_without_a_slot(tmp_path, monkeypatch,
         third=deepcopy(state['last_round'])
         assert state['active_plan'] is None and third['completed_at'] and third['round_id'] not in {original['round_id'],second['round_id']}
         assert Counter(p['token_id'] for p in exchange.posts)==Counter(['E','F'])
-        assert exchange.cancels==['original-D','original-I']
+        assert Counter(exchange.cancels)==Counter(['original-D','original-I'])
         physical=live_orders(exchange)
         assert {k:physical[k] for k in ('A','B','C')}=={k:'original-'+k for k in ('A','B','C')}
         assert set(physical)==({'A','B','C','E','F'} if first_buy_result=='accepted' else {'A','B','C','F'})
@@ -1795,11 +1851,12 @@ def test_retained_order_skips_only_the_buy_without_a_slot(tmp_path, monkeypatch,
             final=capture('distinct_current_A_cancel_no_G_prespend')
             assert final['active_plan'] is None and final['last_round']['completed_at']
             assert final['last_round']['round_id'] not in {original['round_id'],second['round_id'],third['round_id']}
-            action,=[a for a in final['last_round']['actions'] if a['kind']=='cancel' and a['order_id']=='original-A']
-            assert action['action_id'] not in original_keys and action['state']=='canceling'
+            action,=[a for a in _wait_round_cancels(store, final) if a['order_id']=='original-A']
+            assert action['action_id'] not in original_keys and action['state']=='accepted'
+            assert all(a['kind']=='buy' for a in final['last_round']['actions'])
             a_audit,=[a for a in store.lp_actions(action['session_id']) if a.get('order_id')=='original-A']
             assert a_audit['rotation_round_id']==final['last_round']['round_id'] and a_audit['state']=='accepted'
-            assert exchange.cancels==['original-D','original-I','original-A'] and exchange.posts==posts
+            assert Counter(exchange.cancels)==Counter(['original-D','original-I','original-A']) and exchange.posts==posts
             assert not any(p['token_id']=='G' for p in exchange.posts) and not any(s.get('token_id')=='G' for s in store.lp_sessions())
         assert not any(r['active_plan'] for r in evidence['full_reads'])
         evidence['stage']='complete'
@@ -1812,7 +1869,9 @@ def test_retained_order_skips_only_the_buy_without_a_slot(tmp_path, monkeypatch,
 
 @pytest.mark.parametrize('carrier', ['mapping', 'sdk'])
 def test_definite_cancel_rejection_is_not_retried_in_this_round(tmp_path, monkeypatch, request, carrier):
+    from time import monotonic
     import json
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels, _wait_audits
     from collections import Counter
     monkeypatch.setattr(pool,'NOW',pool.NOW)
     if carrier=='sdk':
@@ -1825,14 +1884,89 @@ def test_definite_cancel_rejection_is_not_retried_in_this_round(tmp_path, monkey
         engine.lp_auto_configure(dict(budget_usd='39',target_buy_count=1,buy_price_level=2))
         engine.lp_auto_set_desired_running(True)
         evidence=dict(carrier=carrier)
+        import sqlite3
+        from pathlib import Path
+        from threading import Event, Thread, get_ident
+        intermediate, release_sender, sender_finished = Event(), Event(), Event()
+        helper_observed, helper_returned, helper_progress = Event(), Event(), Event()
+        identity, helper_identity, helper_results, helper_errors = {}, {}, [], []
+        native_connect = sqlite3.connect
+        class RefusalConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=(), /):
+                cursor = super().execute(sql, parameters)
+                command = sql.strip().upper()
+                if (command.startswith('UPDATE LP_ACTIONS SET STATE=') and len(parameters) == 6
+                        and parameters[3:5] == (identity.get('session_id'), identity.get('action_key'))
+                        and get_ident() == identity.get('sender')):
+                    self.refusal_state = parameters[0]
+                elif command == 'COMMIT' and getattr(self, 'refusal_state', None):
+                    outcome, self.refusal_state = self.refusal_state, None
+                    assert not self.in_transaction, 'Actual receipt COMMIT succeeds before observation'
+                    row = super().execute('SELECT * FROM lp_actions WHERE action_key=?',
+                        (identity['action_key'],)).fetchone()
+                    assert row['action_id'] == identity['action_id'] and row['state'] == outcome
+                    if outcome == 'unknown':
+                        evidence['intermediate'] = dict(row)
+                        intermediate.set()
+                        assert release_sender.wait(5), 'Native refusal sender release watchdog'
+                    elif outcome == 'rejected':
+                        evidence['final_commit'] = dict(row)
+                        sender_finished.set()
+                elif (command.startswith('SELECT * FROM LP_ACTIONS WHERE SESSION_ID=')
+                        and parameters == (identity.get('session_id'),)
+                        and get_ident() == helper_identity.get('thread')):
+                    helper_identity['reads'] = helper_identity.get('reads', 0) + 1
+                    if helper_identity['reads'] >= 2:
+                        # A second native read proves the caller rejected the first UNKNOWN.
+                        helper_observed.set()
+                        helper_progress.set()
+                return cursor
+        def observed_connect(database, *args, **kwargs):
+            if Path(database).resolve() == store.path.resolve():
+                kwargs.setdefault('factory', RefusalConnection)
+            return native_connect(database, *args, **kwargs)
+        monkeypatch.setattr(sqlite3, 'connect', observed_connect)
         def venue(*,order_ids):
             account.cancels.append(order_ids);assert order_ids==('rank-b',)
+            registered = [a for s in store.lp_sessions() for a in store.lp_actions(s['session_id'])
+                if a.get('role') == 'reconciliation_cancel' and a.get('order_id') == 'rank-b']
+            pending, = registered
+            assert pending['state'] == 'pending' and pending['post_started']
+            identity.update(session_id=pending['session_id'], action_key=pending['action_key'],
+                action_id=pending['action_id'], round_id=pending['rotation_round_id'], sender=get_ident())
             return CancelOrdersResponse(canceled=(),not_canceled={'rank-b':'venue_denied'})
         monkeypatch.setattr(account,'cancel_orders',venue)
         scheduler=LPAutoScheduler(engine,clock=lambda:sdk_runtime.clock[0])
+        helper_thread = None
         try:
             assert scheduler.run_due()
-            state=engine.lp_auto_state();original=deepcopy(state['last_round']);action,=original['actions']
+            state=engine.lp_auto_state();original=deepcopy(state['last_round'])
+            assert intermediate.wait(5), 'Exact SDK refusal intermediate native COMMIT watchdog'
+            assert identity['round_id'] == original['round_id']
+            assert state['last_round']['cancel_registration']['sessions'] == {'rank-b': identity['session_id']}
+            def wait_for_final():
+                helper_identity['thread'] = get_ident()
+                try:
+                    helper_results.extend(_wait_round_cancels(store, state))
+                except BaseException as exc:
+                    helper_errors.append(exc)
+                finally:
+                    helper_returned.set()
+                    helper_progress.set()
+            helper_thread = Thread(target=wait_for_final, name='final-refusal-receipt-caller')
+            helper_thread.start()
+            assert helper_progress.wait(5), 'Actual helper caller progress watchdog'
+            assert helper_observed.is_set() and not helper_returned.is_set(), \
+                'Final receipt helper must keep waiting while genuine intermediate UNKNOWN is held'
+            release_sender.set()
+            assert sender_finished.wait(5), 'Actual SDK refusal final REJECTED COMMIT watchdog'
+            assert helper_returned.wait(5), 'Final receipt helper completion watchdog'
+            helper_thread.join(5)
+            assert not helper_thread.is_alive() and not helper_errors
+            action, = helper_results
+            assert (action['session_id'], action['action_key'], action['action_id']) == \
+                (identity['session_id'], identity['action_key'], identity['action_id'])
+            assert original['actions']==[]
             assert action['order_id']=='rank-b' and action['state']=='rejected' and action['reason']=='venue_denied'
             assert account.cancels==[('rank-b',)] and account.posts==[] and account.orders==orders
             assert state['active_plan'] is None and original['completed_at'] and state['plan_wait']['kind']=='round'
@@ -1846,6 +1980,12 @@ def test_definite_cancel_rejection_is_not_retried_in_this_round(tmp_path, monkey
             assert [a for a in store.lp_actions(action['session_id']) if a.get('order_id')=='rank-b']==audit
             evidence['stage']='complete'
         finally:
+            release_sender.set()
+            if helper_thread is not None:
+                helper_thread.join(5)
+                assert not helper_thread.is_alive(), 'Actual helper caller cleanup watchdog'
+            if identity:
+                assert sender_finished.wait(5), 'Actual refusal sender cleanup watchdog'
             evidence.update(state=engine.lp_auto_state(),orders=account.orders,cancels=account.cancels,posts=account.posts,
                 audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()})
             (tmp_path/'RF-refusal-sdk-diagnostics.json').write_text(json.dumps(evidence,default=str,indent=2)+'\n')
@@ -1900,12 +2040,14 @@ def test_definite_cancel_rejection_is_not_retried_in_this_round(tmp_path, monkey
         assert scheduler.run_due()
         state=capture('original_denied_A_DI_ack_completed');original=deepcopy(state['last_round'])
         assert state['active_plan'] is None and original['completed_at']
-        action,=[a for a in original['actions'] if a['kind']=='cancel' and a['condition_id']=='A']
+        _wait_audits(store,lambda rows:{a['order_id']:a['state'] for a in rows if a.get('rotation_round_id')==original['round_id']}=={'original-A':'rejected','original-D':'accepted','original-I':'accepted'})
+        action,=[a for a in _wait_round_cancels(store,state) if a['order_id']=='original-A']
+        assert all(a['kind']=='buy' for a in original['actions'])
         assert action['state']=='rejected' and action['reason']=='venue_denied'
         original_session=action['session_id'];audit=deepcopy([a for a in store.lp_actions(original_session) if a.get('order_id')=='original-A'])
         assert len(audit)==1 and audit[0]['state']=='rejected' and audit[0]['reason']=='venue_denied'
         assert audit[0]['rotation_round_id']==original['round_id'] and live_orders(exchange)['A']=='original-A'
-        assert exchange.cancels==['original-A','original-D','original-I'] and exchange.posts==[]
+        assert Counter(exchange.cancels)==Counter(['original-A','original-D','original-I']) and exchange.posts==[]
         assert datetime.fromisoformat(state['plan_wait']['deadline'])==datetime.fromisoformat(original['completed_at'])+timedelta(seconds=30)
         scheduler.request_check();assert not scheduler.run_due();engine.lp_auto_run_once(round_id=original['round_id']);engine.lp_tick()
         assert exchange.cancels.count('original-A')==1 and exchange.posts==[]
@@ -1923,7 +2065,7 @@ def test_definite_cancel_rejection_is_not_retried_in_this_round(tmp_path, monkey
         assert datetime.fromisoformat(cleaned['plan_wait']['deadline'])==datetime.fromisoformat(cleaned['plan_wait']['started_at'])+timedelta(seconds=30)
         assert cleaned['slots']['occupied']==3 and Decimal(cleaned['funds']['buy_reserved_usd'])==Decimal('23.40')
         assert live_orders(exchange)=={k:'original-'+k for k in ('A','B','C')} and exchange.posts==[]
-        assert exchange.cancels==['original-A','original-D','original-I']
+        assert Counter(exchange.cancels)==Counter(['original-A','original-D','original-I'])
         session=store.lp_session(original_session)
         assert session['entry_cancel_requested'] is False
         assert not session.get('yield_rotation_cancel_owners')
@@ -1940,8 +2082,8 @@ def test_definite_cancel_rejection_is_not_retried_in_this_round(tmp_path, monkey
         assert scheduler.run_due()
         final=capture('new_current_distinct_A_only_cancel_and_two_free_BUYs')
         assert final['active_plan'] is None and final['last_round']['completed_at'] and final['last_round']['round_id']!=original['round_id']
-        new_a,=[a for a in final['last_round']['actions'] if a['kind']=='cancel' and a['order_id']=='original-A']
-        assert new_a['action_id']!=action['action_id'] and new_a['state']=='canceling'
+        new_a,=[a for a in _wait_round_cancels(store,final) if a['order_id']=='original-A']
+        assert new_a['action_id']!=action['action_id'] and new_a['state']=='accepted'
         attempts=[a for a in store.lp_actions(original_session) if a.get('order_id')=='original-A']
         assert len(attempts)==2 and audit[0] in attempts
         newest,=[a for a in attempts if a['action_key']!=audit[0]['action_key']]
@@ -1953,6 +2095,14 @@ def test_definite_cancel_rejection_is_not_retried_in_this_round(tmp_path, monkey
         assert not any(r['active_plan'] for r in evidence['full_reads'])
         evidence['stage']='complete'
     finally:
+        sender_deadline=monotonic()+5
+        while True:
+            try:
+                lp.drain_submissions(timeout=.05)
+                break
+            except RuntimeError as exc:
+                assert monotonic()<sender_deadline,str(exc)
+                Event().wait(.01)
         evidence.update(clock=pool.NOW,state=engine.lp_auto_state(),document=document(),sessions=store.lp_sessions(),
             audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()},
             orders=exchange.orders,cancels=exchange.cancels,posts=exchange.posts)
@@ -1963,6 +2113,7 @@ def test_definite_cancel_rejection_is_not_retried_in_this_round(tmp_path, monkey
     'canceled', 'LIVE', 'missing_order', 'incomplete_open_orders', 'uuid_owner_canceled', 'wrong_maker',
 ])
 def test_order_confirmation_does_not_depend_on_balance_transport(runtime, monkeypatch, result):
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     from tests.test_lp_account_reservation_reconciliation import _CandidateSDKPublic, NOW
     from tests.test_lp_order_registration_contract import _open_order, WALLET
     first = _open_order('rank-a', 'BUY', price='.39', original='20')
@@ -1985,9 +2136,9 @@ def test_order_confirmation_does_not_depend_on_balance_transport(runtime, monkey
             state = engine.lp_auto_state()
             original = deepcopy(state['last_round'])
             assert state['active_plan'] is None and original['completed_at']
-            assert [a['order_id'] for a in original['actions']] == ['rank-b']
-            assert original['actions'][0]['state'] == 'not_sent'
-            assert original['actions'][0]['reason'] == 'execution_lock'
+            assert original['actions'] == [] and original['cancel_registration'] is None
+            assert not [a for session in store.lp_sessions() for a in store.lp_actions(session['session_id'])
+                if a.get('rotation_round_id') == original['round_id']]
             assert [r['order_id'] for r in original['targets']] == ['rank-a']
             assert all(Decimal(r['price']) == Decimal('.39') and Decimal(r['quantity']) == 20
                 for r in original['targets'])
@@ -2009,9 +2160,10 @@ def test_order_confirmation_does_not_depend_on_balance_transport(runtime, monkey
     acknowledged = deepcopy(state['last_round'])
     assert state['active_plan'] is None and acknowledged['completed_at']
     assert acknowledged['round_id'] != original['round_id']
-    action, = acknowledged['actions']
-    assert action['kind'] == 'cancel' and action['order_id'] == 'rank-b' and action['state'] == 'canceling'
-    assert action['action_id'] != original['actions'][0]['action_id']
+    action, = _wait_round_cancels(store, state)
+    assert acknowledged['actions'] == []
+    assert action['order_id'] == 'rank-b' and action['state'] == 'accepted'
+    assert action['rotation_round_id'] == acknowledged['round_id']
     identity_fields = ('condition_id', 'token_id', 'order_id', 'session_id', 'retained_constraint')
     assert [{key: row.get(key) for key in identity_fields} for row in acknowledged['targets']] == [
         {key: row.get(key) for key in identity_fields} for row in original['targets']]
@@ -2029,7 +2181,7 @@ def test_order_confirmation_does_not_depend_on_balance_transport(runtime, monkey
     assert account.cancels == [('rank-b',)] and account.posts == []
     assert state['slots']['occupied'] == 2 and Decimal(state['funds']['buy_reserved_usd']) == Decimal('15.60')
     sid = action['session_id']
-    audit, = store.lp_actions(sid)
+    audit, = [a for a in store.lp_actions(sid) if a.get('rotation_round_id') == acknowledged['round_id']]
     assert audit['state'] == 'accepted' and audit['role'] == 'reconciliation_cancel'
     assert audit['order_id'] == 'rank-b' and audit['rotation_round_id'] == acknowledged['round_id']
     assert audit['post_started'] is True
@@ -2113,7 +2265,7 @@ def test_order_confirmation_does_not_depend_on_balance_transport(runtime, monkey
         assert state['slots']['occupied'] == 1
         assert {row['order_id'] for row in state['account_buys']} == {'rank-a'}
         assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('7.80')
-        assert store.lp_session(sid).get('yield_rotation_cancel_owners') == {}
+        assert (store.lp_session(sid).get('yield_rotation_cancel_owners') or {}) == {}
     elif result == 'LIVE':
         assert reads == []
         assert packet['open_orders_complete'] is True and packet['order_read_errors'] == {}
@@ -2142,6 +2294,7 @@ def test_unknown_submission_keeps_identity_until_result_recovery(tmp_path, monke
     from copy import deepcopy
     from threading import get_ident
     import json
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     import uuid
     import sqlite3
     import hashlib
@@ -2167,7 +2320,7 @@ def test_unknown_submission_keeps_identity_until_result_recovery(tmp_path, monke
     def full_account(*args, **kwargs):
         observed = dict(route='account', started=pool.NOW, thread=get_ident(), failed=False)
         full_reads.append(observed)
-        if fail_account[0] and receipt != 'ACK_LIVE':
+        if fail_account[0]:
             monkeypatch.setattr(pool, 'NOW', pool.NOW + timedelta(seconds=3))
             failed_at.append(pool.NOW)
             observed.update(failed=True, ended=pool.NOW)
@@ -2350,6 +2503,7 @@ def test_unknown_submission_keeps_identity_until_result_recovery(tmp_path, monke
         assert [t['token_id'] for t in original['targets']] == ['B', 'C', 'E', 'F', 'G']
         assert all(Decimal(t['price']) == Decimal('.39') and Decimal(t['quantity']) == 20 for t in original['targets'])
         assert state['slots']['occupied'] == 5 and Decimal(state['funds']['buy_reserved_usd']) == 39
+        _wait_round_cancels(store, state)
         original_audits = audit_map()
         original_ids = [(a['action_id'], a.get('session_id'), a.get('order_id')) for a in original['actions']]
         if receipt == 'ACK_LIVE':
@@ -2386,8 +2540,17 @@ def test_unknown_submission_keeps_identity_until_result_recovery(tmp_path, monke
         state, failed_round, failed_completed = completed_state()
         assert failed_round['round_id'] != original['round_id']
         assert failed_round['reason'] == 'account_order_sync_unknown'
-        failures = narrow_failed_at if receipt == 'ACK_LIVE' else failed_at
-        assert len(failures) == 1 and failed_completed == failures[0]
+        failures = failed_at
+        assert len(failures)==1
+        if receipt=='ACK_LIVE':
+            assert len(narrow_failed_at)==1 and failed_completed==narrow_failed_at[0]
+            assert narrow_failed_at[0]==failures[0]+timedelta(seconds=3)
+            result_failure=narrow_reads[-1]
+            assert result_failure['request']['owned_order_ids']==['original-A','original-D','original-I']
+            assert result_failure['failed'] is True and 'packet' not in result_failure
+            assert result_failure['started']==failures[0] and result_failure['ended']==failed_completed
+        else:
+            assert narrow_failed_at==[] and failed_completed==failures[0]
         assert audit_map() == original_audits
         assert state['slots']['occupied'] == 5 and Decimal(state['funds']['buy_reserved_usd']) == 39
         if receipt != 'ACK_LIVE':
@@ -2411,10 +2574,10 @@ def test_unknown_submission_keeps_identity_until_result_recovery(tmp_path, monke
             prepare_current_candidates(lp)
         else:
             refreshes.append(deepcopy(lp.refresh_candidates(force=True)))
-        block_narrow[0] = receipt == 'ACK_LIVE'
-        block_account[0] = receipt != 'ACK_LIVE'
-        expected_event = query_entered if receipt == 'ACK_LIVE' else account_entered
-        expected_release = query_release if receipt == 'ACK_LIVE' else account_release
+        block_narrow[0] = False
+        block_account[0] = True
+        expected_event = account_entered
+        expected_release = account_release
         with ThreadPoolExecutor(max_workers=1) as workers:
             running = workers.submit(scheduler.run_due)
             try:
@@ -2440,6 +2603,7 @@ def test_unknown_submission_keeps_identity_until_result_recovery(tmp_path, monke
         for sid, rows in original_audits.items():
             assert all(a in store.lp_actions(sid) for a in rows)
         if receipt == 'ACK_LIVE':
+            _wait_round_cancels(store, state)
             assert Counter(exchange.cancels) == Counter({'original-A': 2, 'original-D': 2, 'original-I': 2})
             assert exchange.posts == []
             new_audits = [a for s in store.lp_sessions() for a in store.lp_actions(s['session_id'])
@@ -2713,6 +2877,8 @@ def test_resource_wait_resumes_fixed_plan_without_balance_recheck(tmp_path, monk
             assert {sid: store.lp_actions(sid)[:len(audits)] for sid, audits in failed_audits.items()} == failed_audits
         else:
             cancel_round = original
+        from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+        _wait_round_cancels(store, state)
         assert Counter(exchange.cancels) == Counter(['original-A', 'original-D', 'original-I'])
         assert live_orders(exchange) == {token: original_ids[token] for token in ('B', 'C')}
         assert sum(Decimal(str(o['price'])) * Decimal(str(o['original_size']))
@@ -2859,8 +3025,8 @@ def test_execution_controls_still_fence_an_approved_plan(tmp_path, monkeypatch, 
         if window == 'before_cancel':
             cancels = [a for a in plan['actions'] if a['kind'] == 'cancel']
             buys = [a for a in plan['actions'] if a['kind'] == 'buy']
-            assert {a['order_id'] for a in cancels} == {live_orders(exchange)[k] for k in ('A', 'D', 'I')}
-            assert all(a['state'] == 'pending' for a in cancels)
+            assert cancels == [], 'BUY authority contains no cancel action'
+            assert {r['order_id'] for r in plan['victims']} == {live_orders(exchange)[k] for k in ('A', 'D', 'I')}
             assert {a['token_id'] for a in buys} == {'E', 'F', 'G'}
             assert all(a['state'] == 'not_sent' and a['reason'] == 'next_round_capacity' for a in buys)
         else:
@@ -3031,6 +3197,10 @@ def test_execution_controls_still_fence_an_approved_plan(tmp_path, monkeypatch, 
             assert scheduler.run_due()
             assert len(native_commits) == 1 and native_commits[0]['round_id'] == captured[0]['round_id']
         assert len(captured) == 1
+        if window == 'before_cancel' and control != 'order_identity':
+            from tests.test_lp_auto_independent_cancel_contract import _wait_audits
+            _wait_audits(store, lambda rows: len([a for a in rows if a.get('rotation_round_id') == captured[0]['round_id']]) == 3
+                and all(a['state'] != 'pending' for a in rows))
         state = engine.lp_auto_state()
         first = deepcopy(state['last_round'])
         assert first['round_id'] == captured[0]['round_id']
@@ -3078,16 +3248,19 @@ def test_execution_controls_still_fence_an_approved_plan(tmp_path, monkeypatch, 
                     action, = [a for a in first['actions'] if a['token_id'] == audit['token_id']]
                     assert action['session_id'] == audit['session_id']
         elif control == 'stop':
-            assert state['desired_running'] is False and exchange.posts == exchange.cancels == []
-            assert exchange.orders == original_orders
-            assert live_orders(exchange) == {o['token_id']: o['order_id'] for o in original_orders}
+            assert state['desired_running'] is False and exchange.posts == []
+            assert Counter(exchange.cancels) == Counter(live_orders_from_before['order_id']
+                for live_orders_from_before in original_orders if live_orders_from_before['token_id'] in ('A', 'D', 'I'))
+            assert {o['order_id'] for o in exchange.orders} == {o['order_id'] for o in original_orders}
             assert state['slots']['occupied'] == 5 and Decimal(state['funds']['buy_reserved_usd']) == 39
             assert all(a['state'] == 'not_sent' and a['reason'] == 'manually_paused'
                 for a in first['actions'] if a['kind'] == 'cancel')
             assert all(a['state'] == 'not_sent' and a['reason'] == 'next_round_capacity'
                 for a in first['actions'] if a['kind'] == 'buy')
-            assert {s['session_id']: store.lp_actions(s['session_id']) for s in captured_stop_sessions} == captured_stop_audits
-            assert {sid: store.lp_actions(sid) for sid in initial_audits} == initial_audits
+            new_cancels = [a for s in captured_stop_sessions for a in store.lp_actions(s['session_id'])
+                if a.get('rotation_round_id') == first['round_id']]
+            assert len(new_cancels) == 3 and all(a['state'] == 'accepted' for a in new_cancels)
+            assert not any(a['kind'] == 'cancel' for a in first['actions'])
             for original in captured_stop_sessions:
                 current = store.lp_session(original['session_id'])
                 for field in ('entry_order_id', 'order_history', 'queue_protection', 'yield_rotation_cancel_owners',
@@ -3097,12 +3270,12 @@ def test_execution_controls_still_fence_an_approved_plan(tmp_path, monkeypatch, 
         elif control == 'order_identity':
             assert exchange.posts == [] and 'original-A' not in exchange.cancels
             assert next(o for o in exchange.orders if o['order_id'] == 'original-A')['status'] == 'LIVE'
-            assert all(a['state'] == 'not_sent' and a['reason'] == 'owned_order_identity_mismatch'
-                for a in first['actions'] if a['kind'] == 'cancel'), first
+            assert first['independent_cancel_error'] == 'owned_order_identity_mismatch'
+            assert exchange.cancels == []
             assert state['slots']['occupied'] == 5 and Decimal(state['funds']['buy_reserved_usd']) == 39
         else:
             assert monitor_seen.is_set() and monitor_packets
-            assert exchange.cancels.count(original_a) == 1 and exchange.posts == []
+            assert exchange.cancels.count(original_a) == 2 and exchange.posts == []
             session = next(s for s in store.lp_sessions() if s['token_id'] == 'A')
             protected, = [e for e in control_evidence if 'session' in e]
             protected_session = protected['session']
@@ -3116,8 +3289,9 @@ def test_execution_controls_still_fence_an_approved_plan(tmp_path, monkeypatch, 
                 uuid.UUID(audit['action_id'])
                 assert not audit.get('rotation_round_id')
                 assert next(a for a in store.lp_actions(session['session_id']) if a['action_key'] == audit['action_key']) == audit
-            assert not any(a.get('rotation_round_id') == first['round_id'] and a.get('order_id') == original_a
-                for a in store.lp_actions(session['session_id']))
+            separate, = [a for a in store.lp_actions(session['session_id'])
+                if a.get('rotation_round_id') == first['round_id'] and a.get('order_id') == original_a]
+            assert separate['state'] == 'accepted' and separate['role'] == 'reconciliation_cancel'
             assert session.get('stop_requested') == initial_a.get('stop_requested')
             assert next(o for o in exchange.orders if o['order_id'] == original_a)['status'] == 'LIVE'
         audits_before = {s['session_id']: deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
@@ -3261,6 +3435,9 @@ def test_next_round_uses_new_facts_after_the_full_interval(tmp_path, monkeypatch
     publish_candidates(exchange, lp, store, REWARDS)
     assert scheduler.run_due()
     state = engine.lp_auto_state()
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    current_cancel_audits = _wait_round_cancels(store, state)
+    assert {a['order_id'] for a in current_cancel_audits} == {original_live['F'], original_live['G']}
     second = deepcopy(state['last_round'])
     assert len(reads) > before and any(row['changed'] for row in reads[before:])
     assert not any(row['active'] for row in reads)
@@ -3281,7 +3458,7 @@ def test_next_round_uses_new_facts_after_the_full_interval(tmp_path, monkeypatch
         for audit in audits:
             assert next(a for a in current if a['action_key'] == audit['action_key']) == audit
     second_audits = {a['session_id']: deepcopy(store.lp_actions(a['session_id']))
-        for a in second['actions'] if a['kind'] == 'cancel'}
+        for a in current_cancel_audits}
     second_completed = datetime.fromisoformat(second['completed_at'])
     assert datetime.fromisoformat(state['plan_wait']['deadline']) == second_completed + timedelta(seconds=interval)
     before = len(reads)
@@ -3983,6 +4160,9 @@ def test_restart_and_legacy_plan_upgrade_preserve_progress(tmp_path, monkeypatch
             else:
                 engine.lp_auto_run_once()
         saved = engine.lp_auto_state()
+        if not legacy and case == 'cancel_pending':
+            from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+            _wait_round_cancels(store, saved)
         assert saved['last_round']['round_id']
         previous_posts, previous_cancels = deepcopy(exchange.posts), list(exchange.cancels)
         audit = {s['session_id']: deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
@@ -4120,7 +4300,7 @@ def test_restart_and_legacy_plan_upgrade_preserve_progress(tmp_path, monkeypatch
                 expected_controls = deepcopy(original_controls[sid])
                 if case == 'cancel_pending' and not legacy and original_sessions[sid]['token_id'] in {'A', 'D', 'I'}:
                     expected_controls['entry_cancel_requested'] = False
-                    assert store.lp_session(sid).get('yield_rotation_cancel_owners') == {}
+                    assert not store.lp_session(sid).get('yield_rotation_cancel_owners')
                 assert {key: deepcopy(store.lp_session(sid).get(key)) for key in expected_controls} == expected_controls
             if case == 'cancel_pending':
                 assert Counter(p['token_id'] for p in exchange.posts) == Counter(['E', 'F', 'G'])
@@ -4187,9 +4367,35 @@ def test_restart_and_legacy_plan_upgrade_preserve_progress(tmp_path, monkeypatch
                     rr1_evidence['legacy_acquired_account'] = deepcopy(dict(packet=packet, financial=financial,
                         external_terminal_rows=rows))
                 else:
-                    assert any(all(row['fill_quantity_known'] is True for row in read['packet']['orders']
-                        if row['order_id'] in previous_cancels) for read in rr1_evidence['narrow_reads']
-                        if read['phase'] != 'original_execution')
+                    current_reads = [read['packet'] for read in rr1_evidence['full_reads']
+                        if read['method'] == 'lp_account_snapshot_shared' and read['phase'] == 'current_planning'
+                        and not read['failed']]
+                    packet, = current_reads
+                    assert all(packet[key] is True for key in ('authenticated', 'balance_complete',
+                        'open_orders_complete', 'positions_complete', 'trades_complete', 'pagination_complete'))
+                    assert packet['wallet_address'] == packet['account_id'] == 'test-wallet'
+                    assert {row['order_id'] for row in packet['open_orders']} == {'original-B', 'original-C'}
+                    assert sum(Decimal(str(row['price'])) * Decimal(str(row['original_size']))
+                        for row in packet['open_orders']) == Decimal('15.60')
+                    assert packet['positions'] == packet['raw_trades'] == []
+                    assert {row['order_id'] for row in rr1_evidence['external_terminal_rows']} == set(previous_cancels)
+                    assert all(row['status'] == 'CANCELED' and Decimal(str(row['size_matched'])) == 0
+                        for row in rr1_evidence['external_terminal_rows'])
+                    result_read, = [read for read in rr1_evidence['narrow_reads'] if read['phase'] == 'current_planning']
+                    assert result_read['request']['owned_order_ids']==['original-A','original-D','original-I']
+                    result=result_read['packet']
+                    assert all(result[key] is True for key in ('authenticated','open_orders_complete',
+                        'pagination_complete','positions_complete','trades_complete'))
+                    assert result['wallet_address']=='test-wallet'
+                    assert result['read_started_at']<=result['read_ended_at']<=pool.NOW
+                    terminal=[row for row in result['orders'] if row['order_id'] in previous_cancels]
+                    assert {row['order_id'] for row in terminal}==set(previous_cancels)
+                    for row in terminal:
+                        expected=rr1_original_orders[row['order_id']]
+                        assert all(row[key]==expected[key] for key in ('order_id','token_id','condition_id','market_id','outcome','side'))
+                        assert row['status']=='CANCELED' and row['fill_quantity_known'] is True
+                        assert Decimal(str(row['price']))==Decimal('.39') and Decimal(str(row['original_size']))==20
+                        assert Decimal(str(row['size_matched']))==0
             elif case in ('unknown_post', 'accepted_idless'):
                 expected_posts = Counter(['B', 'B', 'C', 'E', 'F', 'G'])
                 assert Counter(p['token_id'] for p in exchange.posts) == expected_posts
@@ -4264,6 +4470,7 @@ def test_restart_and_legacy_plan_upgrade_preserve_progress(tmp_path, monkeypatch
 @pytest.mark.parametrize('outcome', ['live_before_cancel', 'terminal_allowed', 'terminal_rejected'])
 def test_partial_fill_preserves_inventory_without_replanning(tmp_path, monkeypatch, outcome):
     from collections import Counter
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     from tests.test_lp_auto_target_convergence import publish_candidates, REWARDS
     monkeypatch.setattr(pool, 'NOW', pool.NOW)
     engine, exchange, lp, store = plan_setup(tmp_path, monkeypatch, ('A', 'B', 'C', 'D', 'I'), budget='39')
@@ -4313,6 +4520,7 @@ def test_partial_fill_preserves_inventory_without_replanning(tmp_path, monkeypat
         monkeypatch.setattr(exchange,name,observed)
     assert scheduler.run_due()
     first = engine.lp_auto_state()
+    _wait_round_cancels(store, first)
     original = deepcopy(first['last_round'])
     approved = captured[0]
     assert [t['condition_id'] for t in approved['last_round']['targets']]==['B','C','E','F','G']
@@ -4321,14 +4529,15 @@ def test_partial_fill_preserves_inventory_without_replanning(tmp_path, monkeypat
     assert [a['action_id'] for a in original['actions']]==[a['action_id'] for a in approved['active_plan']['actions']]
     assert original['completed_at'] and first['active_plan'] is None and first['plan_wait']['kind']=='round'
     assert exchange.posts==[], 'All five original slots/39 principal were occupied at approval'
-    assert Counter(exchange.cancels)==Counter(['original-D','original-I'] if outcome=='live_before_cancel' else
-        ['original-A','original-D','original-I'])
+    assert Counter(exchange.cancels)==Counter(['original-A','original-D','original-I'])
     assert not any(r['active'] for r in financial_reads), 'No new finance read during original approved execution'
     assert first['funds']['as_of']==approved['funds']['as_of']
     original_a = next(s for s in store.lp_sessions() if s['entry_order_id']=='original-A')
     sid = original_a['session_id']
     if outcome=='live_before_cancel':
-        assert live_orders(exchange)['A']=='original-A'
+        assert next(o for o in exchange.orders if o['order_id']=='original-A')['status']=='CANCELED'
+        assert lp.register_account_snapshot(pool._fresh_registration_bundle(exchange, lp))['state']=='registered'
+        lp.reconcile_facts(sid)
         assert store.lp_session(sid)['queue_protection']==protections[0]
         session = engine.lp_status(sid)
         assert Decimal(session['buy_filled_quantity'])==Decimal(session['residual_quantity'])==8
@@ -4346,8 +4555,7 @@ def test_partial_fill_preserves_inventory_without_replanning(tmp_path, monkeypat
         assert not scheduler.run_due()
         engine.lp_auto_run_once()
         assert (len(financial_reads),len(packets))==before and exchange.posts==[]
-        assert Counter(exchange.cancels)==Counter(['original-D','original-I'] if outcome=='live_before_cancel' else
-            ['original-A','original-D','original-I'])
+        assert Counter(exchange.cancels)==Counter(['original-A','original-D','original-I'])
         assert {s:store.lp_actions(s) for s in old_audits}==old_audits
     monkeypatch.setattr(pool,'NOW',deadline)
     publish_candidates(exchange,lp,store,REWARDS)
@@ -4356,6 +4564,7 @@ def test_partial_fill_preserves_inventory_without_replanning(tmp_path, monkeypat
     assert len(financial_reads)>before[0] and not any(r['active'] for r in financial_reads)
     assert state['last_round']['round_id']!=original['round_id'] and state['last_round']['completed_at']
     assert state['active_plan'] is None
+    lp.reconcile_facts(sid)
     session = engine.lp_status(sid)
     assert Decimal(session['buy_filled_quantity'])==Decimal(session['residual_quantity'])==8
     assert Decimal(session['buy_cost'])==Decimal('3.12') and Decimal(session['buy_fees'])==0
@@ -4368,31 +4577,24 @@ def test_partial_fill_preserves_inventory_without_replanning(tmp_path, monkeypat
     assert all(a.get('session_id') and a['session_id'] not in old_audits for a in new_buys)
     current = live_orders(exchange)
     assert current['B']==original_ids['B'] and current['C']==original_ids['C']
-    if outcome=='live_before_cancel':
-        assert current=={**{k:original_ids[k] for k in ('A','B','C')},'E':current['E'],'F':current['F']}
-        assert state['slots']['occupied']==5 and Decimal(state['funds']['buy_reserved_usd'])==Decimal('35.88')
-        assert store.lp_session(sid)['queue_protection']==protections[0]
-        assert all(a['state']=='success' for a in new_buys)
+    assert [t['condition_id'] for t in state['last_round']['targets']]==['B','C','E','F']
+    assert next(o for o in exchange.orders if o['order_id']=='original-A')['status']=='CANCELED'
+    expected={'B','C','E','F'} if outcome!='terminal_rejected' else {'B','C','F'}
+    assert set(current)==expected
+    assert state['slots']['occupied']==(4 if outcome!='terminal_rejected' else 3)
+    assert Decimal(state['funds']['buy_reserved_usd'])==(Decimal('31.20') if outcome!='terminal_rejected' else Decimal('23.40'))
+    if outcome=='terminal_rejected':
+        refused, = [a for a in new_buys if a['token_id']=='E']
+        assert refused['state']=='rejected' and refused['reason']=='balance_insufficient'
     else:
-        assert [t['condition_id'] for t in state['last_round']['targets']]==['B','C','E','F']
-        assert next(o for o in exchange.orders if o['order_id']=='original-A')['status']=='CANCELED'
-        expected={'B','C','E','F'} if outcome=='terminal_allowed' else {'B','C','F'}
-        assert set(current)==expected
-        assert state['slots']['occupied']==(4 if outcome=='terminal_allowed' else 3)
-        assert Decimal(state['funds']['buy_reserved_usd'])==(Decimal('31.20') if outcome=='terminal_allowed' else Decimal('23.40'))
-        if outcome=='terminal_rejected':
-            refused, = [a for a in new_buys if a['token_id']=='E']
-            assert refused['state']=='rejected' and refused['reason']=='balance_insufficient'
-        else:
-            assert all(a['state']=='success' for a in new_buys)
+        assert all(a['state']=='success' for a in new_buys)
     actual_buys = sum(Decimal(o['price'])*(Decimal(o['original_size'])-Decimal(o['size_matched']))
         for o in exchange.orders if o['status']=='LIVE')
-    expected_total={'live_before_cancel':Decimal('39'),'terminal_allowed':Decimal('34.32'),'terminal_rejected':Decimal('26.52')}[outcome]
+    expected_total={'live_before_cancel':Decimal('34.32'),'terminal_allowed':Decimal('34.32'),'terminal_rejected':Decimal('26.52')}[outcome]
     assert actual_buys+Decimal(session['buy_cost'])==expected_total
     assert Decimal(state['funds']['buy_reserved_usd'])+Decimal(state['funds']['inventory_cost_usd'])==expected_total
     assert {s:store.lp_actions(s) for s in old_audits}==old_audits
-    assert Counter(exchange.cancels)==Counter(['original-D','original-I'] if outcome=='live_before_cancel' else
-        ['original-A','original-D','original-I'])
+    assert Counter(exchange.cancels)==Counter(['original-A','original-D','original-I'])
     assert all(p['side']=='BUY' and Decimal(p['price'])==Decimal('.39') and Decimal(p['quantity'])==20 for p in exchange.posts)
     assert datetime.fromisoformat(state['plan_wait']['deadline'])==datetime.fromisoformat(state['last_round']['completed_at'])+timedelta(seconds=30)
 
@@ -4601,6 +4803,7 @@ def test_execution_diagnostics_separate_planning_and_result_reads(runtime, monke
 @pytest.mark.parametrize('mode', ['prospective', 'legacy_terminal', 'legacy_live',
     'legacy_incomplete', 'legacy_wrong_maker'])
 def test_successful_terminal_owner_does_not_block_later_refused_round(runtime, monkeypatch, tmp_path, mode):
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     import base64
     import hashlib
     import json
@@ -4724,6 +4927,13 @@ def test_successful_terminal_owner_does_not_block_later_refused_round(runtime, m
         evidence['full_packets'].append(deepcopy(dict(stage=stage[0],active_plan=bool(engine.lp_auto_state()['active_plan']),packet=packet)))
         return packet
     monkeypatch.setattr(adapter,'lp_account_snapshot_shared',observed_full)
+    planning_reader=adapter._lp_planning_account_snapshot
+    def observed_planning(**kwargs):
+        packet=planning_reader(**kwargs)
+        evidence['full_packets'].append(deepcopy(dict(stage=stage[0],active_plan=bool(engine.lp_auto_state()['active_plan']),packet=packet)))
+        return packet
+    monkeypatch.setattr(adapter,'_lp_planning_account_snapshot',observed_planning)
+
     scheduler = LPAutoScheduler(engine, clock=lambda:runtime.clock[0])
     def wait_interval(state, dispatched=False):
         assert state['active_plan'] is None and state['plan_wait']['kind']=='round'
@@ -4773,11 +4983,13 @@ def test_successful_terminal_owner_does_not_block_later_refused_round(runtime, m
             engine.lp_auto_set_desired_running(True)
             assert scheduler.run_due()
             sent=capture('original_C_locally_completed')
+            original_c_requests=_wait_round_cancels(store,sent)
             original_c=deepcopy(sent['last_round'])
             assert sent['active_plan'] is None and original_c['completed_at']
-            assert [a['order_id'] for a in original_c['actions']]==['rank-c']
+            assert original_c['actions']==[]
+            assert [a['order_id'] for a in original_c_requests]==['rank-c']
             assert [r['order_id'] for r in original_c['targets']]==['rank-a','rank-b']
-            assert original_c['actions'][0]['session_id']==sid and original_c['actions'][0]['state']=='canceling'
+            assert original_c_requests[0]['session_id']==sid and original_c_requests[0]['state']=='accepted'
             audit_c,=deepcopy(store.lp_actions(sid))
             assert audit_c['state']=='accepted' and audit_c['order_id']=='rank-c'
             assert audit_c['rotation_round_id']==original_c['round_id']
@@ -4788,11 +5000,12 @@ def test_successful_terminal_owner_does_not_block_later_refused_round(runtime, m
             assert scheduler.run_due()
             settled=capture('paused_original_C_terminal_retired')
             paused_shape(settled);assert settled['last_round']['round_id']!=original_c['round_id']
-            assert_c_proof(result_start)
+            assert any(r['stage']==stage[0] and r['packet']['open_orders_complete'] is True
+                and not any(o['order_id']=='rank-c' for o in r['packet']['open_orders']) for r in evidence['full_packets'])
             assert settled['slots']['occupied']==2 and Decimal(settled['funds']['buy_reserved_usd'])==Decimal('15.60')
             assert store.lp_actions(sid)==[audit_c] and account.cancels==[('rank-c',)] and account.posts==[]
             retired=store.lp_session(sid)
-            assert retired.get('yield_rotation_cancel_owners')=={}, 'Exact successful terminal owner must retire without a rejected sibling'
+            assert not retired.get('yield_rotation_cancel_owners'), 'Exact successful terminal owner must retire without a rejected sibling'
             assert 'rank-c' not in retired.get('yield_rotation_protection_before',{})
             assert 'rank-c' not in retired.get('augment_cancel_requested',[])
             stage[0]='public_C_terminal_history_monitor'
@@ -4875,12 +5088,14 @@ def test_successful_terminal_owner_does_not_block_later_refused_round(runtime, m
         runtime.clock[0]=datetime.fromisoformat(ready['plan_wait']['deadline'])
         assert scheduler.run_due()
         waiting=capture('new_D_locally_refused')
+        d_requests=_wait_round_cancels(store,waiting)
         original_d=deepcopy(waiting['last_round'])
         assert waiting['active_plan'] is None and original_d['completed_at']
         assert original_d['round_id']!=original_c['round_id']
-        assert [a['order_id'] for a in original_d['actions']]==['rank-d']
+        assert original_d['actions']==[]
+        assert [a['order_id'] for a in d_requests]==['rank-d']
         assert [r['order_id'] for r in original_d['targets']]==['rank-a','rank-b']
-        assert original_d['actions'][0]['state']=='rejected' and original_d['actions'][0]['reason']=='venue_denied'
+        assert d_requests[0]['state']=='rejected' and d_requests[0]['reason']=='venue_denied'
         audit_d,=[deepcopy(a) for a in store.lp_actions(sid) if a.get('order_id')=='rank-d']
         assert audit_d['state']=='rejected' and audit_d['reason']=='venue_denied'
         assert audit_d['rotation_round_id']==original_d['round_id']
@@ -4910,13 +5125,13 @@ def test_successful_terminal_owner_does_not_block_later_refused_round(runtime, m
         paused_shape(state);assert state['last_round']['round_id'] not in (original_c['round_id'],original_d['round_id'])
         assert state['slots']['occupied']==(4 if mode=='legacy_live' else 3)
         assert Decimal(state['funds']['buy_reserved_usd'])==Decimal('31.40' if mode=='legacy_live' else '23.60')
-        d_packets=[r for r in evidence['result_packets'][result_start:] if 'rank-d' in r['request'].get('owned_order_ids',())]
+        d_packets=[r for r in evidence['full_packets'] if r['stage']==stage[0]]
         assert d_packets and any(r['packet']['authenticated'] is True and r['packet']['open_orders_complete'] is True
             and r['packet']['pagination_complete'] is True and any(o.get('order_id')=='rank-d' and o['status']=='LIVE'
                 and o['fill_quantity_known'] is True and Decimal(o['size_matched'])==0 and Decimal(o['price'])==Decimal('.40')
-                and Decimal(o['original_size'])==20 for o in r['packet']['orders']) for r in d_packets)
+                and Decimal(o['original_size'])==20 for o in r['packet']['open_orders']) for r in d_packets)
         restored=store.lp_session(sid)
-        assert restored.get('yield_rotation_cancel_owners')=={} and restored.get('yield_rotation_protection_before')=={}
+        assert not restored.get('yield_rotation_cancel_owners') and not restored.get('yield_rotation_protection_before')
         assert not restored.get('entry_cancel_requested') and restored.get('augment_cancel_requested',[])==[]
         assert restored['queue_protection']['levels']['0.40']==baseline['levels']['0.40']
         assert restored['queue_protection']['levels']['0.39']==low_control['queue_protection']['levels']['0.39']
@@ -4978,6 +5193,8 @@ def test_successful_terminal_owner_does_not_block_later_refused_round(runtime, m
 
 @pytest.mark.parametrize('case', ['current_protection', 'current_stop', 'healthy'])
 def test_cancel_restoration_preserves_concurrent_public_control(runtime, monkeypatch, tmp_path, case):
+    from collections import Counter
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels, _wait_audits
     import json
     import hashlib
     from pathlib import Path
@@ -5046,29 +5263,27 @@ def test_cancel_restoration_preserves_concurrent_public_control(runtime, monkeyp
     sent = engine.lp_auto_state()
     plan = deepcopy(sent['last_round'])
     assert sent['active_plan'] is None and plan['completed_at']
-    assert [(a['state'], a['reason']) for a in plan['actions']] == [('rejected', 'venue_denied')] * 2
+    original_audits=_wait_audits(store,lambda rows:{a['order_id']:a['state'] for a in rows if a.get('rotation_round_id')==plan['round_id']}=={'rank-a':'rejected','rank-b':'rejected'})
+    assert plan['actions']==[]
+    assert [(a['state'],a['reason']) for a in original_audits]==[('rejected','venue_denied')]*2
     assert sent['slots']['occupied'] == 3 and Decimal(sent['funds']['buy_reserved_usd']) == Decimal('23.80')
     assert datetime.fromisoformat(sent['plan_wait']['deadline']) == datetime.fromisoformat(plan['completed_at']) + timedelta(seconds=30)
     assert all(Decimal(t['price']) == Decimal('.39') and Decimal(t['quantity']) == 20 for t in plan['targets'])
     with sqlite3.connect(store.path) as connection:
         original_document = json.loads(connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
-    original_rotations = {oid: deepcopy(original_document['account_rotations'][oid]) for oid in ('rank-a', 'rank-b')}
-    assert all(rotation['session_id'] == sid and rotation['rotation_round_id'] == plan['round_id']
-        and Decimal(rotation['price']) == Decimal('.40') and Decimal(rotation['original_quantity']) == 20
-        for rotation in original_rotations.values())
-    assert [a['order_id'] for a in plan['actions']] == ['rank-a','rank-b']
+    assert not original_document.get('account_rotations')
+    assert set(plan['cancel_registration']['sessions'])=={'rank-a','rank-b'}
     assert [r['order_id'] for r in plan['targets']] == ['rank-c']
-    assert all(a['session_id']==sid for a in plan['actions'])
+    assert all(a['session_id']==sid for a in original_audits)
     original_audits = deepcopy(store.lp_actions(sid))
     assert len(original_audits)==2
     assert all(a['state']=='rejected' and a['reason']=='venue_denied'
         and a['rotation_round_id']==plan['round_id'] for a in original_audits)
-    assert account.cancels==[('rank-a',),('rank-b',)] and account.posts==[]
+    assert Counter(account.cancels)==Counter([('rank-a',),('rank-b',)]) and account.posts==[]
     assert not any(r['active_plan'] and r['phase']=='planned_auto' for r in finances)
     owned = store.lp_session(sid)
-    assert owned['yield_rotation_cancel_owners'] == {'rank-a': plan['round_id'], 'rank-b': plan['round_id']}
-    assert set(owned['yield_rotation_protection_before']) == {'rank-a', 'rank-b'}
-    assert all(owned['yield_rotation_protection_before'][oid] == baseline for oid in ('rank-a', 'rank-b'))
+    assert not owned.get('yield_rotation_cancel_owners') and not owned.get('yield_rotation_protection_before')
+    assert owned['queue_protection']==baseline
     engine.lp_auto_set_desired_running(False)
     assert engine.lp_auto_state()['desired_running'] is False
     current_phase[0] = 'current_cleanup'
@@ -5091,6 +5306,21 @@ def test_cancel_restoration_preserves_concurrent_public_control(runtime, monkeyp
             result_complete.set()
         return packet
     monkeypatch.setattr(adapter, 'lp_order_result_snapshot', observed_result)
+    planning_reader=adapter._lp_planning_account_snapshot
+    def observed_planning(**kwargs):
+        packet=planning_reader(**kwargs)
+        if scheduler_threads:
+            assert packet['authenticated'] is True and all(packet[k] is True for k in
+                ('balance_complete','open_orders_complete','pagination_complete','positions_complete','trades_complete'))
+            assert {o['order_id']for o in packet['open_orders']}=={'rank-a','rank-b','rank-c'}
+            for oid in ('rank-a','rank-b'):
+                row,=[r for r in packet['open_orders']if r['order_id']==oid]
+                assert row['side']=='BUY' and row['token_id']==owned['token_id'] and row['status']=='LIVE'
+                assert Decimal(row['price'])==Decimal('.40') and Decimal(row['original_size'])==20 and Decimal(row['size_matched'])==0
+            result_complete.set()
+        return packet
+    monkeypatch.setattr(adapter,'_lp_planning_account_snapshot',observed_planning)
+
 
     def control():
         control_threads.append(get_ident())
@@ -5169,8 +5399,8 @@ def test_cancel_restoration_preserves_concurrent_public_control(runtime, monkeyp
             # The FIRST exact original Row is the obligation, even if its
             # writer or baseline premise is wrong. Never skip to a good image.
             assert writer and transaction == 'BEGIN IMMEDIATE' and record['before_dml'], record
-            assert owners == {'rank-a': plan['round_id'], 'rank-b': plan['round_id']}
-            assert set(saved) == {'rank-a', 'rank-b'} and all(saved[oid] == baseline for oid in saved)
+            assert not owners and not saved
+            assert payload['queue_protection']==baseline
             assert not payload.get('stop_requested') and 'rank-c' not in payload.get('augment_cancel_requested', [])
             if case!='healthy':
                 job = Thread(target=control)
@@ -5231,11 +5461,7 @@ def test_cancel_restoration_preserves_concurrent_public_control(runtime, monkeyp
         with connect(store.path) as connection:
             current_document = json.loads(connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
         assert current_document['rounds'][plan['round_id']] == original_document['rounds'][plan['round_id']]
-        for oid, original_rotation in original_rotations.items():
-            rotation = current_document['account_rotations'][oid]
-            assert rotation['state'] == 'active' and rotation['rotation_settled_at']
-            assert all(rotation[k] == original_rotation[k] for k in ('rotation_round_id', 'rotation_requested_at',
-                'session_id', 'order_id', 'token_id', 'condition_id', 'price', 'quantity', 'original_quantity'))
+        assert not current_document.get('account_rotations')
         assert state['slots']['occupied']==3 and Decimal(state['funds']['buy_reserved_usd'])==Decimal('23.80')
         assert {o.id for o in account.orders}=={'rank-a','rank-b','rank-c'} and account.posts==[]
         final = store.lp_session(sid)
@@ -5243,7 +5469,7 @@ def test_cancel_restoration_preserves_concurrent_public_control(runtime, monkeyp
         for old in original_audits:
             assert next(a for a in store.lp_actions(sid) if a['action_key']==old['action_key'])==old
         if case.endswith('_protection'):
-            assert account.cancels==[('rank-a',),('rank-b',),('rank-c',)]
+            assert Counter(account.cancels)==Counter([('rank-a',),('rank-b',),('rank-c',)])
             protected_audit, = [a for a in control_capture['audits'] if a.get('role')=='entry-protection-cancel']
             assert protected_audit['state']=='accepted' and protected_audit['targets']==['rank-c']
             bucket = final['queue_protection']['levels']['0.39']
@@ -5274,11 +5500,11 @@ def test_cancel_restoration_preserves_concurrent_public_control(runtime, monkeyp
             assert account.cancels[2:].count(('rank-c',))==1
             assert account.cancels[2:].count(('rank-a',))<=1 and account.cancels[2:].count(('rank-b',))<=1
         else:
-            assert final['yield_rotation_cancel_owners']=={}
-            assert final['yield_rotation_protection_before']=={}
+            assert not final.get('yield_rotation_cancel_owners')
+            assert not final.get('yield_rotation_protection_before')
             assert not final.get('entry_cancel_requested') and final.get('augment_cancel_requested',[])==[]
             assert final['queue_protection']==baseline
-            assert store.lp_actions(sid)==original_audits and account.cancels==[('rank-a',),('rank-b',)]
+            assert store.lp_actions(sid)==original_audits and Counter(account.cancels)==Counter([('rank-a',),('rank-b',)])
         assert not any(r['active_plan'] and r['phase']=='planned_auto' for r in finances)
         calls, audits = list(account.cancels), deepcopy(store.lp_actions(sid))
         protective[0] = False
@@ -5345,13 +5571,14 @@ def test_cancel_restoration_preserves_concurrent_public_control(runtime, monkeyp
         (tmp_path/'publication-observer.json').write_text(json.dumps(dict(case=case,rows=rows_seen,events=events,
             errors=errors,control_errors=control_errors,control=control_capture,finances=finances,
             actual_calls=account.cancels,result_packets=result_packets,current_states=current_states,
-            original_round=plan,original_rotations=original_rotations,original_audits=original_audits,baseline=baseline,
+            original_round=plan,original_registration=plan['cancel_registration'],original_audits=original_audits,baseline=baseline,
             final_session=store.lp_session(sid),final_audits=store.lp_actions(sid),
             sender_alive=sender.is_alive(),control_alive=[j.is_alive() for j in control_jobs]),indent=2,default=str)+'\n')
 
 
 @pytest.mark.parametrize('case', ['terminal_same_price','unrelated_live_then_terminal'])
 def test_completed_ordinary_cancel_restores_later_yield_protection(runtime, monkeypatch, tmp_path, case):
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     import json
     from time import monotonic
     from polymarket.models.clob.cancel import CancelOrdersResponse
@@ -5425,6 +5652,13 @@ def test_completed_ordinary_cancel_restores_later_yield_protection(runtime, monk
         full_packets.append(deepcopy(dict(stage=stage[0],phase=phase[0],active_plan=bool(engine.lp_auto_state()['active_plan']),packet=packet)))
         return packet
     monkeypatch.setattr(adapter,'lp_account_snapshot_shared',observed_full)
+    planning_reader=adapter._lp_planning_account_snapshot
+    def observed_planning(**kwargs):
+        packet=planning_reader(**kwargs)
+        full_packets.append(deepcopy(dict(stage=stage[0],active_plan=bool(engine.lp_auto_state()['active_plan']),packet=packet)))
+        return packet
+    monkeypatch.setattr(adapter,'_lp_planning_account_snapshot',observed_planning)
+
     def document():
         with sqlite3.connect(store.path.as_uri()+'?mode=ro',uri=True) as connection:
             return json.loads(connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
@@ -5514,7 +5748,9 @@ def test_completed_ordinary_cancel_restores_later_yield_protection(runtime, monk
         sent = engine.lp_auto_state()
         plan = deepcopy(sent['last_round'])
         dispatched(sent);diagnostics['original_D_round']=plan
-        assert [a['order_id']for a in plan['actions']]==['rank-d']
+        d_requests=_wait_round_cancels(store,sent)
+        assert plan['actions']==[]
+        assert [a['order_id']for a in d_requests]==['rank-d']
         assert [t['order_id']for t in plan['targets']]==['rank-a','rank-b']
         original_d=store.lp_session(sid)['order_history']['rank-d']
         assert original_d['order_id']=='rank-d' and original_d['side']=='BUY'
@@ -5547,10 +5783,10 @@ def test_completed_ordinary_cancel_restores_later_yield_protection(runtime, monk
         if case=='terminal_same_price':
             assert Decimal(state['funds']['buy_reserved_usd'])==Decimal('23.60')
         assert state['funds']['status']=='known' and datetime.fromisoformat(state['funds']['as_of'])>=result_at
-        assert result_rows[result_start:] and not any(r['phase']=='planned_auto' and r['order_id']=='old-manual'for r in exact_reads)
+        assert any(p['stage']==stage[0] and p['packet']['open_orders_complete'] is True for p in full_packets) and not any(r['phase']=='planned_auto' and r['order_id']=='old-manual'for r in exact_reads)
         if case=='unrelated_live_then_terminal':
-            assert any(o['id']=='old-manual' and o['status']=='LIVE'
-                for r in result_rows[result_start:]for o in r['orders'])
+            assert any(o['order_id']=='old-manual' and o['status']=='LIVE'
+                for r in full_packets if r['stage']==stage[0] for o in r['packet']['open_orders'])
         restored = store.lp_session(sid)
         assert restored['queue_protection']['levels']['0.40']==baseline['levels']['0.40'], (stage[0],restored,baseline)
         assert restored['queue_protection']['levels']['0.39']==independent_image['queue_protection']['levels']['0.39']
@@ -5623,6 +5859,7 @@ def test_completed_ordinary_cancel_restores_later_yield_protection(runtime, monk
 
 @pytest.mark.parametrize('window', ['atomic_closure_commit'])
 def test_cancel_owner_retirement_recovers_after_committed_session(runtime, monkeypatch, tmp_path, window):
+    from tests.test_lp_auto_independent_cancel_contract import _wait_audits
     import json
     import hashlib
     from pathlib import Path
@@ -5694,8 +5931,9 @@ def test_cancel_owner_retirement_recovers_after_committed_session(runtime, monke
     sent = engine.lp_auto_state()
     plan = deepcopy(sent['last_round'])
     assert sent['active_plan'] is None and plan['completed_at']
-    assert [a['order_id'] for a in plan['actions']] == ['rank-d']
-    assert plan['actions'][0]['state'] == 'rejected' and plan['actions'][0]['reason'] == 'venue_denied'
+    audit,=_wait_audits(store,lambda rows:len(rows)==1 and rows[0]['state']=='rejected')
+    assert plan['actions']==[]
+    assert audit['order_id']=='rank-d' and audit['reason']=='venue_denied'
     assert [t['order_id'] for t in plan['targets']] == ['rank-a', 'rank-b']
     assert all(Decimal(t['price']) == Decimal('.39') and Decimal(t['quantity']) == 20 for t in plan['targets'])
     assert sent['slots']['occupied'] == 3 and Decimal(sent['funds']['buy_reserved_usd']) == Decimal('23.60')
@@ -5703,19 +5941,16 @@ def test_cancel_owner_retirement_recovers_after_committed_session(runtime, monke
     assert datetime.fromisoformat(sent['plan_wait']['deadline']) == original_completed + timedelta(seconds=30)
     with sqlite3.connect(store.path) as connection:
         initial_document = json.loads(connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
-    original_rotation = deepcopy(initial_document['account_rotations']['rank-d'])
-    assert (original_rotation['session_id'], original_rotation['order_id'], original_rotation['price'],
-        original_rotation['original_quantity']) == (sid, 'rank-d', '0.40', '20')
-    assert original_rotation['rotation_round_id'] == plan['round_id']
-    assert original_rotation['rotation_cancel_outcome'] == 'rejected'
+    assert not initial_document.get('account_rotations')
+    assert plan['cancel_registration']['sessions']=={'rank-d':sid}
     audit, = deepcopy(store.lp_actions(sid))
     assert audit['state']=='rejected' and audit['reason']=='venue_denied'
     assert audit['rotation_round_id']==plan['round_id'] and audit['order_id']=='rank-d'
     assert account.cancels==[('rank-d',)] and account.posts==[]
     assert not any(f['active_plan'] and f['phase'] == 'planned_auto' for f in finances)
     owned = store.lp_session(sid)
-    assert owned['yield_rotation_cancel_owners']['rank-d'] == plan['round_id']
-    assert owned['yield_rotation_protection_before']['rank-d'] == baseline
+    assert not owned.get('yield_rotation_cancel_owners') and not owned.get('yield_rotation_protection_before')
+    assert owned['queue_protection']==baseline
     engine.lp_auto_set_desired_running(False)
     assert engine.lp_auto_state()['desired_running'] is False
     interrupted, sender_ids = Event(), []
@@ -5735,6 +5970,22 @@ def test_cancel_owner_retirement_recovers_after_committed_session(runtime, monke
             packet_ready[0] = True
         return packet
     monkeypatch.setattr(adapter, 'lp_order_result_snapshot', observed_result)
+    planning_reader=adapter._lp_planning_account_snapshot
+    def observed_planning(**kwargs):
+        packet=planning_reader(**kwargs)
+        if phase[0]=='current_cleanup':
+            assert packet['authenticated'] is True and all(packet[k]is True for k in
+                ('balance_complete','open_orders_complete','pagination_complete','positions_complete','trades_complete'))
+            assert hashlib.sha256(str(packet['wallet_address']).strip().casefold().encode()).hexdigest()==initial_document['account_id']
+            assert {r['order_id']for r in packet['open_orders']}==set(original)
+            row,=[r for r in packet['open_orders']if r['order_id']=='rank-d']
+            assert row['side']=='BUY' and row['token_id']==owned['token_id'] and row['status']=='LIVE'
+            assert row['fill_quantity_known'] is True and Decimal(row['size_matched'])==0
+            assert Decimal(row['price'])==Decimal('.40') and Decimal(row['original_size'])==20
+            packet_ready[0]=True
+        return packet
+    monkeypatch.setattr(adapter,'_lp_planning_account_snapshot',observed_planning)
+
     connect = sqlite3.connect
     class EndAfterCommit(BaseException):
         pass
@@ -5743,6 +5994,7 @@ def test_cancel_owner_retirement_recovers_after_committed_session(runtime, monke
             command = sql.strip().upper()
             if command in ('BEGIN', 'BEGIN IMMEDIATE'):
                 self.before_session = self.updated_session = None
+                self.current_publication = None
             if command.startswith('UPDATE LP_SESSIONS ') and sid in parameters:
                 before_row = super().execute('SELECT payload FROM lp_sessions WHERE session_id=?', (sid,)).fetchone()
                 self.before_session = json.loads(before_row[0]) if before_row else None
@@ -5750,16 +6002,22 @@ def test_cancel_owner_retirement_recovers_after_committed_session(runtime, monke
                     if isinstance(value, str) and value.startswith('{'):
                         self.updated_session = json.loads(value)
             result = super().execute(sql, parameters)
+            if command.startswith('UPDATE LP_AUTO_POOL') and packet_ready[0]:
+                document=json.loads(super().execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
+                financial=document.get('account_financial_facts') or {}
+                if (financial.get('financial_status')=='known' and financial.get('account_id')==session['account_id']
+                        and datetime.fromisoformat(financial['checked_at'])>=datetime.fromisoformat(sent['plan_wait']['deadline'])):
+                    self.current_publication=deepcopy(document)
             if (command == 'COMMIT' and packet_ready[0] and not interrupted.is_set()
                     and sender_ids and get_ident() == sender_ids[0]):
                 before = getattr(self, 'before_session', None)
                 payload = getattr(self, 'updated_session', None)
-                if (before is None or payload is None
-                        or (before.get('yield_rotation_cancel_owners') or {}).get('rank-d') != plan['round_id']
-                        or (payload.get('yield_rotation_cancel_owners') or {}).get('rank-d') == plan['round_id']):
+                if getattr(self,'current_publication',None) is None:
                     return result
-                # Intercept FIRST exact original owner removal regardless of
-                # baseline/saved/settled state. Assert atomicity only afterward.
+                # Current facts publication need not rewrite a healthy session.
+                # Observe its exact native COMMIT and unchanged protected image.
+                payload=json.loads(super().execute('SELECT payload FROM lp_sessions WHERE session_id=?',(sid,)).fetchone()[0])
+                assert not payload.get('yield_rotation_cancel_owners') and not payload.get('yield_rotation_protection_before')
                 interrupted.set()
                 assert not self.in_transaction, 'Native first removal COMMIT must finish'
                 with connect(store.path) as reader:
@@ -5778,10 +6036,8 @@ def test_cancel_owner_retirement_recovers_after_committed_session(runtime, monke
                 assert actual.get('entry_cancel_requested') == session.get('entry_cancel_requested')
                 assert actual.get('stop_requested') == session.get('stop_requested')
                 assert actual.get('stop_loss_latched') == session.get('stop_loss_latched')
-                rotation = durable['account_rotations']['rank-d']
-                assert rotation['state'] == 'active' and rotation['rotation_settled_at']
-                assert all(rotation[k] == original_rotation[k] for k in ('rotation_round_id', 'rotation_requested_at',
-                    'session_id', 'order_id', 'token_id', 'condition_id', 'price', 'quantity', 'original_quantity'))
+                assert not durable.get('account_rotations')
+                assert durable['last_round']['cancel_registration']==plan['cancel_registration']
                 assert current_audits == [audit] and durable['desired_running'] is False
                 assert durable['rounds'][plan['round_id']] == initial_document['rounds'][plan['round_id']]
                 assert {o.id for o in account.orders if o.status == 'LIVE'} == set(original)
@@ -5839,7 +6095,10 @@ def test_cancel_owner_retirement_recovers_after_committed_session(runtime, monke
         assert deadline == started + timedelta(seconds=30)
         with connect(store.path) as reader:
             resumed_document = json.loads(reader.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
-        assert resumed_document['account_rotations']['rank-d'] == commits[0]['pool']['account_rotations']['rank-d']
+        assert not resumed_document.get('account_rotations')
+        assert resumed_document['last_round']['round_id']!=plan['round_id']
+        assert resumed_document['last_round']['actions']==[] and not resumed_document['last_round'].get('cancel_registration')
+        assert commits[0]['pool']['last_round']['cancel_registration']==plan['cancel_registration']
         assert resumed_document['rounds'][plan['round_id']] == initial_document['rounds'][plan['round_id']]
         assert resumed_document['account_financial_facts']['financial_status'] == 'known'
         assert datetime.fromisoformat(resumed_document['account_financial_facts']['checked_at']) >= datetime.fromisoformat(
@@ -5897,13 +6156,14 @@ def test_cancel_owner_retirement_recovers_after_committed_session(runtime, monke
         (tmp_path/'committed-closure-observer.json').write_text(json.dumps(dict(window=window,commits=commits,
             errors=[repr(e)for e in errors],sender_alive=sender.is_alive(),books=books,finances=finances,
             observations=observations,result_packets=result_packets,restart_states=restart_states,
-            original_round=plan,original_rotation=original_rotation,baseline=baseline,
+            original_round=plan,original_registration=plan['cancel_registration'],baseline=baseline,
             packet_ready=packet_ready[0],pressure_seen=pressure_seen.is_set(),
             sessions=store.lp_sessions(),audits=store.lp_actions(sid)),indent=2,default=str)+'\n')
 
 
 @pytest.mark.parametrize('outcome', ['accepted_live', 'unknown_then_terminal', 'prior_refusal_then_unknown'])
 def test_later_facts_publication_restores_deferred_yield_protection(runtime, monkeypatch, tmp_path, outcome):
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     import json
     from time import monotonic
     from polymarket.models.clob.cancel import CancelOrdersResponse
@@ -6021,7 +6281,8 @@ def test_later_facts_publication_restores_deferred_yield_protection(runtime, mon
             prior_sent = engine.lp_auto_state()
             prior_plan = deepcopy(prior_sent['last_round'])
             dispatched(prior_sent);diagnostics['prior_D_round']=prior_plan
-            assert [a['order_id']for a in prior_plan['actions']]==['rank-d']
+            assert prior_plan['actions']==[]
+            assert [a['order_id']for a in _wait_round_cancels(store,prior_sent)]==['rank-d']
             assert [t['order_id']for t in prior_plan['targets']]==['rank-a','rank-b']
             prior_audit, = deepcopy(store.lp_actions(sid))
             assert prior_audit['state']=='rejected' and prior_audit['reason']=='venue_denied'
@@ -6059,20 +6320,21 @@ def test_later_facts_publication_restores_deferred_yield_protection(runtime, mon
         sent = engine.lp_auto_state()
         plan = deepcopy(sent['last_round'])
         dispatched(sent);diagnostics['original_D_round']=plan
-        assert [a['order_id']for a in plan['actions']]==['rank-d']
+        assert plan['actions']==[]
+        assert [a['order_id']for a in _wait_round_cancels(store,sent)]==['rank-d']
         assert [t['order_id']for t in plan['targets']]==['rank-a','rank-b']
         d_audit, = [deepcopy(a)for a in store.lp_actions(sid)if a.get('rotation_round_id')==plan['round_id']]
         if prior_audit is not None:
             import sqlite3
             assert plan['round_id']!=prior_plan['round_id']
-            assert plan['actions'][0]['action_id']!=prior_plan['actions'][0]['action_id']
+            assert d_audit['action_id']!=prior_audit['action_id']
             assert d_audit['action_id']!=prior_audit['action_id'] and d_audit['action_key']!=prior_audit['action_key']
             assert next(a for a in store.lp_actions(sid)if a['action_key']==prior_audit['action_key'])==prior_audit
             assert account.cancels==[('rank-d',),('rank-d',)] and account.posts==[]
             with sqlite3.connect(store.path.as_uri()+'?mode=ro',uri=True)as reader:
                 actual = json.loads(reader.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
-            assert actual['account_rotations']['rank-d']['rotation_round_id']==plan['round_id']
-            assert actual['account_rotations']['rank-d']['session_id']==sid
+            assert not actual.get('account_rotations')
+            assert plan['cancel_registration']['sessions']['rank-d']==sid
             diagnostics['prior_round'] = dict(plan=prior_plan,audit=prior_audit,deadline=prior_done['plan_wait']['deadline'])
 
         assert d_audit['state']=='rejected' and d_audit['reason']=='venue_denied'
@@ -6084,7 +6346,7 @@ def test_later_facts_publication_restores_deferred_yield_protection(runtime, mon
         adapter.lp_account_snapshot_shared(max_age_seconds=-1,trade_generation_provider=store.lp_trade_generation)
         assert engine.refresh_lp_dashboard_snapshot()['state']=='ready'
         assert set(store.lp_session(sid)['owned_order_ids'])==set(original)
-        assert store.lp_session(sid)['yield_rotation_protection_before']['rank-d']==baseline
+        assert not store.lp_session(sid).get('yield_rotation_protection_before')
         stage[0],phase[0] = 'ordinary_extra_cancel','explicit_manual'
         if outcome in ('unknown_then_terminal','prior_refusal_then_unknown'):
             with pytest.raises(PolymarketTradingError)as unknown:
@@ -6119,11 +6381,14 @@ def test_later_facts_publication_restores_deferred_yield_protection(runtime, mon
         assert state['slots']['occupied']==4 and Decimal(state['funds']['buy_reserved_usd'])==Decimal('31.60')
         assert state['funds']['status']=='known' and datetime.fromisoformat(state['funds']['as_of'])>=datetime.fromisoformat(explicit['funds']['as_of'])
         deferred = deepcopy(store.lp_session(sid))
-        assert deferred['yield_rotation_protection_before']['rank-d']==baseline
+        assert not deferred.get('yield_rotation_protection_before')
         assert not deferred.get('yield_rotation_cancel_owners')
         level = deferred['queue_protection']['levels']['0.40']
-        assert level['state']=='canceling' and level['cancel_reason']=='yield_rotation'
-        assert 'rank-d'in level['cancel_targets']
+        assert level==independent['queue_protection']['levels']['0.40']
+        assert level['order_id']=='rank-d'
+        for key in ('baseline_front','baseline_price','baseline_source','baseline_source_timestamp',
+                'baseline_book_received_at','baseline_book_hash','baseline_version'):
+            assert level[key]==baseline['levels']['0.40'][key],key
         for key in ('entry_cancel_requested','owned_cancel_requested'):
             assert deferred.get(key)==independent.get(key),key
         assert [x for x in deferred.get('augment_cancel_requested',[])if x!='rank-d']==[
@@ -6139,7 +6404,7 @@ def test_later_facts_publication_restores_deferred_yield_protection(runtime, mon
         runtime.clock[0] += timedelta(seconds=1)
         report = lp.reconcile_facts(sid,report_only=True)
         diagnostics['report_error'] = report[3]
-        assert store.lp_session(sid)['yield_rotation_protection_before']['rank-d']==baseline
+        assert not store.lp_session(sid).get('yield_rotation_protection_before')
         assert account.cancels==prior_calls+[('rank-d',),('extra',)] and account.posts==[]
         session,_ = monitor_until(lambda s,o:not s.get('yield_rotation_protection_before')
             and s['queue_protection']['levels']['0.40']['state']=='monitoring'
@@ -6208,6 +6473,7 @@ def test_later_facts_publication_restores_deferred_yield_protection(runtime, mon
 
 @pytest.mark.parametrize('terminal_timing', ['terminal_together', 'independent_later'])
 def test_distinct_round_cancel_requests_restore_survivor_protection(runtime, monkeypatch, tmp_path, terminal_timing):
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     import json
     from time import monotonic
     from polymarket.models.clob.cancel import CancelOrdersResponse
@@ -6325,7 +6591,8 @@ def test_distinct_round_cancel_requests_restore_survivor_protection(runtime, mon
         sent = engine.lp_auto_state()
         plan = deepcopy(sent['last_round'])
         dispatched(sent);capture('first_D_ACK_LIVE_locally_complete')
-        assert [a['order_id']for a in plan['actions']]==['rank-d']
+        assert plan['actions']==[]
+        assert [a['order_id']for a in _wait_round_cancels(store,sent)]==['rank-d']
         assert [t['order_id']for t in plan['targets']]==['rank-a','rank-b']
         first_audit, = deepcopy(store.lp_actions(sid))
         assert first_audit['state']=='accepted' and first_audit['rotation_round_id']==plan['round_id']
@@ -6340,8 +6607,9 @@ def test_distinct_round_cancel_requests_restore_survivor_protection(runtime, mon
         retried=capture('second_current_D_refusal_locally_complete')
         second_plan=deepcopy(retried['last_round']);dispatched(retried)
         assert second_plan['round_id']!=plan['round_id']
-        assert [a['order_id'] for a in second_plan['actions']]==['rank-d']
-        assert second_plan['actions'][0]['action_id']!=plan['actions'][0]['action_id']
+        assert second_plan['actions']==[]
+        second_request,=_wait_round_cancels(store,retried)
+        assert second_request['order_id']=='rank-d' and second_request['action_id']!=first_audit['action_id']
         assert [{k:t.get(k) for k in ('condition_id','token_id','session_id','order_id','price','quantity')} for t in second_plan['targets']]==[
             {k:t.get(k) for k in ('condition_id','token_id','session_id','order_id','price','quantity')} for t in plan['targets']]
         history=store.lp_session(sid)['order_history']['rank-d']
@@ -6359,9 +6627,9 @@ def test_distinct_round_cancel_requests_restore_survivor_protection(runtime, mon
         import sqlite3
         with sqlite3.connect(store.path.as_uri()+'?mode=ro',uri=True)as reader:
             actual = json.loads(reader.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
-        rotation = actual['account_rotations']['rank-d']
-        assert rotation['rotation_round_id']==second_plan['round_id'] and rotation['session_id']==sid
-        assert rotation['rotation_cancel_outcome']=='rejected' and rotation['rotation_rejection_reason']=='venue_denied'
+        assert not actual.get('account_rotations')
+        assert second_plan['cancel_registration']['sessions']['rank-d']==sid
+        assert second_request['state']=='rejected' and second_request['reason']=='venue_denied'
         diagnostics['original_plan'],diagnostics['retry'] = plan,retried
         diagnostics['second_round']=second_plan
         stage[0],phase[0] = 'public_extra_import','explicit_dashboard'
@@ -6371,7 +6639,7 @@ def test_distinct_round_cancel_requests_restore_survivor_protection(runtime, mon
         adapter.lp_account_snapshot_shared(max_age_seconds=-1,trade_generation_provider=store.lp_trade_generation)
         assert engine.refresh_lp_dashboard_snapshot()['state']=='ready'
         assert set(store.lp_session(sid)['owned_order_ids'])==set(original)
-        assert store.lp_session(sid)['yield_rotation_protection_before']['rank-d']==baseline
+        assert not store.lp_session(sid).get('yield_rotation_protection_before')
         stage[0],phase[0] = 'ordinary_extra_cancel','explicit_manual'
         with pytest.raises(PolymarketTradingError)as unknown:
             engine.lp_cancel_orders(dict(confirm=True,order_ids=['extra']))
@@ -6402,11 +6670,14 @@ def test_distinct_round_cancel_requests_restore_survivor_protection(runtime, mon
         assert state['slots']['occupied']==4 and Decimal(state['funds']['buy_reserved_usd'])==Decimal('31.60')
         assert state['funds']['status']=='known' and datetime.fromisoformat(state['funds']['as_of'])>=datetime.fromisoformat(explicit['funds']['as_of'])
         deferred = deepcopy(store.lp_session(sid))
-        assert deferred['yield_rotation_protection_before']['rank-d']==baseline
+        assert not deferred.get('yield_rotation_protection_before')
         assert not deferred.get('yield_rotation_cancel_owners')
         level = deferred['queue_protection']['levels']['0.40']
-        assert level['state']=='canceling' and level['cancel_reason']=='yield_rotation'
-        assert 'rank-d'in level['cancel_targets']
+        assert level==independent['queue_protection']['levels']['0.40']
+        assert level['order_id']=='rank-d'
+        for key in ('baseline_front','baseline_price','baseline_source','baseline_source_timestamp',
+                'baseline_book_received_at','baseline_book_hash','baseline_version'):
+            assert level[key]==baseline['levels']['0.40'][key],key
         for key in ('entry_cancel_requested','owned_cancel_requested'):
             assert deferred.get(key)==independent.get(key),key
         assert [x for x in deferred.get('augment_cancel_requested',[])if x!='rank-d']==[
@@ -6422,7 +6693,7 @@ def test_distinct_round_cancel_requests_restore_survivor_protection(runtime, mon
         assert engine.refresh_lp_dashboard_snapshot()['state']=='ready'
         imported = store.lp_session(sid)
         assert set(imported['owned_order_ids'])==set(original)
-        assert imported['yield_rotation_protection_before']['rank-d']==baseline
+        assert not imported.get('yield_rotation_protection_before')
         survivor = imported['order_history']['survivor']
         assert survivor['status']=='LIVE' and survivor['side']=='BUY' and Decimal(survivor['size_matched'])==0
         assert Decimal(survivor.get('original_size',survivor.get('quantity')))==20
@@ -6436,10 +6707,12 @@ def test_distinct_round_cancel_requests_restore_survivor_protection(runtime, mon
         runtime.clock[0] += timedelta(seconds=1)
         if terminal_timing=='independent_later':
             persisted,_ = monitor_until(lambda s,o:s['order_history']['rank-d']['status']=='CANCELED'
-                and s['queue_protection']['levels']['0.40']['state']=='canceled', 'Actual persisted canceled-yield watchdog')
-            assert persisted['queue_protection']['levels']['0.40']['cancel_reason']=='yield_rotation'
-            assert persisted['yield_rotation_protection_before']['rank-d']==baseline
-            assert persisted['queue_protection']['levels']['0.40']['order_id']=='rank-d'
+                and s['queue_protection']['levels']['0.40']['order_id']=='survivor', 'Actual persisted current survivor watchdog')
+            assert not persisted.get('yield_rotation_protection_before')
+            assert persisted['queue_protection']['levels']['0.40']['order_id']=='survivor'
+            for key in ('baseline_front','baseline_price','baseline_source','baseline_source_timestamp',
+                    'baseline_book_received_at','baseline_book_hash','baseline_version'):
+                assert persisted['queue_protection']['levels']['0.40'][key]==baseline['levels']['0.40'][key],key
             assert next(a for a in store.lp_actions(sid)if a['action_key']==extra_audit['action_key'])==extra_audit
             assert persisted['order_history']['extra']['status']=='LIVE'
             diagnostics['persisted_canceled'] = persisted
@@ -6450,7 +6723,7 @@ def test_distinct_round_cancel_requests_restore_survivor_protection(runtime, mon
         runtime.clock[0] += timedelta(seconds=1)
         report = lp.reconcile_facts(sid,report_only=True)
         diagnostics['report_error'] = report[3]
-        assert store.lp_session(sid)['yield_rotation_protection_before']['rank-d']==baseline
+        assert not store.lp_session(sid).get('yield_rotation_protection_before')
         assert account.cancels==[('rank-d',),('rank-d',),('extra',)] and account.posts==[]
         session,_ = monitor_until(lambda s,o:not s.get('yield_rotation_protection_before')
             and s['queue_protection']['levels']['0.40']['state']=='monitoring'

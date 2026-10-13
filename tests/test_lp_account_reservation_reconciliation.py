@@ -831,6 +831,7 @@ def test_late_same_generation_snapshot_waits_without_overwriting_newer_account_t
 @pytest.mark.parametrize("reverse_input", [False, True], ids=["survivor-is-anchor", "victim-is-anchor"])
 def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_account(runtime, reverse_input):
     import json
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     orders = (
         _open_order("rank-a", "BUY", price="0.40", original="20"),
         _open_order("rank-b", "BUY", price="0.40", original="20"),
@@ -868,13 +869,15 @@ def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_acco
     _advance(runtime)
     rotating = execution.lp_auto_run_once(round_id="real-overcapacity")
     # Same yield, condition and token: the stable exchange-ID tie-break keeps A.
+    requests = _wait_round_cancels(store, rotating)
+    assert len(requests) == 1 and requests[0]['order_id'] == 'rank-b' and requests[0]['state'] == 'accepted'
     assert account.cancels == [("rank-b",)], rotating["last_round"]
     assert rotating["slots"]["occupied"] == 2
-    assert rotating["slots"]["canceling"] == 1
+    assert rotating["slots"]["canceling"] == 0
     assert _amount(rotating, "buy_reserved_usd") == 16
     assert account.posts == account.market_orders == []
     assert rotating["intents"] == []
-    assert_survivor_protected()
+    assert next(iter(lp._queue_protection_levels(store.lp_session(sid)).values())) == initial_bucket
 
     # Current complete account facts release the absent order's slot without
     # inventing a terminal receipt for the historical cancel audit.
@@ -914,7 +917,7 @@ def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_acco
     assert account.cancels == [("rank-b",)]
     assert account.posts == account.market_orders == []
     assert absent["intents"] == []
-    assert_survivor_protected()
+    assert next(iter(lp._queue_protection_levels(store.lp_session(sid)).values())) == initial_bucket
 
     receipt_reads = []
 
@@ -985,6 +988,7 @@ class _FiveMarketPublic(_CandidateSDKPublic):
 @pytest.mark.parametrize('history', ['matching', 'missing', 'different-quantity'])
 def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runtime, budget, expected_buys, history):
     from polymarket.models.clob import SignedOrder
+    from threading import Lock
 
     _, inventory_condition, inventory_token = _refill_identity(6)
     historical_quantity = '10' if history == 'different-quantity' else '20'
@@ -1023,9 +1027,11 @@ def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runti
     assert len(execution._auto_pool.candidates()) == 5
 
     planning_as_of = []
+    planning_capture = Lock()
     def signed_order(**kwargs):
-        if not planning_as_of:
-            planning_as_of.append(execution.lp_auto_state()["funds"]["as_of"])
+        with planning_capture:
+            if not planning_as_of:
+                planning_as_of.append(execution.lp_auto_state()["funds"]["as_of"])
         assert kwargs["price"] == Decimal(".40")
         assert kwargs["size"] == Decimal("20")
         _advance(runtime)
@@ -1057,11 +1063,12 @@ def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runti
         assert len(account.posts) == 5
         assert repeated["slots"]["occupied"] == 5
     if expected_buys:
-        assert planning_as_of and planning_as_of[0]
+        assert len(planning_as_of) == 1 and planning_as_of[0]
         assert datetime.fromisoformat(planning_as_of[0]) <= runtime.clock[0]
         assert refilled["funds"]["status"] == "unknown", refilled
         assert refilled["funds"]["as_of"] == planning_as_of[0]
     else:
+        assert planning_as_of == []
         assert refilled["funds"]["status"] == "known", refilled
     assert refilled["slots"]["active"] == expected_buys
     assert refilled["slots"]["occupied"] == expected_buys

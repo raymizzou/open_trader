@@ -149,33 +149,48 @@ def test_account_rotation_ranks_and_cancels_real_id_without_fake_intent(tmp_path
     rotation.refresh(lp, exchange, 3)
     advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    requests = _wait_round_cancels(store, state)
     assert exchange.cancels == ['o1']
     assert len(exchange.posts) == 1
     assert state['intents'] == []
     assert state['slots']['occupied'] == 1
-    assert state['slots']['canceling'] == 1
+    assert state['slots']['canceling'] == 0
     assert state['funds']['spendable_usd'] is None
-    assert engine._auto_pool._read()['account_rotations']['o1']['rotation_cancel_acknowledged']
+    assert len(requests) == 1 and requests[0]['state'] == 'accepted'
+    assert not store.lp_session(requests[0]['session_id']).get('yield_rotation_cancel_owners')
     assert any(a.get('order_id') == 'o1' and a.get('role') == 'reconciliation_cancel'
                for a in store.lp_actions(state['account_buys'][0]['session_id']))
 
 
 def test_overcapacity_same_token_buys_use_two_slots_and_exact_rotation_victim(tmp_path, monkeypatch):
-    engine, exchange, lp, _, rotation = rotation_pool(tmp_path, monkeypatch, same_token=True)
+    engine, exchange, lp, store, rotation = rotation_pool(tmp_path, monkeypatch, same_token=True)
     from tests.test_lp_auto_plan_execution import install_order_result_reader
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m00'] = Decimal('30')
     rotation.refresh(lp, exchange, 3)
     state = engine.lp_auto_state()
     assert state['slots']['occupied'] == 2
+    assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('16')
     targets, victims, _, blocked = engine._auto_pool._ranked_buys(state)
     assert not blocked
     assert len(targets) == 1
     assert len(victims) == 1
     assert targets[0]['order_id'] != victims[0]['order_id']
     assert {targets[0]['order_id'], victims[0]['order_id']} == {'o1', 'manual-second'}
-    engine.lp_auto_run_once()
+    completed = engine.lp_auto_run_once()
+    assert completed['active_plan'] is None and completed['last_round']['completed_at']
+    receipt, = _wait_round_cancels(store, completed)
+    assert receipt['state'] == 'accepted' and receipt['order_id'] == victims[0]['order_id']
+    assert receipt['session_id'] == victims[0]['session_id']
+    assert receipt['rotation_round_id'] == completed['last_round']['round_id']
+    assert receipt['action_id'] and receipt['action_key']
+    assert any(a['action_id'] == receipt['action_id'] and a['action_key'] == receipt['action_key']
+        for a in store.lp_actions(receipt['session_id']))
+    assert completed['last_round']['targets'][0]['order_id'] == targets[0]['order_id']
+    assert exchange.cancels == [victims[0]['order_id']]
     assert len(exchange.cancels) == 1
     assert len(exchange.posts) == 1
 
@@ -265,8 +280,11 @@ def test_account_rotation_fill_keeps_inventory_budget_without_sale(tmp_path, mon
         advance_auto_wait(engine,monkeypatch)
         rotation.refresh(lp,exchange,3)
         sent=engine.lp_auto_run_once();closed(sent);cancel_round=capture('original_cancel_locally_complete')
+        from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+        requests = _wait_round_cancels(store, sent)
         assert exchange.cancels==[original_order['order_id']] and len(exchange.posts)==1
-        cancel_action,=[a for a in cancel_round['last_round']['actions'] if a['kind']=='cancel']
+        assert not any(a['kind']=='cancel' for a in cancel_round['last_round']['actions'])
+        cancel_action, = requests
         assert cancel_action['session_id']==sid and cancel_action['order_id']==original_order['order_id']
         assert [t['token_id'] for t in cancel_round['last_round']['targets']]==['m01']
         old_audits=deepcopy(store.lp_actions(sid))
@@ -294,12 +312,6 @@ def test_account_rotation_fill_keeps_inventory_budget_without_sale(tmp_path, mon
         assert Decimal(state['funds']['inventory_cost_usd'])==Decimal('3.20')
         planning,=[x for x in evidence['signed'] if x['round']==replacement['last_round']['round_id']]
         assert state['funds']['status']=='unknown' and state['funds']['as_of']==planning['as_of'] and state['funds']['available_usd'] is None
-        owned=store.lp_session(sid)
-        assert Decimal(owned['buy_filled_quantity'])==Decimal(owned['residual_quantity'])==8
-        assert Decimal(owned['buy_cost'])==Decimal('3.20') and Decimal(owned['buy_fees'])==0
-        assert owned['position_reconciled'] is True
-        assert store.lp_actions(sid)==old_audits
-        evidence['ledger']={k:deepcopy(owned.get(k)) for k in ('buy_filled_quantity','residual_quantity','buy_cost','buy_fees','fee_status','position_reconciled','verified_order_fills')}
         registration=lp.register_account_snapshot;publication_results=[]
         def observed_publication(snapshot):
             result=registration(snapshot);publication_results.append(deepcopy(result));return result
@@ -309,6 +321,14 @@ def test_account_rotation_fill_keeps_inventory_budget_without_sale(tmp_path, mon
         published=engine.refresh_lp_dashboard_snapshot()
         assert published['state']=='ready',(published,publication_results)
         financial=capture('complete_fill_finance_88_80')
+        reconciled = lp.reconcile_facts(sid)
+        assert reconciled[3] is None, reconciled[3]
+        owned=store.lp_session(sid)
+        assert Decimal(owned['buy_filled_quantity'])==Decimal(owned['residual_quantity'])==8
+        assert Decimal(owned['buy_cost'])==Decimal('3.20') and Decimal(owned['buy_fees'])==0
+        assert owned['position_reconciled'] is True
+        assert store.lp_actions(sid)==old_audits
+        evidence['ledger']={k:deepcopy(owned.get(k)) for k in ('buy_filled_quantity','residual_quantity','buy_cost','buy_fees','fee_status','position_reconciled','verified_order_fills')}
         assert financial['funds']['status']=='known' and financial['slots']['occupied']==1
         assert Decimal(financial['funds']['buy_reserved_usd'])==8 and Decimal(financial['funds']['inventory_cost_usd'])==Decimal('3.20')
         assert Decimal(financial['funds']['available_usd'])==Decimal('88.80')
@@ -394,9 +414,12 @@ def test_first_account_coverage_preserves_inflight_rotation_fill_stop(tmp_path, 
     advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 2)
-    engine.lp_auto_run_once()
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    rotation_state = engine.lp_auto_run_once()
+    requests = _wait_round_cancels(store, rotation_state)
+    assert len(requests) == 1 and requests[0]['order_id'] == 'o1' and requests[0]['state'] == 'accepted'
     intent = engine.lp_auto_state()['intents'][0]
-    assert intent['state'] == 'canceling'
+    assert intent['state'] == 'active'
     assert exchange.cancels == ['o1']
     original_audit = deepcopy(store.lp_actions(intent['session_id']))
     exchange.orders[0].update(status='CANCELED', size_matched='8')
@@ -412,7 +435,7 @@ def test_first_account_coverage_preserves_inflight_rotation_fill_stop(tmp_path, 
     assert lp.register_account_snapshot(packet)['state'] == 'registered'
     covered = engine.lp_auto_state()['intents'][0]
     assert covered['reservation_coverage']['state'] == 'covered'
-    assert covered['state'] == 'canceling'
+    assert covered['state'] == 'active'
     original_as_of = engine.lp_auto_state()['funds']['as_of']
     state = engine.lp_auto_run_once()
     assert state['last_round']['completed_at'] and state['active_plan'] is None
@@ -424,7 +447,7 @@ def test_first_account_coverage_preserves_inflight_rotation_fill_stop(tmp_path, 
     assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == original_as_of
     assert store.lp_actions(intent['session_id']) == original_audit
     original = next(i for i in state['intents'] if i['intent_id'] == intent['intent_id'])
-    assert original['state'] == 'canceling'  # Original audit stays frozen after coverage.
+    assert original['state'] == 'active'  # Original audit stays frozen after coverage.
     assert original['reservation_coverage'] == covered['reservation_coverage']
     assert all(p['side'] == 'BUY' for p in exchange.posts)
 
@@ -584,9 +607,11 @@ def test_covered_unknown_session_keeps_its_original_request_unbound(tmp_path, mo
         engine.lp_auto_set_desired_running(True)
         state=engine.lp_auto_run_once();closed(state);new_round=capture('distinct_current_manual_late_request_not_original_receipt')
         assert new_round['last_round']['round_id']!=original_round['round_id']
+        from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+        cancel_action,=_wait_round_cancels(store,new_round)
         assert exchange.cancels==['manual-late'] and len(exchange.posts)==1
-        cancel_action,=[a for a in new_round['last_round']['actions'] if a['kind']=='cancel']
-        assert cancel_action['order_id']=='manual-late' and cancel_action['state']=='canceling'
+        assert cancel_action['order_id']=='manual-late' and cancel_action['state']=='accepted'
+        assert all(a['kind']=='buy' for a in new_round['last_round']['actions'])
         new_audit,=[a for a in store.lp_actions(cancel_action['session_id']) if a.get('rotation_round_id')==new_round['last_round']['round_id']]
         assert new_audit['order_id']=='manual-late' and new_audit['state']=='accepted' and new_audit['role']=='reconciliation_cancel'
         assert new_audit['action_id']!=original_audit[0]['action_id'] and new_audit['action_key']!=original_audit[0]['action_key']
@@ -625,16 +650,33 @@ def test_covered_unknown_session_keeps_its_original_request_unbound(tmp_path, mo
     finally:save('KF-covered-unknown-diagnostics.json')
 
 def test_account_row_fill_blocks_rotation_even_before_session_fill_updates(tmp_path, monkeypatch):
-    engine, exchange, lp, store, rotation = rotation_pool(tmp_path, monkeypatch)
-    row = engine.lp_auto_state()['account_buys'][0]
-    assert Decimal(store.lp_session(row['session_id'])['buy_filled_quantity']) == 0
-    def fill(d):
-        d['account_financial_facts']['buys'][0].update(filled_quantity='8', quantity='12', reserved_usd='4.8')
-        d['account_financial_facts']['inventory_cost_usd'] = '3.2'
-    engine._auto_pool._update(fill)
-    with pytest.raises(ValueError, match='rotation_awaiting_reconciliation'):
-        engine._auto_pool._rotation_session(engine.lp_auto_state()['account_buys'][0])
-    assert exchange.cancels == []
+    from tests.test_lp_auto_independent_cancel_contract import _five_resting, _wait_round_cancels
+    from polymarket.models.data.portfolio import Position
+    from tests.test_lp_account_reservation_reconciliation import _refill_identity
+    from tests.test_lp_order_registration_contract import WALLET
+    from tests.test_lp_account_reservation_reconciliation import runtime as sdk_fixture
+    fixture_lifetime = sdk_fixture.__wrapped__(tmp_path, monkeypatch)
+    runtime = next(fixture_lifetime)
+    try:
+        store, adapter, account, lp, engine, public = _five_resting(runtime, f_price='.20')
+        assert engine.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+        session = next(s for s in store.lp_sessions() if s['entry_order_id'] == 'original-E')
+        assert Decimal(session['buy_filled_quantity']) == 0
+        account.orders = tuple(o.model_copy(update={'size_matched': Decimal('8')}) if o.id == 'original-E' else o
+            for o in account.orders)
+        account.positions = (Position(conditionId=_refill_identity(5)[1], proxyWallet=WALLET,
+            asset=_refill_identity(5)[2], size=Decimal('8'), avgPrice=Decimal('.40'), outcome='YES'),)
+        assert Decimal(store.lp_session(session['session_id'])['buy_filled_quantity']) == 0
+        state = engine.lp_auto_run_once(round_id='current-api-partial')
+        requests = _wait_round_cancels(store, state)
+        assert account.cancels == [('original-E',)] and len(requests) == 1
+        assert requests[0]['session_id'] == session['session_id'] and requests[0]['order_id'] == 'original-E'
+        assert account.posts == account.market_orders == []
+        assert state['slots']['occupied'] == 5
+        assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('36.8')
+        assert Decimal(state['funds']['inventory_cost_usd']) == Decimal('3.2')
+    finally:
+        fixture_lifetime.close()
 
 
 def test_rotation_reanchors_same_price_survivor_without_resetting_protection(tmp_path, monkeypatch):
@@ -659,13 +701,34 @@ def test_rotation_reanchors_same_price_survivor_without_resetting_protection(tmp
     assert lp._queue_protection_gate_open(session)
     rotation.refresh(lp, exchange, 2)
     engine.lp_auto_set_desired_running(True)
-    engine.lp_auto_run_once()
+    state=engine.lp_auto_run_once()
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    request,=_wait_round_cancels(store,state)
+    assert state['last_round']['actions']==[]
+    assert request['order_id']=='rank-b' and request['state']=='accepted'
     assert exchange.cancels == ['rank-b']
+    unchanged=store.lp_session(session['session_id'])
+    assert lp._queue_protection_levels(unchanged)[key]==bucket
+    assert not lp._order_cancel_requested(unchanged,'rank-a')
+    assert not lp._order_cancel_requested(unchanged,'rank-b')
+    next(o for o in exchange.orders if o['order_id']=='rank-b')['status']='CANCELED'
+    pool.NOW+=timedelta(seconds=1)
+    assert lp.register_account_snapshot(pool._fresh_registration_bundle(exchange,lp))['state']=='registered'
+    account_reader=exchange.lp_account_snapshot
+    def complete_account():
+        snapshot=account_reader()
+        snapshot.update(balance_complete=True,trades_complete=True,pagination_complete=True,
+            raw_trades=deepcopy(exchange.trades))
+        return snapshot
+    monkeypatch.setattr(exchange,'lp_account_snapshot',complete_account)
+    reconciled=lp.reconcile_facts(session['session_id'])
+    assert reconciled[3] is None, reconciled[3]
     after = store.lp_session(session['session_id'])
     assert lp._queue_protection_levels(after)[key] == {**bucket, 'order_id': 'rank-a'}
     assert lp._queue_protection_gate_open(after)
     assert not lp._order_cancel_requested(after, 'rank-a')
-    assert lp._order_cancel_requested(after, 'rank-b')
+    assert not lp._order_cancel_requested(after, 'rank-b')
+    assert next(a for a in store.lp_actions(session['session_id']) if a['action_key']==request['action_key'])==request
     assert exchange.posts == []
 
 
@@ -872,19 +935,20 @@ def test_account_overcapacity_cancels_only_unfilled_extra_beside_partial_buy(
             if mismatched_original_size:
                 assert exchange.cancels==[] and state['last_round']['reason']=='target_filled'
                 assert Decimal(state['funds']['buy_reserved_usd'])==Decimal('15.60')
-                cancel,=[a for a in state['last_round']['actions'] if a['kind']=='cancel']
-                assert cancel['order_id']=='o1' and cancel['state']=='not_sent' and cancel['reason']=='owned_order_identity_mismatch'
-                retained,=[t for t in evidence['plans'][0]['targets'] if t['token_id']=='m01']
+                assert state['last_round']['independent_cancel_error']=='owned_order_identity_mismatch'
+                assert all(a['kind']=='buy' for a in state['last_round']['actions'])
+                retained,=[t for t in evidence['plans'][0]['victims'] if t['token_id']=='m01']
                 assert Decimal(retained['original_quantity'])==20 and Decimal(retained['quantity'])==19
                 assert any(Decimal(o['original_size'])==21 for x in evidence['result_packets'] for o in x['packet']['orders'] if o['order_id']=='partial-buy')
                 assert store.lp_actions(original_sid)==entry_audits
             else:
-                assert exchange.cancels==['o1'] and state['slots']['canceling']==state['slots']['active']==1
-                cancel_audits=deepcopy(store.lp_actions(original_sid))
-                cancel,=[a for a in cancel_audits if a.get('role')=='reconciliation_cancel']
-                assert cancel['state']=='accepted' and cancel['order_id']=='o1'
-                original_live=next(o for o in exchange.orders if o['order_id']=='o1')
-                original_live.update(status='CANCELED',size_matched='0')
+                from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+                requests = _wait_round_cancels(store, state)
+                assert exchange.cancels==['partial-buy']
+                cancel, = requests
+                assert cancel['state']=='accepted' and cancel['order_id']=='partial-buy'
+                cancel_audits = deepcopy(store.lp_actions('partial-session'))
+                partial.update(status='CANCELED')
                 advance_auto_wait(engine,monkeypatch)
                 later=full(trade_generation_provider=store.lp_trade_generation)
                 assert later['read_started_at']>packet['read_ended_at']
@@ -892,29 +956,16 @@ def test_account_overcapacity_cancels_only_unfilled_extra_beside_partial_buy(
                 assert publication['state']=='registered',publication
                 settled=engine.lp_auto_run_once();capture('later-current-terminal-authority')
                 assert settled['slots']['occupied']==1
-                assert Decimal(settled['funds']['buy_reserved_usd'])==Decimal('7.60')
+                assert Decimal(settled['funds']['buy_reserved_usd'])==8
                 assert Decimal(settled['funds']['inventory_cost_usd'])==Decimal('.40')
-                assert exchange.cancels==['o1'] and len(exchange.posts)==1
-                assert store.lp_actions(original_sid)==cancel_audits
+                assert exchange.cancels==['partial-buy'] and len(exchange.posts)==1
+                assert store.lp_actions(original_sid)==entry_audits
+                assert store.lp_actions('partial-session')==cancel_audits
                 assert not store.lp_session('partial-session').get('entry_cancel_requested')
-                terminal_result, = [x for x in evidence['result_packets'] if any(
-                    o['order_id']=='o1' and o['status']=='CANCELED' for o in x['packet']['orders'])]
-                assert set(terminal_result['request']['owned_order_ids'])=={'o1'}
-                current_packet=terminal_result['packet']
-                assert current_packet['authenticated'] is True and current_packet['wallet_address']=='test-wallet'
-                assert all(current_packet[k] is True for k in ('open_orders_complete','positions_complete','trades_complete','pagination_complete'))
-                terminal, = [o for o in current_packet['orders'] if o['order_id']=='o1']
-                assert terminal['token_id']==terminal['condition_id']=='m00' and terminal['side']=='BUY'
-                assert terminal['status']=='CANCELED' and terminal['fill_quantity_known'] is True
-                assert Decimal(terminal['original_size'])==20 and Decimal(terminal['size_matched'])==0
-                assert Decimal(terminal['price'])==Decimal('.40')
-                assert current_packet['read_started_at']>evidence['result_packets'][0]['packet']['read_ended_at']
-                assert current_packet['read_started_at']<=current_packet['read_ended_at']
-                assert [o['order_id'] for o in settled['account_buys']]==['partial-buy']
-                owned=store.lp_session(original_sid)
-                assert owned['state']=='complete' and owned.get('yield_rotation_cancel_owners')=={}
-                assert owned.get('entry_cancel_requested') is False
-                evidence['historical_order_history_after_current_proof']=deepcopy(owned['order_history'])
+                assert [o['order_id'] for o in settled['account_buys']]==['o1']
+                assert partial['size_matched']=='1' and partial['original_size']=='20'
+                assert Decimal(exchange.positions[0]['size'])==1
+                evidence['historical_order_history_after_current_proof']=deepcopy(store.lp_session('partial-session')['order_history'])
             assert not any(p['side']=='SELL' for p in exchange.posts)
         finally:
             evidence.update(current=engine.lp_auto_state(),original_order=original_order,entry_audits=entry_audits,
