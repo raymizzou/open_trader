@@ -67,6 +67,8 @@ def test_full_pool_replaces_every_market_outside_top_five_without_threshold(tmp_
 
     advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
+    from tests.test_lp_auto_independent_cancel_contract import _wait_audits
+    _wait_audits(lp.store, lambda rows: len(rows) == 5 and all(a['state'] != 'pending' for a in rows))
     assert set(exchange.cancels) == {'o1', 'o2', 'o3', 'o4', 'o5'}
     assert len(exchange.posts) == 5
     assert state['slots']['occupied'] == 5
@@ -279,6 +281,7 @@ def test_rotation_keeps_unknown_occupied_slots_blocked_and_ranks_known_actives(t
 
 def test_rotation_registers_all_victims_and_isolates_unresolved_terminal(tmp_path, monkeypatch):
     import json
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     import sqlite3
     from copy import deepcopy
     from collections import Counter
@@ -373,14 +376,14 @@ def test_rotation_registers_all_victims_and_isolates_unresolved_terminal(tmp_pat
     monkeypatch.setattr(exchange,'cancel_order',cancel_after_registration)
     try:
         phase[0]='original_five_cancel_registration'
-        state=engine.lp_auto_run_once();closed(state);first=capture('original_five_locally_complete_no_buy')
+        state=engine.lp_auto_run_once();closed(state);_wait_round_cancels(store,state);first=capture('original_five_locally_complete_no_buy')
         evidence['registration_before_first_venue_call']=observed
         assert len(observed)==1
         native=observed[0]
         assert len(native['pending'])==5 and {a['order_id'] for a in native['pending']}=={o['order_id'] for o in originals.values()}
         assert all(a['state']=='pending' for a in native['pending'])
         assert native['revisions_changed'] is True and native['locks_free'] is True
-        assert native['state']['funds']['status']=='unknown' and native['state']['slots']['canceling']==5
+        assert native['state']['funds']['status']=='unknown' and native['state']['slots']['canceling']==0 and native['state']['slots']['occupied']==5
         assert Decimal(native['state']['funds']['buy_reserved_usd'])==40
         assert Counter(exchange.cancels)==Counter(o['order_id'] for o in originals.values()) and len(exchange.posts)==5
         original_cancels={i['session_id']:deepcopy(store.lp_actions(i['session_id'])) for i in intents}
@@ -399,7 +402,7 @@ def test_rotation_registers_all_victims_and_isolates_unresolved_terminal(tmp_pat
         assert len(newposts)==4 and len({p['token_id'] for p in newposts})==4 and {p['token_id'] for p in newposts}<={f'm{i:02}' for i in range(5,10)}
         for sid,rows in original_cancels.items():
             for row in rows:assert next(a for a in store.lp_actions(sid) if a['action_key']==row['action_key'])==row
-        fresh=[a for a in second['last_round']['actions'] if a['kind']=='cancel']
+        fresh=_wait_round_cancels(store,second)
         assert all(a['order_id']==last_id for a in fresh)
         if fresh:
             action,=fresh
@@ -471,7 +474,7 @@ def test_second_cancel_registration_failure_sends_nothing_and_recovers_safely(tm
                 AND json_extract(a.payload,'$.order_id')='{first_oid}' AND json_extract(a.payload,'$.role')='reconciliation_cancel'
                 AND json_extract(a.payload,'$.rotation_round_id')=json_extract(NEW.payload,'$.rotation_round_id'))
             BEGIN SELECT RAISE(ABORT, '{fault_message}'); END""")
-    errors, before_failure, packets, financial_reads = [], [], [], []
+    errors, before_failure, packets, financial_reads, financial_packets = [], [], [], [], []
     connect = sqlite3.connect
     class FaultObservationConnection(sqlite3.Connection):
         def execute(self, sql, parameters=(), /):
@@ -499,7 +502,9 @@ def test_second_cancel_registration_failure_sends_nothing_and_recovers_safely(tm
     account_read = exchange.lp_account_snapshot
     def observed_account():
         financial_reads.append(pool.NOW)
-        return account_read()
+        packet = account_read()
+        financial_packets.append(deepcopy(packet))
+        return packet
     monkeypatch.setattr(exchange, 'lp_account_snapshot', observed_account)
     for index in range(5, 10):
         exchange.rewards[f'm{index:02}'] = Decimal('25')
@@ -516,9 +521,8 @@ def test_second_cancel_registration_failure_sends_nothing_and_recovers_safely(tm
     assert first_native['state'] == 'pending'
     assert first['completed_at'] and state['active_plan'] is None
     cancel_actions = [a for a in first['actions'] if a['kind'] == 'cancel']
-    assert {a['order_id'] for a in cancel_actions} == targets
-    assert all(a['state'] == 'not_sent' for a in cancel_actions)
-    assert any(fault_message in a.get('reason', '') for a in cancel_actions)
+    assert cancel_actions == [], 'Cancel registration belongs to its own path'
+    assert fault_message in first['independent_cancel_error']
     assert all(Decimal(t['price']) == Decimal('.40') and Decimal(t['quantity']) == 20 for t in first['targets'])
     assert exchange.cancels == [] and len(exchange.posts) == 5 and exchange.orders == originals
     assert state['slots']['occupied'] == 5 and Decimal(state['funds']['buy_reserved_usd']) == 40
@@ -544,6 +548,8 @@ def test_second_cancel_registration_failure_sends_nothing_and_recovers_safely(tm
         connection.execute('DROP TRIGGER c5_exact_second_cancel')
     cancel = exchange.cancel_order
     observed = []
+    from threading import Lock
+    observation_lock = Lock()
     def unlocked():
         lock = engine._acquire_global_lock()
         if lock is None:
@@ -556,31 +562,36 @@ def test_second_cancel_registration_failure_sends_nothing_and_recovers_safely(tm
         finally:
             engine._release_global_lock(lock)
     def all_registered_before_send(order_id):
-        if not observed:
-            current = deepcopy(engine.lp_auto_state()['active_plan'])
-            assert current and current['round_id'] != first['round_id']
-            assert current['cancel_registration']['completed'] is True
-            actions = [a for a in current['actions'] if a['kind'] == 'cancel']
-            assert {a['order_id'] for a in actions} == targets
-            assert {a['action_id'] for a in actions}.isdisjoint({a['action_id'] for a in cancel_actions})
-            audits = [a for sid in original_audits for a in store.lp_actions(sid)
-                if a.get('role') == 'reconciliation_cancel' and a.get('rotation_round_id') == current['round_id']]
-            assert len(audits) == 5 and {a['order_id'] for a in audits} == targets
-            assert all(a['state'] == 'pending' for a in audits)
-            assert len({a['action_id'] for a in audits}) == len({a['action_key'] for a in audits}) == 5
-            for audit in audits:
-                uuid.UUID(audit['action_id'])
-                assert audit['action_id'] != ended['action_id'] and audit['action_key'] != ended['action_key']
-                assert audit['session_id'] == dict((oid, sid) for sid, oid in ordered)[audit['order_id']]
-            assert next(a for a in store.lp_actions(first_sid) if a['action_key'] == ended['action_key']) == ended
-            with ThreadPoolExecutor(1) as workers:
-                assert workers.submit(unlocked).result(timeout=5)
-            observed.append(dict(round_id=current['round_id'], actions=actions, audits=deepcopy(audits)))
+        with observation_lock:
+            if not observed:
+                current_state = engine.lp_auto_state()
+                current = deepcopy(current_state['active_plan'] or current_state['last_round'])
+                assert current and current['round_id'] != first['round_id']
+                assert current['cancel_registration']['completed'] is True
+                actions = [a for a in current['actions'] if a['kind'] == 'cancel']
+                assert actions == []
+                assert set(current['cancel_registration']['sessions']) == targets
+                assert {a['action_id'] for a in actions}.isdisjoint({a['action_id'] for a in cancel_actions})
+                audits = [a for sid in original_audits for a in store.lp_actions(sid)
+                    if a.get('role') == 'reconciliation_cancel' and a.get('rotation_round_id') == current['round_id']]
+                assert len(audits) == 5 and {a['order_id'] for a in audits} == targets
+                assert all(a['state'] in ('pending', 'accepted') for a in audits)
+                assert len({a['action_id'] for a in audits}) == len({a['action_key'] for a in audits}) == 5
+                for audit in audits:
+                    uuid.UUID(audit['action_id'])
+                    assert audit['action_id'] != ended['action_id'] and audit['action_key'] != ended['action_key']
+                    assert audit['session_id'] == dict((oid, sid) for sid, oid in ordered)[audit['order_id']]
+                assert next(a for a in store.lp_actions(first_sid) if a['action_key'] == ended['action_key']) == ended
+                with ThreadPoolExecutor(1) as workers:
+                    assert workers.submit(unlocked).result(timeout=5)
+                observed.append(dict(round_id=current['round_id'], actions=actions, audits=deepcopy(audits)))
         return cancel(order_id)
     monkeypatch.setattr(exchange, 'cancel_order', all_registered_before_send)
     monkeypatch.setattr(pool, 'NOW', completed + timedelta(seconds=30))
     refresh(lp, exchange)
     assert scheduler.run_due()
+    from tests.test_lp_auto_independent_cancel_contract import _wait_audits
+    _wait_audits(store, lambda rows: len(rows) == 6 and all(a['state'] != 'pending' for a in rows))
     second = deepcopy(engine.lp_auto_state()['last_round'])
     assert len(observed) == 1 and second['round_id'] == observed[0]['round_id'] and second['completed_at']
     assert Counter(exchange.cancels) == Counter(targets) and len(exchange.posts) == 5
@@ -602,7 +613,11 @@ def test_second_cancel_registration_failure_sends_nothing_and_recovers_safely(tm
     terminal_packets = [packet for _, packet in packets if all(any(o['order_id'] == oid and o['status'] == 'CANCELED'
         and Decimal(o['size_matched']) == 0 and Decimal(o['price']) == Decimal('.40') and Decimal(o['original_size']) == 20
         for o in packet['orders']) for oid in targets)]
-    assert terminal_packets, 'Exact original terminal0 results must precede lawful new capacity'
+    assert any(packet.get('open_orders_complete') is True
+        and not any(o['order_id'] in targets and o.get('status') == 'LIVE' for o in packet['open_orders'])
+        for packet in financial_packets), 'Current complete account facts prove released BUY capacity'
+    assert all(o['status'] == 'CANCELED' and Decimal(o['size_matched']) == 0
+        for o in exchange.orders if o['order_id'] in targets)
     assert next(a for a in store.lp_actions(first_sid) if a['action_key'] == ended['action_key']) == ended
     for sid, audits in original_audits.items():
         current = store.lp_actions(sid)
@@ -687,8 +702,11 @@ def test_partial_fill_during_cancel_aborts_replacement_and_keeps_inventory_cost(
         advance_auto_wait(engine,monkeypatch)
         refresh(lp,exchange,2)
         sent=engine.lp_auto_run_once();closed(sent);cancel_round=capture('original_cancel_locally_complete')
+        from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+        requests = _wait_round_cancels(store, sent)
         assert exchange.cancels==[original_order['order_id']] and len(exchange.posts)==1
-        cancel_action,=[a for a in cancel_round['last_round']['actions'] if a['kind']=='cancel']
+        assert not any(a['kind']=='cancel' for a in cancel_round['last_round']['actions'])
+        cancel_action, = requests
         assert cancel_action['session_id']==sid and cancel_action['order_id']==original_order['order_id']
         assert [t['token_id'] for t in cancel_round['last_round']['targets']]==['m01']
         old_audits=deepcopy(store.lp_actions(sid))
@@ -716,12 +734,6 @@ def test_partial_fill_during_cancel_aborts_replacement_and_keeps_inventory_cost(
         assert Decimal(state['funds']['inventory_cost_usd'])==Decimal('3.20')
         planning,=[x for x in evidence['signed'] if x['round']==replacement['last_round']['round_id']]
         assert state['funds']['status']=='unknown' and state['funds']['as_of']==planning['as_of'] and state['funds']['available_usd'] is None
-        owned=store.lp_session(sid)
-        assert Decimal(owned['buy_filled_quantity'])==Decimal(owned['residual_quantity'])==8
-        assert Decimal(owned['buy_cost'])==Decimal('3.20') and Decimal(owned['buy_fees'])==0
-        assert owned['position_reconciled'] is True
-        assert store.lp_actions(sid)==old_audits
-        evidence['ledger']={k:deepcopy(owned.get(k)) for k in ('buy_filled_quantity','residual_quantity','buy_cost','buy_fees','fee_status','position_reconciled','verified_order_fills')}
         registration=lp.register_account_snapshot;publication_results=[]
         def observed_publication(snapshot):
             result=registration(snapshot);publication_results.append(deepcopy(result));return result
@@ -731,6 +743,14 @@ def test_partial_fill_during_cancel_aborts_replacement_and_keeps_inventory_cost(
         published=engine.refresh_lp_dashboard_snapshot()
         assert published['state']=='ready',(published,publication_results)
         financial=capture('complete_fill_finance_88_80')
+        reconciled = lp.reconcile_facts(sid)
+        assert reconciled[3] is None, reconciled[3]
+        owned=store.lp_session(sid)
+        assert Decimal(owned['buy_filled_quantity'])==Decimal(owned['residual_quantity'])==8
+        assert Decimal(owned['buy_cost'])==Decimal('3.20') and Decimal(owned['buy_fees'])==0
+        assert owned['position_reconciled'] is True
+        assert store.lp_actions(sid)==old_audits
+        evidence['ledger']={k:deepcopy(owned.get(k)) for k in ('buy_filled_quantity','residual_quantity','buy_cost','buy_fees','fee_status','position_reconciled','verified_order_fills')}
         assert financial['funds']['status']=='known' and financial['slots']['occupied']==1
         assert Decimal(financial['funds']['buy_reserved_usd'])==8 and Decimal(financial['funds']['inventory_cost_usd'])==Decimal('3.20')
         assert Decimal(financial['funds']['available_usd'])==Decimal('88.80')
@@ -751,6 +771,8 @@ def test_rotation_keeps_existing_buy_when_guard_blocks(tmp_path, monkeypatch, gu
     engine, exchange, lp, store = setup(tmp_path, monkeypatch, count=2, target=1)
     exchange.rewards['m01'] = Decimal('25')
     refresh(lp, exchange, 2)
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    install_order_result_reader(exchange, monkeypatch)
     session_id = engine.lp_auto_state()['intents'][0]['session_id']
     if guard == 'stale_reward':
         read = exchange.lp_reward_catalog
@@ -795,12 +817,14 @@ def test_rotation_keeps_existing_buy_when_guard_blocks(tmp_path, monkeypatch, gu
     assert exchange.cancels == [] and len(exchange.posts) == 1
     monkeypatch.setattr(pool, 'NOW', pool._maybe_datetime(early['plan_wait']['deadline']))
     state = engine.lp_auto_run_once()
-    assert exchange.cancels == []
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    _wait_round_cancels(store, state)
+    assert exchange.cancels == (['o1'] if guard in ('protection', 'review') else [])
     assert len(exchange.posts) == 1
     if guard == 'stale_reward':
-        assert state['last_round']['reason'] == 'rotation_yield_unknown'
+        assert state['last_round']['reason'] == 'ranking_freshness_stale'
         assert state['last_round']['blocked'] == [
-            {'condition_id': 'm00', 'token_id': 'm00', 'reason': 'rotation_yield_unknown'}]
+            {'condition_id': 'm00', 'token_id': 'm00', 'reason': 'ranking_freshness_stale'}]
 
 
 def test_equal_yields_keep_resting_orders_without_counting_them_as_competition(tmp_path, monkeypatch):
@@ -823,6 +847,7 @@ def test_cached_leader_is_reestimated_before_any_cancel(tmp_path, monkeypatch):
 
 
 def test_cancel_timeout_survives_restart_and_reselects_latest_leader_after_terminal(tmp_path, monkeypatch):
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     from copy import deepcopy
     from tests.test_lp_auto_plan_execution import install_order_result_reader
     monkeypatch.setattr(pool, 'NOW', pool.NOW)
@@ -841,6 +866,19 @@ def test_cancel_timeout_survives_restart_and_reselects_latest_leader_after_termi
         packets.append(deepcopy(packet))
         return packet
     monkeypatch.setattr(exchange, 'lp_order_result_snapshot', result)
+    account_packets = []
+    def current_account(*, max_age_seconds=0, trade_generation_provider=None):
+        del max_age_seconds
+        started=pool.NOW
+        packet=pool._fresh_registration_bundle(exchange, engine._lp)
+        pool.NOW+=timedelta(microseconds=1)
+        packet.update(read_started_at=started,read_ended_at=pool.NOW,checked_at=pool.NOW,
+            open_orders=deepcopy([o for o in exchange.orders if o['status']=='LIVE']),
+            positions=deepcopy(exchange.positions),raw_trades=deepcopy(exchange.trades))
+        if trade_generation_provider is not None:packet['trade_generation']=trade_generation_provider()
+        account_packets.append(deepcopy(packet))
+        return packet
+    monkeypatch.setattr(exchange, 'lp_account_snapshot_shared', current_account, raising=False)
     account = exchange.lp_account_snapshot
     def financial():
         financial_reads.append(dict(at=pool.NOW, active=engine.lp_auto_state()['active_plan'] is not None))
@@ -855,9 +893,10 @@ def test_cancel_timeout_survives_restart_and_reselects_latest_leader_after_termi
     exchange.cancel_order = timeout
     first = engine.lp_auto_run_once()
     original = deepcopy(first['last_round'])
-    old_action, = [a for a in original['actions'] if a['kind'] == 'cancel']
+    old_action, = _wait_round_cancels(store,first)
+    assert all(a['kind']=='buy' and a['state']=='not_sent' and a['reason']=='next_round_capacity' for a in original['actions'])
     assert old_action['order_id'] == 'o1' and old_action['session_id'] == original_sid
-    assert old_action['state'] == 'canceling'
+    assert old_action['state'] == 'unknown'
     assert first['active_plan'] is None and original['completed_at']
     audits = deepcopy(store.lp_actions(original_sid))
     unknown, = [a for a in audits if a['role'] == 'reconciliation_cancel']
@@ -886,23 +925,23 @@ def test_cancel_timeout_survives_restart_and_reselects_latest_leader_after_termi
     refresh(lp, exchange, 3)
     state = restarted.lp_auto_run_once()
     assert len(financial_reads) > before[0] and not any(r['active'] for r in financial_reads)
-    assert packets, state['last_round']
-    packet = packets[-1]
-    assert all(packet[k] is True for k in ('authenticated', 'open_orders_complete', 'pagination_complete'))
-    exact, = [r for r in packet['orders'] if r['order_id'] == 'o1']
-    assert exact['status'] == 'CANCELED' and exact['fill_quantity_known'] is True
-    assert exact['side'] == 'BUY' and exact['token_id'] == exact['condition_id'] == 'm00'
-    assert Decimal(exact['price']) == Decimal('.40') and Decimal(exact['original_size']) == 20
-    assert Decimal(exact['size_matched']) == 0
-    assert packet['read_started_at'] > pool.datetime.fromisoformat(unknown['submit_post_started_at'])
-    assert not any(r['order_id'] == 'o1' for r in packet['open_orders'])
+    packet = account_packets[-1]
+    assert all(packet[k] is True for k in ('authenticated','balance_complete','open_orders_complete',
+        'pagination_complete','positions_complete','trades_complete'))
+    assert packet['read_started_at'] >= deadline
+    assert not any(r['order_id']=='o1' for r in packet['open_orders'])
+    assert original_order['status']=='CANCELED' and original_order['fill_quantity_known'] is True
+    assert original_order['side']=='BUY' and original_order['token_id']==original_order['condition_id']=='m00'
+    assert Decimal(original_order['price'])==Decimal('.40') and Decimal(original_order['original_size'])==20
+    assert Decimal(original_order['size_matched'])==0
     assert [o['token_id'] for o in exchange.orders if o['status'] == 'LIVE'] == ['m02'], state['last_round']
     assert [p['token_id'] for p in exchange.posts] == ['m00', 'm02']
     assert exchange.cancels == ['o1']
     confirmed_audits = deepcopy(store.lp_actions(original_sid))
     assert len(confirmed_audits) == len(audits)
     confirmed, = [a for a in confirmed_audits if a['action_key'] == unknown['action_key']]
-    assert unknown['state'] == 'unknown' and confirmed['state'] == 'accepted'
+    assert unknown['state'] == confirmed['state'] == 'unknown'
+    assert confirmed == unknown, 'Current account facts preserve the original ambiguous cancel audit'
     assert {k: v for k, v in confirmed.items() if k not in ('state', 'updated_at')} == {
         k: v for k, v in unknown.items() if k not in ('state', 'updated_at')}
     for original_audit in audits:
@@ -1033,12 +1072,15 @@ def test_resting_buy_that_no_longer_scores_has_zero_estimated_yield(tmp_path, mo
         return result
     exchange.lp_reward_catalog = rewards
     refresh(lp, exchange, 2)
-    engine.lp_auto_run_once()
+    state = engine.lp_auto_run_once()
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    _wait_round_cancels(lp.store, state)
     assert exchange.cancels == ['o1']
 
 
 @pytest.mark.parametrize('failure', ['timeout', 'denied'])
 def test_failed_cancel_retries_only_after_a_new_known_live_receipt(tmp_path, monkeypatch, failure):
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     from copy import deepcopy
     from tests.test_lp_auto_plan_execution import install_order_result_reader
     from tests.test_lp_auto_plan_scheduler import restart_engine
@@ -1083,7 +1125,7 @@ def test_failed_cancel_retries_only_after_a_new_known_live_receipt(tmp_path, mon
     advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     refresh(lp, exchange, 2)
-    native_commits = []
+    native_commits, receipt_commits = [], []
     if failure == 'timeout':
         import json
         import sqlite3
@@ -1095,7 +1137,13 @@ def test_failed_cancel_retries_only_after_a_new_known_live_receipt(tmp_path, mon
                 command = sql.strip().upper()
                 if command in ('BEGIN', 'BEGIN IMMEDIATE'):
                     self.pending_cancel = None
+                    self.pending_receipt = None
                 elif command.startswith('INSERT INTO LP_ACTIONS') and len(parameters) >= 5:
+                    if parameters[1] == sid and parameters[3] == 'accepted':
+                        row = super().execute('SELECT * FROM lp_actions WHERE action_key=?', (parameters[2],)).fetchone()
+                        payload = json.loads(row['payload'])
+                        if payload.get('role')=='reconciliation_cancel' and payload.get('order_id')=='o1':
+                            self.pending_receipt = dict(action_id=row['action_id'],action_key=row['action_key'],payload=payload)
                     if parameters[1] != sid or parameters[3] != 'pending':
                         return result
                     row = super().execute('SELECT * FROM lp_actions WHERE action_key=?', (parameters[2],)).fetchone()
@@ -1107,16 +1155,21 @@ def test_failed_cancel_retries_only_after_a_new_known_live_receipt(tmp_path, mon
                             or any(c['action_id'] == row['action_id'] for c in native_commits)):
                         return result
                     document = json.loads(super().execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
-                    rotation = document['account_rotations'].get('o1', {})
+                    registration = document['active_plan'].get('cancel_registration', {})
                     if (not owner or (document.get('active_plan') or {}).get('round_id') != owner
-                            or owner not in document['rounds'] or rotation.get('rotation_round_id') != owner
-                            or rotation.get('session_id') != sid or rotation.get('order_id') != 'o1'):
+                            or owner not in document['rounds'] or registration.get('round_id') != owner
+                            or registration.get('sessions', {}).get('o1') != sid):
                         return result
                     self.pending_cancel = dict(action_id=row['action_id'], action_key=row['action_key'],
                         session_id=sid, order_id='o1', round_id=owner, pending_row=dict(row),
                         registered_at=document['rounds'][owner]['started_at'],
-                        rotation_requested_at=rotation['rotation_requested_at'],
+                        rotation_requested_at=payload['submit_requested_at'],
                         submit_requested_at=payload['submit_requested_at'])
+                elif command.startswith('UPDATE LP_ACTIONS SET STATE=') and len(parameters)>=6 and parameters[0]=='accepted' and parameters[3]==sid:
+                    row=super().execute('SELECT * FROM lp_actions WHERE action_key=?',(parameters[4],)).fetchone()
+                    payload=json.loads(row['payload'])
+                    if payload.get('role')=='reconciliation_cancel' and payload.get('order_id')=='o1':
+                        self.pending_receipt=dict(action_id=row['action_id'],action_key=row['action_key'],payload=payload)
                 elif command == 'COMMIT' and getattr(self, 'pending_cancel', None) is not None:
                     pending = self.pending_cancel
                     self.pending_cancel = None
@@ -1127,6 +1180,10 @@ def test_failed_cancel_retries_only_after_a_new_known_live_receipt(tmp_path, mon
                     monkeypatch.setattr(pool, 'NOW', before + timedelta(microseconds=1))
                     native_commits.append({**pending, 'commit': command, 'native_commit_returned': True,
                         'in_transaction': self.in_transaction, 'before': before, 'after': pool.NOW})
+                elif command == 'COMMIT' and getattr(self, 'pending_receipt', None) is not None:
+                    assert not self.in_transaction
+                    receipt_commits.append({**self.pending_receipt, 'observed_business_at': pool.NOW, 'native_commit_returned':True})
+                    self.pending_receipt = None
                 return result
         def observed_connect(database, *args, **kwargs):
             if Path(database).resolve() == store.path.resolve():
@@ -1141,9 +1198,10 @@ def test_failed_cancel_retries_only_after_a_new_known_live_receipt(tmp_path, mon
     exchange.cancel_order = failed
     state = engine.lp_auto_run_once()
     original = deepcopy(state['last_round'])
-    cancel, = [a for a in original['actions'] if a['kind'] == 'cancel']
+    cancel, = _wait_round_cancels(store,state)
+    assert all(a['kind']=='buy' and a['state']=='not_sent' and a['reason']=='next_round_capacity' for a in original['actions'])
     assert cancel['order_id'] == 'o1' and cancel['session_id'] == sid
-    assert cancel['state'] == ('canceling' if failure == 'timeout' else 'rejected')
+    assert cancel['state'] == ('unknown' if failure == 'timeout' else 'rejected')
     assert state['active_plan'] is None and original['completed_at']
     original_audits = deepcopy(store.lp_actions(sid))
     old_cancel, = [a for a in original_audits if a['role'] == 'reconciliation_cancel']
@@ -1208,12 +1266,14 @@ def test_failed_cancel_retries_only_after_a_new_known_live_receipt(tmp_path, mon
     assert Decimal(exact['price']) == Decimal('.40') and Decimal(exact['original_size']) == 20
     assert Decimal(exact['size_matched']) == 0
     assert packet['read_started_at'] > pool.datetime.fromisoformat(old_cancel['submit_post_started_at'])
+    _wait_round_cancels(store,state)
     assert exchange.cancels == ['o1', 'o1'], state['last_round']
     current = deepcopy(state['last_round'])
     assert current['round_id'] != original['round_id'] and current['completed_at'] and state['active_plan'] is None
-    new_cancel, = [a for a in current['actions'] if a['kind'] == 'cancel']
+    new_cancel, = _wait_round_cancels(store,state)
+    assert all(a['kind']=='buy' and a['state']=='not_sent' and a['reason']=='next_round_capacity' for a in current['actions'])
     assert new_cancel['action_id'] != cancel['action_id'] and new_cancel['session_id'] == sid
-    assert new_cancel['order_id'] == 'o1' and new_cancel['state'] == 'canceling'
+    assert new_cancel['order_id'] == 'o1' and new_cancel['state'] == 'accepted'
     audits = deepcopy(engine._store.lp_actions(sid))
     assert audits[:len(original_audits)] == original_audits
     newer, = [a for a in audits if a['role'] == 'reconciliation_cancel' and a['action_key'] != old_cancel['action_key']]
@@ -1244,8 +1304,8 @@ def test_failed_cancel_retries_only_after_a_new_known_live_receipt(tmp_path, mon
         assert exchange.cancels==['o1','o1'] and len(exchange.posts)==1 and exchange.orders==[original_order]
         assert engine._store.lp_actions(sid)==audits and len(native_commits)==2
         closed_session = deepcopy(engine._store.lp_session(sid))
-        assert closed_session.get('yield_rotation_cancel_owners')=={}
-        assert closed_session.get('yield_rotation_protection_before')=={}
+        assert not closed_session.get('yield_rotation_cancel_owners')
+        assert not closed_session.get('yield_rotation_protection_before')
         assert closed_session['entry_cancel_requested'] is False
         assert all(b['state']=='registered' for b in closed_session['queue_protection']['levels'].values())
         closed_order = closed_session['order_history']['o1']
@@ -1256,10 +1316,11 @@ def test_failed_cancel_retries_only_after_a_new_known_live_receipt(tmp_path, mon
         # Observe the actual committed closure; never manufacture its age.
         with sqlite3.connect(store.path.as_uri()+'?mode=ro',uri=True) as connection:
             closed_document = json.loads(connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
-        closed_rotation = closed_document['account_rotations']['o1']
-        assert closed_rotation['state']=='active' and closed_rotation['rotation_cancel_outcome']=='acknowledged'
-        assert closed_rotation['rotation_round_id']==current['round_id']
-        settled = pool.datetime.fromisoformat(closed_rotation['rotation_settled_at'])
+        assert not closed_document.get('account_rotations')
+        assert current['round_id'] in closed_document['rounds']
+        receipt_commit, = [r for r in receipt_commits if r['action_key']==newer['action_key']]
+        assert receipt_commit['action_id']==newer['action_id'] and receipt_commit['native_commit_returned'] is True
+        settled = receipt_commit['observed_business_at']
         assert pool.datetime.fromisoformat(newer['submit_post_started_at'])<=settled<=pool.NOW
         idle_deadline = pool.datetime.fromisoformat(idle['plan_wait']['deadline'])
         assert idle_deadline==pool.datetime.fromisoformat(idle['last_round']['completed_at'])+timedelta(seconds=30)
@@ -1290,10 +1351,12 @@ def test_failed_cancel_retries_only_after_a_new_known_live_receipt(tmp_path, mon
         assert third['slots']['occupied']==1
         assert Decimal(third['funds']['buy_reserved_usd'])==8
         assert packets[-1]['read_started_at'] > pool.datetime.fromisoformat(newer['submit_post_started_at'])
+        _wait_round_cancels(store,third)
         assert exchange.cancels == ['o1', 'o1', 'o1'], third['last_round']
         assert third['last_round']['round_id'] not in (original['round_id'], current['round_id'])
         assert third['active_plan'] is None and third['last_round']['completed_at']
-        third_action, = [a for a in third['last_round']['actions'] if a['kind'] == 'cancel']
+        third_action, = _wait_round_cancels(store,third)
+        assert all(a['kind']=='buy' and a['state']=='not_sent' and a['reason']=='next_round_capacity' for a in third['last_round']['actions'])
         assert third_action['action_id'] not in (cancel['action_id'], new_cancel['action_id'])
         all_audits = engine._store.lp_actions(sid)
         assert all_audits[:len(audits)] == audits

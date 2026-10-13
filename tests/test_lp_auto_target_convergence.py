@@ -103,6 +103,8 @@ def test_unified_selection_for_zero_three_four_five_buys(tmp_path, monkeypatch, 
     missing = {'B', 'C', 'E', 'F', 'G'} - set(initial) - immediate
     victims = [f'original-{key}' for key in initial if key not in {'B', 'C'}]
     assert Counter(p['token_id'] for p in exchange.posts) == Counter(immediate)
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    _wait_round_cancels(store, state)
     assert Counter(exchange.cancels) == Counter(victims)
     physical = {'B', 'C'} | immediate if initial else immediate
     assert set(live_orders(exchange)) == physical
@@ -343,6 +345,8 @@ def test_round_plan_survives_better_ranking_until_next_round(tmp_path, monkeypat
     scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
     assert scheduler.run_due()
     state = engine.lp_auto_state()
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    _wait_round_cancels(store, state)
     first = deepcopy(state['last_round'])
     assert {r['condition_id'] for r in first['targets']} == {'B', 'C', 'E', 'F', 'G'}
     assert exchange.posts == [] and Counter(exchange.cancels) == Counter(['original-A', 'original-D', 'original-I'])

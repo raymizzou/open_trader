@@ -334,6 +334,8 @@ def test_current_read_failure_ends_check_without_replaying_prior_requests(tmp_pa
 
 @pytest.mark.parametrize('receipt', ['timeout', 'rejected', 'ACK', 'ACK-generation-race', 'ACK-retry-api-failure'])
 def test_live_after_cancel_automatically_reconciles_and_retries(tmp_path, monkeypatch, receipt):
+    from tests.test_lp_auto_independent_cancel_contract import _wait_audits
+    from time import monotonic
     import json
     import sqlite3
     from copy import deepcopy
@@ -475,9 +477,15 @@ def test_live_after_cancel_automatically_reconciles_and_retries(tmp_path, monkey
         if receipt=='timeout':raise TimeoutError('simulated cancel timeout')
         return dict(canceled=[],not_canceled={order_id:'temporarily unavailable'})
     monkeypatch.setattr(exchange,'cancel_order',response)
+    def completed_cancel_receipts(state):
+        round_id=state['last_round']['round_id']
+        expected='unknown' if receipt=='timeout' else 'rejected' if receipt=='rejected' else 'accepted'
+        return _wait_audits(store,lambda rows:{a['order_id']:a['state'] for a in rows
+            if a.get('rotation_round_id')==round_id}=={oid:expected for oid in ('original-A','original-D','original-I')})
     scheduler=LPAutoScheduler(engine,clock=lambda:pool.NOW)
     try:
         assert scheduler.run_due();first=capture('original_three_live_requests_closed');interval(first,True)
+        completed_cancel_receipts(first)
         original=deepcopy(first['last_round']);audits=original_audits();victims=['original-A','original-D','original-I']
         assert Counter(exchange.cancels)==Counter(victims) and exchange.posts==[]
         assert first['slots']['occupied']==5 and Decimal(first['funds']['buy_reserved_usd'])==39
@@ -499,6 +507,7 @@ def test_live_after_cancel_automatically_reconciles_and_retries(tmp_path, monkey
         phase[0]='new_current_three_separate_requests'
         at_deadline(monkeypatch,engine);prepare(engine._lp)
         assert scheduler.run_due();second=capture('new_round_three_live_cancel_attempts');interval(second,True)
+        completed_cancel_receipts(second)
         assert second['last_round']['round_id']!=original['round_id']
         assert Counter(exchange.cancels)==Counter(victims*2) and exchange.posts==[]
         assert second['slots']['occupied']==5 and Decimal(second['funds']['buy_reserved_usd'])==39
@@ -518,7 +527,16 @@ def test_live_after_cancel_automatically_reconciles_and_retries(tmp_path, monkey
         assert Counter(exchange.cancels)==Counter(victims*2);immutable(all_audits)
         assert not any(x['active_plan'] for x in evidence['financial_reads']+evidence['market_reads'])
         evidence.update(completed='full',parameter=receipt,original_round=original,original_audits=audits,second_audits=all_audits)
-    finally:save('SC-live-diagnostics.json')
+    finally:
+        sender_deadline=monotonic()+5
+        while True:
+            try:
+                lp.drain_submissions(timeout=.05)
+                break
+            except RuntimeError as exc:
+                assert monotonic()<sender_deadline,str(exc)
+                Event().wait(.01)
+        save('SC-live-diagnostics.json')
 
 @pytest.mark.parametrize('fill,window', [('0', 'registered'), ('8', 'registered'),
     ('8', 'before_registration'), ('8', 'live_partial_before_registration')])
@@ -1038,6 +1056,8 @@ def test_restart_and_duplicate_wakes_preserve_unresolved_request_identity(tmp_pa
     entered,release=Event(),Event()
     try:
         assert scheduler.run_due();first=capture('original_closed_before_restart');interval(first,True)
+        from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+        _wait_round_cancels(store,first)
         original=deepcopy(first['last_round']);audits=original_audits()
         value=unknown_request(first) if stage=='unknown_POST' else None
         if stage=='api_failure':
@@ -1056,7 +1076,7 @@ def test_restart_and_duplicate_wakes_preserve_unresolved_request_identity(tmp_pa
         if value is not None:engine.lp_auto_set_desired_running(False)
         at_deadline(monkeypatch,engine)
         if value is None:prepare(engine._lp)
-        endpoint='full' if value is not None else 'narrow';blockers[endpoint]=(entered,release)
+        endpoint='full';blockers[endpoint]=(entered,release)
         with ThreadPoolExecutor(1) as workers:
             running=workers.submit(scheduler.run_due)
             try:

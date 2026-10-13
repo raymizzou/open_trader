@@ -405,6 +405,7 @@ def test_independent_attempts_overlap_without_holding_mutation_lock(runtime):
 
 @pytest.mark.parametrize('preparation', ['buy_sign', 'cancel_queued', 'manual_cancel_queued'])
 def test_ended_round_cannot_send_late_preparation(runtime, preparation):
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     if preparation == 'manual_cancel_queued':
         import uuid
         from tests.test_lp_account_reservation_reconciliation import _CandidateSDKPublic
@@ -481,7 +482,8 @@ def test_ended_round_cannot_send_late_preparation(runtime, preparation):
                     assert auto_entered.wait(5), 'Actual original auto A SDK entered'
                     original_round = deepcopy(engine.lp_auto_state()['last_round'])
                     original_audits = deepcopy(store.lp_actions(sid))
-                    assert [a['order_id'] for a in original_round['actions']] == ['rank-a','rank-b']
+                    assert original_round['actions'] == []
+                    assert set(original_round['cancel_registration']['sessions']) == {'rank-a','rank-b'}
                     assert Counter(a['order_id'] for a in original_audits) == Counter({'rank-a':1,'rank-b':1})
                     assert all(a['state']=='pending' and a['rotation_round_id']==original_round['round_id'] for a in original_audits)
                     capture('auto_A_held_original_batch_registered')
@@ -504,14 +506,16 @@ def test_ended_round_cannot_send_late_preparation(runtime, preparation):
                     ended = running.result(timeout=5)
                     assert auto_finished.wait(5)
                     capture('original_auto_cycle_closed_manual_B_still_pending')
+                    _wait_round_cancels(store, ended)
                     after = store.lp_actions(sid)
                     actual_manual, = [a for a in after if a['action_key']==manual_pending['action_key']]
                     assert actual_manual == manual_pending and not manual_finished.is_set()
                     assert ended['active_plan'] is None and ended['last_round']['completed_at']
                     assert ended['last_round']['round_id']==original_round['round_id'] and ended['desired_running'] is True
                     assert datetime.fromisoformat(ended['plan_wait']['deadline']) == datetime.fromisoformat(ended['last_round']['completed_at'])+timedelta(seconds=30)
-                    assert calls == [dict(role='auto',thread=calls[0]['thread'],order_ids=('rank-a',)),
-                        dict(role='manual',thread=controller_thread[0],order_ids=('rank-b',))], 'Independent pending manual request forbids a second automatic B send'
+                    assert Counter((c['role'],c['order_ids']) for c in calls) == Counter({
+                        ('auto',('rank-a',)):1, ('auto',('rank-b',)):1, ('manual',('rank-b',)):1})
+                    assert next(c for c in calls if c['role']=='manual')['thread']==controller_thread[0]
                     original_auto_a, = [a for a in original_audits if a['order_id']=='rank-a'
                         and a['rotation_round_id']==original_round['round_id']]
                     original_auto_b, = [a for a in original_audits if a['order_id']=='rank-b'
@@ -525,10 +529,8 @@ def test_ended_round_cannot_send_late_preparation(runtime, preparation):
                     auto_b, = [a for a in after if a['action_key']==original_auto_b['action_key']
                         and a['action_id']==original_auto_b['action_id'] and a['session_id']==original_auto_b['session_id']]
                     assert auto_a['order_id']=='rank-a' and auto_a['state']=='accepted' and auto_a['post_started'] is True
-                    assert auto_b['order_id']=='rank-b' and auto_b['state']=='rejected' and auto_b['post_started'] is False
-                    assert auto_b['submit_stage']=='pre_send_rejected' and auto_b['reason']=='rotation_protection_active'
-                    action_b, = [a for a in ended['last_round']['actions'] if a['order_id']=='rank-b']
-                    assert action_b['state']=='not_sent' and action_b['reason']=='rotation_protection_active'
+                    assert auto_b['order_id']=='rank-b' and auto_b['state']=='accepted' and auto_b['post_started'] is True
+                    assert ended['last_round']['actions']==[], 'Independent manual cancellation does not revoke the distinct auto request'
                     assert ended['slots']['occupied']==3 and Decimal(ended['funds']['buy_reserved_usd'])==Decimal('23.80')
                     assert account.posts==[] and account.orders==originals
                     for original in original_audits:
@@ -577,7 +579,7 @@ def test_ended_round_cannot_send_late_preparation(runtime, preparation):
                 early=engine.lp_auto_run_once(round_id=original_round['round_id'])
                 assert early['active_plan'] is None and early['last_round']['round_id']==original_round['round_id']
             assert store.lp_actions(sid)==immutable
-            assert account.cancels==[('rank-a',),('rank-b',)] and account.posts==[] and account.orders==originals
+            assert Counter(account.cancels)==Counter({('rank-a',):1,('rank-b',):2}) and account.posts==[] and account.orders==originals
             adapter.close()
             store,adapter,account,lp,engine=runtime(orders=originals,public_client=public)
             replayed=[]
@@ -631,18 +633,23 @@ def test_ended_round_cannot_send_late_preparation(runtime, preparation):
             try:
                 assert started.wait(5)
                 original_round = deepcopy(engine.lp_auto_state()['last_round'])
-                assert [a['order_id'] for a in original_round['actions']] == ['rank-a', 'rank-b']
+                assert original_round['actions'] == []
+                assert set(original_round['cancel_registration']['sessions']) == {'rank-a','rank-b'}
                 original_audits = deepcopy(store.lp_actions(session['session_id']))
                 assert Counter(a['order_id'] for a in original_audits) == Counter({'rank-a': 1, 'rank-b': 1})
-                assert all(a['state'] == 'pending' for a in original_audits)
-                assert account.cancels == [('rank-a',)] and account.posts == []
+                a_original, = [a for a in original_audits if a['order_id']=='rank-a']
+                b_original, = [a for a in original_audits if a['order_id']=='rank-b']
+                assert a_original['state']=='pending'
+                assert b_original['state'] in ('pending','accepted')
+                assert all(a['rotation_round_id']==original_round['round_id'] for a in original_audits)
+                assert account.cancels.count(('rank-a',))==1 and account.cancels.count(('rank-b',))<=1 and account.posts == []
                 paused = workers.submit(engine.lp_auto_set_desired_running, False).result(timeout=5)
                 assert paused['desired_running'] is False
                 ended = running.result(timeout=5)
                 assert ended['active_plan'] is None and ended['last_round']['completed_at']
                 assert ended['last_round']['round_id'] == original_round['round_id']
                 assert not finished.is_set(), 'Original external A cancel still owns its lifetime'
-                assert account.cancels == [('rank-a',)]
+                assert account.cancels.count(('rank-a',))==1 and account.cancels.count(('rank-b',))<=1
                 resumed = engine.lp_auto_set_desired_running(True)
                 assert resumed['desired_running'] is True and resumed['active_plan'] is None
                 assert resumed['last_round']['round_id'] == original_round['round_id']
@@ -659,10 +666,9 @@ def test_ended_round_cannot_send_late_preparation(runtime, preparation):
                     break
                 assert monotonic() < deadline, 'Original typed cancel results watchdog'
                 Event().wait(.01)
-        assert account.cancels == [('rank-a',)], 'Queued original B permission stays revoked after resume'
-        assert a['state'] == 'accepted' and b['state'] == 'rejected'
-        assert b['reason'] == 'cycle_ended' and b['post_started'] is False
-        assert b['submit_stage'] == 'pre_send_rejected'
+        assert Counter(account.cancels) == Counter({('rank-a',):1,('rank-b',):1}), 'Pause revokes BUY authority while independent exact cancel authority continues'
+        assert a['state'] == b['state'] == 'accepted'
+        assert a['post_started'] is b['post_started'] is True
         assert [(row['action_key'], row['order_id'], row['rotation_round_id']) for row in current_audits] == [
             (row['action_key'], row['order_id'], row['rotation_round_id']) for row in original_audits]
         state = engine.lp_auto_state()
@@ -1099,13 +1105,11 @@ def test_partial_fill_and_active_protection_do_not_keep_yield_round_open(tmp_pat
     assert Counter(p['token_id'] for p in exchange.posts) == Counter({'A': 1, 'B': 1, 'C': 1, 'D': 1, 'E': 1}), state['last_round']
     assert state['slots']['occupied'] == 5
     assert not any(p['side'] == 'SELL' for p in exchange.posts)
-    if management != 'monitoring':
-        assert exchange.cancels == existing_cancels
-        assert live_orders(exchange)['A'] == 'original-A'
-        retained = next(r for r in state['last_round']['targets'] if r['token_id'] == 'A')
-        assert retained['retained_constraint'] is True
-    else:
-        assert exchange.cancels == ['original-A']
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    requests = _wait_round_cancels(store, state)
+    assert exchange.cancels == existing_cancels + ['original-A']
+    assert len(requests) == 1 and requests[0]['order_id'] == 'original-A'
+    assert all(a['kind']=='buy' for a in state['last_round']['actions'])
     if management == 'partial_fill':
         assert Decimal(state['funds']['inventory_cost_usd']) == Decimal('3.12')
         assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('35.88')
@@ -1238,9 +1242,10 @@ def test_same_round_buys_use_wallet_net_free_capital(runtime, tmp_path, limited)
 
     def blocked_cancel(*, order_ids):
         try:
-            current = engine.lp_auto_state()['active_plan']
-            assert current is not None
-            victims = {a['order_id']: a for a in current['actions'] if a['kind'] == 'cancel'}
+            public_state = engine.lp_auto_state()
+            current = public_state['active_plan'] or public_state['last_round']
+            victims = {oid: {'session_id': sid} for oid, sid in current['cancel_registration']['sessions'].items()}
+            assert all(a['kind']=='buy' for a in current['actions'])
             assert set(order_ids) <= set(victims) <= {o.id for o in original_orders}
             for oid in order_ids:
                 action = victims[oid]
@@ -1298,6 +1303,8 @@ def test_same_round_buys_use_wallet_net_free_capital(runtime, tmp_path, limited)
                 cancels=account.cancels, errors=errors, pending_audits=pending_audits,
                 sessions=store.lp_sessions(), audits={sid: store.lp_actions(sid) for sid in original_sessions},
                 finance_calls=finance_calls), default=str, indent=2))
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    _wait_round_cancels(store, state)
     assert not errors, errors
     assert finished.is_set() and pending_audits
     assert signed_tokens == [] and account.posts == account.market_orders == []
@@ -1306,8 +1313,9 @@ def test_same_round_buys_use_wallet_net_free_capital(runtime, tmp_path, limited)
     assert Decimal(state['funds']['buy_reserved_usd']) == 60
     assert state['active_plan'] is None and state['last_round']['completed_at']
     cancel_actions = [a for a in state['last_round']['actions'] if a['kind'] == 'cancel']
-    assert Counter(oid for batch in account.cancels for oid in batch) == Counter(a['order_id'] for a in cancel_actions)
-    assert all(a['state'] == 'canceling' for a in cancel_actions)
+    assert cancel_actions == []
+    assert Counter(oid for batch in account.cancels for oid in batch) == Counter(
+        oid for oid in state['last_round']['cancel_registration']['sessions'])
     buy_actions = [a for a in state['last_round']['actions'] if a['kind'] == 'buy']
     assert buy_actions and all(a['state'] == 'not_sent' for a in buy_actions)
     for action in buy_actions:
