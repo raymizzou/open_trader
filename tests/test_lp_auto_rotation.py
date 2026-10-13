@@ -1784,28 +1784,91 @@ def test_cancel_recovery_waits_when_session_is_missing(tmp_path, monkeypatch):
 
 
 def test_failed_market_does_not_block_healthy_market_rotation(tmp_path, monkeypatch):
-    engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=3, target=2)
+    from collections import Counter
+    from copy import deepcopy
+    import json
+    monkeypatch.setattr(pool, 'NOW', pool.NOW)
+    engine, exchange, lp, store = setup(tmp_path, monkeypatch, count=3, target=2)
     from tests.test_lp_auto_plan_execution import install_order_result_reader
     result_reader = install_order_result_reader(exchange, monkeypatch)
-    advance_auto_wait(engine, monkeypatch)
-    exchange.rewards['m02'] = Decimal('30')
-    refresh(lp, exchange, 3)
-    read = exchange.lp_snapshot
-
-    def unavailable(request):
-        if request['token_id'] == 'm00':
-            raise ValueError('order_read_failed')
-        return read(request)
-
-    exchange.lp_snapshot = unavailable
-    advance_auto_wait(engine, monkeypatch)
-    state = engine.lp_auto_run_once()
-    assert exchange.cancels == ['o2'], 'only the healthy market may rotate'
+    initial = engine.lp_auto_state()
     assert len(exchange.posts) == 2
-    assert Decimal(state['funds']['buy_reserved_usd']) == 16
-    exchange.orders[1]['status'] = 'CANCELED'
-    advance_auto_wait(engine, monkeypatch)
-    state = engine.lp_auto_run_once()
-    assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01', 'm02']
-    assert state['slots']['occupied'] == 2
-    assert Decimal(state['funds']['buy_reserved_usd']) == 16
+    assert Counter(post['token_id'] for post in exchange.posts) == Counter({'m00': 1, 'm01': 1})
+    assert initial['slots']['occupied'] == 2
+    assert Decimal(initial['funds']['buy_reserved_usd']) == 16
+    originals = {}
+    for intent in initial['intents']:
+        token = intent['token_id']
+        assert token in {'m00', 'm01'} and token not in originals
+        session = store.lp_session(intent['session_id'])
+        audit, = [a for a in store.lp_actions(session['session_id']) if a['role'] == 'entry']
+        order_id = session['entry_order_id']
+        order, = [o for o in exchange.orders if o['order_id'] == order_id]
+        assert intent['order_id'] == audit['order_id'] == order_id
+        assert session['token_id'] == audit['token_id'] == order['token_id'] == token
+        assert audit['session_id'] == intent['session_id'] == session['session_id']
+        assert session['idempotency_key'] == 'lp-auto:' + intent['intent_id']
+        assert audit['state'] == 'accepted' and order['side'] == 'BUY' and order['status'] == 'LIVE'
+        assert Decimal(str(order['price'])) == Decimal('.40')
+        assert Decimal(str(order['original_size'])) == 20 and Decimal(str(order['size_matched'])) == 0
+        originals[token] = dict(intent=deepcopy(intent), session=deepcopy(session),
+                                audit=deepcopy(audit), order=deepcopy(order))
+    assert set(originals) == {'m00', 'm01'}
+    assert originals['m00']['order']['order_id'] != originals['m01']['order']['order_id']
+    for post in exchange.posts:
+        assert post['side'] == 'BUY' and post['price'] == Decimal('.40') and post['quantity'] == 20
+    failed_id = originals['m00']['order']['order_id']
+    healthy_id = originals['m01']['order']['order_id']
+    observations = []
+    try:
+        advance_auto_wait(engine, monkeypatch)
+        exchange.rewards['m02'] = Decimal('30')
+        refresh(lp, exchange, 3)
+        read = exchange.lp_snapshot
+
+        def unavailable(request):
+            if request['token_id'] == 'm00':
+                raise ValueError('order_read_failed')
+            return read(request)
+
+        exchange.lp_snapshot = unavailable
+        advance_auto_wait(engine, monkeypatch)
+        state = engine.lp_auto_run_once()
+        observations.append(deepcopy(state))
+        assert exchange.cancels == [healthy_id], 'Only the exact original healthy m01 may rotate'
+        assert failed_id not in exchange.cancels
+        assert len(exchange.posts) == 2
+        assert Decimal(state['funds']['buy_reserved_usd']) == 16
+        failed, = [o for o in exchange.orders if o['order_id'] == failed_id]
+        assert failed == originals['m00']['order'] and failed['status'] == 'LIVE'
+        healthy, = [o for o in exchange.orders if o['order_id'] == healthy_id]
+        assert healthy['token_id'] == 'm01'
+        healthy['status'] = 'CANCELED'
+        advance_auto_wait(engine, monkeypatch)
+        state = engine.lp_auto_run_once()
+        observations.append(deepcopy(state))
+        assert len(exchange.posts) == 3
+        assert Counter(post['token_id'] for post in exchange.posts) == Counter({'m00': 1, 'm01': 1, 'm02': 1})
+        assert exchange.cancels == [healthy_id] and failed_id not in exchange.cancels
+        failed, = [o for o in exchange.orders if o['order_id'] == failed_id]
+        assert failed == originals['m00']['order'] and failed['status'] == 'LIVE'
+        new, = [o for o in exchange.orders if o['token_id'] == 'm02']
+        assert new['order_id'] not in {failed_id, healthy_id} and new['status'] == 'LIVE'
+        assert new['side'] == 'BUY' and Decimal(str(new['price'])) == Decimal('.40')
+        assert Decimal(str(new['original_size'])) == 20
+        assert state['slots']['occupied'] == 2
+        assert Decimal(state['funds']['buy_reserved_usd']) == 16
+        for token, original in originals.items():
+            session = store.lp_session(original['session']['session_id'])
+            assert session['session_id'] == original['session']['session_id']
+            assert session['idempotency_key'] == original['session']['idempotency_key']
+            entry, = [a for a in store.lp_actions(session['session_id']) if a['role'] == 'entry']
+            assert entry == original['audit']
+        new_intent, = [i for i in state['intents'] if i['token_id'] == 'm02']
+        assert new_intent['intent_id'] not in {v['intent']['intent_id'] for v in originals.values()}
+        assert new_intent['session_id'] not in {v['session']['session_id'] for v in originals.values()}
+        assert new_intent['order_id'] == new['order_id']
+    finally:
+        (tmp_path / 'CI02-rotation-proof.json').write_text(json.dumps(dict(
+            originals=originals, observations=observations, posts=exchange.posts,
+            cancels=exchange.cancels, orders=exchange.orders), default=str, indent=2) + '\n')

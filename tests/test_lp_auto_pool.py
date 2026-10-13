@@ -428,21 +428,69 @@ def test_post_timeout_keeps_one_temporary_reservation_without_retry(tmp_path):
 
 
 def test_pause_during_signing_prevents_post(tmp_path):
-    e,x,lp,s=setup(tmp_path)
-    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    import json
+    import threading
+    from copy import deepcopy
+    e, x, lp, store = setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     e.lp_auto_set_desired_running(True)
-    x.before_sign=lambda:e.lp_auto_set_desired_running(False)
-    r=e.lp_auto_run_once()
-    assert not x.posts
-    assert r['pause_confirmed'] is True
-    assert r['slots']['occupied']==0
-    sid=r['intents'][0]['session_id']
-    session=s.lp_session(sid)
-    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    entered, release = Event(), Event()
+    senders = []
+    historical, current, original = None, None, None
+
+    def hold_signature():
+        senders.append(threading.current_thread())
+        e.lp_auto_set_desired_running(False)
+        entered.set()
+        assert release.wait(5), 'Independent original external signer watchdog'
+
+    x.before_sign = hold_signature
+    try:
+        historical = e.lp_auto_run_once()
+        assert entered.is_set() and len(senders) == 1
+        assert senders[0].is_alive(), 'Original native sender still owns signing'
+        assert x.posts == []
+        assert historical['desired_running'] is False and historical['pause_confirmed'] is True
+        assert historical['active_plan'] is None and historical['last_round']['completed_at']
+        assert historical['slots']['occupied'] == 1
+        assert Decimal(historical['funds']['buy_reserved_usd']) == 8
+        intent, = historical['intents']
+        session = store.lp_session(intent['session_id'])
+        audit, = [a for a in store.lp_actions(session['session_id']) if a['role'] == 'entry']
+        assert lp.entry_send_inflight(session['session_id'])
+        assert intent['token_id'] == session['token_id'] == audit['token_id'] == 'm00'
+        assert session['idempotency_key'] == 'lp-auto:' + intent['intent_id']
+        assert audit['session_id'] == session['session_id'] == intent['session_id']
+        original = dict(intent=deepcopy(intent), session=deepcopy(session), audit=deepcopy(audit))
+    finally:
+        release.set()
+        for sender in senders:
+            sender.join(5)
+        (tmp_path / 'CI02-pause-held-proof.json').write_text(json.dumps(dict(
+            historical=historical, original=original, posts=x.posts,
+            sender_count=len(senders), senders_alive=[t.is_alive() for t in senders]),
+            default=str, indent=2) + '\n')
+        assert all(not sender.is_alive() for sender in senders), 'Original native sender must exit'
+    current = e.lp_auto_state()
+    (tmp_path / 'CI02-pause-current-proof.json').write_text(json.dumps(current, default=str, indent=2) + '\n')
+    assert x.posts == []
+    assert current['desired_running'] is False and current['pause_confirmed'] is True
+    assert current['active_plan'] is None
+    assert current['slots']['occupied'] == 0
+    assert Decimal(current['funds']['buy_reserved_usd']) == 0
+    intent, = current['intents']
+    assert intent['intent_id'] == original['intent']['intent_id']
+    assert intent['session_id'] == original['intent']['session_id']
+    sid = intent['session_id']
+    assert not lp.entry_send_inflight(sid)
+    session = store.lp_session(sid)
+    action, = [a for a in store.lp_actions(sid) if a['role'] == 'entry']
     assert action['state'] == 'rejected'
-    assert action['session_id'] == sid and action['token_id'] == session['token_id']
-    for fact in (session,action):
-        assert fact['submit_stage']=='prepare_failed'
+    assert action['action_key'] == original['audit']['action_key']
+    assert session['idempotency_key'] == original['session']['idempotency_key']
+    assert action['session_id'] == sid and action['token_id'] == session['token_id'] == original['session']['token_id']
+    for fact in (session, action):
+        assert fact['submit_stage'] == 'prepare_failed'
         assert fact['post_started'] is False
         assert fact['submit_post_started_at'] is None
 
