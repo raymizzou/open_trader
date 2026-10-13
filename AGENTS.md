@@ -29,7 +29,8 @@ request requires it.
 ## Worktree and approval
 
 Start every implementation or repository-change task from freshly fetched
-`origin/main` in an isolated branch and worktree. Local `main` only synchronizes
+`origin/main` in an isolated branch and worktree at a durable path. Keep task
+evidence durable too; `/tmp` must not be its only location. Local `main` only synchronizes
 GitHub `main`; never integrate task branches or create delivery commits there.
 Do not use an unrelated or dirty checkout. Code and behavior changes require a concrete plan and explicit user
 approval; follow the implementation and TDD workflow in the linked runbook after
@@ -56,6 +57,32 @@ Before requesting plan approval, explain the current problem, intended behavior,
 key tradeoff or risk, and focused validation in plain language. Once approved,
 continue within that scope without repeated approval requests; material scope
 or risk changes and the existing action-specific approval boundaries still apply.
+
+Main owns investigation, planning, acceptance, Git and publication. Before
+implementation, include one concise [impact map](docs/operations/agent-verification.md#implementation-impact-map)
+in the approved plan: changed behavior, production seams/direct consumers, exact
+test nodeids, old expectations to migrate and assertions to preserve. Update that
+map as evidence changes; it does not add a verification gate or full suite.
+
+When modules/services, behavior, risk or expected effort/time materially exceed
+the approved plan, pause expanded repairs. Main may classify causes and check
+representative cases read-only, then present impact, repair batches, dependencies,
+verification, exclusions, uncertainty and continue/narrow/split options. Obtain
+approval before expanded implementation; failure counts are not defect counts.
+Follow [scope reassessment](docs/operations/agent-verification.md#scope-expansion-and-reassessment).
+The worker autonomously batches routine in-scope repairs, preserving the contract
+and protected assertions; do not require another release instruction per test or
+small correction. Keep the worker for the same target and use the required fresh
+initial reviewer. See [worker batches](docs/operations/agent-verification.md#approved-worker-batches).
+
+Keep one compact [task state and execution record](docs/operations/agent-verification.md#task-state-and-recovery),
+updating state after a batch or commit and linking original evidence at handoff.
+On interruption, verify actual worktree, edits, active commands and live session
+ownership before resuming the original session/model. Actual reads, edits or tool
+execution establish progress; a `working` badge alone does not. After 10 continuous
+minutes without actual progress, Main reports the blocker and waiting/model-change
+options. The user decides model changes; this does not change the reviewer model,
+set a test/CI timeout or authorize stopping active commands.
 
 For review and delivery, lead with what behavior changed and why. Tie claims to
 the exact SHA and evidence links; distinguish verified, failed, unrun, and unknown
@@ -160,7 +187,11 @@ independent review. Under the standing 2026-10-09 user authorization scoped to
 `raymizzou/open_trader`, Main must promptly push the task branch and create a
 normal (non-draft) PR targeting `main`, or update its existing PR, once the
 [first reviewable implementation](docs/operations/agent-verification.md#first-reviewable-implementation)
-passes applicable focused/security checks. Documentation-only work uses its
+passes new/changed and known directly affected tests (the relevant consumer union
+for shared production changes), plus applicable focused/security checks. Known
+confirmed affected failures must be repaired before publication; new core tests
+alone do not meet that condition. Full CI supplements local checks by finding
+previously unrecognized impacts. Documentation-only work uses its
 verification exemption. Do not ask again for task-branch push or PR permission.
 Explicit local-only, no-push, do-not-publish or draft instructions override this
 default. This standing authorization supersedes older pre-publication review

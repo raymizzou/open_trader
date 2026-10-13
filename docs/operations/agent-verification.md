@@ -35,6 +35,111 @@ Before assigning work, use `herdr agent read <worker-name>` to verify the select
 model. Planning, independent review, and existing sessions retain their separately
 selected models. Herdr is not required for work the user has not assigned to it.
 
+### Implementation impact map
+
+Main owns investigation, requirements, planning and acceptance. Before
+implementation, keep one concise impact map with the approved plan and worker
+brief. Map each changed behavior to its production seam and direct consumers,
+exact affected test nodeids, old expectations to migrate and assertions to
+preserve. Use source/caller evidence to identify consumers, including across
+services for shared production changes. Mark unknown impacts explicitly and
+update this same map when evidence changes. This is planning evidence, not an
+additional gate or a reason to run a full suite.
+
+For serial-to-concurrent migrations, include these checks in the map:
+
+- Match orders/results by request, order, session and audit identity, rather than
+  arrival position or a fixed order number.
+- Wait for the actual completion event or thread/Future completion before
+  observing terminal state. For example, `Event.is_set()` is an observation,
+  not a wait for an asynchronously produced event.
+- State whether an assertion concerns a historical return snapshot or fresh
+  public state. After the original sender completes, fetch current state when
+  testing current resource ownership; do not treat an old snapshot as fresh.
+- Keep an independent real-time watchdog for synchronization, separate from
+  controlled business time. Retain cleanup and negative regression evidence.
+
+Preserve financial, identity, UNKNOWN resource ownership and no-replay
+protections, along with success, boundary and negative assertions. Give the
+worker and reviewer the same approved public seams, exact cases, independent
+expectations, verified runner commands and per-case evidence under the existing
+TDD contract. Do not re-approve unchanged cases or duplicate the TDD cycle across
+roles.
+
+### Scope expansion and reassessment
+
+Pause expanded repairs when modules/services, behavior, architecture, risk or
+expected effort/time materially exceed the approved plan. Main may do bounded
+read-only classification and representative checks before discussion; it need
+not establish every cause first. Group failures by confirmed common cause:
+old expectations, fixture/observation problems, production regressions and
+unknowns. A failure count is not a count of independent defects; no numeric
+failure threshold replaces this assessment.
+
+Main presents the following before requesting approval for expanded work:
+
+- Cause groups and unknowns, target paths/modules, changed behavior and impact
+  relative to the approved contract.
+- Repair batches by common cause, dependencies/order, verification nodeids,
+  preserved assertions, completion and renewed-pause conditions.
+- Risks, exclusions, effort/time uncertainty and viable continue, narrow or
+  split options with their costs.
+
+Obtain user approval before expanded implementation. Routine in-scope fixture,
+field, serialization, assertion or observation-timing corrections that preserve
+the approved contract do not need repeated approval. Do not silently absorb a
+material expansion into such corrections.
+
+### Approved worker batches
+
+Main owns overall assessment, planning, progress, acceptance, Git and publication.
+An approved batch authorizes its worker to complete same-cause scoped repairs
+autonomously, including routine fixture, field, serialization and observation
+corrections. Preserve original failures and protected assertions; batch findings
+and results instead of stopping for a release instruction after every test or
+small correction. Escalate material scope, contract, architecture, risk or effort
+changes through the reassessment procedure above.
+
+Use the same worker for the same target/architecture, with an updated brief when
+needed; use a fresh worker for a new target. The first independent review needs
+a fresh reviewer, reused only for this target's in-scope repairs. Do not add agents
+merely to satisfy a skill recipe. These rules do not expand delegation authority
+or change worker/reviewer Git, model, pane or file-write boundaries.
+
+### Task state and recovery
+
+Keep isolated task worktrees and essential evidence in durable directories,
+never only in `/tmp`. Unique briefs can use `mktemp -d` under a persistent parent.
+Maintain one compact task-state record: task and owner, completed work, pending
+issues, branch/SHA, unsaved or uncommitted edits, active commands/handles, live
+session/pane identity, next action and owner. Update it after a batch or commit;
+do not add a manual handoff after each tool call.
+
+Keep append-only execution evidence. Record each execution once with command,
+test scope, code identity (including uncommitted changes where applicable),
+environment, exit status and original log reference. Preserve failures and
+exact-SHA limits; a later pass does not erase them. Handoffs link existing records
+and update changed facts. Do not copy full histories, rebuild all impact maps or
+hash every repository file for each small repair. Final task diff and version
+checks remain required. Test-only repairs cover affected shared-helper consumers
+but do not re-audit unrelated production code.
+
+On capacity or connection interruption, first check active execution handles so
+an in-flight command is not duplicated. Verify the state record against the
+actual worktree, dirty/unsaved edits and live session/pane ownership, then resume
+the original session and model. Preserve saved work and distinguish missing
+evidence from completed work; do not guess why temporary data disappeared or
+repeat completed commands merely to reconstruct a handoff. Do not move or delete
+other tasks' worktrees.
+
+Actual reads, edits or tool execution establish progress; a `working` badge alone
+does not prove recovery. After 10 continuous minutes without actual progress,
+Main proactively reports the specific blocker and recommends waiting or changing
+the implementation model. Do not continue blind retriggers indefinitely. The
+user decides any model change; the independent reviewer model rule is unchanged.
+This threshold is not a test/CI timeout and does not authorize interrupting active
+processes.
+
 ## Development verification
 
 Run only directly affected or newly added test nodeids locally, in an existing
@@ -274,11 +379,18 @@ This procedure coordinates [#293](https://github.com/raymizzou/open_trader/issue
 
 ### First reviewable implementation
 
-The first reviewable implementation covers the approved scope with the necessary
-tests and enough evidence for independent review. It does not require all later
-improvements or completed remote CI. Complete applicable focused tests and
-security checks and add the dated `CHANGELOG.md` entry. Documentation-only work
-uses diff inspection and `git diff --check`, without local backend tests.
+The first reviewable implementation covers the approved scope with enough
+evidence for independent review. Complete the new/changed and known directly
+affected tests; for shared production changes, run the relevant consumer union.
+Known confirmed affected failures must be handled before publication; passing
+only new core tests does not establish this condition. Complete applicable
+focused/security checks and add the dated operator-facing `CHANGELOG.md` entry.
+Documentation-only work uses diff inspection and `git diff --check`, without
+local backend tests. First publication does not require later improvements or
+completed remote CI. Full backend CI supplements focused local checks by finding
+previously unrecognized or omitted impacts, including cross-service and
+environment/concurrency differences; it is not a reason to postpone known
+affected failures or expand local verification to a full backend suite.
 
 Standing user authorization dated 2026-10-09, scoped to `raymizzou/open_trader`
 across machines and checkouts, requires Main to promptly stage/commit only the
@@ -487,11 +599,15 @@ rules do not authorize closing existing sessions as part of documentation work.
 
 ### Handoff and evidence record
 
-Keep a compact durable record; use `pending`, `blocked`, `unrun` or `unknown`
-where appropriate, with reasons. This is a format, not an executed delivery:
+Use the existing compact durable [task state and execution evidence](#task-state-and-recovery);
+link original records and update only changed facts at handoff. Use `pending`,
+`blocked`, `unrun` or `unknown` where appropriate, with reasons. The following
+fields apply as relevant; they do not require a new full report per small repair.
+This is a format, not an executed delivery:
 
 ```text
 Task/approved scope; delivery owner; publication/reply authority:
+Worktree/branch/SHA; dirty or unsaved edits; active commands/handles; session/pane:
 PR URL; immutable head/base; synthetic merge SHA; Actions run/check IDs/URLs:
 Local focused/security checks: command, environment, identity, result, limits:
 Independent review: published head/base (or unpublished local-only staged tree), result/evidence:
