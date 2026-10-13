@@ -447,7 +447,8 @@ def test_pause_during_signing_prevents_post(tmp_path):
     x.before_sign = hold_signature
     try:
         historical = e.lp_auto_run_once()
-        assert entered.is_set() and len(senders) == 1
+        assert entered.wait(5), 'Independent original signer entry watchdog'
+        assert len(senders) == 1
         assert senders[0].is_alive(), 'Original native sender still owns signing'
         assert x.posts == []
         assert historical['desired_running'] is False and historical['pause_confirmed'] is True
