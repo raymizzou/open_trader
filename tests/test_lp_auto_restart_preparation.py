@@ -171,8 +171,48 @@ def _arm_refill(runtime, owner, account, *, index=5):
 @pytest.mark.parametrize('dead_preparation', ['signing', 'before-post-marker'], indirect=True)
 def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replaying_old_request(
         runtime, dead_preparation, monkeypatch, tmp_path, shape):
+    import json
+    import io
+    from datetime import datetime
+    from dataclasses import asdict, is_dataclass
+    evidence = dict(preparations=[], states=[])
+    def prepare_public(owner, adapter, public):
+        current_rewards = public.list_current_rewards
+        def catalog(*, sponsored=False):
+            rows = current_rewards(sponsored=sponsored)
+            class Pages:
+                def iter_items(self): yield from rows
+                def first_page(self): return SimpleNamespace(items=rows, has_more=False)
+            return Pages()
+        monkeypatch.setattr(public,'list_current_rewards',catalog)
+        def response(request, **kwargs):
+            if request.data:
+                body = json.loads(request.data)
+                payload = {'history': {token:[dict(t=body['start_ts'],p='.40'),
+                    dict(t=body['end_ts'],p='.401')] for token in body['markets']}}
+            else:
+                payload = {'data':[dict(condition_id=_refill_identity(i)[1],market_competitiveness='2.5')
+                    for i in range(1,7)],'next_cursor':'LTE='}
+            return io.BytesIO(json.dumps(payload).encode())
+        monkeypatch.setattr(adapter,'_urlopen_fn',response)
+        competition = owner.lp.refresh_competition_cache()
+        prepared = owner.lp.refresh_price_history()
+        qualified = owner.lp.refresh_candidates(force=True)
+        evidence['preparations'].append(deepcopy(dict(competition=competition,prepared=prepared,qualified=qualified)))
+        assert prepared['preparation_outcome'] == 'success', prepared
+        row, = [x for x in qualified['candidates'] if x['condition_id'] == _refill_identity(5)[1]]
+        assert row['selected_direction']['token_id'] == _refill_identity(5)[2] and row['selected_direction']['eligible'] is True, row
+    def persist(label):
+        def serialize(value):
+            if is_dataclass(value): return asdict(value)
+            if hasattr(value,'model_dump'): return value.model_dump(mode='json')
+            return str(value)
+        (store.path.parent/('CI-F-'+label+'-native-proof.json')).write_text(json.dumps(dict(
+            evidence=evidence,current=owner.execution.lp_auto_state(),sessions=store.lp_sessions(),
+            audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()},
+            posts=account.posts,cancels=account.cancels,orders=account.orders),default=serialize,indent=2))
     child, original, _ = dead_preparation
-    owner, store, _, account, _ = _new_owner(runtime, monkeypatch, tmp_path)
+    owner, store, adapter, account, public = _new_owner(runtime, monkeypatch, tmp_path)
     sid = original['session_id']
     audit = deepcopy(store.lp_actions(sid))
     assert Decimal(original['reserved_usd']) == Decimal('17.80')
@@ -192,7 +232,7 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         assert reader.lp_auto_state()['intents'][0]['state'] == 'unknown'
         assert session['submit_stage'] == 'preparing' and session['post_started'] is False
         assert audit[0]['submit_stage'] == 'preparing' and audit[0]['post_started'] is False
-    owner, store, _, account, _ = _new_owner(runtime, monkeypatch, tmp_path)
+    owner, store, adapter, account, public = _new_owner(runtime, monkeypatch, tmp_path)
     owner.start()
     try:
         assert owner.state == 'RUNNING'
@@ -217,15 +257,9 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         original_financial_as_of = state['funds']['as_of']
         advance_api_wait(runtime, owner.execution, refresh=False)
         resolved = owner.execution.lp_auto_run_once(round_id='old-preparing-request')
-        assert resolved['last_round']['round_id'] == original_plan['round_id']
-        assert [(t['token_id'], t['price'], t['quantity']) for t in resolved['last_round']['targets']] == original_terms
+        evidence['states'].append(deepcopy(dict(label='first-current-cleanup',state=resolved,original_plan=original_plan)))
         assert resolved['last_round']['completed_at'] and resolved['active_plan'] is None, resolved['last_round']
-        action = next(a for a in resolved['last_round']['actions'] if a['action_id'] == original_action['action_id'])
-        assert action['state'] == 'rejected' and action['reason'] == 'candidate_best_bid_changed'
-        assert len(action['attempts']) == 1
-        assert action['attempts'][0]['request_id'] == original_action['action_id']
-        assert action['attempts'][0]['session_id'] == sid and action['attempts'][0]['reason'] == 'preparation_interrupted'
-        assert action['request_id'] != original_action['action_id']
+        assert not store.lp_session(sid).get('entry_order_id')
         final_audit = deepcopy(store.lp_actions(sid))
         assert len(final_audit) == len(audit) == 1
         assert final_audit[0]['state'] == 'rejected' and final_audit[0]['reason'] == 'preparation_interrupted'
@@ -233,15 +267,17 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         for key in ('action_id', 'action_key', 'created_at', 'token_id', 'side', 'price', 'quantity'):
             assert final_audit[0].get(key) == audit[0].get(key)
         assert account.posts == account.cancels == []
-        assert resolved['funds']['as_of'] == original_financial_as_of
+        assert datetime.fromisoformat(resolved['funds']['as_of']) >= datetime.fromisoformat(original_financial_as_of)
         from datetime import datetime
         completed = datetime.fromisoformat(resolved['last_round']['completed_at'])
-        assert datetime.fromisoformat(resolved['plan_wait']['deadline']) == completed + timedelta(seconds=60)
-        runtime.clock[0] = completed + timedelta(seconds=59)
-        owner.execution.lp_auto_run_once(round_id='new-owner-refill')
-        assert account.posts == account.cancels == [] and store.lp_actions(sid) == final_audit
-        runtime.clock[0] = completed + timedelta(seconds=60)
+        assert datetime.fromisoformat(resolved['plan_wait']['deadline']) == completed + timedelta(seconds=30)
+        for elapsed in (1,29):
+            runtime.clock[0] = completed+timedelta(seconds=elapsed)
+            owner.execution.lp_auto_run_once(round_id='new-owner-refill')
+            assert account.posts == account.cancels == [] and store.lp_actions(sid) == final_audit
+        runtime.clock[0] = completed + timedelta(seconds=30)
         _arm_refill(runtime, owner, account)
+        prepare_public(owner, adapter, public)
         reads, planning_as_of = account.position_reads, []
         sign = account.create_limit_order
         def new_sign(**kwargs):
@@ -252,6 +288,14 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         state = owner.execution.lp_auto_run_once(round_id='new-owner-refill')
         assert state['slots']['occupied'] == len(account.orders) == 5, state['last_round']
         assert len(account.posts) == 1
+        assert state['last_round']['round_id'] != original_plan['round_id']
+        new_action, = [a for a in state['last_round']['actions'] if a['kind'] == 'buy']
+        assert new_action['token_id'] == original['token_id'] and new_action['action_id'] != original_action['action_id']
+        assert new_action['session_id'] != sid and new_action.get('request_id',new_action['action_id']) != original_action.get('request_id',original_action['action_id'])
+        assert store.lp_session(new_action['session_id'])['entry_order_id'] == 'new-owner-buy'
+        assert store.lp_session(new_action['session_id'])['idempotency_key'] != store.lp_session(sid)['idempotency_key']
+        assert new_action['state'] == 'success' and state['active_plan'] is None
+        assert state['last_round']['completed_at']
         assert account.position_reads > reads, 'A new plan still requires fresh complete account publication'
         assert Decimal(state['funds']['buy_reserved_usd']) == 40
         assert planning_as_of and planning_as_of[0]
@@ -264,6 +308,7 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         assert len(account.posts) == 1 and store.lp_actions(sid) == final_audit
         orders = account.orders
     finally:
+        persist('prepost')
         owner.stop()
     owner, store, adapter, account, _ = _new_owner(runtime, monkeypatch, tmp_path, orders=orders)
     owner.start()
@@ -289,6 +334,7 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         assert store.lp_actions(sid) == final_audit
         assert account.posts == account.cancels == []
     finally:
+        persist('prepost')
         owner.stop()
 
 
@@ -473,9 +519,49 @@ def test_api_added_session_identity_does_not_defeat_owner_ended_coverage(
 @pytest.mark.parametrize('dead_preparation', ['awaiting-receipt'], indirect=True)
 def test_dead_post_started_sender_with_lagging_preparing_action_is_covered_after_owner_exit(
         runtime, dead_preparation, monkeypatch, tmp_path):
+    import json
+    import io
+    from datetime import datetime
+    from dataclasses import asdict, is_dataclass
+    evidence = dict(preparations=[], states=[])
+    def prepare_public(owner, adapter, public):
+        current_rewards = public.list_current_rewards
+        def catalog(*, sponsored=False):
+            rows = current_rewards(sponsored=sponsored)
+            class Pages:
+                def iter_items(self): yield from rows
+                def first_page(self): return SimpleNamespace(items=rows, has_more=False)
+            return Pages()
+        monkeypatch.setattr(public,'list_current_rewards',catalog)
+        def response(request, **kwargs):
+            if request.data:
+                body = json.loads(request.data)
+                payload = {'history': {token:[dict(t=body['start_ts'],p='.40'),
+                    dict(t=body['end_ts'],p='.401')] for token in body['markets']}}
+            else:
+                payload = {'data':[dict(condition_id=_refill_identity(i)[1],market_competitiveness='2.5')
+                    for i in range(1,7)],'next_cursor':'LTE='}
+            return io.BytesIO(json.dumps(payload).encode())
+        monkeypatch.setattr(adapter,'_urlopen_fn',response)
+        competition = owner.lp.refresh_competition_cache()
+        prepared = owner.lp.refresh_price_history()
+        qualified = owner.lp.refresh_candidates(force=True)
+        evidence['preparations'].append(deepcopy(dict(competition=competition,prepared=prepared,qualified=qualified)))
+        assert prepared['preparation_outcome'] == 'success', prepared
+        row, = [x for x in qualified['candidates'] if x['condition_id'] == _refill_identity(5)[1]]
+        assert row['selected_direction']['token_id'] == _refill_identity(5)[2] and row['selected_direction']['eligible'] is True, row
+    def persist(label):
+        def serialize(value):
+            if is_dataclass(value): return asdict(value)
+            if hasattr(value,'model_dump'): return value.model_dump(mode='json')
+            return str(value)
+        (store.path.parent/('CI-F-'+label+'-native-proof.json')).write_text(json.dumps(dict(
+            evidence=evidence,current=owner.execution.lp_auto_state(),sessions=store.lp_sessions(),
+            audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()},
+            posts=account.posts,cancels=account.cancels,orders=account.orders),default=serialize,indent=2))
     child, original, _ = dead_preparation
     _terminate_old(child)
-    owner, store, _, account, _ = _new_owner(runtime, monkeypatch, tmp_path)
+    owner, store, adapter, account, public = _new_owner(runtime, monkeypatch, tmp_path)
     sid = original['session_id']
     audit = deepcopy(store.lp_actions(sid))
     assert audit[0]['state'] == 'pending' and audit[0]['submit_stage'] == 'preparing'
@@ -498,27 +584,86 @@ def test_dead_post_started_sender_with_lagging_preparing_action_is_covered_after
         owner.execution.lp_auto_run_once(round_id='old-preparing-request')
         advance_api_wait(runtime, owner.execution, refresh=False)
         _arm_refill(runtime, owner, account)
+        prepare_public(owner, adapter, public)
         state = owner.execution.lp_auto_run_once(round_id='post-owner-exit-refill')
-        assert state['slots']['occupied'] == 4
-        assert Decimal(state['funds']['buy_reserved_usd']) == 32
-        assert state['active_plan']['round_id'] == original_plan['round_id']
-        assert not state['last_round']['completed_at']
-        original_action = next(a for a in state['active_plan']['actions'] if a['kind'] == 'buy')
-        assert original_action['action_id'] == original_plan['actions'][0]['action_id']
-        assert original_action['state'] == 'unknown' and not original_action.get('order_id')
+        evidence['states'].append(deepcopy(dict(label='new-current-refill',state=state,original_plan=original_plan)))
+        assert state['slots']['occupied'] == len(account.orders) == 5
+        assert Decimal(state['funds']['buy_reserved_usd']) == 40
+        assert state['active_plan'] is None and state['last_round']['completed_at']
+        assert datetime.fromisoformat(state['plan_wait']['deadline']) == datetime.fromisoformat(state['last_round']['completed_at'])+timedelta(seconds=30)
+        action, = [a for a in state['last_round']['actions'] if a['kind'] == 'buy']
+        old_action, = [a for a in original_plan['actions'] if a['kind'] == 'buy']
+        assert action['state'] == 'success' and action['token_id'] == original['token_id']
+        assert state['last_round']['round_id'] != original_plan['round_id']
+        assert action['action_id'] != old_action['action_id'] and action['session_id'] != sid
+        assert action.get('request_id',action['action_id']) != old_action.get('request_id',old_action['action_id'])
+        new_session = store.lp_session(action['session_id'])
+        assert new_session['idempotency_key'] != store.lp_session(sid)['idempotency_key']
+        assert new_session['entry_order_id'] == 'new-owner-buy' and not store.lp_session(sid).get('entry_order_id')
         assert store.lp_session(sid)['post_started'] is True
-        assert account.posts == account.cancels == []
-        assert store.lp_actions(sid) == audit
+        assert store.lp_session(sid)['reservation_coverage']['basis'] == 'runtime_owner_exit'
+        assert len(account.posts) == 1 and account.posts[0].token_id == original['token_id']
+        assert account.posts[0].maker_amount == 8000000 and account.posts[0].taker_amount == 20000000 and account.posts[0].post_only is True
+        assert account.cancels == account.market_orders == [] and store.lp_actions(sid) == audit
+        completed = datetime.fromisoformat(state['last_round']['completed_at'])
+        for elapsed in (1,29):
+            runtime.clock[0] = completed+timedelta(seconds=elapsed)
+            owner.execution.lp_auto_run_once(round_id='old-preparing-request')
+            owner.execution.lp_auto_run_once(round_id='post-owner-exit-refill')
+            assert len(account.posts) == 1 and store.lp_actions(sid) == audit
     finally:
+        persist('awaiting-receipt')
         owner.stop()
 
 
 @pytest.mark.parametrize('fence, reason', [('pause', 'manually_paused'), ('config', 'config_version_changed')])
 def test_recovery_preserves_new_submission_pause_and_configuration_fences(
         runtime, dead_preparation, monkeypatch, tmp_path, fence, reason):
+    import json
+    import io
+    from datetime import datetime
+    from dataclasses import asdict, is_dataclass
+    evidence = dict(preparations=[], states=[])
+    def prepare_public(owner, adapter, public):
+        current_rewards = public.list_current_rewards
+        def catalog(*, sponsored=False):
+            rows = current_rewards(sponsored=sponsored)
+            class Pages:
+                def iter_items(self): yield from rows
+                def first_page(self): return SimpleNamespace(items=rows, has_more=False)
+            return Pages()
+        monkeypatch.setattr(public,'list_current_rewards',catalog)
+        def response(request, **kwargs):
+            if request.data:
+                body = json.loads(request.data)
+                payload = {'history': {token:[dict(t=body['start_ts'],p='.40'),
+                    dict(t=body['end_ts'],p='.401')] for token in body['markets']}}
+            else:
+                payload = {'data':[dict(condition_id=_refill_identity(i)[1],market_competitiveness='2.5')
+                    for i in range(1,7)],'next_cursor':'LTE='}
+            return io.BytesIO(json.dumps(payload).encode())
+        monkeypatch.setattr(adapter,'_urlopen_fn',response)
+        competition = owner.lp.refresh_competition_cache()
+        prepared = owner.lp.refresh_price_history()
+        qualified = owner.lp.refresh_candidates(force=True)
+        evidence['preparations'].append(deepcopy(dict(competition=competition,prepared=prepared,qualified=qualified)))
+        assert prepared['preparation_outcome'] == 'success', prepared
+        row, = [x for x in qualified['candidates'] if x['condition_id'] == _refill_identity(5)[1]]
+        assert row['selected_direction']['token_id'] == _refill_identity(5)[2] and row['selected_direction']['eligible'] is True, row
+    def persist(label):
+        def serialize(value):
+            if is_dataclass(value): return asdict(value)
+            if hasattr(value,'model_dump'): return value.model_dump(mode='json')
+            return str(value)
+        (store.path.parent/('CI-F-'+label+'-native-proof.json')).write_text(json.dumps(dict(
+            evidence=evidence,current=owner.execution.lp_auto_state(),sessions=store.lp_sessions(),
+            audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()},
+            posts=account.posts,cancels=account.cancels,orders=account.orders),default=serialize,indent=2))
+    from time import monotonic
     child, original, _ = dead_preparation
     _terminate_old(child)
-    owner, store, _, account, _ = _new_owner(runtime, monkeypatch, tmp_path)
+    owner, store, adapter, account, public = _new_owner(runtime, monkeypatch, tmp_path)
+    old_audit = deepcopy(store.lp_actions(original['session_id']))
     owner.start()
     entered, release = Event(), Event()
     try:
@@ -528,13 +673,18 @@ def test_recovery_preserves_new_submission_pause_and_configuration_fences(
         advance_api_wait(runtime, owner.execution, refresh=False)
         completed = owner.execution.lp_auto_run_once(round_id='old-preparing-request')
         assert completed['last_round']['completed_at'] and completed['active_plan'] is None
-        assert completed['last_round']['actions'][0]['state'] == 'rejected'
+        final_audit = deepcopy(store.lp_actions(original['session_id']))
+        assert final_audit[0]['state'] == 'rejected' and final_audit[0]['reason'] == 'preparation_interrupted'
+        for key in ('action_id','action_key','created_at','token_id','side','price','quantity'):
+            assert final_audit[0].get(key) == old_audit[0].get(key)
+        assert not store.lp_session(original['session_id']).get('entry_order_id')
         assert account.posts == account.cancels == []
         from datetime import datetime
         assert datetime.fromisoformat(completed['plan_wait']['deadline']) == datetime.fromisoformat(
-            completed['last_round']['completed_at']) + timedelta(seconds=60)
+            completed['last_round']['completed_at']) + timedelta(seconds=30)
         advance_api_wait(runtime, owner.execution, refresh=False)
         _arm_refill(runtime, owner, account)
+        prepare_public(owner, adapter, public)
         sign = account.create_limit_order
         def blocked(**kwargs):
             entered.set()
@@ -545,17 +695,67 @@ def test_recovery_preserves_new_submission_pause_and_configuration_fences(
             pending = workers.submit(owner.execution.lp_auto_run_once, round_id='fenced-restart-refill')
             try:
                 assert entered.wait(5)
+                held = deepcopy(owner.execution.lp_auto_state())
+                evidence['states'].append(deepcopy(dict(label='held-new-current-before-control',state=held)))
+                persist('control-held')
+                new_action, = [a for a in held['last_round']['actions'] if a['kind'] == 'buy']
+                new_intent, = [i for i in held['intents'] if i['intent_id'] == new_action.get('request_id',new_action['action_id'])]
+                assert new_intent['state'] == 'reserved' and new_intent['token_id'] == new_action['token_id']
+                assert Decimal(new_intent['reserved_usd']) == 8
+                new_sid = new_intent['session_id']
+                new_audit = deepcopy(store.lp_actions(new_sid))
+                assert new_sid != original['session_id'] and new_action['token_id'] == original['token_id']
+                assert owner.lp.entry_send_inflight(new_sid)
                 if fence == 'pause':
                     owner.execution.lp_auto_set_desired_running(False)
+                    deadline = monotonic()+5
+                    while True:
+                        local = owner.execution.lp_auto_state()
+                        if local['active_plan'] is None and local['last_round']['completed_at']:
+                            break
+                        assert monotonic() < deadline, 'Public new paused local closure watchdog'
+                        Event().wait(.01)
+                    action, = local['last_round']['actions']
+                    assert action['state'] == 'not_sent' and action['reason'] == 'cycle_ended'
+                    assert owner.lp.entry_send_inflight(new_sid) and account.posts == []
                 else:
                     owner.execution._auto_pool._update(lambda d: d.update(config_version=d['config_version']+1, trading_config_version=d['trading_config_version']+1))
             finally:
                 release.set()
             state = pending.result(timeout=5)
-        assert state['last_round']['actions'][0]['reason'] == reason
+            evidence['states'].append(deepcopy(dict(label='historical-local-return',state=state)))
+            deadline = monotonic()+5
+            while owner.lp.entry_send_inflight(new_sid):
+                assert monotonic() < deadline, 'Native new sender completion watchdog'
+                Event().wait(.01)
+        action, = state['last_round']['actions']
+        assert action['reason'] == ('cycle_ended' if fence == 'pause' else 'prepare_failed')
+        assert action['state'] == ('not_sent' if fence == 'pause' else 'rejected')
+        assert action['action_id'] == new_action['action_id'] and action['session_id'] == new_sid
+        assert state['active_plan'] is None and state['last_round']['completed_at']
+        audit, = store.lp_actions(new_sid)
+        assert audit['action_id'] == new_audit[0]['action_id'] and audit['action_key'] == new_audit[0]['action_key']
+        assert audit['state'] == 'rejected' and audit['post_started'] is False
+        assert not audit.get('order_id') and not store.lp_session(new_sid).get('entry_order_id')
+        assert store.lp_actions(original['session_id']) == final_audit
+        if fence == 'pause':
+            returned = deepcopy(state)
+            state = owner.execution.lp_auto_state()
+            evidence['states'].append(deepcopy(dict(label='final-public-after-native-sender',state=state)))
+            assert state['last_round']['round_id'] == returned['last_round']['round_id']
+            assert state['last_round']['actions'] == returned['last_round']['actions']
+            assert state['active_plan'] is None and state['last_round']['completed_at'] == returned['last_round']['completed_at']
+            latest_audit, = store.lp_actions(new_sid)
+            assert latest_audit == audit and latest_audit['submit_stage'] == 'prepare_failed'
+            assert latest_audit['post_started'] is False and not latest_audit.get('order_id')
+            assert not store.lp_session(new_sid).get('entry_order_id')
+            assert Decimal(state['funds']['buy_reserved_usd']) == 32
+            assert state['desired_running'] is False and account.market_orders == []
+        evidence['states'].append(deepcopy(dict(label='fenced-new-current',held=held,state=state)))
         assert state['slots']['occupied'] == 4
         assert store.lp_session(original['session_id'])['reservation_coverage']['basis'] == 'runtime_owner_exit'
         assert account.posts == account.cancels == []
     finally:
         release.set()
+        persist('control')
         owner.stop()

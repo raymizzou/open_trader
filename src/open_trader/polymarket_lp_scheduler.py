@@ -48,7 +48,7 @@ class LPAutoScheduler:
                 "check_in_progress": self._checking,
                 "last_check_error": self._error,
                 "scheduler_running": self._thread is not None and self._thread.is_alive(),
-                "check_interval_seconds": self._core_state().get('round_interval_seconds', 60),
+                "check_interval_seconds": self._core_state().get('round_interval_seconds', 30),
             }
 
     def request_check(self) -> None:
@@ -80,8 +80,7 @@ class LPAutoScheduler:
                 with self._state:
                     self._checking = False
                     now = self.clock()
-                    field = 'api_retry_interval_seconds' if self._error else 'round_interval_seconds'
-                    self._next_check_at = now + timedelta(seconds=self._core_state().get(field, 60))
+                    self._next_check_at = now + timedelta(seconds=self._core_state().get('round_interval_seconds', 30))
                     # An exception cannot keep restoring an expired deadline
                     # and spin. Preserve an already begun future wait instead.
                     self._restore_deadline(future_only=self._error is not None)

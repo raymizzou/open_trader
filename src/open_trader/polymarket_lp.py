@@ -9381,7 +9381,8 @@ class PolymarketLPService:
         )
         return result["session"], bool(result["changed"])
 
-    def _register_account_snapshot(self, snapshot: Mapping[str, object], *, _planning_only=False) -> dict[str, object]:
+    def _register_account_snapshot(self, snapshot: Mapping[str, object], *, _planning_only=False,
+                                   _automatic_observation=False) -> dict[str, object]:
         """Register every account-owned order in one complete sync bundle.
 
         One LP session owns one token; a newly discovered SELL joins that
@@ -9529,11 +9530,77 @@ class PolymarketLPService:
                     observed = connection.execute(
                         "SELECT generation FROM lp_trade_generation WHERE singleton=1"
                     ).fetchone()
-                    if observed is None or int(observed["generation"]) != generation:
+                    current_revisions = revisions(connection)
+                    if observed is None:
                         raise LpObservationWait("account_round_invalid")
-                    if revisions(connection) != expected_revisions:
-                        raise LpObservationWait("account_round_invalid")
+                    current_generation = int(observed['generation'])
+                    if current_generation != generation or current_revisions != expected_revisions:
+                        if not _automatic_observation or current_generation != generation:
+                            raise LpObservationWait("account_round_invalid")
+                        # Monitoring may publish the very IDs in this read.
+                        # Accept that narrow change only after checking every
+                        # changed owner and actual new BUY request/exposure.
+                        buys = {buy['order_id']: buy for buy in financial_facts['buys']}
+                        positions = {position['token_id']: position for position in financial_facts['positions']}
+                        fills = financial_facts.get('order_fills') or {}
+                        owned_fill_rows = {str(fill['order_id']): fill for fill in owned_fills}
+                        for sid in expected_revisions.keys() | current_revisions.keys():
+                            if expected_revisions.get(sid) == current_revisions.get(sid):
+                                continue
+                            row = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?', (sid,)).fetchone()
+                            session = self.store._lp_row_result(row) if row else None
+                            if not session or session.get('order_identity_conflict'):
+                                raise LpObservationWait('account_round_invalid')
+                            for audit in self.store.lp_actions(sid, connection=connection):
+                                stamp = audit.get('submit_requested_at') or audit.get('submit_post_started_at')
+                                if (submission_action_kind(audit) in ('entry', 'augment')
+                                        and audit.get('side') == 'BUY' and stamp
+                                        and _timestamp(stamp, name='submit_requested_at') >= read_started
+                                        and audit.get('state') in ('pending', 'accepted', 'unknown')):
+                                    raise LpObservationWait('account_round_invalid')
+                            for oid, fact in self._order_history(session).items():
+                                if fact.get('side') != 'BUY':
+                                    continue
+                                buy = buys.get(oid)
+                                matched = _maybe_decimal(fact.get('size_matched'))
+                                if (fact.get('status') == 'LIVE' or buy is not None) and (
+                                        not buy or fact.get('status') != 'LIVE'
+                                        or str(buy['token_id']) != str(session['token_id'])
+                                        or str(fact.get('token_id')) != str(buy['token_id'])
+                                        or _maybe_decimal(fact.get('price')) != _maybe_decimal(buy['price'])
+                                        or _maybe_decimal(fact.get('original_size', fact.get('quantity'))) != _maybe_decimal(buy['original_quantity'])
+                                        or matched != _maybe_decimal(buy['filled_quantity'])
+                                        or _maybe_decimal(fact.get('remaining_size')) != _maybe_decimal(buy['quantity'])):
+                                    raise LpObservationWait('account_round_invalid')
+                                if matched is None or matched < Decimal('0'):
+                                    raise LpObservationWait('account_round_invalid')
+                                if matched > Decimal('0'):
+                                    fill = owned_fill_rows.get(oid, {})
+                                    position = positions.get(str(session['token_id']), {})
+                                    quantity = _maybe_decimal(fact.get('original_size', fact.get('quantity')))
+                                    remaining = _maybe_decimal(fact.get('remaining_size'))
+                                    average = _maybe_decimal(fact.get('average_price'))
+                                    if (fill.get('side') != 'BUY'
+                                            or str(fill.get('token_id')) != str(session['token_id'])
+                                            or str(fill.get('condition_id')) != str(session.get('condition_id'))
+                                            or _maybe_decimal(fills.get(oid)) != matched
+                                            or _maybe_decimal(fill.get('size_matched')) != matched
+                                            or average is None or average <= Decimal('0')
+                                            or _maybe_decimal(fill.get('average_price')) != average
+                                            or quantity is None or quantity < matched
+                                            or remaining is None or remaining != quantity - matched
+                                            or str(fact.get('token_id')) != str(session['token_id'])
+                                            or (_maybe_decimal(fact.get('price')) or Decimal('0')) <= Decimal('0')
+                                            or _maybe_decimal(position.get('quantity')) != _maybe_decimal(session.get('residual_quantity'))
+                                            or _maybe_decimal(position.get('inventory_cost_usd')) is None
+                                            or _maybe_decimal(position['inventory_cost_usd']) != _maybe_decimal(session.get('buy_cost'))):
+                                        raise LpObservationWait('account_round_invalid')
                     _freshness(read_ended, self._now(), "account_freshness")
+                    pool_row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+                    published = (json.loads(pool_row['payload']).get('account_financial_facts') or {}) if pool_row else {}
+                    capture_only = _automatic_observation and any(
+                        published.get(key) and _timestamp(published[key], name=key) > _timestamp(financial_facts[key], name=key)
+                        for key in ('read_started_at', 'read_ended_at', 'checked_at'))
                     session_cache = {}
                     for token, token_rows, candidate in prepared:
                         result = self.store.lp_register_exchange_orders(
@@ -9549,7 +9616,7 @@ class PolymarketLPService:
                         registered_sessions[token] = result['session']
                     # The empty-account case uses the same fenced transaction:
                     # it is evidence of zero occupancy, not an early return.
-                    if _planning_only:
+                    if _planning_only or capture_only:
                         # Register proven current IDs, without account-wide
                         # coverage, historical conclusions or full publication.
                         for buy in financial_facts['buys']:
@@ -9567,7 +9634,7 @@ class PolymarketLPService:
                     # registration return. A later publisher is not its owner.
                     row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
                     planning_document = json.loads(row['payload']) if row else {}
-                    if _planning_only:
+                    if _planning_only or capture_only:
                         sessions = [self.store._lp_row_result(row) for row in
                             connection.execute('SELECT * FROM lp_sessions ORDER BY session_id').fetchall()]
                         holds = project_planning_buy_holds(sessions,
@@ -9583,7 +9650,8 @@ class PolymarketLPService:
                                 | {'account_send_inflight'})
                         planning_document['_planning_buy_isolation'] = holds['isolation']
                         planning_document['account_financial_facts'] = deepcopy(financial_facts)
-                    planning_capture = dict(document=planning_document, validated_at=self._now())
+                    planning_capture = dict(document=planning_document, validated_at=self._now(),
+                        validated_generation=generation)
             return {"state": "registered", "tokens": token_results,
                     "created": created, "joined": joined,
                     '_planning_capture': planning_capture,
@@ -9597,7 +9665,19 @@ class PolymarketLPService:
 
     def _register_planning_account_snapshot(self, snapshot):
         """Current-only registration cannot clear or replace full-publication diagnostics."""
-        return self._register_account_snapshot(snapshot, _planning_only=True)
+        _lp_causal_event('account_publish_wait', account=snapshot)
+        outcome = 'failed'
+        try:
+            result = self._register_account_snapshot(snapshot,
+                _planning_only=snapshot.get('trades_complete') is not True,
+                _automatic_observation=True)
+            outcome = result.get('state', 'failed')
+            return result
+        except LpAccountRoundInvalid:
+            outcome = 'skipped'
+            raise
+        finally:
+            _lp_causal_event('account_publish_end', account=snapshot, outcome=outcome)
 
     def register_account_snapshot(
         self, snapshot: Mapping[str, object]
@@ -10281,18 +10361,28 @@ class PolymarketLPService:
         except ValueError as exc:
             return {"state": "rejected", "reason": str(exc)}
         entry_action_key = self._action_key(session_id, "entry-submit")
-        self.store.lp_upsert_action(
-            session_id,
-            entry_action_key,
-            state="pending",
-            payload={
-                "role": "entry",
-                "side": "BUY",
-                "token_id": request["token_id"],
-                "expiration": expiration,
-                **entry_action_base,
-            },
-        )
+        try:
+            self.store.lp_upsert_action(
+                session_id,
+                entry_action_key,
+                state="pending",
+                payload={
+                    "role": "entry",
+                    "side": "BUY",
+                    "token_id": request["token_id"],
+                    "expiration": expiration,
+                    **entry_action_base,
+                },
+            )
+        except sqlite3.Error as exc:
+            if plan_authorization is None:
+                raise
+            # This boundary precedes signing and POST. The automatic caller
+            # rechecks durable identity and the exited sender before cleanup.
+            not_sent = AutoEntryNotSent('entry_audit_registration_failed')
+            not_sent.error_type = type(exc).__name__
+            not_sent.error_code = getattr(exc, 'sqlite_errorname', None)
+            raise not_sent from exc
         if release_preparation_lock is not None:
             release_preparation_lock()
         post_started = False

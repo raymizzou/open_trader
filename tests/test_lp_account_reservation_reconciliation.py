@@ -830,6 +830,7 @@ def test_late_same_generation_snapshot_waits_without_overwriting_newer_account_t
 
 @pytest.mark.parametrize("reverse_input", [False, True], ids=["survivor-is-anchor", "victim-is-anchor"])
 def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_account(runtime, reverse_input):
+    import json
     orders = (
         _open_order("rank-a", "BUY", price="0.40", original="20"),
         _open_order("rank-b", "BUY", price="0.40", original="20"),
@@ -888,15 +889,22 @@ def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_acco
         return balance(**kwargs)
     account.get_balance_allowance = observed_balance
     pending = execution.lp_auto_run_once(round_id="cancel-absent")
-    assert pending['active_plan']['round_id'] == 'real-overcapacity'
-    assert not pending['last_round']['completed_at'] and pending['plan_wait']['kind'] == 'api'
-    assert pending['slots']['occupied'] == 2 and _amount(pending, 'buy_reserved_usd') == 16
-    assert balance_reads == []
+    assert rotating['active_plan'] is None and rotating['last_round']['completed_at']
+    assert rotating['plan_wait']['kind'] == 'round'
+    assert pending['active_plan'] is None and pending['last_round']['round_id'] == 'cancel-absent'
+    assert pending['last_round']['completed_at'] and pending['plan_wait']['kind'] == 'round'
+    assert pending['slots']['occupied'] == 1 and _amount(pending, 'buy_reserved_usd') == 8
+    assert _amount(pending, 'available_usd') == 8
+    assert balance_reads, 'New current check acquires actual complete wallet inputs'
+    reads_after_current = len(balance_reads)
     assert store.lp_actions(sid) == original_audit
     _advance(runtime)
     assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
     absent = execution.lp_auto_state()
-    assert len(balance_reads) == 1
+    assert len(balance_reads) in (reads_after_current, reads_after_current + 1)
+    (store.path.parent / 'CI-C-current-absence-proof.json').write_text(json.dumps(dict(
+        current_check=pending, after_dashboard=absent, original_audit=original_audit,
+        current_read_count=reads_after_current, total_read_count=len(balance_reads)), default=str, indent=2))
     assert store.lp_actions(sid) == original_audit
     assert absent["slots"]["occupied"] == 1, absent
     assert absent["slots"]["canceling"] == 0

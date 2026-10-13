@@ -597,42 +597,73 @@ def test_auto_second_bid_requires_depth_and_budget(tmp_path):
     ]
 
 
-def test_auto_rechecks_second_bid_before_post(tmp_path, monkeypatch):
+def test_auto_uses_fixed_second_bid_then_new_round_quote(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from datetime import datetime
+    from tests import test_lp_auto_pool as shared_pool
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    monkeypatch.setattr(shared_pool, 'NOW', shared_pool.NOW)
+    monkeypatch.setattr(sys.modules[__name__], 'NOW', NOW)
     e, exchange, lp, store = setup(tmp_path, 1)
+    install_order_result_reader(exchange, monkeypatch)
     bids = [("0.40", "1000"), ("0.37", "1000")]
     _install_level2_books(exchange, lp, store, bids=bids, count=1)
-    e.lp_auto_configure({
-        "budget_usd": "100", "target_buy_count": 1, "buy_price_level": 2,
-    })
+    e.lp_auto_configure({"budget_usd": "100", "target_buy_count": 1, "buy_price_level": 2})
     e.lp_auto_set_desired_running(True)
-
     def move_second_bid_before_post():
         bids[1] = ("0.36", "1000")
-
     exchange.before_sign = move_second_bid_before_post
-    stale = e.lp_auto_run_once(round_id="issue288-g-stale")
-    assert exchange.posts == []
-    assert stale["slots"]["occupied"] == 0
-    assert stale["last_round"]["actions"], stale["last_round"]
-    stale_action = stale["last_round"]["actions"][0]
-    assert stale_action["condition_id"] == "m00"
-    assert stale_action["state"] == "rejected"
-    assert stale_action["request_state"] == "entry_rejected"
-    assert stale_action["reason"] == "candidate_bid_level_changed"
-
+    first = e.lp_auto_run_once(round_id="issue288-g-fixed")
+    assert len(exchange.posts) == 1
+    assert Decimal(exchange.posts[0]['price']) == Decimal('.37') and exchange.posts[0]['quantity'] == 20
+    assert first['slots']['occupied'] == 1 and Decimal(first['funds']['buy_reserved_usd']) == Decimal('7.40')
+    assert first['last_round']['actions'], first['last_round']
+    original_action, = first['last_round']['actions']
+    assert original_action['condition_id'] == 'm00' and original_action['state'] == 'success'
+    assert original_action['request_state'] == 'entry_open'
+    original_sid, original_oid = original_action['session_id'], original_action['order_id']
+    original_audit, = deepcopy(store.lp_actions(original_sid))
+    assert original_audit['state'] == 'accepted' and original_audit['post_started'] is True
+    assert original_audit['order_id'] == original_oid
+    assert Decimal(original_audit['price']) == Decimal('.37') and Decimal(original_audit['quantity']) == 20
+    assert first['active_plan'] is None and first['last_round']['completed_at']
+    completed = datetime.fromisoformat(first['last_round']['completed_at'])
+    assert first['plan_wait']['kind'] == 'round'
+    assert datetime.fromisoformat(first['plan_wait']['deadline']) == completed + timedelta(seconds=30)
+    monkeypatch.setattr(shared_pool, 'NOW', completed + timedelta(seconds=29))
+    quiet = e.lp_auto_run_once()
+    assert quiet['last_round'] == first['last_round'] and len(exchange.posts) == 1
     exchange.before_sign = None
+    order = next(o for o in exchange.orders if o['order_id'] == original_oid)
+    assert order['token_id'] == 'm00' and Decimal(order['original_size']) == 20 and Decimal(order['price']) == Decimal('.37')
+    order.update(status='CANCELED', size_matched='0')
+    lp.reconcile_facts(original_sid)
+    terminal = store.lp_session(original_sid)
+    assert terminal['order_history'][original_oid]['status'] == 'CANCELED'
+    assert Decimal(terminal['order_history'][original_oid]['size_matched']) == 0
+    assert store.lp_actions(original_sid) == [original_audit]
     advance_auto_wait(e, monkeypatch, refresh=False)
     monkeypatch.setattr(sys.modules[__name__], 'NOW', e._lp._now())
-    lp._candidate_pool_record_success(
-        "m00",
-        dict(condition_id="m00"),
-        judged_at=NOW,
-        facts=dict(directions=[exchange.direction("m00")], account=exchange.lp_account_snapshot()),
-    )
-    fresh = e.lp_auto_run_once(round_id="issue288-g-fresh")
-    assert len(exchange.posts) == 1
-    assert Decimal(exchange.posts[0]["price"]) == Decimal("0.36")
-    assert fresh["slots"]["occupied"] == 1
+    lp._candidate_pool_record_success('m00', dict(condition_id='m00'), judged_at=NOW,
+        facts=dict(directions=[exchange.direction('m00')], account=exchange.lp_account_snapshot()))
+    fresh = e.lp_auto_run_once(round_id='issue288-g-fresh')
+    assert len(exchange.posts) == 2
+    assert [Decimal(p['price']) for p in exchange.posts] == [Decimal('.37'), Decimal('.36')]
+    assert all(p['token_id'] == 'm00' and p['side'] == 'BUY' and p['quantity'] == 20 for p in exchange.posts)
+    new_action, = fresh['last_round']['actions']
+    assert new_action['state'] == 'success' and new_action['request_state'] == 'entry_open'
+    assert new_action['action_id'] != original_action['action_id']
+    assert new_action['session_id'] != original_sid and new_action['order_id'] != original_oid
+    new_audit, = store.lp_actions(new_action['session_id'])
+    assert new_audit['action_id'] != original_audit['action_id'] and new_audit['action_key'] != original_audit['action_key']
+    assert new_audit['state'] == 'accepted' and new_audit['post_started'] is True
+    assert Decimal(new_audit['price']) == Decimal('.36') and Decimal(new_audit['quantity']) == 20
+    assert store.lp_actions(original_sid) == [original_audit]
+    assert fresh['slots']['occupied'] == 1 and Decimal(fresh['funds']['buy_reserved_usd']) == Decimal('7.20')
+    assert fresh['last_round']['completed_at'] and fresh['active_plan'] is None
+    (tmp_path / 'CI-C-fixed-next-quote-proof.json').write_text(json.dumps(dict(
+        first=first, terminal=terminal, fresh=fresh, original_audit=original_audit,
+        new_audit=new_audit, posts=exchange.posts), default=str, indent=2))
 
 
 class _UnknownImportedBuyAccount(_ImportedExitAccount):
