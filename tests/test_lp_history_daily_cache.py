@@ -395,8 +395,13 @@ def test_daily_history_refresh_only_fetches_missing_or_expired_directions(
 def test_daily_history_failure_preserves_cache_and_per_market_budget(
     tmp_path: Path,
 ) -> None:
+    from collections import Counter
+    from threading import Event
+    import json
+
     data_dir = tmp_path / "data"
     current = [T]
+    next_day_ac_appended = Event()
     db = PredictionArbitrageStore(data_dir)
     db.lp_save_price_history_batch(
         (
@@ -475,7 +480,11 @@ def test_daily_history_failure_preserves_cache_and_per_market_budget(
             stop_event: object = None,
         ) -> dict[str, object]:
             del fidelity, stop_event
+            if self.include_c and token_ids == ("token-b",):
+                assert next_day_ac_appended.wait(5), "Next-day A/C SDK arrival watchdog"
             self.history_calls.append(token_ids)
+            if self.include_c and token_ids == ("token-a", "token-c"):
+                next_day_ac_appended.set()
             if "token-b" in token_ids and self.b_failures < 2:
                 self.b_failures += 1
                 raise IncompleteRead(b"partial")
@@ -525,7 +534,9 @@ def test_daily_history_failure_preserves_cache_and_per_market_budget(
     )
     refreshed = next_day.refresh_price_history()
     assert refreshed["request_count"] == 2
-    assert exchange.history_calls[-1] == ("token-a", "token-c")
+    assert Counter(exchange.history_calls) == Counter({("token-b",): 3, ("token-a", "token-c"): 1})
+    # The external Event exercises the old failure's legitimate arrival order.
+    assert exchange.history_calls[-2:] == [("token-a", "token-c"), ("token-b",)]
     updated_a = next_day.store.lp_price_history_summary(
         "condition-a", "token-a", now=current[0]
     )
@@ -535,6 +546,17 @@ def test_daily_history_failure_preserves_cache_and_per_market_budget(
     assert updated_a is not None and updated_a["checked_at"] == "2026-09-19T01:00:00.000000Z"
     assert updated_c is not None and updated_c["state"] == "known"
     assert exchange.history_calls.count(("token-b",)) == 3
+    (tmp_path / "history-observation.json").write_text(json.dumps({
+        "history_calls": exchange.history_calls,
+        "next_day_history_calls": exchange.history_calls[-2:],
+        "next_day_ac_appended": next_day_ac_appended.is_set(),
+        "b_failures": exchange.b_failures,
+        "request_count": refreshed["request_count"],
+        "original_a": original_a,
+        "updated_a": updated_a,
+        "updated_c": updated_c,
+        "current_time": current[0],
+    }, default=str, indent=2) + "\n")
 
 
 def test_latest_failed_refresh_blocks_valid_old_summary_until_success(
