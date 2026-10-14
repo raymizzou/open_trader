@@ -6832,6 +6832,36 @@ class PredictionArbitrageStore:
                 tx.execute('UPDATE lp_sessions SET payload=? WHERE session_id=?', (_dump_execution_payload(payload), sid))
                 self._lp_register_trade_change(tx, sid)
 
+    def lp_publish_planning_account_facts(self, facts, isolation, *, connection):
+        """Persist current planning exposure without certifying full history."""
+        from .polymarket_lp_accounting import default_account_pool_document
+        value = dict(facts)
+        account = str(value.get('account_id') or '').strip().casefold()
+        pool_account = hashlib.sha256(account.encode()).hexdigest()
+        generation = connection.execute(
+            'SELECT generation FROM lp_trade_generation WHERE singleton=1').fetchone()
+        if not account or generation is None or generation['generation'] != value.get('trade_generation'):
+            raise LpObservationWait('account_round_invalid')
+        row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+        document = (_load_payload(row['payload']) if row else
+            default_account_pool_document(self.path, pool_account, _parse_timestamp(value['checked_at'])))
+        if document.get('account_id') != pool_account:
+            raise ValueError('account_identity_mismatch')
+        previous = document.get('account_planning_facts') or {}
+        if any(previous.get(key) and _parse_timestamp(previous[key]) > _parse_timestamp(value[key])
+               for key in ('read_started_at', 'read_ended_at', 'checked_at')):
+            raise LpObservationWait('account_snapshot_superseded')
+        patch = {'account_planning_facts': value, '_planning_buy_isolation': isolation}
+        if row:
+            connection.execute("UPDATE lp_auto_pool SET payload=json_set(payload,"
+                "'$.account_planning_facts',json_extract(?,'$.account_planning_facts'),"
+                "'$._planning_buy_isolation',json_extract(?,'$._planning_buy_isolation')) WHERE singleton=1",
+                (_dump_execution_payload(patch), _dump_execution_payload(patch)))
+        else:
+            document.update(patch)
+            connection.execute('INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?)',
+                (_dump_execution_payload(document),))
+
     def lp_publish_account_financial_facts(
         self, facts: Mapping[str, object], *, connection: sqlite3.Connection | None = None,
         expected_generation: int | None = None,

@@ -252,14 +252,16 @@ def test_durable_receipt_reconciles_after_interrupted_submit_without_overriding_
         return update(session_id, **kwargs)
     monkeypatch.setattr(store, "lp_update_session", fail_after_receipt)
     scheduler = LPAutoScheduler(execution, clock=lambda: pool.NOW)
-    def no_io_before(engine,checking_scheduler,state,elapsed):
-        counts=(len(evidence['financial_reads']),len(evidence['full_snapshot_reads']),len(evidence['result_packets']))
-        latest=deepcopy(state['last_round']);wait=deepcopy(state['plan_wait'])
-        pool.NOW=datetime.fromisoformat(wait['started_at'])+timedelta(seconds=elapsed)
-        assert pool.NOW<datetime.fromisoformat(wait['deadline'])
-        checking_scheduler.request_check();checking_scheduler.run_due();engine.lp_auto_run_once()
-        assert counts==(len(evidence['financial_reads']),len(evidence['full_snapshot_reads']),len(evidence['result_packets']))
-        assert engine.lp_auto_state()['last_round']==latest and engine.lp_auto_state()['plan_wait']==wait
+    def observe_without_replay(engine, checking_scheduler, state, label):
+        before = len(exchange.posts)
+        checking_scheduler.request_check()
+        assert checking_scheduler.run_due()
+        current_state = engine.lp_auto_state()
+        assert current_state['last_round']['round_id'] != state['last_round']['round_id']
+        assert current_state['active_plan'] is None and current_state['last_round']['actions'] == []
+        assert len(exchange.posts) == before
+        capture(label)
+        return current_state
     def audit_immutable(engine,originals):
         for sid,row in originals.items():
             assert engine._store.lp_actions(sid)==[row]
@@ -269,7 +271,7 @@ def test_durable_receipt_reconciles_after_interrupted_submit_without_overriding_
         original=capture('both_original_requests_locally_complete_with_apply_failures')
         original_round=deepcopy(original['last_round'])
         assert original['active_plan'] is None and original_round['completed_at']
-        assert datetime.fromisoformat(original['plan_wait']['deadline'])==datetime.fromisoformat(original_round['completed_at'])+timedelta(seconds=30)
+        assert original['plan_wait'] is None
         assert Counter(p['token_id'] for p in exchange.posts)==Counter(['m00','m01'])
         assert all(p['side']=='BUY' and Decimal(p['price'])==Decimal('.40') and Decimal(p['quantity'])==20 and p['post_only'] is True for p in exchange.posts)
         assert len(exchange.orders)==2 and all(o['status']=='LIVE' and Decimal(o['price'])==Decimal('.40')
@@ -294,17 +296,17 @@ def test_durable_receipt_reconciles_after_interrupted_submit_without_overriding_
         assert original['slots']['occupied']==2 and Decimal(original['funds']['buy_reserved_usd'])==16
         evidence['original_round']=original_round;evidence['original_audits']=audits
         evidence['canonical']=canonical;evidence['actual_venue_ids']=actual_ids;evidence['scheduler_first']=scheduler.snapshot()
-        phase[0]='full_cold_before_original_deadline'
+        phase[0]='full_cold_before_current_recovery'
         restored, restored_lp = restart(tmp_path, exchange, lp)
         current[0]=restored
         recovered = LPAutoScheduler(restored, clock=lambda: pool.NOW)
-        no_io_before(restored,recovered,original,29)
+        # Restart itself preserves durable original requests until a new read.
         assert len(exchange.posts)==2 and {o['token_id']:o['order_id'] for o in exchange.orders}==actual_ids
         assert all(restored._store.lp_session(sid).get('submit_status') is None and restored._store.lp_session(sid).get('entry_order_id')==actual_ids[token] for token,sid in canonical.items())
         audit_immutable(restored,audits)
         phase[0]='actual_full_snapshot_failure_and_narrow_recovery'
         unavailable[0]=True
-        pool.NOW=datetime.fromisoformat(original['plan_wait']['deadline'])
+        pool.NOW += timedelta(microseconds=1)
         result_start=len(evidence['result_packets']);full_start=len(evidence['full_snapshot_reads'])
         assert recovered.run_due()
         blocked=capture('original_metadata_recovered_independently_of_failed_full_read')
@@ -324,20 +326,22 @@ def test_durable_receipt_reconciles_after_interrupted_submit_without_overriding_
         assert blocked['block_reasons']
         assert blocked['funds']['as_of']==original['funds']['as_of']
         assert blocked['slots']['occupied']==2 and Decimal(blocked['funds']['buy_reserved_usd'])==16
-        assert datetime.fromisoformat(blocked['plan_wait']['deadline'])==datetime.fromisoformat(blocked['plan_wait']['started_at'])+timedelta(seconds=30)
+        assert blocked['plan_wait'] is None
         assert len(exchange.posts)==2 and {o['token_id']:o['order_id'] for o in exchange.orders}==actual_ids
         audit_immutable(restored,audits)
         if pause_while_blocked:
             assert restored.lp_auto_set_desired_running(False)['pause_confirmed'] is True
         assert restored.lp_auto_state()['desired_running'] is (not pause_while_blocked)
         unavailable[0]=False
-        phase[0]='restored_external_full_read_before_deadline'
-        for elapsed in (1,29):
-            no_io_before(restored,recovered,blocked,elapsed)
-            assert len(exchange.posts)==2 and {o['token_id']:o['order_id'] for o in exchange.orders}==actual_ids
+        phase[0]='restored_external_full_read_current_cycle'
+        pool.NOW += timedelta(microseconds=1)
+        for observation_index in range(2):
+            current_state = observe_without_replay(restored,recovered,blocked,f'current-recovery-{observation_index}')
+            assert current_state['desired_running'] is (not pause_while_blocked)
+            assert current_state['slots']['occupied'] == 2 and Decimal(current_state['funds']['buy_reserved_usd']) == 16
+            assert {o['token_id']:o['order_id'] for o in exchange.orders} == actual_ids
             audit_immutable(restored,audits)
         phase[0]='next_current_healthy_observation'
-        pool.NOW=datetime.fromisoformat(blocked['plan_wait']['deadline'])
         refresh_candidates(restored_lp, exchange)
         full_start=len(evidence['full_snapshot_reads'])
         assert recovered.run_due()
@@ -347,8 +351,7 @@ def test_durable_receipt_reconciles_after_interrupted_submit_without_overriding_
         assert healthy['desired_running'] is (not pause_while_blocked)
         assert healthy['slots']['occupied']==2 and Decimal(healthy['funds']['buy_reserved_usd'])==16
         assert healthy['last_round']['round_id'] not in (original_round['round_id'],blocked['last_round']['round_id'])
-        assert healthy['plan_wait']['kind']=='round'
-        assert datetime.fromisoformat(healthy['plan_wait']['deadline'])==datetime.fromisoformat(healthy['plan_wait']['started_at'])+timedelta(seconds=30)
+        assert healthy['plan_wait'] is None
         if pause_while_blocked:
             assert healthy['last_round']['actions']==[] and healthy['last_round']['checked_at']
         else:
@@ -361,11 +364,14 @@ def test_durable_receipt_reconciles_after_interrupted_submit_without_overriding_
             session=restored._store.lp_session(sid)
             assert session['submit_status']=='accepted' and session['entry_order_id']==actual_ids[token] and not session.get('facts_error')
         audit_immutable(restored,audits)
-        phase[0]='healthy_full_cold_before_next_deadline'
+        phase[0]='healthy_full_cold_current_observation'
         counts=(len(evidence['financial_reads']),len(evidence['full_snapshot_reads']),len(evidence['result_packets']))
         again,_=restart(tmp_path,exchange,restored_lp);current[0]=again
         again.lp_auto_run_once()
-        assert counts==(len(evidence['financial_reads']),len(evidence['full_snapshot_reads']),len(evidence['result_packets']))
+        assert len(evidence['financial_reads']) > counts[0]
+        again_state = again.lp_auto_state()
+        assert again_state['last_round']['round_id'] != healthy['last_round']['round_id']
+        assert again_state['active_plan'] is None and again_state['last_round']['actions'] == []
         assert again.lp_auto_state()['desired_running'] is (not pause_while_blocked)
         assert len(exchange.posts)==2 and {o['token_id']:o['order_id'] for o in exchange.orders}==actual_ids
         audit_immutable(again,audits)

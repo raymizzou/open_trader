@@ -1548,7 +1548,9 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--target-buys")
             command.add_argument("--bid-level")
             for option in ('round-interval-seconds', 'api-retry-interval-seconds', 'order-check-interval-seconds'):
-                command.add_argument('--' + option)
+                command.add_argument('--' + option, help=(
+                    'Retired in continuous mode; setting this option returns an error'
+                    if option == 'round-interval-seconds' else 'Dependency retry/check seconds'))
 
     cross_auto_parser = prediction_commands.add_parser(
         "cross-auto", help="Inspect Service-owned cross-venue execution state"

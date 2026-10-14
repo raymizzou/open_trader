@@ -332,14 +332,15 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
                 assert result['active_plan'] is None and result['last_round']['actions']==[]
                 assert result['last_round']['completed_at'] and result['last_round']['reason']=='account_round_invalid'
                 completed=datetime.fromisoformat(result['last_round']['completed_at'])
-                assert result['plan_wait']['kind']=='round' and datetime.fromisoformat(result['plan_wait']['deadline'])==completed+timedelta(seconds=30)
+                assert result['plan_wait'] is None
                 assert len(trace['requests'])==len(trace['publishers'])==1
                 assert gate['records'][0]['rows_identity']==gate['records'][0]['returned_rows_identity'] and gate['errors']==[]
-                counts=(account.position_reads,len(account.posts))
-                for elapsed in (1,29):
-                    runtime.clock[0]=completed+timedelta(seconds=elapsed)
-                    early=execution.lp_auto_scheduled_check()
-                    assert early['last_round']==result['last_round'] and counts==(account.position_reads,len(account.posts))
+                assert execution.lp_auto_set_desired_running(False)['pause_confirmed']
+                active_trace = None
+                early = execution.lp_auto_run_once(round_id=f'paused-current-refill-{cycle}')
+                assert early['last_round']['round_id'] != result['last_round']['round_id']
+                assert early['last_round']['actions'] == [] and len(account.posts) == posts_before
+                assert execution.lp_auto_set_desired_running(True)['desired_running']
                 active_trace=None
                 advance_to_due();publish_qualification();lp.refresh_candidate_recommendations()
                 trace=start_trace();active_trace=trace
@@ -368,7 +369,9 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
                     assert len(account.posts) == posts_before, limited['last_round']
                     assert len(account.orders) == 3
                     if dependency == 'timeout':
-                        assert limited['last_round']['reason'] == 'account_order_sync_unknown'
+                        assert limited['last_round']['reason'] == 'account_snapshot_incomplete'
+                        component = limited['account_observation']['components']['positions']
+                        assert component['state'] == 'failed' and component['error']['error_type'] == 'TimeoutError' and component['error']['error_chain'] == ['TimeoutError']
                         assert limited['admission_block_reasons']
                     else:
                         assert limited['last_round']['reason'] == 'candidates_or_funds_insufficient'

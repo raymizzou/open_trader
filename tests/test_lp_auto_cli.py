@@ -304,6 +304,12 @@ def test_timing_parameters_can_be_configured_independently(service, capsys, fiel
     service.state.update(defaults, desired_running=True, pause_confirmed=False, runtime_state='running')
     before = deepcopy(service.state)
     option = '--' + field.replace('_', '-')
+    if field == 'round_interval_seconds':
+        assert invoke(service, 'config', option, str(value), '--json') == 2
+        result = json.loads(capsys.readouterr().out)
+        assert result['reason'] == 'ValueError: round_interval_seconds_retired_in_continuous_mode'
+        assert service.requests == [] and service.state == before
+        return
     assert invoke(service, 'config', option, str(value), '--json') == 0
     result = json.loads(capsys.readouterr().out)
     assert result['result'] == 'CONFIGURED'
@@ -315,8 +321,9 @@ def test_timing_parameters_can_be_configured_independently(service, capsys, fiel
         assert result['state'][key] == before[key]
     assert invoke(service, 'status') == 0
     output = capsys.readouterr().out
-    for key in defaults:
+    for key in ('api_retry_interval_seconds', 'order_check_interval_seconds'):
         assert f'{key}: {value if key == field else before[key]}' in output.splitlines()
+    assert not any(line.startswith('round_interval_seconds:') for line in output.splitlines())
     service.state.update(desired_running=False, pause_confirmed=True, runtime_state='paused')
     assert invoke(service, 'config', '--budget', '120', '--target-buys', '0', '--json') == 0
     result = json.loads(capsys.readouterr().out)
@@ -330,6 +337,13 @@ def test_timing_parameters_reject_invalid_values_and_unconfirmed_results(service
     service.state.update(round_interval_seconds=60, api_retry_interval_seconds=60, order_check_interval_seconds=10,
                          desired_running=True, pause_confirmed=False, runtime_state='running')
     before = deepcopy(service.state)
+    if field == 'round_interval_seconds':
+        assert invoke(service, 'config', '--round-interval-seconds=' + (fault if fault in {'0', '-1', '1.5', 'invalid'} else '15'), '--json') == 2
+        result = json.loads(capsys.readouterr().out)
+        assert result['reason'] == 'ValueError: round_interval_seconds_retired_in_continuous_mode'
+        assert service.requests == [] and service.state == before
+        assert service.orders == [{'id': 'buy-1', 'side': 'BUY'}, {'id': 'sell-1', 'side': 'SELL'}]
+        return
     invalid = fault in {'0', '-1', '1.5', 'invalid'}
     if not invalid:
         reply = {**service.state, field: 15, 'config_version': 8}

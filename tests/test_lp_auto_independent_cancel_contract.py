@@ -21,7 +21,6 @@ def _five_resting(runtime, *, f_price=".40"):
             'market': _refill_identity(i)[1], 'condition_id': _refill_identity(i)[1]})
         for i, letter in enumerate('ABCDE', 1))
     account.get_order = lambda *, order_id: next(o for o in account.orders if o.id == order_id)
-    engine.lp_auto_configure({'round_interval_seconds': 30})
     lp.refresh_candidate_recommendations()
     return store, adapter, account, lp, engine, public
 
@@ -57,7 +56,7 @@ def test_buy_plan_finishes_while_cancel_is_inflight(runtime):
             assert state['slots']['occupied'] == 5
             assert Decimal(state['funds']['buy_reserved_usd']) == 40
             completed = datetime.fromisoformat(state['last_round']['completed_at'])
-            assert datetime.fromisoformat(state['plan_wait']['deadline']) == completed + timedelta(seconds=30)
+            assert state['plan_wait'] is None
             audits = [a for s in store.lp_sessions() for a in store.lp_actions(s['session_id'])
                       if a.get('order_id') == 'original-E' and a.get('role') == 'reconciliation_cancel']
             assert len(audits) == 1 and audits[0]['state'] == 'pending' and audits[0]['post_started']
@@ -142,7 +141,7 @@ def test_each_cycle_selects_current_orders_without_cancel_memory(runtime, scenar
             release.set()
             assert finished.wait(5)
             _wait_audits(store, lambda rows: all(a['state'] == 'accepted' for a in rows))
-        runtime.clock[0] = datetime.fromisoformat(first['plan_wait']['deadline'])
+        runtime.clock[0] = datetime.fromisoformat(first['last_round']['completed_at']) + timedelta(seconds=1)
         lp.refresh_candidate_recommendations()
         second = engine.lp_auto_run_once(round_id='current-two')
         assert second['last_round']['round_id'] == 'current-two'
@@ -221,7 +220,7 @@ def test_partially_filled_buy_can_rotate_without_selling_inventory(runtime):
         release.set()
         assert finished.wait(5)
         _wait_audits(store, lambda rows: all(a['state'] == 'accepted' for a in rows))
-        runtime.clock[0] = datetime.fromisoformat(first['plan_wait']['deadline'])
+        runtime.clock[0] = datetime.fromisoformat(first['last_round']['completed_at']) + timedelta(seconds=1)
         lp.refresh_candidate_recommendations()
         second = engine.lp_auto_run_once(round_id='partial-two')
         assert [p.token_id for p in account.posts] == [_refill_identity(6)[2]], second['last_round']
@@ -254,7 +253,6 @@ def _protected_f(runtime):
         return result
     public.get_order_book = current_book
     store, adapter, account, lp, engine, _ = prepare(runtime, budget='8', target=1, count=6, public=public)
-    engine.lp_auto_configure({'round_interval_seconds': 30})
     first = engine.lp_auto_run_once(round_id='initial-f')
     assert [p.token_id for p in account.posts] == [_refill_identity(6)[2]]
     original, = account.orders
@@ -273,40 +271,54 @@ def _protected_f(runtime):
 
 def test_protected_candidate_can_reenter_with_new_order_baseline(runtime):
     store, account, lp, engine, public, depth, original, first = _protected_f(runtime)
-    depth[0] = Decimal('20')
-    runtime.clock[0] += timedelta(seconds=1)
-    deadline = monotonic() + 5
-    while not account.cancels:
-        protection = engine.lp_tick()
-        assert monotonic() < deadline, protection
-    assert account.cancels == [(original.id,)], protection
-    assert account.orders == ()
-    old_session, = store.lp_sessions()
-    old_audits = deepcopy(store.lp_actions(old_session['session_id']))
-    assert any(a.get('role') == 'entry-protection-cancel' for a in old_audits), old_audits
-    depth[0] = Decimal('1500')
-    runtime.clock[0] = datetime.fromisoformat(first['plan_wait']['deadline'])
-    # External venue allocates a new ID to the next logical BUY.
-    post = account.post_order
-    def new_post(signed):
-        result = post(signed)
-        oid = 'f-reentry-new'
-        account.orders = tuple(o.model_copy(update={'id': oid}) if o.id == result['order_id'] else o for o in account.orders)
-        return {**result, 'order_id': oid}
-    account.post_order = new_post
-    lp.refresh_candidate_recommendations()
-    second = engine.lp_auto_run_once(round_id='reentry-f')
-    assert len(account.posts) == 2, second['last_round']
-    new_order, = account.orders
-    assert new_order.id == 'f-reentry-new' and new_order.id != original.id
-    assert new_order.token_id == original.token_id
-    new_session = next(s for s in store.lp_sessions() if s.get('entry_order_id') == new_order.id)
-    assert new_session['session_id'] != old_session['session_id']
-    baseline = new_session['queue_protection']
-    assert Decimal(baseline['baseline_front']) == 1500, baseline
-    assert baseline['levels']['0.40']['order_id'] == new_order.id
-    assert store.lp_actions(old_session['session_id']) == old_audits
-    assert account.cancels == [(original.id,)] and account.market_orders == []
+    try:
+        depth[0] = Decimal('20')
+        runtime.clock[0] += timedelta(seconds=1)
+        deadline = monotonic() + 5
+        while not account.cancels:
+            protection = engine.lp_tick()
+            assert monotonic() < deadline, protection
+        assert account.cancels == [(original.id,)], protection
+        assert account.orders == ()
+        # A venue callback can return before its native receipt is committed.
+        lp.drain_submissions(timeout=5)
+        old_session, = store.lp_sessions()
+        old_audits = deepcopy(store.lp_actions(old_session['session_id']))
+        assert any(a.get('role') == 'entry-protection-cancel' for a in old_audits), old_audits
+        depth[0] = Decimal('1500')
+        # Follow the completed protection event, never the historical BUY clock.
+        runtime.clock[0] += timedelta(seconds=1)
+        # The ordinary planning reader does not own terminal/fill proof. Publish
+        # the real exact-result/full-account recovery before asking for a new BUY.
+        lp.reconcile_facts(old_session['session_id'])
+        assert engine.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+        recovered = engine.lp_auto_state()
+        assert recovered['slots']['occupied'] == 0 and recovered['funds']['status'] == 'known'
+        assert Decimal(recovered['funds']['buy_reserved_usd']) == 0
+        assert Decimal(recovered['funds']['inventory_cost_usd']) == 0
+        # External venue allocates a new ID to the next logical BUY.
+        post = account.post_order
+        def new_post(signed):
+            result = post(signed)
+            oid = 'f-reentry-new'
+            account.orders = tuple(o.model_copy(update={'id': oid}) if o.id == result['order_id'] else o for o in account.orders)
+            return {**result, 'order_id': oid}
+        account.post_order = new_post
+        lp.refresh_candidate_recommendations()
+        second = engine.lp_auto_run_once(round_id='reentry-f')
+        assert len(account.posts) == 2, second['last_round']
+        new_order, = account.orders
+        assert new_order.id == 'f-reentry-new' and new_order.id != original.id
+        assert new_order.token_id == original.token_id
+        new_session = next(s for s in store.lp_sessions() if s.get('entry_order_id') == new_order.id)
+        assert new_session['session_id'] != old_session['session_id']
+        baseline = new_session['queue_protection']
+        assert Decimal(baseline['baseline_front']) == 1500, baseline
+        assert baseline['levels']['0.40']['order_id'] == new_order.id
+        assert store.lp_actions(old_session['session_id']) == old_audits
+        assert account.cancels == [(original.id,)] and account.market_orders == []
+    finally:
+        lp.drain_submissions(timeout=5)
 
 
 def test_protection_and_rotation_keep_independent_cancel_receipts(runtime):
@@ -339,7 +351,9 @@ def test_protection_and_rotation_keep_independent_cancel_receipts(runtime):
             before = deepcopy(store.lp_sessions()[0]['queue_protection'])
             public.rates[1], public.rates[6] = '3000', '1'
             depth[0] = Decimal('1000')
-            runtime.clock[0] = datetime.fromisoformat(first['plan_wait']['deadline'])
+            # Maintenance refreshes source facts at its real 30-second lead.
+            # Advance from the pending protection event, not the earlier BUY.
+            runtime.clock[0] += timedelta(seconds=31)
             lp.refresh_candidate_recommendations()
             rotation = engine.lp_auto_run_once(round_id='independent-rotation')
             assert rotation['active_plan'] is None and not finished.is_set()
@@ -362,6 +376,7 @@ def test_protection_and_rotation_keep_independent_cancel_receipts(runtime):
             release.set()
             assert finished.wait(5)
             protection.result(timeout=5)
+            lp.drain_submissions(timeout=5)
             final_audits = store.lp_actions(current['session_id'])
             own_protection, = [a for a in final_audits if a.get('role') == 'entry-protection-cancel']
             assert own_protection['state'] == 'accepted' and own_protection['canceled'] == [original.id]
@@ -369,8 +384,11 @@ def test_protection_and_rotation_keep_independent_cancel_receipts(runtime):
             assert engine.lp_auto_state()['slots']['occupied'] == 1
         finally:
             release.set()
-            assert finished.wait(5)
-            protection.result(timeout=5)
+            try:
+                assert finished.wait(5)
+                protection.result(timeout=5)
+            finally:
+                lp.drain_submissions(timeout=5)
 
 import base64
 import hashlib
@@ -530,7 +548,7 @@ def test_independent_cancel_preserves_native_inflight_lifetime(runtime, tmp_path
         host.start()
         assert host.state == 'RUNNING'
         engine, lp, store = host.execution, host.lp, host.store
-        engine.lp_auto_configure({'budget_usd': '40', 'target_buy_count': 5, 'round_interval_seconds': 30})
+        engine.lp_auto_configure({'budget_usd': '40', 'target_buy_count': 5})
         deadline = monotonic() + 5
         while lp.preparation_snapshot().get('state') != 'ready':
             assert monotonic() < deadline, lp.preparation_snapshot()

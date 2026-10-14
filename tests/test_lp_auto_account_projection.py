@@ -266,8 +266,7 @@ def test_account_rotation_fill_keeps_inventory_budget_without_sale(tmp_path, mon
     exchange.before_sign=signed
     def closed(state):
         assert state['active_plan'] is None and state['last_round']['completed_at']
-        assert state['plan_wait']['kind']=='round'
-        assert pool.datetime.fromisoformat(state['plan_wait']['deadline'])==pool.datetime.fromisoformat(state['last_round']['completed_at'])+timedelta(seconds=30)
+        assert state['plan_wait'] is None
     def save(name):
         evidence.update(phase=phase[0],clock=pool.NOW,state=engine.lp_auto_state(),document=document(),
             sessions=store.lp_sessions(),audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()},
@@ -336,9 +335,12 @@ def test_account_rotation_fill_keeps_inventory_budget_without_sale(tmp_path, mon
         assert not any(p['side']=='SELL' for p in exchange.posts)
         engine.lp_auto_set_desired_running(False)
         counts=(len(evidence['financial_reads']),len(evidence['result_reads']),len(evidence['full_reads']))
-        pool.NOW=pool.datetime.fromisoformat(financial['plan_wait']['deadline'])-timedelta(seconds=1)
         engine.lp_auto_run_once()
-        assert counts==(len(evidence['financial_reads']),len(evidence['result_reads']),len(evidence['full_reads']))
+        current = engine.lp_auto_state()
+        assert current['last_round']['round_id'] != financial['last_round']['round_id']
+        assert current['active_plan'] is None and current['last_round']['actions'] == []
+        assert len(evidence['financial_reads']) > counts[0] and len(evidence['full_reads']) > counts[2]
+        assert Decimal(current['funds']['buy_reserved_usd']) == 8 and Decimal(current['funds']['inventory_cost_usd']) == Decimal('3.20')
         assert len(exchange.posts)==2 and exchange.cancels==[original_order['order_id']] and store.lp_actions(sid)==old_audits
         assert not any(x['active_plan'] for x in evidence['financial_reads'])
         evidence['publication_results']=publication_results;evidence['completed']='full'
@@ -562,8 +564,7 @@ def test_covered_unknown_session_keeps_its_original_request_unbound(tmp_path, mo
     exchange.before_sign=signed
     def closed(state):
         assert state['active_plan'] is None and state['last_round']['completed_at']
-        assert state['plan_wait']['kind']=='round'
-        assert pool.datetime.fromisoformat(state['plan_wait']['deadline'])==pool.datetime.fromisoformat(state['last_round']['completed_at'])+timedelta(seconds=30)
+        assert state['plan_wait'] is None
     def save(name):
         evidence.update(phase=phase[0],clock=pool.NOW,state=engine.lp_auto_state(),document=document(),
             sessions=store.lp_sessions(),audits={s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()},
@@ -597,7 +598,7 @@ def test_covered_unknown_session_keeps_its_original_request_unbound(tmp_path, mo
         advance_auto_wait(engine,monkeypatch)
         state=engine.lp_auto_run_once()
         assert state['active_plan'] is None and state['last_round']['actions']==[] and state['last_round']['checked_at']
-        assert pool.datetime.fromisoformat(state['plan_wait']['deadline'])==pool.datetime.fromisoformat(state['plan_wait']['started_at'])+timedelta(seconds=30)
+        assert state['plan_wait'] is None
         assert_original_request();assert exchange.cancels==[] and len(exchange.posts)==1
         exchange.rewards['m01']=Decimal('25')
         rotation.refresh(lp,exchange,2)
@@ -631,16 +632,19 @@ def test_covered_unknown_session_keeps_its_original_request_unbound(tmp_path, mo
         completed=pool.datetime.fromisoformat(new_round['last_round']['completed_at'])
         scheduler=LPAutoScheduler(engine,clock=lambda:pool.NOW)
         for elapsed in (1,29):
-            pool.NOW=completed+timedelta(seconds=elapsed)
             scheduler.request_check();scheduler.run_due();engine.lp_auto_run_once()
-            assert counts==(len(evidence['financial_reads']),len(evidence['full_reads']),len(evidence['result_reads']))
+            current = engine.lp_auto_state()
+            assert current['last_round']['round_id'] != new_round['last_round']['round_id']
+            assert current['active_plan'] is None and current['last_round']['actions'] == []
+            assert len(evidence['financial_reads']) > counts[0] and len(evidence['full_reads']) > counts[1]
             assert {s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()}==audits
             assert exchange.cancels==['manual-late'] and len(exchange.posts)==1
             assert_original_request()
-        phase[0]='full_cold_before_common_deadline'
+        phase[0]='full_cold_current_observation'
         engine=restart_engine(engine,exchange)
         state=engine.lp_auto_run_once()
-        assert counts==(len(evidence['financial_reads']),len(evidence['full_reads']),len(evidence['result_reads']))
+        assert state['active_plan'] is None and state['last_round']['actions'] == []
+        assert len(evidence['financial_reads']) > counts[0] and len(evidence['full_reads']) > counts[1]
         assert exchange.cancels==['manual-late'] and len(exchange.posts)==1
         assert state['slots']['occupied']==1 and Decimal(state['funds']['buy_reserved_usd'])==8
         assert {s['session_id']:store.lp_actions(s['session_id']) for s in store.lp_sessions()}==audits
@@ -930,8 +934,7 @@ def test_account_overcapacity_cancels_only_unfilled_extra_beside_partial_buy(
             assert state['slots']['occupied']==2 and Decimal(state['funds']['inventory_cost_usd'])==Decimal('.40')
             assert len(exchange.posts)==1 and not store.lp_session('partial-session').get('entry_cancel_requested')
             assert state['active_plan'] is None and state['last_round']['completed_at']
-            assert state['plan_wait']['kind']=='round'
-            assert datetime.fromisoformat(state['plan_wait']['deadline'])==datetime.fromisoformat(state['last_round']['completed_at'])+timedelta(seconds=30)
+            assert state['plan_wait'] is None
             if mismatched_original_size:
                 assert exchange.cancels==[] and state['last_round']['reason']=='target_filled'
                 assert Decimal(state['funds']['buy_reserved_usd'])==Decimal('15.60')

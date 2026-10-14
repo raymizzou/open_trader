@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from datetime import UTC, date as Date, datetime
+from datetime import UTC, date as Date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -2202,6 +2202,8 @@ class PolymarketTradingClient:
         self._lp_public_readers = 0
         self._lp_account_read_lock = threading.Lock()
         self._lp_account_read_retry = None
+        self._lp_planning_reads: dict[str, Future] = {}
+        self._lp_planning_components: dict[str, dict[str, object]] = {}
         self._lp_public_read_timeout = 1.0
         self._lp_public_reads_lock = threading.Lock()
         self._lp_public_reads: dict[str, Future] = {}
@@ -2536,14 +2538,15 @@ class PolymarketTradingClient:
         except Exception:
             return False
 
-    def _account_read_facts(self, *, _planning: bool = False):
+    def _account_read_facts(self, *, _planning: bool = False, _retry_seconds: int = 60, _previous_components=None):
         with _lp_read_task("account_read_facts"), _lp_read_lock(self._lp_account_read_lock, "account_lock_wait"):
             retry = self._lp_account_read_retry
             if retry is not None and time.monotonic() < retry[0]:
                 raise PolymarketTradingError("network", response_facts=self._lp_public_retry_projection(retry))
             self._lp_account_read_retry = None
             try:
-                return (self._account_read_facts_once(_planning=True) if _planning
+                return (self._account_read_facts_once(_planning=True, _retry_seconds=_retry_seconds,
+                            _previous_components=_previous_components) if _planning
                         else self._account_read_facts_once())
             except PolymarketTradingError as exc:
                 deadline = self._lp_public_retry_after(exc.response_facts)
@@ -2553,7 +2556,7 @@ class PolymarketTradingClient:
                 raise
 
     def _account_read_facts_once(
-        self, *, _planning: bool = False,
+        self, *, _planning: bool = False, _retry_seconds: int = 60, _previous_components=None,
     ) -> tuple[
         Decimal,
         Decimal,
@@ -2564,7 +2567,9 @@ class PolymarketTradingClient:
         bool,
         datetime,
         datetime,
-    ]:
+    ] | dict[str, object]:
+        if _planning:
+            return self._read_lp_planning_components(retry_seconds=_retry_seconds, previous_components=_previous_components)
         response_facts: dict[str, object] = {}
         remove_hooks = []
         read_started_at = datetime.now(UTC)
@@ -2597,22 +2602,19 @@ class PolymarketTradingClient:
                 _lp_read_count(records=len(orders))
             # This read is intentionally performed even though the snapshot only
             # formerly discarded it; the round now preserves the complete list.
-            trades_complete = True
-            try:
+            trades_complete = not _planning
+            if _planning:
+                # LP Facts Reader: current planning needs balance, orders and
+                # positions. History belongs to on-demand recovery/reporting.
+                # None preserves not-read truth; it is not an empty history.
+                trades = None
+            else:
                 with _lp_read_stage("account_trades"):
                     raw_trades = self._client.list_account_trades()
                     if raw_trades is None:
                         raise ValueError("account_trades_unknown")
                     trades = tuple(_collect(raw_trades))
                     _lp_read_count(records=len(trades))
-            except Exception as exc:
-                # Only the private planning read can proceed without a
-                # historical transport. Authentication and invalid carriers
-                # still fail; None means unavailable, never a complete empty list.
-                if (not _planning or _safe_error_code(exc) not in {"timeout", "network", "unavailable"}
-                        or _safe_history_response_facts(exc).get("status") in {401, 403}):
-                    raise
-                trades, trades_complete = None, False
             with _lp_read_stage("account_positions"):
                 raw_positions = self._client.list_positions()
                 if raw_positions is None:
@@ -2645,6 +2647,117 @@ class PolymarketTradingClient:
                     remove()
                 except Exception:
                     pass
+
+    def _read_lp_planning_components(self, *, retry_seconds=60, previous_components=None):
+        """LP Facts Reader: bounded current reads with independent outcomes.
+
+        Called under the existing account read lock. Timed-out native workers
+        keep their slots until they finish; late values are never adopted as
+        the next observation. There is no executor or unbounded queue.
+        """
+        started = datetime.now(UTC)
+        values, components = {}, {}
+        readers = {
+            'balance': self._collateral_balance_allowance,
+            'open_orders': lambda: self._planning_account_rows(self._client.list_open_orders()),
+            'positions': lambda: self._planning_account_rows(self._client.list_positions()),
+        }
+        for name, read in readers.items():
+            now = datetime.now(UTC)
+            # Persisted failure metadata can restore pacing after a cold
+            # restart. It never restores a successful value or send authority.
+            previous = self._lp_planning_components.get(name) or (previous_components or {}).get(name) or {}
+            existing = self._lp_planning_reads.get(name)
+            if existing is not None and existing.done():
+                self._lp_planning_reads.pop(name)
+                # A late value cannot become fresh authority. Shared auth or
+                # rate-limit errors still install the existing account fence.
+                failure = existing.exception()
+                if isinstance(failure, PolymarketTradingError) and failure.response_facts.get('status') in {401, 403, 429}:
+                    raise failure
+                existing = None
+            retry_at = _venue_timestamp(previous.get('retry_at'))
+            if existing is not None or isinstance(retry_at, datetime) and now < retry_at:
+                components[name] = {**previous, 'state': 'failed',
+                    'error': previous.get('error') or {'error_type': 'account_read_in_progress'}}
+                continue
+            if sum(not job.done() for job in self._lp_planning_reads.values()) >= 2:
+                components[name] = {**previous, 'state': 'failed',
+                    'error': {'error_type': 'account_read_capacity'}}
+                continue
+            future = Future()
+            self._lp_planning_reads[name] = future
+
+            def run(result=future, reader=read, component_name=name):
+                response_facts = {}
+                transport, path = {'balance': ('secure_clob', '/balance-allowance'),
+                    'open_orders': ('secure_clob', '/data/orders'),
+                    'positions': ('data', '/positions')}[component_name]
+                remove = None
+                try:
+                    remove = _install_lp_response_fact_hook(self._client, path=path,
+                        facts=response_facts, transport_name=transport)
+                    result.set_result((reader(), datetime.now(UTC)))
+                except BaseException as exc:
+                    if isinstance(exc, Exception):
+                        result.set_exception(PolymarketTradingError(_safe_error_code(exc),
+                            response_facts={**_safe_history_response_facts(exc), **response_facts}))
+                    else:
+                        result.set_exception(exc)
+                finally:
+                    if remove is not None:
+                        remove()
+
+            threading.Thread(target=run, daemon=True, name='lp-account-' + name).start()
+            try:
+                value, checked = future.result(timeout=self._lp_public_read_timeout)
+                values[name] = value
+                component = dict(state='known', read_started_at=now,
+                    checked_at=checked, last_success_at=checked, error=None, retry_at=None)
+            except Exception as exc:
+                error = _safe_history_response_facts(exc)
+                response = getattr(exc, 'response_facts', None)
+                if isinstance(response, Mapping):
+                    error.update(response)
+                if error.get('status') in {401, 403, 429}:
+                    raise PolymarketTradingError(_safe_error_code(exc), response_facts=error) from None
+                component = dict(state='failed', read_started_at=now,
+                    checked_at=None, last_success_at=previous.get('last_success_at'),
+                    error=error, retry_at=now + timedelta(seconds=retry_seconds))
+            finally:
+                if future.done():
+                    self._lp_planning_reads.pop(name, None)
+            self._lp_planning_components[name] = component
+            components[name] = component
+        return dict(values=values, components=components, read_started_at=started,
+            checked_at=datetime.now(UTC), read_ended_at=datetime.now(UTC))
+
+    @staticmethod
+    def _planning_account_rows(rows):
+        if rows is None:
+            raise ValueError('account_rows_unknown')
+        return tuple(_collect(rows))
+
+    def drain_lp_account_reads(self, *, timeout: float = 5) -> None:
+        """Keep native read ownership until the underlying calls finish."""
+        deadline = time.monotonic() + timeout
+        if not self._lp_account_read_lock.acquire(timeout=max(0, timeout)):
+            raise RuntimeError('prediction LP account reader did not stop')
+        try:
+            pending = tuple(self._lp_planning_reads.values())
+            for future in pending:
+                try:
+                    future.result(timeout=max(0, deadline - time.monotonic()))
+                except FuturesTimeoutError:
+                    if not future.done():
+                        raise RuntimeError('prediction LP account reader did not stop') from None
+                except Exception:
+                    # Failure is a completed read, not a live resource.
+                    pass
+            self._lp_planning_reads = {name: job for name, job in self._lp_planning_reads.items()
+                if not job.done()}
+        finally:
+            self._lp_account_read_lock.release()
 
     def account_snapshot(self) -> AccountSnapshot:
         (
@@ -2743,11 +2856,12 @@ class PolymarketTradingClient:
                 account = dict(self._lp_account_snapshot_for_round(account_round)[0])
             return self._enrich_lp_account_snapshot(account, keep_raw=account_round is not None)
 
-    def _lp_planning_account_snapshot(self, *, trade_generation_provider) -> dict[str, object]:
+    def _lp_planning_account_snapshot(self, *, trade_generation_provider, retry_seconds=60, previous_components=None) -> dict[str, object]:
         """Read one current planning observation without sharing partial cache data."""
         with _lp_read_task("planning_account_snapshot"):
             before = trade_generation_provider()
-            account = self._lp_account_facts(include_raw_trades=True, _planning=True)
+            account = self._lp_account_facts(include_raw_trades=True, _planning=True,
+                _retry_seconds=retry_seconds, _previous_components=previous_components)
             after = trade_generation_provider()
             if before != after:
                 raise LpAccountRoundInvalid("lp_account_round_invalid")
@@ -2776,7 +2890,7 @@ class PolymarketTradingClient:
             if not keep_raw:
                 # Raw own-fill evidence is internal to a fenced registration round.
                 account.pop("raw_trades", None)
-            order_rows, position_rows = account['open_orders'], account['positions']
+            order_rows, position_rows = account['open_orders'] or (), account['positions'] or ()
             condition_ids = tuple(
                 dict.fromkeys(
                     str(row.get("condition_id") or "")
@@ -2915,15 +3029,25 @@ class PolymarketTradingClient:
             raise ValueError("open_orders_unknown")
         return deepcopy(list(account.get("open_orders", ())))
 
-    def _lp_account_facts(self, *, include_raw_trades: bool = False, _planning: bool = False) -> dict[str, object]:
+    def _lp_account_facts(self, *, include_raw_trades: bool = False, _planning: bool = False, _retry_seconds=60, _previous_components=None) -> dict[str, object]:
         """Normalize complete authenticated lists before any display enrichment."""
 
         lp_checked_at = datetime.now(UTC)
         try:
-            facts = tuple(self._account_read_facts(_planning=True) if _planning else self._account_read_facts())
-            balance, allowance, orders, positions, account_checked_at, raw_trades, trades_complete = facts[:7]
-            read_started_at = facts[7] if len(facts) > 7 else account_checked_at
-            read_ended_at = facts[8] if len(facts) > 8 else datetime.now(UTC)
+            facts = self._account_read_facts(_planning=True, _retry_seconds=_retry_seconds,
+                _previous_components=_previous_components) if _planning else self._account_read_facts()
+            if _planning:
+                values = facts['values']
+                balance, allowance = values.get('balance', (None, None))
+                orders, positions = values.get('open_orders'), values.get('positions')
+                account_checked_at = facts['checked_at']
+                read_started_at, read_ended_at = facts['read_started_at'], facts['read_ended_at']
+                raw_trades, trades_complete = None, False
+            else:
+                facts = tuple(facts)
+                balance, allowance, orders, positions, account_checked_at, raw_trades, trades_complete = facts[:7]
+                read_started_at = facts[7] if len(facts) > 7 else account_checked_at
+                read_ended_at = facts[8] if len(facts) > 8 else datetime.now(UTC)
         except PolymarketTradingError as exc:
             facts = exc.response_facts
             if facts.get("status") == 401:
@@ -2939,10 +3063,16 @@ class PolymarketTradingClient:
             else lp_checked_at
         )
         order_rows: list[dict[str, object]] = []
-        open_orders_complete = True
-        for order in orders:
+        open_orders_complete = orders is not None
+        for order in orders or ():
             raw = _model_dict(order)
             row = _lp_order(order)
+            if (_planning and raw is not None and raw.get('maker_address')
+                    and str(raw['maker_address']).casefold() != self.config.wallet_address.casefold()):
+                open_orders_complete = False
+                facts['components']['open_orders'].update(state='failed',
+                    error={'error_type': 'account_identity_mismatch'})
+                continue
             if raw is None or row is None:
                 open_orders_complete = False
                 continue
@@ -2963,8 +3093,8 @@ class PolymarketTradingClient:
             order_rows.append(row)
 
         position_rows: list[dict[str, object]] = []
-        positions_complete = True
-        for position in positions:
+        positions_complete = positions is not None
+        for position in positions or ():
             raw = _model_dict(position)
             row = _lp_position(position)
             if raw is None or row is None:
@@ -2990,9 +3120,9 @@ class PolymarketTradingClient:
             "read_started_at": read_started_at,
             "balance": balance,
             "allowance": allowance,
-            "balance_complete": True,
-            "open_orders": tuple(order_rows),
-            "positions": tuple(position_rows),
+            "balance_complete": balance is not None and allowance is not None,
+            "open_orders": tuple(order_rows) if orders is not None else None,
+            "positions": tuple(position_rows) if positions is not None else None,
             "checked_at": checked_at,
             "read_ended_at": read_ended_at,
             "pagination_complete": (
@@ -3005,7 +3135,8 @@ class PolymarketTradingClient:
             "trades": (),
             "trades_complete": trades_complete,
             "raw_trades": raw_trades,
-            **({"current_pagination_complete": open_orders_complete and positions_complete} if _planning else {}),
+            **({"current_pagination_complete": open_orders_complete and positions_complete,
+                "components": facts['components'], "history_state": "not_read"} if _planning else {}),
         }
 
     def lp_open_orders_snapshot(self) -> dict[str, object]:

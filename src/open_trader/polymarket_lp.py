@@ -9651,6 +9651,9 @@ class PolymarketLPService:
                                 | {'account_send_inflight'})
                         planning_document['_planning_buy_isolation'] = holds['isolation']
                         planning_document['account_financial_facts'] = deepcopy(financial_facts)
+                        if _planning_only and not capture_only:
+                            self.store.lp_publish_planning_account_facts(financial_facts,
+                                holds['isolation'], connection=connection)
                     planning_capture = dict(document=planning_document, validated_at=self._now(),
                         validated_generation=generation)
             return {"state": "registered", "tokens": token_results,
@@ -10225,6 +10228,10 @@ class PolymarketLPService:
         finally:
             self._mutex.release()
 
+        drain_reads = getattr(self.exchange, 'drain_lp_account_reads', None)
+        if callable(drain_reads):
+            drain_reads(timeout=timeout)
+
     def _entry_execute(self, **kwargs) -> dict[str, object]:
         # A durable legacy "sending" field is not proof of a live process.
         # Track the real lane through receipt application and clean up on error.
@@ -10454,18 +10461,21 @@ class PolymarketLPService:
         except Exception as exc:
             if not post_started:
                 failure = _submit_failure_facts(exc)
+                # One ended automatic attempt owns one finish timestamp across
+                # its audit and session writes, even across a native commit.
+                finished_at = _iso(self._now())
                 self.store.lp_upsert_action(session_id, entry_action_key, state="rejected",
                     payload={
                         "role": "entry", "side": "BUY", "reason": "prepare_failed",
                         "error": type(exc).__name__, **send_receipt_base,
                         "submit_stage": "prepare_failed",
-                        "submit_finished_at": _iso(self._now()), **failure,
+                        "submit_finished_at": finished_at, **failure,
                     })
                 session = self.store.lp_update_session(session_id, state="entry_rejected",
                     patch={
                         "submit_status": "rejected", "reason": "prepare_failed",
                         **send_receipt_base, "submit_stage": "prepare_failed",
-                        "submit_finished_at": _iso(self._now()), **failure,
+                        "submit_finished_at": finished_at if plan_authorization is not None else _iso(self._now()), **failure,
                     })
                 return self._status_payload(session)
             failure = _submit_failure_facts(exc)
@@ -12383,46 +12393,81 @@ class PolymarketLPService:
             # the automatic BUY pool is paused or account/history reads fail.
             self._monitor_buy_yield(session_id)
 
-    def _monitor_buy_yield(self, session_id):
+    def _refresh_buy_yield(self, session_id):
+        """Publish only current per-order yield fields, independently of admission."""
         session = self.store.lp_session(session_id)
         wallet = str(getattr(getattr(self.exchange, 'config', None), 'wallet_address', '') or '').casefold()
         if (not session or not wallet or str(session.get('account_id') or '').casefold() != wallet
                 or session.get('order_identity_conflict')):
-            return
+            return None
         history = self._order_history(session)
         buys = {oid: row for oid, row in history.items()
             if row.get('side') == 'BUY' and row.get('status') == 'LIVE'
             and row.get('token_id') == session.get('token_id')
             and self._queue_row_remaining(row) is not None and self._queue_row_remaining(row) > 0}
         if not buys:
-            return
+            return None
         direction = None
+        error = None
+        started_at = self._now()
         try:
             direction = self._market_read(session, lambda: self._fetch_market_direction(session))
             now = self._now()
             _freshness(direction.get('reward_checked_at'), now, 'reward_data', max_age=60)
             _freshness(direction['book'].get('received_at'), now, 'book_freshness', max_age=60)
-        except Exception:
+        except Exception as exc:
             now = self._now()
             direction = None
-        with self._mutex:
-            current = self.store.lp_session(session_id)
+            error = type(exc).__name__
+
+        estimates = {}
+        for oid, row in buys.items():
+            remaining = self._queue_row_remaining(row)
+            estimate = None
+            if direction is not None:
+                try:
+                    estimate = minimum_order_estimate(direction,
+                        {'price': row['price'], 'quantity': remaining}, now, resting_quantity=remaining)
+                except (ValueError, KeyError, TypeError):
+                    pass
+            estimates[oid] = estimate
+
+        def publish(current, connection):
             timers = deepcopy(current.get('buy_yield_unknown') or {})
+            observations = deepcopy(current.get('buy_yield_observations') or {})
             for oid, row in buys.items():
+                actual = self._order_history(current).get(oid)
+                if (str(current.get('account_id') or '').casefold() != wallet
+                        or current.get('order_identity_conflict')
+                        or actual != row
+                        or _timestamp((observations.get(oid) or {}).get('attempted_at') or _iso(started_at)) > started_at):
+                    continue
                 remaining = self._queue_row_remaining(row)
-                estimate = None
-                if direction is not None:
-                    try:
-                        estimate = minimum_order_estimate(direction,
-                            {'price': row['price'], 'quantity': remaining}, now, resting_quantity=remaining)
-                    except (ValueError, KeyError, TypeError):
-                        pass
-                if estimate is not None and estimate.get('state') == 'known':
+                estimate = estimates[oid]
+                known = estimate is not None and estimate.get('state') == 'known'
+                previous = observations.get(oid) or {}
+                observations[oid] = dict(estimate or {'state': 'unknown'})
+                observations[oid].update(account_id=wallet, order_id=oid,
+                    quantity=str(remaining), price=str(row['price']), attempted_at=_iso(started_at),
+                    checked_at=_iso(now), error=None if known else error or 'buy_yield_unknown',
+                    last_success_at=_iso(now) if known else previous.get('last_success_at'),
+                    reward_checked_at=direction.get('reward_checked_at') if direction else None,
+                    book_received_at=direction['book'].get('received_at') if direction else None)
+                if known:
                     timers.pop(oid, None)
                 else:
                     timers.setdefault(oid, {'account_id': wallet, 'unknown_since': _iso(now)})
-            if timers != (current.get('buy_yield_unknown') or {}):
-                self.store.lp_update_session(session_id, patch={'buy_yield_unknown': timers})
+            return {'buy_yield_unknown': timers, 'buy_yield_observations': observations}
+
+        current = self.store.lp_update_session(session_id, patch_builder=publish)
+        return buys, current.get('buy_yield_unknown') or {}, now
+
+    def _monitor_buy_yield(self, session_id):
+        refreshed = self._refresh_buy_yield(session_id)
+        if refreshed is None:
+            return
+        buys, timers, now = refreshed
+        wallet = str(getattr(getattr(self.exchange, 'config', None), 'wallet_address', '') or '').casefold()
         for oid in buys:
             timer = timers.get(oid)
             if (not timer or timer.get('account_id') != wallet

@@ -118,7 +118,8 @@ def _emit(result: str, state: dict[str, object] | None, reason: str | None, json
         return
     desired = state.get('desired_running')
     print('desired_running: ' + ('ON' if desired is True else 'OFF' if desired is False else 'UNKNOWN'))
-    for key in ('runtime_state', 'budget_usd', 'target_buy_count', 'buy_price_level', 'config_version', *_TIMING_DEFAULTS):
+    for key in ('runtime_state', 'budget_usd', 'target_buy_count', 'buy_price_level', 'config_version',
+            'cycle_mode', 'api_retry_interval_seconds', 'order_check_interval_seconds'):
         value = state.get(key)
         if key == 'runtime_state' and isinstance(value, str) and result != 'UNKNOWN':
             value = value.upper()
@@ -232,6 +233,8 @@ def run(action: str, url: str, timeout: float | str, *, json_output: bool = Fals
             raise ValueError('timeout must be finite and positive') from exc
         payload = None
         if action == 'config':
+            if round_interval_seconds is not None:
+                raise ValueError('round_interval_seconds_retired_in_continuous_mode')
             payload = _config_payload(budget, target_buys, bid_level) if any(
                 value is not None for value in (budget, target_buys, bid_level)) else {}
             for key, value in dict(round_interval_seconds=round_interval_seconds,

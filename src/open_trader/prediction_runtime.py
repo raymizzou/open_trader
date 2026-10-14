@@ -1087,7 +1087,7 @@ class PredictionRuntime:
             **(self._lp_auto_scheduler.snapshot() if self._lp_auto_scheduler else {
                 "scheduler_running": False, "last_check_at": None,
                 "next_check_at": None, "check_in_progress": False,
-                "last_check_error": None, "check_interval_seconds": state.get('round_interval_seconds', 60),
+                "last_check_error": None, "check_interval_seconds": None,
             }),
         }
 

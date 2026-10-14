@@ -9,6 +9,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import sqlite3
 import hashlib
 import uuid
 import threading
@@ -286,7 +287,18 @@ class LPAutoPool:
             document.setdefault('trading_config_version', document['config_version'])
             for key, value in TIMING_DEFAULTS.items():
                 document.setdefault(key, value)
-            return document
+            return self._planning_document(document)
+
+    @staticmethod
+    def _planning_document(document):
+        """Auto alone consumes current exposure; full history keeps its source."""
+        current = document.get('account_planning_facts')
+        full = document.get('account_financial_facts') or {}
+        if (isinstance(current, Mapping) and current.get('checked_at')
+                and (not full.get('checked_at')
+                     or _timestamp(current['checked_at']) >= _timestamp(full['checked_at']))):
+            return {**document, 'account_financial_facts': current}
+        return document
 
     def buy_price_level(self):
         """Return the effective quote level, including legacy default one."""
@@ -369,6 +381,12 @@ class LPAutoPool:
         """A covered reservation never returns, including after facts expire."""
         facts = d.get('account_financial_facts')
         waiting = None if planning else self._account_facts_wait
+        durable_wait = d.get('account_reader_wait') or {}
+        retry_at = _maybe_datetime(durable_wait.get('retry_at'))
+        if not planning and retry_at is not None and retry_at > self._now():
+            waiting = {**durable_wait, 'baseline': self._account_facts_identity(facts),
+                'baseline_times': {key: facts.get(key) for key in
+                    ('read_started_at', 'read_ended_at', 'checked_at')} if isinstance(facts, Mapping) else {}}
         wait_reason = waiting['reason'] if waiting else None
         reasons = []
         if facts is None:
@@ -498,6 +516,7 @@ class LPAutoPool:
 
     def _projection(self, d, *, include_intents=True, planning=False, observed_at=None, observed_generation=None,
                     terminal_intent_bindings=None):
+        d = self._planning_document(d)
         audit_intents = list(d['intents'].values())
         # Coverage is a one-way replacement, not a new interpretation of the
         # original submission. Its audit survives late callbacks unchanged.
@@ -706,6 +725,9 @@ class LPAutoPool:
                     'ever_enabled','enabled_at','target_buy_count','budget_usd','buy_price_level',
                     'last_round','last_reconciled_at','updated_at')},
                     plan_wait=deepcopy(d.get('plan_wait')), active_plan=deepcopy(d.get('active_plan')),
+                    account_observation=deepcopy(d.get('account_observation')),
+                    account_reader_wait=deepcopy(d.get('account_reader_wait')),
+                    cycle_mode='continuous', effective_round_interval_seconds=None,
                     trading_config_version=d.get('trading_config_version', d['config_version']),
                     **{key: d.get(key, value) for key, value in TIMING_DEFAULTS.items()},
                     auto_run_id=d['run_id'], budget_configured=d['budget_usd'] is not None,
@@ -974,6 +996,8 @@ class LPAutoPool:
                         else str(sum((Decimal(row['amount_usd']) for row in released), ZERO))), state=self.state())
 
     def configure(self, payload, *, audit=None):
+        if isinstance(payload, dict) and 'round_interval_seconds' in payload:
+            raise ValueError('round_interval_seconds_retired_in_continuous_mode')
         if (not isinstance(payload, dict) or not payload or
                 set(payload)-{'budget_usd','target_buy_count','buy_price_level','expected_config_version', *TIMING_DEFAULTS}):
             raise ValueError('auto_config_invalid')
@@ -1560,6 +1584,8 @@ class LPAutoPool:
         drifted = []
         for intent in active:
             try:
+                if intent.get('session_id') in getattr(self, '_yield_publication_failures', {}):
+                    raise ValueError('buy_yield_publication_failed')
                 self._rotation_session(intent, diagnostics=diagnostics, account=account_facts)
                 facts = self.lp._read_candidate_facts(intent, account=source_account, wait_for_capacity=True)
                 account, direction = facts['account'], facts['direction']
@@ -1585,9 +1611,13 @@ class LPAutoPool:
                 # This is an existing quote, including a partial remainder.
                 # New-entry inventory/minimum-size admission does not decide
                 # whether its expected reward can be ranked and canceled.
-                estimate = minimum_order_estimate(direction, intent, self._now(), resting_quantity=_decimal(intent['quantity']))
-                if estimate['state'] != 'known':
+                session = self.store.lp_session(intent['session_id'])
+                estimate = (session.get('buy_yield_observations') or {}).get(intent['order_id']) or {}
+                if (estimate.get('state') != 'known'
+                        or _maybe_decimal(estimate.get('quantity')) != _decimal(intent['quantity'])
+                        or _maybe_decimal(estimate.get('price')) != _decimal(intent['price'])):
                     raise ValueError('rotation_yield_unknown')
+                _freshness(estimate.get('checked_at'), self._now(), 'buy_yield', max_age=60)
                 row = {**intent, 'minimum_order_estimate': estimate,
                        'ranking_account': {k: v for k, v in account.items() if not k.startswith('raw_')}, 'ranking_book_at': direction['book']['received_at'],
                        'ranking_reward_at': direction['reward_checked_at']}
@@ -3450,32 +3480,43 @@ class LPAutoPool:
         return restored or not error and before != identity(intent)
 
     def _refresh_account_facts(self, *, account_round=None, planning=False):
-        from .polymarket_lp import LpAccountRoundInvalid, LpObservationWait
+        from .polymarket_lp import LpAccountReadError, LpAccountRoundInvalid, LpObservationWait
         reader = getattr(self.lp.exchange, 'lp_account_snapshot_shared', None)
         if not callable(reader):
             return None
         with self._account_refresh_lock:
             self._account_refresh_attempt += 1
             attempt = self._account_refresh_attempt
-            prior = self._read().get('account_financial_facts')
+            prior_document = self._read()
+            prior = prior_document.get('account_financial_facts')
             baseline = self._account_facts_identity(prior)
             baseline_times = {key: prior.get(key) for key in ('read_started_at', 'read_ended_at', 'checked_at')} if isinstance(prior, Mapping) else {}
 
-        def failed(reason, *, waiting=False):
+        def failed(reason, *, waiting=False, retry_at=None):
             with self._account_refresh_lock:
                 if attempt == self._account_refresh_attempt:
                     self._current_account = None
                     if waiting or planning:
                         # Automatic planning owns its attempt-local failure;
                         # healthy planning clears this wait, not shared diagnostics.
-                        self._account_facts_wait = dict(attempt=attempt, baseline=baseline, baseline_times=baseline_times, reason=reason)
+                        self._account_facts_wait = dict(attempt=attempt, baseline=baseline, baseline_times=baseline_times,
+                            reason=reason, retry_at=retry_at)
                     else:
                         self.lp._account_order_sync_error = reason
             return False
 
         try:
+            durable_wait = prior_document.get('account_reader_wait') or {}
+            retry_at = _maybe_datetime(durable_wait.get('retry_at'))
+            if planning and retry_at is not None and self._now() < retry_at:
+                return failed(durable_wait['reason'], waiting=True, retry_at=retry_at)
             planning_reader = getattr(self.lp.exchange, '_lp_planning_account_snapshot', None)
-            snapshot = (planning_reader(trade_generation_provider=self.store.lp_trade_generation)
+            previous_observation = prior_document.get('account_observation') or {}
+            wallet = str(getattr(getattr(self.lp.exchange, 'config', None), 'wallet_address', '') or '').casefold()
+            previous_components = (previous_observation.get('components')
+                if wallet and str(previous_observation.get('account_id') or '').casefold() == wallet else None)
+            snapshot = (planning_reader(trade_generation_provider=self.store.lp_trade_generation,
+                            retry_seconds=prior_document['api_retry_interval_seconds'], previous_components=previous_components)
                         if planning and callable(planning_reader) else
                         self.lp.exchange.lp_account_snapshot(account_round=account_round)
                         if account_round is not None else
@@ -3483,6 +3524,33 @@ class LPAutoPool:
             with self._account_refresh_lock:
                 if attempt != self._account_refresh_attempt:
                     return False
+                if planning:
+                    self._update(lambda doc: doc.update(account_reader_wait=None, account_observation={
+                        key: deepcopy(value) for key, value in snapshot.items()
+                        if not key.startswith('raw_')}))
+                    previous = prior_document.get('account_last_usable_observation')
+                    if (snapshot.get('balance_complete') is not True
+                            and snapshot.get('open_orders_complete') is True
+                            and snapshot.get('positions_complete') is True
+                            and isinstance(previous, Mapping)
+                            and previous.get('trade_generation') == snapshot.get('trade_generation') == self.store.lp_trade_generation()
+                            and previous.get('account_id') == snapshot.get('account_id')
+                            and previous.get('wallet_address') == snapshot.get('wallet_address')):
+                        def rows_equal(field, keys):
+                            def normalize(rows):
+                                return sorted(tuple(str(row.get(k)) for k in keys) for row in rows or ())
+                            return normalize(previous.get(field)) == normalize(snapshot.get(field))
+                        try:
+                            _freshness(previous.get('checked_at'), self._now(), 'account_freshness', max_age=60)
+                        except ValueError:
+                            pass
+                        else:
+                            if (rows_equal('open_orders', ('order_id', 'token_id', 'side', 'status',
+                                    'price', 'original_size', 'size_matched', 'remaining_size'))
+                                    and rows_equal('positions', ('token_id', 'size', 'average_price', 'initial_value'))):
+                                # Reuse the whole committed source unchanged;
+                                # the failed current attempt remains published.
+                                snapshot = deepcopy(previous)
                 # Serialize publication with attempt admission, not the account
                 # read. A late old read cannot publish over a newer wait.
                 result = (self.lp._register_planning_account_snapshot(snapshot) if planning
@@ -3490,6 +3558,10 @@ class LPAutoPool:
                 if result.get('state') != 'registered':
                     reason = result.get('reason') or 'account_order_sync_unknown'
                     return failed(reason, waiting=reason in ('account_round_invalid', 'session_changed'))
+                if planning:
+                    self._update(lambda doc: doc.update(account_last_usable_observation={
+                        key: deepcopy(value) for key, value in snapshot.items()
+                        if not key.startswith('raw_')}))
                 self._account_facts_wait = None
                 self._current_account = snapshot
                 if planning:
@@ -3506,6 +3578,11 @@ class LPAutoPool:
                         state=deepcopy(state), reservations=deepcopy(reservations),
                         validated_at=validated_at)
                 return True
+        except LpAccountReadError as exc:
+            if planning and exc.retry_at is not None:
+                self._update(lambda doc: doc.update(account_reader_wait=dict(
+                    reason=str(exc), retry_at=exc.retry_at)))
+            return failed(str(exc), waiting=True, retry_at=exc.retry_at)
         except (LpAccountRoundInvalid, LpObservationWait) as exc:
             # The next scheduled read or a newer valid dashboard publication
             # owns recovery. Never retry internal invalidation in this round.
@@ -3681,19 +3758,14 @@ class LPAutoPool:
             raise ValueError('active_execution')
 
     def _acquire_plan_apply_lock(self):
-        # Serialize only this pool's short writers, never external preparation
-        # or HTTP. Another process still gets the real native lock refusal.
+        # Automatic current plans own their short writer lane. SQLite keeps
+        # cross-process atomicity and the round flock prevents reentrancy;
+        # unrelated full-fact application must not veto a registered attempt.
         self._plan_mutation_lock.acquire()
-        lock = self.execution._acquire_global_lock()
-        if lock is None:
-            self._plan_mutation_lock.release()
-        return lock
+        return self._plan_mutation_lock
 
     def _release_plan_apply_lock(self, lock):
-        try:
-            self.execution._release_global_lock(lock)
-        finally:
-            self._plan_mutation_lock.release()
+        self._plan_mutation_lock.release()
 
     def _launch_plan_attempt(self, row, plan, action):
         request_id = action.get('request_id', action['action_id'])
@@ -4030,17 +4102,31 @@ class LPAutoPool:
         with _lp_read_task("auto_round"), self._round_barrier() as locked:
             if not locked:
                 return {**self.state(),'round_reason':'round_in_progress'}
-            return self._run_once(round_id=round_id, reuse_facts=reuse_facts)
+            try:
+                return self._run_once(round_id=round_id, reuse_facts=reuse_facts)
+            except sqlite3.Error:
+                # A failed authoritative write grants no send permission.
+                # Keep the scheduler able to retry current observations; this
+                # returned failure is explicitly not a persisted round.
+                logger.exception('lp_auto_store_unavailable')
+                try:
+                    state = self.state()
+                except sqlite3.Error:
+                    state = dict(funds={}, slots=None)
+                return {**state, 'runtime_state': 'blocked', 'reason': 'store_unavailable',
+                    'round_persisted': False,
+                    'funds': {**state['funds'], 'status': 'unknown', 'spendable_usd': None,
+                        'available_usd': None},
+                    'last_round': dict(round_id=round_id, completed_at=self._stamp(),
+                        reason='store_unavailable', persisted=False, actions=[])}
 
     def _plan_wait(self, kind):
         self._update(lambda d: self._set_plan_wait(d, kind))
 
     def _set_plan_wait(self, d, kind, *, started_at=None):
-        # Yield attempts and failed current observations share one cycle clock.
-        field, default = 'round_interval_seconds', 30
-        now = _maybe_datetime(started_at) or self._now()
-        d['plan_wait'] = dict(kind='round', started_at=now.isoformat(),
-            deadline=(now + timedelta(seconds=d.get(field, default))).isoformat())
+        # A round ending is not a reason to wait. Only a lack of runnable
+        # observations can supply a dependency deadline for the scheduler.
+        d['plan_wait'] = deepcopy(getattr(self, '_cycle_wait', None))
 
     def _save_plan(self, plan, *, reason=None, blocked=(), wait_kind=None, connection=None):
         def apply(d):
@@ -4085,9 +4171,7 @@ class LPAutoPool:
     def _run_once(self, *, round_id=None, reuse_facts=False):
         from .polymarket_lp import LpAccountRoundInvalid
         d = self._read()
-        waiting = d.get('plan_wait')
-        if waiting and self._now() < _timestamp(waiting['deadline']):
-            return self.state()
+        self._cycle_wait = None
         plan = d.get('active_plan')
         if plan is not None:
             self._restore_plan_buy_progress(plan)
@@ -4105,6 +4189,29 @@ class LPAutoPool:
             self._reconcile_unknown(reuse=reuse_facts, bounded=True)
             refreshed = None
         observation = refreshed if isinstance(refreshed, Mapping) else None
+        # Current resting yields are observations, including on empty, paused,
+        # or financially blocked rounds. They never grant new BUY authority.
+        self._yield_publication_failures = {}
+        sessions = self.store.lp_active_sessions()
+        for session in sessions:
+            try:
+                self.lp._refresh_buy_yield(session['session_id'])
+            except Exception as exc:
+                self._yield_publication_failures[session['session_id']] = type(exc).__name__
+                logger.exception('lp_auto_buy_yield_publication_failed')
+        # Healthy components and resting-order observations remain runnable
+        # even when a different dependency is cooling down.
+        current_observation = self._read().get('account_observation') or {}
+        components = current_observation.get('components') or {}
+        waiting = self._account_facts_wait or {}
+        retry = _maybe_datetime(waiting.get('retry_at'))
+        deadlines = [_maybe_datetime(c.get('retry_at')) for c in components.values()]
+        all_blocked = (len(components) == 3 and all(c.get('state') == 'failed' for c in components.values()))
+        if not sessions and (all_blocked or retry is not None):
+            deadlines = [at for at in [retry, *deadlines] if at is not None and at > self._now()]
+            if deadlines:
+                self._cycle_wait = dict(kind='dependencies', reason=waiting.get('reason') or 'dependencies_unavailable',
+                    started_at=self._stamp(), deadline=min(deadlines).isoformat())
         # Exact ended cancellation recovery is independent of balance admission.
         self._recover_cancel_requests()
         self._recover_entry_requests()
@@ -5597,11 +5704,18 @@ class LPAutoPool:
         if (receipt.get('session_id') != sid or receipt.get('side') != 'BUY'
                 or receipt.get('state') != 'accepted' or receipt.get('post_started') is not True
                 or receipt.get('submit_stage') != 'receipt_received' or not receipt.get('action_id')
-                or not oid or session.get('entry_order_id') != oid
-                or oid not in (session.get('owned_order_ids') or ())
+                or not oid or session.get('entry_order_id') not in (None, oid)
+                or self.lp.entry_send_inflight(sid)
                 or action.get('order_id') not in (None, oid)
                 or intent.get('order_id') not in (None, oid)):
             return None
+        if session.get('entry_order_id') == oid:
+            if oid not in (session.get('owned_order_ids') or ()):
+                return None
+        elif self.lp._session_order_ids(session):
+            return None
+        # The accepted audit also holds exposure when its first identity merge
+        # rolled back. It grants no new send permission or ownership binding.
         for field in ('market_id', 'condition_id', 'token_id', 'outcome'):
             if not target.get(field) or any(str(row.get(field)) != str(target[field])
                     for row in (intent, session, receipt)):
@@ -5821,7 +5935,7 @@ class LPAutoPool:
                                 action.update(state='not_sent', reason=reason)
                             else:
                                 action.update(state='rejected', reason=reason)
-                        except OSError as exc:
+                        except (OSError, sqlite3.Error) as exc:
                             binding = self._completed_buy_receipt_binding(plan, action, future)
                             if binding is None:
                                 raise

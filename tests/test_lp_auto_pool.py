@@ -210,11 +210,13 @@ def test_planning_read_refusals_preserve_native_worker_lifetime(tmp_path, monkey
             if refusal!='cooling_down':
                 assert not any(x.is_set() for x in completed.values()) and all(t.is_alive() for t in native_threads.values())
             end=datetime.fromisoformat(state['last_round']['completed_at'])
-            assert state['plan_wait']['kind']=='round' and datetime.fromisoformat(state['plan_wait']['deadline'])==end+timedelta(seconds=30)
+            assert state['plan_wait'] is None
             counts=len(calls)
             for elapsed in (1,29):
-                monkeypatch.setitem(globals(),'NOW',end+timedelta(seconds=elapsed))
-                assert e.lp_auto_run_once()['last_round']==state['last_round']
+                current = e.lp_auto_run_once()
+                observations.append(deepcopy(current))
+                assert current['last_round']['round_id'] != state['last_round']['round_id']
+                assert current['active_plan'] is None and current['last_round']['actions'] == []
                 assert len(calls)==counts and signatures==posts==exchange.posts==cancels==[]
     finally:
         release.set();lp._market_read_timeout=timeout
@@ -263,11 +265,15 @@ def test_current_read_failure_does_not_reopen_ended_resource_attempt(tmp_path, m
     assert len(original['targets'])==len(original['actions'])==2
     assert all(Decimal(t['price'])==Decimal('.40') and Decimal(t['quantity'])==20 for t in original['targets'])
     assert first['active_plan'] is None and original['completed_at']
-    assert all(a['state']=='not_sent' and a['reason']=='execution_lock' for a in original['actions'])
+    # The unrelated native execution lock no longer vetoes registered auto BUYs.
+    assert all(a['state']=='success' for a in original['actions'])
+    original_posts = deepcopy(exchange.posts)
+    assert len(original_posts) == 2 and first['slots']['occupied'] == 2
+    assert Decimal(first['funds']['buy_reserved_usd']) == 16
     audits={s['session_id']:deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
-    assert all(a['post_started'] is False for rows in audits.values() for a in rows)
+    assert all(a['post_started'] is True and a['state'] == 'accepted' for rows in audits.values() for a in rows)
     completed_at=datetime.fromisoformat(original['completed_at'])
-    assert datetime.fromisoformat(first['plan_wait']['deadline'])==completed_at+timedelta(seconds=30)
+
     metadata=exchange.lp_market_metadata_fresh
     blockers=('Y','Z');entered={t:Event() for t in blockers};completed={t:Event() for t in blockers};release=Event()
     native_threads,calls,financial_reads={ },[],[]
@@ -308,13 +314,14 @@ def test_current_read_failure_does_not_reopen_ended_resource_attempt(tmp_path, m
                 assert state['last_round']['reason']=='account_order_sync_unknown'
                 assert state['active_plan'] is None and state['last_round']['actions']==[] and state['last_round']['completed_at']
                 end=datetime.fromisoformat(state['last_round']['completed_at'])
-                assert state['plan_wait']['kind']=='round' and datetime.fromisoformat(state['plan_wait']['deadline'])==end+timedelta(seconds=30)
-                assert exchange.posts==[] and {sid:store.lp_actions(sid) for sid in audits}==audits
+                assert state['plan_wait'] is None
+                assert exchange.posts==original_posts and {sid:store.lp_actions(sid) for sid in audits}==audits
                 assert not any(event.is_set() for event in completed.values())
                 for elapsed in (1,29):
-                    monkeypatch.setitem(globals(),'NOW',end+timedelta(seconds=elapsed))
-                    assert e.lp_auto_run_once()['last_round']==state['last_round']
-                    assert len(financial_reads)==1 and exchange.posts==[] and {sid:store.lp_actions(sid) for sid in audits}==audits
+                    current = e.lp_auto_run_once()
+                    assert current['last_round']['round_id'] != state['last_round']['round_id']
+                    assert current['active_plan'] is None and current['last_round']['actions'] == []
+                    assert len(financial_reads) == 2 + (elapsed == 29) and exchange.posts==original_posts and {sid:store.lp_actions(sid) for sid in audits}==audits
             finally:
                 release.set()
                 for token in blockers:assert completed[token].wait(3)
@@ -533,14 +540,16 @@ def test_planning_book_failure_creates_no_send_reservation(tmp_path, monkeypatch
         assert state['funds']['as_of']==reads[-1]['packet']['checked_at'].isoformat()
         assert signatures==posts==x.posts==cancels==[]
         completed=datetime.fromisoformat(state['last_round']['completed_at'])
-        assert state['plan_wait']['kind']=='round' and datetime.fromisoformat(state['plan_wait']['deadline'])==completed+timedelta(seconds=30)
+        assert state['plan_wait'] is None
         original=deepcopy(state['last_round'])
         e.lp_auto_reconcile_unknown()
         counts=(len(reads),len(failures))
         for elapsed in (1,29):
-            monkeypatch.setitem(globals(),'NOW',completed+timedelta(seconds=elapsed))
             current=e.lp_auto_run_once()
-            assert current['last_round']==original and counts==(len(reads),len(failures))
+            assert current['last_round']['round_id'] != original['round_id']
+            assert current['last_round']['actions'] == [] and current['active_plan'] is None
+            assert len(reads) > counts[0] and len(failures) == counts[1] + 1 + (elapsed == 29)
+            assert current['last_round']['candidate_filter']['recheck_reasons'] == {'book_unknown': 1}
             assert signatures==posts==x.posts==cancels==[] and s.lp_sessions()==[]
     finally:
         (tmp_path/'CI-H-book-native-proof.json').write_text(json.dumps(dict(state=e.lp_auto_state(),reads=reads,
@@ -980,7 +989,7 @@ def test_definite_cash_refusal_and_automatic_augment_block(tmp_path, monkeypatch
     assert audit['state'] == 'rejected' and audit['post_started'] is True
     assert audit['reason'] == 'balance_insufficient'
     assert state['slots']['occupied'] == 0 and state['last_round']['completed_at']
-    assert state['plan_wait']['kind'] == 'round'
+    assert state['plan_wait'] is None
     e.lp_auto_run_once()
     assert len(x.posts) == 1 and store.lp_actions(action['session_id']) == [audit]
     x.before_sign = None
