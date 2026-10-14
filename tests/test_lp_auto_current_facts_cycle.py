@@ -328,7 +328,7 @@ def test_cancel_and_free_slot_buys_can_run_in_one_round(runtime):
         finally:
             release_cancel.set()
             state = running.result(timeout=5)
-    assert cancel_finished.is_set()
+    assert cancel_finished.wait(5), 'Independent C cancel completion watchdog after release'
     assert account.cancels == [('original-3',)], state['last_round']
     assert Counter(p.token_id for p in account.posts) == Counter(_refill_identity(i)[2] for i in (4, 5)), state['last_round']
     assert all(Decimal(p.maker_amount) / 1000000 == 20 for p in account.posts)
