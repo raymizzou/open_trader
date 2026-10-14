@@ -1,7 +1,6 @@
 """Current ranking contracts through native SDK feeds and public LP controls."""
 
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -11,6 +10,7 @@ import sqlite3
 from threading import Event, Lock
 
 import pytest
+from timing_support import run_test_in_subprocess
 
 from tests.test_lp_account_reservation_reconciliation import runtime, _refill_identity, _position
 from tests.test_lp_auto_refill_contract import RefillPublic, prepare
@@ -18,25 +18,16 @@ from tests.test_lp_order_registration_contract import _open_order
 
 
 def _run_round(engine, lp, *, round_id):
-    """Bound real execution independently of the fixture's business clock."""
-    finished = Event()
-
-    def run():
-        try:
-            return engine.lp_auto_run_once(round_id=round_id)
-        finally:
-            finished.set()
-
+    """Run inside the process supervisor and verify local sender cleanup."""
     try:
-        with ThreadPoolExecutor(1) as runner:
-            result = runner.submit(run)
-            assert finished.wait(5), 'Independent local round completion watchdog'
-            return result.result(timeout=5)
+        return engine.lp_auto_run_once(round_id=round_id)
     finally:
         lp.drain_submissions()
 
 
-def test_candidate_selection_uses_current_facts_without_history_rescans(runtime, tmp_path, monkeypatch):
+def test_candidate_selection_uses_current_facts_without_history_rescans(request, runtime, tmp_path, monkeypatch):
+    if run_test_in_subprocess(request):
+        return
     public = RefillPublic(runtime.clock)
     public.rates = {1: '48', 2: '24', 3: '96', 4: '12'}
     store, adapter, account, lp, engine, _ = prepare(runtime, count=4, target=2, public=public)
@@ -113,10 +104,13 @@ def test_candidate_selection_uses_current_facts_without_history_rescans(runtime,
     assert state['funds']['spendable_usd'] is None and state['funds']['available_usd'] is None
     assert state['active_plan'] is None and state['last_round']['completed_at']
     assert {sid: store.lp_session(sid) for sid in ended} == history
+    assert len(sql) <= 11, 'Candidate selection must not add per-candidate full-history SELECTs'
 
 
 @pytest.mark.parametrize('outcome', ['all_accepted', 'mixed_receipts'])
-def test_fixed_targets_survive_elapsed_planning_without_refill(runtime, tmp_path, outcome):
+def test_fixed_targets_survive_elapsed_planning_without_refill(request, runtime, tmp_path, outcome):
+    if run_test_in_subprocess(request):
+        return
     public = RefillPublic(runtime.clock)
     public.rates = {1: '48', 2: '36', 3: '24', 4: '12'}
     store, adapter, account, lp, engine, _ = prepare(runtime, count=4, target=3, public=public)
