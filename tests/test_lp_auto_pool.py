@@ -557,17 +557,35 @@ def test_planning_book_failure_creates_no_send_reservation(tmp_path, monkeypatch
 
 
 def test_public_pause_before_post_releases_reservation(tmp_path):
+    from copy import deepcopy
+    from time import monotonic
+    import json
     e, x, lp, store = setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     e.lp_auto_set_desired_running(True)
-    signing = []
+    signing, held_states = [], []
     def pause_before_signed_order():
-        signing.append(e.lp_auto_state()['active_plan']['round_id'])
+        held = deepcopy(e.lp_auto_state())
+        signing.append(held['active_plan']['round_id'])
+        held_states.append(held)
+        held_intent, = held['intents']
+        assert held_intent['state'] == 'reserved' and lp.entry_send_inflight(held_intent['session_id'])
+        assert held['slots']['occupied'] == 1 and Decimal(held['funds']['buy_reserved_usd']) == 8
+        assert x.posts == []
         assert e.lp_auto_set_desired_running(False)['desired_running'] is False
     x.before_sign = pause_before_signed_order
-    result = e.lp_auto_run_once(round_id='public-pause-before-post')
+    returned = e.lp_auto_run_once(round_id='public-pause-before-post')
     assert signing == ['public-pause-before-post'] and x.posts == []
-    intent, = result['intents']
+    intent, = returned['intents']
+    deadline = monotonic()+5
+    while True:
+        result = e.lp_auto_state()
+        published, = [i for i in result['intents'] if i['intent_id'] == intent['intent_id']]
+        assert published['session_id'] == intent['session_id'] and published['token_id'] == intent['token_id']
+        if published['state'] == 'rejected':
+            break
+        assert monotonic() < deadline, 'Public same-request terminal publication watchdog'
+        Event().wait(.01)
     session = store.lp_session(intent['session_id'])
     action, = [a for a in store.lp_actions(intent['session_id']) if a.get('role') == 'entry']
     assert session['state'] == 'entry_rejected' and session['submit_status'] == 'rejected'
@@ -575,8 +593,17 @@ def test_public_pause_before_post_releases_reservation(tmp_path):
     assert session['post_started'] is action['post_started'] is False
     assert not session.get('entry_order_id') and not action.get('order_id')
     assert action['state'] == 'rejected'
+    assert session['idempotency_key'] == 'lp-auto:' + intent['intent_id']
+    assert action['session_id'] == intent['session_id'] and action['token_id'] == intent['token_id']
+    assert result['last_round']['round_id'] == returned['last_round']['round_id'] == 'public-pause-before-post'
+    assert result['active_plan'] is None and result['last_round']['completed_at'] == returned['last_round']['completed_at']
+    assert result['last_round']['actions'] == returned['last_round']['actions']
+    (store.path.parent/'CI-public-pause-assertion-boundary.json').write_text(json.dumps(dict(
+        historical_return=returned,held=held_states,final_public=result,session=session,audit=action,
+        posts=x.posts,orders=x.orders,sender_inflight=lp.entry_send_inflight(intent['session_id'])),default=str,indent=2))
     assert result['slots']['occupied'] == 0 and Decimal(result['funds']['buy_reserved_usd']) == 0
     assert not lp.entry_send_inflight(intent['session_id']) and result['desired_running'] is False
+    assert x.posts == []
 
 
 def test_second_mutation_guard_before_post_releases_reservation(tmp_path):

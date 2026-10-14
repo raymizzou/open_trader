@@ -12436,6 +12436,8 @@ class PolymarketLPService:
                 else:
                     # Monitoring can reuse the same proved terms, but cannot
                     # renew their source time or restore older history as fresh.
+                    if previous.get('order_proof_invalidated_at'):
+                        raise ValueError('current_order_proof_invalidated')
                     checked_at = previous['order_checked_at']
                     read_started_at = previous.get('order_read_started_at')
                     generation = previous.get('order_trade_generation')
@@ -12443,6 +12445,9 @@ class PolymarketLPService:
                     if previous.get('account_id') != wallet or previous.get('order_id') != oid:
                         raise ValueError('current_order_identity_unknown')
                 _freshness(checked_at, self._now(), 'order_freshness', max_age=60)
+                invalidated_at = previous.get('order_proof_invalidated_at')
+                if invalidated_at and _timestamp(checked_at) <= _timestamp(invalidated_at):
+                    raise ValueError('current_order_proof_invalidated')
                 if type(generation) is not int or generation != self.store.lp_trade_generation():
                     raise ValueError('current_order_generation_unknown')
                 current_generation = generation
@@ -12461,7 +12466,8 @@ class PolymarketLPService:
                 buys[oid] = deepcopy(row)
                 order_provenance[oid] = dict(order_checked_at=checked_at,
                     order_read_started_at=read_started_at, order_trade_generation=generation,
-                    order_terms=deepcopy(row), order_current_proof_required=True)
+                    order_terms=deepcopy(row), order_current_proof_required=True,
+                    order_proof_invalidated_at=None)
             except (ValueError, TypeError, KeyError):
                 unproven.add(oid)
                 # Retain provenance even for UNKNOWN so a later monitor cannot
@@ -12470,6 +12476,14 @@ class PolymarketLPService:
                     ('order_checked_at', 'order_read_started_at', 'order_trade_generation', 'order_terms')
                     if k in previous}
                 order_provenance[oid]['order_current_proof_required'] = True
+                invalidated_at = previous.get('order_proof_invalidated_at')
+                if current_orders:
+                    try:
+                        denied_at = _timestamp(component.get('checked_at'))
+                    except (ValueError, TypeError):
+                        denied_at = self._now()
+                    invalidated_at = _iso(max(denied_at, _timestamp(invalidated_at))) if invalidated_at else _iso(denied_at)
+                order_provenance[oid]['order_proof_invalidated_at'] = invalidated_at or _iso(self._now())
         direction = None
         error = None
         started_at = self._now()

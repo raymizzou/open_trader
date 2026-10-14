@@ -1161,7 +1161,7 @@ finally:
 '''
         import os
         result = subprocess.run([sys.executable, '-B', '-c', producer, str(tmp_path), sha],
-            cwd=source, env={**os.environ, 'PYTHONPATH': str(source / 'src')},
+            cwd=source, env={**os.environ, 'PYTHONPATH': os.pathsep.join((str(source), str(source / 'src')))},
             text=True, capture_output=True, timeout=15)
         assert result.returncode == 0, result.stdout + result.stderr
         evidence = json.loads((tmp_path / 'baseline-producer.json').read_text())
@@ -1534,9 +1534,77 @@ def test_partial_account_failure_uses_current_owned_buy_quantity(request, runtim
     assert Decimal(after_tick['buy_filled_quantity']) == 0
     assert engine.lp_auto_state()['funds']['as_of'] == financial_as_of
     assert account.posts == account.market_orders == account.cancels == []
+    # A newer complete current list contradicts the retained LIVE terms while
+    # the same financial source remains unavailable. Absence grants no release.
+    account.orders = ()
+    runtime.clock[0] += timedelta(seconds=1)
+    omitted = engine.lp_auto_run_once(round_id='review-partial-new-complete-omission')
+    omission = omitted['account_observation']
+    assert omission['authenticated'] is True
+    assert omission['account_id'] == omission['wallet_address'] == owner['account_id']
+    assert omission['open_orders_complete'] is True and omission['open_orders'] == []
+    assert omission['components']['open_orders']['state'] == 'known'
+    assert omission['components']['balance' if failure == 'balance_failed' else 'positions']['state'] == 'failed'
+    assert datetime.fromisoformat(omission['components']['open_orders']['checked_at'].replace('Z', '+00:00')) > datetime.fromisoformat(observed['order_checked_at'].replace('Z', '+00:00'))
+    invalidated = _yield(store, original.id)
+    assert invalidated['state'] == 'unknown'
+    unknown_since = store.lp_session(sid)['buy_yield_unknown'][original.id]['unknown_since']
+    for key in ('order_checked_at', 'order_read_started_at', 'order_trade_generation', 'order_terms'):
+        assert invalidated[key] == monitored[key], 'Contradiction retains the old proof only as audit provenance'
+    assert omitted['funds']['status'] == 'unknown' and omitted['funds']['spendable_usd'] is None
+    assert omitted['funds']['as_of'] == financial_as_of
+    assert omitted['slots']['occupied'] == 1 and Decimal(omitted['funds']['buy_reserved_usd']) == 16
+    assert Decimal(omitted['funds']['inventory_cost_usd']) == 0
+    assert store.lp_session(sid)['order_history'] == history and store.lp_actions(sid) == audits
+    assert {k: store.lp_session(sid).get(k) for k in controls} == expected_controls
+    runtime.clock[0] += timedelta(seconds=1)
+    assert runtime.clock[0] - datetime.fromisoformat(observed['order_checked_at'].replace('Z', '+00:00')) < timedelta(seconds=60)
+    invalid_tick = engine.lp_tick()
+    still_unknown = _yield(store, original.id)
+    assert still_unknown['state'] == 'unknown', 'Normal monitoring cannot revive a proof disproved by newer complete current facts'
+    assert store.lp_session(sid)['buy_yield_unknown'][original.id]['unknown_since'] == unknown_since
+    for key in ('order_checked_at', 'order_read_started_at', 'order_trade_generation', 'order_terms'):
+        assert still_unknown[key] == invalidated[key]
+    expected_controls['queue_protection']['data_failures'] += 1
+    assert {k: store.lp_session(sid).get(k) for k in controls} == expected_controls
+    assert store.lp_session(sid)['order_history'] == history and store.lp_actions(sid) == audits
+    assert Decimal(store.lp_session(sid)['buy_filled_quantity']) == 0
+    unknown_state = engine.lp_auto_state()
+    assert unknown_state['funds']['status'] == 'unknown' and unknown_state['funds']['spendable_usd'] is None
+    assert unknown_state['funds']['as_of'] == financial_as_of
+    assert unknown_state['slots']['occupied'] == 1 and Decimal(unknown_state['funds']['buy_reserved_usd']) == 16
+    assert account.posts == account.market_orders == account.cancels == []
+    # Only a later actual exact owned current observation can restore authority.
+    account.orders = (original.model_copy(update={'size_matched': Decimal('8')}),)
+    runtime.clock[0] += timedelta(seconds=1)
+    restored = engine.lp_auto_run_once(round_id='review-partial-later-current32-restoration')
+    restoration = restored['account_observation']
+    assert restoration['open_orders_complete'] is True
+    assert restoration['components']['open_orders']['state'] == 'known'
+    assert restoration['components']['balance' if failure == 'balance_failed' else 'positions']['state'] == 'failed'
+    revalidated = _yield(store, original.id)
+    assert revalidated['state'] == 'known' and revalidated['order_id'] == original.id
+    assert Decimal(revalidated['quantity']) == 32 and Decimal(revalidated['capital_usd']) == Decimal('12.80')
+    assert Decimal(revalidated['yield_pct_per_hour']).quantize(Decimal('.000001')) == Decimal('.084232')
+    assert revalidated['order_checked_at'] == restoration['components']['open_orders']['checked_at']
+    assert revalidated['order_read_started_at'] == restoration['components']['open_orders']['read_started_at']
+    assert revalidated['order_trade_generation'] == restoration['trade_generation']
+    assert datetime.fromisoformat(revalidated['order_checked_at'].replace('Z', '+00:00')) > datetime.fromisoformat(omission['components']['open_orders']['checked_at'].replace('Z', '+00:00'))
+    assert original.id not in store.lp_session(sid).get('buy_yield_unknown', {})
+    assert restored['funds']['status'] == 'unknown' and restored['funds']['spendable_usd'] is None
+    assert restored['funds']['as_of'] == financial_as_of
+    assert restored['slots']['occupied'] == 1 and Decimal(restored['funds']['buy_reserved_usd']) == 16
+    assert Decimal(restored['funds']['inventory_cost_usd']) == 0
+    assert store.lp_session(sid)['order_history'] == history and store.lp_actions(sid) == audits
+    assert {k: store.lp_session(sid).get(k) for k in controls} == expected_controls
+    assert Decimal(store.lp_session(sid)['buy_filled_quantity']) == 0
+    assert account.trades == account.positions == ()
+    assert account.posts == account.market_orders == account.cancels == []
     (tmp_path / 'review-F4-current-terms.json').write_text(json.dumps(
         dict(failure=failure, initial=initial, current=current, observed=observed,
-            tick=tick, monitored=monitored), default=str, indent=2))
+            tick=tick, monitored=monitored, omitted=omitted, invalidated=invalidated,
+            invalid_tick=invalid_tick, still_unknown=still_unknown, restored=restored,
+            revalidated=revalidated), default=str, indent=2))
 
 
 def test_cold_unknown_entry_waits_for_real_dependency_deadline(request, runtime, tmp_path):
