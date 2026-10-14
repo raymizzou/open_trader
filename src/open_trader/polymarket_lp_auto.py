@@ -3581,7 +3581,7 @@ class LPAutoPool:
         except LpAccountReadError as exc:
             if planning and exc.retry_at is not None:
                 self._update(lambda doc: doc.update(account_reader_wait=dict(
-                    reason=str(exc), retry_at=exc.retry_at)))
+                    reason=str(exc), retry_at=exc.retry_at, error=getattr(exc, 'planning_error', None))))
             return failed(str(exc), waiting=True, retry_at=exc.retry_at)
         except (LpAccountRoundInvalid, LpObservationWait) as exc:
             # The next scheduled read or a newer valid dashboard publication
@@ -4193,21 +4193,41 @@ class LPAutoPool:
         # or financially blocked rounds. They never grant new BUY authority.
         self._yield_publication_failures = {}
         sessions = self.store.lp_active_sessions()
+        current_observation = self._read().get('account_observation') or {}
         for session in sessions:
             try:
-                self.lp._refresh_buy_yield(session['session_id'])
+                self.lp._refresh_buy_yield(session['session_id'], current_account=current_observation)
             except Exception as exc:
                 self._yield_publication_failures[session['session_id']] = type(exc).__name__
                 logger.exception('lp_auto_buy_yield_publication_failed')
         # Healthy components and resting-order observations remain runnable
         # even when a different dependency is cooling down.
-        current_observation = self._read().get('account_observation') or {}
         components = current_observation.get('components') or {}
         waiting = self._account_facts_wait or {}
         retry = _maybe_datetime(waiting.get('retry_at'))
         deadlines = [_maybe_datetime(c.get('retry_at')) for c in components.values()]
         all_blocked = (len(components) == 3 and all(c.get('state') == 'failed' for c in components.values()))
-        if not sessions and (all_blocked or retry is not None):
+        runnable = any(row.get('side') == 'BUY' and row.get('status') == 'LIVE'
+            and row.get('token_id') == session.get('token_id')
+            and self.lp._queue_row_remaining(row) is not None and self.lp._queue_row_remaining(row) > ZERO
+            for session in sessions for row in self.lp._order_history(session).values())
+        if not runnable:
+            for session in sessions:
+                if self.lp.entry_send_inflight(session['session_id']):
+                    runnable = True
+                    break
+                actions = self.store.lp_actions(session['session_id'])
+                runnable = any(
+                    submission_action_kind(a) == 'entry' and (
+                        a.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
+                        or a.get('state') == 'accepted' and session.get('submit_status') != 'accepted')
+                    or submission_action_kind(a) == 'cancel' and (
+                        a.get('state') in {'pending', 'unknown'}
+                        or a.get('state') == 'accepted' and session.get('yield_rotation_cancel_owners'))
+                    for a in actions)
+                if runnable:
+                    break
+        if not runnable and (all_blocked or retry is not None):
             deadlines = [at for at in [retry, *deadlines] if at is not None and at > self._now()]
             if deadlines:
                 self._cycle_wait = dict(kind='dependencies', reason=waiting.get('reason') or 'dependencies_unavailable',

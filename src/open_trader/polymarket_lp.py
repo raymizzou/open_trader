@@ -12393,7 +12393,7 @@ class PolymarketLPService:
             # the automatic BUY pool is paused or account/history reads fail.
             self._monitor_buy_yield(session_id)
 
-    def _refresh_buy_yield(self, session_id):
+    def _refresh_buy_yield(self, session_id, *, current_account=None):
         """Publish only current per-order yield fields, independently of admission."""
         session = self.store.lp_session(session_id)
         wallet = str(getattr(getattr(self.exchange, 'config', None), 'wallet_address', '') or '').casefold()
@@ -12407,6 +12407,42 @@ class PolymarketLPService:
             and self._queue_row_remaining(row) is not None and self._queue_row_remaining(row) > 0}
         if not buys:
             return None
+        anchors = deepcopy(buys)
+        unproven, order_provenance = set(), {}
+        current_generation = None
+        component = (current_account.get('components') or {}).get('open_orders') if isinstance(current_account, Mapping) else None
+        if (isinstance(component, Mapping) and component.get('state') == 'known'
+                and current_account.get('open_orders_complete') is True):
+            try:
+                _freshness(component.get('checked_at'), self._now(), 'order_freshness', max_age=60)
+                if (current_account.get('authenticated') is not True
+                        or str(current_account.get('wallet_address') or '').casefold() != wallet
+                        or str(current_account.get('account_id') or '').casefold() != wallet
+                        or type(current_account.get('trade_generation')) is not int
+                        or current_account['trade_generation'] != self.store.lp_trade_generation()):
+                    raise ValueError('current_order_identity_unknown')
+                current_generation = current_account['trade_generation']
+                for oid, anchor in anchors.items():
+                    rows = [r for r in current_account.get('open_orders') or () if r.get('order_id') == oid]
+                    row = rows[0] if len(rows) == 1 else {}
+                    original = _maybe_decimal(anchor.get('original_size', anchor.get('quantity')))
+                    matched = _maybe_decimal(row.get('size_matched'))
+                    old_matched = _maybe_decimal(anchor.get('size_matched'))
+                    if (oid not in self._session_order_ids(session) or row.get('side') != 'BUY'
+                            or row.get('status') != 'LIVE' or row.get('token_id') != session.get('token_id')
+                            or row.get('condition_id') != session.get('condition_id')
+                            or _maybe_decimal(row.get('price')) != _maybe_decimal(anchor.get('price'))
+                            or _maybe_decimal(row.get('original_size', row.get('quantity'))) != original
+                            or original is None or matched is None or old_matched is None
+                            or not old_matched <= matched <= original or original <= matched):
+                        unproven.add(oid)
+                        continue
+                    buys[oid] = deepcopy(row)
+                    order_provenance[oid] = dict(order_checked_at=component['checked_at'],
+                        order_read_started_at=component.get('read_started_at'),
+                        order_trade_generation=current_generation)
+            except (ValueError, TypeError, KeyError):
+                unproven.update(buys)
         direction = None
         error = None
         started_at = self._now()
@@ -12424,7 +12460,7 @@ class PolymarketLPService:
         for oid, row in buys.items():
             remaining = self._queue_row_remaining(row)
             estimate = None
-            if direction is not None:
+            if direction is not None and oid not in unproven:
                 try:
                     estimate = minimum_order_estimate(direction,
                         {'price': row['price'], 'quantity': remaining}, now, resting_quantity=remaining)
@@ -12439,7 +12475,8 @@ class PolymarketLPService:
                 actual = self._order_history(current).get(oid)
                 if (str(current.get('account_id') or '').casefold() != wallet
                         or current.get('order_identity_conflict')
-                        or actual != row
+                        or actual != anchors[oid]
+                        or current_generation is not None and int(connection.execute('SELECT generation FROM lp_trade_generation WHERE singleton=1').fetchone()[0]) != current_generation
                         or _timestamp((observations.get(oid) or {}).get('attempted_at') or _iso(started_at)) > started_at):
                     continue
                 remaining = self._queue_row_remaining(row)
@@ -12449,10 +12486,11 @@ class PolymarketLPService:
                 observations[oid] = dict(estimate or {'state': 'unknown'})
                 observations[oid].update(account_id=wallet, order_id=oid,
                     quantity=str(remaining), price=str(row['price']), attempted_at=_iso(started_at),
-                    checked_at=_iso(now), error=None if known else error or 'buy_yield_unknown',
+                    checked_at=_iso(now), error=None if known else 'current_order_unknown' if oid in unproven else error or 'buy_yield_unknown',
                     last_success_at=_iso(now) if known else previous.get('last_success_at'),
                     reward_checked_at=direction.get('reward_checked_at') if direction else None,
                     book_received_at=direction['book'].get('received_at') if direction else None)
+                observations[oid].update(order_provenance.get(oid) or {})
                 if known:
                     timers.pop(oid, None)
                 else:
@@ -12502,16 +12540,42 @@ class PolymarketLPService:
                             or previous.get('post_started') is not False
                             or previous.get('submit_stage') != 'pre_send_rejected'):
                         continue
-                attempts = self.begin_order_cancel((oid,))
-                own = [(sid, key, {**payload, 'reason': 'buy_yield_unknown_timeout'})
-                    for sid, key, payload in attempts if sid == session_id]
-                if len(own) != 1:
+                key = self._action_key(session_id, 'reconciliation-cancel', uuid.uuid4().hex)
+                payload = dict(role='reconciliation_cancel', order_id=oid,
+                    submit_requested_at=_iso(self._now()), reason='buy_yield_unknown_timeout')
+                def claim(latest, connection):
+                    # Publication and this claim serialize in the existing
+                    # writer; eligibility from the earlier read grants no send.
+                    latest_timer = (latest.get('buy_yield_unknown') or {}).get(oid)
+                    order = self._order_history(latest).get(oid)
+                    if (latest_timer != timer or oid not in self._session_order_ids(latest)
+                            or self._now() - _timestamp(timer['unknown_since']) < timedelta(seconds=600)
+                            or latest.get('order_identity_conflict')
+                            or str(latest.get('account_id') or '').casefold() != wallet
+                            or (latest.get('buy_yield_observations') or {}).get(oid, {}).get('state') == 'known'
+                            or not order or order.get('side') != 'BUY' or order.get('status') != 'LIVE'
+                            or order.get('token_id') != latest.get('token_id')
+                            or self._queue_row_remaining(order) is None or self._queue_row_remaining(order) <= 0):
+                        return None
+                    if previous_key:
+                        previous_row = connection.execute('SELECT * FROM lp_actions WHERE session_id=? AND action_key=?',
+                            (session_id, previous_key)).fetchone()
+                        previous_payload = json.loads(previous_row['payload']) if previous_row else {}
+                        if (not previous_row or previous_row['state'] != 'rejected'
+                                or previous_payload.get('order_id') != oid
+                                or previous_payload.get('role') != 'reconciliation_cancel'
+                                or previous_payload.get('reason') != 'buy_yield_unknown_timeout'
+                                or previous_payload.get('post_started') is not False
+                                or previous_payload.get('submit_stage') != 'pre_send_rejected'):
+                            return None
+                    saved = deepcopy(latest.get('buy_yield_unknown') or {})
+                    saved[oid] = {**latest_timer, 'cancel_request_key': key}
+                    return {'buy_yield_unknown': saved}
+                registered = self.store.lp_register_fenced_actions(session_id,
+                    [dict(action_key=key, payload=payload)], patch_builder=claim)
+                if not registered:
                     continue
-                sid, key, payload = own[0]
-                self.store.lp_upsert_action(sid, key, state='pending', payload=payload)
-                saved = deepcopy(current.get('buy_yield_unknown') or {})
-                saved[oid] = {**timer, 'cancel_request_key': key}
-                self.store.lp_update_session(session_id, patch={'buy_yield_unknown': saved})
+                own = [(session_id, key, payload)]
             try:
                 self._cancel_order(oid, attempts=own)
             except _MutationBlocked:

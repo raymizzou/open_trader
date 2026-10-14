@@ -7209,6 +7209,7 @@ class PredictionArbitrageStore:
         expected_generation: int | None = None,
         expected_trade_revision: int | None = None,
         patch: Mapping[str, object] | None = None,
+        patch_builder: Callable[[dict[str, object], sqlite3.Connection], Mapping[str, object] | None] | None = None,
         state: str | None = None,
         reject_existing: bool = False,
     ) -> list[dict[str, object]]:
@@ -7220,9 +7221,13 @@ class PredictionArbitrageStore:
         action insert share one SQLite transaction, so a lost race cannot leave
         one action authorized while another is rejected. ``reject_existing``
         is the claim boundary for result-unknown BUY/SELL intents; the default
-        preserves the existing exact-ID retry/upsert contract.
+        preserves the existing exact-ID retry/upsert contract. An optional
+        patch_builder validates the current row inside this transaction;
+        returning None declines the claim without authorizing any action.
         """
 
+        if patch is not None and patch_builder is not None:
+            raise ValueError("lp_action_patch_ambiguous")
         if not actions:
             return []
         encoded: list[tuple[str, str]] = []
@@ -7271,6 +7276,12 @@ class PredictionArbitrageStore:
                 ).fetchone()
                 if existing is not None:
                     return []
+            if patch_builder is not None:
+                patch = patch_builder(self._lp_row_result(row), connection)
+                if patch is None:
+                    return []
+                if not isinstance(patch, Mapping):
+                    raise TypeError("lp_action_patch_invalid")
             self._lp_register_trade_change(connection, str(session_id))
             if patch is not None or state is not None:
                 fenced = connection.execute(

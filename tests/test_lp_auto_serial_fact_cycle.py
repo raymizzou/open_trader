@@ -1218,3 +1218,285 @@ finally:
     else:
         assert len(original_posts) == 1 and account.posts == []
         assert all(store.lp_actions(sid) == rows for sid, rows in original_audits.items())
+
+
+@pytest.mark.parametrize('status, late', [(503, False), (503, True), (401, False),
+    (401, True), (429, False), (429, True), (403, False)])
+def test_planning_dependency_deadlines_survive_errors_and_restart(request, runtime, tmp_path, status, late):
+    if run_test_in_subprocess(request):
+        return
+    from threading import current_thread
+    public = SerialPublic(runtime.clock)
+    orders = (_resting(1), _resting(2))
+    store, adapter, account, lp, engine = runtime(public_client=public, orders=orders)
+    engine.lp_auto_configure({'budget_usd': '16', 'target_buy_count': 2,
+        'api_retry_interval_seconds': 7})
+    assert engine.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    assert not (engine.lp_auto_state().get('account_observation') or {}).get('components')
+    engine.lp_auto_set_desired_running(True)
+    entered, release, ended = Event(), Event(), Event()
+    calls, native_threads, raised_at = [], [], []
+    def fail(**kwargs):
+        calls.append(runtime.clock[0])
+        native_threads.append(current_thread())
+        entered.set()
+        try:
+            if late:
+                assert release.wait(5), 'Independent original SDK error watchdog'
+            raised_at.append(runtime.clock[0])
+            raise HTTPError('https://offline.invalid/balance-allowance', status, 'offline dependency',
+                {'Retry-After': '120'} if status == 503 else {}, None)
+        finally:
+            ended.set()
+    account.get_balance_allowance = fail
+    records = []
+    future, thread = _round_thread(engine, 'review-deadline-original')
+    try:
+        assert entered.wait(5)
+        first = future.result(timeout=5)
+        records.append(first)
+        if late:
+            assert not ended.is_set(), 'Original native SDK call outlives bounded round return'
+            runtime.clock[0] += timedelta(seconds=1)
+            release.set()
+            assert ended.wait(5)
+            native_threads[0].join(5)
+            assert not native_threads[0].is_alive()
+            runtime.clock[0] += timedelta(seconds=2)
+            first = engine.lp_auto_run_once(round_id='review-deadline-late-collection')
+            records.append(first)
+        expected = raised_at[0] + timedelta(seconds=120 if status == 503 else 7)
+        component = ((first.get('account_observation') or {}).get('components') or {}).get('balance')
+        wait = first.get('account_reader_wait') or {}
+        actual = wait.get('retry_at') or (component or {}).get('retry_at')
+        assert actual and datetime.fromisoformat(actual.replace('Z', '+00:00')) == expected, records
+        if component:
+            assert component['state'] == 'failed' and component['error']
+            assert component['checked_at'] is None and component.get('last_success_at') is None
+        assert len(calls) == 1 and account.posts == account.market_orders == account.cancels == []
+        previous = _yield(store, orders[1].id)
+        runtime.clock[0] += timedelta(seconds=1)
+        public.rates = {1: '48', 2: '48'}
+        current = engine.lp_auto_run_once(round_id='review-deadline-current')
+        records.append(current)
+        assert len(calls) == 1 and _yield(store, orders[1].id)['checked_at'] != previous['checked_at']
+        assert account.posts == account.market_orders == account.cancels == []
+        lp.drain_submissions()
+        adapter.close()
+        store, adapter, account, lp, engine = runtime(public_client=public, orders=orders)
+        balance, cold_calls = account.get_balance_allowance, []
+        def observed(**kwargs):
+            cold_calls.append(runtime.clock[0])
+            return balance(**kwargs)
+        account.get_balance_allowance = observed
+        runtime.clock[0] = expected - timedelta(seconds=1)
+        cold = engine.lp_auto_run_once(round_id='review-deadline-cold-before')
+        records.append(cold)
+        assert cold_calls == [] and account.posts == account.market_orders == account.cancels == []
+        wait = cold.get('account_reader_wait') or {}
+        component = ((cold.get('account_observation') or {}).get('components') or {}).get('balance') or {}
+        assert datetime.fromisoformat((wait.get('retry_at') or component['retry_at']).replace('Z', '+00:00')) == expected
+        runtime.clock[0] = expected
+        due = engine.lp_auto_run_once(round_id='review-deadline-cold-due')
+        records.append(due)
+        assert cold_calls == [expected], 'The real dependency becomes readable exactly at its saved deadline'
+        assert account.posts == account.market_orders == account.cancels == []
+    finally:
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive()
+        for native in native_threads:
+            native.join(5)
+            assert not native.is_alive()
+        lp.drain_submissions()
+        (tmp_path / 'review-F1-public-evidence.json').write_text(json.dumps(
+            dict(status=status, late=late, calls=calls, raised_at=raised_at, records=records), default=str, indent=2))
+
+
+@pytest.mark.parametrize('failure', ['local_components', 'shared_retry_after'])
+def test_sell_only_sessions_wait_for_account_dependencies(request, runtime, tmp_path, failure):
+    if run_test_in_subprocess(request):
+        return
+    from time import monotonic
+    from copy import deepcopy
+    from polymarket.models.clob import SignedOrder
+    from polymarket.models.data.portfolio import Position
+    from tests.test_lp_buy_yield_unknown_guard import _managed_buy
+    from tests.test_lp_order_registration_contract import WALLET, _maker_order, _trade
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+    store, account, lp, engine, public, original = _managed_buy(runtime, 'auto')
+    engine.lp_auto_configure({'api_retry_interval_seconds': 7})
+    maker = _maker_order(original.id, 'BUY', '20', '.40').model_copy(update={'token_id': original.token_id})
+    fill = _trade('review-real-buy-fill', maker, size='20').model_copy(update={
+        'market': _refill_identity(6)[1], 'condition_id': _refill_identity(6)[1], 'token_id': original.token_id,
+        'matched_at': runtime.clock[0], 'updated_at': runtime.clock[0]})
+    account.trades = (fill,)
+    account.positions = (Position(conditionId=_refill_identity(6)[1], proxyWallet=WALLET,
+        asset=original.token_id, size=Decimal('20'), avgPrice=Decimal('.40'), outcome='YES'),)
+    account.orders = ()
+    terminal = original.model_copy(update={'status': 'FILLED', 'size_matched': Decimal('20'),
+        'associate_trades': ('review-real-buy-fill',)})
+    account.get_order = lambda *, order_id: terminal if order_id == original.id else next(o for o in account.orders if o.id == order_id)
+    def sign(**kwargs):
+        assert kwargs['side'] == 'SELL'
+        return SignedOrder(builder='0x1', expiration=kwargs['expiration'], maker=WALLET,
+            maker_amount=int(kwargs['size'] * 1000000), metadata='0x3',
+            order_type='GTC' if kwargs['expiration'] is None else 'GTD', salt=1, side='SELL', signature='0x4',
+            signature_type=0, signer=WALLET, taker_amount=int(kwargs['price'] * kwargs['size'] * 1000000),
+            timestamp=1, token_id=str(kwargs['token_id']), post_only=True)
+    def post(signed):
+        account.posts.append(signed)
+        sell = _open_order('review-real-passive-sell', 'SELL',
+            price=str(Decimal(signed.taker_amount) / signed.maker_amount), original='20',
+            token_id=signed.token_id).model_copy(update={'market': _refill_identity(6)[1],
+                'condition_id': _refill_identity(6)[1]})
+        account.orders += (sell,)
+        return {'order_id': sell.id, 'status': 'LIVE', 'accepted': True, 'size_matched': '0'}
+    account.create_limit_order, account.post_order = sign, post
+    scheduler = None
+    records = []
+    try:
+        runtime.clock[0] += timedelta(seconds=1)
+        registered = lp.register_account_snapshot(lp.exchange.lp_account_snapshot_shared(max_age_seconds=-1,
+            trade_generation_provider=store.lp_trade_generation))
+        assert registered['state'] == 'registered'
+        watchdog = monotonic() + 5
+        while not any(p.side == 'SELL' for p in account.posts):
+            observed = engine.lp_tick()
+            assert monotonic() < watchdog, observed
+        lp.drain_submissions()
+        runtime.clock[0] += timedelta(seconds=1)
+        sid = next(s['session_id'] for s in store.lp_sessions() if s.get('entry_order_id') == original.id)
+        lp.reconcile_facts(sid)
+        fresh = lp.exchange.lp_account_snapshot_shared(max_age_seconds=-1,
+            trade_generation_provider=store.lp_trade_generation)
+        assert lp.register_account_snapshot(fresh)['state'] == 'registered'
+        dashboard = engine.refresh_lp_dashboard_snapshot()
+        assert dashboard['state'] == 'ready', dashboard
+        active, = store.lp_active_sessions()
+        sid = active['session_id']
+        assert active['order_history'][original.id]['status'] == 'FILLED'
+        assert active['order_history']['review-real-passive-sell']['side'] == 'SELL'
+        assert active['order_history']['review-real-passive-sell']['status'] == 'LIVE'
+        assert not any(o['side'] == 'BUY' and o['status'] == 'LIVE' for o in active['order_history'].values())
+        assert not lp.entry_send_inflight(sid)
+        audits = deepcopy(store.lp_actions(sid))
+        assert all(a['state'] == 'accepted' for a in audits), audits
+        initial = engine.lp_auto_state()
+        assert Decimal(initial['funds']['inventory_cost_usd']) == 8
+        assert account.positions[0].size == 20 and account.positions[0].avg_price == Decimal('.40')
+        posts, orders = deepcopy(account.posts), tuple(account.orders)
+        originals = {name: getattr(account, name) for name in
+            ('get_balance_allowance', 'list_open_orders', 'list_positions')}
+        calls = {name: [] for name in originals}
+        for name, read in originals.items():
+            def fail(*args, _name=name, **kwargs):
+                calls[_name].append(runtime.clock[0])
+                if failure == 'shared_retry_after' and _name == 'get_balance_allowance':
+                    raise HTTPError('https://offline.invalid/balance-allowance', 429, 'shared limit', {'Retry-After': '120'}, None)
+                raise TimeoutError('Actual SDK dependency unavailable: ' + _name)
+            setattr(account, name, fail)
+        runtime.clock[0] += timedelta(seconds=61)
+        failed_at = runtime.clock[0]
+        scheduler = LPAutoScheduler(engine, clock=lambda: runtime.clock[0])
+        assert scheduler.run_due()
+        state = engine.lp_auto_state()
+        records.append(state)
+        expected = failed_at + timedelta(seconds=120 if failure == 'shared_retry_after' else 7)
+        assert state['plan_wait'] and state['plan_wait']['kind'] == 'dependencies', state
+        assert datetime.fromisoformat(state['plan_wait']['deadline']) == expected
+        assert datetime.fromisoformat(scheduler.snapshot()['next_check_at']) == expected
+        prior_calls, prior_round = deepcopy(calls), deepcopy(state['last_round'])
+        assert not scheduler.run_due()
+        assert calls == prior_calls and engine.lp_auto_state()['last_round'] == prior_round
+        scheduler.request_check()
+        assert scheduler.run_due()
+        assert calls == prior_calls, 'Wake cannot bypass genuine SDK cooldown'
+        assert not scheduler.run_due()
+        runtime.clock[0] = expected - timedelta(seconds=1)
+        assert not scheduler.run_due() and calls == prior_calls
+        for name, read in originals.items():
+            def observed(*args, _name=name, _read=read, **kwargs):
+                calls[_name].append(runtime.clock[0])
+                return _read(*args, **kwargs)
+            setattr(account, name, observed)
+        runtime.clock[0] = expected
+        assert scheduler.run_due()
+        records.append(engine.lp_auto_state())
+        assert calls['get_balance_allowance'][-1] == expected and len(calls['get_balance_allowance']) == 2
+        assert all(calls[name][-1] == expected for name in originals)
+        assert account.posts == posts and tuple(account.orders) == orders
+        assert account.cancels == account.market_orders == []
+        assert store.lp_actions(sid) == audits
+        assert account.positions[0].size == 20
+    finally:
+        if scheduler:
+            scheduler.stop()
+        lp.drain_submissions()
+        (tmp_path / 'review-F3-public-sell.json').write_text(json.dumps(
+            dict(failure=failure, records=records), default=str, indent=2))
+
+
+@pytest.mark.parametrize('failure', ['balance_failed', 'positions_failed'])
+def test_partial_account_failure_uses_current_owned_buy_quantity(request, runtime, tmp_path, failure):
+    if run_test_in_subprocess(request):
+        return
+    from copy import deepcopy
+    public = SerialPublic(runtime.clock)
+    original = _open_order('owned-current-partial', 'BUY', price='.40', original='40',
+        token_id=_refill_identity(1)[2], outcome='YES').model_copy(update={
+            'market': _refill_identity(1)[1], 'condition_id': _refill_identity(1)[1]})
+    store, adapter, account, lp, engine = runtime(public_client=public, orders=(original,))
+    engine.lp_auto_configure({'budget_usd': '16', 'target_buy_count': 1})
+    assert engine.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    engine.lp_auto_set_desired_running(True)
+    initial = engine.lp_auto_run_once(round_id='review-partial-original40')
+    first = _yield(store, original.id)
+    assert first['state'] == 'known' and Decimal(first['quantity']) == 40 and Decimal(first['capital_usd']) == 16
+    owner, = store.lp_sessions()
+    sid = owner['session_id']
+    audits = deepcopy(store.lp_actions(sid))
+    financial_as_of = initial['funds']['as_of']
+    history = deepcopy(owner['order_history'])
+    controls = {k: deepcopy(owner.get(k)) for k in ('idempotency_key', 'entry_order_id',
+        'owned_order_ids', 'stop_requested', 'loss_requested', 'entry_cancel_requested', 'queue_protection')}
+    account.orders = (original.model_copy(update={'size_matched': Decimal('8')}),)
+    method = 'get_balance_allowance' if failure == 'balance_failed' else 'list_positions'
+    calls = []
+    def unavailable(**kwargs):
+        calls.append(runtime.clock[0])
+        raise TimeoutError('Actual SDK source unavailable after partial match: ' + method)
+    setattr(account, method, unavailable)
+    runtime.clock[0] += timedelta(seconds=61)
+    current = engine.lp_auto_run_once(round_id='review-partial-current32')
+    observed = _yield(store, original.id)
+    packet = current['account_observation']
+    failed = packet['components']['balance' if failure == 'balance_failed' else 'positions']
+    assert failed['state'] == 'failed' and failed['error'] and calls
+    assert packet['authenticated'] is True and packet['wallet_address'] == packet['account_id'] == owner['account_id']
+    assert packet['open_orders_complete'] is True and packet['components']['open_orders']['state'] == 'known'
+    row, = packet['open_orders']
+    assert row['order_id'] == original.id and row['token_id'] == original.token_id and row['side'] == 'BUY'
+    assert Decimal(row['original_size']) == 40 and Decimal(row['size_matched']) == 8 and Decimal(row['price']) == Decimal('.40')
+    assert observed['state'] == 'known' and observed['order_id'] == original.id
+    assert Decimal(observed['quantity']) == 32, 'Fresh current owned terms replace stale remaining40'
+    assert Decimal(observed['capital_usd']) == Decimal('12.80')
+    assert observed['order_checked_at'] == packet['components']['open_orders']['checked_at']
+    assert observed['order_read_started_at'] == packet['components']['open_orders']['read_started_at']
+    assert observed['order_trade_generation'] == packet['trade_generation']
+    # Symmetric single1000 levels: remaining32 gives share32/2968,
+    # daily24 => hourly percent250/2968, independently rounded here as literal.
+    assert Decimal(observed['yield_pct_per_hour']).quantize(Decimal('.000001')) == Decimal('.084232')
+    assert datetime.fromisoformat(observed['checked_at'].replace('Z', '+00:00')) == runtime.clock[0]
+    assert datetime.fromisoformat(observed['reward_checked_at'].replace('Z', '+00:00')) == runtime.clock[0]
+    assert datetime.fromisoformat(str(packet['components']['open_orders']['checked_at']).replace('Z', '+00:00')) == runtime.clock[0]
+    assert current['funds']['status'] == 'unknown' and current['funds']['spendable_usd'] is None
+    assert current['funds']['as_of'] == financial_as_of
+    unchanged = store.lp_session(sid)
+    assert unchanged['order_history'] == history, 'Current-order yield evidence does not fabricate a full fill/account publication'
+    assert {k: unchanged.get(k) for k in controls} == controls
+    assert store.lp_actions(sid) == audits and Decimal(unchanged['buy_filled_quantity']) == 0
+    assert account.trades == () and account.positions == ()
+    assert account.posts == account.market_orders == account.cancels == []
+    (tmp_path / 'review-F4-current-terms.json').write_text(json.dumps(
+        dict(failure=failure, initial=initial, current=current, observed=observed), default=str, indent=2))

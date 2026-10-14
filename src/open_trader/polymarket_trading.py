@@ -2541,18 +2541,26 @@ class PolymarketTradingClient:
     def _account_read_facts(self, *, _planning: bool = False, _retry_seconds: int = 60, _previous_components=None):
         with _lp_read_task("account_read_facts"), _lp_read_lock(self._lp_account_read_lock, "account_lock_wait"):
             retry = self._lp_account_read_retry
-            if retry is not None and time.monotonic() < retry[0]:
-                raise PolymarketTradingError("network", response_facts=self._lp_public_retry_projection(retry))
+            planning_deadline = _venue_timestamp(retry[1].get('planning_retry_at')) if _planning and retry else None
+            cooling = (datetime.now(UTC) < planning_deadline if isinstance(planning_deadline, datetime)
+                else retry is not None and time.monotonic() < retry[0])
+            if cooling:
+                projected = ({**retry[1], 'retry_after_at': planning_deadline}
+                    if isinstance(planning_deadline, datetime) else self._lp_public_retry_projection(retry))
+                raise PolymarketTradingError("network", response_facts=projected)
             self._lp_account_read_retry = None
             try:
                 return (self._account_read_facts_once(_planning=True, _retry_seconds=_retry_seconds,
                             _previous_components=_previous_components) if _planning
                         else self._account_read_facts_once())
             except PolymarketTradingError as exc:
-                deadline = self._lp_public_retry_after(exc.response_facts)
+                planning_deadline = _venue_timestamp(exc.response_facts.get('planning_retry_at')) if _planning else None
+                deadline = (time.monotonic() + max(0, (planning_deadline - datetime.now(UTC)).total_seconds())
+                    if isinstance(planning_deadline, datetime) else self._lp_public_retry_after(exc.response_facts))
                 if deadline is not None:
                     self._lp_account_read_retry = (deadline, exc.response_facts)
-                    exc.response_facts = self._lp_public_retry_projection(self._lp_account_read_retry)
+                    exc.response_facts = ({**exc.response_facts, 'retry_after_at': planning_deadline}
+                        if isinstance(planning_deadline, datetime) else self._lp_public_retry_projection(self._lp_account_read_retry))
                 raise
 
     def _account_read_facts_once(
@@ -2673,8 +2681,14 @@ class PolymarketTradingClient:
                 # A late value cannot become fresh authority. Shared auth or
                 # rate-limit errors still install the existing account fence.
                 failure = existing.exception()
-                if isinstance(failure, PolymarketTradingError) and failure.response_facts.get('status') in {401, 403, 429}:
-                    raise failure
+                if isinstance(failure, PolymarketTradingError):
+                    if failure.response_facts.get('status') in {401, 403, 429}:
+                        raise failure
+                    error = failure.response_facts
+                    previous = dict(state='failed', read_started_at=previous.get('read_started_at'),
+                        checked_at=None, last_success_at=previous.get('last_success_at'), error=error,
+                        retry_at=error['planning_retry_at'])
+                    self._lp_planning_components[name] = previous
                 existing = None
             retry_at = _venue_timestamp(previous.get('retry_at'))
             if existing is not None or isinstance(retry_at, datetime) and now < retry_at:
@@ -2700,8 +2714,16 @@ class PolymarketTradingClient:
                     result.set_result((reader(), datetime.now(UTC)))
                 except BaseException as exc:
                     if isinstance(exc, Exception):
-                        result.set_exception(PolymarketTradingError(_safe_error_code(exc),
-                            response_facts={**_safe_history_response_facts(exc), **response_facts}))
+                        error = {**_safe_history_response_facts(exc), **response_facts}
+                        failed_at = datetime.now(UTC)
+                        supplied = _venue_timestamp(error.get('retry_after_at'))
+                        seconds = error.get('retry_after_seconds')
+                        if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and math.isfinite(seconds) and seconds >= 0:
+                            supplied = failed_at + timedelta(seconds=seconds)
+                        error.update(planning_failed_at=failed_at,
+                            planning_retry_at=supplied if isinstance(supplied, datetime) else failed_at + timedelta(seconds=retry_seconds),
+                            planning_component=component_name)
+                        result.set_exception(PolymarketTradingError(_safe_error_code(exc), response_facts=error))
                     else:
                         result.set_exception(exc)
                 finally:
@@ -2723,7 +2745,7 @@ class PolymarketTradingClient:
                     raise PolymarketTradingError(_safe_error_code(exc), response_facts=error) from None
                 component = dict(state='failed', read_started_at=now,
                     checked_at=None, last_success_at=previous.get('last_success_at'),
-                    error=error, retry_at=now + timedelta(seconds=retry_seconds))
+                    error=error, retry_at=error.get('planning_retry_at') or now + timedelta(seconds=retry_seconds))
             finally:
                 if future.done():
                     self._lp_planning_reads.pop(name, None)
@@ -3050,6 +3072,11 @@ class PolymarketTradingClient:
                 read_ended_at = facts[8] if len(facts) > 8 else datetime.now(UTC)
         except PolymarketTradingError as exc:
             facts = exc.response_facts
+            if _planning and isinstance(_venue_timestamp(facts.get('planning_retry_at')), datetime):
+                error = LpAccountReadError('credential_invalid' if facts.get('status') == 401 else 'account_read_cooling_down',
+                    _venue_timestamp(facts['planning_retry_at']))
+                error.planning_error = facts
+                raise error from None
             if facts.get("status") == 401:
                 raise LpAccountReadError("credential_invalid") from None
             retry_at = facts.get("retry_after_at")
