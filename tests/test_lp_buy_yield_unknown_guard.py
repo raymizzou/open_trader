@@ -482,3 +482,153 @@ def test_expired_buy_yield_recovers_after_definitely_unsent_cancel(runtime, tmp_
     assert _timer(cold_store, order.id)['unknown_since'] == original_timer['unknown_since']
     assert _timer(cold_store, order.id)['cancel_request_key'] == accepted['action_key']
     cold_lp.drain_submissions()
+
+
+@pytest.mark.parametrize('ordering', ['publication_first', 'registration_first', 'persistent_unknown'])
+def test_known_yield_and_unknown_cancel_claim_are_ordered(request, runtime, monkeypatch, tmp_path, ordering):
+    from timing_support import run_test_in_subprocess
+    if run_test_in_subprocess(request):
+        return
+    import json
+    import sqlite3
+    from copy import deepcopy
+    from pathlib import Path
+    from threading import Thread, get_ident
+    from concurrent.futures import Future
+    store, account, lp, engine, public, order = _managed_buy(runtime, 'manual')
+    instances = [lp]
+    rewards = _unknown_rewards(public)
+    engine.lp_tick()
+    original_timer = deepcopy(_timer(store, order.id))
+    since = datetime.fromisoformat(original_timer['unknown_since'].replace('Z', '+00:00'))
+    sid = next(s['session_id'] for s in store.lp_sessions() if order.id in s['owned_order_ids'])
+    original_audits = deepcopy(store.lp_actions(sid))
+    original_controls = {k: deepcopy(store.lp_session(sid).get(k)) for k in
+        ('stop_requested', 'loss_requested', 'entry_cancel_requested', 'queue_protection')}
+    runtime.clock[0] = since + timedelta(seconds=600)
+    expired_at = runtime.clock[0]
+    entered, release = Event(), Event()
+    monitor_threads, owner_threads, reads, commits = [], [], [], []
+    native_connect = sqlite3.connect
+    class NativeCursor(sqlite3.Cursor):
+        def execute(self, sql, parameters=(), /):
+            self.statement, self.parameters = sql, parameters
+            return super().execute(sql, parameters)
+        def fetchone(self):
+            row = super().fetchone()
+            if (ordering == 'publication_first' and not reads and monitor_threads
+                    and owner_threads and get_ident() == owner_threads[0] and not self.connection.in_transaction
+                    and self.statement == 'SELECT * FROM lp_sessions WHERE session_id=?'
+                    and tuple(self.parameters) == (sid,) and row is not None):
+                payload = json.loads(row['payload'])
+                observation = (payload.get('buy_yield_observations') or {}).get(order.id) or {}
+                if observation.get('attempted_at') == expired_at.strftime('%Y-%m-%dT%H:%M:%S.%fZ'):
+                    assert payload['buy_yield_unknown'][order.id]['unknown_since'] == original_timer['unknown_since']
+                    self.close()  # Release the native read cursor before another writer proceeds.
+                    reads.append(dict(payload=payload, in_transaction=False, thread=get_ident()))
+                    entered.set()
+                    assert release.wait(5), 'Independent post-read/preclaim watchdog'
+            return row
+    class NativeConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=(), /):
+            result = self.cursor(factory=NativeCursor).execute(sql, parameters)
+            if sql == 'COMMIT':
+                row = self.cursor().execute('SELECT payload FROM lp_sessions WHERE session_id=?', (sid,)).fetchone()
+                if row:
+                    payload = json.loads(row[0])
+                    timer = (payload.get('buy_yield_unknown') or {}).get(order.id)
+                    observation = (payload.get('buy_yield_observations') or {}).get(order.id) or {}
+                    if (not owner_threads and observation.get('state') == 'unknown'
+                            and observation.get('attempted_at') == expired_at.strftime('%Y-%m-%dT%H:%M:%S.%fZ')):
+                        owner_threads.append(get_ident())
+                    actions = [dict(a) for a in self.cursor().execute(
+                        'SELECT * FROM lp_actions WHERE session_id=?', (sid,)).fetchall()]
+                    risks = [a for a in actions if json.loads(a['payload']).get('reason') == 'buy_yield_unknown_timeout']
+                    if observation.get('state') == 'known' or risks:
+                        commits.append(dict(timer=timer, observation=observation, risks=risks,
+                            in_transaction=self.in_transaction, thread=get_ident()))
+            return result
+    def connect(database, *args, **kwargs):
+        if Path(database).resolve() == store.path.resolve():
+            kwargs['factory'] = NativeConnection
+        return native_connect(database, *args, **kwargs)
+    monkeypatch.setattr(sqlite3, 'connect', connect)
+    def cancel(*, order_ids):
+        account.cancels.append(order_ids)
+        assert order_ids == (order.id,)
+        if ordering == 'registration_first':
+            entered.set()
+            assert release.wait(5), 'Independent registered external cancel watchdog'
+        return CancelOrdersResponse(canceled=order_ids, not_canceled={})
+    account.cancel_orders = cancel
+    result = Future()
+    def monitor():
+        monitor_threads.append(get_ident())
+        try:
+            result.set_result(engine.lp_tick())
+        except BaseException as exc:
+            result.set_exception(exc)
+    thread = Thread(target=monitor, daemon=True)
+    thread.start()
+    try:
+        if ordering != 'persistent_unknown':
+            assert entered.wait(5), 'Actual monitor reaches the selected native/external boundary'
+            if ordering == 'publication_first':
+                assert len(reads) == 1 and account.cancels == []
+            else:
+                assert any(c['risks'] and c['timer'] and c['timer'].get('cancel_request_key') for c in commits)
+            public.list_market_rewards = rewards
+            public.rates[6] = '0'  # Known zero is still known current yield.
+            runtime.clock[0] += timedelta(seconds=1)
+            published = engine.lp_auto_run_once(round_id='known-before-release')
+            assert published['last_round']['round_id'] == 'known-before-release'
+            assert _timer(store, order.id) is None
+            assert any(c['observation'].get('state') == 'known' and not c['timer'] and not c['in_transaction'] for c in commits)
+            if ordering == 'publication_first':
+                assert not any(c['risks'] for c in commits), 'Known committed before any timeout claim'
+        release.set()
+        result.result(timeout=5)
+        thread.join(5)
+        assert not thread.is_alive()
+        lp.drain_submissions()
+        risks = [a for a in store.lp_actions(sid) if a.get('reason') == 'buy_yield_unknown_timeout']
+        if ordering == 'publication_first':
+            assert risks == [] and account.cancels == [], 'Committed known yield must prevent stale UNKNOWN cancellation'
+            assert _timer(store, order.id) is None
+            assert store.lp_actions(sid) == original_audits
+        else:
+            risk, = risks
+            assert risk['state'] == 'accepted' and risk['order_id'] == order.id and risk['session_id'] == sid
+            assert account.cancels == [(order.id,)] and risk['action_id'] and risk['action_key']
+            if ordering == 'registration_first':
+                assert _timer(store, order.id) is None
+        current = store.lp_session(sid)
+        assert {k: current.get(k) for k in original_controls if k != 'queue_protection'} == {
+            k: v for k, v in original_controls.items() if k != 'queue_protection'}
+        for level, bucket in original_controls['queue_protection']['levels'].items():
+            observed = current['queue_protection']['levels'][level]
+            for key in ('order_id', 'baseline_front', 'baseline_price', 'baseline_book_hash',
+                    'baseline_book_received_at', 'baseline_source_timestamp', 'baseline_version', 'cancel_scope', 'threshold'):
+                assert observed.get(key) == bucket.get(key)
+        assert account.posts == account.market_orders == [] and account.orders == (order,)
+        frozen = deepcopy(store.lp_actions(sid))
+        engine.lp_tick()
+        lp.drain_submissions()
+        assert store.lp_actions(sid) == frozen and len(account.cancels) == (0 if ordering == 'publication_first' else 1)
+        lp.exchange.close()
+        store, adapter, cold_account, lp, engine = runtime(public_client=public, orders=(order,))
+        instances.append(lp)
+        cold_account.get_order = lambda *, order_id: order
+        assert engine.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+        engine.lp_tick()
+        lp.drain_submissions()
+        assert cold_account.cancels == cold_account.posts == cold_account.market_orders == []
+        assert store.lp_actions(sid) == frozen
+    finally:
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive()
+        for service in instances:
+            service.drain_submissions()
+        (tmp_path / 'review-F2-native-ordering.json').write_text(json.dumps(
+            dict(ordering=ordering, reads=reads, commits=commits), default=str, indent=2))

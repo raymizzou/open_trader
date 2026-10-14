@@ -27,37 +27,62 @@ def test_read_publish_and_auto_use_share_timestamps_during_sqlite_wait(runtime, 
     caplog.set_level(logging.INFO)
     store, adapter, account, lp, execution = runtime()
     started, release = Event(), Event()
+    import inspect
     connect = store._connection
+    holders, publications, source_reads = [], [], []
+    for name in ('get_balance_allowance', 'list_open_orders', 'list_positions'):
+        native = getattr(account, name)
+        def read_source(*args, _name=name, _native=native, **kwargs):
+            with connect() as probe:
+                probe.execute('BEGIN IMMEDIATE')
+                probe.rollback()
+            source_reads.append(_name)
+            return _native(*args, **kwargs)
+        monkeypatch.setattr(account, name, read_source)
     class ObservedConnection(sqlite3.Connection):
         def execute(self, sql, *args):
             if sql == 'BEGIN IMMEDIATE':
-                started.set()
-                assert release.wait(5), 'Independent SQLite publication watchdog'
+                frame = inspect.currentframe()
+                try:
+                    while frame and frame.f_code.co_name != '_register_account_snapshot':
+                        frame = frame.f_back
+                    if frame and frame.f_locals.get('_automatic_observation') is True:
+                        publications.append(dict(frame.f_locals['snapshot']))
+                        holder = sqlite3.connect(store.path, isolation_level=None, check_same_thread=False)
+                        holder.execute('BEGIN IMMEDIATE')
+                        holders.append(holder)
+                        started.set()
+                        assert release.wait(5), 'Independent exact account publication watchdog'
+                finally:
+                    del frame
             return super().execute(sql, *args)
     def observed():
         connection = sqlite3.connect(store.path, isolation_level=None, factory=ObservedConnection)
         connection.row_factory = sqlite3.Row
         return connection
-    # The holder is a real writer. Gate the attempt so the assertion has no
-    # dependency on scheduler speed or the production busy timeout.
-    holder = connect()
-    holder.execute('BEGIN IMMEDIATE')
     monkeypatch.setattr(store, '_connection', observed)
-    with ThreadPoolExecutor(1) as workers:
-        job = workers.submit(execution._auto_pool.run_once)
-        try:
-            assert started.wait(5)
-            wait_read_logs()
-            assert not job.done()
-            assert events(caplog, 'account_read_begin')
-            assert events(caplog, 'account_read_end')
-            assert events(caplog, 'account_publish_wait')
-            assert not events(caplog, 'account_publish_end')
-        finally:
-            holder.rollback()
-            holder.close()
-            release.set()
-        result = job.result(timeout=5)
+    try:
+        with ThreadPoolExecutor(1) as workers:
+            job = workers.submit(execution.lp_auto_run_once)
+            try:
+                assert started.wait(5)
+                wait_read_logs()
+                assert not job.done()
+                assert set(source_reads) == {'get_balance_allowance', 'list_open_orders', 'list_positions'}
+                assert len(publications) == 1
+                assert events(caplog, 'account_read_begin')
+                assert events(caplog, 'account_read_end')
+                assert events(caplog, 'account_publish_wait')
+                assert not events(caplog, 'account_publish_end')
+            finally:
+                for holder in holders:
+                    holder.rollback()
+                    holder.close()
+                release.set()
+            result = job.result(timeout=5)
+    finally:
+        release.set()
+        lp.drain_submissions()
     wait_read_logs()
     read = events(caplog, 'account_read_end')[-1]
     for name in ('account_publish_wait', 'account_publish_begin', 'account_publish_end', 'auto_account_use'):

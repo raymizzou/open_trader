@@ -33,7 +33,7 @@ class LPAutoScheduler:
 
     def _restore_deadline(self, *, future_only=False):
         waiting = self._core_state().get('plan_wait')
-        if waiting:
+        if waiting and waiting.get('kind') == 'dependencies':
             deadline = datetime.fromisoformat(waiting['deadline'])
             if not future_only or deadline > self.clock():
                 self._next_check_at = deadline
@@ -48,11 +48,14 @@ class LPAutoScheduler:
                 "check_in_progress": self._checking,
                 "last_check_error": self._error,
                 "scheduler_running": self._thread is not None and self._thread.is_alive(),
-                "check_interval_seconds": self._core_state().get('round_interval_seconds', 30),
+                "check_interval_seconds": None,
+                "cycle_mode": "continuous",
             }
 
     def request_check(self) -> None:
-        self._wake.set()
+        with self._state:
+            self._next_check_at = self.clock()
+            self._wake.set()
 
     def run_due(self) -> bool:
         if not self._cycle.acquire(blocking=False):
@@ -80,10 +83,14 @@ class LPAutoScheduler:
                 with self._state:
                     self._checking = False
                     now = self.clock()
-                    self._next_check_at = now + timedelta(seconds=self._core_state().get('round_interval_seconds', 30))
+                    core = self._core_state()
+                    self._next_check_at = (now + timedelta(seconds=core.get('api_retry_interval_seconds', 60))
+                        if self._error is not None else now)
                     # An exception cannot keep restoring an expired deadline
                     # and spin. Preserve an already begun future wait instead.
                     self._restore_deadline(future_only=self._error is not None)
+                    if self._wake.is_set():
+                        self._next_check_at = now
             return True
         finally:
             self._cycle.release()
@@ -99,9 +106,6 @@ class LPAutoScheduler:
                 self.run_due()
                 with self._state:
                     delay = max(0, (self._next_check_at - self.clock()).total_seconds())
-                # A wake requests future progress, never bypasses a deadline.
-                # Clear it here to avoid spinning on an already-set Event.
-                self._wake.clear()
                 if self._stop.is_set():
                     break
                 self._wake.wait(min(delay, 60))

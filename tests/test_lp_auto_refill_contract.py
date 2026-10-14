@@ -226,16 +226,15 @@ def test_selected_price_history_rejects_only_this_candidate(runtime, phase, inva
     assert state['funds']['available_usd'] is None and state['funds']['spendable_usd'] is None
     assert 'account_financial_facts_changed' in state['admission_block_reasons']
     assert original['completed_at'] and state['active_plan'] is None
-    deadline = datetime.fromisoformat(state['plan_wait']['deadline'])
-    assert state['plan_wait']['kind'] == 'round' and deadline == datetime.fromisoformat(original['completed_at']) + timedelta(seconds=30)
-    runtime.clock[0] = deadline - timedelta(seconds=1)
-    execution.lp_auto_run_once()
+    assert state['plan_wait'] is None
+    current = execution.lp_auto_run_once(round_id='current-history-observation')
+    assert current['last_round']['round_id'] != original['round_id']
+    assert current['active_plan'] is None and current['last_round']['actions'] == []
     assert len(signed_objects) == 1 and account.posts == [signed] and account.cancels == []
     assert store.lp_actions(action['session_id']) == original_audits
     if phase == 'signing':
         # Current history affects new admission. The real superior LIVE token1
         # still occupies the sole slot, so it is retained without replay.
-        advance_api_wait(runtime, execution)
         next_state = execution.lp_auto_run_once(round_id='next-history-round')
         assert next_state['last_round']['round_id'] != original['round_id']
         assert next_state['last_round']['completed_at'] and next_state['active_plan'] is None
@@ -248,8 +247,7 @@ def test_selected_price_history_rejects_only_this_candidate(runtime, phase, inva
         assert Decimal(current.size_matched) == 0
         assert next_state['slots']['occupied'] == 1 and Decimal(next_state['funds']['buy_reserved_usd']) == 8
         assert store.lp_actions(action['session_id']) == original_audits
-        assert datetime.fromisoformat(next_state['plan_wait']['deadline']) == datetime.fromisoformat(
-            next_state['last_round']['completed_at']) + timedelta(seconds=30)
+        assert next_state['plan_wait'] is None
 
 
 def test_unknown_unrelated_account_report_history_does_not_block_new_buys(runtime):
@@ -485,14 +483,14 @@ def test_candidate_failures_and_unknown_account_have_distinct_scope(runtime, fai
                     first_unknown.set()
         return original_post(signed)
     account.create_limit_order, account.post_order = sign, post
-    def quiet(state, elapsed):
-        counts = (len(evidence['reads']), len(evidence['faults']), len(account.posts))
-        waiting = deepcopy(state['plan_wait']); last = deepcopy(state['last_round'])
-        runtime.clock[0] = datetime.fromisoformat(waiting['started_at']) + timedelta(seconds=elapsed)
-        assert runtime.clock[0] < datetime.fromisoformat(waiting['deadline'])
-        scheduler.request_check(); scheduler.run_due(); execution.lp_auto_run_once(round_id='failure-scope')
-        assert counts == (len(evidence['reads']), len(evidence['faults']), len(account.posts))
-        assert execution.lp_auto_state()['last_round'] == last and execution.lp_auto_state()['plan_wait'] == waiting
+    def observe_without_replay(state, elapsed):
+        # Pause fences fresh BUYs while current observations continue.
+        assert execution.lp_auto_set_desired_running(False)['pause_confirmed']
+        before = len(account.posts)
+        current = execution.lp_auto_run_once(round_id=f'paused-current-{failure}-{elapsed}')
+        assert current['active_plan'] is None and current['last_round']['actions'] == []
+        assert current['last_round']['round_id'] != state['last_round']['round_id']
+        assert len(account.posts) == before
     try:
         if failure == 'pause':
             with ThreadPoolExecutor(max_workers=1) as worker:
@@ -528,8 +526,7 @@ def test_candidate_failures_and_unknown_account_have_distinct_scope(runtime, fai
         assert [r['token_id'] for r in original_round['targets']] == tokens
         assert all(Decimal(r['price']) == Decimal('.40') and Decimal(r['quantity']) == 20 for r in original_round['targets'])
         assert len(original_round['actions']) == 2 and all(a['state'] != 'pending' for a in original_round['actions'])
-        assert state['plan_wait']['kind'] == 'round'
-        assert datetime.fromisoformat(state['plan_wait']['deadline']) == datetime.fromisoformat(original_round['completed_at']) + timedelta(seconds=30)
+        assert state['plan_wait'] is None
         assert all(p.side == 'BUY' and p.post_only is True and Decimal(p.maker_amount) / p.taker_amount == Decimal('.40')
             and Decimal(p.taker_amount) / 1000000 == 20 for p in account.posts)
         evidence['original_round'] = original_round
@@ -563,24 +560,26 @@ def test_candidate_failures_and_unknown_account_have_distinct_scope(runtime, fai
             assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[0]
             evidence.update(original_session=original_session, original_audit=audit, unknown_sid=sid)
             for elapsed in (1, 29):
-                quiet(state, elapsed); assert store.lp_actions(sid) == audit
+                observe_without_replay(state, elapsed); assert store.lp_actions(sid) == audit
             if failure == 'account-unknown':
                 phase[0] = 'actual_next_current_positions_failure'
-                runtime.clock[0] = datetime.fromisoformat(state['plan_wait']['deadline'])
+                # Current cycles run immediately; only failed source retry paces I/O.
+                _advance(runtime, 61)
                 before = len(evidence['faults'])
                 failed = execution.lp_auto_run_once()
                 capture('actual_current_required_positions_failure')
                 assert len(evidence['faults']) == before + 1 and evidence['faults'][-1]['endpoint'] == 'list_positions'
-                assert failed['last_round']['reason'] == 'account_order_sync_unknown'
+                assert failed['last_round']['reason'] == 'account_snapshot_incomplete'
+                component = failed['account_observation']['components']['positions']
+                assert component['state'] == 'failed' and component['error']['error_type'] == 'TimeoutError' and component['error']['error_chain'] == ['TimeoutError']
                 assert failed['active_plan'] is None and failed['last_round']['actions'] == []
                 assert failed['last_round']['round_id'] != original_round['round_id']
-                assert failed['plan_wait']['kind'] == 'round'
-                assert datetime.fromisoformat(failed['plan_wait']['deadline']) == datetime.fromisoformat(failed['last_round']['completed_at']) + timedelta(seconds=30)
+                assert failed['plan_wait'] is None
                 assert failed['funds']['status'] == 'unknown' and failed['funds']['as_of'] == planning_as_of[0]
                 assert failed['slots']['occupied'] == 2 and Decimal(failed['funds']['buy_reserved_usd']) == 16
                 assert len(account.posts) == 2 and store.lp_actions(sid) == audit
                 for elapsed in (1, 29):
-                    quiet(failed, elapsed); assert store.lp_actions(sid) == audit
+                    observe_without_replay(failed, elapsed); assert store.lp_actions(sid) == audit
                 account.list_positions = original_positions
             assert active_finance == []
             phase[0] = 'genuine_complete_public_dashboard'
@@ -607,7 +606,7 @@ def test_candidate_failures_and_unknown_account_have_distinct_scope(runtime, fai
             locally_ended = execution.lp_auto_state()
             originals = {s['session_id']: deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
             for elapsed in (1, 29):
-                quiet(locally_ended, elapsed)
+                observe_without_replay(locally_ended, elapsed)
                 assert all(store.lp_actions(sid) == rows for sid, rows in originals.items())
         assert active_finance == []
         assert all(p.token_id != _refill_identity(3)[2] for p in account.posts)
@@ -771,9 +770,7 @@ def test_planned_entry_keeps_real_market_and_identity_fences(runtime, invalid):
         assert state['slots']['occupied'] == 2 and Decimal(state['funds']['buy_reserved_usd']) == 16
         assert all(a['state'] == 'success' for a in state['last_round']['actions'])
     assert state['last_round']['completed_at'] and state['active_plan'] is None
-    assert state['plan_wait']['kind'] == 'round'
-    deadline = datetime.fromisoformat(state['plan_wait']['deadline'])
-    assert deadline == datetime.fromisoformat(state['last_round']['completed_at']) + timedelta(seconds=30)
+    assert state['plan_wait'] is None
     assert forbidden == []
     original_audits = {}
     for action in state['last_round']['actions']:
@@ -796,9 +793,10 @@ def test_planned_entry_keeps_real_market_and_identity_fences(runtime, invalid):
             assert Decimal(session['price']) == Decimal('.40') and Decimal(session['quantity']) == 20
         original_audits[action['session_id']] = deepcopy(store.lp_actions(action['session_id']))
     before = (len(account_reads),len(signed_objects),len(account.posts),len(account.cancels))
-    runtime.clock[0] = deadline - timedelta(seconds=1)
-    execution.lp_auto_run_once()
-    assert (len(account_reads),len(signed_objects),len(account.posts),len(account.cancels)) == before
+    current = execution.lp_auto_run_once(round_id=f'invalid-{invalid}')
+    assert current['active_plan'] is None
+    assert (len(signed_objects),len(account.posts),len(account.cancels)) == before[1:]
+    assert len(account_reads) >= before[0]
     assert {sid:store.lp_actions(sid) for sid in original_audits} == original_audits
 
 
@@ -815,7 +813,7 @@ def test_definite_allowance_refusal_continues_fixed_plan_then_replans(runtime):
         if kwargs['token_id'] == _refill_identity(1)[2]:
             def balance(**kwargs):
                 _advance(runtime)
-                return SimpleNamespace(balance='100000000', allowances={WALLET: '30000000'})
+                return SimpleNamespace(balance='100000000', allowances={account.environment.standard_exchange: '30000000'})
             account.get_balance_allowance = balance
         return signed
     account.create_limit_order = sign
@@ -838,12 +836,11 @@ def test_definite_allowance_refusal_continues_fixed_plan_then_replans(runtime):
     second, = [p for p in account.posts if p.token_id == _refill_identity(2)[2]]
     assert first.maker_amount == 40000000 and first.taker_amount == 100000000
     assert second.maker_amount == 8000000 and second.taker_amount == 20000000
-    assert state['last_round']['completed_at'] and state['plan_wait']['kind'] == 'round'
-    execution.lp_auto_run_once()
+    assert state['last_round']['completed_at'] and state['plan_wait'] is None
+    execution.lp_auto_run_once(round_id='allowance-drop')
     assert len(account.posts) == 2 and store.lp_actions(action['session_id']) == [audit]
     assert state['slots']['occupied'] == 1
     assert Decimal(state['funds']['buy_reserved_usd']) == 8
-    advance_api_wait(runtime, execution)
     state = execution.lp_auto_run_once(round_id='next-allowance-round')
     assert Counter(p.token_id for p in account.posts) == Counter(_refill_identity(i)[2] for i in [1, 2, 3])
     assert state['slots']['occupied'] == 2
@@ -916,17 +913,12 @@ def test_newer_dashboard_publication_preserves_original_plan_authorization(runti
     original_round = state['last_round']['round_id']
     original_action = dict(action)
     original_audit = store.lp_actions(action['session_id'])
-    waiting = state['plan_wait']
-    from datetime import datetime
-    deadline = datetime.fromisoformat(waiting['deadline'])
-    assert deadline - datetime.fromisoformat(waiting['started_at']) == timedelta(seconds=30)
-    runtime.clock[0] = deadline - timedelta(seconds=1)
+    assert state['plan_wait'] is None
     before = (account.position_reads, account.balance_reads, account.order_reads)
     execution.lp_auto_run_once(round_id=original_round)
-    assert (account.position_reads, account.balance_reads, account.order_reads) == before
+    assert account.position_reads > before[0] and account.balance_reads > before[1] and account.order_reads > before[2]
     assert len(account.posts) == 1 and store.lp_actions(action['session_id']) == original_audit
     assert action['token_id'] == _refill_identity(2)[2]
-    runtime.clock[0] = deadline
     next_state = execution.lp_auto_run_once(round_id='next-generation-round')
     assert next_state['last_round']['round_id'] != original_round
     assert store.lp_actions(action['session_id']) == original_audit
@@ -1295,7 +1287,9 @@ def test_failed_current_api_read_retains_matching_unknown_holds_until_recovery(r
         assert state['intents']==originals and account.posts==account.cancels==[]
         assert position_calls and {sid:store.lp_actions(sid) for sid in audits}==audits
         account.list_positions=positions
-        runtime.clock[0]=datetime.fromisoformat(state['plan_wait']['deadline'])
+        assert state['plan_wait'] is None
+        # The failed positions source has a real dependency cooldown.
+        _advance(runtime, 61)
         recovered=adapter.lp_account_snapshot_shared(max_age_seconds=-1,trade_generation_provider=store.lp_trade_generation)
         assert recovered['authenticated'] is True and recovered['wallet_address']==adapter.config.wallet_address
         assert all(recovered[k] is True for k in ('open_orders_complete','positions_complete','trades_complete','pagination_complete'))
@@ -1518,8 +1512,7 @@ def test_current_read_failures_preserve_original_unknown_cause_and_audit(runtime
         capture('original_selected_attempts_locally_complete')
         original_round=deepcopy(state['last_round'])
         assert state['active_plan'] is None and original_round['completed_at']
-        assert state['plan_wait']['kind']=='round'
-        assert datetime.fromisoformat(state['plan_wait']['deadline'])==datetime.fromisoformat(original_round['completed_at'])+timedelta(seconds=30)
+        assert state['plan_wait'] is None
         assert [r['token_id'] for r in original_round['targets']]==tokens
         assert all(Decimal(r['price'])==Decimal('.40') and Decimal(r['quantity'])==20 for r in original_round['targets'])
         assert Counter(p.token_id for p in account.posts)==Counter(tokens)
@@ -1555,10 +1548,11 @@ def test_current_read_failures_preserve_original_unknown_cause_and_audit(runtime
             assert returned[0].token_id=='wrong-owned-token' and actual[0].token_id==tokens[1]
             return returned
         account.list_open_orders=failure
-        for cause in ('account_order_sync_unknown','order_identity_conflict'):
+        for cause in ('account_snapshot_incomplete','order_identity_conflict'):
             phase[0]='actual_required_current_'+cause
             prior=state['last_round']['round_id'];before=len(failed_at)
-            runtime.clock[0]=datetime.fromisoformat(state['plan_wait']['deadline'])
+            if before:
+                _advance(runtime, 61)  # Genuine failed open-orders cooldown.
             state=execution.lp_auto_run_once()
             capture(cause)
             assert len(failed_at)==before+1
@@ -1571,24 +1565,19 @@ def test_current_read_failures_preserve_original_unknown_cause_and_audit(runtime
             assert all(store.lp_actions(original_sid)==rows for original_sid,rows in originals.items())
             assert state['funds']['status']=='unknown' and state['funds']['as_of']==financial[0]
             assert state['slots']['occupied']==2 and Decimal(state['funds']['buy_reserved_usd'])==16
-            waiting=deepcopy(state['plan_wait']);last=deepcopy(state['last_round'])
-            assert waiting['kind']=='round'
-            assert datetime.fromisoformat(waiting['started_at'])==datetime.fromisoformat(last['completed_at'])
-            assert datetime.fromisoformat(waiting['started_at'])>=failed_at[-1]
-            assert datetime.fromisoformat(waiting['deadline'])==datetime.fromisoformat(waiting['started_at'])+timedelta(seconds=30)
-            for elapsed in (1,29):
-                counts=(len(evidence['reads']),len(failed_at),len(account.posts))
-                runtime.clock[0]=datetime.fromisoformat(waiting['started_at'])+timedelta(seconds=elapsed)
-                assert runtime.clock[0]<datetime.fromisoformat(waiting['deadline'])
-                scheduler.request_check();scheduler.run_due();execution.lp_auto_run_once()
-                assert counts==(len(evidence['reads']),len(failed_at),len(account.posts))
-                assert execution.lp_auto_state()['last_round']==last and execution.lp_auto_state()['plan_wait']==waiting
-                assert store.lp_actions(sid)==audit
-        assert len(failed_at)==2 and forbidden==[]
+            assert state['plan_wait'] is None
+            last = deepcopy(state['last_round'])
+            before_posts = len(account.posts)
+            current = execution.lp_auto_run_once()
+            assert current['last_round']['round_id'] != last['round_id']
+            assert current['last_round']['actions'] == [] and current['active_plan'] is None
+            assert len(account.posts) == before_posts and store.lp_actions(sid) == audit
+            assert all(store.lp_actions(original_sid)==rows for original_sid,rows in originals.items())
+        assert len(failed_at)==3 and forbidden==[]
         account.list_open_orders=open_orders
         phase[0]='paused_healthy_current_check'
         assert execution.lp_auto_set_desired_running(False)['pause_confirmed']
-        runtime.clock[0]=datetime.fromisoformat(state['plan_wait']['deadline'])
+        _advance(runtime, 61)  # Allow the actual failed source to recover.
         checked=execution.lp_auto_run_once()
         capture('actual_paused_healthy_private_observation_before_dashboard')
         assert checked['active_plan'] is None and checked['last_round']['actions']==[] and checked['last_round']['checked_at']
@@ -1613,7 +1602,7 @@ def test_current_read_failures_preserve_original_unknown_cause_and_audit(runtime
         assert not store.lp_session(sid).get('entry_order_id') and store.lp_actions(sid)==audit
         assert all(store.lp_actions(original_sid)==rows for original_sid,rows in originals.items())
         assert len(account.posts)==2 and account.cancels==account.market_orders==[]
-        assert forbidden==[] and len(failed_at)==2
+        assert forbidden==[] and len(failed_at)==3
         evidence['completed']='full'
     finally:
         evidence.update(phase=phase[0],clock=runtime.clock[0],state=execution.lp_auto_state(),sessions=store.lp_sessions(),

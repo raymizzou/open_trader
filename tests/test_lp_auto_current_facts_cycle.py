@@ -78,13 +78,13 @@ def test_local_attempts_finish_round_without_settling_unknown(runtime, tmp_path,
         first = engine.lp_auto_run_once(round_id='mixed-attempts')
     finally:
         release_lock()
-    assert refusals == ['native_execution_lock']
+    assert refusals == [] and len(refusal_thread) == 1, 'The native unrelated flock is held but does not veto D'
     assert Counter(preparations) == Counter(_refill_identity(i)[2] for i in range(1, 6))
-    assert Counter(p.token_id for p in account.posts) == Counter(_refill_identity(i)[2] for i in (1, 2, 3, 5))
+    assert Counter(p.token_id for p in account.posts) == Counter(_refill_identity(i)[2] for i in (1, 2, 3, 4, 5))
     assert first['active_plan'] is None and first['last_round']['completed_at'], first['last_round']
-    assert [a['state'] for a in first['last_round']['actions']] == ['success', 'success', 'rejected', 'not_sent', 'unknown']
-    assert first['slots']['occupied'] == 3, first
-    assert Decimal(first['funds']['buy_reserved_usd']) + Decimal(first['funds']['isolated_reserved_usd']) == 60
+    assert [a['state'] for a in first['last_round']['actions']] == ['success', 'success', 'rejected', 'success', 'unknown']
+    assert first['slots']['occupied'] == 4, first
+    assert Decimal(first['funds']['buy_reserved_usd']) + Decimal(first['funds']['isolated_reserved_usd']) == 80
     unknown = next(s for s in store.lp_sessions() if s['token_id'] == _refill_identity(5)[2])
     audit = deepcopy(store.lp_actions(unknown['session_id']))
     assert audit[0]['state'] == 'unknown' and audit[0]['post_started']
@@ -92,14 +92,15 @@ def test_local_attempts_finish_round_without_settling_unknown(runtime, tmp_path,
     def history_unavailable(**kwargs):
         raise TimeoutError('history transport only; current orders and funds remain complete')
 
-    runtime.clock[0] = datetime.fromisoformat(first['plan_wait']['deadline'])
+    assert first['plan_wait'] is None
+    runtime.clock[0] += timedelta(seconds=1)
     lp.refresh_candidate_recommendations()
     account.list_account_trades = history_unavailable
     account.create_limit_order = sign
     account.post_order = post
     second = engine.lp_auto_run_once(round_id='fresh-two-free')
     assert second['last_round']['round_id'] == 'fresh-two-free', second['last_round']
-    assert Counter(p.token_id for p in account.posts[4:]) == Counter(_refill_identity(i)[2] for i in (3, 4))
+    assert Counter(p.token_id for p in account.posts[5:]) == Counter(_refill_identity(i)[2] for i in (3,))
     assert second['slots']['occupied'] == 5, second
     assert Decimal(second['funds']['buy_reserved_usd']) + Decimal(second['funds']['isolated_reserved_usd']) == 100
     assert store.lp_actions(unknown['session_id']) == audit
@@ -249,13 +250,12 @@ def test_capacity_dependent_replacement_uses_next_round_candidates(tmp_path, mon
     assert exchange.posts == [], 'No BUY can spend E before the next observation'
     assert first['active_plan'] is None and first['last_round']['completed_at']
     completed = datetime.fromisoformat(first['last_round']['completed_at'])
-    assert datetime.fromisoformat(first['plan_wait']['deadline']) == completed + timedelta(seconds=30)
+    assert first['plan_wait'] is None
     exchange.rewards['G'] = Decimal(2000)
     before_reads = len(exchange.reads)
-    monkeypatch.setattr(pool, 'NOW', completed + timedelta(seconds=29))
-    assert not scheduler.run_due()
-    assert len(exchange.reads) == before_reads and exchange.posts == []
-    monkeypatch.setattr(pool, 'NOW', completed + timedelta(seconds=30))
+    monkeypatch.setattr(pool, 'NOW', completed + timedelta(microseconds=1))
+    from tests.test_lp_auto_target_convergence import publish_candidates
+    publish_candidates(exchange, lp, store, ('A', 'B', 'C', 'D', 'E', 'F', 'G'))
     lp.refresh_candidate_recommendations()
     assert scheduler.run_due()
     second = engine.lp_auto_state()
@@ -523,7 +523,7 @@ def test_ended_round_cannot_send_late_preparation(runtime, preparation):
                     assert actual_manual == manual_pending and not manual_finished.is_set()
                     assert ended['active_plan'] is None and ended['last_round']['completed_at']
                     assert ended['last_round']['round_id']==original_round['round_id'] and ended['desired_running'] is True
-                    assert datetime.fromisoformat(ended['plan_wait']['deadline']) == datetime.fromisoformat(ended['last_round']['completed_at'])+timedelta(seconds=30)
+                    assert ended['plan_wait'] is None
                     assert Counter((c['role'],c['order_ids']) for c in calls) == Counter({
                         ('auto',('rank-a',)):1, ('auto',('rank-b',)):1, ('manual',('rank-b',)):1})
                     assert next(c for c in calls if c['role']=='manual')['thread']==controller_thread[0]
@@ -582,11 +582,9 @@ def test_ended_round_cannot_send_late_preparation(runtime, preparation):
             state=capture('both_actual_IO_lifetimes_finished')
             immutable=deepcopy(store.lp_actions(sid))
             assert state['slots']['occupied']==3 and Decimal(state['funds']['buy_reserved_usd'])==Decimal('23.80')
-            deadline=datetime.fromisoformat(state['plan_wait']['deadline'])
+            deadline=datetime.fromisoformat((state['last_round'].get('completed_at') or state['last_round']['checked_at']))
             scheduler=LPAutoScheduler(engine,clock=lambda:runtime.clock[0])
             for _ in range(2):
-                scheduler.request_check()
-                assert not scheduler.run_due()
                 early=engine.lp_auto_run_once(round_id=original_round['round_id'])
                 assert early['active_plan'] is None and early['last_round']['round_id']==original_round['round_id']
             assert store.lp_actions(sid)==immutable
@@ -600,9 +598,7 @@ def test_ended_round_cannot_send_late_preparation(runtime, preparation):
             account.cancel_orders=cold_cancel
             cold=LPAutoScheduler(engine,clock=lambda:runtime.clock[0])
             for seconds in (1,29):
-                runtime.clock[0]=deadline-timedelta(seconds=30-seconds)
-                cold.request_check()
-                assert not cold.run_due()
+                runtime.clock[0]=deadline+timedelta(seconds=seconds)
                 early=engine.lp_auto_run_once(round_id=original_round['round_id'])
                 assert early['active_plan'] is None and early['last_round']['round_id']==original_round['round_id']
                 assert early['slots']['occupied']==3 and Decimal(early['funds']['buy_reserved_usd'])==Decimal('23.80')
@@ -847,7 +843,8 @@ from open_trader.polymarket_trading import TradingConfig
 
 @pytest.mark.parametrize('failure', ['transport', 'incomplete_orders', 'wrong_account', 'history_only_transport'])
 def test_failed_current_read_finishes_check_and_retries_next_interval(runtime, failure):
-    store, adapter, account, lp, engine, _ = prepare(runtime, count=1, target=1)
+    public = ColdPublic(runtime.clock)
+    store, adapter, account, lp, engine, _ = prepare(runtime, count=1, target=1, public=public)
     scheduler = LPAutoScheduler(engine, clock=lambda: runtime.clock[0])
     balance, orders, history, config = account.get_balance_allowance, account.list_open_orders, account.list_account_trades, adapter.config
     def unavailable(**kwargs):
@@ -874,16 +871,26 @@ def test_failed_current_read_finishes_check_and_retries_next_interval(runtime, f
         return
     assert account.posts == account.cancels == []
     assert first['last_round']['targets'] == first['last_round']['actions'] == []
-    ended = datetime.fromisoformat(first['plan_wait']['started_at'])
-    assert datetime.fromisoformat(first['plan_wait']['deadline']) == ended + timedelta(seconds=30)
+    ended = datetime.fromisoformat((first['last_round'].get('completed_at') or first['last_round']['checked_at']))
+    assert first['plan_wait'] is None
     before_reads = (account.balance_reads, account.order_reads, account.position_reads)
     runtime.clock[0] = ended + timedelta(seconds=29)
     scheduler.request_check()
-    assert not scheduler.run_due()
-    assert before_reads == (account.balance_reads, account.order_reads, account.position_reads)
+    assert scheduler.run_due()
+    current = engine.lp_auto_state()
+    assert account.position_reads > before_reads[2], 'Healthy current positions remain runnable'
+    failed_component = 'balance' if failure == 'transport' else 'open_orders'
+    if failure != 'wrong_account':
+        original_failure = first['account_observation']['components'][failed_component]
+        assert original_failure['state'] == 'failed'
+        assert current['account_observation']['components'][failed_component]['retry_at'] == original_failure['retry_at']
     assert account.posts == account.cancels == []
     account.get_balance_allowance, account.list_open_orders, account.list_account_trades, adapter.config = balance, orders, history, config
-    runtime.clock[0] = ended + timedelta(seconds=30)
+    deadlines = [datetime.fromisoformat(row['retry_at']) for row in current['account_observation']['components'].values() if row.get('retry_at')]
+    runtime.clock[0] = max([runtime.clock[0], *deadlines]) + timedelta(microseconds=1)
+    adapter.lp_account_snapshot_shared(max_age_seconds=-1, trade_generation_provider=store.lp_trade_generation)
+    _prepare_public_inputs(lp, adapter)
+    lp.refresh_candidate_recommendations()
     assert scheduler.run_due()
     second = engine.lp_auto_state()
     assert second['last_round']['round_id'] != first['last_round']['round_id']
@@ -898,6 +905,7 @@ from polymarket.models.clob.cancel import CancelOrdersResponse
 
 @pytest.mark.parametrize('scenario', ['bound_live_unknown', 'bound_terminal_null', 'post_unknown'])
 def test_request_recovery_does_not_require_resuming_old_plan(runtime, tmp_path, scenario):
+    import sqlite3
     public = ColdPublic(runtime.clock)
     store, adapter, account, lp, engine, _ = prepare(runtime, count=1, target=1, budget='8', public=public)
     sign, post = _entry_sdk(account, runtime.clock)
@@ -933,8 +941,17 @@ def test_request_recovery_does_not_require_resuming_old_plan(runtime, tmp_path, 
         account.orders = tuple(o for o in venue.values() if o.status == 'LIVE')
         return CancelOrdersResponse(canceled=order_ids, not_canceled={})
     account.post_order, account.get_order, account.cancel_orders = send, exact, cancel
+    if scenario != 'post_unknown':
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("""CREATE TRIGGER hold_original_receipt_binding BEFORE UPDATE ON lp_sessions
+                WHEN json_extract(NEW.payload, '$.entry_order_id') IS NOT NULL
+                AND json_extract(OLD.payload, '$.entry_order_id') IS NULL
+                BEGIN SELECT RAISE(ABORT, 'offline original receipt binding interrupted'); END""")
     try:
         sent = engine.lp_auto_run_once(round_id='original-request')
+        if scenario != 'post_unknown':
+            with sqlite3.connect(store.path) as connection:
+                connection.execute('DROP TRIGGER hold_original_receipt_binding')
         assert sent['active_plan'] is None and sent['last_round']['completed_at']
         session, = store.lp_sessions()
         sid = session['session_id']
@@ -974,7 +991,7 @@ def test_request_recovery_does_not_require_resuming_old_plan(runtime, tmp_path, 
     # nor active_plan contains the original request's execution ownership.
     balance = account.get_balance_allowance
     account.get_balance_allowance = lambda **kwargs: (_ for _ in ()).throw(TimeoutError('intervening read failure'))
-    runtime.clock[0] = datetime.fromisoformat(engine.lp_auto_state()['plan_wait']['deadline'])
+    runtime.clock[0] = datetime.fromisoformat((engine.lp_auto_state()['last_round'].get('completed_at') or engine.lp_auto_state()['last_round']['checked_at']))
     if scenario != 'post_unknown':
         open_orders = account.list_open_orders
         account.list_open_orders = lambda **kwargs: None
@@ -1014,7 +1031,11 @@ def test_request_recovery_does_not_require_resuming_old_plan(runtime, tmp_path, 
     fields = ('state', 'stop_requested', 'stop_loss_latched', 'entry_cancel_requested',
         'queue_protection', 'order_history', 'owned_order_ids', 'reservation_coverage',
         'buy_filled_quantity', 'buy_cost', 'sold_quantity', 'sold_revenue', 'residual_quantity')
-    runtime.clock[0] = datetime.fromisoformat(intervening['plan_wait']['deadline']) + timedelta(seconds=1)
+    runtime.clock[0] = datetime.fromisoformat((intervening['last_round'].get('completed_at') or intervening['last_round']['checked_at'])) + timedelta(seconds=1)
+    if scenario != 'post_unknown':
+        retry_at = intervening['account_observation']['components']['balance'].get('retry_at')
+        if retry_at:
+            runtime.clock[0] = max(runtime.clock[0], datetime.fromisoformat(retry_at))
     recovered = engine.lp_auto_run_once(round_id='current-recovery')
     current = store.lp_session(sid)
     assert recovered['active_plan'] is None and recovered['desired_running'] is False
@@ -1049,12 +1070,13 @@ def test_request_recovery_does_not_require_resuming_old_plan(runtime, tmp_path, 
             assert all(Decimal(before[key]) == 0 for key in ('buy_filled_quantity', 'buy_cost',
                 'sold_quantity', 'sold_revenue', 'residual_quantity', 'buy_fees', 'sell_fees', 'fees'))
         assert recovered['funds']['as_of'] == prior_financial_as_of
-        assert 'account_order_sync_unknown' in recovered['admission_block_reasons']
+        assert 'account_snapshot_incomplete' in recovered['admission_block_reasons']
+        assert recovered['account_observation']['components']['balance']['state'] == 'failed'
+        assert recovered['funds']['spendable_usd'] is None
         assert recovered['last_round']['actions'] == [] and recovered['last_round']['completed_at']
-        assert recovered['last_round']['reason'] == 'account_order_sync_unknown'
-        assert recovered['plan_wait']['kind'] == 'round'
-        assert datetime.fromisoformat(recovered['plan_wait']['deadline']) == datetime.fromisoformat(
-            recovered['last_round']['completed_at']) + timedelta(seconds=30)
+        assert recovered['last_round']['reason'] == 'account_snapshot_incomplete'
+        assert recovered['plan_wait'] is None
+        assert recovered['plan_wait'] is None
         assert account.cancels == [] and len(store.lp_sessions()) == 1
         assert current['submit_status'] == 'accepted' and current['submit_stage'] == 'receipt_received'
         assert current['submit_receipt_at'] == entry_audit['submit_receipt_at']
@@ -1132,8 +1154,9 @@ def test_partial_fill_and_active_protection_do_not_keep_yield_round_open(tmp_pat
 def test_common_interval_starts_after_attempts_and_cycles_do_not_overlap(runtime, interval):
     store, adapter, account, lp, engine, _ = prepare(runtime, count=1, target=1)
     if interval == 90:
-        engine.lp_auto_configure(dict(round_interval_seconds=90))
-    assert engine.lp_auto_state()['round_interval_seconds'] == interval
+        with pytest.raises(ValueError, match='round_interval_seconds_retired_in_continuous_mode'):
+            engine.lp_auto_configure(dict(round_interval_seconds=90))
+    assert engine.lp_auto_state()['round_interval_seconds'] == 30
     _, post = _entry_sdk(account, runtime.clock)
     started, release, finished = Event(), Event(), Event()
 
@@ -1167,15 +1190,11 @@ def test_common_interval_starts_after_attempts_and_cycles_do_not_overlap(runtime
     ended = datetime.fromisoformat(first['last_round']['completed_at'])
     assert ended >= began + timedelta(seconds=98)
     assert first['active_plan'] is None and len(account.posts) == 1
-    assert datetime.fromisoformat(first['plan_wait']['started_at']) == ended
-    assert datetime.fromisoformat(first['plan_wait']['deadline']) == ended + timedelta(seconds=interval)
-    assert scheduler.snapshot()['next_check_at'] == first['plan_wait']['deadline']
+    assert first['plan_wait'] is None
+    assert datetime.fromisoformat(scheduler.snapshot()['next_check_at']) == ended
     reads = (account.balance_reads, account.order_reads, account.position_reads)
-    runtime.clock[0] = ended + timedelta(seconds=interval - 1)
-    scheduler.request_check()
-    assert not scheduler.run_due()
-    assert reads == (account.balance_reads, account.order_reads, account.position_reads)
-    assert len(account.posts) == 1
+    assert scheduler.run_due(), 'The next healthy cycle is immediately eligible'
+    assert account.balance_reads > reads[0] and len(account.posts) == 1
 
     balance = account.get_balance_allowance
     failed_reads = []
@@ -1184,21 +1203,21 @@ def test_common_interval_starts_after_attempts_and_cycles_do_not_overlap(runtime
         runtime.clock[0] += timedelta(seconds=11)
         raise TimeoutError('simulated required read after completed attempt')
     account.get_balance_allowance = unavailable
-    runtime.clock[0] = ended + timedelta(seconds=interval)
+    runtime.clock[0] += timedelta(seconds=1)
     assert scheduler.run_due()
     failed = engine.lp_auto_state()
     assert failed_reads and failed['last_round']['round_id'] != first['last_round']['round_id']
     assert failed['active_plan'] is None and failed['last_round']['actions'] == []
     failed_end = datetime.fromisoformat(failed['last_round']['completed_at'])
     assert failed_end == runtime.clock[0]
-    assert datetime.fromisoformat(failed['plan_wait']['deadline']) == failed_end + timedelta(seconds=interval)
-    runtime.clock[0] = failed_end + timedelta(seconds=interval - 1)
+    assert failed['plan_wait'] is None
+    runtime.clock[0] += timedelta(seconds=1)
     scheduler.request_check()
-    assert not scheduler.run_due()
+    assert scheduler.run_due(), 'Healthy order/yield reads continue while balance is paced'
     assert len(failed_reads) == 1
     account.get_balance_allowance = balance
     engine.lp_auto_set_desired_running(False)
-    runtime.clock[0] = failed_end + timedelta(seconds=interval)
+    runtime.clock[0] += timedelta(seconds=1)
     scheduler.request_check()
     assert scheduler.run_due()
     stopped = engine.lp_auto_state()
@@ -1341,16 +1360,34 @@ def test_same_round_buys_use_wallet_net_free_capital(runtime, tmp_path, limited)
         and a['order_id'] == pending['order_id'] and a['state'] == 'accepted'
         for a in completed_audits[pending['session_id']]) for pending in pending_audits)
     completed = datetime.fromisoformat(state['last_round']['completed_at'])
-    assert state['plan_wait']['kind'] == 'round'
-    assert datetime.fromisoformat(state['plan_wait']['deadline']) == completed + timedelta(seconds=30)
+    assert state['plan_wait'] is None
+    from contextvars import ContextVar
+    recovery_request = ContextVar('wallet_cancel_recovery', default=None)
+    history_reads = []
+    native_result, native_history = adapter.lp_order_result_snapshot, account.list_account_trades
+    def result_snapshot(request):
+        token = recovery_request.set(tuple(request.get('owned_order_ids') or ()))
+        try:
+            return native_result(request)
+        finally:
+            recovery_request.reset(token)
+    def history(**kwargs):
+        history_reads.append(recovery_request.get())
+        return native_history(**kwargs)
+    adapter.lp_order_result_snapshot, account.list_account_trades = result_snapshot, history
     reads = (account.balance_reads, account.order_reads, account.trade_reads, account.position_reads)
-    for elapsed in (1, 29):
+    for elapsed in (1, 2):
         runtime.clock[0] = completed + timedelta(seconds=elapsed)
-        quiet = engine.lp_auto_run_once()
-        assert quiet['last_round'] == state['last_round']
+        current = engine.lp_auto_run_once()
+        assert current['last_round']['round_id'] != state['last_round']['round_id']
+        assert current['slots']['occupied'] == 3 and Decimal(current['funds']['buy_reserved_usd']) == 60
         assert signed_tokens == [] and account.posts == []
-        assert (account.balance_reads, account.order_reads, account.trade_reads, account.position_reads) == reads
-        assert {sid: store.lp_actions(sid) for sid in original_sessions} == completed_audits
+        assert account.balance_reads > reads[0] and account.order_reads > reads[1]
+        assert all(ids and set(ids) <= {o.id for o in original_orders} for ids in history_reads), 'History is on-demand exact cancel recovery, never ordinary planning'
+        for sid, original_rows in completed_audits.items():
+            actual = store.lp_actions(sid)
+            for row in original_rows:
+                assert [a for a in actual if a['action_key'] == row['action_key']] == [row]
     assert finance_calls and not any(call['active'] for call in finance_calls)
 
 
@@ -1547,8 +1584,7 @@ def test_invalidated_observation_cannot_authorize_new_round(runtime, tmp_path, m
     assert state['last_round']['actions'] == []
     assert state['last_round']['completed_at'] and state['last_round']['reason'] == 'account_round_invalid'
     completed = datetime.fromisoformat(state['last_round']['completed_at'])
-    assert state['plan_wait']['kind'] == 'round'
-    assert datetime.fromisoformat(state['plan_wait']['deadline']) == completed + timedelta(seconds=30)
+    assert state['plan_wait'] is None
     after = store.lp_session(sid)
     assert after['account_id'] == original['account_id'] and after['owned_order_ids'] == original['owned_order_ids']
     if schedule == 'filled_owner_publication':

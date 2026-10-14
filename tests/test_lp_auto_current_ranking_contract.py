@@ -213,11 +213,11 @@ def test_fixed_targets_survive_elapsed_planning_without_refill(request, runtime,
         assert audit['state'] == {'success': 'accepted', 'unknown': 'unknown', 'rejected': 'rejected'}[action['state']]
     assert account.market_orders == account.cancels == []
     completed = datetime.fromisoformat(original['completed_at'])
-    deadline = datetime.fromisoformat(state['plan_wait']['deadline'])
-    assert deadline == completed + timedelta(seconds=30)
+    assert state['plan_wait'] is None
     reads = (account.balance_reads, account.order_reads, account.position_reads, account.trade_reads, len(wire))
-    runtime.clock[0] = deadline - timedelta(seconds=1)
+    runtime.clock[0] += timedelta(seconds=1)
     quiet = engine.lp_auto_run_once(round_id=original['round_id'])
     assert quiet['last_round'] == original and len(account.posts) == 3 and len(signing) == 3
-    assert (account.balance_reads, account.order_reads, account.position_reads, account.trade_reads, len(wire)) == reads
+    assert account.balance_reads > reads[0] and account.order_reads > reads[1]
+    assert account.trade_reads == reads[3], 'Ordinary planning does not scan history'
     assert {sid: store.lp_actions(sid) for sid in audits} == {sid: [audit] for sid, audit in audits.items()}

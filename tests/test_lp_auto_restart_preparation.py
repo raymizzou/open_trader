@@ -270,12 +270,14 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         assert datetime.fromisoformat(resolved['funds']['as_of']) >= datetime.fromisoformat(original_financial_as_of)
         from datetime import datetime
         completed = datetime.fromisoformat(resolved['last_round']['completed_at'])
-        assert datetime.fromisoformat(resolved['plan_wait']['deadline']) == completed + timedelta(seconds=30)
-        for elapsed in (1,29):
-            runtime.clock[0] = completed+timedelta(seconds=elapsed)
-            owner.execution.lp_auto_run_once(round_id='new-owner-refill')
-            assert account.posts == account.cancels == [] and store.lp_actions(sid) == final_audit
-        runtime.clock[0] = completed + timedelta(seconds=30)
+
+        assert resolved['plan_wait'] is None
+        owner.execution.lp_auto_set_desired_running(False)
+        current = owner.execution.lp_auto_run_once(round_id='paused-owner-current')
+        assert current['last_round']['round_id'] != resolved['last_round']['round_id']
+        assert current['active_plan'] is None and current['last_round']['actions'] == []
+        assert account.posts == account.cancels == [] and store.lp_actions(sid) == final_audit
+        owner.execution.lp_auto_set_desired_running(True)
         _arm_refill(runtime, owner, account)
         prepare_public(owner, adapter, public)
         reads, planning_as_of = account.position_reads, []
@@ -590,7 +592,7 @@ def test_dead_post_started_sender_with_lagging_preparing_action_is_covered_after
         assert state['slots']['occupied'] == len(account.orders) == 5
         assert Decimal(state['funds']['buy_reserved_usd']) == 40
         assert state['active_plan'] is None and state['last_round']['completed_at']
-        assert datetime.fromisoformat(state['plan_wait']['deadline']) == datetime.fromisoformat(state['last_round']['completed_at'])+timedelta(seconds=30)
+
         action, = [a for a in state['last_round']['actions'] if a['kind'] == 'buy']
         old_action, = [a for a in original_plan['actions'] if a['kind'] == 'buy']
         assert action['state'] == 'success' and action['token_id'] == original['token_id']
@@ -607,7 +609,6 @@ def test_dead_post_started_sender_with_lagging_preparing_action_is_covered_after
         assert account.cancels == account.market_orders == [] and store.lp_actions(sid) == audit
         completed = datetime.fromisoformat(state['last_round']['completed_at'])
         for elapsed in (1,29):
-            runtime.clock[0] = completed+timedelta(seconds=elapsed)
             owner.execution.lp_auto_run_once(round_id='old-preparing-request')
             owner.execution.lp_auto_run_once(round_id='post-owner-exit-refill')
             assert len(account.posts) == 1 and store.lp_actions(sid) == audit
@@ -680,8 +681,7 @@ def test_recovery_preserves_new_submission_pause_and_configuration_fences(
         assert not store.lp_session(original['session_id']).get('entry_order_id')
         assert account.posts == account.cancels == []
         from datetime import datetime
-        assert datetime.fromisoformat(completed['plan_wait']['deadline']) == datetime.fromisoformat(
-            completed['last_round']['completed_at']) + timedelta(seconds=30)
+
         advance_api_wait(runtime, owner.execution, refresh=False)
         _arm_refill(runtime, owner, account)
         prepare_public(owner, adapter, public)
@@ -725,9 +725,17 @@ def test_recovery_preserves_new_submission_pause_and_configuration_fences(
             state = pending.result(timeout=5)
             evidence['states'].append(deepcopy(dict(label='historical-local-return',state=state)))
             deadline = monotonic()+5
-            while owner.lp.entry_send_inflight(new_sid):
-                assert monotonic() < deadline, 'Native new sender completion watchdog'
+            while True:
+                terminal = owner.execution.lp_auto_state()
+                published, = [i for i in terminal['intents'] if i['intent_id'] == new_intent['intent_id']]
+                assert published['session_id'] == new_sid and published['token_id'] == new_action['token_id']
+                if published['state'] == 'rejected':
+                    break
+                assert monotonic() < deadline, 'Public same-request terminal publication watchdog'
                 Event().wait(.01)
+            evidence['states'].append(deepcopy(dict(label='public-same-request-terminal',
+                request_id=new_intent['intent_id'],session_id=new_sid,state=terminal)))
+            assert not owner.lp.entry_send_inflight(new_sid)
         action, = state['last_round']['actions']
         assert action['reason'] == ('cycle_ended' if fence == 'pause' else 'prepare_failed')
         assert action['state'] == ('not_sent' if fence == 'pause' else 'rejected')
@@ -749,6 +757,7 @@ def test_recovery_preserves_new_submission_pause_and_configuration_fences(
             assert latest_audit == audit and latest_audit['submit_stage'] == 'prepare_failed'
             assert latest_audit['post_started'] is False and not latest_audit.get('order_id')
             assert not store.lp_session(new_sid).get('entry_order_id')
+            persist('final-public-assertion-boundary')
             assert Decimal(state['funds']['buy_reserved_usd']) == 32
             assert state['desired_running'] is False and account.market_orders == []
         evidence['states'].append(deepcopy(dict(label='fenced-new-current',held=held,state=state)))

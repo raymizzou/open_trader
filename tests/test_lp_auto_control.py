@@ -61,16 +61,16 @@ def test_timing_config_reaches_persistent_runtime_scheduler(tmp_path, monkeypatc
     root = '/api/prediction-arbitrage/lp/auto/'
     with _server(runtime, session_token='session-token', csrf_token='csrf-token') as base:
         code = cli.main(['prediction-arb', 'lp-auto', 'config', '--url', base,
-            '--round-interval-seconds', '90', '--api-retry-interval-seconds', '30',
+            '--api-retry-interval-seconds', '30',
             '--order-check-interval-seconds', '5', '--json'])
         receipt = json.loads(capsys.readouterr().out)
         assert code == 0, receipt['reason']
         assert receipt['result'] == 'CONFIGURED'
         status, state = _response(base + root + 'state')
         assert status == 200
-        for key, value in dict(round_interval_seconds=90, api_retry_interval_seconds=30, order_check_interval_seconds=5).items():
+        for key, value in dict(api_retry_interval_seconds=30, order_check_interval_seconds=5).items():
             assert state[key] == receipt['state'][key] == value
-        assert state['check_interval_seconds'] == 90
+        assert state['check_interval_seconds'] is None and state['cycle_mode'] == 'continuous'
         assert state['config_version'] == before['config_version'] + 1
         for key in ('active_plan', 'plan_wait', 'trading_config_version', 'desired_running', 'budget_usd', 'target_buy_count', 'buy_price_level'):
             assert state[key] == before[key]
@@ -84,15 +84,11 @@ def test_timing_config_reaches_persistent_runtime_scheduler(tmp_path, monkeypatc
         restored = _response(base + root + 'state')[1]
         for key in ('active_plan', 'plan_wait', 'desired_running', 'round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds'):
             assert restored[key] == state[key]
-        at_deadline(monkeypatch, runtime.execution, before=1)
         runtime._lp_auto_scheduler.request_check()
-        assert not runtime._lp_auto_scheduler.run_due()
-        at_deadline(monkeypatch, runtime.execution)
         assert runtime._lp_auto_scheduler.run_due()
-        waiting = _response(base + root + 'state')[1]['plan_wait']
-        assert datetime.fromisoformat(waiting['deadline']) - datetime.fromisoformat(waiting['started_at']) == timedelta(seconds=90)
+        assert _response(base + root + 'state')[1]['plan_wait'] is None
         runtime._lp_auto_scheduler = None
-        assert runtime.lp_auto_state()['check_interval_seconds'] == 90
+        assert runtime.lp_auto_state()['check_interval_seconds'] is None
 
 
 def test_dashboard_omits_intents_without_materializing_detail_projection(tmp_path, monkeypatch):

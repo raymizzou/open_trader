@@ -156,17 +156,12 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
         assert result['funds']['status']=='known' and Decimal(result['funds']['buy_reserved_usd'])==24
         assert result['active_plan'] is None and result['last_round']['actions']==[]
         assert result['last_round']['completed_at'] and result['last_round']['reason']=='account_round_invalid'
-        assert result['plan_wait']['kind']=='round'
-        deadline=datetime.fromisoformat(result['plan_wait']['deadline'])
+        assert result['plan_wait'] is None
         completed=datetime.fromisoformat(result['last_round']['completed_at'])
-        assert deadline==completed+timedelta(seconds=30)
         evidence['invalidated']=deepcopy(result)
-        counts=(len(reads),account.position_reads,len(account.posts))
-        for elapsed in (1,29):
-            runtime.clock[0]=completed+timedelta(seconds=elapsed)
-            early=execution.lp_auto_run_once(round_id='three-to-five-invalidated')
-            assert early['last_round']==result['last_round'] and counts==(len(reads),account.position_reads,len(account.posts))
-            assert early['funds']['status']=='known'
+        # No old attempt was sent; recovery uses a new current acquisition.
+        assert account.posts == []
+        runtime.clock[0] = completed + timedelta(seconds=1)
         advance_api_wait(runtime,execution)
         evidence['original_reads']=list(reads)
         reads.clear();shared_reads.clear()
@@ -212,7 +207,7 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
     assert all(p.maker_amount==8000000 and p.taker_amount==20000000 and p.post_only is True for p in account.posts)
     assert Decimal(result['funds']['buy_reserved_usd'])==40 and account.cancels==account.market_orders==[]
     assert result['active_plan'] is None and result['last_round']['completed_at']
-    assert datetime.fromisoformat(result['plan_wait']['deadline'])==datetime.fromisoformat(result['last_round']['completed_at'])+timedelta(seconds=30)
+    assert result['plan_wait'] is None
 
 
 def test_recovered_account_can_refill_three_to_five(runtime):
@@ -290,11 +285,13 @@ def test_failed_attempt_still_blocks_without_current_durable_facts(runtime, boun
     real_reader = adapter.lp_account_snapshot_shared
     initial_facts = deepcopy(auto._read()['account_financial_facts'])
     reads = []
-    def invalidated(**kwargs):
+    def invalidated(*, trade_generation_provider, retry_seconds, previous_components):
+        assert retry_seconds == 60
+        assert previous_components is None or isinstance(previous_components, dict)
         reads.append(True)
         if boundary != 'no_new_publication':
             _advance(runtime)
-            fresh = real_reader(max_age_seconds=0, **kwargs)
+            fresh = real_reader(max_age_seconds=0, trade_generation_provider=trade_generation_provider)
             assert lp.register_account_snapshot(fresh)['state'] == 'registered'
             if boundary == 'generation_changed':
                 store.lp_advance_trade_generation(store.lp_trade_generation())

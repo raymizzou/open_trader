@@ -2135,7 +2135,7 @@ def test_auto_bounded_round_waits_for_launched_jobs(tmp_path, monkeypatch, reque
     engine.lp_auto_run_once(round_id='tick-does-not-couple-refill')
     assert public.book_calls == before_books
     assert pool._reconcile_jobs == {}
-    assert account.calls == dict.fromkeys(account.calls, 1)
+    assert account.calls == {'balance': 1, 'orders': 1, 'positions': 1, 'trades': 0}
 
 
 def test_provider_failure_completes_round_waiters(monkeypatch) -> None:

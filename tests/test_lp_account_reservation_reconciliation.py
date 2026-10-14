@@ -290,7 +290,15 @@ def test_two_old_reservations_are_replaced_once_by_complete_account_truth(runtim
     elif entrypoint == "reconcile":
         state = execution.lp_auto_reconcile_unknown()
     else:
-        state = execution.lp_auto_run_once(round_id="one-complete-account-round")
+        state = execution.lp_auto_run_once(round_id="one-current-only-round")
+        assert state["funds"]["status"] == "unknown"
+        _assert_unknown_audit(store, execution, originals)
+        assert account.posts == account.cancels == []
+        # Historical local holds need genuine full account evidence, not a
+        # planning-only response or absence converted to a rejected audit.
+        _advance(runtime)
+        assert execution.refresh_lp_dashboard_snapshot()["state"] == "ready"
+        state = execution.lp_auto_state()
     assert state["funds"]["status"] == "known", state
     assert _amount(state, "buy_reserved_usd") == (8 if actual_buy else 0), state
     assert _amount(state, "available_usd") == (92 if actual_buy else 100)
@@ -707,8 +715,9 @@ def test_enabled_round_refills_covered_legacy_market_once_without_overspending(r
     second = execution.lp_auto_run_once(round_id="refill-repeat")
     assert len(account.posts) == 1
     assert _amount(second, "buy_reserved_usd") == 8
-    assert second['funds']['status'] == 'unknown' and second['funds']['as_of'] == planning_as_of[-1]
-    assert second['funds']['available_usd'] is None and not any(financial_calls)
+    assert second['funds']['status'] == 'known'
+    assert second['funds']['as_of'] != planning_as_of[-1]
+    assert _amount(second, 'available_usd') == 0 and not any(financial_calls)
     _advance(runtime)
     assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
     second = execution.lp_auto_state()
@@ -893,9 +902,9 @@ def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_acco
     account.get_balance_allowance = observed_balance
     pending = execution.lp_auto_run_once(round_id="cancel-absent")
     assert rotating['active_plan'] is None and rotating['last_round']['completed_at']
-    assert rotating['plan_wait']['kind'] == 'round'
+    assert rotating['plan_wait'] is None
     assert pending['active_plan'] is None and pending['last_round']['round_id'] == 'cancel-absent'
-    assert pending['last_round']['completed_at'] and pending['plan_wait']['kind'] == 'round'
+    assert pending['last_round']['completed_at'] and pending['plan_wait'] is None
     assert pending['slots']['occupied'] == 1 and _amount(pending, 'buy_reserved_usd') == 8
     assert _amount(pending, 'available_usd') == 8
     assert balance_reads, 'New current check acquires actual complete wallet inputs'

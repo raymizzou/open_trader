@@ -269,9 +269,10 @@ def test_manual_release_wakes_enabled_pool_and_normal_sdk_refill(runtime, reserv
     _advance(runtime)
     known = execution.lp_auto_run_once(round_id='confirm-manual-refill')
     assert planning_as_of[-1] and not any(financial_calls)
-    assert refilled['funds']['status'] == known['funds']['status'] == 'unknown'
-    assert refilled['funds']['as_of'] == known['funds']['as_of'] == planning_as_of[-1]
-    assert known['funds']['available_usd'] is None and known['funds']['spendable_usd'] is None
+    assert refilled['funds']['status'] == 'unknown' and refilled['funds']['as_of'] == planning_as_of[-1]
+    assert refilled['funds']['available_usd'] is None and refilled['funds']['spendable_usd'] is None
+    assert known['funds']['status'] == 'known' and known['funds']['as_of'] != planning_as_of[-1]
+    assert _amount(known, 'buy_reserved_usd') == 8 and _amount(known, 'available_usd') == 0
     _advance(runtime)
     assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
     known = execution.lp_auto_state()
@@ -846,8 +847,11 @@ def test_release_fixed_budget_current_position_and_unknown_report_allow_normal_r
     _advance(runtime)
     confirmed = execution.lp_auto_run_once(round_id='joint-fixed-budget-confirm')
     assert planning_as_of[-1] and not any(financial_calls)
-    assert confirmed['funds']['status'] == 'unknown' and confirmed['funds']['as_of'] == planning_as_of[-1]
-    assert confirmed['funds']['available_usd'] is None and confirmed['funds']['spendable_usd'] is None
+    assert confirmed['funds']['status'] == 'known' and confirmed['funds']['as_of'] != planning_as_of[-1]
+    assert _amount(confirmed, 'total_usd') == 16
+    assert _amount(confirmed, 'inventory_cost_usd') == Decimal(cost)
+    assert _amount(confirmed, 'buy_reserved_usd') == 8
+    assert _amount(confirmed, 'available_usd') == 8 - Decimal(cost)
     _advance(runtime)
     assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
     confirmed = execution.lp_auto_state()

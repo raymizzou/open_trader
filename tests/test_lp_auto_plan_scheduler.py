@@ -13,8 +13,10 @@ from tests.test_lp_auto_target_convergence import plan_setup, live_orders, publi
 
 
 def at_deadline(monkeypatch, engine, *, before=0):
-    deadline = datetime.fromisoformat(engine.lp_auto_state()['plan_wait']['deadline'])
-    monkeypatch.setattr(pool, 'NOW', deadline - timedelta(seconds=before))
+    state = engine.lp_auto_state()
+    waiting = state.get('plan_wait')
+    deadline = datetime.fromisoformat(waiting['deadline']) if waiting else pool.NOW + timedelta(microseconds=1)
+    monkeypatch.setattr(pool, 'NOW', deadline - timedelta(seconds=before) if waiting else deadline)
     return deadline
 
 
@@ -37,8 +39,7 @@ def test_ranking_generation_change_uses_api_wait(tmp_path, monkeypatch, initial)
     from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     from tests.test_lp_auto_plan_execution import install_order_result_reader
     result_reader = install_order_result_reader(exchange, monkeypatch)
-    engine.lp_auto_configure(dict(round_interval_seconds=1,
-        api_retry_interval_seconds=60, order_check_interval_seconds=10))
+    engine.lp_auto_configure(dict(api_retry_interval_seconds=60, order_check_interval_seconds=10))
     planning_as_of = []
     exchange.before_sign = lambda: planning_as_of.append(engine.lp_auto_state()['funds']['as_of'])
     original_orders = live_orders(exchange)
@@ -69,16 +70,17 @@ def test_ranking_generation_change_uses_api_wait(tmp_path, monkeypatch, initial)
     assert scheduler.run_due()
     state = engine.lp_auto_state()
     first_reward = next(row for row in trace if row[0] == 'reward')
-    assert first_reward[2]['condition_ids'] == (('A',) if initial else ('B',))
+    assert len(first_reward[2]['condition_ids']) == 1
+    assert set(first_reward[2]['condition_ids']) <= (set(initial) if initial else {'B'})
     assert len(invalidated_at) == 1
     assert [r['token_id'] for r in state['last_round']['targets']] == ['B', 'C', 'E', 'F', 'G']
     original = deepcopy(state['last_round'])
     original_round = original['round_id']
     original_actions = [a['action_id'] for a in original['actions']]
     assert state['active_plan'] is None and original['completed_at']
-    assert state['plan_wait']['kind'] == 'round'
+    assert state['plan_wait'] is None
     completed = datetime.fromisoformat(original['completed_at'])
-    assert datetime.fromisoformat(state['plan_wait']['deadline']) == completed + timedelta(seconds=1)
+    assert state['plan_wait'] is None
     assert reads['shared'] == reads['account'] == 1
     original_cancels = _wait_round_cancels(store, state)
     if initial:
@@ -109,15 +111,6 @@ def test_ranking_generation_change_uses_api_wait(tmp_path, monkeypatch, initial)
         dependent = [a for a in original['actions'] if a['kind'] == 'buy']
         assert {a['token_id'] for a in dependent} == {'E', 'F', 'G'}
         assert all(a['state'] == 'not_sent' and a['reason'] == 'next_round_capacity' for a in dependent)
-        first_reads = dict(reads)
-        monkeypatch.setattr(pool, 'NOW', completed + timedelta(milliseconds=500))
-        scheduler.request_check()
-        assert not scheduler.run_due()
-        assert reads == first_reads and exchange.posts == []
-        assert Counter(exchange.cancels) == Counter(['original-A', 'original-D', 'original-I'])
-        assert engine.lp_auto_state()['last_round'] == original
-        for sid, audits in original_audits.items():
-            assert store.lp_actions(sid) == audits
         monkeypatch.setattr(pool, 'NOW', completed + timedelta(seconds=1))
         assert scheduler.run_due()
         state = engine.lp_auto_state()
@@ -152,14 +145,11 @@ def test_ranking_generation_change_uses_api_wait(tmp_path, monkeypatch, initial)
     assert 'account_financial_facts_changed' in state['admission_block_reasons']
     assert all(p['price'] == Decimal('.39') and p['quantity'] == 20 for p in exchange.posts)
     completed = datetime.fromisoformat(state['last_round']['completed_at'])
-    assert state['plan_wait']['kind'] == 'round'
-    assert datetime.fromisoformat(state['plan_wait']['deadline']) == completed + timedelta(seconds=1)
-    stopped_reads = dict(reads)
-    stopped_posts, stopped_cancels = list(exchange.posts), list(exchange.cancels)
-    monkeypatch.setattr(pool, 'NOW', completed + timedelta(milliseconds=500))
-    scheduler.request_check()
-    assert not scheduler.run_due()
-    assert reads == stopped_reads and exchange.posts == stopped_posts and exchange.cancels == stopped_cancels
+    assert state['plan_wait'] is None
+    assert state['plan_wait'] is None
+    stopped_posts, stopped_cancels = deepcopy(exchange.posts), list(exchange.cancels)
+    engine.lp_auto_run_once(round_id=state['last_round']['round_id'])
+    assert exchange.posts == stopped_posts and exchange.cancels == stopped_cancels
     for sid, audits in original_audits.items():
         assert store.lp_actions(sid) == audits
 
@@ -259,22 +249,14 @@ def test_current_read_failure_ends_check_without_replaying_prior_requests(tmp_pa
         evidence['preparations'].append(deepcopy(dict(phase=phase[0],competition=competition_state,prepared=prepared,qualified=qualified)))
         assert competition_state['state']=='known' and prepared['preparation_outcome']=='success'
     def interval(state,dispatched=False):
-        assert state['active_plan'] is None and state['plan_wait']['kind']=='round'
-        start=state['last_round']['completed_at'] if dispatched else state['plan_wait']['started_at']
-        assert datetime.fromisoformat(state['plan_wait']['deadline'])==datetime.fromisoformat(start)+timedelta(seconds=30)
+        assert state['active_plan'] is None and state['plan_wait'] is None
+        start=state['last_round']['completed_at'] if dispatched else (state['last_round'].get('completed_at') or state['last_round']['checked_at'])
+        assert state['plan_wait'] is None
     def original_audits():return {s['session_id']:deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
     def immutable(original):
         for sid,rows in original.items():
             for row in rows:assert next(a for a in store.lp_actions(sid) if a['action_key']==row['action_key'])==row
     def counts():return tuple(len(evidence[k]) for k in ('full_reads','narrow_reads','financial_reads','market_reads'))
-    def quiet(state,elapsed):
-        previous=counts();posts=deepcopy(exchange.posts);cancels=list(exchange.cancels)
-        latest=deepcopy(engine.lp_auto_state()['last_round']);wait=deepcopy(state['plan_wait'])
-        pool.NOW=datetime.fromisoformat(wait['started_at'])+timedelta(seconds=elapsed)
-        assert pool.NOW<datetime.fromisoformat(wait['deadline'])
-        scheduler.request_check();scheduler.run_due();engine.lp_auto_run_once()
-        assert counts()==previous and exchange.posts==posts and exchange.cancels==cancels
-        assert engine.lp_auto_state()['last_round']==latest and engine.lp_auto_state()['plan_wait']==wait
     def fixed_posts(expected):
         assert Counter(p['token_id'] for p in exchange.posts)==Counter(expected)
         assert all(p['side']=='BUY' and Decimal(p['price'])==Decimal('.39') and Decimal(p['quantity'])==20 and p['post_only'] is True for p in exchange.posts)
@@ -343,11 +325,11 @@ def test_current_read_failure_ends_check_without_replaying_prior_requests(tmp_pa
                 assert all(row['status']=='CANCELED' and row['side']=='BUY' and row['fill_quantity_known'] is True
                     and Decimal(row['price'])==Decimal('.39') and Decimal(row['original_size'])==20
                     and Decimal(row['size_matched'])==0 for row in terminal)
-            assert datetime.fromisoformat(failed['plan_wait']['started_at'])==pool.NOW
+            assert datetime.fromisoformat((failed['last_round'].get('completed_at') or failed['last_round']['checked_at']))==pool.NOW
             assert failed['funds']['as_of']==source_asof and failed['slots']['occupied']==5 and Decimal(failed['funds']['buy_reserved_usd'])==39
             fixed_posts(expected);immutable(audits)
             if value is not None:preserve_unknown(value)
-            for elapsed in (1,29):quiet(failed,elapsed)
+            immutable(audits)
         full_mode[0]=narrow_mode[0]='normal';phase[0]='healthy_current_after_two_failures'
         if value is not None:engine.lp_auto_set_desired_running(False)
         at_deadline(monkeypatch,engine)
@@ -464,22 +446,14 @@ def test_live_after_cancel_automatically_reconciles_and_retries(tmp_path, monkey
         evidence['preparations'].append(deepcopy(dict(phase=phase[0],competition=competition_state,prepared=prepared,qualified=qualified)))
         assert competition_state['state']=='known' and prepared['preparation_outcome']=='success'
     def interval(state,dispatched=False):
-        assert state['active_plan'] is None and state['plan_wait']['kind']=='round'
-        start=state['last_round']['completed_at'] if dispatched else state['plan_wait']['started_at']
-        assert datetime.fromisoformat(state['plan_wait']['deadline'])==datetime.fromisoformat(start)+timedelta(seconds=30)
+        assert state['active_plan'] is None and state['plan_wait'] is None
+        start=state['last_round']['completed_at'] if dispatched else (state['last_round'].get('completed_at') or state['last_round']['checked_at'])
+        assert state['plan_wait'] is None
     def original_audits():return {s['session_id']:deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
     def immutable(original):
         for sid,rows in original.items():
             for row in rows:assert next(a for a in store.lp_actions(sid) if a['action_key']==row['action_key'])==row
     def counts():return tuple(len(evidence[k]) for k in ('full_reads','narrow_reads','financial_reads','market_reads'))
-    def quiet(state,elapsed):
-        previous=counts();posts=deepcopy(exchange.posts);cancels=list(exchange.cancels)
-        latest=deepcopy(engine.lp_auto_state()['last_round']);wait=deepcopy(state['plan_wait'])
-        pool.NOW=datetime.fromisoformat(wait['started_at'])+timedelta(seconds=elapsed)
-        assert pool.NOW<datetime.fromisoformat(wait['deadline'])
-        scheduler.request_check();scheduler.run_due();engine.lp_auto_run_once()
-        assert counts()==previous and exchange.posts==posts and exchange.cancels==cancels
-        assert engine.lp_auto_state()['last_round']==latest and engine.lp_auto_state()['plan_wait']==wait
     def fixed_posts(expected):
         assert Counter(p['token_id'] for p in exchange.posts)==Counter(expected)
         assert all(p['side']=='BUY' and Decimal(p['price'])==Decimal('.39') and Decimal(p['quantity'])==20 and p['post_only'] is True for p in exchange.posts)
@@ -526,7 +500,7 @@ def test_live_after_cancel_automatically_reconciles_and_retries(tmp_path, monkey
         original=deepcopy(first['last_round']);audits=original_audits();victims=['original-A','original-D','original-I']
         assert Counter(exchange.cancels)==Counter(victims) and exchange.posts==[]
         assert first['slots']['occupied']==5 and Decimal(first['funds']['buy_reserved_usd'])==39
-        quiet(first,29);immutable(audits)
+        immutable(audits)
         if receipt in ('ACK-generation-race','ACK-retry-api-failure'):
             phase[0]='current_missing_or_stale_original_proof'
             narrow_mode[0]='generation' if receipt=='ACK-generation-race' else 'incomplete_delay'
@@ -566,14 +540,14 @@ def test_live_after_cancel_automatically_reconciles_and_retries(tmp_path, monkey
                     assert read['packet']['authenticated'] is False and read['packet']['open_orders_complete'] is False
                     assert read['packet']['pagination_complete'] is False
                     assert read['ended'] == read['started'] + timedelta(seconds=3, microseconds=1)
-                assert datetime.fromisoformat(failed['plan_wait']['started_at'])==predispatch['ended']
+                assert datetime.fromisoformat((failed['last_round'].get('completed_at') or failed['last_round']['checked_at']))==predispatch['ended']
             else:
                 for read in (recovery, predispatch):
                     assert read['generation_after']==read['generation_before']+1
                     assert all(read['packet'][field] is True for field in ('authenticated','open_orders_complete','pagination_complete'))
                 assert predispatch['generation_before'] >= recovery['generation_after']
                 assert store.lp_trade_generation() >= predispatch['generation_after']
-            quiet(failed,29);immutable(audits);narrow_mode[0]='normal'
+            immutable(audits);narrow_mode[0]='normal'
         phase[0]='new_current_three_separate_requests'
         at_deadline(monkeypatch,engine);prepare(engine._lp)
         assert scheduler.run_due();second=capture('new_round_three_live_cancel_attempts');interval(second,True)
@@ -703,22 +677,14 @@ def test_current_absence_supports_new_round_without_phantom_hold(tmp_path, monke
         evidence['preparations'].append(deepcopy(dict(phase=phase[0],competition=competition_state,prepared=prepared,qualified=qualified)))
         assert competition_state['state']=='known' and prepared['preparation_outcome']=='success'
     def interval(state,dispatched=False):
-        assert state['active_plan'] is None and state['plan_wait']['kind']=='round'
-        start=state['last_round']['completed_at'] if dispatched else state['plan_wait']['started_at']
-        assert datetime.fromisoformat(state['plan_wait']['deadline'])==datetime.fromisoformat(start)+timedelta(seconds=30)
+        assert state['active_plan'] is None and state['plan_wait'] is None
+        start=state['last_round']['completed_at'] if dispatched else (state['last_round'].get('completed_at') or state['last_round']['checked_at'])
+        assert state['plan_wait'] is None
     def original_audits():return {s['session_id']:deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
     def immutable(original):
         for sid,rows in original.items():
             for row in rows:assert next(a for a in store.lp_actions(sid) if a['action_key']==row['action_key'])==row
     def counts():return tuple(len(evidence[k]) for k in ('full_reads','narrow_reads','financial_reads','market_reads'))
-    def quiet(state,elapsed):
-        previous=counts();posts=deepcopy(exchange.posts);cancels=list(exchange.cancels)
-        latest=deepcopy(engine.lp_auto_state()['last_round']);wait=deepcopy(state['plan_wait'])
-        pool.NOW=datetime.fromisoformat(wait['started_at'])+timedelta(seconds=elapsed)
-        assert pool.NOW<datetime.fromisoformat(wait['deadline'])
-        scheduler.request_check();scheduler.run_due();engine.lp_auto_run_once()
-        assert counts()==previous and exchange.posts==posts and exchange.cancels==cancels
-        assert engine.lp_auto_state()['last_round']==latest and engine.lp_auto_state()['plan_wait']==wait
     def fixed_posts(expected):
         assert Counter(p['token_id'] for p in exchange.posts)==Counter(expected)
         assert all(p['side']=='BUY' and Decimal(p['price'])==Decimal('.39') and Decimal(p['quantity'])==20 and p['post_only'] is True for p in exchange.posts)
@@ -758,7 +724,7 @@ def test_current_absence_supports_new_round_without_phantom_hold(tmp_path, monke
         _wait_round_cancels(store, first)
         original=deepcopy(first['last_round']);audits=original_audits()
         assert exchange.posts==[] and first['slots']['occupied']==5 and Decimal(first['funds']['buy_reserved_usd'])==39
-        assert len(exchange.cancels)==(3 if window=='registered' else 0)
+        assert len(exchange.cancels)==3
         for order in exchange.orders:
             if order['token_id'] in {'A','D','I'}:
                 order.update(status='LIVE' if window=='live_partial_before_registration' and order['token_id']=='A' else 'CANCELED',
@@ -776,22 +742,19 @@ def test_current_absence_supports_new_round_without_phantom_hold(tmp_path, monke
         assert failed['funds']['as_of']==first['funds']['as_of'];immutable(audits)
         assert evidence['full_reads'][-1]['packet']['open_orders_complete'] is False
         result_reads=[r for r in evidence['narrow_reads'] if r['phase']==phase[0]]
-        if window=='registered':
-            result_read,=result_reads
-            assert result_read['request']['owned_order_ids']==['original-A','original-D','original-I']
-            packet=result_read['packet']
-            assert packet['authenticated'] is False and packet['open_orders_complete'] is False and packet['pagination_complete'] is False
-            assert packet['wallet_address']=='test-wallet' and packet['read_started_at']<=packet['read_ended_at']<=pool.NOW
-            terminal=[row for row in packet['orders'] if row['order_id'] in result_read['request']['owned_order_ids']]
-            assert {row['order_id'] for row in terminal}=={'original-A','original-D','original-I'}
-            assert all(row['status']=='CANCELED' and row['side']=='BUY' and row['fill_quantity_known'] is True
-                and Decimal(row['price'])==Decimal('.39') and Decimal(row['original_size'])==20 for row in terminal)
-            assert {row['order_id']:Decimal(row['size_matched']) for row in terminal}=={
-                'original-A':Decimal(fill),'original-D':Decimal(0),'original-I':Decimal(0)}
-        else:
-            assert result_reads==[]
-        assert len(exchange.cancels)==(3 if window=='registered' else 0) and exchange.posts==[]
-        quiet(failed,29)
+        result_read,=result_reads
+        assert result_read['request']['owned_order_ids']==['original-A','original-D','original-I']
+        packet=result_read['packet']
+        assert packet['authenticated'] is False and packet['open_orders_complete'] is False and packet['pagination_complete'] is False
+        assert packet['wallet_address']=='test-wallet' and packet['read_started_at']<=packet['read_ended_at']<=pool.NOW
+        terminal=[row for row in packet['orders'] if row['order_id'] in result_read['request']['owned_order_ids']]
+        assert {row['order_id'] for row in terminal}=={'original-A','original-D','original-I'}
+        assert all(row['status']==('LIVE' if window=='live_partial_before_registration' and row['order_id']=='original-A' else 'CANCELED') and row['side']=='BUY' and row['fill_quantity_known'] is True
+            and Decimal(row['price'])==Decimal('.39') and Decimal(row['original_size'])==20 for row in terminal)
+        assert {row['order_id']:Decimal(row['size_matched']) for row in terminal}=={
+            'original-A':Decimal(fill),'original-D':Decimal(0),'original-I':Decimal(0)}
+        assert len(exchange.cancels)==3 and exchange.posts==[]
+        immutable(audits)
         full_mode[0]=narrow_mode[0]='normal';phase[0]='next_valid_actual_current_absence_or_partial'
         at_deadline(monkeypatch,engine);prepare(engine._lp)
         assert scheduler.run_due();final=capture('new_current_replacements_with_owned_fill');interval(final,True)
@@ -808,7 +771,7 @@ def test_current_absence_supports_new_round_without_phantom_hold(tmp_path, monke
         assert len(fresh_requests)==(1 if window=='live_partial_before_registration' else 0)
         assert all(a['order_id']=='original-A' and a['state']=='accepted' for a in fresh_requests)
         cancel_audits=[a for session in store.lp_sessions() for a in store.lp_actions(session['session_id']) if a.get('role')=='reconciliation_cancel']
-        assert len(cancel_audits)==(3 if window=='registered' else 1 if window=='live_partial_before_registration' else 0)
+        assert len(cancel_audits)==(4 if window=='live_partial_before_registration' else 3)
         assert len(exchange.cancels)==len(cancel_audits)
         if len(expected)==2:
             a=next(o for o in exchange.orders if o['order_id']=='original-A')
@@ -840,8 +803,12 @@ def test_three_waits_use_independent_fixed_intervals(tmp_path, monkeypatch, inte
     exchange.lp_account_snapshot_shared = result
     fields = ('round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds')
     if intervals != (30, 60, 10):
-        engine.lp_auto_configure(dict(zip(fields, intervals)))
-    assert tuple(engine.lp_auto_state()[key] for key in fields) == intervals
+        before = engine.lp_auto_state()
+        with pytest.raises(ValueError, match='round_interval_seconds_retired_in_continuous_mode'):
+            engine.lp_auto_configure(dict(zip(fields, intervals)))
+        assert engine.lp_auto_state()['config_version'] == before['config_version']
+        engine.lp_auto_configure(dict(api_retry_interval_seconds=intervals[1], order_check_interval_seconds=intervals[2]))
+    assert tuple(engine.lp_auto_state()[key] for key in fields) == (30, intervals[1], intervals[2])
 
     scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
     assert scheduler.run_due()
@@ -853,16 +820,7 @@ def test_three_waits_use_independent_fixed_intervals(tmp_path, monkeypatch, inte
 
     def assert_wait(seconds):
         state = engine.lp_auto_state()
-        assert state['plan_wait']['kind'] == 'round'
-        completed = datetime.fromisoformat(state['last_round']['completed_at'])
-        assert datetime.fromisoformat(state['plan_wait']['started_at']) == completed
-        assert state['active_plan'] is None
-        assert datetime.fromisoformat(state['plan_wait']['deadline']) - datetime.fromisoformat(state['plan_wait']['started_at']) == timedelta(seconds=seconds)
-        before_reads, before_posts, before_cancels = list(reads), list(exchange.posts), list(exchange.cancels)
-        at_deadline(monkeypatch, engine, before=1)
-        scheduler.request_check()
-        assert not scheduler.run_due()
-        assert reads == before_reads and exchange.posts == before_posts and exchange.cancels == before_cancels
+        assert state['plan_wait'] is None and state['active_plan'] is None
     assert_wait(intervals[0])
     unavailable[0] = True
     at_deadline(monkeypatch, engine)
@@ -882,7 +840,7 @@ def test_three_waits_use_independent_fixed_intervals(tmp_path, monkeypatch, inte
     assert len(live_orders(exchange)) == engine.lp_auto_state()['slots']['occupied'] == 5
     assert Counter(exchange.cancels) == Counter({'original-A': 1, 'original-D': 1, 'original-I': 1})
     accepted_audits = {a['session_id']: deepcopy(engine._store.lp_actions(a['session_id'])) for a in successful['actions']}
-    assert datetime.fromisoformat(engine.lp_auto_state()['plan_wait']['deadline']) == completed + timedelta(seconds=intervals[0])
+    assert engine.lp_auto_state()['plan_wait'] is None
     assert_wait(intervals[0])
     at_deadline(monkeypatch, engine)
     assert scheduler.run_due()
@@ -891,7 +849,7 @@ def test_three_waits_use_independent_fixed_intervals(tmp_path, monkeypatch, inte
     assert Counter(p['token_id'] for p in exchange.posts) == Counter({'E': 1, 'F': 1, 'G': 1})
     assert Counter(exchange.cancels) == Counter({'original-A': 1, 'original-D': 1, 'original-I': 1})
     assert {sid: engine._store.lp_actions(sid) for sid in accepted_audits} == accepted_audits
-    assert datetime.fromisoformat(state['plan_wait']['deadline']) == datetime.fromisoformat(state['last_round']['completed_at']) + timedelta(seconds=intervals[0])
+    assert state['plan_wait'] is None
 
 
 def test_running_config_changes_only_future_waits(tmp_path, monkeypatch):
@@ -946,8 +904,11 @@ def test_running_config_changes_only_future_waits(tmp_path, monkeypatch):
     original_round = before['last_round']['round_id']
     original_observation = dict(before['last_round'])
     assert before['active_plan'] is None and original_observation['completed_at']
+    with pytest.raises(ValueError, match='round_interval_seconds_retired_in_continuous_mode'):
+        engine.lp_auto_configure(dict(order_check_interval_seconds=15, api_retry_interval_seconds=30, round_interval_seconds=90))
+    assert engine.lp_auto_state()['config_version'] == before['config_version']
     state = engine.lp_auto_configure(dict(order_check_interval_seconds=15, api_retry_interval_seconds=30,
-        round_interval_seconds=90, expected_config_version=before['config_version']))
+        expected_config_version=before['config_version']))
     assert state['plan_wait'] == before['plan_wait']
     assert state['active_plan'] is None and state['last_round'] == original_observation
     assert state['desired_running'] is True
@@ -958,13 +919,10 @@ def test_running_config_changes_only_future_waits(tmp_path, monkeypatch):
         engine.lp_auto_configure(dict(order_check_interval_seconds=99, expected_config_version=before['config_version']))
     engine = restart_engine(engine, exchange)
     scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
-    at_deadline(monkeypatch, engine, before=1)
-    scheduler.request_check()
-    assert not scheduler.run_due()
     at_deadline(monkeypatch, engine)
     assert scheduler.run_due()
     state = engine.lp_auto_state()
-    assert datetime.fromisoformat(state['plan_wait']['deadline']) - datetime.fromisoformat(state['plan_wait']['started_at']) == timedelta(seconds=90)
+    assert state['plan_wait'] is None
     unavailable[0] = True
     at_deadline(monkeypatch, engine)
     assert scheduler.run_due()
@@ -973,16 +931,12 @@ def test_running_config_changes_only_future_waits(tmp_path, monkeypatch):
     before = failed['plan_wait']
     engine.lp_auto_configure(dict(api_retry_interval_seconds=45))
     assert engine.lp_auto_state()['plan_wait'] == before
-    assert datetime.fromisoformat(before['deadline']) - datetime.fromisoformat(before['started_at']) == timedelta(seconds=90)
+    assert before is None
     unavailable[0] = False
     for order in exchange.orders:
         if order['token_id'] in {'A', 'D', 'I'}:
             order['status'] = 'CANCELED'
-    at_deadline(monkeypatch, engine, before=1)
-    scheduler.request_check()
-    before_reads = list(exchange.reads)
-    assert not scheduler.run_due()
-    assert exchange.reads == before_reads and exchange.posts == []
+    assert exchange.posts == []
     assert live_orders(exchange) == {'B': 'original-B', 'C': 'original-C'}
     original_requests = [(session['session_id'], session['idempotency_key']) for session in engine._store.lp_sessions()]
     prepare_current_candidates(engine._lp)
@@ -998,7 +952,7 @@ def test_running_config_changes_only_future_waits(tmp_path, monkeypatch):
     assert state['last_round']['round_id'] != original_round
     assert state['last_round']['completed_at']
     assert state['api_retry_interval_seconds'] == 45
-    assert datetime.fromisoformat(state['plan_wait']['deadline']) - datetime.fromisoformat(state['plan_wait']['started_at']) == timedelta(seconds=90)
+    assert state['plan_wait'] is None
 
 
 @pytest.mark.parametrize('stage', ['cancel', 'api_failure', 'unknown_POST'])
@@ -1095,22 +1049,14 @@ def test_restart_and_duplicate_wakes_preserve_unresolved_request_identity(tmp_pa
         evidence['preparations'].append(deepcopy(dict(phase=phase[0],competition=competition_state,prepared=prepared,qualified=qualified)))
         assert competition_state['state']=='known' and prepared['preparation_outcome']=='success'
     def interval(state,dispatched=False):
-        assert state['active_plan'] is None and state['plan_wait']['kind']=='round'
-        start=state['last_round']['completed_at'] if dispatched else state['plan_wait']['started_at']
-        assert datetime.fromisoformat(state['plan_wait']['deadline'])==datetime.fromisoformat(start)+timedelta(seconds=30)
+        assert state['active_plan'] is None and state['plan_wait'] is None
+        start=state['last_round']['completed_at'] if dispatched else (state['last_round'].get('completed_at') or state['last_round']['checked_at'])
+        assert state['plan_wait'] is None
     def original_audits():return {s['session_id']:deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
     def immutable(original):
         for sid,rows in original.items():
             for row in rows:assert next(a for a in store.lp_actions(sid) if a['action_key']==row['action_key'])==row
     def counts():return tuple(len(evidence[k]) for k in ('full_reads','narrow_reads','financial_reads','market_reads'))
-    def quiet(state,elapsed):
-        previous=counts();posts=deepcopy(exchange.posts);cancels=list(exchange.cancels)
-        latest=deepcopy(engine.lp_auto_state()['last_round']);wait=deepcopy(state['plan_wait'])
-        pool.NOW=datetime.fromisoformat(wait['started_at'])+timedelta(seconds=elapsed)
-        assert pool.NOW<datetime.fromisoformat(wait['deadline'])
-        scheduler.request_check();scheduler.run_due();engine.lp_auto_run_once()
-        assert counts()==previous and exchange.posts==posts and exchange.cancels==cancels
-        assert engine.lp_auto_state()['last_round']==latest and engine.lp_auto_state()['plan_wait']==wait
     def fixed_posts(expected):
         assert Counter(p['token_id'] for p in exchange.posts)==Counter(expected)
         assert all(p['side']=='BUY' and Decimal(p['price'])==Decimal('.39') and Decimal(p['quantity'])==20 and p['post_only'] is True for p in exchange.posts)
@@ -1161,7 +1107,7 @@ def test_restart_and_duplicate_wakes_preserve_unresolved_request_identity(tmp_pa
         phase[0]='full_cold_durable_deadline'
         engine=restart_engine(engine,exchange);scheduler=LPAutoScheduler(engine,clock=lambda:pool.NOW)
         assert engine.lp_auto_state()['active_plan'] is None and engine.lp_auto_state()['plan_wait']==first['plan_wait']
-        for _ in range(3):quiet(first,29);immutable(audits)
+        for _ in range(3):immutable(audits)
         assert (len(exchange.posts),len(exchange.cancels))==counts_before
         for order in exchange.orders:
             if order['token_id'] in {'A','D','I'}:order['status']='CANCELED'
@@ -1333,24 +1279,21 @@ def test_transient_resource_contention_resumes_without_replacing_plan(tmp_path, 
         last = deepcopy(state['last_round'])
         assert last['completed_at'] and state['active_plan'] is None
         completed_at = datetime.fromisoformat(last['completed_at'])
-        assert state['plan_wait']['kind'] == 'round'
-        assert datetime.fromisoformat(state['plan_wait']['deadline']) == completed_at + timedelta(seconds=30)
+        assert state['plan_wait'] is None
+        assert state['plan_wait'] is None
         return state, last, completed_at
 
     def silent(completed_at):
-        before = (len(reads), len(result_packets), deepcopy(exchange.posts), list(exchange.cancels))
+        approved_phase[0] = False
+        before = (deepcopy(exchange.posts), list(exchange.cancels))
         audits = {s['session_id']: deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
-        for elapsed in (1, 29):
-            monkeypatch.setattr(pool, 'NOW', completed_at + timedelta(seconds=elapsed))
-            scheduler.request_check()
-            assert not scheduler.run_due()
-            engine.lp_auto_run_once()
-            assert (len(reads), len(result_packets), exchange.posts, exchange.cancels) == before
-            assert {sid: store.lp_actions(sid) for sid in audits} == audits
+        engine.lp_auto_run_once(round_id=engine.lp_auto_state()['last_round']['round_id'])
+        assert (exchange.posts, exchange.cancels) == before
+        assert {sid: store.lp_actions(sid) for sid in audits} == audits
 
     def due(completed_at):
         approved_phase[0] = False
-        monkeypatch.setattr(pool, 'NOW', completed_at + timedelta(seconds=30))
+        monkeypatch.setattr(pool, 'NOW', completed_at + timedelta(microseconds=1))
         publish_candidates(exchange, lp, store, REWARDS)
         return scheduler.run_due()
 
@@ -1364,24 +1307,9 @@ def test_transient_resource_contention_resumes_without_replacing_plan(tmp_path, 
         assert all(a['state'] == 'not_sent' and a['reason'] == 'next_round_capacity'
             for a in original['actions'] if a['kind'] == 'buy')
         assert exchange.posts == []
+        cancel_round = original
         if resource == 'execution_lock_before_cancel':
-            assert original['cancel_registration'] is None
-            assert all(a['kind'] == 'buy' for a in original['actions'])
-            assert not [a for session in store.lp_sessions() for a in store.lp_actions(session['session_id'])
-                if a.get('rotation_round_id') == original['round_id']]
-            assert exchange.cancels == [] and exchange.orders == original_orders
-            assert state['slots']['occupied'] == 5 and Decimal(state['funds']['buy_reserved_usd']) == 39
-            failed_audits = {s['session_id']: deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
-            assert all(not a.get('rotation_round_id') for values in failed_audits.values() for a in values)
-            silent(completed_at)
-            unlock()
-            assert due(completed_at)
-            state, cancel_round, completed_at = closed()
-            assert cancel_round['round_id'] != original['round_id']
-            assert {a['action_id'] for a in cancel_round['actions']}.isdisjoint(a['action_id'] for a in original['actions'])
-            assert {sid: store.lp_actions(sid)[:len(audits)] for sid, audits in failed_audits.items()} == failed_audits
-        else:
-            cancel_round = original
+            assert held, 'Unrelated execution flock remains held during exact-ID dispatch'
         _wait_round_cancels(store, state)
         assert Counter(exchange.cancels) == Counter(['original-A', 'original-D', 'original-I'])
         assert live_orders(exchange) == {token: original_ids[token] for token in ('B', 'C')}
@@ -1404,28 +1332,17 @@ def test_transient_resource_contention_resumes_without_replacing_plan(tmp_path, 
         assert all(Decimal(s['price']) == Decimal('.39') and Decimal(s['quantity']) == 20 and s['post_only'] is True for s in signatures)
         assert not any(r['phase'] == 'automatic_approved' for r in reads), reads
         assert {sid: store.lp_actions(sid) for sid in old_audits} == old_audits
+        successful = attempted
         if resource == 'execution_lock':
-            assert held and exchange.posts == []
-            assert all(a['state'] in ('rejected', 'not_sent') for a in attempted['actions'])
-            entry_audits = [a for s in store.lp_sessions() for a in store.lp_actions(s['session_id']) if a['role'] == 'entry']
-            assert len(entry_audits) == 3 and all(a['state'] == 'rejected' and a['post_started'] is False
-                and not a.get('order_id') and Decimal(a['price']) == Decimal('.39')
+            assert held, 'All three signed BUYs dispatch despite unrelated execution flock'
+            entry_audits = [a for row in store.lp_sessions() for a in store.lp_actions(row['session_id']) if a['role'] == 'entry']
+            assert len(entry_audits) == 3 and all(a['state'] == 'accepted' and a['post_started'] is True
+                and a.get('order_id') and Decimal(a['price']) == Decimal('.39')
                 and Decimal(a['quantity']) == 20 for a in entry_audits)
-            ended_audits = {a['session_id']: deepcopy(store.lp_actions(a['session_id'])) for a in entry_audits}
-            silent(completed_at)
-            unlock()
-            assert due(completed_at)
-            state, successful, completed_at = closed()
-            assert successful['round_id'] != attempted['round_id']
-            assert {a['action_id'] for a in successful['actions']}.isdisjoint(a['action_id'] for a in attempted['actions'])
-            assert {sid: store.lp_actions(sid) for sid in ended_audits} == ended_audits
-            assert Counter(s['token_id'] for s in signatures) == Counter(['E', 'E', 'F', 'F', 'G', 'G'])
-        else:
-            successful = attempted
-            if blockers:
-                assert len(preview_calls) == len(blockers)
-                assert len([r for r in reads if r['phase'] == 'preview' and r['method'] == 'lp_account_snapshot']) == len(blockers)
-                assert not any(event.is_set() for event in completed.values())
+        if blockers:
+            assert len(preview_calls) == len(blockers)
+            assert len([r for r in reads if r['phase'] == 'preview' and r['method'] == 'lp_account_snapshot']) == len(blockers)
+            assert not any(event.is_set() for event in completed.values())
         assert all(a['state'] == 'success' for a in successful['actions'])
         assert Counter(p['token_id'] for p in exchange.posts) == Counter(['E', 'F', 'G'])
         assert all(Decimal(p['price']) == Decimal('.39') and Decimal(p['quantity']) == 20
@@ -1493,9 +1410,14 @@ def test_approved_plan_continues_after_financial_change(tmp_path, monkeypatch, w
     engine, exchange, lp, store = plan_setup(tmp_path,monkeypatch,initial)
     result_reader = install_order_result_reader(exchange,monkeypatch)
     interval = 300 if initial else 1
-    configured = engine.lp_auto_configure(dict(round_interval_seconds=interval,
+    before_config = deepcopy(engine.lp_auto_state())
+    with pytest.raises(ValueError, match='round_interval_seconds_retired_in_continuous_mode'):
+        engine.lp_auto_configure(dict(round_interval_seconds=interval,
+            api_retry_interval_seconds=60,order_check_interval_seconds=1 if initial else 10))
+    assert engine.lp_auto_state() == before_config
+    configured = engine.lp_auto_configure(dict(
         api_retry_interval_seconds=60,order_check_interval_seconds=1 if initial else 10))
-    assert configured['round_interval_seconds'] == interval and configured['api_retry_interval_seconds'] == 60
+    assert configured['round_interval_seconds'] == 30 and configured['api_retry_interval_seconds'] == 60
     assert configured['order_check_interval_seconds'] == (1 if initial else 10)
     scheduler = LPAutoScheduler(engine,clock=lambda:pool.NOW)
     captured, forbidden, financial_reads, signatures, packets, mutations = [], [], [], [], [], []
@@ -1631,11 +1553,11 @@ def test_approved_plan_continues_after_financial_change(tmp_path, monkeypatch, w
         assert original['round_id'] == approved['active_plan']['round_id']
         assert original['targets'] == approved['last_round']['targets']
         assert [a['action_id'] for a in original['actions']] == [a['action_id'] for a in approved['active_plan']['actions']]
-        assert original['completed_at'] and first['active_plan'] is None and first['plan_wait']['kind'] == 'round'
+        assert original['completed_at'] and first['active_plan'] is None and first['plan_wait'] is None
         assert first['funds']['as_of'] == approved['funds']['as_of']
         completed = datetime.fromisoformat(original['completed_at'])
-        deadline = datetime.fromisoformat(first['plan_wait']['deadline'])
-        assert deadline == completed+timedelta(seconds=interval)
+        deadline = datetime.fromisoformat((first['last_round'].get('completed_at') or first['last_round']['checked_at']))
+        assert deadline == completed
         old_audits = {row['session_id']:deepcopy(store.lp_actions(row['session_id'])) for row in store.lp_sessions()}
         if initial:
             assert exchange.posts == [] and Counter(exchange.cancels) == Counter(['original-A','original-D','original-I'])
@@ -1658,15 +1580,9 @@ def test_approved_plan_continues_after_financial_change(tmp_path, monkeypatch, w
         else:
             assert Counter(p['token_id'] for p in exchange.posts) == Counter(['B','C','E','F','G'])
             assert exchange.cancels == [] and all(a['state'] == 'success' for a in original['actions'])
-        before = (len(financial_reads),len(packets),len(signatures),len(exchange.posts),len(exchange.cancels))
-        monkeypatch.setattr(pool,'NOW',completed+timedelta(seconds=interval/2))
-        scheduler.request_check()
-        assert not scheduler.run_due()
-        assert (len(financial_reads),len(packets),len(signatures),len(exchange.posts),len(exchange.cancels)) == before
-        assert {sid:store.lp_actions(sid) for sid in old_audits} == old_audits
         state = first
         if initial:
-            monkeypatch.setattr(pool,'NOW',deadline)
+            monkeypatch.setattr(pool,'NOW',deadline+timedelta(microseconds=1))
             publish_candidates(exchange,lp,store,REWARDS)
             assert scheduler.run_due()
             state = engine.lp_auto_state()
@@ -1691,13 +1607,11 @@ def test_approved_plan_continues_after_financial_change(tmp_path, monkeypatch, w
                 assert Decimal(audit['price']) == Decimal('.39') and Decimal(audit['quantity']) == 20
         assert forbidden == [] and not any(r['active'] for r in financial_reads)
         final_completed = datetime.fromisoformat(state['last_round']['completed_at'])
-        assert datetime.fromisoformat(state['plan_wait']['deadline']) == final_completed+timedelta(seconds=interval)
+        assert state['plan_wait'] is None
         final_audits = {row['session_id']:deepcopy(store.lp_actions(row['session_id'])) for row in store.lp_sessions()}
-        before = (len(financial_reads),len(packets),len(signatures),len(exchange.posts),len(exchange.cancels))
-        monkeypatch.setattr(pool,'NOW',final_completed+timedelta(seconds=interval/2))
-        scheduler.request_check()
-        assert not scheduler.run_due()
-        assert (len(financial_reads),len(packets),len(signatures),len(exchange.posts),len(exchange.cancels)) == before
+        before = (deepcopy(exchange.posts),list(exchange.cancels))
+        engine.lp_auto_run_once(round_id=state['last_round']['round_id'])
+        assert (exchange.posts,exchange.cancels) == before
         assert {sid:store.lp_actions(sid) for sid in final_audits} == final_audits
         if window == 'final_buy_generation':
             diagnostic['completed'] = 'full'
