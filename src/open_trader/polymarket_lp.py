@@ -12520,10 +12520,19 @@ class PolymarketLPService:
                         or current_generation is not None and int(connection.execute('SELECT generation FROM lp_trade_generation WHERE singleton=1').fetchone()[0]) != current_generation
                         or _timestamp((observations.get(oid) or {}).get('attempted_at') or _iso(started_at)) > started_at):
                     continue
+                previous = observations.get(oid) or {}
+                prepared = previous_observations.get(oid) or {}
+                # A later start cannot renew authority read before another
+                # publisher changed its proof or denial. Fence both directions:
+                # stale known and stale UNKNOWN must preserve the current proof.
+                if any(previous.get(key) != prepared.get(key) for key in (
+                        'account_id', 'order_id', 'order_checked_at', 'order_read_started_at',
+                        'order_trade_generation', 'order_terms', 'order_current_proof_required',
+                        'order_proof_invalidated_at')):
+                    continue
                 remaining = self._queue_row_remaining(row)
                 estimate = estimates[oid]
                 known = estimate is not None and estimate.get('state') == 'known'
-                previous = observations.get(oid) or {}
                 observations[oid] = dict(estimate or {'state': 'unknown'})
                 observations[oid].update(account_id=wallet, order_id=oid,
                     quantity=str(remaining), price=str(row['price']), attempted_at=_iso(started_at),

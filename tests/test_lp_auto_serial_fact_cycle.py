@@ -1600,6 +1600,169 @@ def test_partial_account_failure_uses_current_owned_buy_quantity(request, runtim
     assert Decimal(store.lp_session(sid)['buy_filled_quantity']) == 0
     assert account.trades == account.positions == ()
     assert account.posts == account.market_orders == account.cancels == []
+    # Suspend the real monitor after its valid source proof has been read,
+    # without holding its publication writer or the common LP mutex.
+    from threading import get_ident
+    sdk_failed, proof_read, resume_monitor, denial_committed = Event(), Event(), Event(), Event()
+    native = dict(owner_thread=None, claimed=False, proofs={}, commits=[], gate=None)
+    claim_lock = Lock()
+    connect = store._connection
+    failure_count = expected_controls['queue_protection']['data_failures'] + 1
+    old_proof = deepcopy(revalidated)
+    generation_before = store.lp_trade_generation()
+    def race_source_failure(**kwargs):
+        sdk_failed.set()
+        return unavailable(**kwargs)
+    setattr(account, method, race_source_failure)
+    class ProofCursor(sqlite3.Cursor):
+        def execute(self, sql, parameters=()):
+            self.statement = sql
+            self.parameters = parameters
+            result = super().execute(sql, parameters)
+            if sql == 'UPDATE lp_sessions SET state=?,payload=?,updated_at=? WHERE session_id=?' and parameters[-1] == sid:
+                payload = json.loads(parameters[1])
+                if (sdk_failed.is_set() and native['owner_thread'] is None
+                        and Decimal(str((payload.get('queue_protection') or {}).get('data_failures', 0))) == failure_count):
+                    self.connection.failed_snapshot_transition = True
+                observation = (payload.get('buy_yield_observations') or {}).get(original.id) or {}
+                if observation.get('state') == 'unknown' and observation.get('order_proof_invalidated_at'):
+                    self.connection.denial_candidate = deepcopy(observation)
+            if sql == 'COMMIT':
+                if getattr(self.connection, 'failed_snapshot_transition', False) and native['owner_thread'] is None:
+                    native['owner_thread'] = get_ident()
+                    native['failure_commit'] = dict(thread=get_ident(), in_transaction=self.connection.in_transaction,
+                        at=runtime.clock[0].isoformat(), data_failures=failure_count)
+                if getattr(self.connection, 'denial_candidate', None):
+                    native['commits'].append(dict(thread=get_ident(), in_transaction=self.connection.in_transaction,
+                        at=runtime.clock[0].isoformat(), observation=self.connection.denial_candidate))
+                    denial_committed.set()
+            return result
+        def fetchone(self):
+            row = super().fetchone()
+            thread = get_ident()
+            if (self.statement == 'SELECT * FROM lp_sessions WHERE session_id=?'
+                    and self.parameters == (sid,) and row is not None
+                    and thread == native['owner_thread'] and not self.connection.in_transaction):
+                proof = (json.loads(row['payload']).get('buy_yield_observations') or {}).get(original.id) or {}
+                if (proof.get('state') == 'known' and proof.get('order_checked_at') == old_proof['order_checked_at']
+                        and Decimal(proof['quantity']) == 32):
+                    native['proofs'][thread] = deepcopy(proof)
+            if (self.statement == 'SELECT generation FROM lp_trade_generation WHERE singleton=1'
+                    and row is not None and thread == native['owner_thread']
+                    and thread in native['proofs'] and not self.connection.in_transaction):
+                with claim_lock:
+                    claim = not native['claimed']
+                    if claim:
+                        native['claimed'] = True
+                if claim:
+                    native['gate'] = dict(thread=thread, generation=int(row[0]),
+                        in_transaction=self.connection.in_transaction, at=runtime.clock[0].isoformat(),
+                        proof=native['proofs'][thread])
+                    self.close()  # Release the actual SQLite read cursor before suspension.
+                    proof_read.set()
+                    assert resume_monitor.wait(5), 'Independent native proof-read watchdog'
+            return row
+    class ProofConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            return self.cursor(factory=ProofCursor).execute(sql, parameters)
+    def observed_connection():
+        connection = sqlite3.connect(store.path, isolation_level=None, check_same_thread=False,
+            factory=ProofConnection)
+        connection.row_factory = sqlite3.Row
+        connection.execute('PRAGMA foreign_keys=ON')
+        return connection
+    race_result = Future()
+    def public_monitor():
+        try:
+            race_result.set_result(engine.lp_tick())
+        except BaseException as exc:
+            race_result.set_exception(exc)
+    monitor = Thread(target=public_monitor)
+    raced_omission = raced_current = restored_after_race = None
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(store, '_connection', observed_connection)
+        try:
+            monitor.start()
+            assert sdk_failed.wait(5) and proof_read.wait(5), native
+            assert native['gate']['in_transaction'] is False
+            assert native['gate']['proof'] == old_proof and native['gate']['generation'] == generation_before
+            assert lp._mutex.acquire(blocking=False), 'Proof gate must not hold the common LP mutex'
+            lp._mutex.release()
+            writer_probe = connect()
+            try:
+                writer_probe.execute('BEGIN IMMEDIATE')
+                writer_probe.rollback()
+            finally:
+                writer_probe.close()
+            expected_controls['queue_protection']['data_failures'] = failure_count
+            account.orders = ()
+            runtime.clock[0] += timedelta(seconds=1)
+            raced_omission = engine.lp_auto_run_once(round_id='review-overlap-new-complete-omission')
+            assert denial_committed.is_set(), native
+            raced_packet = raced_omission['account_observation']
+            assert raced_packet['authenticated'] is True and raced_packet['account_id'] == owner['account_id']
+            assert raced_packet['open_orders_complete'] is True and raced_packet['open_orders'] == []
+            assert raced_packet['components']['open_orders']['state'] == 'known'
+            assert raced_packet['components']['balance' if failure == 'balance_failed' else 'positions']['state'] == 'failed'
+            raced_current = deepcopy(_yield(store, original.id))
+            assert raced_current['state'] == 'unknown' and raced_current['order_proof_invalidated_at']
+            assert native['commits'][-1]['observation'] == raced_current
+            assert native['commits'][-1]['in_transaction'] is False
+            race_unknown_since = store.lp_session(sid)['buy_yield_unknown'][original.id]['unknown_since']
+            assert store.lp_trade_generation() == generation_before
+            assert store.lp_session(sid)['order_history'] == history and store.lp_actions(sid) == audits
+            assert {k: store.lp_session(sid).get(k) for k in controls} == expected_controls
+            assert raced_omission['funds']['status'] == 'unknown' and raced_omission['funds']['as_of'] == financial_as_of
+            assert raced_omission['funds']['spendable_usd'] is None
+            assert raced_omission['slots']['occupied'] == 1 and Decimal(raced_omission['funds']['buy_reserved_usd']) == 16
+            assert account.posts == account.market_orders == account.cancels == []
+            runtime.clock[0] += timedelta(seconds=1)
+            assert runtime.clock[0] > datetime.fromisoformat(raced_current['attempted_at'].replace('Z', '+00:00'))
+            assert runtime.clock[0] - datetime.fromisoformat(old_proof['order_checked_at'].replace('Z', '+00:00')) < timedelta(seconds=60)
+            native['resume_at'] = runtime.clock[0].isoformat()
+            resume_monitor.set()
+            race_result.result(timeout=5)
+            monitor.join(5)
+            assert not monitor.is_alive()
+            after_overlap = _yield(store, original.id)
+            assert after_overlap['state'] == 'unknown', 'A later-starting old monitor cannot erase a committed newer proof revocation'
+            assert after_overlap['order_proof_invalidated_at'] == raced_current['order_proof_invalidated_at']
+            assert store.lp_session(sid)['buy_yield_unknown'][original.id]['unknown_since'] == race_unknown_since
+            for key in ('order_checked_at', 'order_read_started_at', 'order_trade_generation', 'order_terms'):
+                assert after_overlap[key] == raced_current[key]
+            assert store.lp_session(sid)['order_history'] == history and store.lp_actions(sid) == audits
+            assert {k: store.lp_session(sid).get(k) for k in controls} == expected_controls
+            assert Decimal(store.lp_session(sid)['buy_filled_quantity']) == 0
+            # A genuine strictly later owned source can still revalidate.
+            account.orders = (original.model_copy(update={'size_matched': Decimal('8')}),)
+            runtime.clock[0] += timedelta(seconds=1)
+            restored_after_race = engine.lp_auto_run_once(round_id='review-overlap-later-valid32')
+            final_proof = _yield(store, original.id)
+            assert final_proof['state'] == 'known' and Decimal(final_proof['quantity']) == 32
+            assert Decimal(final_proof['capital_usd']) == Decimal('12.80')
+            assert Decimal(final_proof['yield_pct_per_hour']).quantize(Decimal('.000001')) == Decimal('.084232')
+            assert final_proof['order_checked_at'] == restored_after_race['account_observation']['components']['open_orders']['checked_at']
+            assert datetime.fromisoformat(final_proof['order_checked_at'].replace('Z', '+00:00')) > datetime.fromisoformat(raced_current['order_proof_invalidated_at'].replace('Z', '+00:00'))
+            assert not final_proof.get('order_proof_invalidated_at')
+            assert original.id not in store.lp_session(sid).get('buy_yield_unknown', {})
+            assert restored_after_race['funds']['status'] == 'unknown' and restored_after_race['funds']['spendable_usd'] is None
+            assert restored_after_race['funds']['as_of'] == financial_as_of
+            assert restored_after_race['slots']['occupied'] == 1 and Decimal(restored_after_race['funds']['buy_reserved_usd']) == 16
+            assert Decimal(restored_after_race['funds']['inventory_cost_usd']) == 0
+            assert store.lp_session(sid)['order_history'] == history and store.lp_actions(sid) == audits
+            assert {k: store.lp_session(sid).get(k) for k in controls} == expected_controls
+            assert Decimal(store.lp_session(sid)['buy_filled_quantity']) == 0
+            assert account.trades == account.positions == ()
+            assert account.posts == account.market_orders == account.cancels == []
+        finally:
+            resume_monitor.set()
+            if monitor.ident is not None:
+                monitor.join(5)
+                assert not monitor.is_alive()
+            lp.drain_submissions()
+            (tmp_path / 'F4-native-overlap-evidence.json').write_text(json.dumps(dict(
+                native=native, raced_omission=raced_omission, raced_current=raced_current,
+                restored_after_race=restored_after_race), default=str, indent=2))
     (tmp_path / 'review-F4-current-terms.json').write_text(json.dumps(
         dict(failure=failure, initial=initial, current=current, observed=observed,
             tick=tick, monitored=monitored, omitted=omitted, invalidated=invalidated,
