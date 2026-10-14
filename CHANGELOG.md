@@ -3,6 +3,11 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-14
+
+- #339 自动 LP 候选筛选复用本轮已验证的当前挂单、持仓及未释放请求占位，按市场和 token 建立索引，避免逐候选读取全部历史会话。行情在各自资格校验时检查有效期；后续选单耗时不撤销已经校验的目标，账户身份检查继续生效。
+  固定 BUY 目标和价量各尝试一次，真实拒绝或 UNKNOWN 不触发同轮替换。公开 SDK 回归证明原生全会话 SELECT 从 15 次降至 11 次，早期行情因后续读取超过 60 秒的回归已有 RED／GREEN；43 项直接受影响检查通过，最终新增用例的观察及资源回收断言另行通过。独立评审与精确提交 CI 由 Main 确认，尚未合并或部署。
+
 ## 2026-10-13
 
 - #339 日历史并发测试按精确请求身份与次数核对 B 的重试及 A/C 的刷新；外部事件固定合法的 A/C 先到、B 后到顺序，保留 299/300 秒边界、冷重启、缓存不变与次日新缓存断言。生产源码不变，定向串行与双进程并行结果保存在任务证据，更新提交的 CI 与复审由 Main 确认。

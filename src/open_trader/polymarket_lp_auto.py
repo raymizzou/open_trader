@@ -1153,9 +1153,13 @@ class LPAutoPool:
                 else:
                     counts['facts_present'] += 1
             counts['pool_unexpired'] = counts['pool_total'] - counts['pool_expired']
+        participation = self._planning_participation(observation) if observation is not None else None
         result=[]
         for condition_id,cached in facts.items():
-            if self._excluded(condition_id):
+            participating = (condition_id in participation[0] or any(
+                str(direction.get('market', {}).get('token_id') or '') in participation[1]
+                for direction in cached.get('directions', ()))) if participation is not None else self._excluded(condition_id)
+            if participating:
                 if diagnostics is not None:
                     counts['participating_markets'] += 1
                     _candidate_filter_reasons(diagnostics, ['participating_market'])
@@ -1209,6 +1213,27 @@ class LPAutoPool:
         if diagnostics is not None:
             counts['qualified_directions'] = len(result)
         return sorted(result,key=lambda r:(*_candidate_yield_sort_key(r), str(r['token_id'])))
+
+    @staticmethod
+    def _planning_participation(observation):
+        """Index the acquired current exposure and its unreleased request holds."""
+        conditions, tokens = set(), set()
+        account = observation['account']
+        document = observation['document']
+        rows = list(account.get('open_orders') or ())
+        rows += [row for row in account.get('positions') or ()
+                 if (_maybe_decimal(row.get('size')) or ZERO) > ZERO]
+        financial = document.get('account_financial_facts') or {}
+        rows += list(financial.get('pending_buy_actions') or ())
+        rows += [row for row in document['intents'].values()
+                 if row['state'] not in ('terminal', 'rejected', 'aborted')
+                 and not reservation_is_released(row, document['account_id'])]
+        for row in rows:
+            if row.get('condition_id'):
+                conditions.add(str(row['condition_id']))
+            if row.get('token_id'):
+                tokens.add(str(row['token_id']))
+        return conditions, tokens
 
     def _ranking_account(self, account, releasing):
         if not isinstance(account.get('open_orders'), (list, tuple)):
@@ -1685,7 +1710,9 @@ class LPAutoPool:
                     _candidate_filter_reasons(diagnostics, [str(exc)], field='recheck_reasons')
         blocked.extend(budget_skipped)
         for row in targets:
-            self._ranking_fresh(row, observation=observation)
+            # Each market packet passed freshness at its own qualification.
+            # Other targets' reads cannot revoke that receipt by ageing it.
+            self._ranking_fresh(row, observation=observation, qualification_receipt=True)
         selected = {self._buy_identity(t) for t in targets if self._resting_buy(t)}
         victims = drifted + [r for r in rows if self._resting_buy(r) and self._buy_identity(r) not in selected]
         if victims:
@@ -1704,13 +1731,15 @@ class LPAutoPool:
         candidates.sort(key=lambda r: (-_decimal(r['minimum_order_estimate']['yield_pct_per_hour']), str(r['condition_id']), str(r['token_id'])))
         return [*retained, *targets], victims, candidates, blocked
 
-    def _ranking_fresh(self, row, *, observation=None):
+    def _ranking_fresh(self, row, *, observation=None, qualification_receipt=False):
         wallet = str(row['ranking_account'].get('wallet_address') or '').strip().casefold()
         if not wallet or hashlib.sha256(wallet.encode()).hexdigest() != self.execution._lp_account_id():
             raise ValueError('account_identity_mismatch')
         generation = row['ranking_account'].get('trade_generation')
         if observation is None and generation is not None and generation != self.store.lp_trade_generation():
             raise ValueError('account_financial_facts_changed')
+        if qualification_receipt:
+            return
         stamps = [row['ranking_book_at']]
         if observation is None:
             stamps.append(row['ranking_account'].get('checked_at'))
