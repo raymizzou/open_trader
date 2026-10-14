@@ -952,7 +952,7 @@ def test_history_fallback_preserves_current_read_failures(runtime, failure):
         state = execution.lp_auto_run_once()
         assert signed == account.posts == account.cancels == []
         assert state['active_plan'] is None and state['last_round']['targets'] == []
-        assert state['last_round']['reason'] == ('account_order_sync_unknown' if failure == 'orders' else 'account_position_cost_unknown')
+        assert state['last_round']['reason'] == ('account_snapshot_incomplete' if failure == 'orders' else 'account_position_cost_unknown')
         assert account_packet(store) == original
         assert store.lp_sessions() == sessions
         with pytest.raises(PolymarketTradingError):
@@ -963,8 +963,12 @@ def test_history_fallback_preserves_current_read_failures(runtime, failure):
         assert signed == account.posts == account.cancels == []
         assert state['active_plan'] is None and state['last_round']['targets'] == []
         assert store.lp_sessions() == sessions
-        assert state['last_round']['reason'] == ('account_order_sync_unknown' if failure == 'orders' else 'account_position_cost_unknown')
+        assert state['last_round']['reason'] == ('account_snapshot_incomplete' if failure == 'orders' else 'account_position_cost_unknown')
         account.list_open_orders, account.positions = orders, ()
+        if failure == 'orders':
+            deadline = state['account_observation']['components']['open_orders']['retry_at']
+            assert deadline is not None
+            runtime.clock[0] = datetime.fromisoformat(deadline)
         advance_api_wait(runtime, execution)
         state = execution.lp_auto_run_once()
         assert Counter(post.token_id for post in account.posts) == Counter(_refill_identity(i)[2] for i in range(1, 6))

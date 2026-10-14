@@ -164,35 +164,38 @@ def test_account_rotation_ranks_and_cancels_real_id_without_fake_intent(tmp_path
 
 
 def test_overcapacity_same_token_buys_use_two_slots_and_exact_rotation_victim(tmp_path, monkeypatch):
-    engine, exchange, lp, store, rotation = rotation_pool(tmp_path, monkeypatch, same_token=True)
+    from tests import test_lp_auto_rotation as rotation
     from tests.test_lp_auto_plan_execution import install_order_result_reader
     from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    monkeypatch.setattr(pool, 'NOW', pool.NOW)
+    engine, exchange, lp, store = rotation.setup(tmp_path, monkeypatch, count=3, target=1)
+    original = deepcopy(store.lp_actions(engine.lp_auto_state()['intents'][0]['session_id']))
+    exchange.orders.append({**exchange.orders[0], 'order_id': 'manual-second'})
+    exchange.lp_account_snapshot_shared = lambda **kwargs: pool._fresh_registration_bundle(exchange, lp)
+    engine.lp_auto_set_desired_running(False)
+    assert engine.refresh_lp_dashboard_snapshot()['state'] == 'ready'
     install_order_result_reader(exchange, monkeypatch)
-    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m00'] = Decimal('30')
     rotation.refresh(lp, exchange, 3)
-    state = engine.lp_auto_state()
-    assert state['slots']['occupied'] == 2
-    assert Decimal(state['funds']['buy_reserved_usd']) == Decimal('16')
-    targets, victims, _, blocked = engine._auto_pool._ranked_buys(state)
-    assert not blocked
-    assert len(targets) == 1
-    assert len(victims) == 1
-    assert targets[0]['order_id'] != victims[0]['order_id']
-    assert {targets[0]['order_id'], victims[0]['order_id']} == {'o1', 'manual-second'}
-    completed = engine.lp_auto_run_once()
+    observed = engine.lp_auto_run_once(round_id='observe-actual-yields')
+    assert exchange.cancels == [] and len(exchange.posts) == 1
+    assert observed['slots']['occupied'] == 2
+    assert Decimal(observed['funds']['buy_reserved_usd']) == 16
+    engine.lp_auto_set_desired_running(True)
+    completed = engine.lp_auto_run_once(round_id='exact-overcapacity-victim')
     assert completed['active_plan'] is None and completed['last_round']['completed_at']
+    target, = completed['last_round']['targets']
     receipt, = _wait_round_cancels(store, completed)
-    assert receipt['state'] == 'accepted' and receipt['order_id'] == victims[0]['order_id']
-    assert receipt['session_id'] == victims[0]['session_id']
+    # Equal yields retain the stable lexical exchange-ID winner.
+    assert target['order_id'] == 'manual-second' and receipt['order_id'] == 'o1'
+    assert receipt['state'] == 'accepted' and receipt['session_id'] == target['session_id']
     assert receipt['rotation_round_id'] == completed['last_round']['round_id']
     assert receipt['action_id'] and receipt['action_key']
     assert any(a['action_id'] == receipt['action_id'] and a['action_key'] == receipt['action_key']
         for a in store.lp_actions(receipt['session_id']))
-    assert completed['last_round']['targets'][0]['order_id'] == targets[0]['order_id']
-    assert exchange.cancels == [victims[0]['order_id']]
-    assert len(exchange.cancels) == 1
-    assert len(exchange.posts) == 1
+    assert [a for a in store.lp_actions(receipt['session_id']) if a.get('role') == 'entry'] == original
+    assert completed['slots']['occupied'] == 2 and Decimal(completed['funds']['buy_reserved_usd']) == 16
+    assert exchange.cancels == ['o1'] and len(exchange.posts) == 1
 
 
 def test_account_rotation_fill_keeps_inventory_budget_without_sale(tmp_path, monkeypatch):

@@ -232,17 +232,19 @@ def test_fresh_funds_survive_refresh_but_expire_and_recovery_wakes_scheduler(tmp
     from tests import test_lp_auto_pool as venue
     from open_trader.polymarket_lp_scheduler import LPAutoScheduler
 
-    execution, exchange, _, _ = setup(tmp_path)
+    execution, exchange, lp, store = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
     execution.lp_auto_run_once()
     execution.lp_auto_set_desired_running(False)
     scheduler_now = venue.NOW
     scheduler = LPAutoScheduler(execution, clock=lambda: scheduler_now)
-    advance_auto_wait(execution, monkeypatch)
     scheduler_now = venue.NOW
     assert scheduler.run_due()
-    assert not scheduler.run_due()
+    first_round = execution.lp_auto_state()['last_round']['round_id']
+    assert scheduler.run_due(), 'Paused automatic observation stays continuously runnable'
+    assert execution.lp_auto_state()['last_round']['round_id'] != first_round
+    assert execution.lp_auto_state()['plan_wait'] is None
     entered, release = Event(), Event()
     read = exchange.lp_snapshot
 
@@ -266,7 +268,14 @@ def test_fresh_funds_survive_refresh_but_expire_and_recovery_wakes_scheduler(tmp
     assert execution.lp_auto_state()['funds']['status'] == 'known'
     scheduler_now = venue.NOW
     assert scheduler.run_due(), 'recovery runs after the persisted deadline has elapsed'
-    assert not scheduler.run_due(), 'one recovery produces a coalesced wake'
+    recovered_round = execution.lp_auto_state()['last_round']['round_id']
+    assert scheduler.run_due(), 'Healthy current cycles remain runnable after the recovery wake'
+    assert execution.lp_auto_state()['last_round']['round_id'] != recovered_round
+    assert execution.lp_auto_state()['plan_wait'] is None
+    assert Decimal(execution.lp_auto_state()['funds']['buy_reserved_usd']) == 0
+    assert Decimal(execution.lp_auto_state()['funds']['available_usd']) == 100
+    scheduler.stop()
+    lp.drain_submissions()
     assert len(exchange.posts) == 1
 
 
@@ -471,8 +480,8 @@ def test_review_cancel_omitted_from_snapshot_stays_outside_common_mutex(
     from tests.test_lp_auto_pool import _manual_request
 
     execution, exchange, lp, store = setup(tmp_path)
-    now = datetime(2026, 9, 27, 8, tzinfo=UTC)
-    lp.clock = lambda: now
+    from tests import test_lp_auto_pool as venue
+    now = venue.NOW
     store.lp_create_session(
         "review-off-lock",
         "review-off-lock",
@@ -535,6 +544,13 @@ def test_review_cancel_omitted_from_snapshot_stays_outside_common_mutex(
     finally:
         release.set()
         worker.join(5)
+        import json
+        from tests import test_lp_auto_pool as venue
+        (tmp_path / 'manual-review-observation.json').write_text(json.dumps(dict(
+            results=results, session=store.lp_session("review-off-lock"),
+            lp_now=lp._now(), venue_now=venue.NOW, entered=entered.is_set()), default=str, indent=2))
+        assert not worker.is_alive()
+        lp.drain_submissions()
     assert not worker.is_alive()
     assert cancel_calls == ["o1"]
     row = store.lp_session("review-off-lock")
@@ -547,8 +563,8 @@ def test_converged_queue_buy_allows_protected_sell_outside_common_mutex(tmp_path
     from tests.test_lp_auto_pool import _manual_request
 
     execution, exchange, lp, store = setup(tmp_path)
-    now = datetime(2026, 9, 27, 8, tzinfo=UTC)
-    lp.clock = lambda: now
+    from tests import test_lp_auto_pool as venue
+    now = venue.NOW
     store.lp_create_session(
         "protected-off-lock",
         "protected-off-lock",
@@ -627,7 +643,8 @@ def test_converged_queue_buy_allows_protected_sell_outside_common_mutex(tmp_path
         return {"order_id": "sell-o1", "status": "LIVE"}
 
     exchange.submit_protected_sell = protected_sell
-    worker = Thread(target=execution.lp_tick)
+    results = []
+    worker = Thread(target=lambda: results.append(execution.lp_tick()))
     worker.start()
     try:
         assert entered.wait(5)
@@ -644,6 +661,13 @@ def test_converged_queue_buy_allows_protected_sell_outside_common_mutex(tmp_path
     finally:
         release.set()
         worker.join(5)
+        import json
+        from tests import test_lp_auto_pool as venue
+        (tmp_path / 'manual-protected-observation.json').write_text(json.dumps(dict(
+            results=results, session=store.lp_session("protected-off-lock"),
+            lp_now=lp._now(), venue_now=venue.NOW, entered=entered.is_set()), default=str, indent=2))
+        assert not worker.is_alive()
+        lp.drain_submissions()
     assert not worker.is_alive()
     assert len(sell_calls) == 1
     assert sell_calls[0]["token_id"] == "m00"
@@ -778,16 +802,29 @@ def test_scheduler_reuses_published_facts_and_leaves_settled_history_alone(tmp_p
 
 def test_session_and_funds_publication_roll_back_together(tmp_path):
     import sqlite3
+    from copy import deepcopy
     execution, exchange, _, store = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
     sid = execution.lp_auto_run_once()['intents'][0]['session_id']
     before = store.lp_session(sid)
+    audits = deepcopy(store.lp_actions(sid))
+    funds = deepcopy(execution.lp_auto_state()['funds'])
     exchange.orders[0]['status'] = 'CANCELED'
     with sqlite3.connect(store.path) as connection:
         connection.execute("CREATE TRIGGER fail_funds BEFORE UPDATE ON lp_auto_pool BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
     assert execution.lp_tick()['state'] == 'error'
-    assert store.lp_session(sid) == before
+    after = store.lp_session(sid)
+    observed = after['buy_yield_observations']['o1']
+    assert observed['state'] == 'known' and observed['order_id'] == 'o1'
+    assert Decimal(observed['quantity']) == 20 and Decimal(observed['capital_usd']) == 8
+    assert observed['checked_at'] and observed['reward_checked_at'] and observed['book_received_at']
+    expected = deepcopy(before)
+    expected.update(buy_yield_observations=after['buy_yield_observations'],
+        buy_yield_unknown={}, updated_at=after['updated_at'])
+    assert after == expected, 'Only the independent successful yield publication committed'
+    assert store.lp_actions(sid) == audits
+    assert execution.lp_auto_state()['funds'] == funds
     assert Decimal(execution.lp_auto_state()['funds']['buy_reserved_usd']) == 8
     with sqlite3.connect(store.path) as connection:
         connection.execute('DROP TRIGGER fail_funds')
@@ -1128,16 +1165,15 @@ def test_tick_recovers_saved_accepted_id_after_receipt_apply_was_busy(tmp_path):
     execution, exchange, _, store = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
-    original = exchange.lp_post_order
-    with (tmp_path / 'execution.lock').open('a+') as lock:
-        def posted(signed):
-            result = original(signed)
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return result
-        exchange.lp_post_order = posted
+    from copy import deepcopy
+    from tests.test_lp_auto_plan_execution import _native_unbound_receipt
+    with _native_unbound_receipt(store, 'm00'):
         result = execution.lp_auto_run_once()
         sid = result['intents'][0]['session_id']
         assert not store.lp_session(sid).get('entry_order_id')
+        audit, = store.lp_actions(sid)
+        assert audit['state'] == 'accepted' and audit['post_started'] is True and audit['order_id'] == 'o1'
+        original_audit = deepcopy(audit)
         assert result['funds']['status'] == 'unknown'
     exchange.orders.append(dict(order_id='extra', token_id='m00', condition_id='m00', side='BUY',
         status='CANCELED', original_size='1', size_matched='0', price='.4'))
@@ -1147,6 +1183,7 @@ def test_tick_recovers_saved_accepted_id_after_receipt_apply_was_busy(tmp_path):
     assert store.lp_session(sid)['entry_order_id'] == 'o1'
     assert execution.lp_auto_state()['funds']['status'] == 'known'
     assert len(exchange.posts) == 1
+    assert store.lp_actions(sid) == [original_audit]
 
 
 def test_fresh_read_during_manual_cancel_cannot_restore_known_funds(tmp_path):

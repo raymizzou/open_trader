@@ -2664,95 +2664,102 @@ class PolymarketTradingClient:
         the next observation. There is no executor or unbounded queue.
         """
         started = datetime.now(UTC)
-        values, components = {}, {}
-        readers = {
-            'balance': self._collateral_balance_allowance,
-            'open_orders': lambda: self._planning_account_rows(self._client.list_open_orders()),
-            'positions': lambda: self._planning_account_rows(self._client.list_positions()),
-        }
-        for name, read in readers.items():
-            now = datetime.now(UTC)
-            # Persisted failure metadata can restore pacing after a cold
-            # restart. It never restores a successful value or send authority.
-            previous = self._lp_planning_components.get(name) or (previous_components or {}).get(name) or {}
-            existing = self._lp_planning_reads.get(name)
-            if existing is not None and existing.done():
-                self._lp_planning_reads.pop(name)
-                # A late value cannot become fresh authority. Shared auth or
-                # rate-limit errors still install the existing account fence.
-                failure = existing.exception()
-                if isinstance(failure, PolymarketTradingError):
-                    if failure.response_facts.get('status') in {401, 403, 429}:
-                        raise failure
-                    error = failure.response_facts
-                    previous = dict(state='failed', read_started_at=previous.get('read_started_at'),
-                        checked_at=None, last_success_at=previous.get('last_success_at'), error=error,
-                        retry_at=error['planning_retry_at'])
-                    self._lp_planning_components[name] = previous
-                existing = None
-            retry_at = _venue_timestamp(previous.get('retry_at'))
-            if existing is not None or isinstance(retry_at, datetime) and now < retry_at:
-                components[name] = {**previous, 'state': 'failed',
-                    'error': previous.get('error') or {'error_type': 'account_read_in_progress'}}
-                continue
-            if sum(not job.done() for job in self._lp_planning_reads.values()) >= 2:
-                components[name] = {**previous, 'state': 'failed',
-                    'error': {'error_type': 'account_read_capacity'}}
-                continue
-            future = Future()
-            self._lp_planning_reads[name] = future
+        ended = None
+        _lp_causal_event('account_read_begin', account={'read_started_at': started})
+        try:
+            values, components = {}, {}
+            readers = {
+                'balance': self._collateral_balance_allowance,
+                'open_orders': lambda: self._planning_account_rows(self._client.list_open_orders()),
+                'positions': lambda: self._planning_account_rows(self._client.list_positions()),
+            }
+            for name, read in readers.items():
+                now = datetime.now(UTC)
+                # Persisted failure metadata can restore pacing after a cold
+                # restart. It never restores a successful value or send authority.
+                previous = self._lp_planning_components.get(name) or (previous_components or {}).get(name) or {}
+                existing = self._lp_planning_reads.get(name)
+                if existing is not None and existing.done():
+                    self._lp_planning_reads.pop(name)
+                    # A late value cannot become fresh authority. Shared auth or
+                    # rate-limit errors still install the existing account fence.
+                    failure = existing.exception()
+                    if isinstance(failure, PolymarketTradingError):
+                        if failure.response_facts.get('status') in {401, 403, 429}:
+                            raise failure
+                        error = failure.response_facts
+                        previous = dict(state='failed', read_started_at=previous.get('read_started_at'),
+                            checked_at=None, last_success_at=previous.get('last_success_at'), error=error,
+                            retry_at=error['planning_retry_at'])
+                        self._lp_planning_components[name] = previous
+                    existing = None
+                retry_at = _venue_timestamp(previous.get('retry_at'))
+                if existing is not None or isinstance(retry_at, datetime) and now < retry_at:
+                    components[name] = {**previous, 'state': 'failed',
+                        'error': previous.get('error') or {'error_type': 'account_read_in_progress'}}
+                    continue
+                if sum(not job.done() for job in self._lp_planning_reads.values()) >= 2:
+                    components[name] = {**previous, 'state': 'failed',
+                        'error': {'error_type': 'account_read_capacity'}}
+                    continue
+                future = Future()
+                self._lp_planning_reads[name] = future
 
-            def run(result=future, reader=read, component_name=name):
-                response_facts = {}
-                transport, path = {'balance': ('secure_clob', '/balance-allowance'),
-                    'open_orders': ('secure_clob', '/data/orders'),
-                    'positions': ('data', '/positions')}[component_name]
-                remove = None
+                def run(result=future, reader=read, component_name=name):
+                    response_facts = {}
+                    transport, path = {'balance': ('secure_clob', '/balance-allowance'),
+                        'open_orders': ('secure_clob', '/data/orders'),
+                        'positions': ('data', '/positions')}[component_name]
+                    remove = None
+                    try:
+                        remove = _install_lp_response_fact_hook(self._client, path=path,
+                            facts=response_facts, transport_name=transport)
+                        result.set_result((reader(), datetime.now(UTC)))
+                    except BaseException as exc:
+                        if isinstance(exc, Exception):
+                            error = {**_safe_history_response_facts(exc), **response_facts}
+                            failed_at = datetime.now(UTC)
+                            supplied = _venue_timestamp(error.get('retry_after_at'))
+                            seconds = error.get('retry_after_seconds')
+                            if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and math.isfinite(seconds) and seconds >= 0:
+                                supplied = failed_at + timedelta(seconds=seconds)
+                            error.update(planning_failed_at=failed_at,
+                                planning_retry_at=supplied if isinstance(supplied, datetime) else failed_at + timedelta(seconds=retry_seconds),
+                                planning_component=component_name)
+                            result.set_exception(PolymarketTradingError(_safe_error_code(exc), response_facts=error))
+                        else:
+                            result.set_exception(exc)
+                    finally:
+                        if remove is not None:
+                            remove()
+
+                threading.Thread(target=run, daemon=True, name='lp-account-' + name).start()
                 try:
-                    remove = _install_lp_response_fact_hook(self._client, path=path,
-                        facts=response_facts, transport_name=transport)
-                    result.set_result((reader(), datetime.now(UTC)))
-                except BaseException as exc:
-                    if isinstance(exc, Exception):
-                        error = {**_safe_history_response_facts(exc), **response_facts}
-                        failed_at = datetime.now(UTC)
-                        supplied = _venue_timestamp(error.get('retry_after_at'))
-                        seconds = error.get('retry_after_seconds')
-                        if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and math.isfinite(seconds) and seconds >= 0:
-                            supplied = failed_at + timedelta(seconds=seconds)
-                        error.update(planning_failed_at=failed_at,
-                            planning_retry_at=supplied if isinstance(supplied, datetime) else failed_at + timedelta(seconds=retry_seconds),
-                            planning_component=component_name)
-                        result.set_exception(PolymarketTradingError(_safe_error_code(exc), response_facts=error))
-                    else:
-                        result.set_exception(exc)
+                    value, checked = future.result(timeout=self._lp_public_read_timeout)
+                    values[name] = value
+                    component = dict(state='known', read_started_at=now,
+                        checked_at=checked, last_success_at=checked, error=None, retry_at=None)
+                except Exception as exc:
+                    error = _safe_history_response_facts(exc)
+                    response = getattr(exc, 'response_facts', None)
+                    if isinstance(response, Mapping):
+                        error.update(response)
+                    if error.get('status') in {401, 403, 429}:
+                        raise PolymarketTradingError(_safe_error_code(exc), response_facts=error) from None
+                    component = dict(state='failed', read_started_at=now,
+                        checked_at=None, last_success_at=previous.get('last_success_at'),
+                        error=error, retry_at=error.get('planning_retry_at') or now + timedelta(seconds=retry_seconds))
                 finally:
-                    if remove is not None:
-                        remove()
-
-            threading.Thread(target=run, daemon=True, name='lp-account-' + name).start()
-            try:
-                value, checked = future.result(timeout=self._lp_public_read_timeout)
-                values[name] = value
-                component = dict(state='known', read_started_at=now,
-                    checked_at=checked, last_success_at=checked, error=None, retry_at=None)
-            except Exception as exc:
-                error = _safe_history_response_facts(exc)
-                response = getattr(exc, 'response_facts', None)
-                if isinstance(response, Mapping):
-                    error.update(response)
-                if error.get('status') in {401, 403, 429}:
-                    raise PolymarketTradingError(_safe_error_code(exc), response_facts=error) from None
-                component = dict(state='failed', read_started_at=now,
-                    checked_at=None, last_success_at=previous.get('last_success_at'),
-                    error=error, retry_at=error.get('planning_retry_at') or now + timedelta(seconds=retry_seconds))
-            finally:
-                if future.done():
-                    self._lp_planning_reads.pop(name, None)
-            self._lp_planning_components[name] = component
-            components[name] = component
-        return dict(values=values, components=components, read_started_at=started,
-            checked_at=datetime.now(UTC), read_ended_at=datetime.now(UTC))
+                    if future.done():
+                        self._lp_planning_reads.pop(name, None)
+                self._lp_planning_components[name] = component
+                components[name] = component
+            ended = datetime.now(UTC)
+            return dict(values=values, components=components, read_started_at=started,
+                checked_at=ended, read_ended_at=ended)
+        finally:
+            _lp_causal_event('account_read_end', account={'read_started_at': started,
+                'read_ended_at': ended or datetime.now(UTC)}, outcome='complete' if ended is not None else 'failed')
 
     @staticmethod
     def _planning_account_rows(rows):
@@ -2760,22 +2767,31 @@ class PolymarketTradingClient:
             raise ValueError('account_rows_unknown')
         return tuple(_collect(rows))
 
-    def drain_lp_account_reads(self, *, timeout: float = 5) -> None:
+    def drain_lp_account_reads(self, *, timeout: float = 5, failure_publisher=None) -> None:
         """Keep native read ownership until the underlying calls finish."""
         deadline = time.monotonic() + timeout
         if not self._lp_account_read_lock.acquire(timeout=max(0, timeout)):
             raise RuntimeError('prediction LP account reader did not stop')
         try:
-            pending = tuple(self._lp_planning_reads.values())
-            for future in pending:
+            pending = tuple(self._lp_planning_reads.items())
+            failures = {}
+            for name, future in pending:
                 try:
                     future.result(timeout=max(0, deadline - time.monotonic()))
                 except FuturesTimeoutError:
                     if not future.done():
                         raise RuntimeError('prediction LP account reader did not stop') from None
+                except PolymarketTradingError as exc:
+                    # Only failure timing is publishable at shutdown. Late
+                    # successful values never become current account authority.
+                    if exc.response_facts.get('planning_component') == name:
+                        failures[name] = dict(exc.response_facts)
                 except Exception:
-                    # Failure is a completed read, not a live resource.
                     pass
+            if failures and callable(failure_publisher):
+                # Retain completed Futures if durable publication fails, so
+                # the normal lifecycle can retry without losing the evidence.
+                failure_publisher(wallet_address=self.config.wallet_address, failures=failures)
             self._lp_planning_reads = {name: job for name, job in self._lp_planning_reads.items()
                 if not job.done()}
         finally:

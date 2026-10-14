@@ -87,8 +87,7 @@ def test_financial_registration_failure_fences_planning_but_preserves_approved_s
             assert len(exchange.posts) == 1 and exchange.posts[0]['token_id'] == 'm00'
             assert exchange.posts[0]['price'] == Decimal('.40') and exchange.posts[0]['quantity'] == 20
             assert result['slots']['occupied'] == 1 and result['funds']['status'] == 'unknown'
-            assert result['last_round']['completed_at'] and result['plan_wait']['kind'] == 'round'
-            assert datetime.fromisoformat(result['plan_wait']['deadline']) == datetime.fromisoformat(result['last_round']['completed_at']) + timedelta(seconds=30)
+            assert result['last_round']['completed_at'] and result['plan_wait'] is None
             execution.lp_auto_run_once()
             from tests.test_lp_auto_plan_scheduler import restart_engine
             restarted = restart_engine(execution, exchange)
@@ -97,9 +96,8 @@ def test_financial_registration_failure_fences_planning_but_preserves_approved_s
         else:
             assert exchange.posts == []
             assert result['slots']['occupied'] == 0 and Decimal(result['funds']['buy_reserved_usd']) == 0
-            assert result['plan_wait']['kind'] == 'round' and result['last_round']['completed_at']
+            assert result['plan_wait'] is None and result['last_round']['completed_at']
             assert result['active_plan'] is None and result['last_round']['actions'] == []
-            assert datetime.fromisoformat(result['plan_wait']['deadline']) == datetime.fromisoformat(result['last_round']['completed_at'])+timedelta(seconds=30)
         exchange.before_sign = None
         now = [lp._now()]
         lp.clock = lambda: now[0]
@@ -119,13 +117,13 @@ def test_financial_registration_failure_fences_planning_but_preserves_approved_s
             assert store.lp_actions(action['session_id']) == [audit] and len(exchange.posts) == 1
             _diagnostic_completed = True
             return
-        now[0] = datetime.fromisoformat(execution.lp_auto_state()['plan_wait']['deadline'])
+        now[0] += timedelta(microseconds=1)
         advance_auto_wait(execution, monkeypatch)
         recovered = execution.lp_auto_run_once()
         assert recovered['last_round']['round_id'] != result['last_round']['round_id']
         assert len(exchange.posts) == 1 and exchange.posts[0]['token_id'] == 'm00'
         assert exchange.posts[0]['price'] == Decimal('.40') and exchange.posts[0]['quantity'] == 20
-        assert recovered['last_round']['completed_at'] and recovered['plan_wait']['kind'] == 'round'
+        assert recovered['last_round']['completed_at'] and recovered['plan_wait'] is None
         execution.lp_auto_run_once()
         assert len(exchange.posts) == 1
         _diagnostic_completed = True

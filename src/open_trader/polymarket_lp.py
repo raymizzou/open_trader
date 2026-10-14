@@ -10230,7 +10230,11 @@ class PolymarketLPService:
 
         drain_reads = getattr(self.exchange, 'drain_lp_account_reads', None)
         if callable(drain_reads):
-            drain_reads(timeout=timeout)
+            publisher = getattr(self, '_planning_failure_publisher', None)
+            if callable(publisher):
+                drain_reads(timeout=timeout, failure_publisher=publisher)
+            else:
+                drain_reads(timeout=timeout)
 
     def _entry_execute(self, **kwargs) -> dict[str, object]:
         # A durable legacy "sending" field is not proof of a live process.
@@ -12411,38 +12415,61 @@ class PolymarketLPService:
         unproven, order_provenance = set(), {}
         current_generation = None
         component = (current_account.get('components') or {}).get('open_orders') if isinstance(current_account, Mapping) else None
-        if (isinstance(component, Mapping) and component.get('state') == 'known'
-                and current_account.get('open_orders_complete') is True):
+        current_orders = (isinstance(component, Mapping) and component.get('state') == 'known'
+            and current_account.get('open_orders_complete') is True)
+        previous_observations = session.get('buy_yield_observations') or {}
+        for oid, anchor in anchors.items():
+            previous = previous_observations.get(oid) or {}
+            if not current_orders and not previous.get('order_current_proof_required') and not previous.get('order_checked_at'):
+                continue  # Default/manual history has no independent current-order proof.
             try:
-                _freshness(component.get('checked_at'), self._now(), 'order_freshness', max_age=60)
-                if (current_account.get('authenticated') is not True
-                        or str(current_account.get('wallet_address') or '').casefold() != wallet
-                        or str(current_account.get('account_id') or '').casefold() != wallet
-                        or type(current_account.get('trade_generation')) is not int
-                        or current_account['trade_generation'] != self.store.lp_trade_generation()):
-                    raise ValueError('current_order_identity_unknown')
-                current_generation = current_account['trade_generation']
-                for oid, anchor in anchors.items():
+                if current_orders:
+                    checked_at = component.get('checked_at')
+                    read_started_at = component.get('read_started_at')
+                    generation = current_account.get('trade_generation')
+                    if (current_account.get('authenticated') is not True
+                            or str(current_account.get('wallet_address') or '').casefold() != wallet
+                            or str(current_account.get('account_id') or '').casefold() != wallet):
+                        raise ValueError('current_order_identity_unknown')
                     rows = [r for r in current_account.get('open_orders') or () if r.get('order_id') == oid]
                     row = rows[0] if len(rows) == 1 else {}
-                    original = _maybe_decimal(anchor.get('original_size', anchor.get('quantity')))
-                    matched = _maybe_decimal(row.get('size_matched'))
-                    old_matched = _maybe_decimal(anchor.get('size_matched'))
-                    if (oid not in self._session_order_ids(session) or row.get('side') != 'BUY'
-                            or row.get('status') != 'LIVE' or row.get('token_id') != session.get('token_id')
-                            or row.get('condition_id') != session.get('condition_id')
-                            or _maybe_decimal(row.get('price')) != _maybe_decimal(anchor.get('price'))
-                            or _maybe_decimal(row.get('original_size', row.get('quantity'))) != original
-                            or original is None or matched is None or old_matched is None
-                            or not old_matched <= matched <= original or original <= matched):
-                        unproven.add(oid)
-                        continue
-                    buys[oid] = deepcopy(row)
-                    order_provenance[oid] = dict(order_checked_at=component['checked_at'],
-                        order_read_started_at=component.get('read_started_at'),
-                        order_trade_generation=current_generation)
+                else:
+                    # Monitoring can reuse the same proved terms, but cannot
+                    # renew their source time or restore older history as fresh.
+                    checked_at = previous['order_checked_at']
+                    read_started_at = previous.get('order_read_started_at')
+                    generation = previous.get('order_trade_generation')
+                    row = previous.get('order_terms') or {}
+                    if previous.get('account_id') != wallet or previous.get('order_id') != oid:
+                        raise ValueError('current_order_identity_unknown')
+                _freshness(checked_at, self._now(), 'order_freshness', max_age=60)
+                if type(generation) is not int or generation != self.store.lp_trade_generation():
+                    raise ValueError('current_order_generation_unknown')
+                current_generation = generation
+                original = _maybe_decimal(anchor.get('original_size', anchor.get('quantity')))
+                matched = _maybe_decimal(row.get('size_matched'))
+                old_matched = _maybe_decimal(anchor.get('size_matched'))
+                if (oid not in self._session_order_ids(session) or row.get('order_id') != oid
+                        or row.get('side') != 'BUY' or row.get('status') != 'LIVE'
+                        or row.get('token_id') != session.get('token_id')
+                        or row.get('condition_id') != session.get('condition_id')
+                        or _maybe_decimal(row.get('price')) != _maybe_decimal(anchor.get('price'))
+                        or _maybe_decimal(row.get('original_size', row.get('quantity'))) != original
+                        or original is None or matched is None or old_matched is None
+                        or not old_matched <= matched <= original or original <= matched):
+                    raise ValueError('current_order_terms_unknown')
+                buys[oid] = deepcopy(row)
+                order_provenance[oid] = dict(order_checked_at=checked_at,
+                    order_read_started_at=read_started_at, order_trade_generation=generation,
+                    order_terms=deepcopy(row), order_current_proof_required=True)
             except (ValueError, TypeError, KeyError):
-                unproven.update(buys)
+                unproven.add(oid)
+                # Retain provenance even for UNKNOWN so a later monitor cannot
+                # treat the historical anchor as newly proved current terms.
+                order_provenance[oid] = {k: deepcopy(previous[k]) for k in
+                    ('order_checked_at', 'order_read_started_at', 'order_trade_generation', 'order_terms')
+                    if k in previous}
+                order_provenance[oid]['order_current_proof_required'] = True
         direction = None
         error = None
         started_at = self._now()

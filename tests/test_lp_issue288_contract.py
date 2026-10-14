@@ -106,198 +106,214 @@ def _enable_shared_account_refresh(exchange, lp):
 
 
 def test_sell_unknown_does_not_block_configuration_or_buy_refill(tmp_path):
-    e, exchange, lp, store = setup(tmp_path, 2)
-    _seed_unknown_sell(store)
-    assert _register_inventory(e, exchange, lp)["state"] == "registered"
-    _enable_shared_account_refresh(exchange, lp)
+    import pytest
+    from tests import test_lp_auto_pool as shared_clock
+    with pytest.MonkeyPatch.context() as clock_scope:
+        clock_scope.setattr(shared_clock, "NOW", NOW)
+        e, exchange, lp, store = setup(tmp_path, 2)
+        _seed_unknown_sell(store)
+        assert _register_inventory(e, exchange, lp)["state"] == "registered"
+        _enable_shared_account_refresh(exchange, lp)
 
-    configured = e.lp_auto_configure({"budget_usd": "100", "target_buy_count": 5})
-    assert configured["slots"]["occupied"] == 0
-    assert Decimal(configured["funds"]["available_usd"]) == Decimal("80")
-    assert configured["funds"]["realized_pnl_usd"] is None
-    assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
+        configured = e.lp_auto_configure({"budget_usd": "100", "target_buy_count": 5})
+        assert configured["slots"]["occupied"] == 0
+        assert Decimal(configured["funds"]["available_usd"]) == Decimal("80")
+        assert configured["funds"]["realized_pnl_usd"] is None
+        assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
 
-    planning_as_of, financial_calls = [], []
-    sign, read = exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared
-    def observed_sign(**kwargs):
-        planning_as_of.append(e.lp_auto_state()['funds']['as_of'])
-        return sign(**kwargs)
-    def observed_read(**kwargs):
-        financial_calls.append(bool(e.lp_auto_state()['active_plan']))
-        return read(**kwargs)
-    exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared = observed_sign, observed_read
-    e.lp_auto_set_desired_running(True)
-    state = e.lp_auto_run_once(round_id="issue288-a")
-    assert exchange.posts
-    assert all(post["side"] == "BUY" for post in exchange.posts)
-    assert planning_as_of[-1] and not any(financial_calls)
-    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
-    assert state['funds']['available_usd'] is None and state['funds']['spendable_usd'] is None
-    assert e.refresh_lp_dashboard_snapshot()['state'] == 'ready'
-    state = e.lp_auto_state()
-    assert state['funds']['status'] == 'known'
-    assert Decimal(state["funds"]["available_usd"]) == Decimal("80") - Decimal("8") * len(exchange.posts)
-    assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
+        planning_as_of, financial_calls = [], []
+        sign, read = exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared
+        def observed_sign(**kwargs):
+            planning_as_of.append(e.lp_auto_state()['funds']['as_of'])
+            return sign(**kwargs)
+        def observed_read(**kwargs):
+            financial_calls.append(bool(e.lp_auto_state()['active_plan']))
+            return read(**kwargs)
+        exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared = observed_sign, observed_read
+        e.lp_auto_set_desired_running(True)
+        state = e.lp_auto_run_once(round_id="issue288-a")
+        assert exchange.posts
+        assert all(post["side"] == "BUY" for post in exchange.posts)
+        assert planning_as_of[-1] and not any(financial_calls)
+        assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+        assert state['funds']['available_usd'] is None and state['funds']['spendable_usd'] is None
+        assert e.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+        state = e.lp_auto_state()
+        assert state['funds']['status'] == 'known'
+        assert Decimal(state["funds"]["available_usd"]) == Decimal("80") - Decimal("8") * len(exchange.posts)
+        assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
 
 
 def test_sell_unknown_does_not_block_configuration_with_represented_buys(tmp_path):
-    e, exchange, lp, store = setup(tmp_path, 5)
-    _seed_unknown_sell(store)
-    exchange.orders = [
-        {
-            "order_id": f"live-{index}",
-            "token_id": f"m0{index}",
-            "condition_id": f"m0{index}",
-            "market_id": f"m0{index}",
-            "outcome": "YES",
-            "side": "BUY",
-            "status": "LIVE",
-            "price": "0.40",
-            "original_size": "20",
-            "size_matched": "0",
-        }
-        for index in range(3)
-    ]
-    assert _register_inventory(e, exchange, lp)["state"] == "registered"
-    _enable_shared_account_refresh(exchange, lp)
+    import pytest
+    from tests import test_lp_auto_pool as shared_clock
+    with pytest.MonkeyPatch.context() as clock_scope:
+        clock_scope.setattr(shared_clock, "NOW", NOW)
+        e, exchange, lp, store = setup(tmp_path, 5)
+        _seed_unknown_sell(store)
+        exchange.orders = [
+            {
+                "order_id": f"live-{index}",
+                "token_id": f"m0{index}",
+                "condition_id": f"m0{index}",
+                "market_id": f"m0{index}",
+                "outcome": "YES",
+                "side": "BUY",
+                "status": "LIVE",
+                "price": "0.40",
+                "original_size": "20",
+                "size_matched": "0",
+            }
+            for index in range(3)
+        ]
+        assert _register_inventory(e, exchange, lp)["state"] == "registered"
+        _enable_shared_account_refresh(exchange, lp)
 
-    configured = e.lp_auto_configure({"budget_usd": "100", "target_buy_count": 5})
-    assert configured["slots"]["occupied"] == 3
-    assert Decimal(configured["funds"]["buy_reserved_usd"]) == Decimal("24")
-    assert Decimal(configured["funds"]["available_usd"]) == Decimal("56")
-    assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
+        configured = e.lp_auto_configure({"budget_usd": "100", "target_buy_count": 5})
+        assert configured["slots"]["occupied"] == 3
+        assert Decimal(configured["funds"]["buy_reserved_usd"]) == Decimal("24")
+        assert Decimal(configured["funds"]["available_usd"]) == Decimal("56")
+        assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
 
-    planning_as_of, financial_calls = [], []
-    sign, read = exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared
-    def observed_sign(**kwargs):
-        planning_as_of.append(e.lp_auto_state()['funds']['as_of'])
-        return sign(**kwargs)
-    def observed_read(**kwargs):
-        financial_calls.append(bool(e.lp_auto_state()['active_plan']))
-        return read(**kwargs)
-    exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared = observed_sign, observed_read
-    e.lp_auto_set_desired_running(True)
-    state = e.lp_auto_run_once(round_id="issue288-a-represented")
-    assert len(exchange.posts) == 2
-    assert state["slots"]["occupied"] == 5
-    assert planning_as_of[-1] and not any(financial_calls)
-    assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
-    assert state['funds']['available_usd'] is None and state['funds']['spendable_usd'] is None
-    assert e.refresh_lp_dashboard_snapshot()['state'] == 'ready'
-    state = e.lp_auto_state()
-    assert state['funds']['status'] == 'known'
-    assert Decimal(state["funds"]["available_usd"]) == Decimal("40")
-    assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
+        planning_as_of, financial_calls = [], []
+        sign, read = exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared
+        def observed_sign(**kwargs):
+            planning_as_of.append(e.lp_auto_state()['funds']['as_of'])
+            return sign(**kwargs)
+        def observed_read(**kwargs):
+            financial_calls.append(bool(e.lp_auto_state()['active_plan']))
+            return read(**kwargs)
+        exchange.lp_create_limit_order, exchange.lp_account_snapshot_shared = observed_sign, observed_read
+        e.lp_auto_set_desired_running(True)
+        state = e.lp_auto_run_once(round_id="issue288-a-represented")
+        assert len(exchange.posts) == 2
+        assert state["slots"]["occupied"] == 5
+        assert planning_as_of[-1] and not any(financial_calls)
+        assert state['funds']['status'] == 'unknown' and state['funds']['as_of'] == planning_as_of[-1]
+        assert state['funds']['available_usd'] is None and state['funds']['spendable_usd'] is None
+        assert e.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+        state = e.lp_auto_state()
+        assert state['funds']['status'] == 'known'
+        assert Decimal(state["funds"]["available_usd"]) == Decimal("40")
+        assert store.lp_actions("sell-unknown")[0]["state"] == "unknown"
 
 
 def test_sell_unknown_does_not_block_represented_buy_refill(tmp_path):
-    e, exchange, lp, store = setup(tmp_path, 3)
-    _enable_shared_account_refresh(exchange, lp)
-    e.lp_auto_configure({"budget_usd": "100", "target_buy_count": 5})
-    e.lp_auto_set_desired_running(True)
-    initial = e.lp_auto_run_once(round_id="issue288-a-represented-live")
-    assert len(exchange.posts) == 3
-    assert initial["slots"]["occupied"] == 3
+    import pytest
+    from tests import test_lp_auto_pool as shared_clock
+    with pytest.MonkeyPatch.context() as clock_scope:
+        clock_scope.setattr(shared_clock, "NOW", NOW)
+        e, exchange, lp, store = setup(tmp_path, 3)
+        _enable_shared_account_refresh(exchange, lp)
+        e.lp_auto_configure({"budget_usd": "100", "target_buy_count": 5})
+        e.lp_auto_set_desired_running(True)
+        initial = e.lp_auto_run_once(round_id="issue288-a-represented-live")
+        assert len(exchange.posts) == 3
+        assert initial["slots"]["occupied"] == 3
 
-    for market_id in ("m03", "m04"):
-        lp._candidate_pool_record_success(
-            market_id,
-            dict(condition_id=market_id),
-            judged_at=NOW,
-            facts=dict(directions=[exchange.direction(market_id)], account=exchange.lp_account_snapshot()),
-        )
-        store.lp_save_price_history(
-            market_id,
-            market_id,
-            [],
-            dict(state="known", amplitude=Decimal(".005"), checked_at=NOW,
-                 valid_until=NOW + timedelta(days=1)),
-        )
+        for market_id in ("m03", "m04"):
+            lp._candidate_pool_record_success(
+                market_id,
+                dict(condition_id=market_id),
+                judged_at=NOW,
+                facts=dict(directions=[exchange.direction(market_id)], account=exchange.lp_account_snapshot()),
+            )
+            store.lp_save_price_history(
+                market_id,
+                market_id,
+                [],
+                dict(state="known", amplitude=Decimal(".005"), checked_at=NOW,
+                     valid_until=NOW + timedelta(days=1)),
+            )
 
-    first = initial["intents"][0]
-    store.lp_upsert_action(
-        first["session_id"],
-        f"{first['session_id']}:passive-unknown",
-        state="unknown",
-        payload={"role": "passive_exit", "side": "SELL", "token_id": first["token_id"]},
-    )
-    exchange.positions = [
-        {"token_id": "sell-token", "condition_id": "sell-market", "size": "20", "average_price": "1"}
-    ]
-    e.lp_auto_set_desired_running(False)
-    assert e._auto_pool._refresh_account_facts() is True
-    paused = e.lp_auto_state()
-    assert paused["slots"]["occupied"] == 3
-    assert Decimal(paused["funds"]["buy_reserved_usd"]) == Decimal("24")
-    assert Decimal(paused["funds"]["available_usd"]) == Decimal("56")
-    assert store.lp_actions(first["session_id"])[-1]["state"] == "unknown"
+        first = initial["intents"][0]
+        store.lp_upsert_action(
+            first["session_id"],
+            f"{first['session_id']}:passive-unknown",
+            state="unknown",
+            payload={"role": "passive_exit", "side": "SELL", "token_id": first["token_id"]},
+        )
+        exchange.positions = [
+            {"token_id": "sell-token", "condition_id": "sell-market", "size": "20", "average_price": "1"}
+        ]
+        e.lp_auto_set_desired_running(False)
+        assert e._auto_pool._refresh_account_facts() is True
+        paused = e.lp_auto_state()
+        assert paused["slots"]["occupied"] == 3
+        assert Decimal(paused["funds"]["buy_reserved_usd"]) == Decimal("24")
+        assert Decimal(paused["funds"]["available_usd"]) == Decimal("56")
+        assert store.lp_actions(first["session_id"])[-1]["state"] == "unknown"
 
 
 def test_original_unknown_buy_with_sell_history_still_reserves(tmp_path):
-    e, exchange, lp, store = setup(tmp_path, 1)
-    _install_level2_books(
-        exchange,
-        lp,
-        store,
-        bids=(("0.40", "1000"), ("0.37", "1000")),
-        count=1,
-    )
-    store.lp_create_session(
-        "original-buy-unknown",
-        "original-buy-unknown",
-        state="entry_open",
-        payload={
-            "session_id": "original-buy-unknown",
-            "account_id": "test-wallet",
-            "wallet_address": "test-wallet",
-            "market_id": "old-market",
-            "condition_id": "old-market",
-            "token_id": "old-token",
-            "outcome": "YES",
-            "state": "entry_open",
-            "entry_order_id": None,
-            "passive_exit_order_id": "old-sell",
-            "price": Decimal("0.40"),
-            "quantity": Decimal("20"),
-            "owned_order_ids": [],
-            "order_history": {
-                "old-sell": {"order_id": "old-sell", "side": "SELL", "status": "LIVE"},
+    import pytest
+    from tests import test_lp_auto_pool as shared_clock
+    with pytest.MonkeyPatch.context() as clock_scope:
+        clock_scope.setattr(shared_clock, "NOW", NOW)
+        e, exchange, lp, store = setup(tmp_path, 1)
+        _install_level2_books(
+            exchange,
+            lp,
+            store,
+            bids=(("0.40", "1000"), ("0.37", "1000")),
+            count=1,
+        )
+        store.lp_create_session(
+            "original-buy-unknown",
+            "original-buy-unknown",
+            state="entry_open",
+            payload={
+                "session_id": "original-buy-unknown",
+                "account_id": "test-wallet",
+                "wallet_address": "test-wallet",
+                "market_id": "old-market",
+                "condition_id": "old-market",
+                "token_id": "old-token",
+                "outcome": "YES",
+                "state": "entry_open",
+                "entry_order_id": None,
+                "passive_exit_order_id": "old-sell",
+                "price": Decimal("0.40"),
+                "quantity": Decimal("20"),
+                "owned_order_ids": [],
+                "order_history": {
+                    "old-sell": {"order_id": "old-sell", "side": "SELL", "status": "LIVE"},
+                },
             },
-        },
-    )
-    store.lp_upsert_action(
-        "original-buy-unknown",
-        "original-buy-unknown:entry-submit",
-        state="unknown",
-        payload={
-            "role": "entry", "side": "BUY", "token_id": "old-token",
-            "price": "0.40", "quantity": "20",
-        },
-    )
-    original_account_snapshot = exchange.lp_account_snapshot
+        )
+        store.lp_upsert_action(
+            "original-buy-unknown",
+            "original-buy-unknown:entry-submit",
+            state="unknown",
+            payload={
+                "role": "entry", "side": "BUY", "token_id": "old-token",
+                "price": "0.40", "quantity": "20",
+            },
+        )
+        original_account_snapshot = exchange.lp_account_snapshot
 
-    def account_with_only_original_buy_budget():
-        snapshot = original_account_snapshot()
-        snapshot.update(balance="8", allowance="8")
-        return snapshot
+        def account_with_only_original_buy_budget():
+            snapshot = original_account_snapshot()
+            snapshot.update(balance="8", allowance="8")
+            return snapshot
 
-    exchange.lp_account_snapshot = account_with_only_original_buy_budget
-    lp._candidate_pool_record_success(
-        "m00",
-        dict(condition_id="m00"),
-        judged_at=NOW,
-        facts=dict(directions=[exchange.direction("m00")], account=exchange.lp_account_snapshot()),
-    )
+        exchange.lp_account_snapshot = account_with_only_original_buy_budget
+        lp._candidate_pool_record_success(
+            "m00",
+            dict(condition_id="m00"),
+            judged_at=NOW,
+            facts=dict(directions=[exchange.direction("m00")], account=exchange.lp_account_snapshot()),
+        )
 
-    e.lp_auto_configure({
-        "budget_usd": "100", "target_buy_count": 1, "buy_price_level": 2,
-    })
-    e.lp_auto_set_desired_running(True)
-    state = e.lp_auto_run_once(round_id="issue288-a-original-buy")
-    assert exchange.posts == []
-    assert state["last_round"]["candidate_filter"]["reasons"] == {
-        "balance_insufficient": 1
-    }
+        e.lp_auto_configure({
+            "budget_usd": "100", "target_buy_count": 1, "buy_price_level": 2,
+        })
+        e.lp_auto_set_desired_running(True)
+        state = e.lp_auto_run_once(round_id="issue288-a-original-buy")
+        assert exchange.posts == []
+        assert state["last_round"]["candidate_filter"]["reasons"] == {
+            "balance_insufficient": 1
+        }
 
 
 def _http_runtime(store, exchange, lp, execution):
@@ -453,73 +469,81 @@ def _install_level2_books(exchange, lp, store, *, bids, count=6):
 
 
 def test_second_bid_rejects_crossed_book(tmp_path):
-    _execution, exchange, _lp, _store = setup(tmp_path, 0)
-    direction = exchange.direction("crossed")
-    direction["book"] = {
-        "condition_id": "crossed",
-        "token_id": "crossed",
-        "received_at": NOW,
-        "bids": [
-            {"price": "0.40", "size": "1000"},
-            {"price": "0.37", "size": "1000"},
-            {"price": "0.35", "size": "1000"},
-        ],
-        "asks": [{"price": "0.39", "size": "1000"}],
-    }
-    evaluated = evaluate_lp_entry(
-        direction,
-        account=exchange.lp_account_snapshot(),
-        now=NOW,
-        candidate=True,
-        bid_level=2,
-    )
-    assert evaluated == {
-        "state": "unknown",
-        "reason_codes": ["book_crossed"],
-        "guidance": None,
-    }
+    import pytest
+    from tests import test_lp_auto_pool as shared_clock
+    with pytest.MonkeyPatch.context() as clock_scope:
+        clock_scope.setattr(shared_clock, "NOW", NOW)
+        _execution, exchange, _lp, _store = setup(tmp_path, 0)
+        direction = exchange.direction("crossed")
+        direction["book"] = {
+            "condition_id": "crossed",
+            "token_id": "crossed",
+            "received_at": NOW,
+            "bids": [
+                {"price": "0.40", "size": "1000"},
+                {"price": "0.37", "size": "1000"},
+                {"price": "0.35", "size": "1000"},
+            ],
+            "asks": [{"price": "0.39", "size": "1000"}],
+        }
+        evaluated = evaluate_lp_entry(
+            direction,
+            account=exchange.lp_account_snapshot(),
+            now=NOW,
+            candidate=True,
+            bid_level=2,
+        )
+        assert evaluated == {
+            "state": "unknown",
+            "reason_codes": ["book_crossed"],
+            "guidance": None,
+        }
 
 
 def test_second_bid_stress_discards_actual_best_bid(tmp_path):
-    _execution, exchange, _lp, _store = setup(tmp_path, 0)
-    direction = exchange.direction("stress")
-    direction["book"] = {
-        "condition_id": "stress",
-        "token_id": "stress",
-        "received_at": NOW,
-        "bids": [
-            {"price": "0.40", "size": "20"},
-            {"price": "0.37", "size": "5"},
-            {"price": "0.20", "size": "15"},
-        ],
-        "asks": [{"price": "0.41", "size": "1000"}],
-    }
-    market = direction["market"]
-    book = direction["book"]
-    stress = estimate_lp_stress_exit(
-        book,
-        market=market,
-        price=Decimal("0.37"),
-        quantity=Decimal("20"),
-        bid_level=2,
-    )
-    assert stress["state"] == "rejected"
-    assert stress["reason_codes"] == ["stress_loss_exceeded"]
-    assert stress["gross_exit_value"] == Decimal("4.85")
-    assert stress["capital"] == Decimal("7.40")
-    assert stress["net_loss"] == Decimal("2.55")
-    assert stress["loss_ratio"] == Decimal("2.55") / Decimal("7.40")
+    import pytest
+    from tests import test_lp_auto_pool as shared_clock
+    with pytest.MonkeyPatch.context() as clock_scope:
+        clock_scope.setattr(shared_clock, "NOW", NOW)
+        _execution, exchange, _lp, _store = setup(tmp_path, 0)
+        direction = exchange.direction("stress")
+        direction["book"] = {
+            "condition_id": "stress",
+            "token_id": "stress",
+            "received_at": NOW,
+            "bids": [
+                {"price": "0.40", "size": "20"},
+                {"price": "0.37", "size": "5"},
+                {"price": "0.20", "size": "15"},
+            ],
+            "asks": [{"price": "0.41", "size": "1000"}],
+        }
+        market = direction["market"]
+        book = direction["book"]
+        stress = estimate_lp_stress_exit(
+            book,
+            market=market,
+            price=Decimal("0.37"),
+            quantity=Decimal("20"),
+            bid_level=2,
+        )
+        assert stress["state"] == "rejected"
+        assert stress["reason_codes"] == ["stress_loss_exceeded"]
+        assert stress["gross_exit_value"] == Decimal("4.85")
+        assert stress["capital"] == Decimal("7.40")
+        assert stress["net_loss"] == Decimal("2.55")
+        assert stress["loss_ratio"] == Decimal("2.55") / Decimal("7.40")
 
-    evaluated = evaluate_lp_entry(
-        direction,
-        account=exchange.lp_account_snapshot(),
-        now=NOW,
-        candidate=True,
-        bid_level=2,
-    )
-    assert evaluated["state"] == "rejected"
-    assert evaluated["reason_codes"] == ["stress_loss_exceeded"]
-    assert evaluated["guidance"] is None
+        evaluated = evaluate_lp_entry(
+            direction,
+            account=exchange.lp_account_snapshot(),
+            now=NOW,
+            candidate=True,
+            bid_level=2,
+        )
+        assert evaluated["state"] == "rejected"
+        assert evaluated["reason_codes"] == ["stress_loss_exceeded"]
+        assert evaluated["guidance"] is None
 
 
 def test_auto_quotes_true_second_bid_and_caps_five_orders(tmp_path):
@@ -559,111 +583,117 @@ def test_auto_quotes_true_second_bid_and_caps_five_orders(tmp_path):
 
 
 def test_auto_second_bid_requires_depth_and_budget(tmp_path):
-    shallow, shallow_exchange, shallow_lp, shallow_store = setup(tmp_path / "shallow", 1)
-    _install_level2_books(
-        shallow_exchange,
-        shallow_lp,
-        shallow_store,
-        bids=(("0.40", "1000"), ("0.39", "0")),
-        count=1,
-    )
-    shallow.lp_auto_configure({
-        "budget_usd": "100", "target_buy_count": 1, "buy_price_level": 2,
-    })
-    shallow.lp_auto_set_desired_running(True)
-    shallow_state = shallow.lp_auto_run_once(round_id="issue288-f-depth")
-    assert shallow_exchange.posts == []
-    assert shallow_state["last_round"]["candidate_filter"]["reasons"] == {
-        "second_bid_insufficient": 1
-    }, shallow_state["last_round"]
+    import pytest
+    from tests import test_lp_auto_pool as shared_clock
+    with pytest.MonkeyPatch.context() as clock_scope:
+        clock_scope.setattr(shared_clock, "NOW", NOW)
+        shallow, shallow_exchange, shallow_lp, shallow_store = setup(tmp_path / "shallow", 1)
+        _install_level2_books(
+            shallow_exchange,
+            shallow_lp,
+            shallow_store,
+            bids=(("0.40", "1000"), ("0.39", "0")),
+            count=1,
+        )
+        shallow.lp_auto_configure({
+            "budget_usd": "100", "target_buy_count": 1, "buy_price_level": 2,
+        })
+        shallow.lp_auto_set_desired_running(True)
+        shallow_state = shallow.lp_auto_run_once(round_id="issue288-f-depth")
+        assert shallow_exchange.posts == []
+        assert shallow_state["last_round"]["candidate_filter"]["reasons"] == {
+            "second_bid_insufficient": 1
+        }, shallow_state["last_round"]
 
-    budget, budget_exchange, budget_lp, budget_store = setup(tmp_path / "budget", 1)
-    _install_level2_books(
-        budget_exchange,
-        budget_lp,
-        budget_store,
-        bids=(("0.40", "1000"), ("0.37", "1000")),
-        count=1,
-    )
-    budget.lp_auto_configure({
-        "budget_usd": "7", "target_buy_count": 1, "buy_price_level": 2,
-    })
-    budget.lp_auto_set_desired_running(True)
-    budget_state = budget.lp_auto_run_once(round_id="issue288-f-budget")
-    assert budget_exchange.posts == []
-    assert budget_state["last_round"]["actions"] == []
-    assert budget_state["last_round"]["blocked"] == [
-        {"condition_id": "m00", "token_id": "m00", "reason": "rotation_budget_insufficient"}
-    ]
+        budget, budget_exchange, budget_lp, budget_store = setup(tmp_path / "budget", 1)
+        _install_level2_books(
+            budget_exchange,
+            budget_lp,
+            budget_store,
+            bids=(("0.40", "1000"), ("0.37", "1000")),
+            count=1,
+        )
+        budget.lp_auto_configure({
+            "budget_usd": "7", "target_buy_count": 1, "buy_price_level": 2,
+        })
+        budget.lp_auto_set_desired_running(True)
+        budget_state = budget.lp_auto_run_once(round_id="issue288-f-budget")
+        assert budget_exchange.posts == []
+        assert budget_state["last_round"]["actions"] == []
+        assert budget_state["last_round"]["blocked"] == [
+            {"condition_id": "m00", "token_id": "m00", "reason": "rotation_budget_insufficient"}
+        ]
 
 
 def test_auto_uses_fixed_second_bid_then_new_round_quote(tmp_path, monkeypatch):
-    from copy import deepcopy
-    from datetime import datetime
-    from tests import test_lp_auto_pool as shared_pool
-    from tests.test_lp_auto_plan_execution import install_order_result_reader
-    monkeypatch.setattr(shared_pool, 'NOW', shared_pool.NOW)
-    monkeypatch.setattr(sys.modules[__name__], 'NOW', NOW)
-    e, exchange, lp, store = setup(tmp_path, 1)
-    install_order_result_reader(exchange, monkeypatch)
-    bids = [("0.40", "1000"), ("0.37", "1000")]
-    _install_level2_books(exchange, lp, store, bids=bids, count=1)
-    e.lp_auto_configure({"budget_usd": "100", "target_buy_count": 1, "buy_price_level": 2})
-    e.lp_auto_set_desired_running(True)
-    def move_second_bid_before_post():
-        bids[1] = ("0.36", "1000")
-    exchange.before_sign = move_second_bid_before_post
-    first = e.lp_auto_run_once(round_id="issue288-g-fixed")
-    assert len(exchange.posts) == 1
-    assert Decimal(exchange.posts[0]['price']) == Decimal('.37') and exchange.posts[0]['quantity'] == 20
-    assert first['slots']['occupied'] == 1 and Decimal(first['funds']['buy_reserved_usd']) == Decimal('7.40')
-    assert first['last_round']['actions'], first['last_round']
-    original_action, = first['last_round']['actions']
-    assert original_action['condition_id'] == 'm00' and original_action['state'] == 'success'
-    assert original_action['request_state'] == 'entry_open'
-    original_sid, original_oid = original_action['session_id'], original_action['order_id']
-    original_audit, = deepcopy(store.lp_actions(original_sid))
-    assert original_audit['state'] == 'accepted' and original_audit['post_started'] is True
-    assert original_audit['order_id'] == original_oid
-    assert Decimal(original_audit['price']) == Decimal('.37') and Decimal(original_audit['quantity']) == 20
-    assert first['active_plan'] is None and first['last_round']['completed_at']
-    completed = datetime.fromisoformat(first['last_round']['completed_at'])
-    assert first['plan_wait']['kind'] == 'round'
-    assert datetime.fromisoformat(first['plan_wait']['deadline']) == completed + timedelta(seconds=30)
-    monkeypatch.setattr(shared_pool, 'NOW', completed + timedelta(seconds=29))
-    quiet = e.lp_auto_run_once()
-    assert quiet['last_round'] == first['last_round'] and len(exchange.posts) == 1
-    exchange.before_sign = None
-    order = next(o for o in exchange.orders if o['order_id'] == original_oid)
-    assert order['token_id'] == 'm00' and Decimal(order['original_size']) == 20 and Decimal(order['price']) == Decimal('.37')
-    order.update(status='CANCELED', size_matched='0')
-    lp.reconcile_facts(original_sid)
-    terminal = store.lp_session(original_sid)
-    assert terminal['order_history'][original_oid]['status'] == 'CANCELED'
-    assert Decimal(terminal['order_history'][original_oid]['size_matched']) == 0
-    assert store.lp_actions(original_sid) == [original_audit]
-    advance_auto_wait(e, monkeypatch, refresh=False)
-    monkeypatch.setattr(sys.modules[__name__], 'NOW', e._lp._now())
-    lp._candidate_pool_record_success('m00', dict(condition_id='m00'), judged_at=NOW,
-        facts=dict(directions=[exchange.direction('m00')], account=exchange.lp_account_snapshot()))
-    fresh = e.lp_auto_run_once(round_id='issue288-g-fresh')
-    assert len(exchange.posts) == 2
-    assert [Decimal(p['price']) for p in exchange.posts] == [Decimal('.37'), Decimal('.36')]
-    assert all(p['token_id'] == 'm00' and p['side'] == 'BUY' and p['quantity'] == 20 for p in exchange.posts)
-    new_action, = fresh['last_round']['actions']
-    assert new_action['state'] == 'success' and new_action['request_state'] == 'entry_open'
-    assert new_action['action_id'] != original_action['action_id']
-    assert new_action['session_id'] != original_sid and new_action['order_id'] != original_oid
-    new_audit, = store.lp_actions(new_action['session_id'])
-    assert new_audit['action_id'] != original_audit['action_id'] and new_audit['action_key'] != original_audit['action_key']
-    assert new_audit['state'] == 'accepted' and new_audit['post_started'] is True
-    assert Decimal(new_audit['price']) == Decimal('.36') and Decimal(new_audit['quantity']) == 20
-    assert store.lp_actions(original_sid) == [original_audit]
-    assert fresh['slots']['occupied'] == 1 and Decimal(fresh['funds']['buy_reserved_usd']) == Decimal('7.20')
-    assert fresh['last_round']['completed_at'] and fresh['active_plan'] is None
-    (tmp_path / 'CI-C-fixed-next-quote-proof.json').write_text(json.dumps(dict(
-        first=first, terminal=terminal, fresh=fresh, original_audit=original_audit,
-        new_audit=new_audit, posts=exchange.posts), default=str, indent=2))
+    import pytest
+    from tests import test_lp_auto_pool as shared_clock
+    with pytest.MonkeyPatch.context() as clock_scope:
+        clock_scope.setattr(shared_clock, "NOW", NOW)
+        from copy import deepcopy
+        from datetime import datetime
+        from tests import test_lp_auto_pool as shared_pool
+        from tests.test_lp_auto_plan_execution import install_order_result_reader
+        monkeypatch.setattr(shared_pool, 'NOW', shared_pool.NOW)
+        monkeypatch.setattr(sys.modules[__name__], 'NOW', NOW)
+        e, exchange, lp, store = setup(tmp_path, 1)
+        install_order_result_reader(exchange, monkeypatch)
+        bids = [("0.40", "1000"), ("0.37", "1000")]
+        _install_level2_books(exchange, lp, store, bids=bids, count=1)
+        e.lp_auto_configure({"budget_usd": "100", "target_buy_count": 1, "buy_price_level": 2})
+        e.lp_auto_set_desired_running(True)
+        def move_second_bid_before_post():
+            bids[1] = ("0.36", "1000")
+        exchange.before_sign = move_second_bid_before_post
+        first = e.lp_auto_run_once(round_id="issue288-g-fixed")
+        assert len(exchange.posts) == 1
+        assert Decimal(exchange.posts[0]['price']) == Decimal('.37') and exchange.posts[0]['quantity'] == 20
+        assert first['slots']['occupied'] == 1 and Decimal(first['funds']['buy_reserved_usd']) == Decimal('7.40')
+        assert first['last_round']['actions'], first['last_round']
+        original_action, = first['last_round']['actions']
+        assert original_action['condition_id'] == 'm00' and original_action['state'] == 'success'
+        assert original_action['request_state'] == 'entry_open'
+        original_sid, original_oid = original_action['session_id'], original_action['order_id']
+        original_audit, = deepcopy(store.lp_actions(original_sid))
+        assert original_audit['state'] == 'accepted' and original_audit['post_started'] is True
+        assert original_audit['order_id'] == original_oid
+        assert Decimal(original_audit['price']) == Decimal('.37') and Decimal(original_audit['quantity']) == 20
+        assert first['active_plan'] is None and first['last_round']['completed_at']
+        completed = datetime.fromisoformat(first['last_round']['completed_at'])
+        assert first['plan_wait'] is None
+        quiet = e.lp_auto_run_once(round_id=first['last_round']['round_id'])
+        assert quiet['last_round'] == first['last_round'] and len(exchange.posts) == 1
+        exchange.before_sign = None
+        order = next(o for o in exchange.orders if o['order_id'] == original_oid)
+        assert order['token_id'] == 'm00' and Decimal(order['original_size']) == 20 and Decimal(order['price']) == Decimal('.37')
+        order.update(status='CANCELED', size_matched='0')
+        lp.reconcile_facts(original_sid)
+        terminal = store.lp_session(original_sid)
+        assert terminal['order_history'][original_oid]['status'] == 'CANCELED'
+        assert Decimal(terminal['order_history'][original_oid]['size_matched']) == 0
+        assert store.lp_actions(original_sid) == [original_audit]
+        advance_auto_wait(e, monkeypatch, refresh=False)
+        monkeypatch.setattr(sys.modules[__name__], 'NOW', e._lp._now())
+        lp._candidate_pool_record_success('m00', dict(condition_id='m00'), judged_at=NOW,
+            facts=dict(directions=[exchange.direction('m00')], account=exchange.lp_account_snapshot()))
+        fresh = e.lp_auto_run_once(round_id='issue288-g-fresh')
+        assert len(exchange.posts) == 2
+        assert [Decimal(p['price']) for p in exchange.posts] == [Decimal('.37'), Decimal('.36')]
+        assert all(p['token_id'] == 'm00' and p['side'] == 'BUY' and p['quantity'] == 20 for p in exchange.posts)
+        new_action, = fresh['last_round']['actions']
+        assert new_action['state'] == 'success' and new_action['request_state'] == 'entry_open'
+        assert new_action['action_id'] != original_action['action_id']
+        assert new_action['session_id'] != original_sid and new_action['order_id'] != original_oid
+        new_audit, = store.lp_actions(new_action['session_id'])
+        assert new_audit['action_id'] != original_audit['action_id'] and new_audit['action_key'] != original_audit['action_key']
+        assert new_audit['state'] == 'accepted' and new_audit['post_started'] is True
+        assert Decimal(new_audit['price']) == Decimal('.36') and Decimal(new_audit['quantity']) == 20
+        assert store.lp_actions(original_sid) == [original_audit]
+        assert fresh['slots']['occupied'] == 1 and Decimal(fresh['funds']['buy_reserved_usd']) == Decimal('7.20')
+        assert fresh['last_round']['completed_at'] and fresh['active_plan'] is None
+        (tmp_path / 'CI-C-fixed-next-quote-proof.json').write_text(json.dumps(dict(
+            first=first, terminal=terminal, fresh=fresh, original_audit=original_audit,
+            new_audit=new_audit, posts=exchange.posts), default=str, indent=2))
 
 
 class _UnknownImportedBuyAccount(_ImportedExitAccount):

@@ -57,7 +57,8 @@ def refresh(lp, exchange, count=10):
 
 
 def test_full_pool_replaces_every_market_outside_top_five_without_threshold(tmp_path, monkeypatch):
-    engine, exchange, lp, _ = setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(pool, 'NOW', pool.NOW)
+    engine, exchange, lp, store = setup(tmp_path, monkeypatch)
     from tests.test_lp_auto_plan_execution import install_order_result_reader
     result_reader = install_order_result_reader(exchange, monkeypatch)
     advance_auto_wait(engine, monkeypatch)
@@ -67,14 +68,23 @@ def test_full_pool_replaces_every_market_outside_top_five_without_threshold(tmp_
 
     advance_auto_wait(engine, monkeypatch)
     state = engine.lp_auto_run_once()
-    from tests.test_lp_auto_independent_cancel_contract import _wait_audits
-    _wait_audits(lp.store, lambda rows: len(rows) == 5 and all(a['state'] != 'pending' for a in rows))
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
+    from copy import deepcopy
+    from collections import Counter
+    original = deepcopy(_wait_round_cancels(store, state))
+    assert len(original) == 5
     assert set(exchange.cancels) == {'o1', 'o2', 'o3', 'o4', 'o5'}
     assert len(exchange.posts) == 5
     assert state['slots']['occupied'] == 5
     assert Decimal(state['funds']['buy_reserved_usd']) == 40
-    engine.lp_auto_run_once()
-    assert len(exchange.cancels) == 5
+    fresh = engine.lp_auto_run_once()
+    requests = _wait_round_cancels(store, fresh)
+    assert len(requests) == 5
+    assert {a['order_id'] for a in requests} == {'o1', 'o2', 'o3', 'o4', 'o5'}
+    assert {a['action_key'] for a in requests}.isdisjoint(a['action_key'] for a in original)
+    assert all(next(a for a in store.lp_actions(old['session_id']) if a['action_key'] == old['action_key']) == old for old in original)
+    assert Counter(exchange.cancels) == Counter({oid: 2 for oid in ('o1','o2','o3','o4','o5')})
+    assert fresh['slots']['occupied'] == 5 and Decimal(fresh['funds']['buy_reserved_usd']) == 40
     assert len(exchange.posts) == 5
 
     for order in exchange.orders:
@@ -145,6 +155,8 @@ def test_rotation_waits_for_first_real_shared_read_and_recovers_without_overbuyi
         assert slow_entered.wait(2)
         fast.start()
         assert fast_entered.wait(2)
+        with lp._market_reads_lock:
+            slow_job, fast_job = lp._market_reads['m10'], lp._market_reads['m11']
         state = engine.lp_auto_scheduled_check()
         assert state['last_round']['reason'] == 'market_read_capacity'
         assert [row['condition_id'] for row in state['last_round']['blocked']] == ['m00']
@@ -186,7 +198,14 @@ def test_rotation_waits_for_first_real_shared_read_and_recovers_without_overbuyi
         round_thread.join(5)
         assert checked
         assert not slow_completed.is_set() and not slow_release.is_set()
-        state = checked[0]
+        deferred = checked[0]
+        assert not deferred['last_round'].get('cancel_registration')
+        assert exchange.cancels == [] and len(exchange.posts) == 1
+        assert deferred['slots']['occupied'] == 1 and Decimal(deferred['funds']['buy_reserved_usd']) == 8
+        # SDK-finally is earlier than the actual read Future completion.
+        fast_job.result(timeout=2)
+        assert fast_job.done() and not slow_job.done()
+        state = engine.lp_auto_scheduled_check()
         request, = _wait_round_cancels(store, state)
         assert request['order_id']=='o1' and request['state']=='accepted'
         assert exchange.cancels == ['o1']
@@ -274,7 +293,12 @@ def test_rotation_reports_exact_block_when_financial_facts_expire(tmp_path, monk
 
 
 def test_rotation_keeps_unknown_occupied_slots_blocked_and_ranks_known_actives(tmp_path, monkeypatch):
+    monkeypatch.setattr(pool, 'NOW', pool.NOW)
     engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=3, target=2)
+    engine.lp_auto_set_desired_running(False)
+    observed = engine.lp_auto_run_once(round_id='observe-known-resting-yields')
+    assert len(exchange.posts) == 2 and exchange.cancels == []
+    engine.lp_auto_set_desired_running(True)
     exchange.rewards['m02'] = Decimal('25')
     refresh(lp, exchange, 3)
     intents = engine.lp_auto_state()['intents']

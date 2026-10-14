@@ -250,6 +250,41 @@ class LPAutoPool:
         self._current_account = None
         self.lp._facts_attention_summary = self.state
         self.lp._facts_attention_verifier = self.reconcile_attention
+        self.lp._planning_failure_publisher = self._persist_drained_planning_failures
+
+    def _persist_drained_planning_failures(self, *, wallet_address, failures):
+        """Commit late failure deadlines before successful public drain releases them."""
+        account_id = hashlib.sha256(str(wallet_address or '').strip().casefold().encode()).hexdigest()
+        if account_id != self.execution._lp_account_id():
+            raise ValueError('planning_failure_account_changed')
+        def publish(doc):
+            if doc.get('account_id') != account_id:
+                raise ValueError('planning_failure_account_changed')
+            packet = doc.get('account_observation') or {}
+            components = packet.get('components') or {}
+            for name, error in failures.items():
+                failed_at = _maybe_datetime(error.get('planning_failed_at'))
+                retry_at = _maybe_datetime(error.get('planning_retry_at'))
+                previous = components.get(name) or {}
+                if (name not in ('balance', 'open_orders', 'positions')
+                        or failed_at is None or retry_at is None
+                        or any(at is not None and at > failed_at for at in
+                            (_maybe_datetime(previous.get('read_started_at')),
+                             _maybe_datetime(previous.get('checked_at'))))):
+                    continue
+                if error.get('status') in {401, 403, 429}:
+                    prior = doc.get('account_reader_wait') or {}
+                    prior_deadline = _maybe_datetime(prior.get('retry_at'))
+                    if prior_deadline is None or prior_deadline < retry_at:
+                        doc['account_reader_wait'] = dict(reason='credential_invalid' if error.get('status') == 401
+                            else 'account_read_cooling_down', retry_at=retry_at, error=error)
+                else:
+                    components[name] = dict(state='failed', read_started_at=previous.get('read_started_at'),
+                        checked_at=None, last_success_at=previous.get('last_success_at'), error=error, retry_at=retry_at)
+            if components:
+                packet['components'] = components
+                doc['account_observation'] = packet
+        self._update(publish)
 
     def _begin_account_round(self) -> _AccountRoundLease | None:
         begin = getattr(self.lp.exchange, 'lp_account_round_begin', None)
@@ -4217,16 +4252,14 @@ class LPAutoPool:
                     runnable = True
                     break
                 actions = self.store.lp_actions(session['session_id'])
-                runnable = any(
-                    submission_action_kind(a) == 'entry' and (
-                        a.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
-                        or a.get('state') == 'accepted' and session.get('submit_status') != 'accepted')
-                    or submission_action_kind(a) == 'cancel' and (
-                        a.get('state') in {'pending', 'unknown'}
-                        or a.get('state') == 'accepted' and session.get('yield_rotation_cancel_owners'))
+                runnable = any(submission_action_kind(a) == 'cancel' and (
+                    a.get('state') in {'pending', 'unknown'}
+                    or a.get('state') == 'accepted' and session.get('yield_rotation_cancel_owners'))
                     for a in actions)
                 if runnable:
                     break
+        if not runnable:
+            runnable = bool(self._recoverable_entry_receipts(self._read()))
         if not runnable and (all_blocked or retry is not None):
             deadlines = [at for at in [retry, *deadlines] if at is not None and at > self._now()]
             if deadlines:
@@ -4866,9 +4899,8 @@ class LPAutoPool:
             # Missing/conflicting results preserve the original owner and hold.
             return
 
-    def _recover_entry_requests(self):
-        """Use request/session/audit ownership, independently of any round record."""
-        document = self._read()
+    def _recoverable_entry_receipts(self, document):
+        """Ended accepted-ID receipts are work; unresolved audits retain holds only."""
         account_id = document['account_id']
         requests = []
         for intent in document['intents'].values():
@@ -4893,6 +4925,13 @@ class LPAutoPool:
                         or _maybe_decimal(audit.get(k)) != _decimal(target[k]) for k in ('price', 'quantity'))):
                 continue
             requests.append((intent, target, session, audit))
+        return requests
+
+    def _recover_entry_requests(self):
+        """Use request/session/audit ownership, independently of any round record."""
+        document = self._read()
+        account_id = document['account_id']
+        requests = self._recoverable_entry_receipts(document)
         if not requests:
             return
         reader = getattr(self.lp.exchange, 'lp_order_result_snapshot', None)

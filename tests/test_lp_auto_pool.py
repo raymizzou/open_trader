@@ -556,35 +556,27 @@ def test_planning_book_failure_creates_no_send_reservation(tmp_path, monkeypatch
             failures=failures,signatures=signatures,posts=posts,cancels=cancels,sessions=s.lp_sessions()),default=str,indent=2))
 
 
-def test_callback_lock_failure_before_post_releases_reservation(tmp_path):
-    e,x,lp,s=setup(tmp_path)
-    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+def test_public_pause_before_post_releases_reservation(tmp_path):
+    e, x, lp, store = setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     e.lp_auto_set_desired_running(True)
-    original=e._acquire_global_lock
-    granted=[]
-    def acquire():
-        lock=original()
-        if len(granted)==1:
-            if lock is not None:
-                e._release_global_lock(lock)
-            granted.append(False)
-            return None
-        granted.append(lock is not None)
-        if lock is not None:
-            return lock
-        return lock
-    e._acquire_global_lock=acquire
-    r=e.lp_auto_run_once()
-    sid=r['intents'][0]['session_id']
-    session=s.lp_session(sid)
-    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
-    assert granted==[True,False] and not x.posts
-    assert session['state']=='entry_rejected'
-    assert session['submit_stage']=='pre_send_rejected'
-    assert session['reason']=='execution_lock'
-    assert session['post_started'] is False
-    assert action['submit_stage']=='pre_send_rejected'
-    assert r['slots']['occupied']==0
+    signing = []
+    def pause_before_signed_order():
+        signing.append(e.lp_auto_state()['active_plan']['round_id'])
+        assert e.lp_auto_set_desired_running(False)['desired_running'] is False
+    x.before_sign = pause_before_signed_order
+    result = e.lp_auto_run_once(round_id='public-pause-before-post')
+    assert signing == ['public-pause-before-post'] and x.posts == []
+    intent, = result['intents']
+    session = store.lp_session(intent['session_id'])
+    action, = [a for a in store.lp_actions(intent['session_id']) if a.get('role') == 'entry']
+    assert session['state'] == 'entry_rejected' and session['submit_status'] == 'rejected'
+    assert session['submit_stage'] == action['submit_stage'] == 'prepare_failed'
+    assert session['post_started'] is action['post_started'] is False
+    assert not session.get('entry_order_id') and not action.get('order_id')
+    assert action['state'] == 'rejected'
+    assert result['slots']['occupied'] == 0 and Decimal(result['funds']['buy_reserved_usd']) == 0
+    assert not lp.entry_send_inflight(intent['session_id']) and result['desired_running'] is False
 
 
 def test_second_mutation_guard_before_post_releases_reservation(tmp_path):
@@ -1112,7 +1104,7 @@ def test_new_external_buy_is_absorbed_by_next_plan(tmp_path, monkeypatch):
         NOW += timedelta(microseconds=1)
         return {**packet, 'read_started_at': started, 'read_ended_at': NOW, 'checked_at': NOW}
     x.lp_order_result_snapshot = current_result
-    financial_reads = []
+    financial_reads, financial_read_plans = [], []
     def complete_account_round(*, max_age_seconds=0, trade_generation_provider=None):
         del max_age_seconds
         global NOW
@@ -1123,6 +1115,7 @@ def test_new_external_buy_is_absorbed_by_next_plan(tmp_path, monkeypatch):
         if trade_generation_provider is not None:
             packet['trade_generation'] = trade_generation_provider()
         financial_reads.append(deepcopy(packet))
+        financial_read_plans.append(bool(e.lp_auto_state()['active_plan']))
         return packet
     x.lp_account_snapshot_shared = complete_account_round
     cancels = []
@@ -1143,17 +1136,16 @@ def test_new_external_buy_is_absorbed_by_next_plan(tmp_path, monkeypatch):
     assert [p['token_id'] for p in x.posts] == ['m00'], r['last_round']
     assert x.posts[0]['price'] == Decimal('.40') and x.posts[0]['quantity'] == 20
     assert r['last_round']['actions'][0]['state'] == 'success' and r['last_round']['completed_at']
-    assert len(financial_reads) == 1
+    assert financial_reads and not any(financial_read_plans)
     original_plan = deepcopy(r['last_round'])
     assert {o['order_id'] for o in x.orders if o['status'] == 'LIVE'} == {'manual', 'o1'}
-    completed = datetime.fromisoformat(r['last_round']['completed_at'])
-    monkeypatch.setattr(sys.modules[__name__], 'NOW', completed + timedelta(seconds=29))
-    e.lp_auto_run_once()
-    assert len(financial_reads) == 1 and len(x.posts) == 1 and cancels == []
-    assert e.lp_auto_state()['last_round'] == original_plan
-    monkeypatch.setattr(sys.modules[__name__], 'NOW', completed + timedelta(seconds=30))
+    old_reads = len(financial_reads)
+    original_sid = r['last_round']['actions'][0]['session_id']
+    original_entry = deepcopy([a for a in s.lp_actions(original_sid) if a.get('role') == 'entry'])
     state = e.lp_auto_run_once()
-    assert len(financial_reads) > 1
+    assert len(financial_reads) > old_reads and not any(financial_read_plans)
+    assert state['last_round']['round_id'] != original_plan['round_id']
+    assert [a for a in s.lp_actions(original_sid) if a.get('role') == 'entry'] == original_entry
     _wait_round_cancels(s, state)
     assert cancels == ['o1'] and len(x.posts) == 1
     assert state['slots']['occupied'] == 2
@@ -1298,7 +1290,7 @@ def test_late_live_receipt_preserves_already_verified_fill(tmp_path, sell_receip
 
 
 @pytest.mark.parametrize('signed_id',[False,True])
-def test_receipt_apply_respects_another_service_tick_lock(tmp_path,signed_id):
+def test_receipt_apply_ignores_unrelated_service_tick_lock(tmp_path,signed_id):
     from threading import Barrier, Event, Lock
     e,x,lp,s=setup(tmp_path)
     other_store=PredictionArbitrageStore(s.data_dir)
@@ -1339,7 +1331,8 @@ def test_receipt_apply_respects_another_service_tick_lock(tmp_path,signed_id):
             return_receipt.set()
             r=automatic.result(timeout=2)
             sid=r['intents'][0]['session_id']
-            assert s.lp_session(sid).get('submit_status')!='accepted'
+            assert s.lp_session(sid).get('submit_status') == 'accepted'
+            assert s.lp_session(sid)['entry_order_id'] == 'o1'
             actions=s.lp_actions(sid)
             assert any(a['state']=='accepted' and a.get('order_id')=='o1' for a in actions)
         finally:

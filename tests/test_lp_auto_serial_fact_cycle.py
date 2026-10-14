@@ -1110,16 +1110,24 @@ def test_cold_restart_uses_current_facts_without_old_send_authority(request, run
         assert account.posts == [] and second['slots']['occupied'] == 2
         return
     if scenario == 'legacy_interval':
-        # The approved exact-baseline producer uses its original public config
-        # API against this offline DB. CI fetches full history (ci.yml).
+        # Authenticate immutable old-version inputs without runtime Git history.
+        import hashlib
+        fixture = Path(__file__).parent / 'fixtures' / 'lp_legacy_de24'
+        manifest = json.loads((fixture / 'manifest.json').read_text())
         sha = 'de24fd97c611e98658f9f215c760c1b2e593da15'
+        assert manifest['commit'] == sha
+        archive = (fixture / manifest['archive']).read_bytes()
+        assert hashlib.sha256(archive).hexdigest() == manifest['archive_sha256']
         source = tmp_path / 'baseline-source'
         source.mkdir()
-        archive = subprocess.check_output(['git', 'archive', sha, 'src', 'tests'], timeout=5)
-        with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+        with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as bundle:
+            actual = {m.name: hashlib.sha256(bundle.extractfile(m).read()).hexdigest()
+                for m in bundle.getmembers() if m.isfile()}
+            assert actual == manifest['members_sha256']
+            assert all(m.isdir() or m.isfile() for m in bundle.getmembers())
             bundle.extractall(source, filter='data')
         producer = r'''
-import json,sys
+import json,sys,hashlib
 from pathlib import Path
 import pytest
 from tests.test_lp_account_reservation_reconciliation import runtime
@@ -1128,6 +1136,7 @@ import open_trader.polymarket_lp_auto as auto
 patch=pytest.MonkeyPatch()
 generator=runtime.__wrapped__(Path(sys.argv[1]),patch)
 build=next(generator)
+lp=None
 try:
     store,adapter,account,lp,engine=build(public_client=RefillPublic(build.clock))
     engine.lp_auto_configure({'budget_usd':'16','target_buy_count':2,'round_interval_seconds':900})
@@ -1137,9 +1146,15 @@ try:
     assert state['plan_wait']['kind']=='round' and state['round_interval_seconds']==900
     assert account.posts==[]
     Path(sys.argv[1],'baseline-producer.json').write_text(json.dumps({'sha':sys.argv[2],
-        'module':auto.__file__,'state':state},default=str))
-    lp.drain_submissions()
+        'module':auto.__file__,'module_sha256':hashlib.sha256(Path(auto.__file__).read_bytes()).hexdigest(),
+        'origins':{name:{'path':sys.modules[name].__file__,
+            'sha256':hashlib.sha256(Path(sys.modules[name].__file__).read_bytes()).hexdigest()}
+            for name in ('open_trader.polymarket_lp_auto','open_trader.polymarket_trading',
+                'open_trader.polymarket_lp','open_trader.prediction_arbitrage_store',
+                'tests.test_lp_account_reservation_reconciliation','tests.test_lp_auto_refill_contract',
+                'tests.test_lp_order_registration_contract')},'state':state},default=str))
 finally:
+    if lp is not None: lp.drain_submissions()
     try: next(generator)
     except StopIteration: pass
     patch.undo()
@@ -1151,6 +1166,11 @@ finally:
         assert result.returncode == 0, result.stdout + result.stderr
         evidence = json.loads((tmp_path / 'baseline-producer.json').read_text())
         assert Path(evidence['module']).is_relative_to(source)
+        assert evidence['module_sha256'] == manifest['members_sha256']['src/open_trader/polymarket_lp_auto.py']
+        for origin in evidence['origins'].values():
+            relative = Path(origin['path']).relative_to(source).as_posix()
+            assert origin['sha256'] == manifest['members_sha256'][relative]
+
         legacy_wait = evidence['state']['plan_wait']
         assert datetime.fromisoformat(legacy_wait['deadline']) > runtime.clock[0]
         original_audits, original_posts = {}, []
@@ -1498,5 +1518,189 @@ def test_partial_account_failure_uses_current_owned_buy_quantity(request, runtim
     assert store.lp_actions(sid) == audits and Decimal(unchanged['buy_filled_quantity']) == 0
     assert account.trades == () and account.positions == ()
     assert account.posts == account.market_orders == account.cancels == []
+    tick = engine.lp_tick()
+    monitored = _yield(store, original.id)
+    assert monitored['state'] == 'known'
+    assert Decimal(monitored['quantity']) == 32, 'Ordinary monitoring must retain proved current remaining32'
+    assert Decimal(monitored['capital_usd']) == Decimal('12.80')
+    assert Decimal(monitored['yield_pct_per_hour']).quantize(Decimal('.000001')) == Decimal('.084232')
+    for key in ('order_checked_at', 'order_read_started_at', 'order_trade_generation'):
+        assert monitored[key] == observed[key], 'Monitoring must retain the actual current-order source provenance'
+    after_tick = store.lp_session(sid)
+    expected_controls = deepcopy(controls)
+    expected_controls['queue_protection']['data_failures'] += 1
+    assert {k: after_tick.get(k) for k in controls} == expected_controls
+    assert after_tick['order_history'] == history and store.lp_actions(sid) == audits
+    assert Decimal(after_tick['buy_filled_quantity']) == 0
+    assert engine.lp_auto_state()['funds']['as_of'] == financial_as_of
+    assert account.posts == account.market_orders == account.cancels == []
     (tmp_path / 'review-F4-current-terms.json').write_text(json.dumps(
-        dict(failure=failure, initial=initial, current=current, observed=observed), default=str, indent=2))
+        dict(failure=failure, initial=initial, current=current, observed=observed,
+            tick=tick, monitored=monitored), default=str, indent=2))
+
+
+def test_cold_unknown_entry_waits_for_real_dependency_deadline(request, runtime, tmp_path):
+    if run_test_in_subprocess(request):
+        return
+    from copy import deepcopy
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+    store, adapter, account, lp, engine, public = prepare(runtime, budget='8', target=1, count=1)
+    engine.lp_auto_configure({'api_retry_interval_seconds': 7})
+    def lost(signed):
+        account.posts.append(signed)
+        raise TimeoutError('Actual original POST response lost without order ID')
+    account.post_order = lost
+    initial = engine.lp_auto_run_once(round_id='cold-unknown-original-post')
+    lp.drain_submissions()
+    assert len(account.posts) == 1 and account.orders == ()
+    owner, = store.lp_sessions()
+    sid = owner['session_id']
+    original_audits = deepcopy(store.lp_actions(sid))
+    audit, = original_audits
+    assert audit['state'] == 'unknown' and audit['post_started'] is True and not audit.get('order_id')
+    assert not lp.entry_send_inflight(sid)
+    assert initial['slots']['occupied'] == 1 and Decimal(initial['funds']['buy_reserved_usd']) == 8
+    identity = {k: deepcopy(owner.get(k)) for k in ('account_id', 'idempotency_key', 'entry_order_id',
+        'owned_order_ids', 'price', 'quantity', 'stop_requested', 'loss_requested')}
+    adapter.close()
+    store, adapter, account, lp, engine = runtime(public_client=public)
+    assert not lp.entry_send_inflight(sid) and account.orders == ()
+    calls = {name: [] for name in ('get_balance_allowance', 'list_open_orders', 'list_positions')}
+    native = {name: getattr(account, name) for name in calls}
+    for name in calls:
+        def failed(*args, _name=name, **kwargs):
+            calls[_name].append(runtime.clock[0])
+            raise TimeoutError('Actual cold dependency unavailable: ' + _name)
+        setattr(account, name, failed)
+    runtime.clock[0] += timedelta(seconds=61)
+    deadline = runtime.clock[0] + timedelta(seconds=7)
+    scheduler = LPAutoScheduler(engine, clock=lambda: runtime.clock[0])
+    records = []
+    try:
+        assert scheduler.run_due()
+        state = engine.lp_auto_state()
+        records.append(state)
+        assert all(c['state'] == 'failed' for c in state['account_observation']['components'].values())
+        assert state['plan_wait'] and state['plan_wait']['kind'] == 'dependencies', state
+        assert datetime.fromisoformat(state['plan_wait']['deadline']) == deadline
+        assert datetime.fromisoformat(scheduler.snapshot()['next_check_at']) == deadline
+        prior_calls, prior_round = deepcopy(calls), deepcopy(state['last_round'])
+        assert not scheduler.run_due()
+        assert calls == prior_calls and engine.lp_auto_state()['last_round'] == prior_round
+        scheduler.request_check()
+        assert scheduler.run_due() and calls == prior_calls
+        assert not scheduler.run_due()
+        runtime.clock[0] = deadline - timedelta(seconds=1)
+        assert not scheduler.run_due() and calls == prior_calls
+        # A due read remains failed; it cannot prove rejection or release holds.
+        runtime.clock[0] = deadline
+        assert scheduler.run_due()
+        records.append(engine.lp_auto_state())
+        assert all(len(at) == 2 and at[-1] == deadline for at in calls.values())
+        current = engine.lp_auto_state()
+        assert current['slots']['occupied'] == 1 and Decimal(current['funds']['buy_reserved_usd']) == 8
+        assert store.lp_actions(sid) == original_audits
+        assert {k: store.lp_session(sid).get(k) for k in identity} == identity
+        assert account.posts == account.market_orders == account.cancels == []
+        assert account.trades == account.positions == ()
+    finally:
+        scheduler.stop()
+        lp.drain_submissions()
+        (tmp_path / 'cold-unknown-dependency-evidence.json').write_text(json.dumps(
+            dict(initial=initial, audit=original_audits, records=records, calls=calls), default=str, indent=2))
+
+
+@pytest.mark.parametrize('status', [503, 429])
+def test_late_account_retry_survives_shutdown_before_another_round(request, runtime, tmp_path, status):
+    if run_test_in_subprocess(request):
+        return
+    from copy import deepcopy
+    from threading import current_thread
+    public = SerialPublic(runtime.clock)
+    orders = (_resting(1), _resting(2))
+    store, adapter, account, lp, engine = runtime(public_client=public, orders=orders)
+    engine.lp_auto_configure({'budget_usd': '16', 'target_buy_count': 2, 'api_retry_interval_seconds': 7})
+    assert engine.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    engine.lp_auto_set_desired_running(True)
+    before = deepcopy(engine.lp_auto_state())
+    audits = {s['session_id']: deepcopy(store.lp_actions(s['session_id'])) for s in store.lp_sessions()}
+    entered, release, ended, drain_started = Event(), Event(), Event(), Event()
+    native_threads, raised_at, calls, records = [], [], [], []
+    def delayed_failure(**kwargs):
+        native_threads.append(current_thread())
+        calls.append(runtime.clock[0])
+        entered.set()
+        try:
+            assert release.wait(5), 'Independent native SDK watchdog'
+            raised_at.append(runtime.clock[0])
+            raise HTTPError('https://offline.invalid/balance-allowance', status, 'late shutdown failure',
+                {'Retry-After': '120'} if status == 503 else {}, None)
+        finally:
+            ended.set()
+    account.get_balance_allowance = delayed_failure
+    first_future, round_thread = _round_thread(engine, 'shutdown-first-bounded-timeout')
+    drain_result = Future()
+    def shutdown():
+        drain_started.set()
+        try:
+            lp.drain_submissions()
+            adapter.close()
+            drain_result.set_result(True)
+        except BaseException as exc:
+            drain_result.set_exception(exc)
+    drain_thread = Thread(target=shutdown)
+    try:
+        assert entered.wait(5)
+        first = first_future.result(timeout=5)
+        records.append(first)
+        assert not ended.is_set(), 'Original SDK Future still owns its resource after bounded timeout'
+        assert first['funds']['as_of'] == before['funds']['as_of']
+        drain_thread.start()
+        assert drain_started.wait(5) and not drain_result.done()
+        runtime.clock[0] += timedelta(seconds=1)
+        release.set()
+        assert ended.wait(5)
+        for native in native_threads:
+            native.join(5)
+            assert not native.is_alive()
+        assert drain_result.result(timeout=5)
+        drain_thread.join(5)
+        assert not drain_thread.is_alive()
+        expected = raised_at[0] + timedelta(seconds=120 if status == 503 else 7)
+        assert len(calls) == 1 and account.posts == account.market_orders == account.cancels == []
+        assert all(store.lp_actions(sid) == rows for sid, rows in audits.items())
+        # No automatic round collected the completed error before public close.
+        store, adapter, account, lp, engine = runtime(public_client=public, orders=orders)
+        balance, cold_calls = account.get_balance_allowance, []
+        def observed(**kwargs):
+            cold_calls.append(runtime.clock[0])
+            return balance(**kwargs)
+        account.get_balance_allowance = observed
+        runtime.clock[0] = expected - timedelta(seconds=1)
+        cold = engine.lp_auto_run_once(round_id='shutdown-cold-before-deadline')
+        records.append(cold)
+        assert cold_calls == [], 'Public shutdown must preserve actual completion-anchored provider/fallback deadline'
+        wait = cold.get('account_reader_wait') or {}
+        component = ((cold.get('account_observation') or {}).get('components') or {}).get('balance') or {}
+        assert datetime.fromisoformat((wait.get('retry_at') or component['retry_at']).replace('Z', '+00:00')) == expected
+        assert cold['funds']['as_of'] == before['funds']['as_of']
+        assert cold['slots']['occupied'] == 2 and Decimal(cold['funds']['buy_reserved_usd']) == 16
+        runtime.clock[0] = expected
+        due = engine.lp_auto_run_once(round_id='shutdown-cold-at-deadline')
+        records.append(due)
+        assert cold_calls == [expected]
+        assert account.posts == account.market_orders == account.cancels == []
+        assert all(store.lp_actions(sid) == rows for sid, rows in audits.items())
+    finally:
+        release.set()
+        round_thread.join(5)
+        assert not round_thread.is_alive()
+        if drain_thread.ident is not None:
+            drain_thread.join(5)
+            assert not drain_thread.is_alive()
+        for native in native_threads:
+            native.join(5)
+            assert not native.is_alive()
+        lp.drain_submissions()
+        (tmp_path / 'shutdown-late-deadline.json').write_text(json.dumps(
+            dict(status=status, raised_at=raised_at, calls=calls, records=records), default=str, indent=2))
