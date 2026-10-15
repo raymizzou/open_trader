@@ -23,6 +23,7 @@ from typing import Any, cast
 from types import MappingProxyType
 from zoneinfo import ZoneInfo
 
+from .polymarket_lp_reader_comparison import capture as _reader_capture
 from .polymarket_lp_risk import (
     BOOK_FRESHNESS_SECONDS,
     _MARKET_METADATA_MAX_AGE_SECONDS,
@@ -12508,6 +12509,9 @@ class PolymarketLPService:
                 except (ValueError, KeyError, TypeError):
                     pass
             estimates[oid] = estimate
+            _reader_capture('yield', order_id=oid, account_id=wallet, direction=direction,
+                order_terms=row, guidance={'price': row['price'], 'quantity': remaining}, as_of=now, resting_quantity=remaining,
+                old=estimate.get('yield_pct_per_hour') if estimate else None)
 
         def publish(current, connection):
             timers = deepcopy(current.get('buy_yield_unknown') or {})

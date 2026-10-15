@@ -38,6 +38,7 @@ from .polymarket_lp_notification_batches import (
     ChannelDeliveryResult, matching_batch_channels, plan_notification_batches,
 )
 
+from .polymarket_lp_reader_comparison import comparison_capture, capture as _reader_capture, bind_round_id as _reader_bind_round_id
 from .polymarket_trading import _lp_capture_read_log, _lp_causal_event, _lp_read_task
 
 logger = logging.getLogger(__name__)
@@ -1266,6 +1267,8 @@ class LPAutoPool:
                         counts['estimate_unknown'] += 1
                         _candidate_filter_reasons(diagnostics, estimate.get('reason_codes') or ['other'])
                     continue
+                _reader_capture('candidate', direction=direction, guidance=guidance, as_of=estimate_at,
+                    old=estimate.get('yield_pct_per_hour'), token_id=guidance.get('token_id', ''))
                 result.append({**guidance,'minimum_order_estimate':estimate,
                     'estimated_yield_raw':estimate['yield_pct_per_hour'],
                     'updated_at':updated_at[condition_id]})
@@ -1705,6 +1708,7 @@ class LPAutoPool:
                 if account is None:
                     raise ValueError('account_facts_unknown')
                 available = min(available, _decimal(account['balance']), _decimal(account['allowance']))
+            comparison_controls = dict(slots=slots, available=available, capacity=resting_capacity)
             targets = []
             budget_skipped = []
             remaining = available
@@ -1747,6 +1751,8 @@ class LPAutoPool:
                 estimate = minimum_order_estimate(direction, evaluated['guidance'], self._now())
                 if estimate['state'] != 'known':
                     raise ValueError('ranking_yield_unknown')
+                _reader_capture('candidate', direction=direction, guidance=evaluated['guidance'],
+                    as_of=estimate['checked_at'], old=estimate.get('yield_pct_per_hour'), token_id=pending['token_id'])
                 pending.update(evaluated['guidance'], minimum_order_estimate=estimate,
                                ranking_account={k: v for k, v in account.items() if not k.startswith('raw_')},
                                ranking_book_at=direction['book']['received_at'], ranking_reward_at=direction['reward_checked_at'])
@@ -1794,6 +1800,11 @@ class LPAutoPool:
             if capital - existing_capital > max(ZERO, available):
                 raise ValueError('top_yield_funds_insufficient')
         candidates.sort(key=lambda r: (-_decimal(r['minimum_order_estimate']['yield_pct_per_hour']), str(r['condition_id']), str(r['token_id'])))
+        _reader_capture('ranking', rows=[{k: r.get(k) for k in ('condition_id', 'token_id', 'order_id',
+            'intent_id', 'account_order', 'price', 'quantity', 'minimum_order_estimate', 'ranking_book_at')}
+            for r in unique.values()], controls=comparison_controls,
+            old=tuple(str(r.get('order_id') or r['token_id']) for r in targets),
+            retained=bool(retained))
         return [*retained, *targets], victims, candidates, blocked
 
     def _ranking_fresh(self, row, *, observation=None, qualification_receipt=False):
@@ -4134,7 +4145,7 @@ class LPAutoPool:
             return self._reconcile_unknown() if locked else {**self.state(),'round_reason':'round_in_progress'}
 
     def run_once(self, *, round_id=None, reuse_facts=False):
-        with _lp_read_task("auto_round"), self._round_barrier() as locked:
+        with comparison_capture(getattr(self.lp, "reader_comparison_observer", None)), _lp_read_task("auto_round"), self._round_barrier() as locked:
             if not locked:
                 return {**self.state(),'round_reason':'round_in_progress'}
             try:
@@ -4272,6 +4283,12 @@ class LPAutoPool:
         source_document = observation['document'] if observation is not None else self._read()
         _lp_causal_event('auto_account_use', account=source_document.get('account_financial_facts'), used_at=self._now())
         round_id = plan['round_id'] if plan else round_id or uuid.uuid4().hex
+        _reader_bind_round_id(round_id)
+        if observation is not None:
+            _reader_capture('account', round_id=round_id, account=observation['account'],
+                old=source_document.get('account_financial_facts') or {}, as_of=observation['validated_at'])
+        else:
+            _reader_capture('unavailable')
         diagnostics = dict(round_id=round_id, state='not_evaluated', counts={}, reasons={},
             recheck_reasons={}, facts={}, account_sources=dict(current=0, candidate=0, unknown=0),
             round_started_at=self._stamp())
