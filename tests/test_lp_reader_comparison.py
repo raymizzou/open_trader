@@ -252,25 +252,33 @@ def test_missing_or_different_source_is_not_reported_as_match(missing):
 
 
 @pytest.mark.parametrize('failure', ['blocked_compare', 'blocked_sink', 'comparison_error'])
-def test_blocked_comparison_or_log_sink_never_waits_for_main_flow(runtime, failure):
-    from open_trader.polymarket_lp_reader_comparison import ReaderComparisonObserver, compare_snapshot, logger
+def test_blocked_comparison_or_log_sink_never_waits_for_main_flow(runtime, failure, monkeypatch):
+    from open_trader.polymarket_lp_reader_comparison import ReaderComparisonObserver, compare_snapshot
     from tests.test_lp_account_reservation_reconciliation import _refill_identity
     from threading import Thread
-    import logging
+    import io, sys
     entered, release, done = Event(), Event(), Event()
+    sink_done = Event()
     primary, errors = [], []
     store, adapter, account, lp, engine, _ = prepare(runtime, count=3, target=3, budget='24', public=RefillPublic(runtime.clock))
-    class Sink(logging.Handler):
-        def emit(self, record):
-            entered.set()
-            assert release.wait(4)
+    class Sink(io.StringIO):
+        def write(self, text):
+            result = super().write(text)
+            if 'lp_reader_comparison facts=' in text:
+                entered.set()
+                assert release.wait(4)
+            return result
+        def flush(self):
+            super().flush()
+            if 'lp_reader_comparison facts=' in self.getvalue():
+                sink_done.set()
     sink=Sink()
     def compare(value):
         entered.set()
         if failure=='comparison_error': raise RuntimeError('secret original error')
         assert release.wait(4)
         return compare_snapshot(value)
-    if failure=='blocked_sink': logger.addHandler(sink); logger.setLevel(logging.INFO)
+    if failure=='blocked_sink': monkeypatch.setattr(sys, 'stdout', sink)
     observer=ReaderComparisonObserver(**({'compare':compare} if failure!='blocked_sink' else {}))
     lp.reader_comparison_observer=observer
     def run():
@@ -292,7 +300,9 @@ def test_blocked_comparison_or_log_sink_never_waits_for_main_flow(runtime, failu
         assert observer.wait_idle(timeout=3)
         if failure=='comparison_error': assert observer.snapshot()['error']==1
     finally:
-        release.set(); thread.join(timeout=4); observer.close(); logger.removeHandler(sink)
+        release.set(); thread.join(timeout=4); observer.close()
+        if failure == 'blocked_sink' and entered.is_set():
+            assert sink_done.wait(3), 'asynchronous stdout sink did not finish after release'
         assert not thread.is_alive()
 
 
@@ -361,7 +371,75 @@ def test_capture_is_immutable_and_observer_close_releases_references():
         release.set(); observer.close(); assert observer.wait_idle(timeout=3)
 
 
-def test_periodic_summary_and_mismatch_logs_are_bounded_and_redacted():
+def _assert_default_observation_streams(tmp_path, monkeypatch):
+    import io
+    import logging
+    from pathlib import Path
+    import re
+    import subprocess
+    import sys
+    from open_trader.polymarket_lp_reader_comparison import ReaderComparisonObserver, logger
+
+    written = Event()
+    class Output(io.StringIO):
+        def flush(self):
+            super().flush()
+            if 'lp_reader_comparison facts=' in self.getvalue():
+                written.set()
+    stdout, stderr = Output(), Output()
+    root = logging.getLogger()
+    handlers, root_level, module_level = list(root.handlers), root.level, logger.level
+    observer = ReaderComparisonObserver()
+    business_handler = None
+    try:
+        with monkeypatch.context() as streams:
+            streams.setattr(sys, 'stdout', stdout)
+            streams.setattr(sys, 'stderr', stderr)
+            for handler in handlers:
+                root.removeHandler(handler)
+            business_handler = logging.StreamHandler()
+            business_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s',
+                datefmt='%Y-%m-%dT%H:%M:%S%z'))
+            root.addHandler(business_handler)
+            root.setLevel(logging.INFO)
+            logger.setLevel(logging.INFO)
+            assert observer.offer(packet(old='8', new='8'))
+            assert observer.wait_idle(timeout=3)
+            assert written.wait(3), 'default observation output did not finish within the real watchdog'
+            err_path = tmp_path / 'launchd.err.log'
+            err_path.write_text(stderr.getvalue())
+            checker = Path(__file__).resolve().parents[1] / 'scripts' / 'check_production_log.py'
+            healthy = subprocess.run([sys.executable, str(checker), str(err_path)], capture_output=True, text=True, timeout=3)
+            assert healthy.returncode == 0, (healthy.stderr, stderr.getvalue())
+            assert 'lp_reader_comparison' not in stderr.getvalue()
+            text = stdout.getvalue()
+            assert re.match(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:?\d{2}|Z) INFO open_trader\.polymarket_lp_reader_comparison lp_reader_comparison facts=', text)
+            assert "'event': 'summary'" in text and "'error': 0" in text and "Decimal('8')" in text
+            assert "'as_of': '2026-10-15T00:00:00+00:00'" in text and "'checked_at': '2026-10-15T00:00:00+00:00'" in text
+            assert 'wallet-secret' not in text and 'order-secret' not in text
+            assert observer.snapshot()['error'] == 0
+            logging.getLogger('test_business_error').error('independent business ERROR sentinel')
+            err_path.write_text(stderr.getvalue())
+            business = subprocess.run([sys.executable, str(checker), str(err_path)], capture_output=True, text=True, timeout=3)
+            assert business.returncode == 1 and 'reason=log_error_signal' in business.stderr
+            assert 'independent business ERROR sentinel' in stderr.getvalue()
+    finally:
+        observer.close()
+        try:
+            assert observer.wait_idle(timeout=3)
+        finally:
+            for handler in list(root.handlers):
+                root.removeHandler(handler)
+            if business_handler is not None:
+                business_handler.close()
+            for handler in handlers:
+                root.addHandler(handler)
+            root.setLevel(root_level)
+            logger.setLevel(module_level)
+
+
+def test_periodic_summary_and_mismatch_logs_are_bounded_and_redacted(tmp_path, monkeypatch):
+    _assert_default_observation_streams(tmp_path, monkeypatch)
     from open_trader.polymarket_lp_reader_comparison import ReaderComparisonObserver, compare_snapshot
     clock=[0.0]; records=[]
     wallet='0x'+'a'*40

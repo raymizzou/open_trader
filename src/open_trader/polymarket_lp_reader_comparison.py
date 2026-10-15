@@ -296,7 +296,9 @@ class ReaderComparisonObserver:
     @staticmethod
     def _log(record):
         from .polymarket_trading import _lp_capture_read_log
-        _lp_capture_read_log(lambda: logger.info('lp_reader_comparison facts=%s', record))
+        _lp_capture_read_log(lambda: print(
+            f'{datetime.now().astimezone().isoformat(timespec="seconds")} INFO {__name__} lp_reader_comparison facts={record}',
+            flush=True))
 
     def offer(self, snapshot):
         with self._condition:
