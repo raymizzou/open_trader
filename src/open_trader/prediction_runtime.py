@@ -532,6 +532,7 @@ class PredictionRuntime:
         self.store: PredictionArbitrageStore | None = None
         self.monitor: PolymarketMonitor | None = None
         self.lp: PolymarketLPService | None = None
+        self._lp_reader_comparison = None
         self.observation_monitor: PredictionObservationMonitor | None = None
         self.cross_venue_monitor: object | None = None
         self.execution: PredictionExecutionService | None = None
@@ -788,6 +789,7 @@ class PredictionRuntime:
                 self._prediction_trading,
                 owner_lock=self._owner,
             )
+            self._attach_lp_reader_comparison()
             if self._history_clock_injected:
                 # Keep the production constructor seam compatible with the
                 # existing test doubles while allowing the history scheduler
@@ -1780,6 +1782,7 @@ class PredictionRuntime:
                     if callable(attach_cache):
                         attach_cache(self.store)
                     self.lp = PolymarketLPService(self.store, self._prediction_trading, owner_lock=self._owner)
+                    self._attach_lp_reader_comparison()
                     self.monitor = PolymarketMonitor(store=self.store, trading=self._prediction_trading)
                     self.execution = PredictionExecutionService(
                         store=self.store, monitor=self.monitor, trading=self._prediction_trading,
@@ -1825,6 +1828,7 @@ class PredictionRuntime:
                 self._prediction_trading,
                 owner_lock=self._owner,
             )
+            self._attach_lp_reader_comparison()
             try:
                 self._predict_trading = PredictTradingClient.from_keychain(trading_config)
             except Exception:
@@ -2009,8 +2013,19 @@ class PredictionRuntime:
             ),
         }
 
+    def _attach_lp_reader_comparison(self):
+        # No worker or network activity until an existing automatic round offers values.
+        from .polymarket_lp_reader_comparison import ReaderComparisonObserver
+        self._lp_reader_comparison = ReaderComparisonObserver()
+        self.lp.reader_comparison_observer = self._lp_reader_comparison
+
     def _cleanup_resources(self) -> list[BaseException]:
         errors: list[BaseException] = []
+        if self._lp_reader_comparison is not None:
+            # Only frozen values remain in flight; real SDK/sender drains below
+            # continue to own the trading resources and runtime lock.
+            self._lp_reader_comparison.close()
+            self._lp_reader_comparison = None
         uncertain_thread = False
         # An HTTP handler can retain execution/LP references during STOPPING.
         # Close admission before checking lanes, including queued manual sends.

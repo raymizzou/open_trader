@@ -3,6 +3,10 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-15
+
+- #350 新增不可变当前市场 Reader 与纯资金／收益／目标计算，并在原 LP 自动轮次旁路抽样同一来源的输入作日志对照。比较最多一项执行加一项最新待处理，差异、UNKNOWN、跳过和错误分别计数；不增加线上 API 请求，不改变交易、暂停或保护计时权威。独立并行读取仅作离线验证，线上日志不冒充该能力的生产证据；聚焦检查与精确版本的 CI／独立评审由任务证据和 Main 交付流程确认，未合并或部署。
+
 ## 2026-10-14
 
 - #344 BUY 收益发布在同一事务内重新核对当前订单证据及撤销身份，旧准备结果不能覆盖更新的有效证据或 UNKNOWN 期间；更晚的真实当前归属订单仍可恢复收益。原生只读屏障证明旧监控读取后，自动轮次先提交撤销、监控再恢复的竞争真实 2 项 RED，修复后同 2 项 GREEN；一次 14 个受影响函数选择器执行 25 项全部通过，保留 1 条既有警告，子进程及外层均退出 0。原财务、控制、审计及禁止重放约束保留；精确提交 CI 与独立复审由 Main 继续，未重跑全后端。
