@@ -182,6 +182,8 @@ class MarketReader:
                         sources[name] = SourceResult('', complete=False, error='in_progress')
                     elif retry and self._clock() < retry.retry_at:
                         sources[name] = retry
+                    elif time.monotonic() >= deadline:
+                        sources[name] = SourceResult('', complete=False, error='timeout')
                     elif sum(not f.done() for f in self._jobs.values()) < 2:
                         own[name] = self._start(key, scope)
                     else:

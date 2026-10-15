@@ -69,9 +69,61 @@ def _check_candidates(runtime):
 
 
 
-@pytest.mark.parametrize('scenario', ['resting', 'candidates'])
+def _check_balance_failure(runtime):
+    from open_trader.polymarket_lp_reader_comparison import ReaderComparisonObserver, compare_snapshot
+    from tests.test_lp_auto_serial_fact_cycle import _yield
+    public = SerialPublic(runtime.clock)
+    store, adapter, account, lp, engine = runtime(public_client=public, orders=(_resting(1),))
+    engine.lp_auto_configure({'budget_usd': '8', 'target_buy_count': 1})
+    engine.lp_auto_set_desired_running(True)
+    engine.lp_auto_run_once(round_id='healthy-before-partial')
+    def unavailable(**kwargs):
+        raise TimeoutError('offline balance unavailable')
+    account.get_balance_allowance = unavailable
+    runtime.clock[0] += timedelta(seconds=61)
+    public.rates = {1: '48'}
+    calls = Counter()
+    for obj, names in [(account, ('get_balance_allowance', 'list_open_orders', 'list_positions', 'list_account_trades')),
+                       (public, ('get_market', 'list_market_rewards', 'get_order_book'))]:
+        for name in names:
+            external = getattr(obj, name)
+            def counted(*args, _name=name, _call=external, **kwargs):
+                calls[_name] += 1
+                return _call(*args, **kwargs)
+            setattr(obj, name, counted)
+    entered, release = Event(), Event()
+    def compare(value):
+        entered.set()
+        assert release.wait(4)
+        return compare_snapshot(value)
+    records = []
+    observer = ReaderComparisonObserver(compare=compare, emit=records.append)
+    lp.reader_comparison_observer = observer
+    try:
+        primary = engine.lp_auto_run_once(round_id='partial-failure')
+        assert entered.wait(2)
+        primary_calls = calls.copy()
+        assert primary_calls['get_balance_allowance'] == primary_calls['list_open_orders'] == primary_calls['list_positions'] == 1
+        assert primary_calls['list_account_trades'] == 0
+        release.set()
+        assert observer.wait_idle(timeout=3)
+        assert calls == primary_calls
+        assert _yield(store, 'resting-1')['state'] == 'known'
+        assert observer.snapshot()['coverage'].get('yield') == 1, records
+        assert observer.snapshot()['not_comparable'] >= 1
+        assert observer.snapshot()['mismatch'] == observer.snapshot()['error'] == 0
+        assert any(r['round_id'] == 'partial-failure' and r['compared'] >= 1 for r in records)
+        assert primary['last_round']['round_id'] == 'partial-failure'
+        assert primary['funds']['status'] == 'unknown'
+        assert primary['funds']['spendable_usd'] is None and primary['last_round']['actions'] == []
+        assert account.posts == account.cancels == account.market_orders == []
+    finally:
+        release.set(); observer.close(); assert observer.wait_idle(timeout=3)
+
+
+@pytest.mark.parametrize('scenario', ['resting', 'candidates', 'balance_failure'])
 def test_same_source_runtime_capture_matches_without_extra_reads(runtime, scenario):
-    (_check_resting if scenario == 'resting' else _check_candidates)(runtime)
+    {'resting': _check_resting, 'candidates': _check_candidates, 'balance_failure': _check_balance_failure}[scenario](runtime)
 
 
 def packet(*, old='8', new='7', **changes):
@@ -84,7 +136,8 @@ def packet(*, old='8', new='7', **changes):
     return dict(round_id='explicit-round', entries=[entry])
 
 
-def test_difference_reports_both_values_without_changing_primary_result(runtime):
+@pytest.mark.parametrize('holding_difference', ['quantity', 'identity', 'cost_attribution', 'unknown_cost'])
+def test_difference_reports_both_values_without_changing_primary_result(runtime, holding_difference):
     from open_trader.polymarket_lp_reader_comparison import ReaderComparisonObserver
     store, adapter, account, lp, engine = runtime(public_client=SerialPublic(runtime.clock), orders=(_resting(1),))
     engine.lp_auto_configure({'budget_usd':'8', 'target_buy_count':1})
@@ -112,6 +165,55 @@ def test_difference_reports_both_values_without_changing_primary_result(runtime)
         assert field['source_times']['checked_at']=='2026-10-15T00:00:00+00:00'
         assert len(field['order_hash'])==64 and 'order-secret' not in str(records)
         assert observer.snapshot()['mismatch']==2
+        from datetime import UTC, datetime
+        from hashlib import sha256
+        from open_trader.polymarket_lp_reader_comparison import compare_snapshot
+        at = datetime(2026, 10, 15, tzinfo=UTC)
+        token = 'holding-token-secret-T'
+        healthy_token = 'healthy-token-secret-H'
+        source_positions = [dict(condition_id='C', token_id=token, quantity='40', cost_usd='16'),
+            dict(condition_id='H', token_id=healthy_token, quantity='5', cost_usd='0')]
+        old_positions = [dict(token_id=healthy_token, quantity='5', inventory_cost_usd='0'),
+            dict(token_id=token, quantity='20', inventory_cost_usd='16')]
+        if holding_difference == 'identity':
+            old_positions[1]['token_id'] = 'different-holding-token-secret'
+        elif holding_difference == 'cost_attribution':
+            source_positions = [dict(condition_id='U', token_id='holding-token-secret-U', quantity='20', cost_usd='12'),
+                dict(condition_id='C', token_id=token, quantity='20', cost_usd='4'), source_positions[1]]
+            old_positions = [old_positions[0], dict(token_id=token, quantity='20', inventory_cost_usd='8'),
+                dict(token_id='holding-token-secret-U', quantity='20', inventory_cost_usd='8')]
+        elif holding_difference == 'unknown_cost':
+            source_positions[0].update(quantity='20', cost_usd=None)
+        source = dict(account_id='wallet-secret', balance='100', allowance='100', balance_complete=True,
+            open_orders=(), open_orders_complete=True, positions_complete=True, checked_at=at, positions=source_positions)
+        old_account = dict(buys=(), inventory_cost_usd='16', balance_usd='100', allowance_usd='100', positions=old_positions)
+        holdings = dict(round_id='holdings', entries=[dict(kind='account', source_id='positions-source',
+            account=source, old=old_account, as_of=at)])
+        fields = compare_snapshot(holdings)
+        expected_field = {'quantity': 'position_quantity', 'identity': 'position_present',
+            'cost_attribution': 'position_cost', 'unknown_cost': 'position_cost'}[holding_difference]
+        affected = [f for f in fields if f['field'] == expected_field and f.get('token_hash') == sha256(token.encode()).hexdigest()]
+        assert affected, fields
+        assert affected[0]['status'] == ('not_comparable' if holding_difference == 'unknown_cost' else 'mismatch')
+        if holding_difference == 'quantity':
+            assert affected[0]['old'] == Decimal('20') and affected[0]['new'] == Decimal('40') and affected[0]['delta'] == Decimal('20')
+        elif holding_difference == 'cost_attribution':
+            assert affected[0]['old'] == Decimal('8') and affected[0]['new'] == Decimal('4')
+            assert {f['field'] for f in fields if f['status'] == 'mismatch'} == {'position_cost'}
+        elif holding_difference == 'unknown_cost':
+            assert affected[0]['new'] is None and not any(f['status'] == 'mismatch' for f in fields)
+        total = next(f for f in fields if f['field'] == 'inventory_cost')
+        if holding_difference != 'unknown_cost':
+            assert total['old'] == total['new'] == Decimal('16') and total['status'] == 'match'
+        healthy_fields = [f for f in fields if f.get('token_hash') == sha256(healthy_token.encode()).hexdigest()]
+        assert len(healthy_fields) == 3 and all(f['status'] == 'match' for f in healthy_fields)
+        assert any(f['field'] == 'balance' and f['status'] == 'match' for f in fields)
+        assert observer.offer(holdings) and observer.wait_idle(timeout=3)
+        if holding_difference != 'unknown_cost':
+            details = records[-1]['fields']
+            assert any(f.get('token_hash') == sha256(token.encode()).hexdigest() and f['status'] == 'mismatch' for f in details)
+            assert all(len(r.get('fields', ())) <= 12 for r in records)
+        assert token not in str(records) and healthy_token not in str(records) and 'wallet-secret' not in str(records)
         assert engine.lp_auto_state()==before
         assert primary['last_round']['actions']==[]
         assert account.posts==account.cancels==account.market_orders==[]
@@ -297,5 +399,24 @@ def test_periodic_summary_and_mismatch_logs_are_bounded_and_redacted():
         assert differences and differences[0]['omitted_differences']==18
         assert all(any(f['status']=='mismatch' for f in r['fields']) for r in differences)
         assert all(f['as_of'] for r in differences for f in r['fields'])
+        # A new mismatching token is changed evidence even with identical values.
+        from datetime import UTC, datetime
+        from hashlib import sha256
+        at = datetime(2026, 10, 15, tzinfo=UTC)
+        before_changes = len(differences)
+        for token in ('changed-token-secret-T', 'changed-token-secret-U'):
+            source = dict(account_id='wallet-secret', balance='100', allowance='100', balance_complete=True,
+                open_orders=(), open_orders_complete=True, positions_complete=True, checked_at=at,
+                positions=[dict(condition_id='C', token_id=token, quantity='40', cost_usd='16')])
+            old_account = dict(buys=(), inventory_cost_usd='16', balance_usd='100', allowance_usd='100',
+                positions=[dict(token_id=token, quantity='20', inventory_cost_usd='16')])
+            offer(dict(round_id='changed-position', entries=[dict(kind='account', source_id='changed-source',
+                account=source, old=old_account, as_of=at)]))
+        changes = [r for r in records if r['event'] == 'difference'][before_changes:]
+        assert len(changes) == 2
+        assert [r['fields'][0]['token_hash'] for r in changes] == [
+            sha256(t.encode()).hexdigest() for t in ('changed-token-secret-T', 'changed-token-secret-U')]
+        assert all(r['fields'][0]['old'] == Decimal('20') and r['fields'][0]['new'] == Decimal('40') for r in changes)
+        assert 'changed-token-secret' not in str(records)
     finally:
         observer.close()

@@ -38,7 +38,7 @@ from .polymarket_lp_notification_batches import (
     ChannelDeliveryResult, matching_batch_channels, plan_notification_batches,
 )
 
-from .polymarket_lp_reader_comparison import comparison_capture, capture as _reader_capture
+from .polymarket_lp_reader_comparison import comparison_capture, capture as _reader_capture, bind_round_id as _reader_bind_round_id
 from .polymarket_trading import _lp_capture_read_log, _lp_causal_event, _lp_read_task
 
 logger = logging.getLogger(__name__)
@@ -4283,9 +4283,12 @@ class LPAutoPool:
         source_document = observation['document'] if observation is not None else self._read()
         _lp_causal_event('auto_account_use', account=source_document.get('account_financial_facts'), used_at=self._now())
         round_id = plan['round_id'] if plan else round_id or uuid.uuid4().hex
+        _reader_bind_round_id(round_id)
         if observation is not None:
             _reader_capture('account', round_id=round_id, account=observation['account'],
                 old=source_document.get('account_financial_facts') or {}, as_of=observation['validated_at'])
+        else:
+            _reader_capture('unavailable')
         diagnostics = dict(round_id=round_id, state='not_evaluated', counts={}, reasons={},
             recheck_reasons={}, facts={}, account_sources=dict(current=0, candidate=0, unknown=0),
             round_started_at=self._stamp())

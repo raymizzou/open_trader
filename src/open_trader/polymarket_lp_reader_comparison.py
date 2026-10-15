@@ -51,7 +51,7 @@ def bounded_freeze(value, budget=None):
 @contextmanager
 def comparison_capture(observer):
     previous = getattr(_local, 'batch', None)
-    batch = {'entries': [], 'budget': [0, 0], 'failure': None} if observer is not None else None
+    batch = {'entries': [], 'budget': [0, 0], 'failure': None, 'round_id': None} if observer is not None else None
     _local.batch = batch
     try:
         yield
@@ -63,9 +63,16 @@ def comparison_capture(observer):
                     observer.note(batch['failure'])
                 elif batch['entries']:
                     entries = batch['entries']
-                    observer.offer({'round_id': next((e.get('round_id') for e in entries if e.get('round_id')), None), 'entries': entries})
+                    observer.offer({'round_id': batch['round_id'], 'entries': entries})
             except Exception:
                 pass  # Optional diagnostics cannot change a round's result.
+
+
+def bind_round_id(round_id):
+    """Bind the existing business identity even when account capture failed."""
+    batch = getattr(_local, 'batch', None)
+    if batch is not None:
+        batch['round_id'] = round_id if type(round_id) is str else None
 
 
 def capture(kind, **values):
@@ -76,6 +83,27 @@ def capture(kind, **values):
         except Exception as exc:
             batch['entries'].clear()
             batch['failure'] = 'skipped' if isinstance(exc, CaptureLimit) else 'error'
+
+
+def _position_index(rows, *, cost_field):
+    """Mirror current accounting's token identity: duplicates are not additive."""
+    complete = isinstance(rows, (tuple, list))
+    indexed = {}
+    for row in rows or ():
+        if not isinstance(row, Mapping) or not isinstance(row.get('token_id'), str) or not row['token_id']:
+            complete = False
+            continue
+        token = row['token_id']
+        quantity, cost = decimal(row.get('quantity')), decimal(row.get(cost_field))
+        quantity = quantity if quantity is not None and quantity >= 0 else None
+        cost = cost if cost is not None and cost >= 0 else None
+        values = (quantity, cost)
+        if token in indexed and indexed[token] != values:
+            indexed[token] = (None, None)
+            complete = False
+        else:
+            indexed[token] = values
+    return indexed, complete
 
 
 def _account(entry):
@@ -101,6 +129,14 @@ def _account(entry):
             rows.append(('order.' + row['order_id'] + '.' + name, primary.get(name), row.get(name)))
         rows.append(('order.' + row['order_id'] + '.identity',
             (primary.get('condition_id'), primary.get('token_id')), (row['condition_id'], row['token_id'])))
+    old_positions, old_complete = _position_index(old.get('positions'), cost_field='inventory_cost_usd')
+    positions, _ = _position_index(frame.positions, cost_field='cost_usd')
+    for token in sorted(old_positions.keys() | positions.keys()):
+        old_values, new_values = old_positions.get(token, (None, None)), positions.get(token, (None, None))
+        rows.append(('position_present', True if token in old_positions else False if old_complete else None,
+            True if token in positions else False if frame.positions_complete else None, token))
+        rows.append(('position_quantity', old_values[0], new_values[0], token))
+        rows.append(('position_cost', old_values[1], new_values[1], token))
     return rows
 
 
@@ -108,7 +144,11 @@ def compare_snapshot(snapshot):
     fields, candidate_inputs = [], {}
     for entry in snapshot['entries']:
         if entry['kind'] == 'account':
-            fields.extend((*f, entry) for f in _account(entry))
+            for field in _account(entry):
+                provenance = {**entry, 'token_id': field[3]} if len(field) == 4 else entry
+                fields.append((*field[:3], provenance))
+        elif entry['kind'] == 'unavailable':
+            fields.append(('account', None, None, entry))
         elif entry['kind'] == 'field':
             fields.append((entry['field'], entry.get('old'), entry.get('new'), entry))
         elif entry['kind'] in ('yield', 'candidate'):
@@ -178,11 +218,13 @@ def compare_snapshot(snapshot):
             elif not entry.get('as_of') or entry.get('as_of') != entry.get('old_as_of'):
                 reason = 'evaluation_time_missing_or_different'
         if reason is None and (old is None or new is None):
-            reason = 'control_or_value_unknown' if field == 'targets' else 'value_unknown'
+            reason = ('account_inputs_unknown' if field == 'account' else
+                'control_or_value_unknown' if field == 'targets' else 'value_unknown')
         result.append(dict(field=field, old=old, new=new,
             delta=new-old if isinstance(old, Decimal) and isinstance(new, Decimal) else None,
             source_id=entry.get('source_id'), as_of=entry.get('as_of'),
             source_times=_source_times(entry), order_hash=hashlib.sha256(str(oid).encode()).hexdigest(),
+            token_hash=hashlib.sha256(str(entry['token_id']).encode()).hexdigest() if entry.get('token_id') else None,
             status='not_comparable' if reason else 'match' if old == new else 'mismatch', reason=reason, basis='raw_decimal'))
     return result
 
@@ -225,9 +267,9 @@ def _source_times(entry):
 
 
 def _safe_field(field):
-    allowed = {'buy_reserved', 'inventory_cost', 'quantity', 'price', 'yield', 'targets', 'coverage',
-        'comparison', 'identity', 'status', 'side', 'remaining', 'original_quantity', 'filled_quantity', 'balance', 'allowance'}
-    return {**{k: field.get(k) for k in ('status', 'reason', 'order_hash', 'basis')},
+    allowed = {'account', 'buy_reserved', 'inventory_cost', 'quantity', 'price', 'yield', 'targets', 'coverage',
+        'comparison', 'position_present', 'position_quantity', 'position_cost', 'identity', 'status', 'side', 'remaining', 'original_quantity', 'filled_quantity', 'balance', 'allowance'}
+    return {**{k: field.get(k) for k in ('status', 'reason', 'order_hash', 'token_hash', 'basis')},
         'field': field['field'] if field['field'] in allowed else 'value',
         'old': _safe_value(field.get('old')), 'new': _safe_value(field.get('new')),
         'delta': _safe_value(field.get('delta')), 'source_id': _safe_identity(field.get('source_id')),
@@ -299,7 +341,7 @@ class ReaderComparisonObserver:
                 self._counts.update(f['status'] for f in fields)
                 self._coverage.update(f['field'] for f in fields if f['status'] in {'match', 'mismatch'})
             now = self._clock()
-            fingerprint = tuple((f['field'], f['order_hash'], str(f['old']), str(f['new']))
+            fingerprint = tuple((f['field'], f['order_hash'], f.get('token_hash'), str(f['old']), str(f['new']))
                 for f in fields if f['status'] == 'mismatch')
             difference = bool(fingerprint and fingerprint != self._last_mismatch)
             summary = self._last_summary is None or now - self._last_summary >= 60

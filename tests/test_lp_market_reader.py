@@ -137,6 +137,20 @@ def test_same_id_uses_current_quantity_and_confirmed_terminal_exits():
 @pytest.mark.parametrize('upstream', [False, True])
 def test_timeout_retains_native_capacity_and_actual_retry_deadline(tmp_path, upstream):
     from open_trader.polymarket_lp_market_reader import MarketReader, ReadScope
+    expired_calls = []
+    class ExpiredSources:
+        def read(self, component, scope):
+            expired_calls.append(component)
+            return ('100', '100')
+    expired_reader = MarketReader(ExpiredSources())
+    try:
+        expired = expired_reader.read_current(ReadScope('account-A', ('balance',), related_markets=True), time.monotonic() - 1)
+        assert expired_reader.drain(timeout=0), 'expired admission created a native task'
+        assert expired_calls == []
+        assert not expired.sources['balance'].complete and expired.sources['balance'].error == 'timeout'
+        assert expired.sources['balance'].value is None
+    finally:
+        assert expired_reader.close(timeout=2)
     entered, release, finished = Event(), Event(), Event()
     clock = [0.0]
     calls = []

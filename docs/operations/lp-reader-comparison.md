@@ -23,14 +23,18 @@ HTTP endpoint, UI, command, or second polling loop.
 - `compared`: fields actually compared in this sample. UNKNOWN, missing
   provenance, skipped samples, and empty coverage do not count as matches.
 - Each detail has `field`, `old`, `new`, `delta`, `basis`, `status`, `reason`,
-  `source_id`, `order_hash`, `as_of`, and available `source_times`. Numeric
+  `source_id`, `order_hash`, `token_hash`, `as_of`, and available `source_times`. Numeric
   comparison uses exact Decimal values. Order identities are hashed; arbitrary
   strings and exception messages are excluded. Target identities are hashed.
 - `round_id` correlates the sample with the primary round. Unsafe identifiers
   are hashed. `source_id` identifies the captured source packet; original
   acquisition and evaluation timestamps remain separate from the round ID.
 
-Account comparison covers current exposure and captured per-order facts. BUY
+Account comparison covers current exposure and captured per-order facts, plus
+per-token position presence, quantity, and inventory cost. Equal aggregate cost
+does not hide a changed holding; an unknown token cost stays UNKNOWN while healthy
+fields still compare. Partial account failures retain the original round identity
+and independently valid BUY yields; unavailable account inputs remain UNKNOWN. BUY
 estimates use captured order terms, remaining quantity, direction, and original
 business evaluation time through `MarketReader` and `calculate_current`.
 Candidate target comparison uses the final adopted candidate inputs and frozen
