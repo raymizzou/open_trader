@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -5702,7 +5703,7 @@ def test_lp_metadata_event_pagination_preserves_failure_and_cancellation(outcome
 
 
 @pytest.mark.parametrize("fallback", ["failed", "absent", "cancelled"])
-def test_lp_metadata_closed_fallback_preserves_known_and_only_caches_proven_absence(fallback) -> None:
+def test_lp_metadata_closed_fallback_preserves_known_and_only_caches_proven_absence(request: pytest.FixtureRequest, fallback) -> None:
     import httpx
 
     present, missing = "0x" + "a" * 64, "0x" + "b" * 64
@@ -5727,9 +5728,11 @@ def test_lp_metadata_closed_fallback_preserves_known_and_only_caches_proven_abse
         TradingConfig(SIGNER, WALLET), client=object(),
         public_client_factory=lambda: _lp_mock_public_client(handler), metadata_cache=backing,
     )
+    request.addfinalizer(adapter.close)
     result = adapter.lp_market_metadata_batch((present, missing), stop_event=stop)
     assert requests == [False, True]
     assert set(result["markets"]) == {present}
+    _wait_lp_metadata_persistence(adapter)
     assert present in backing.rows
     if fallback == "absent":
         assert result["state"] == "known"
@@ -5854,7 +5857,7 @@ def test_lp_metadata_stops_after_all_requested_ids() -> None:
     assert requests == [None]
 
 
-def test_lp_metadata_missing_id_continuation_failure_stays_unknown() -> None:
+def test_lp_metadata_missing_id_continuation_failure_stays_unknown(request: pytest.FixtureRequest) -> None:
     import httpx
 
     condition_ids = tuple(f"0x{index:064x}" for index in range(50))
@@ -5883,6 +5886,7 @@ def test_lp_metadata_missing_id_continuation_failure_stays_unknown() -> None:
         public_client_factory=lambda: _lp_mock_public_client(handler),
         metadata_cache=backing,
     )
+    request.addfinalizer(adapter.close)
     result = adapter.lp_market_metadata_batch(condition_ids)
 
     assert result["state"] == "unknown"
@@ -5893,11 +5897,12 @@ def test_lp_metadata_missing_id_continuation_failure_stays_unknown() -> None:
         reason == "market_read_RequestRejectedError"
         for reason in result["failed_ids"].values()
     )
+    _wait_lp_metadata_persistence(adapter)
     assert backing.rows == {}
 
 
 def test_lp_metadata_error_response_diagnostics_are_bounded_and_redacted(
-    caplog: pytest.LogCaptureFixture,
+    request: pytest.FixtureRequest, caplog: pytest.LogCaptureFixture,
 ) -> None:
     import httpx
 
@@ -6087,12 +6092,14 @@ def test_lp_metadata_error_response_diagnostics_are_bounded_and_redacted(
         return public
 
     stream_backing = _LpMetadataBackingStore()
-    stream_result = PolymarketTradingClient(
+    stream_adapter = PolymarketTradingClient(
         TradingConfig(SIGNER, WALLET),
         client=object(),
         public_client_factory=stream_factory,
         metadata_cache=stream_backing,
-    ).lp_market_metadata_batch(condition_ids)
+    )
+    request.addfinalizer(stream_adapter.close)
+    stream_result = stream_adapter.lp_market_metadata_batch(condition_ids)
 
     assert stream_result["state"] == "unknown"
     assert stream_result["markets"] == {}
@@ -6104,6 +6111,7 @@ def test_lp_metadata_error_response_diagnostics_are_bounded_and_redacted(
         "error_types=TransportError>ReadError" in record.getMessage()
         for record in caplog.records
     )
+    _wait_lp_metadata_persistence(stream_adapter)
     assert stream_backing.rows == {}
     assert existing_statuses == [400]
     assert saved_public["value"]._ctx.gamma._client.event_hooks["response"] == [
@@ -6160,12 +6168,14 @@ def test_lp_metadata_error_response_diagnostics_are_bounded_and_redacted(
     logging_backing = _LpMetadataBackingStore()
     polymarket_trading.logger.addHandler(logging_handler)
     try:
-        logging_result = PolymarketTradingClient(
+        logging_adapter = PolymarketTradingClient(
             TradingConfig(SIGNER, WALLET),
             client=object(),
             public_client_factory=logging_factory,
             metadata_cache=logging_backing,
-        ).lp_market_metadata_batch(condition_ids)
+        )
+        request.addfinalizer(logging_adapter.close)
+        logging_result = logging_adapter.lp_market_metadata_batch(condition_ids)
     finally:
         polymarket_trading.logger.removeHandler(logging_handler)
 
@@ -6176,6 +6186,7 @@ def test_lp_metadata_error_response_diagnostics_are_bounded_and_redacted(
     assert set(logging_result["failed_ids"].values()) == {
         "market_read_RequestRejectedError"
     }
+    _wait_lp_metadata_persistence(logging_adapter)
     assert logging_backing.rows == {}
     assert logging_handler.calls == 1
     assert existing_statuses == [400]
@@ -6469,6 +6480,19 @@ def test_lp_metadata_refresh_cap_bounds_ids_per_call(
     assert set(second) == set(condition_ids)
 
 
+def _wait_lp_metadata_persistence(adapter):
+    """Observe completed saves before durable assertions; close never flushes."""
+    deadline = time.monotonic() + 5
+    wake = threading.Event()
+    while True:
+        status = adapter.lp_metadata_persistence_status()
+        if status["pending_entries"] == status["inflight_entries"] == 0:
+            assert status["failed_entries"] == 0, status
+            return status
+        assert time.monotonic() < deadline, status
+        wake.wait(0.005)
+
+
 class _LpMetadataBackingStore:
     """Duck-typed stand-in for the SQLite metadata cache backing store."""
 
@@ -6512,7 +6536,7 @@ class _LpMetadataBackingStore:
 
 
 def test_lp_metadata_batches_preserve_success_and_distinguish_absence_from_failure(
-    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     condition_ids = tuple(f"0x{index:064x}" for index in range(201))
     cached_id = condition_ids[0]
@@ -6591,7 +6615,7 @@ def test_lp_metadata_batches_preserve_success_and_distinguish_absence_from_failu
         public_client_factory=BatchPublicClient,
         metadata_cache=backing,
     )
-
+    request.addfinalizer(adapter.close)
     result = adapter.lp_market_metadata_batch(condition_ids)
 
     assert result["state"] == "partial"
@@ -6607,8 +6631,8 @@ def test_lp_metadata_batches_preserve_success_and_distinguish_absence_from_failu
     assert markets[condition_ids[1]]["metadata_checked_at"] == read_at
     assert absent_id not in markets
     assert set(markets).isdisjoint(set(result["failed_ids"]))
+    _wait_lp_metadata_persistence(adapter)
     assert all(condition_id not in backing.rows for condition_id in failed_ids)
-
     queries_after_first = len(market_queries)
     rebuilt = PolymarketTradingClient(
         TradingConfig(SIGNER, WALLET),
@@ -6616,6 +6640,7 @@ def test_lp_metadata_batches_preserve_success_and_distinguish_absence_from_failu
         public_client_factory=BatchPublicClient,
         metadata_cache=backing,
     )
+    request.addfinalizer(rebuilt.close)
     rebuilt_result = rebuilt.lp_market_metadata_batch(condition_ids)
 
     assert rebuilt_result["state"] == "partial"
@@ -6669,7 +6694,7 @@ def test_lp_metadata_batches_preserve_success_and_distinguish_absence_from_failu
 
 
 def test_lp_metadata_cache_keeps_original_twelve_hour_expiry(
-    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     condition_present = "0x" + "a" * 64
     condition_absent = "0x" + "b" * 64
@@ -6702,11 +6727,12 @@ def test_lp_metadata_cache_keeps_original_twelve_hour_expiry(
         public_client_factory=probe.public_client_factory(),
         metadata_cache=backing,
     )
-
+    request.addfinalizer(adapter.close)
     first = adapter.lp_market_metadata(
         (condition_present, condition_absent, condition_fresh)
     )
     assert set(first) == {condition_present, condition_fresh}
+    _wait_lp_metadata_persistence(adapter)
     first_positive_stamp = backing.rows[condition_present][0]
     assert first_positive_stamp == read_at.timestamp() + 43200
     assert backing.rows[condition_absent][0] == read_at.timestamp() + 3600
@@ -6717,6 +6743,7 @@ def test_lp_metadata_cache_keeps_original_twelve_hour_expiry(
     fresh_read = adapter.lp_market_metadata_fresh((condition_fresh,))
     assert set(fresh_read) == {condition_fresh}
     assert len(probe.market_queries) == queries_after_first + 1
+    _wait_lp_metadata_persistence(adapter)
 
     rebuilt = PolymarketTradingClient(
         TradingConfig(SIGNER, WALLET),
@@ -6724,6 +6751,7 @@ def test_lp_metadata_cache_keeps_original_twelve_hour_expiry(
         public_client_factory=probe.public_client_factory(),
         metadata_cache=backing,
     )
+    request.addfinalizer(rebuilt.close)
     clock_at["value"] = read_at + timedelta(seconds=100)
     warm = rebuilt.lp_market_metadata((condition_present, condition_absent))
     assert set(warm) == {condition_present}
@@ -6748,6 +6776,7 @@ def test_lp_metadata_cache_keeps_original_twelve_hour_expiry(
     assert probe.market_queries[queries_after_warm:] == [
         ((condition_absent,), 100), ((condition_absent,), 100),
     ]
+    _wait_lp_metadata_persistence(rebuilt)
     assert backing.rows[condition_absent][0] == clock_at["value"].timestamp() + 3600
     assert backing.rows[condition_absent][1] is None
 
@@ -6771,6 +6800,7 @@ def test_lp_metadata_cache_keeps_original_twelve_hour_expiry(
     probe.fail_market_reads = False
     refreshed = rebuilt.lp_market_metadata((condition_present,))
     assert refreshed[condition_present]["metadata_checked_at"] == clock_at["value"]
+    _wait_lp_metadata_persistence(rebuilt)
     assert backing.rows[condition_present][0] == clock_at["value"].timestamp() + 43200
 
 
@@ -6938,7 +6968,7 @@ def test_lp_selected_rewards_accept_real_sdk_configs_without_double_counting() -
 
 
 def test_lp_metadata_warm_start_from_persisted_store(
-    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     probe = _LpMetadataProbe()
     condition_a = "0x" + "a" * 64
@@ -6975,7 +7005,7 @@ def test_lp_metadata_warm_start_from_persisted_store(
         public_client_factory=probe.public_client_factory(),
         metadata_cache=backing,
     )
-
+    request.addfinalizer(adapter.close)
     result = adapter.lp_market_metadata((condition_a, condition_b))
 
     assert result == {condition_a: payload_a, condition_b: payload_b}
@@ -6986,7 +7016,7 @@ def test_lp_metadata_warm_start_from_persisted_store(
 
 
 def test_lp_metadata_persisted_expiry_rollover(
-    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     probe = _LpMetadataProbe()
     condition_a = "0x" + "a" * 64
@@ -7009,7 +7039,7 @@ def test_lp_metadata_persisted_expiry_rollover(
         public_client_factory=probe.public_client_factory(),
         metadata_cache=backing,
     )
-
+    request.addfinalizer(adapter.close)
     result = adapter.lp_market_metadata((condition_a, condition_b))
 
     # Expired persisted entries are treated as stale: refreshed under the
@@ -7024,7 +7054,8 @@ def test_lp_metadata_persisted_expiry_rollover(
     assert result[condition_a]["market_id"] == "market-rollover-0"
     assert len(queried) <= polymarket_trading.LP_METADATA_MAX_REFRESH_IDS_PER_CALL
 
-    # The backing store rows are updated afterwards with fresh expiries.
+    # The backing store rows are updated asynchronously with fresh expiries.
+    _wait_lp_metadata_persistence(adapter)
     assert backing.stored
     assert set(backing.stored[-1]) == {condition_a, condition_b}
     for condition_id in (condition_a, condition_b):
@@ -7034,7 +7065,7 @@ def test_lp_metadata_persisted_expiry_rollover(
 
 
 def test_lp_metadata_warm_entry_expires_at_persisted_stamp(
-    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     probe = _LpMetadataProbe()
     condition_present = "0x" + "a" * 64
@@ -7079,7 +7110,7 @@ def test_lp_metadata_warm_entry_expires_at_persisted_stamp(
         public_client_factory=probe.public_client_factory(),
         metadata_cache=backing,
     )
-
+    request.addfinalizer(adapter.close)
     first = adapter.lp_market_metadata((condition_present, condition_absent))
 
     # Before the persisted stamps: served/omitted with zero queries.
@@ -7121,6 +7152,7 @@ def test_lp_metadata_warm_entry_expires_at_persisted_stamp(
     assert refreshed[condition_present]["market_id"] == "market-warm-present"
     # The re-read negative row persists the negative TTL again (confirmed
     # missing never adopts the positive jittered TTL).
+    _wait_lp_metadata_persistence(adapter)
     negative_stamp, negative_payload = backing.rows[condition_absent]
     assert negative_payload is None
     assert negative_stamp == (
