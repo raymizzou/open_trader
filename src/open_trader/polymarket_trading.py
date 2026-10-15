@@ -2567,6 +2567,49 @@ class PolymarketTradingClient:
         except Exception:
             return False
 
+    def lp_reader_source_port(self):
+        """Opt-in current read port. The automatic loop never calls this port."""
+        adapter = self
+
+        class CurrentSourcePort:
+            def read(self, component, scope):
+                wallet = adapter.config.wallet_address.casefold()
+                if scope.account.casefold() != wallet:
+                    raise ValueError('account_identity_mismatch')
+                if component == 'balance':
+                    return adapter._collateral_balance_allowance()
+                if component in ('open_orders', 'positions'):
+                    raw = (adapter._client.list_open_orders() if component == 'open_orders'
+                        else adapter._client.list_positions())
+                    if raw is None:
+                        return None
+                    result = []
+                    for value in _collect(raw):
+                        original = _model_dict(value) or {}
+                        row = (_lp_order(value) if component == 'open_orders' else _lp_position(value))
+                        if row is None:
+                            result.append({})
+                            continue
+                        row['account_id'] = str(original.get('maker_address') or original.get('proxy_wallet')
+                            or original.get('user') or wallet).casefold()
+                        if component == 'open_orders':
+                            # Normalizer display defaults cannot prove missing terms.
+                            row['original_size'] = _lp_decimal(original.get('original_size', original.get('size')))
+                            row['size_matched'] = _lp_decimal(original.get('size_matched', original.get('matched_amount')))
+                        result.append(row)
+                    return tuple(result)
+                if component.startswith('market:'):
+                    _, condition, token = component.split(':', 2)
+                    metadata = adapter.lp_market_metadata_fresh((condition,)).get(condition)
+                    rewards = adapter.lp_reward_catalog(condition_ids=(condition,))
+                    book = adapter.lp_order_books((token,)).get(token)
+                    if not metadata or not book or not rewards:
+                        raise ValueError('market_source_unknown')
+                    return dict(metadata=metadata, rewards=rewards, book=book)
+                raise ValueError('unsupported_current_source')
+
+        return CurrentSourcePort()
+
     def _account_read_facts(self, *, _planning: bool = False, _retry_seconds: int = 60, _previous_components=None):
         with _lp_read_task("account_read_facts"), _lp_read_lock(self._lp_account_read_lock, "account_lock_wait"):
             retry = self._lp_account_read_retry
