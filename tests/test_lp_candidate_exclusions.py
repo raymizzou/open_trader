@@ -287,7 +287,7 @@ def test_candidate_exclusions_default_off_and_keep_order_management(tmp_path, mo
     assert enabled.exclusions_enabled is True
 
 
-def test_metadata_warm_restore_filters_exclusions_without_blocking_risk_reads(tmp_path):
+def test_metadata_warm_restore_filters_exclusions_without_blocking_risk_reads(request: pytest.FixtureRequest, tmp_path):
     from open_trader.polymarket_trading import PolymarketTradingClient, TradingConfig
     from test_polymarket_trading import _LpMetadataProbe, _lp_cache_market, SIGNER, WALLET
     now = datetime.now(UTC)
@@ -297,12 +297,16 @@ def test_metadata_warm_restore_filters_exclusions_without_blocking_risk_reads(tm
     probe.market_rows[blocked] = _lp_cache_market(blocked, slug='blocked')
     first = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), object(),
         metadata_cache=store, public_client_factory=probe.public_client_factory())
+    request.addfinalizer(first.close)
+    from test_polymarket_trading import _wait_lp_metadata_persistence
     payload = first.lp_market_metadata((blocked,))[blocked]
+    _wait_lp_metadata_persistence(first)
     store.lp_metadata_cache_store_entries({good: ((now + timedelta(hours=1)).timestamp(), {**payload, 'condition_id': good})})
     store.lp_record_market_exclusion(blocked, '', 'reward_inactive', checked_at=now,
         cooldown_until=now + timedelta(minutes=30), now=now)
     rebuilt = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), object(),
         metadata_cache=store, public_client_factory=probe.public_client_factory())
+    request.addfinalizer(rebuilt.close)
     rebuilt.configure_lp_candidate_exclusions(True)
     rebuilt.lp_market_metadata((good,))
     assert set(rebuilt._metadata_entries) == {good}
@@ -411,7 +415,7 @@ def test_fixed_offline_load_reduces_requests_and_candidate_cache_rows(tmp_path):
     print('offline fixed load:', measurements)
 
 
-def test_public_terminal_flags_are_preserved_without_date_inference(tmp_path):
+def test_public_terminal_flags_are_preserved_without_date_inference(request: pytest.FixtureRequest, tmp_path):
     import json
     from polymarket.models.gamma.market import Market
     from open_trader.polymarket_trading import PolymarketTradingClient, TradingConfig
@@ -437,7 +441,10 @@ def test_public_terminal_flags_are_preserved_without_date_inference(tmp_path):
     adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), object(),
         metadata_cache=store, public_client_factory=probe.public_client_factory(),
         urlopen_fn=lambda *args, **kwargs: Response())
+    request.addfinalizer(adapter.close)
+    from test_polymarket_trading import _wait_lp_metadata_persistence
     metadata = adapter.lp_market_metadata((blocked, still_unknown))
+    _wait_lp_metadata_persistence(adapter)
     assert metadata[blocked]['closed'] is True
     assert metadata[still_unknown]['closed'] is not True
     for cid in (blocked, still_unknown):

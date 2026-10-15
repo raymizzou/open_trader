@@ -598,6 +598,7 @@ def test_legacy_exact_id_and_new_id_keep_lifecycle_ownership(tmp_path, state, le
 
 
 def test_old_negative_metadata_rechecks_closed_market_without_losing_positive_cache(tmp_path) -> None:
+    from test_polymarket_trading import _wait_lp_metadata_persistence
     store = PredictionArbitrageStore(tmp_path / "state.sqlite")
     closed_id, absent_id = "0x" + "d" * 64, "0x" + "e" * 64
     expiry = (datetime.now(UTC) + timedelta(hours=1)).timestamp()
@@ -635,6 +636,7 @@ def test_old_negative_metadata_rechecks_closed_market_without_losing_positive_ca
             assert result["markets"][closed_id]["market_id"] == closed_market.id
             assert result["confirmed_absent_ids"] == (absent_id,)
             assert calls == [((closed_id, absent_id), None), ((closed_id, absent_id), True)]
+            _wait_lp_metadata_persistence(adapter)
             with sqlite3.connect(store.path) as connection:
                 proof, saved_expiry, present = connection.execute(
                     "SELECT payload,expires_at,present FROM lp_market_metadata_cache WHERE condition_id=?", (absent_id,),

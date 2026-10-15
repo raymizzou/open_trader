@@ -42,6 +42,7 @@ from polymarket import BuilderApiKey, PRODUCTION, PublicClient, SecureClient
 from polymarket._internal.wallet import signature_type_for
 
 from .polymarket_lp_errors import LpObservationWait
+from .lp_metadata_writer import LPMetadataWriter, empty_status, writer_policy
 from .polymarket_lp_scratch import LPReadRows, LPReadScratch
 from .prediction_arbitrage import (
     MAX_NORMAL_COST,
@@ -2191,6 +2192,7 @@ class PolymarketTradingClient:
         urlopen_fn: Callable[..., object] | None = None,
         public_client_factory: Callable[[], object] | None = None,
         metadata_cache: object | None = None,
+        metadata_writer_policy: Mapping[str, int] | None = None,
     ) -> None:
         self.config = config
         self._client = client
@@ -2209,6 +2211,10 @@ class PolymarketTradingClient:
         self._lp_public_reads: dict[str, Future] = {}
         self._lp_public_read_retry: dict[str, tuple[float, dict[str, object]]] = {}
         self._metadata_cache = metadata_cache
+        self._metadata_writer: LPMetadataWriter | None = None
+        self._metadata_writer_closed = False
+        self._metadata_closed_drops = 0
+        self._metadata_writer_policy = writer_policy(metadata_writer_policy)
         self._candidate_exclusions_enabled = False
         self._metadata_entries: MutableMapping[
             str, tuple[float, dict[str, object] | None]
@@ -2427,6 +2433,7 @@ class PolymarketTradingClient:
 
     def close(self) -> None:
         """Release the public connections owned by LP snapshots."""
+        self.stop_lp_metadata_writer()
         with self._lp_public_client_lock:
             self._lp_public_closed = True
             # Timed-out market workers can still be reading. The final reader
@@ -2443,7 +2450,29 @@ class PolymarketTradingClient:
         """Attach a duck-typed persistent backing store before first use."""
 
         with self._metadata_lock:
+            if cache is not self._metadata_cache and (
+                self._metadata_writer is not None or self._metadata_warm_loaded
+            ):
+                raise RuntimeError("metadata cache must be attached before first use")
             self._metadata_cache = cache
+
+    def stop_lp_metadata_writer(self, *, timeout=5) -> None:
+        """Drop pending saves and join actual in-flight work; timeout is retryable."""
+        with self._metadata_lock:
+            self._metadata_writer_closed = True
+            writer = self._metadata_writer
+        if writer is not None:
+            writer.stop(timeout=timeout)
+
+    def lp_metadata_persistence_status(self) -> dict[str, object]:
+        """Snapshot cache-save outcomes; admission never implies durable success."""
+        with self._metadata_lock:
+            writer = self._metadata_writer
+            closed = self._metadata_writer_closed
+            closed_drops = self._metadata_closed_drops
+        status = empty_status(closed=closed) if writer is None else writer.status()
+        status["dropped_closed"] += closed_drops
+        return status
 
     def configure_lp_candidate_exclusions(self, enabled: bool) -> None:
         self._candidate_exclusions_enabled = enabled
@@ -3682,14 +3711,14 @@ class PolymarketTradingClient:
             return
         with self._metadata_lock:
             self._metadata_entries.update(updated)
-        cache_store = self._metadata_cache
-        if cache_store is not None:
-            try:
-                cache_store.lp_metadata_cache_store_entries(updated)
-            except Exception:
-                logger.warning(
-                    "lp_metadata_cache_store_entries_failed", exc_info=True
-                )
+            if self._metadata_cache is not None and self._metadata_writer_closed:
+                self._metadata_closed_drops += len(updated)
+            elif self._metadata_cache is not None:
+                if self._metadata_writer is None:
+                    self._metadata_writer = LPMetadataWriter(
+                        self._metadata_cache, policy=self._metadata_writer_policy,
+                    )
+                self._metadata_writer.enqueue(updated)
 
     def _fetch_lp_market_metadata(
         self,

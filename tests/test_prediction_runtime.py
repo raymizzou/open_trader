@@ -7182,6 +7182,7 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
 ) -> None:
     """The real adapter warms 1501 metadata IDs and stops without overlap."""
 
+    from test_polymarket_trading import _wait_lp_metadata_persistence
     import open_trader.polymarket_trading as trading_module
     import open_trader.prediction_runtime as runtime_module
     from open_trader.polymarket_trading import (
@@ -7465,6 +7466,7 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
             .isoformat(timespec="microseconds")
             .replace("+00:00", "Z")
         )
+        _wait_lp_metadata_persistence(trading)
         first_entries = store.lp_metadata_cache_entries(now=clock[0])
         assert set(first_entries) == set(initial_ids)
         assert len(first_entries) == 1500
@@ -7513,6 +7515,7 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
             for condition_id in batch
         ) == set(condition_ids)
 
+        _wait_lp_metadata_persistence(trading)
         final_entries = store.lp_metadata_cache_entries(now=clock[0])
         assert set(final_entries) == set(condition_ids)
         assert len(final_entries) == 1501

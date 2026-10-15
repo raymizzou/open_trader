@@ -2027,6 +2027,17 @@ class PredictionRuntime:
         self._lp_stop_event.set()
         self._lp_report_stop_event.set()
         self._book_sample_stop_event.set()
+        # Close metadata admission and discard pending snapshots immediately.
+        # A still-running save owns the Store/client: the generic close loop
+        # below clears references even when close raises, so do not reach it
+        # until this actual writer has exited. A later stop can retry the join.
+        stop_metadata = getattr(self._prediction_trading, "stop_lp_metadata_writer", None)
+        if callable(stop_metadata):
+            try:
+                stop_metadata(timeout=5)
+            except BaseException as exc:
+                errors.append(exc)
+                return errors
         if self._lp_auto_scheduler is not None:
             try:
                 self._lp_auto_scheduler.stop()
