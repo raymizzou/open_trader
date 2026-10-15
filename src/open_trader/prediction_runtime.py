@@ -2028,16 +2028,17 @@ class PredictionRuntime:
         self._lp_report_stop_event.set()
         self._book_sample_stop_event.set()
         # Close metadata admission and discard pending snapshots immediately.
-        # A still-running save owns the Store/client: the generic close loop
-        # below clears references even when close raises, so do not reach it
-        # until this actual writer has exited. A later stop can retry the join.
+        # Do not wait here: independent producers must receive their own stop
+        # even while a metadata COMMIT remains blocked. Collect the actual
+        # writer before the generic resource close loop below.
         stop_metadata = getattr(self._prediction_trading, "stop_lp_metadata_writer", None)
         if callable(stop_metadata):
             try:
-                stop_metadata(timeout=5)
+                stop_metadata(timeout=0)
+            except TimeoutError:
+                pass  # Admission is closed; collection follows producer stop.
             except BaseException as exc:
                 errors.append(exc)
-                return errors
         if self._lp_auto_scheduler is not None:
             try:
                 self._lp_auto_scheduler.stop()
@@ -2216,6 +2217,15 @@ class PredictionRuntime:
             except RuntimeError as exc:
                 errors.append(exc)
                 return errors  # Keep collaborators and owner for a later stop.
+        # A still-running save owns the Store/client. The generic close loop
+        # clears references even when close raises, so retain all collaborators
+        # and the owner if this real writer has not exited. A later stop retries.
+        if callable(stop_metadata):
+            try:
+                stop_metadata(timeout=5)
+            except BaseException as exc:
+                errors.append(exc)
+                return errors
         for resource in (
             ("n_leg_shadow", self.n_leg_shadow),
             ("solver_server", self.solver_server),

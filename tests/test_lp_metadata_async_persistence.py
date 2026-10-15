@@ -455,11 +455,15 @@ def test_completed_background_save_restores_original_ttl_after_restart(
             restarted.close()
 
 
+@pytest.mark.parametrize("active_producers", (False, True))
 def test_runtime_stop_retains_owner_until_actual_metadata_writer_exit(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, active_producers, request,
 ):
+    import asyncio
     from types import SimpleNamespace
     from open_trader import prediction_runtime as runtime_module
+    from open_trader.polymarket_monitor import PolymarketMonitor
+    from open_trader.predict_cross_venue import PredictCrossVenueMonitor
 
     # The credential/config factory supplies a real adapter with offline SDK
     # boundaries. Real runtime startup owns and attaches the real Store.
@@ -472,13 +476,82 @@ def test_runtime_stop_retains_owner_until_actual_metadata_writer_exit(
         dashboard_url="http://127.0.0.1:8766/", n_leg_paused=True,
         enable_n_leg_background=False,
     )
+    request.addfinalizer(runtime.stop)
     runtime.start()
-    # Missing account SDK facts keep startup NOT_READY, with no live monitor
-    # loops. This does not mock shutdown or metadata persistence behavior.
+    # Missing account SDK facts keep startup NOT_READY. The original variant
+    # has no monitor loops; the active variant composes real producers below.
     assert runtime.state == "NOT_READY"
     assert runtime.production_owner is True
     store = runtime.store
     assert isinstance(store, PredictionArbitrageStore)
+    cross = monitor = monitor_thread = None
+    source_started, source_cancelled = threading.Event(), threading.Event()
+    monitor_started, monitor_closed = threading.Event(), threading.Event()
+    producer_io = []
+    if active_producers:
+        class OfflinePredictSource:
+            async def list_open_markets(self):
+                producer_io.append("predict-markets")
+                source_started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    source_cancelled.set()
+
+            def snapshot(self):
+                return {"rest": "ready", "ws": "ready"}
+
+        class OfflineStream:
+            async def __anext__(self):
+                monitor_started.set()
+                await asyncio.Future()
+
+            async def close(self):
+                pass
+
+        class OfflineMonitorPublic:
+            async def list_events(self, **kwargs):
+                producer_io.append("polymarket-events")
+                return []
+
+            def subscribe(self, spec):
+                producer_io.append("polymarket-subscribe")
+                return OfflineStream()
+
+            async def close(self):
+                monitor_closed.set()
+
+        def offline_http(*args, **kwargs):
+            raise RuntimeError("offline account HTTP boundary")
+
+        # Compose actual production monitor lifecycles on this owned runtime.
+        # No stop implementation, worker, cleanup, or trading result is mocked.
+        # The separate real adapter keeps monitor readiness HTTP fully offline.
+        monitor_trading = PolymarketTradingClient(
+            adapter.config, client=object(), urlopen_fn=offline_http,
+        )
+        request.addfinalizer(monitor_trading.close)
+        monitor = PolymarketMonitor(
+            store=store, trading=monitor_trading,
+            public_client_factory=OfflineMonitorPublic,
+        )
+        request.addfinalizer(monitor.stop)
+        monitor.set_cross_venue_tokens(("offline-monitor-token",))
+        runtime.monitor = monitor
+        monitor.start()
+        monitor_thread = monitor._thread
+        assert monitor_started.wait(2), "real monitor did not begin offline stream work"
+        cross_monitor = PredictCrossVenueMonitor(
+            predict_source=OfflinePredictSource(), polymarket_monitor=monitor,
+            validator=object(), gamma_lookup=lambda *args, **kwargs: (),
+        )
+        cross = runtime_module._CrossVenueRuntime(cross_monitor)
+        request.addfinalizer(cross.stop)
+        runtime._cross_runtime = cross
+        cross.start()
+        assert source_started.wait(2), "real cross producer did not begin offline I/O"
+        assert cross.thread_alive
+        assert monitor_thread is not None and monitor_thread.is_alive()
     _prime(adapter)
     inflight_id, pending_id = "0x" + "a" * 64, "0x" + "b" * 64
     at_commit, release_commit = threading.Event(), threading.Event()
@@ -525,6 +598,12 @@ def test_runtime_stop_retains_owner_until_actual_metadata_writer_exit(
         status = _wait_status(adapter, lambda s: s["dropped_shutdown"] == 1)
         assert status["pending_entries"] == 0
         assert status["inflight_entries"] == 1
+        if active_producers:
+            # Producer stop must proceed while the actual metadata COMMIT is
+            # still held, rather than waiting out its five-second join first.
+            assert source_cancelled.wait(2), "metadata join prevented real cross producer shutdown"
+            assert monitor_closed.wait(2), "metadata join prevented real monitor shutdown"
+            assert not release_commit.is_set()
         assert stop_done.wait(7), "runtime stop exceeded its writer join watchdog"
         assert len(stop_errors) == 1
         assert isinstance(stop_errors[0], RuntimeError)
@@ -536,6 +615,14 @@ def test_runtime_stop_retains_owner_until_actual_metadata_writer_exit(
         with pytest.raises(runtime_module.PredictionRuntimeOwnershipError):
             contender.acquire()
         assert adapter.lp_metadata_persistence_status()["thread_alive"] is True
+        if active_producers:
+            assert cross is not None and not cross.thread_alive
+            assert monitor_thread is not None and not monitor_thread.is_alive()
+            finished_io = tuple(producer_io)
+            assert cross.refresh_opportunity("late-after-stop") is None
+            assert tuple(producer_io) == finished_io
+            assert finished_io.count("predict-markets") == 1
+            assert finished_io.count("polymarket-subscribe") == 1
         release_commit.set()
         _wait_status(adapter, lambda s: not s["thread_alive"])
         runtime.stop()
@@ -557,6 +644,11 @@ def test_runtime_stop_retains_owner_until_actual_metadata_writer_exit(
             stopper.join(timeout=7)
         runtime.stop()
         adapter.close()
+        if cross is not None:
+            cross.stop()
+        if monitor is not None:
+            monitor.stop()
+            monitor_trading.close()
         assert not stopper.is_alive()
 
 
