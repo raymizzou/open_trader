@@ -7,8 +7,11 @@ protection timer. Differences and observer failures do not stop the round.
 
 `prediction_runtime` attaches the observer when it constructs the LP service.
 The observer starts its memory-only worker on the first automatic-round sample.
-Look for `lp_reader_comparison` in the existing Prediction logs. There is no new
-HTTP endpoint, UI, command, or second polling loop.
+Look for `lp_reader_comparison` in Prediction's `launchd.out.log` (default stdout).
+The existing Queue32 sink writes the timestamped observation record there, including
+its unchanged error counters, so healthy summaries do not contaminate the business
+stderr log checked by Production Smoke. Business errors still use stderr. There is
+no new HTTP endpoint, UI, command, or second polling loop.
 
 ## Records and coverage
 
