@@ -3,6 +3,10 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-16
+
+- #357 交付独立的 LP 当前内存状态与可靠控制保存组件：保留精确订单、持仓、金额、原来源时间和 UNKNOWN；暂停立即生效，恢复等待真实保存，旧结果不能覆盖新控制。保存明确失败后等待 1 秒重试一次；超过 10 秒未返回则保持 UNKNOWN 并请求停止，迟到成功不撤销停止，实际 writer 结束前保留资源。真正恢复仅重置 BUY 收益未知计时。16 项组件合同的聚焦验证与证据由任务记录保存；D2 共享接线、交易启用和整进程退出验证由 #351 负责，本组件未启用或部署。
+
 ## 2026-10-15
 
 - #349 LP metadata 公开读取在当前事实处理完成后异步保存持久缓存，不再等待该保存。普通 FIFO 按 3000 条或 16 MiB（含执行中快照）限额，丢弃最旧待写项；失败记录结果未知且不重放。退出立即丢弃待写项，只回收实际执行中的保存；未结束时保留客户端、Store 与 runtime owner，保存等待不阻止其他生产者停止。原来源时间、正／负缓存 TTL、排除读取及 UNKNOWN 语义保留；聚焦验证记录在任务证据，独立评审与精确提交 CI 由 Main 继续。未合并或部署。
