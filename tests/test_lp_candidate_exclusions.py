@@ -309,10 +309,15 @@ def test_metadata_warm_restore_filters_exclusions_without_blocking_risk_reads(re
     request.addfinalizer(rebuilt.close)
     rebuilt.configure_lp_candidate_exclusions(True)
     rebuilt.lp_market_metadata((good,))
-    assert set(rebuilt._metadata_entries) == {good}
+    assert set(rebuilt._metadata_entries) == {blocked, good}
+    assert not rebuilt._metadata_entries.has_display(blocked)
+    assert rebuilt._metadata_entries.has_display(good)
     # The shared adapter still reads an excluded market for active-order management.
     assert rebuilt.lp_market_metadata((blocked,))[blocked]['condition_id'] == blocked
-    assert set(rebuilt._metadata_entries) == {good}, 'risk response cannot rewarm excluded candidate details'
+    assert not rebuilt._metadata_entries.has_display(blocked), 'risk response cannot rewarm excluded candidate details'
+    assert rebuilt.lp_metadata_cache_status()['display_entries'] == 1
+    assert store.lp_candidate_conditions((blocked, good), now=datetime.now(UTC),
+        current_tokens=rebuilt.lp_candidate_metadata_tokens((blocked, good), now=datetime.now(UTC))) == (good,)
 
 
 def test_market_and_direction_deadlines_remain_independent(tmp_path):
@@ -631,6 +636,7 @@ def test_new_maintenance_cooldown_shortens_already_sleeping_history_schedule(tmp
 def test_old_history_tokens_do_not_wake_current_cooled_metadata(tmp_path):
     now = datetime(2026, 10, 5, tzinfo=UTC)
     store = PredictionArbitrageStore(tmp_path)
+    store.initialize_lp_metadata_cache()
     store.lp_save_price_history('m', 'obsolete', [], {'state': 'known', 'checked_at': now})
     metadata = {'condition_id': 'm', 'outcomes': {
         'yes': {'token_id': 'yes'}, 'no': {'token_id': 'no'}}}

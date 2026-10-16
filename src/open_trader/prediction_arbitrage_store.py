@@ -3432,10 +3432,10 @@ class PredictionArbitrageStore:
 
     def lp_candidate_conditions(
         self, condition_ids: Sequence[str], *, now: datetime,
+        current_tokens: Mapping[str, Sequence[str]] | None = None,
     ) -> tuple[str, ...]:
-        """Skip shared metadata when all current directions are cooling."""
+        """Prefilter conditions; explicit current mode never reads replica/history identity."""
         current = _canonical_timestamp(now)
-        self._ensure_lp_metadata_cache_schema()
         result = []
         with self._read_connection() as connection:
             for condition in condition_ids:
@@ -3450,10 +3450,20 @@ class PredictionArbitrageStore:
                 ).fetchone():
                     result.append(condition)
                     continue
+                if current_tokens is not None:
+                    tokens = current_tokens.get(condition, ())
+                    # Missing identity permits refresh only; exact direction/risk gates remain mandatory.
+                    if not tokens or any(not connection.execute(
+                        "SELECT 1 FROM lp_market_exclusions WHERE condition_id=? AND token_id=? AND cooldown_until>?",
+                        (condition, token, current),
+                    ).fetchone() for token in tokens):
+                        result.append(condition)
+                    continue
+                table_exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lp_market_metadata_cache'").fetchone()
                 cached = connection.execute(
                     "SELECT payload FROM lp_market_metadata_cache WHERE condition_id=? AND present=1",
                     (condition,),
-                ).fetchone()
+                ).fetchone() if table_exists else None
                 tokens = ()
                 if cached:
                     try:
@@ -3537,13 +3547,12 @@ class PredictionArbitrageStore:
                 (condition_id, _canonical_timestamp(checked_at)),
             ).rowcount
 
-    def _ensure_lp_metadata_cache_schema(self) -> None:
-        """Create `lp_market_metadata_cache` on first use.
+    def initialize_lp_metadata_cache(self) -> None:
+        """Initialize the disposable metadata schema at adapter startup only."""
+        self._ensure_lp_metadata_cache_schema()
 
-        Expand-only companion of the LP price-history cache.  It is created
-        lazily (CREATE TABLE IF NOT EXISTS on the first metadata-cache call)
-        so a store open never mutates the pinned init-time table set.
-        """
+    def _ensure_lp_metadata_cache_schema(self) -> None:
+        """Create the companion table without changing general Store startup."""
 
         if self._lp_metadata_cache_ready:
             return
@@ -3587,9 +3596,10 @@ class PredictionArbitrageStore:
         self, *, now: datetime | None = None, exclude_candidates: bool = False,
     ) -> Iterator[tuple[str, tuple[float, dict[str, object] | None]]]:
         """Stream warm-cache rows without materializing the entire universe."""
-        self._ensure_lp_metadata_cache_schema()
         horizon = self._lp_metadata_cache_horizon(now)
         with self._read_connection() as connection:
+            if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lp_market_metadata_cache'").fetchone():
+                return
             rows = connection.execute(
                 """
                 SELECT condition_id, payload, expires_at, present,
@@ -3600,6 +3610,7 @@ class PredictionArbitrageStore:
                 WHERE expires_at > ? AND (?=0 OR NOT EXISTS (
                   SELECT 1 FROM lp_market_exclusions e WHERE e.condition_id=m.condition_id
                     AND e.token_id='' AND e.cooldown_until>?))
+                ORDER BY expires_at DESC, condition_id LIMIT 3000
                 """,
                 (int(exclude_candidates), _canonical_timestamp(now or datetime.now(timezone.utc)),
                  horizon, int(exclude_candidates), _canonical_timestamp(now or datetime.now(timezone.utc))),
@@ -3625,7 +3636,6 @@ class PredictionArbitrageStore:
     ) -> None:
         """Upsert LP market metadata rows in bounded ~400-row transactions."""
 
-        self._ensure_lp_metadata_cache_schema()
         encoded: list[tuple[str, str, float, int]] = []
         for raw_condition, raw_entry in entries.items():
             condition = str(raw_condition or "").strip()
@@ -3666,16 +3676,21 @@ class PredictionArbitrageStore:
                     chunk,
                 )
 
-    def lp_metadata_cache_prune(self, *, now: datetime | None = None) -> None:
-        """Delete expired LP market metadata rows."""
-
-        self._ensure_lp_metadata_cache_schema()
+    def lp_metadata_cache_prune(self, *, now: datetime | None = None, limit: int = 400) -> tuple[int, bool]:
+        """Delete one bounded expiry chunk; return count and same-cutoff remainder."""
+        if type(limit) is not int or not 1 <= limit <= 400:
+            raise ValueError("lp_metadata_cache_prune_limit_invalid")
         horizon = self._lp_metadata_cache_horizon(now)
         with self._transaction() as connection:
-            connection.execute(
-                "DELETE FROM lp_market_metadata_cache WHERE expires_at <= ?",
-                (horizon,),
-            )
+            deleted = connection.execute(
+                """DELETE FROM lp_market_metadata_cache WHERE rowid IN (
+                    SELECT rowid FROM lp_market_metadata_cache WHERE expires_at<=?
+                    ORDER BY expires_at, condition_id LIMIT ?)""", (horizon, limit),
+            ).rowcount
+            remaining = connection.execute(
+                "SELECT 1 FROM lp_market_metadata_cache WHERE expires_at<=? LIMIT 1", (horizon,),
+            ).fetchone() is not None
+        return deleted, remaining
 
     def lp_save_screening_snapshot(
         self, payload: Mapping[str, object]
