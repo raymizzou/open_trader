@@ -2078,3 +2078,305 @@ def test_d2_deferred_manual_anchor_proof_is_not_gated_by_prior_dispatch(tmp_path
         for release in releases.values(): release.set()
         assert live.close(timeout=3)
         live.trading.close()
+
+
+def test_current_settings_cas_preserves_control_and_unrelated_fields(tmp_path, monkeypatch):
+    import hashlib, json
+    from open_trader.polymarket_lp_accounting import default_account_pool_document
+    account = hashlib.sha256(WALLET.strip().casefold().encode()).hexdigest()
+    store = PredictionArbitrageStore(tmp_path)
+    document = default_account_pool_document(store.path, account, datetime.now(UTC))
+    document.update(budget_usd='40',target_buy_count=2,buy_price_level=1,config_version=7,
+        trading_config_version=5,legacy_keep=dict(intent='unrelated',amount='999'),round_interval_seconds=30)
+    with store._transaction() as c: c.execute('INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?)',(json.dumps(document),))
+    loaded = store.lp_load_current_settings(account)
+    assert (loaded['budget_usd'],loaded['target_buy_count'],loaded['buy_price_level'],loaded['config_version'])==('40',2,1,7)
+    assert (loaded['round_interval_seconds'],loaded['api_retry_interval_seconds'],loaded['order_check_interval_seconds'])==(30,60,10)
+    with pytest.raises(TypeError): loaded['budget_usd']='999'
+    # Actual separate narrow control commit between settings read and CAS.
+    store.lp_save_current_control(dict(account_id=account,process_epoch='settings-seed',request_version=1,
+        request_id='control-between',desired_running=True,requested_at=datetime.now(UTC),actor=None))
+    current_control = dict(store.lp_load_current_control(account))
+    saved = store.lp_save_current_settings(account,expected_config_version=7,
+        changes=dict(budget_usd='50',target_buy_count=3,buy_price_level=2),actor='test')
+    assert (saved['budget_usd'],saved['target_buy_count'],saved['buy_price_level'],saved['config_version'],saved['trading_config_version'])==('50',3,2,8,6)
+    assert dict(store.lp_load_current_control(account))==current_control
+    with store._read_connection() as c: actual=json.loads(c.execute('SELECT payload FROM lp_auto_pool').fetchone()[0])
+    assert actual['legacy_keep']==document['legacy_keep'] and actual['intents']==document['intents']
+    timing=store.lp_save_current_settings(account,expected_config_version=8,
+        changes=dict(api_retry_interval_seconds=61,order_check_interval_seconds=11))
+    assert (timing['config_version'],timing['trading_config_version'])==(9,6)
+    assert loaded['config_version']==7 and saved['config_version']==8
+    for expected,changes in [(7,dict(budget_usd='1')), (True,dict(api_retry_interval_seconds=2)),
+            (9,dict(budget_usd=True)),(9,dict(budget_usd='NaN')),(9,dict(budget_usd='Infinity')),
+            (9,dict(target_buy_count=True)),(9,dict(buy_price_level=True)),(9,dict(buy_price_level=3)),
+            (9,dict(api_retry_interval_seconds=0)),(9,dict(order_check_interval_seconds=True)),
+            (9,dict(round_interval_seconds=31)),(9,dict(desired_running=False))]:
+        with pytest.raises(ValueError): store.lp_save_current_settings(account,expected_config_version=expected,changes=changes)
+        assert store.lp_load_current_settings(account)==timing
+    for foreign in ('foreign',WALLET,'0'*64):
+        with pytest.raises(ValueError):store.lp_load_current_settings(foreign)
+        with pytest.raises(ValueError):store.lp_save_current_settings(foreign,expected_config_version=9,changes=dict(budget_usd='1'))
+    initial=PredictionArbitrageStore(tmp_path/'initial')
+    defaults=initial.lp_load_current_settings(account)
+    assert defaults['budget_usd'] is None and defaults['config_version']==0 and defaults['trading_config_version']==0
+    assert (defaults['round_interval_seconds'],defaults['api_retry_interval_seconds'],defaults['order_check_interval_seconds'])==(30,60,10)
+    with store._transaction() as c:
+        bad={**actual,'budget_usd':False}
+        c.execute('UPDATE lp_auto_pool SET payload=?',(json.dumps(bad),))
+    with pytest.raises(ValueError): store.lp_load_current_settings(account)
+    def failed_read(): raise OSError('actual SQLite read failure')
+    monkeypatch.setattr(initial,'_read_connection',failed_read)
+    with pytest.raises(OSError): initial.lp_load_current_settings(account)
+
+
+def test_settings_publish_after_commit_without_blocking_current_facts(tmp_path, monkeypatch):
+    import hashlib, sqlite3, threading
+    from threading import Event, Thread
+    from tests.test_lp_d2_current_inputs import _qualified_service
+    from tests.test_lp_order_registration_contract import _open_order, CONDITION_ID, TOKEN_ID
+    initial,_,_,_ = _d2_protection_runtime(tmp_path/'initial',monkeypatch,submit=False)
+    try:
+        assert initial.load_settings().budget is None
+        initial.request_running(False);settle_control(initial);initial.run_once()
+        assert initial.state.snapshot().new_capacity.state=='unknown'
+        assert initial.state.snapshot().current_exposure.state=='known'
+        initial.configure(dict(budget_usd='40',target_buy_count=2))
+        deadline=time.monotonic()+3
+        while initial.settings_status()['pending'] and time.monotonic()<deadline:time.sleep(.001)
+        assert initial.settings_status()['effective'].budget==Decimal('40')
+    finally:
+        assert initial.close(timeout=3)
+        initial.trading.close()
+    live,sdk,public,clock = _d2_protection_runtime(tmp_path,monkeypatch,submit=False)
+    account=hashlib.sha256(WALLET.strip().casefold().encode()).hexdigest()
+    live.store.lp_save_current_settings(account,expected_config_version=0,
+        changes=dict(budget_usd='40',target_buy_count=2,buy_price_level=1))
+    entered,release,read_entered,read_release=Event(),Event(),Event(),Event()
+    mode=['hold']; commits=[];control_entered=Event()
+    real_connect=sqlite3.connect
+    class SettingsConnection(sqlite3.Connection):
+        def execute(self,sql,*args,**kwargs):
+            if sql.startswith('BEGIN') and threading.current_thread().name=='lp-control-save':control_entered.set()
+            if sql=='COMMIT' and threading.current_thread().name=='lp-settings-save':
+                commits.append(mode[0]);entered.set()
+                if mode[0]=='hold':assert release.wait(5),'actual settings commit watchdog'
+                if mode[0]=='fail':raise sqlite3.OperationalError('known settings commit failure')
+            return super().execute(sql,*args,**kwargs)
+    def connect(*args,**kwargs):return real_connect(*args,**(kwargs|dict(factory=SettingsConnection)))
+    def wait_settings(predicate):
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline:
+            status=live.settings_status()
+            if predicate(status):return status
+            time.sleep(.001)
+        raise AssertionError('actual settings completion watchdog')
+    try:
+        old=live.load_settings()
+        assert (old.budget,old.target_count,old.buy_price_level,old.config_version)==(Decimal('40'),2,1,1)
+        live.request_running(False);settle_control(live);live.run_once()
+        cycle=live.state.snapshot().current.cycle_generation
+        monkeypatch.setattr(sqlite3,'connect',connect)
+        started=live.configure(dict(budget_usd='50',target_buy_count=3,buy_price_level=2,expected_config_version=1))
+        assert entered.wait(2) and started['pending']
+        assert live.policy is old and live.settings_status()['native_inflight']
+        assert live.request_running(True).status=='rejected'
+        with pytest.raises(ValueError):live.configure(dict(api_retry_interval_seconds=62))
+        before=live.state.snapshot().snapshot_version
+        assert live.run_once().acceptance.observation is not None
+        assert live.state.snapshot().snapshot_version>before
+        assert live.run_protection_once()==() and live.policy is old
+        # Actual settings completion while a real Reader component is pending.
+        balance=sdk.get_balance_allowance
+        def held_balance(**kwargs):
+            read_entered.set();assert read_release.wait(5),'current account read watchdog'
+            return balance(**kwargs)
+        sdk.get_balance_allowance=held_balance
+        now=live.state.snapshot().observation.accepted_at
+        producer,_=_qualified_service(tmp_path/'pool',now,condition=CONDITION_ID,token=TOKEN_ID)
+        pool=producer.capture_qualified_pool()
+        results=[]
+        read_thread=Thread(target=lambda:results.append(live.run_once(pool)),name='settings-current-frame')
+        read_thread.start();assert read_entered.wait(2)
+        release.set()
+        committed=wait_settings(lambda s:not s['native_inflight'])
+        assert committed['committed'].config_version==2 and committed['effective'] is old and committed['pending']
+        assert live.policy is old and live.request_running(True).status=='rejected'
+        read_release.set();read_thread.join(timeout=3);assert not read_thread.is_alive() and len(results)==1
+        observation=results[0].acceptance.observation
+        assert observation.calculation.new_capacity==Decimal('40') and observation.calculation.policy_version==1
+        current=wait_settings(lambda s:not s['pending'])['effective']
+        assert (current.budget,current.target_count,current.buy_price_level,current.config_version,current.trading_config_version)==(Decimal('50'),3,2,2,2)
+        assert old.budget==Decimal('40') and live.state.snapshot().current.cycle_generation==cycle
+        sdk.get_balance_allowance=balance
+        fresh=live.run_once(pool).acceptance.observation
+        assert fresh.calculation.new_capacity==Decimal('50') and fresh.calculation.policy_version==2
+        assert commits==['hold']
+        # An actual SQLite failure is visible, leaves old policy, and is never retried.
+        mode[0]='fail';entered.clear()
+        live.configure(dict(budget_usd='60',target_buy_count=4,buy_price_level=1,expected_config_version=2))
+        failed=wait_settings(lambda s:not s['pending'])
+        assert failed['error']=='OperationalError' and failed['effective'] is current
+        assert live.store.lp_load_current_settings(account)['config_version']==2
+        for _ in range(2):live.poll();live.settings_status()
+        assert commits==['hold','fail']
+        # A current BUY forbids trading settings; timing-only retains running semantics.
+        sdk.orders=(_open_order('manual-settings-guard','BUY',price='.30',original='20'),)
+        live.run_once()
+        with pytest.raises(ValueError):live.configure(dict(budget_usd='60',target_buy_count=4))
+        sdk.orders=();live.run_once()
+        mode[0]='pass'
+        assert live.request_running(True).status=='accepted';settle_control(live)
+        live.run_once()
+        sent=live.run_once(pool)
+        assert [o.status.value for o in sent.outcomes]==['accepted']
+        terms=sent.outcomes[0].identity.target.terms
+        assert (terms.price,terms.quantity,terms.order_type,terms.post_only)==(Decimal('.39'),Decimal('20'),'GTD',True)
+        assert sdk.posts[-1]['price']==Decimal('.39') and sdk.posts[-1]['size']==Decimal('20')
+        assert sent.acceptance.observation.calculation.policy_version==2
+        resumed=live.state.snapshot().current.cycle_generation
+        version=live.control.status().requested_version
+        live.configure(dict(api_retry_interval_seconds=65,order_check_interval_seconds=12,expected_config_version=2))
+        timing=wait_settings(lambda s:not s['pending'])['effective']
+        assert (timing.config_version,timing.trading_config_version,timing.api_retry_interval_seconds,timing.order_check_interval_seconds)==(3,2,65,12)
+        assert live.state.snapshot().current.cycle_generation==resumed and live.control.status().requested_version==version
+        assert live.settings_status()['effective_round_interval_seconds'] is None
+        with pytest.raises(ValueError):live.configure(dict(round_interval_seconds=30))
+        # Bounded close retains the actual native settings writer until it ends.
+        mode[0]='hold';release.clear();entered.clear()
+        live.configure(dict(api_retry_interval_seconds=66,expected_config_version=3))
+        assert entered.wait(2)
+        control_entered.clear()
+        assert live.request_running(False).status=='accepted'
+        assert control_entered.wait(2)
+        clock[0]+=11
+        fatal=live.poll().fatal
+        assert fatal is not None and live.state.snapshot().current.shutdown_requested
+        assert live.close(timeout=.01) is False and live.settings_status()['native_inflight']
+        release.set();wait_settings(lambda s:not s['pending'])
+        assert live.close(timeout=3) and live.settings_status()['effective'].config_version==4
+        assert live.state.snapshot().current.effective_running is False
+        assert live.control.status().fatal==fatal  # late settings commit never clears peer fatal or resumes
+    finally:
+        release.set();read_release.set()
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_captured_production_candidates_seal_real_gtd_terms_without_legacy_gates(tmp_path, monkeypatch):
+    import hashlib, json, sqlite3, threading
+    from open_trader import polymarket_lp_market_reader, polymarket_trading
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from polymarket.models.clob.order_response import AcceptedOrder
+    from tests.test_lp_d2_current_inputs import _qualified_service
+    from tests.test_lp_order_registration_contract import _SDKPublicClient, CONDITION_ID, TOKEN_ID
+    now=datetime(2026,10,16,1,tzinfo=UTC)
+    class FixedClockMeta(type):
+        def __instancecheck__(cls,value):return isinstance(value,datetime)
+    class FixedDateTime(datetime,metaclass=FixedClockMeta):
+        @classmethod
+        def now(cls,tz=None):return now if tz is not None else now.replace(tzinfo=None)
+    monkeypatch.setattr(polymarket_lp_market_reader,'datetime',FixedDateTime)
+    monkeypatch.setattr(polymarket_trading,'datetime',FixedDateTime)
+    producer,_=_qualified_service(tmp_path/'producer',now,condition=CONDITION_ID,token=TOKEN_ID)
+    capture=producer.capture_qualified_pool()
+    public=_SDKPublicClient(now)
+    adapter,sdk=_adapter(tmp_path/'runtime',public_client=public)
+    sdk.orders=();sdk.positions=()
+    creates=[]
+    def create(**kwargs):
+        creates.append(kwargs)
+        return dict(kwargs,order_type='GTD')
+    def post(signed):
+        sdk.posts.append(signed)
+        return AcceptedOrder(order_id='real-captured-buy',status='live',making_amount=Decimal('0'),
+            taking_amount=Decimal('0'),trade_ids=(),transactions_hashes=())
+    sdk.create_limit_order,sdk.post_order=create,post
+    store=PredictionArbitrageStore(tmp_path/'runtime')
+    account=hashlib.sha256(WALLET.strip().casefold().encode()).hexdigest()
+    store.lp_save_current_settings(account,expected_config_version=0,
+        changes=dict(budget_usd='40',target_buy_count=1,buy_price_level=1))
+    seed_running(store)
+    live=LPD2LiveExecution(store,adapter,account_id=WALLET,venue='polymarket',process_epoch='captured-policy',
+        policy=CalculationPolicy(None),utc_now=lambda:now)
+    def prohibited(*args,**kwargs):pytest.fail('legacy permission or extra candidate acquisition attempted')
+    for name in ('lp_active_sessions','lp_sessions','lp_register_account_snapshot'):
+        if hasattr(store,name):monkeypatch.setattr(store,name,prohibited)
+    public.get_market=public.get_order_book=prohibited
+    real_connect=sqlite3.connect
+    class BrokenBusinessLog(sqlite3.Connection):
+        def execute(self,sql,*args,**kwargs):
+            if threading.current_thread().name=='lp-business-writer' and 'lp_sessions' in sql:
+                raise sqlite3.OperationalError('business logging unavailable')
+            return super().execute(sql,*args,**kwargs)
+    def connect(*args,**kwargs):return real_connect(*args,**(kwargs|dict(factory=BrokenBusinessLog)))
+    monkeypatch.setattr(sqlite3,'connect',connect)
+    frames=[];read=live.reader.read_current
+    def current(*args,**kwargs):
+        frame=read(*args,**kwargs);frames.append(frame);return frame
+    live.reader.read_current=current
+    try:
+        policy=live.load_settings();assert policy.config_version==1
+        live.initialize(ValidatedStartAdmission('captured-policy','offline-permit'))
+        first=live.run_once(capture)
+        assert first.outcomes==() and sdk.posts==[] and len(frames)==1
+        result=live.run_once(capture)
+        assert len(frames)==2 and result.acceptance.observation.source_frame is frames[-1]
+        assert [o.status.value for o in result.outcomes]==['accepted']
+        outcome,=result.outcomes;terms=outcome.identity.target.terms
+        assert outcome.identity.account_id==WALLET and outcome.identity.target.venue=='polymarket'
+        assert outcome.identity.target.token_id==TOKEN_ID
+        assert (terms.price,terms.quantity,terms.order_type,terms.post_only,terms.send_options)==(Decimal('.40'),Decimal('20'),'GTD',True,())
+        assert terms.expiration==1792195260
+        assert datetime.fromtimestamp(terms.expiration-60,UTC)==datetime(2026,10,17,0,tzinfo=UTC)
+        assert creates==[dict(token_id=TOKEN_ID,price=Decimal('.40'),size=Decimal('20'),side='BUY',post_only=True,expiration=1792195260)]
+        assert sdk.posts==[dict(creates[0],order_type='GTD')]
+        snapshot=live.state.snapshot();order,=snapshot.orders
+        assert (order.key,order.order_type.value,order.expiration.value,order.original_size.value,order.size_matched.value)==((WALLET,CONDITION_ID,TOKEN_ID,'real-captured-buy'),'GTD',1792195260,Decimal('20'),Decimal('0'))
+        baseline=next(b for b in snapshot.baselines.values() if b.key.kind=='queue_bucket')
+        assert baseline.source.source_id==capture.rows[CONDITION_ID].source_id
+        assert baseline.source.checked_at==capture.rows[CONDITION_ID].checked_at
+        assert baseline.source.checked_at!=capture.captured_at
+        assert result.acceptance.observation.calculation.policy_version==policy.config_version
+        # Current API UNKNOWN blocks new BUY authority even with a healthy pool.
+        real_balance=sdk.get_balance_allowance
+        sdk.get_balance_allowance=lambda **kwargs:(_ for _ in ()).throw(TimeoutError('current API unavailable'))
+        before=len(sdk.posts)
+        assert live.run_once(capture).outcomes==() and len(sdk.posts)==before
+        assert live.state.snapshot().new_capacity.state=='unknown'
+        # The existing SDK three-minute GTD minimum rejects a near review,
+        # while current facts still reach the state owner.
+        now=datetime(2026,10,16,23,59,tzinfo=UTC)
+        near_producer,_=_qualified_service(tmp_path/'near-review',now,condition=CONDITION_ID,token=TOKEN_ID)
+        near_pool=near_producer.capture_qualified_pool()
+        sdk.get_balance_allowance=real_balance
+        near=LPD2LiveExecution(store,adapter,account_id=WALLET,venue='polymarket',
+            process_epoch='near-review',policy=CalculationPolicy(None),utc_now=lambda:now)
+        try:
+            near.load_settings();near.initialize(ValidatedStartAdmission('near-review','offline-permit'))
+            near_result=near.run_once(near_pool)
+            assert near_result.acceptance.observation is not None
+            assert near_result.acceptance.observation.calculation.target_tokens==()
+            assert near_result.outcomes==() and len(sdk.posts)==before
+        finally:
+            assert near.close(timeout=3)
+        # A malformed saved policy surfaces and cannot authorize a new process BUY.
+        with store._transaction() as c:
+            d=json.loads(c.execute('SELECT payload FROM lp_auto_pool').fetchone()[0]);d['budget_usd']=False
+            c.execute('UPDATE lp_auto_pool SET payload=?',(json.dumps(d),))
+        sdk.get_balance_allowance=real_balance
+        now=datetime(2026,10,17,1,tzinfo=UTC)
+        invalid_producer,_=_qualified_service(tmp_path/'invalid-policy-pool',now,condition=CONDITION_ID,token=TOKEN_ID)
+        invalid_pool=invalid_producer.capture_qualified_pool()
+        invalid=LPD2LiveExecution(store,adapter,account_id=WALLET,venue='polymarket',
+            process_epoch='invalid-policy',policy=CalculationPolicy(Decimal('40'),1),utc_now=lambda:now)
+        try:
+            with pytest.raises(ValueError):invalid.load_settings()
+            invalid.initialize(ValidatedStartAdmission('invalid-policy','offline-permit'))
+            for _ in range(2):
+                assert invalid.run_once(invalid_pool).outcomes==() and len(sdk.posts)==before
+        finally:
+            assert invalid.close(timeout=3)
+    finally:
+        assert live.close(timeout=3)
+        adapter.close()

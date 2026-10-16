@@ -7610,6 +7610,76 @@ class PredictionArbitrageStore:
         return MappingProxyType(dict(account_id=account_id,
             desired_running=document['desired_running'], ever_enabled=document['ever_enabled'], **times))
 
+    @staticmethod
+    def _lp_current_settings_values(document, account_id):
+        from types import MappingProxyType
+        from decimal import Decimal, InvalidOperation
+        if (type(account_id) is not str or len(account_id) != 64
+                or any(c not in '0123456789abcdef' for c in account_id)
+                or not isinstance(document, dict) or document.get('account_id') != account_id):
+            raise ValueError('lp_settings_account_identity')
+        values = {key: document.get(key, default) for key, default in dict(
+            budget_usd=None, target_buy_count=0, buy_price_level=1, config_version=0,
+            trading_config_version=document.get('config_version', 0),
+            round_interval_seconds=30, api_retry_interval_seconds=60, order_check_interval_seconds=10).items()}
+        raw = values['budget_usd']
+        if raw is not None:
+            try:
+                if isinstance(raw, bool):
+                    raise ValueError
+                budget = Decimal(str(raw))
+                if not budget.is_finite() or budget < 0:
+                    raise ValueError
+            except (InvalidOperation, ValueError, TypeError):
+                raise ValueError('lp_settings_budget_invalid') from None
+            values['budget_usd'] = str(budget)
+        for key in ('target_buy_count', 'config_version', 'trading_config_version'):
+            if type(values[key]) is not int or values[key] < 0:
+                raise ValueError('lp_settings_integer_invalid')
+        if type(values['buy_price_level']) is not int or values['buy_price_level'] not in (1, 2):
+            raise ValueError('lp_settings_price_level_invalid')
+        for key in ('round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds'):
+            if type(values[key]) is not int or values[key] <= 0:
+                raise ValueError('lp_settings_timing_invalid')
+        return MappingProxyType(dict(account_id=account_id, **values))
+
+    def lp_load_current_settings(self, account_id: str):
+        """Read policy only; never reconstruct financial or send authority."""
+        from .polymarket_lp_accounting import default_account_pool_document
+        with self._read_connection() as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+        document = (json.loads(row['payload']) if row is not None else
+            default_account_pool_document(self.path, account_id, datetime.now(timezone.utc)))
+        return self._lp_current_settings_values(document, account_id)
+
+    def lp_save_current_settings(self, account_id: str, *, expected_config_version, changes, actor=None):
+        """CAS a narrow settings merge, returning only after actual commit."""
+        from .polymarket_lp_accounting import default_account_pool_document
+        fields = {'budget_usd', 'target_buy_count', 'buy_price_level',
+                  'api_retry_interval_seconds', 'order_check_interval_seconds'}
+        if (not isinstance(changes, Mapping) or not changes or set(changes) - fields
+                or type(expected_config_version) is not int or expected_config_version < 0
+                or actor is not None and type(actor) is not str
+                or 'budget_usd' in changes and changes['budget_usd'] is None):
+            raise ValueError('lp_settings_changes_invalid')
+        with self._transaction() as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+            document = (json.loads(row['payload']) if row is not None else
+                default_account_pool_document(self.path, account_id, datetime.now(timezone.utc)))
+            current = self._lp_current_settings_values(document, account_id)
+            if current['config_version'] != expected_config_version:
+                raise ValueError('config_version_changed')
+            trading = bool(set(changes) & {'budget_usd', 'target_buy_count', 'buy_price_level'})
+            proposed = {**document, **changes, 'config_version': current['config_version'] + 1,
+                        'trading_config_version': current['trading_config_version'] + int(trading)}
+            saved = self._lp_current_settings_values(proposed, account_id)
+            # Merge fields only, preserving any concurrent control/legacy data.
+            document.update({key: saved[key] for key in (*fields, 'config_version', 'trading_config_version')})
+            document.update(settings_updated_at=datetime.now(timezone.utc).isoformat(), settings_actor=actor)
+            connection.execute('INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?) '
+                'ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload', (json.dumps(document),))
+        return saved
+
     def lp_load_current_control(self, account_id: str):
         """Load saved control only; a new account starts paused, never running."""
         if type(account_id) is not str or not account_id.strip():

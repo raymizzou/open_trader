@@ -9,12 +9,14 @@ import threading
 import time
 from concurrent.futures import Future
 from uuid import uuid4
+from types import MappingProxyType
 
 from .lp_business_writer import LPBusinessWriter, RequestRecord, ReceiptRecord, ProgressRecord
 from .polymarket_lp_control import LPControlOwner
 from .polymarket_lp_current_inputs import prepare_current_inputs
 from .polymarket_lp_current_state import (
     AppliedControl, CommittedControl, CurrentLPState, StoredControl, ValidatedStartAdmission,
+    ControlRequestResult,
     ReceiptEvidence, SourceStamp, TerminalProof, CurrentOrderFact, Fact,
     BuyExecutionUncertainty,
     ProtectionKey, ProtectionGuard, ProtectionBaseline, SetBaseline,
@@ -24,7 +26,7 @@ from .polymarket_lp_current_state import (
     ScoringState, ScoringObservation,
     OwnFillEvidence, SellState, ExitAttempt, ExitEvidenceUpdate,
 )
-from .polymarket_lp_market_calculation import calculate_current
+from .polymarket_lp_market_calculation import CalculationPolicy, calculate_current
 from .polymarket_lp_market_reader import MarketReader, ReadScope
 from .polymarket_lp_risk import (estimate_lp_queue_position, first_observation_baseline,
     _executable_bid_value, _projected_taker_fee, _freshness, _levels, TERMINAL_ORDER_STATES)
@@ -204,6 +206,12 @@ class LPD2LiveExecution:
         self.control = LPControlOwner(self.state, _ControlStore(store, account_id), self, self,
                                       clock=clock, utc_now=utc_now)
         self._run_lock = threading.Lock()
+        self._settings_lock = threading.RLock()
+        self._settings_future = self._settings_thread = None
+        self._committed_policy = policy
+        self._settings_error = None
+        self._settings_loaded = False
+        self._settings_required = False
         self._protection_lock = threading.Lock()
         self._closed = False
         self._admission = None
@@ -213,6 +221,7 @@ class LPD2LiveExecution:
         self._opening_order_associations = {}
         self._sealed_candidates = {}
         self._sealed_candidate_source = None
+        self._sealed_candidate_sources = {}
         self._native_jobs = {}
         # Finite dispatch tickets for an already accepted protection trigger.
         # No request/native attempt exists until actual capacity is admitted.
@@ -258,10 +267,149 @@ class LPD2LiveExecution:
     def trip(self, signal):
         self._closed = True
 
+    @staticmethod
+    def _policy_from_settings(saved):
+        return CalculationPolicy(None if saved['budget_usd'] is None else Decimal(saved['budget_usd']),
+            saved['target_buy_count'], buy_price_level=saved['buy_price_level'],
+            config_version=saved['config_version'], trading_config_version=saved['trading_config_version'],
+            api_retry_interval_seconds=saved['api_retry_interval_seconds'],
+            order_check_interval_seconds=saved['order_check_interval_seconds'],
+            round_interval_seconds=saved['round_interval_seconds'])
+
+    def _settings_account(self):
+        return hashlib.sha256(self.account_id.strip().casefold().encode('utf-8')).hexdigest()
+
+    def load_settings(self):
+        if not self._run_lock.acquire(blocking=False):
+            raise ValueError('settings_iteration_pending')
+        try:
+            with self._settings_lock:
+                if self._settings_future is not None:
+                    raise ValueError('settings_save_pending')
+            with self._settings_lock:
+                self._settings_required = True
+            try:
+                saved = self.store.lp_load_current_settings(self._settings_account())
+                policy = self._policy_from_settings(saved)
+            except BaseException as exc:
+                with self._settings_lock:
+                    self._settings_loaded, self._settings_error = False, type(exc).__name__
+                raise
+            with self._settings_lock:
+                self.policy = self._committed_policy = policy
+                self._settings_loaded, self._settings_error = True, None
+            return policy
+        finally:
+            self._run_lock.release()
+
+    def _collect_settings(self, *, publish=False):
+        # Caller owns settings lock; native SQL is never run under it.
+        if (self._settings_future is not None and self._settings_future.done()
+                and not self._settings_thread.is_alive()):
+            future, self._settings_future = self._settings_future, None
+            try:
+                self._committed_policy = self._policy_from_settings(future.result())
+            except BaseException as exc:
+                self._settings_error = type(exc).__name__
+            else:
+                self._settings_error = None
+        if publish:
+            self.policy = self._committed_policy
+        return self._settings_future is not None or self.policy is not self._committed_policy
+
+    def settings_status(self):
+        boundary = self._run_lock.acquire(blocking=False)
+        try:
+            with self._settings_lock:
+                pending = self._collect_settings(publish=boundary)
+                return MappingProxyType(dict(effective=self.policy, committed=self._committed_policy,
+                    pending=pending, native_inflight=bool(self._settings_thread and self._settings_thread.is_alive()),
+                    error=self._settings_error, loaded=self._settings_loaded,
+                    effective_round_interval_seconds=None))
+        finally:
+            if boundary:
+                self._run_lock.release()
+
+    def configure(self, payload, *, actor=None):
+        if not isinstance(payload, Mapping) or not payload:
+            raise ValueError('auto_config_invalid')
+        fields = {'budget_usd', 'target_buy_count', 'buy_price_level',
+                  'api_retry_interval_seconds', 'order_check_interval_seconds'}
+        if 'round_interval_seconds' in payload:
+            raise ValueError('round_interval_seconds_retired_in_continuous_mode')
+        if set(payload) - fields - {'expected_config_version'}:
+            raise ValueError('auto_config_invalid')
+        with self._settings_lock:
+            self._collect_settings()
+            if (not self._settings_loaded or self._settings_future is not None
+                    or self.policy is not self._committed_policy):
+                raise ValueError('settings_save_pending')
+            if self._closed:
+                raise ValueError('settings_stopping')
+            policy = self.policy
+            expected = payload.get('expected_config_version', policy.config_version)
+            changes = {key: payload[key] for key in fields if key in payload}
+            if type(expected) is not int or expected != policy.config_version or not changes:
+                raise ValueError('config_version_changed')
+            values = dict(account_id=self._settings_account(), budget_usd=policy.budget,
+                target_buy_count=policy.target_count, buy_price_level=policy.buy_price_level,
+                config_version=policy.config_version, trading_config_version=policy.trading_config_version,
+                api_retry_interval_seconds=policy.api_retry_interval_seconds,
+                order_check_interval_seconds=policy.order_check_interval_seconds,
+                round_interval_seconds=policy.round_interval_seconds)
+            if 'budget_usd' in changes and changes['budget_usd'] is None:
+                raise ValueError('auto_config_invalid')
+            self.store._lp_current_settings_values({**values, **changes}, self._settings_account())
+            if actor is not None and type(actor) is not str:
+                raise ValueError('auto_config_invalid')
+            trading = bool(set(changes) & {'budget_usd', 'target_buy_count', 'buy_price_level'})
+            with self.state._lock:
+                status, snapshot = self.control.status(), self.state.snapshot()
+                if status.fatal is not None or snapshot.current.shutdown_requested:
+                    raise ValueError('settings_stopping')
+                if trading:
+                    if not {'budget_usd', 'target_buy_count'} <= set(changes):
+                        raise ValueError('auto_config_invalid')
+                    if (snapshot.current.effective_running or status.requested_running
+                            or status.requested_version != status.saved_version or status.native_save_in_flight
+                            or status.save_state != 'saved' or self._run_lock.locked()
+                            or self.rounds.snapshot().active_batch_id is not None
+                            or self._active_sends or any(h._thread.is_alive() for h in self._native_jobs.values())
+                            or any(o.side == 'BUY' for o in snapshot.active_orders)
+                            or any(o.phase != 'closed' for o in snapshot.openings.values())):
+                        raise ValueError('pause_and_finish_automatic_buys_before_configuring')
+                    observation = snapshot.observation
+                    from .polymarket_lp_current_inputs import _current_account
+                    if (observation is None or not observation.orders_complete or not observation.positions_complete
+                            or observation.cycle_generation != snapshot.current.cycle_generation
+                            or observation.read_ticket.trade_version_at_start != snapshot.trade_version
+                            or not _current_account(observation.source_frame, self._utc_now()).complete
+                            or any(f.state != 'known' for f in (snapshot.buy_reserved,
+                                snapshot.inventory_cost, snapshot.current_exposure))
+                            or snapshot.new_capacity.state != 'known' and policy.budget is not None):
+                        raise ValueError('financial_facts_unknown')
+            future = self._settings_future = Future()
+            self._settings_error = None
+            def save():
+                try:
+                    saved = self.store.lp_save_current_settings(self._settings_account(),
+                        expected_config_version=expected, changes=changes, actor=actor)
+                except BaseException as exc:
+                    future.set_exception(exc)
+                else:
+                    future.set_result(saved)
+            self._settings_thread = threading.Thread(target=save, name='lp-settings-save', daemon=False)
+            self._settings_thread.start()
+        return self.settings_status()
+
     def request_running(self, running, *, actor=None):
-        return self.control.request_running(running, actor=actor)
+        with self._settings_lock:
+            if running is True and self._collect_settings():
+                return ControlRequestResult('rejected', 'settings_save_pending', self.control.status())
+            return self.control.request_running(running, actor=actor)
 
     def poll(self):
+        self.settings_status()
         return self.control.poll(self._clock())
 
     def run_once(self, captured_candidates=None, *, timeout=2):
@@ -270,13 +418,16 @@ class LPD2LiveExecution:
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError('d2_run_in_progress')
         try:
+            with self._settings_lock:
+                self._collect_settings(publish=True)
+                policy = self.policy
             self.poll()
             current = self.state.snapshot().current
             ticket = self.state.begin_observation(current.cycle_generation, ('balance', 'open_orders', 'positions'))
             frame = self.reader.read_current(ReadScope(self.account_id, related_markets=True), time.monotonic()+timeout)
             as_of = self._utc_now()
-            prepared = prepare_current_inputs(frame, captured_candidates, self.policy, as_of)
-            calculation = calculate_current(prepared, self.policy, as_of)
+            prepared = prepare_current_inputs(frame, captured_candidates, policy, as_of)
+            calculation = calculate_current(prepared, policy, as_of)
             accepted = self.state.accept(ticket, frame, calculation, evaluated_at=as_of)
             if accepted.observation is None:
                 return RunResult(accepted)
@@ -308,10 +459,13 @@ class LPD2LiveExecution:
                 for row in prepared.sources['candidates'].value
                 if row['token_id'] == a.target.token_id and row.get('market_id') == a.target.market_id}
             self._sealed_candidate_source = prepared.sources['candidates']
+            per_direction = prepared.sources.get('candidate_sources')
+            self._sealed_candidate_sources = per_direction.value if per_direction else {}
             outcomes = tuple(self._attempt(start.token, action, observation) for action in start.token.actions)
             finish = self.complete_local_attempts(start.token, outcomes)
             self._sealed_candidates.clear()
             self._sealed_candidate_source = None
+            self._sealed_candidate_sources = {}
             return RunResult(accepted, start, finish, outcomes)
         finally:
             self._run_lock.release()
@@ -346,7 +500,8 @@ class LPD2LiveExecution:
 
     def _fixed_plan(self, observation, prepared, calculation):
         source = prepared.sources['candidates']
-        if (not source.complete or source.error or source.value is None
+        if (self._settings_required and not self._settings_loaded
+                or not source.complete or source.error or source.value is None
                 or self.state.snapshot().new_capacity.state != 'known'):
             return None
         if not isinstance(source.value, tuple) or any(not isinstance(row, Mapping) for row in source.value):
@@ -359,6 +514,8 @@ class LPD2LiveExecution:
             if len(rows) != 1:
                 return None  # ambiguous identity is not an empty fixed plan
             row = rows[0]
+            if ('policy_version' in row and row['policy_version'] != calculation.policy_version):
+                return None
             if any(o.phase != 'closed' and o.stop_requested and o.scope[1:3] == (row.get('condition_id'), row.get('token_id'))
                     for o in self.state.snapshot().openings.values()):
                 continue
@@ -721,7 +878,8 @@ class LPD2LiveExecution:
 
     def _register_submit_baseline(self, token, action, record, order_key):
         row = self._sealed_candidates[(token.batch_id, action.request_id)]
-        source = self._sealed_candidate_source
+        source = self._sealed_candidate_sources.get(
+            f'{record.condition_id}:{record.token_id}', self._sealed_candidate_source)
         book = row.get('direction', {}).get('book')
         if (source is None or not source.complete or source.error or not isinstance(book, Mapping)
                 or book.get('condition_id') != record.condition_id or book.get('token_id') != record.token_id):
@@ -1575,6 +1733,10 @@ class LPD2LiveExecution:
             handles = tuple(self._native_jobs.values())
         for handle in handles:
             handle._thread.join(timeout=max(0, deadline-time.monotonic()))
+        with self._settings_lock:
+            settings_thread = self._settings_thread
+        if settings_thread is not None:
+            settings_thread.join(timeout=max(0, deadline-time.monotonic()))
         # A synchronous batch may also be inside a real native call. Neither
         # local control reset nor this bounded close releases that owner.
         run_done = self._run_lock.acquire(timeout=max(0, deadline-time.monotonic()))
@@ -1584,5 +1746,6 @@ class LPD2LiveExecution:
             self.writer.close(timeout=max(0, deadline-time.monotonic()))
         except TimeoutError:
             return False
-        return (reader_done and control_done and run_done
+        settings_done = not self.settings_status()['pending']
+        return (reader_done and control_done and run_done and settings_done
             and all(not h._thread.is_alive() for h in handles))
