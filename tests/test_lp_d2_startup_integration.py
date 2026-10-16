@@ -131,3 +131,64 @@ def test_resume_clears_old_provider_wait_but_new_limit_applies(tmp_path, respons
         release.set()
         assert live.close(timeout=3)
         adapter.close()
+
+
+@pytest.mark.parametrize('saved_state', ['paused', 'running', 'foreign'])
+def test_existing_pool_control_identity_load_save_preserves_pause(tmp_path, saved_state):
+    import json
+    import sqlite3
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from tests.test_lp_d2_integration import settle_control
+    pool_key = '30ffa9b5e1968e54bddadba7ff14c633c7c955a6f41808d9f5633a42c07537dd'
+    stored_running = saved_state == 'running'
+    original = dict(account_id='f'*64 if saved_state == 'foreign' else pool_key,
+        run_id='existing-d1-pool', config_version=7, desired_running=stored_running,
+        ever_enabled=True, enabled_at='2026-10-01T01:02:03+00:00',
+        updated_at='2026-10-02T01:02:03+00:00', budget_usd='123.45',
+        target_buy_count=3, buy_price_level=2, custom_settings={'operator_note': 'keep', 'mode': 9},
+        allocations=[], intents={}, events={}, rounds={}, last_round={})
+    store = PredictionArbitrageStore(tmp_path)
+    with sqlite3.connect(store.path) as db:
+        db.execute('INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?)', (json.dumps(original),))
+    orders = (_open_order('paused-preserved-buy', 'BUY', price='.40', original='10'),) if saved_state == 'paused' else ()
+    adapter, sdk = _adapter(tmp_path, orders=orders)
+    live = LPD2LiveExecution(store, adapter, account_id=WALLET, venue='polymarket',
+        process_epoch='existing-d1-control', policy=CalculationPolicy(Decimal('40')))
+    def saved_document():
+        with sqlite3.connect(store.path) as db:
+            return json.loads(db.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
+    try:
+        live.initialize(ValidatedStartAdmission('existing-d1-control', 'offline-permit'))
+        status = live.control.status()
+        if saved_state == 'foreign':
+            assert status.fatal is not None and status.fatal.origin == 'startup_read'
+            assert status.current.effective_running is None  # failed startup has no admitted control
+            assert status.current.shutdown_requested is True
+            assert (sdk.balance_reads, sdk.order_reads, sdk.position_reads) == (0, 0, 0)
+            assert sdk.posts == [] and sdk.cancels == []
+            assert saved_document() == original
+            assert live.request_running(True).status == 'rejected'
+            return
+        assert status.fatal is None
+        assert status.current.account_id == WALLET
+        assert status.current.effective_running is stored_running
+        observed = live.run_once()
+        assert observed.acceptance.observation.source_frame.account == WALLET
+        if not stored_running:
+            assert observed.outcomes == () and live.rounds.snapshot().round_number == 0
+            assert sdk.cancels == [] and sdk.posts == []
+            assert live.state.snapshot().active_orders[0].key[3] == 'paused-preserved-buy'
+        assert saved_document() == original
+        assert live.request_running(not stored_running, actor='operator').status == 'accepted'
+        saved = settle_control(live)
+        assert saved.saved_version == saved.requested_version
+        assert saved.current.account_id == WALLET
+        assert saved.current.effective_running is (not stored_running)
+        actual = saved_document()
+        assert actual['account_id'] == pool_key
+        assert actual['desired_running'] is (not stored_running)
+        assert {k:v for k,v in actual.items() if k not in ('desired_running', 'updated_at')} == {
+            k:v for k,v in original.items() if k not in ('desired_running', 'updated_at')}
+    finally:
+        assert live.close(timeout=3)
+        adapter.close()

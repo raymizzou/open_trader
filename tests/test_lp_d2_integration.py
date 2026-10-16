@@ -12,7 +12,8 @@ from tests.test_lp_order_registration_contract import _adapter, WALLET
 
 
 def seed_running(store):
-    store.lp_save_current_control(dict(account_id=WALLET, process_epoch='seed', request_version=1,
+    store.lp_save_current_control(dict(account_id='30ffa9b5e1968e54bddadba7ff14c633c7c955a6f41808d9f5633a42c07537dd',
+        process_epoch='seed', request_version=1,
         request_id='seed', desired_running=True, requested_at=datetime.now(UTC), actor=None))
 
 
@@ -173,7 +174,7 @@ def test_fixed_cde_finishes_once_with_mixed_sync_and_unknown_results(tmp_path, m
     builder_code = '0x' + 'b'*64
     caller_rows[3].update(order_type='GTC', expiration=None,
         send_options=(('builder_code', builder_code),) if option_variant == 'supported_builder' else (('defer_exec', False),))
-    signs, posts = [], []
+    signs, posts, after_c = [], [], []
     def sign(**kwargs):
         signs.append(dict(kwargs))
         if len(signs) == 1:
@@ -187,6 +188,7 @@ def test_fixed_cde_finishes_once_with_mixed_sync_and_unknown_results(tmp_path, m
                 making_amount=Decimal('0'), taking_amount=Decimal('0'),
                 trade_ids=(), transactions_hashes=())
         if signed['token_id'] == 'token-D':
+            after_c.append(live.state.snapshot())  # C is applied; E has not been posted
             return RejectedOrder(ok=False, code='post_only_would_cross', message='offline venue rejection')
         raise TimeoutError('offline local attempt timed out')
     sdk.create_limit_order, sdk.post_order = sign, post
@@ -228,10 +230,13 @@ def test_fixed_cde_finishes_once_with_mixed_sync_and_unknown_results(tmp_path, m
             assert current.key == (WALLET, 'condition-C', 'token-C', 'venue-C')
             assert current.original_size.value == 20 and current.size_matched.value == 0
             assert current.remaining.value == 20
-            assert live.state.snapshot().buy_reserved.value == Decimal('8.00')
-            assert live.state.snapshot().new_capacity.state == 'unknown'
+            assert after_c[0].buy_reserved.value == Decimal('8.00')
+            assert after_c[0].orders[0] is current  # E uncertainty does not renew C's evidence
         else:
             assert live.state.snapshot().orders == ()
+        final = live.state.snapshot()
+        assert all(f.state == 'unknown' and f.value is None for f in (
+            final.buy_reserved, final.inventory_cost, final.current_exposure, final.new_capacity))
         from dataclasses import replace
         assert live.complete_local_attempts(replace(token, account_id='foreign-account'), result.outcomes).status.value == 'identity_error'
         assert live.complete_local_attempts(replace(token, cycle_generation='stale-generation'), result.outcomes).status.value == 'stale'
@@ -341,5 +346,227 @@ def test_independent_cancel_preserves_native_inflight_lifetime(tmp_path):
         assert current.terminal_proof.status == 'CANCELED'
     finally:
         release.set()
+        assert live.close(timeout=3)
+        adapter.close()
+
+
+def test_accepted_buy_can_be_canceled_before_another_observation(tmp_path):
+    from polymarket.models.clob.order_response import AcceptedOrder
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    adapter, sdk = _adapter(tmp_path)
+    store = PredictionArbitrageStore(tmp_path)
+    seed_running(store)
+    sdk.create_limit_order = lambda **kw: dict(kw, order_type='GTD')
+    def post(signed):
+        sdk.posts.append(signed)
+        return AcceptedOrder(order_id='venue-C', status='live', making_amount=Decimal('0'),
+            taking_amount=Decimal('0'), trade_ids=(), transactions_hashes=())
+    sdk.post_order = post
+    live = LPD2LiveExecution(store, adapter, account_id=WALLET, venue='polymarket',
+        process_epoch='receipt-then-cancel', policy=CalculationPolicy(Decimal('40'), 1))
+    try:
+        live.initialize(ValidatedStartAdmission('receipt-then-cancel', 'offline-permit'))
+        live.run_once()
+        captured, _ = candidates_for_fixed_send()
+        bought = live.run_once(captured)
+        assert [o.status.value for o in bought.outcomes] == ['accepted']
+        key = (WALLET, 'condition-C', 'token-C', 'venue-C')
+        snapshot = live.state.snapshot()
+        assert snapshot.observation.orders == ()  # actual frame predates this receipt
+        current, = snapshot.active_orders
+        assert current.key == key and current.price.value == Decimal('.40')
+        assert current.original_size.value == 20
+        before = (sdk.balance_reads, sdk.order_reads, sdk.position_reads)
+        with pytest.raises(ValueError):
+            live.cancel_independent((WALLET, 'condition-C', 'token-C', 'foreign-order'))
+        attempt = live.cancel_independent(key)
+        outcome = attempt.result(timeout=3)
+        assert outcome.identity is attempt.identity and outcome.status.value == 'accepted'
+        assert outcome.identity.account_id == WALLET
+        assert outcome.identity.target.venue == 'polymarket'
+        assert outcome.identity.target.token_id == 'token-C'
+        assert outcome.identity.target.existing_order_id == 'venue-C'
+        assert outcome.identity.request_id and outcome.identity.request_id != bought.outcomes[0].identity.request_id
+        assert sdk.cancels == [('venue-C',)] and len(sdk.posts) == 1
+        assert before == (sdk.balance_reads, sdk.order_reads, sdk.position_reads)
+        assert live.state.snapshot().observation is snapshot.observation
+        # R2 owns final fill provenance; this case does not seal/assert old matched0.
+    finally:
+        assert live.close(timeout=3)
+        adapter.close()
+
+
+@pytest.mark.parametrize('fill_ordering', ['fill_after_ack', 'newer_fill_before_ack'])
+def test_cancel_ack_preserves_unknown_final_fill_until_authoritative_api(tmp_path, fill_ordering):
+    from threading import Event
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from tests.test_lp_order_registration_contract import _open_order, CONDITION_ID, TOKEN_ID
+    adapter, sdk = _adapter(tmp_path)
+    store = PredictionArbitrageStore(tmp_path)
+    seed_running(store)
+    live = LPD2LiveExecution(store, adapter, account_id=WALLET, venue='polymarket',
+        process_epoch='cancel-final-unknown', policy=CalculationPolicy(Decimal('40')))
+    entered, release = Event(), Event()
+    def cancel(*, order_ids):
+        sdk.cancels.append(order_ids)
+        entered.set()
+        assert release.wait(5), 'actual ID-only cancel completion watchdog'
+        return dict(canceled=order_ids, not_canceled={})
+    sdk.cancel_orders = cancel
+    sdk.list_account_trades = lambda **kw: pytest.fail('cancel reconciliation attempted whole-account history')
+    key = (WALLET, CONDITION_ID, TOKEN_ID, 'cancel-A')
+    def current_order(): return next(o for o in live.state.snapshot().orders if o.key == key)
+    try:
+        live.initialize(ValidatedStartAdmission('cancel-final-unknown', 'offline-permit'))
+        live.run_once()
+        sdk.orders = (_open_order('cancel-A', 'BUY', price='.40', original='10'),)
+        observed = live.run_once()
+        original = current_order()
+        assert original.size_matched.value == 0 and original.original_size.value == 10
+        attempt = live.cancel_independent(key)
+        assert entered.wait(2)
+        if fill_ordering == 'newer_fill_before_ack':
+            sdk.orders = (_open_order('cancel-A', 'BUY', price='.40', original='10', matched='3'),)
+            sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='3', average_price='.40'),)
+            live.run_once()
+        lower_bound = current_order().size_matched
+        reads = (sdk.balance_reads, sdk.order_reads, sdk.position_reads)
+        release.set()
+        outcome = attempt.result(timeout=3)
+        assert outcome.status.value == 'accepted' and outcome.identity is attempt.identity
+        acked = current_order()
+        assert acked.terminal_proof is not None and acked.terminal_proof.status == 'CANCELED'
+        assert acked.terminal_proof.matched.state == 'unknown' and acked.terminal_proof.matched.value is None
+        assert acked.terminal_proof.original_size is original.original_size
+        assert acked.size_matched is lower_bound  # old observed quantity keeps its own provenance
+        assert acked.remaining.state == 'unknown' and acked.remaining.value is None
+        assert live.status()['last_current_evidence'] == (attempt.identity.request_id, 'cancel', 'applied')
+        assert reads == (sdk.balance_reads, sdk.order_reads, sdk.position_reads)
+        assert observed.acceptance.observation.orders[0].size_matched.value == 0
+        assert observed.acceptance.observation.orders[0].terminal_proof is None
+        # A contradictory ordinary LIVE row cannot resurrect a canceled order.
+        sdk.orders = (_open_order('cancel-A', 'BUY', price='.40', original='10'),)
+        live.run_once()
+        assert current_order().terminal_proof is acked.terminal_proof
+        # Later authoritative ordinary API supplies the actual final cumulative fills.
+        sdk.orders = (_open_order('cancel-A', 'BUY', price='.40', original='10', matched='3', status='CANCELED'),)
+        sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='3', average_price='.40'),)
+        reconciled = live.run_once()
+        final = current_order()
+        assert final.terminal_proof.matched.value == 3 and final.size_matched.value == 3
+        assert final.remaining.value == 7
+        assert live.state.snapshot().positions[0].quantity.value == 3
+        assert live.state.snapshot().inventory_cost.value == Decimal('1.20')
+        assert final.size_matched.sources[0].source_id == reconciled.acceptance.observation.source_frame.sources['open_orders'].source_id
+        with pytest.raises(ValueError): live.cancel_independent(key)
+        assert sdk.cancels == [('cancel-A',)] and sdk.posts == []
+    finally:
+        release.set()
+        assert live.close(timeout=3)
+        adapter.close()
+
+
+@pytest.mark.parametrize('failure', ['post_timeout', 'post_error', 'missing_quantity',
+    'invalid_quantity', 'conflicting_quantity', 'create_not_sent'])
+def test_all_uncertain_buy_results_invalidate_financial_authority(tmp_path, monkeypatch, failure):
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from open_trader.lp_business_writer import LPBusinessWriter
+    from tests.test_lp_business_writer_contract import blocked_database, request, stored_actions
+    from tests.test_lp_order_registration_contract import _open_order, CONDITION_ID, TOKEN_ID
+    adapter, sdk = _adapter(tmp_path)
+    store = PredictionArbitrageStore(tmp_path)
+    seed_running(store)
+    writer = LPBusinessWriter(store)
+    live = LPD2LiveExecution(store, adapter, account_id=WALLET, venue='polymarket',
+        process_epoch='all-uncertain', policy=CalculationPolicy(Decimal('40'), 3), writer=writer)
+    signs, posts, old_tickets = [], [], []
+    def sign(**kw):
+        signs.append(dict(kw))
+        if failure == 'create_not_sent': raise TimeoutError('offline create/sign did not post')
+        return dict(kw, order_type='GTD')
+    def post(signed):
+        posts.append(dict(signed))
+        if not old_tickets:
+            old_tickets.append(live.state.begin_observation(live.state.snapshot().current.cycle_generation,
+                ('balance', 'open_orders', 'positions')))
+        if failure == 'post_timeout': raise TimeoutError('offline unknown native post')
+        if failure == 'post_error': raise RuntimeError('offline unknown native post')
+        response = dict(accepted=True, status='LIVE', order_id='possible-'+signed['token_id'])
+        if failure == 'invalid_quantity': response['taking_amount'] = Decimal('NaN')
+        if failure == 'conflicting_quantity': response.update(taking_amount=Decimal('0'), size_matched=Decimal('1'))
+        return response
+    sdk.create_limit_order, sdk.post_order = sign, post
+    sdk.list_account_trades = lambda **kw: pytest.fail('uncertain BUY attempted history recovery')
+    blocker = None
+    try:
+        live.initialize(ValidatedStartAdmission('all-uncertain', 'offline-permit'))
+        live.run_once()
+        baseline = live.state.snapshot()
+        assert baseline.buy_reserved.value == baseline.inventory_cost.value == baseline.current_exposure.value == 0
+        assert baseline.new_capacity.value == 40
+        blocker, entered = blocked_database(store, monkeypatch)
+        writer.offer(request('held-uncertainty-audit'))
+        assert entered.wait(2)
+        captured, _ = candidates_for_fixed_send()
+        reads = (sdk.balance_reads, sdk.order_reads, sdk.position_reads)
+        result = live.run_once(captured)
+        expected = 'not_sent' if failure == 'create_not_sent' else 'unknown_timeout' if failure == 'post_timeout' else 'unknown_error'
+        assert [o.status.value for o in result.outcomes] == [expected]*3
+        assert tuple(o.identity for o in result.outcomes) == result.start.token.actions
+        assert len({o.identity.request_id for o in result.outcomes}) == 3
+        assert [s['token_id'] for s in signs] == ['token-C', 'token-D', 'token-E']
+        assert [s['token_id'] for s in posts] == ([] if failure == 'create_not_sent' else ['token-C', 'token-D', 'token-E'])
+        assert (sdk.balance_reads, sdk.order_reads, sdk.position_reads) == tuple(n+1 for n in reads)
+        assert live.rounds.snapshot().round_number == 2
+        assert live.complete_local_attempts(result.start.token, result.outcomes).status.value == 'duplicate'
+        snapshot = live.state.snapshot()
+        assert snapshot.orders == () and snapshot.own_fills == {}
+        assert snapshot.observation is result.acceptance.observation
+        assert stored_actions(store) == []  # actual audit write is still blocked
+        finances = (snapshot.buy_reserved, snapshot.inventory_cost, snapshot.current_exposure, snapshot.new_capacity)
+        if failure == 'create_not_sent':
+            assert [f.value for f in finances] == [0, 0, 0, 40]
+            assert all(f.state == 'known' for f in finances)
+            assert snapshot.trade_version == baseline.trade_version
+            assert live.status()['last_buy_uncertainty'] is None
+            return
+        assert all(f.state == 'unknown' and f.value is None for f in finances)
+        assert snapshot.trade_version == baseline.trade_version + 3
+        uncertainty = live.status()['last_buy_uncertainty']
+        last = result.start.token.actions[-1]
+        assert uncertainty.request_id == last.request_id and uncertainty.account_id == WALLET
+        assert uncertainty.process_epoch == 'all-uncertain'
+        assert uncertainty.cycle_generation == result.start.token.cycle_generation
+        assert uncertainty.batch_id == result.start.token.batch_id and uncertainty.round_number == 1
+        assert uncertainty.observation_id == result.start.token.observation_id
+        assert (uncertainty.venue, uncertainty.condition_id, uncertainty.token_id) == ('polymarket', 'condition-E', 'token-E')
+        assert uncertainty.price == Decimal('.40') and uncertainty.quantity == 20
+        assert uncertainty.order_type == 'GTD' and uncertainty.expiration == 1893456000
+        assert uncertainty.post_only is True and uncertainty.send_options == ()
+        assert uncertainty.native_started_at <= uncertainty.observed_at
+        assert uncertainty.reason == ('unknown_timeout' if failure == 'post_timeout' else 'unknown_error' if failure == 'post_error' else 'invalid_receipt')
+        assert uncertainty.venue_order_id == (None if failure in ('post_timeout', 'post_error') else 'possible-token-E')
+        assert live.status()['last_current_evidence'] == (last.request_id, 'buy_uncertainty', 'applied')
+        old_frame, old_calculation = result.acceptance.observation.source_frame, result.acceptance.observation.calculation
+        assert live.state.accept(old_tickets[0], old_frame, old_calculation, evaluated_at=datetime.now(UTC)).status == 'stale'
+        fresh_ticket = live.state.begin_observation(snapshot.current.cycle_generation, ('balance', 'open_orders', 'positions'))
+        live.state.accept(fresh_ticket, old_frame, old_calculation, evaluated_at=datetime.now(UTC))
+        assert live.state.snapshot().new_capacity.state == 'unknown'  # new ticket cannot renew pre-event sources
+        sdk.orders = (_open_order('fresh-api-order', 'BUY', price='.40', original='20', matched='3'),)
+        sdk.positions = None
+        live.run_once()
+        assert live.state.snapshot().new_capacity.state == 'unknown'  # partial API is not recovered authority
+        sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='3', average_price='.40'),)
+        fresh = live.run_once()
+        restored = live.state.snapshot()
+        assert restored.buy_reserved.value == Decimal('6.80') and restored.inventory_cost.value == Decimal('1.20')
+        assert restored.current_exposure.value == Decimal('8.00') and restored.new_capacity.value == Decimal('32.00')
+        assert fresh.acceptance.observation.source_frame.sources['open_orders'].checked_at > uncertainty.observed_at
+        assert sdk.cancels == [] and len(posts) == 3
+        assert stored_actions(store) == []  # current recovery still has no business DB dependency
+    finally:
+        if blocker is not None:
+            if blocker.in_transaction: blocker.execute('ROLLBACK')
+            blocker.close()
         assert live.close(timeout=3)
         adapter.close()

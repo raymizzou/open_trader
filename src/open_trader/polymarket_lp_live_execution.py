@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from collections.abc import Mapping
 import json
+import hashlib
 import threading
 import time
 from concurrent.futures import Future
@@ -15,6 +16,7 @@ from .polymarket_lp_current_inputs import prepare_current_inputs
 from .polymarket_lp_current_state import (
     AppliedControl, CommittedControl, CurrentLPState, StoredControl, ValidatedStartAdmission,
     ReceiptEvidence, SourceStamp, TerminalProof, CurrentOrderFact, Fact,
+    BuyExecutionUncertainty,
 )
 from .polymarket_lp_market_calculation import calculate_current
 from .polymarket_lp_market_reader import MarketReader, ReadScope
@@ -105,14 +107,26 @@ class NativeAttempt:
 
 
 class _ControlStore:
-    def __init__(self, store):
+    def __init__(self, store, account_id):
         self.store = store
+        self.account_id = account_id
+        # The legacy pool persists a normalized wallet hash. Current API facts
+        # and the state owner retain the wallet itself as their account identity.
+        self.pool_account_id = hashlib.sha256(account_id.strip().casefold().encode('utf-8')).hexdigest()
 
     def load(self, account_id):
-        return StoredControl(**self.store.lp_load_current_control(account_id))
+        if account_id != self.account_id:
+            raise ValueError('d2_control_account_identity')
+        saved = dict(self.store.lp_load_current_control(self.pool_account_id))
+        if saved['account_id'] != self.pool_account_id:
+            raise ValueError('d2_control_pool_identity')
+        return StoredControl(**{**saved, 'account_id': self.account_id})
 
     def save(self, write):
-        return CommittedControl(**self.store.lp_save_current_control(asdict(write)))
+        if write.account_id != self.account_id:
+            raise ValueError('d2_control_account_identity')
+        return CommittedControl(**self.store.lp_save_current_control({
+            **asdict(write), 'account_id': self.pool_account_id}))
 
 
 def _transition_id(value):
@@ -135,7 +149,7 @@ class LPD2LiveExecution:
         self.writer = writer if writer is not None else LPBusinessWriter(store)
         self.state = CurrentLPState(account_id, process_epoch, clock=clock, utc_now=utc_now)
         self.rounds = LPRoundCoordinator()
-        self.control = LPControlOwner(self.state, _ControlStore(store), self, self,
+        self.control = LPControlOwner(self.state, _ControlStore(store, account_id), self, self,
                                       clock=clock, utc_now=utc_now)
         self._run_lock = threading.Lock()
         self._closed = False
@@ -145,6 +159,8 @@ class LPD2LiveExecution:
         self._native_jobs = {}
         self._active_sends = set()
         self._last_preparation_rejection = None
+        self._last_current_evidence = None
+        self._last_buy_uncertainty = None
 
     def initialize(self, admission):
         self._admission = admission
@@ -295,10 +311,11 @@ class LPD2LiveExecution:
         with self.state._lock:
             return self.rounds.finish_local_attempts(self._control_view(), token, outcomes)
 
-    def _attempt(self, token, action, observation):
+    def _attempt(self, token, action, observation, *, cancel_order=None):
         target = action.target
         if isinstance(target, CancelTarget):
-            order = next(o for o in observation.orders if o.key[3] == target.existing_order_id
+            order = cancel_order if cancel_order is not None else next(
+                o for o in observation.orders if o.key[3] == target.existing_order_id
                 and o.key[2] == target.token_id)
             condition, price, quantity = order.key[1], order.price.value, order.original_size.value
             order_id, kind = order.key[3], 'CANCEL'
@@ -339,7 +356,7 @@ class LPD2LiveExecution:
             outcome = LocalOutcome(action, LocalStatus.NOT_SENT, True)
         else:
             try:
-                outcome = self._cancel(action, observation) if isinstance(target, CancelTarget) else self._buy(token, action, record)
+                outcome = self._cancel(action, observation, order) if isinstance(target, CancelTarget) else self._buy(token, action, record)
             finally:
                 with self.state._lock:
                     self._active_sends.discard(action.request_id)
@@ -367,35 +384,63 @@ class LPD2LiveExecution:
             return 'invalid_builder_code'
         return None
 
+    def _uncertain_buy(self, token, action, record, native_started_at, reason,
+                       venue_order_id=None, receipt_status=None):
+        terms = action.target.terms
+        evidence = BuyExecutionUncertainty(
+            event_id=action.request_id + ':buy_uncertain', request_id=action.request_id,
+            account_id=record.account_id, process_epoch=record.process_epoch,
+            cycle_generation=token.cycle_generation, batch_id=token.batch_id,
+            round_number=token.round_number, observation_id=token.observation_id,
+            venue=action.target.venue, condition_id=record.condition_id, token_id=record.token_id,
+            price=terms.price, quantity=terms.quantity, order_type=terms.order_type,
+            expiration=terms.expiration, post_only=terms.post_only, send_options=terms.send_options,
+            native_started_at=native_started_at, observed_at=self._utc_now(), reason=reason,
+            venue_order_id=venue_order_id)
+        disposition = self.state.accept_buy_execution_uncertainty(evidence)
+        self._last_buy_uncertainty = evidence
+        self._last_current_evidence = (action.request_id, 'buy_uncertainty', disposition)
+        if disposition not in ('applied', 'stale_evidence'):
+            # Continuing with known financial authority would be unsafe if the
+            # sole current owner rejected this actual execution uncertainty.
+            self._closed = True
+            raise RuntimeError('d2_buy_uncertainty_not_applied:' + str(disposition))
+        return LocalOutcome(action, LocalStatus.UNKNOWN_TIMEOUT if reason == 'unknown_timeout'
+            else LocalStatus.UNKNOWN_ERROR, True, venue_order_id, receipt_status)
+
     def _buy(self, token, action, record):
         terms = action.target.terms
         try:
             signed = self.trading.lp_create_limit_order(token_id=record.token_id, price=terms.price,
                 quantity=terms.quantity, side='BUY', post_only=terms.post_only, expiration=terms.expiration,
                 **dict(terms.send_options))
-            with self.state._lock:
-                current = self._control_view()
-                if not current.effective_running or current.fatal or current.cycle_generation != token.cycle_generation:
-                    return LocalOutcome(action, LocalStatus.NOT_SENT, True)
+        except Exception:
+            return LocalOutcome(action, LocalStatus.NOT_SENT, True)
+        with self.state._lock:
+            current = self._control_view()
+            if not current.effective_running or current.fatal or current.cycle_generation != token.cycle_generation:
+                return LocalOutcome(action, LocalStatus.NOT_SENT, True)
+        native_started_at = self._utc_now()
+        try:
             response = self.trading.lp_post_order(signed)
         except TimeoutError:
-            return LocalOutcome(action, LocalStatus.UNKNOWN_TIMEOUT, True)
+            return self._uncertain_buy(token, action, record, native_started_at, 'unknown_timeout')
         except Exception:
-            return LocalOutcome(action, LocalStatus.UNKNOWN_ERROR, True)
+            return self._uncertain_buy(token, action, record, native_started_at, 'unknown_error')
         def value(name, default=None):
             return response.get(name, default) if isinstance(response, Mapping) else getattr(response, name, default)
         for name, expected in (('account_id', self.account_id), ('venue', self.venue),
                 ('token_id', record.token_id), ('request_id', action.request_id)):
             if value(name, expected) != expected:
-                return LocalOutcome(action, LocalStatus.UNKNOWN_ERROR, True)
+                return self._uncertain_buy(token, action, record, native_started_at, 'invalid_receipt')
         status = str(value('status', '')).upper()
         venue_id = value('order_id', value('id')) or None
         if venue_id is not None and (type(venue_id) is not str or not venue_id):
-            return LocalOutcome(action, LocalStatus.UNKNOWN_ERROR, True)
+            return self._uncertain_buy(token, action, record, native_started_at, 'invalid_receipt')
         if value('accepted') is False or value('ok') is False or status in ('REJECTED', 'FAILED'):
             return LocalOutcome(action, LocalStatus.REJECTED, True, venue_id, status)
         if not (value('accepted') is True or venue_id or status in ('LIVE', 'OPEN', 'ACCEPTED', 'MATCHED', 'FILLED')):
-            return LocalOutcome(action, LocalStatus.UNKNOWN_ERROR, True)
+            return self._uncertain_buy(token, action, record, native_started_at, 'invalid_receipt', venue_id, status)
         # SDK BUY taking_amount is returned filled shares, not making_amount
         # (cash) or the signed order's intended maker/taker quantities. Older
         # transport shapes may provide size_matched; require agreement if both
@@ -409,7 +454,9 @@ class LPD2LiveExecution:
                 raise ValueError('invalid_receipt_quantity')
             matched = quantities[0]
         except (ValueError, ArithmeticError):
-            return LocalOutcome(action, LocalStatus.UNKNOWN_ERROR, True, venue_id, status)
+            return self._uncertain_buy(token, action, record, native_started_at, 'invalid_receipt', venue_id, status)
+        if venue_id is None:
+            return self._uncertain_buy(token, action, record, native_started_at, 'invalid_receipt', None, status)
         if venue_id:
             stamp = SourceStamp(action.request_id, checked_at=self._utc_now(), complete=True, state='known')
             def fact(v): return Fact('known', v, (stamp,))
@@ -419,11 +466,14 @@ class LPD2LiveExecution:
                 fact(terms.order_type), fact(terms.expiration), 1, stamp)
             applied = self.state.accept_receipt_evidence(ReceiptEvidence(action.request_id, action.request_id,
                 self.account_id, self.process_epoch, token.cycle_generation, key, 'BUY', 0, order_fact=incoming))
+            self._last_current_evidence = (action.request_id, 'buy_receipt', applied)
             if applied == 'applied':
                 self._record_requests[key] = replace(record, order_id=venue_id)
+            elif applied != 'stale_evidence':
+                return self._uncertain_buy(token, action, record, native_started_at, 'invalid_receipt', venue_id, status)
         return LocalOutcome(action, LocalStatus.ACCEPTED, True, venue_id, status)
 
-    def _cancel(self, action, observation):
+    def _cancel(self, action, observation, order):
         target = action.target
         if not isinstance(target, CancelTarget) or target.venue != self.venue:
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
@@ -431,8 +481,9 @@ class LPD2LiveExecution:
         if (not control.effective_running or control.fatal
                 or control.cycle_generation != observation.cycle_generation):
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
-        order = next(o for o in observation.orders if o.key[3] == target.existing_order_id
-            and o.key[2] == target.token_id and o.side == 'BUY')
+        if (order.key[0] != self.account_id or order.key[2:] != (target.token_id, target.existing_order_id)
+                or order.side != 'BUY'):
+            return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         try:
             result = self.trading.cancel_orders_detailed((target.existing_order_id,))
         except Exception:
@@ -440,10 +491,17 @@ class LPD2LiveExecution:
         if target.existing_order_id not in result['canceled']:
             return LocalOutcome(action, LocalStatus.REJECTED, True, target.existing_order_id)
         stamp = SourceStamp(action.request_id, checked_at=self._utc_now(), complete=True, state='known')
-        proof = TerminalProof(order.key, 'CANCELED', order.original_size, order.size_matched, stamp, True)
-        self.state.accept_receipt_evidence(ReceiptEvidence(action.request_id, action.request_id,
+        # The cancel endpoint supplies exact IDs only. It proves cancellation,
+        # not cumulative fills since the captured observation.
+        proof = TerminalProof(order.key, 'CANCELED', order.original_size,
+            Fact('unknown', sources=(stamp,), reason_codes=('cancel_final_fill_unknown',)), stamp, True)
+        disposition = self.state.accept_receipt_evidence(ReceiptEvidence(action.request_id, action.request_id,
             self.account_id, self.process_epoch, observation.cycle_generation, order.key,
             'BUY', order.terms_version, terminal_proof=proof))
+        # The venue ACK and application to current facts are separate results.
+        # In particular, rejection by a newer final proof must never overwrite
+        # that proof or be reported as a successful current-state application.
+        self._last_current_evidence = (action.request_id, 'cancel', disposition)
         return LocalOutcome(action, LocalStatus.ACCEPTED, True, target.existing_order_id, 'CANCELED')
 
     def status(self):
@@ -452,7 +510,9 @@ class LPD2LiveExecution:
             return dict(control=self.control.status(),
                 round=self.rounds.snapshot() if self.state.snapshot().current.cycle_generation else None,
                 native_inflight=len(owned | self._active_sends), writer=self.writer.status(), closed=self._closed,
-                last_preparation_rejection=self._last_preparation_rejection)
+                last_preparation_rejection=self._last_preparation_rejection,
+                last_current_evidence=self._last_current_evidence,
+                last_buy_uncertainty=self._last_buy_uncertainty)
 
     def cancel_independent(self, order_key):
         """Normal exact-ID BUY cancellation outside the sealed BUY barrier.
@@ -471,10 +531,14 @@ class LPD2LiveExecution:
             snapshot = self.state.snapshot()
             control = self._control_view()
             observation = snapshot.observation
+            # A receipt may have added this immutable fact after the last API
+            # frame. Carry the exact fact validated here through the sender;
+            # selecting again from observation.orders would lose that receipt.
+            current_order = next((o for o in snapshot.active_orders if o.key == order_key and o.side == 'BUY'), None)
             if (not control.effective_running or control.fatal or observation is None
                     or not observation.orders_complete
                     or observation.cycle_generation != control.cycle_generation
-                    or not any(o.key == order_key and o.side == 'BUY' for o in snapshot.active_orders)):
+                    or current_order is None):
                 raise ValueError('independent_cancel_not_current')
             if len({h.identity.request_id for h in self._native_jobs.values()} | self._active_sends) >= 2:
                 raise RuntimeError('native_capacity')
@@ -485,7 +549,7 @@ class LPD2LiveExecution:
             future = Future()
             def run():
                 try:
-                    outcome = self._attempt(context, identity, observation)
+                    outcome = self._attempt(context, identity, observation, cancel_order=current_order)
                 except BaseException as exc:
                     future.set_exception(exc)
                 else:
