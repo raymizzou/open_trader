@@ -3,8 +3,11 @@
 351 supplies already accepted 357 views and serializes control/admission with
 these short memory operations. A result never authorizes a send on its own.
 """
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
+import hmac
+import json
+import secrets
 from decimal import Decimal
 from typing import Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -257,6 +260,26 @@ class RoundStart:
     reason: str | None = None
 
 
+def _authentication_decimal(value):
+    """Canonical numeric identity without Decimal context rounding.
+
+    Equal finite Decimals can use different scales. JSON's other leaf values
+    already have deterministic encodings; dataclass fields include action kind
+    and every send-defining term.
+    """
+    if not isinstance(value, Decimal):
+        raise TypeError('unsupported token value')
+    sign, digits, exponent = value.as_tuple()
+    if value.is_finite():
+        if value.is_zero():
+            sign, digits, exponent = 0, (0,), 0
+        else:
+            while digits[-1] == 0:
+                digits = digits[:-1]
+                exponent += 1
+    return {'decimal': (sign, digits, exponent)}
+
+
 class LPRoundCoordinator:
     """One instance per existing runtime lifetime; 357 retains control authority."""
 
@@ -264,7 +287,9 @@ class LPRoundCoordinator:
         self._state: RoundSnapshot | None = None
         self._process_epoch: str | None = None
         self._active: RoundBatchToken | None = None
-        self._completed: dict[str, RoundBatchToken] = {}
+        # Fixed-size, process-local authentication replaces completed payload
+        # history. Only the active token retains action/target/terms objects.
+        self._batch_key = secrets.token_bytes(32)
         self._cycle_ordinal = 0
         self._transitions: dict[str, tuple] = {}
 
@@ -311,7 +336,6 @@ class LPRoundCoordinator:
             generation = str(uuid5(NAMESPACE_URL,
                 f'lp-cycle:{len(self._process_epoch)}:{self._process_epoch}:{self._cycle_ordinal}'))
             self._active = None
-            self._completed.clear()
             self._state = replace(self._state, cycle_generation=generation, round_number=0,
                                   active_batch_id=None, active_batch_kind=None, phase='idle')
             return CycleUpdate(CycleStatus.APPLIED, generation, 0, True, True)
@@ -357,6 +381,9 @@ class LPRoundCoordinator:
                                 state.round_number, kind,
                                 observation.observation_id,
                                 tuple(ActionIdentity(str(uuid4()), state.account_id, t) for t in targets))
+        # batch_id is opaque to consumers: a nonce and authentication tag over
+        # the full immutable token. No issued-ID or completed-token ledger.
+        token = replace(token, batch_id=f'{token.batch_id}.{self._batch_signature(token, token.batch_id)}')
         self._active = token
         self._state = replace(state, active_batch_id=token.batch_id,
                               active_batch_kind=token.kind, phase='active')
@@ -372,7 +399,11 @@ class LPRoundCoordinator:
             return result(FinishStatus.STALE)
         if not self._control_is_current(control) or not control.effective_running or control.fatal:
             return result(FinishStatus.CONTROL_NOT_CURRENT)
-        if self._completed.get(token.batch_id) == token:
+        if not self._authentic_batch(token):
+            return result(FinishStatus.IDENTITY_ERROR)
+        # Within this generation, round advances only after successful finish.
+        # Authentication proves the full old identity, not just its round/ID.
+        if token.round_number < state.round_number:
             return result(FinishStatus.DUPLICATE)
         if token != self._active:
             return result(FinishStatus.IDENTITY_ERROR)
@@ -390,11 +421,24 @@ class LPRoundCoordinator:
             seen.add(identity.request_id)
         if seen != set(expected) or any(not o.local_attempt_finished for o in outcomes):
             return result(FinishStatus.INCOMPLETE)
-        self._completed[token.batch_id] = token
         self._active = None
         self._state = replace(state, round_number=state.round_number + 1,
                               active_batch_id=None, active_batch_kind=None, phase='idle')
         return RoundFinish(FinishStatus.COMPLETED, state.cycle_generation, state.round_number + 1)
+
+    def _batch_signature(self, token: RoundBatchToken, nonce: str) -> str:
+        identity = asdict(replace(token, batch_id=nonce))
+        payload = json.dumps(identity, sort_keys=True, separators=(',', ':'),
+                             ensure_ascii=True, allow_nan=False,
+                             default=_authentication_decimal).encode('utf-8')
+        return hmac.new(self._batch_key, payload, 'sha256').hexdigest()
+
+    def _authentic_batch(self, token: RoundBatchToken) -> bool:
+        try:
+            nonce, signature = token.batch_id.rsplit('.', 1)
+            return bool(nonce) and hmac.compare_digest(signature, self._batch_signature(token, nonce))
+        except (TypeError, ValueError):
+            return False
 
     def _control_is_current(self, control: CurrentControlView) -> bool:
         state = self.snapshot()

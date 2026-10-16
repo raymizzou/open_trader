@@ -1,5 +1,8 @@
 """Source-independent examples for the five public round-coordinator methods."""
 from dataclasses import dataclass, replace
+import copy
+import gc
+import weakref
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -318,6 +321,73 @@ def test_old_completion_cannot_advance_resumed_round_zero():
     assert coordinator.snapshot().round_number == 2
     assert buy.actions == (original,)
     assert not hasattr(original.target, 'venue_order_id')
+
+    # Caller-owned early token stays valid after arbitrary subsequent rounds.
+    # The helper drops every strong reference for the other 64 round payloads.
+    def complete_unretained_round(index):
+        observation_id = f'observation-{index + 3}'
+        plan = replace(fixed_plan(control, observation_id), plan_id=f'plan-{index + 3}')
+        token = coordinator.begin_round(control, Orders(control.cycle_generation,
+            observation_id=observation_id), fixed_buys=plan).token
+        refs = tuple(weakref.ref(value) for value in (
+            token, *token.actions, *(a.target for a in token.actions),
+            *(a.target.terms for a in token.actions)))
+        assert coordinator.finish_local_attempts(control, token, tuple(
+            LocalOutcome(action, 'rejected', True) for action in token.actions)).status == 'completed'
+        return refs
+
+    historical_refs = tuple(complete_unretained_round(index) for index in range(64))
+    gc.collect()
+    # At most one round's bookkeeping is allowed; freeing only one item fails.
+    assert sum(any(ref() is not None for ref in refs) for refs in historical_refs) <= 1
+    assert sum(ref() is not None for refs in historical_refs for ref in refs) <= 10
+    before = coordinator.snapshot()
+    assert before.round_number == 66 and before.active_batch_id is None
+    detached = copy.deepcopy(buy)
+    assert detached == buy and detached is not buy
+    assert coordinator.finish_local_attempts(control, detached, late).status == 'duplicate'
+    equivalent = replace(detached, actions=(replace(detached.actions[0], target=replace(
+        detached.actions[0].target, terms=replace(detached.actions[0].target.terms,
+            price=Decimal('0.3700'), quantity=Decimal('12.500')))),))
+    assert equivalent == buy
+    assert coordinator.finish_local_attempts(control, equivalent, late).status == 'duplicate'
+    assert coordinator.snapshot() == before
+
+    from open_trader.polymarket_lp_round import CancelTarget
+    bad_tokens = (
+        (replace(buy, account_id='wrong-account'), 'identity_error'),
+        (replace(buy, cycle_generation='wrong-generation'), 'stale'),
+        (replace(buy, batch_id='forged-batch'), 'identity_error'),
+        (replace(buy, round_number=0), 'identity_error'),
+        (replace(buy, kind='STARTUP_CANCEL'), 'identity_error'),
+        (replace(buy, observation_id='wrong-observation'), 'identity_error'),
+        (replace(buy, actions=(replace(original, request_id='wrong-request'),)), 'identity_error'),
+        (replace(buy, actions=(replace(original, account_id='wrong-account'),)), 'identity_error'),
+        (replace(buy, actions=(replace(original,
+            target=replace(original.target, token_id='wrong-token')),)), 'identity_error'),
+        (replace(buy, actions=(replace(original,
+            target=replace(original.target, venue='wrong-venue')),)), 'identity_error'),
+        (replace(buy, actions=(replace(original,
+            target=replace(original.target, market_id='wrong-market')),)), 'identity_error'),
+        (replace(buy, actions=(replace(original,
+            target=CancelTarget('polymarket', 'token-C', 'existing-C')),)), 'identity_error'),
+    )
+    for token, status in bad_tokens:
+        assert coordinator.finish_local_attempts(control, token, late).status == status
+        assert coordinator.snapshot() == before
+    for changed_terms in (
+        replace(original.target.terms, price=Decimal('0.38')),
+        replace(original.target.terms, quantity=Decimal('13')),
+        replace(original.target.terms, order_type='GTC'),
+        replace(original.target.terms, expiration=1792141201),
+        replace(original.target.terms, post_only=False),
+        replace(original.target.terms, send_options=(('defer_exec', True),)),
+    ):
+        forged = replace(buy, actions=(replace(original,
+            target=replace(original.target, terms=changed_terms)),))
+        assert coordinator.finish_local_attempts(control, forged, late).status == 'identity_error'
+        assert coordinator.snapshot() == before
+    assert buy.actions == (original,)
     update, current = pause_resume(coordinator, control)
     assert update.round_number == 0
     assert coordinator.finish_local_attempts(current, buy, late).status == 'stale'
