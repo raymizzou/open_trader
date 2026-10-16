@@ -630,6 +630,7 @@ class CurrentLPState:
         self._resolved_exit_attempts = {}
         self._exit_request_identities = {}
         self._retired_exit_scopes = set()
+        self._retired_exit_requests = {}
         self._reserved = self._inventory = self._capacity = Fact('not_read')
 
     def apply_effective_control(self, transition: EffectiveControlTransition,
@@ -1094,6 +1095,9 @@ class CurrentLPState:
                 return 'stale'
             # Rich records end only at explicit, proven discharge. Identity-only
             # tombstones remain for this process so cleanup cannot permit a replay.
+            self._retired_exit_requests.update({attempt.request_id: (attempt.order_key,
+                attempt.order_key is None and attempt.state == 'rejected' and attempt.native_state == 'ended')
+                for attempt in attempts})
             self._resolved_exit_attempts = {key: attempt for key, attempt in self._resolved_exit_attempts.items()
                 if key[0] != scope}
             self._sells[scope] = replace(sell, passive=None, protected=None)
@@ -1283,10 +1287,13 @@ class CurrentLPState:
                     return 'identity_error'
                 if registered[0] in self._retired_exit_scopes:
                     return 'stale_evidence'
-            # Retirement deliberately removes submit context. Independent receipts
-            # may improve canonical facts, but cannot reconstruct that context.
+            # Retirement removes submit facts, never a proven order association
+            # or local NOT_SENT exclusion. Only exact independent facts may pass.
             if registered is not None and registered[0] in self._retired_exit_scopes:
-                registered = None
+                association = self._retired_exit_requests.get(evidence.request_id)
+                if (association is None or registered[0] != evidence.scope or evidence.side != 'SELL'
+                        or association[1] or association[0] != evidence.order_key):
+                    return 'identity_error'
             if evidence.exit_attempt is not None or evidence.own_fill is not None or registered is not None:
                 if registered is not None and registered[0] != evidence.scope:
                     return 'identity_error'

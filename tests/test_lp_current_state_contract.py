@@ -1364,3 +1364,60 @@ def test_retired_exit_scope_rejects_recreation_and_keeps_independent_facts():
     fresh_process = cs.CurrentLPState('A', 'another-process')
     fresh = fresh_process.snapshot()
     assert not fresh.resolved_exit_attempts and not fresh.sells and not fresh.openings and not fresh.own_fills
+
+
+    # Retirement must preserve the known NOT_SENT and exact-order exclusions.
+    excluded, real_p1, local_p2 = completed_exit_fixture(current_local_rejection=True)
+    before_local = excluded.snapshot()
+    assert local_p2.order_key is None and local_p2.state == 'rejected' and local_p2.native_state == 'ended'
+    original_orders, original_fills = before_local.orders, before_local.own_fills
+    local_stamp = before_local.observation.components['open_orders']
+    local_known = lambda value: cs.Fact('known', value, (local_stamp,))
+    false_key = ('A', 'M', 'TOKEN', 'false-NOT-SENT-venue-ID')
+    false_order = cs.CurrentOrderFact(false_key, 'SELL', 'LIVE', local_known(D('0.40')), local_known(D('60')),
+        local_known(D('0')), local_known(D('60')), 'present', None, local_known('FOK'), local_known(None), 1, local_stamp)
+    false_receipt = cs.ReceiptEvidence('false-before-retire', local_p2.request_id, 'A', 'process',
+        'opaque-generation', false_key, 'SELL', 1, order_fact=false_order, scope=EXIT_SCOPE)
+    assert excluded.accept_receipt_evidence(false_receipt) == 'identity_error'
+    assert excluded.snapshot() == before_local
+    assert excluded.retire_exit_attempts(exit_guard(excluded, event='retire-local-exclusions', observation=True)) == 'applied'
+    after_local = excluded.snapshot()
+    assert excluded.accept_receipt_evidence(replace(false_receipt, event_id='false-after-retire')) == 'identity_error'
+    assert excluded.snapshot() == after_local
+    real_fill = after_local.own_fills[real_p1.order_key]
+    false_fill_receipt = replace(false_receipt, event_id='false-fill-after-retire', order_key=real_p1.order_key,
+        order_fact=None, own_fill=real_fill)
+    for candidate in (false_fill_receipt,
+            replace(false_receipt, event_id='false-order-wrong-scope', scope=('A', 'M', 'TOKEN', 'wrong-scope')),
+            replace(false_fill_receipt, event_id='false-fill-wrong-scope', scope=('A', 'M', 'TOKEN', 'wrong-scope')),
+            replace(false_fill_receipt, event_id='false-fill-no-scope', scope=None)):
+        assert excluded.accept_receipt_evidence(candidate) == 'identity_error'
+        assert excluded.snapshot() == after_local
+    exact_real = replace(false_fill_receipt, event_id='real-retired-exact-fill', request_id=real_p1.request_id)
+    other_key = ('A', 'M', 'TOKEN', 'S2')
+    other_fill = cs.OwnFillEvidence(other_key, local_known(D('0')), local_known(D('0')), local_known(D('0')),
+        ('other-order-zero',), local_stamp, True)
+    for candidate in (replace(exact_real, event_id='real-retired-wrong-scope', scope=('A', 'M', 'TOKEN', 'wrong-scope')),
+            replace(exact_real, event_id='real-retired-no-scope', scope=None),
+            replace(exact_real, event_id='real-retired-wrong-order', order_key=other_key, own_fill=other_fill),
+            replace(false_receipt, event_id='real-retired-false-order', request_id=real_p1.request_id),
+            replace(exact_real, event_id='real-retired-wrong-side', side='BUY')):
+        assert excluded.accept_receipt_evidence(candidate) == 'identity_error'
+        assert excluded.snapshot() == after_local
+    assert excluded.accept_receipt_evidence(exact_real) == 'applied'
+    improved = excluded.snapshot()
+    assert improved.orders == original_orders and improved.own_fills == original_fills
+    assert improved.sells == after_local.sells and improved.openings == after_local.openings
+    assert not improved.resolved_exit_attempts
+    exact_proof = next(o.terminal_proof for o in improved.orders if o.key == real_p1.order_key)
+    assert excluded.accept_receipt_evidence(replace(exact_real, event_id='real-retired-exact-order-proof',
+        own_fill=None, terminal_proof=exact_proof)) == 'applied'
+    assert not excluded.snapshot().resolved_exit_attempts
+    assert excluded.snapshot().sells == after_local.sells
+    excluded.apply_effective_control(cs.EffectiveControlTransition('A', 'process', ('process', 1),
+        1, 0, True, False, 'pause'), 'opaque-generation')
+    excluded.apply_effective_control(cs.EffectiveControlTransition('A', 'process', ('process', 2),
+        2, 1, False, True, 'explicit_resume'), 'resumed-exclusion-generation')
+    after_resume = excluded.snapshot()
+    assert excluded.accept_receipt_evidence(replace(false_receipt, event_id='false-after-resume')) == 'identity_error'
+    assert excluded.snapshot() == after_resume
