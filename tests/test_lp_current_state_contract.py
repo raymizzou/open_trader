@@ -216,15 +216,24 @@ def test_rejected_order_terms_cannot_clear_unknown_yield_timer():
     current = state(clock)
     observe(current, yields={'O1': None})
     original_yield = current.snapshot().yields[KEY]
+    original_order = current.snapshot().orders[0]
+    stamp = cs.SourceStamp('exact-newer-O1', checked_at=T + timedelta(seconds=1), complete=True, state='known')
+    newer_terms = {name: replace(getattr(original_order, name), sources=(stamp,))
+        for name in ('price', 'original_size', 'size_matched', 'remaining', 'order_type', 'expiration')}
+    receipt_order = replace(original_order, source=stamp, **newer_terms)
+    receipt = cs.ReceiptEvidence('newer-O1-facts', 'O1-request', 'A', 'process',
+        'opaque-generation', KEY, 'BUY', 1, order_fact=receipt_order)
+    assert current.accept_receipt_evidence(receipt) == 'applied'
     clock.value = 600
-    source = frame([order(matched='0'), order('O2', matched='0')], checked_at=T - timedelta(seconds=1))
+    # The whole component is current; only O1 has newer exact receipt evidence.
+    source = frame([order(matched='0'), order('O2', matched='0')], checked_at=T)
     prepared = calculation(source, {'O1': D('0'), 'O2': D('0.10')}, capacity=D('11'))
     ticket = current.begin_observation('opaque-generation', tuple(source.sources))
     result = current.accept(ticket, source, prepared, evaluated_at=T)
     snapshot = current.snapshot()
     retained = next(o for o in snapshot.orders if o.key == KEY)
     assert retained.size_matched.value == D('3')
-    assert retained.source.checked_at == T
+    assert retained.source.checked_at == T + timedelta(seconds=1)
     assert snapshot.yields[KEY].yield_pct_per_hour.state == 'unknown'
     assert snapshot.yields[KEY].unknown_since_monotonic == 100
     assert snapshot.yields[KEY].unknown_deadline_monotonic == 700
@@ -321,3 +330,195 @@ def test_late_exit_receipt_cannot_regress_completed_native_state():
     assert current.snapshot().sells[scope].passive == final_attempt
     assert current.snapshot().orders[0].terminal_proof == proof
     assert current.snapshot().own_fills[sell_key] == final_fill
+
+
+def test_old_complete_order_source_cannot_remove_or_revive_current_orders():
+    clock = Clock(100)
+    current = state(clock)
+    observe(current, yields={'O1': None})
+    original = current.snapshot()
+    clock.value = 600
+    stale_empty = frame([], checked_at=T - timedelta(seconds=1))
+    result = observe(current, stale_empty, yields={}, capacity=D('20'))
+    snapshot = current.snapshot()
+    assert snapshot.active_orders == original.active_orders
+    assert snapshot.orders[0].source.checked_at == T
+    assert snapshot.yields[KEY] == original.yields[KEY]
+    assert snapshot.yields[KEY].unknown_deadline_monotonic == 700
+    assert snapshot.buy_reserved.state == 'unknown'
+    assert snapshot.buy_reserved.value is None
+    assert snapshot.new_capacity.state == 'unknown'
+    assert snapshot.new_capacity.value is None
+    assert result.observation.source_frame is stale_empty
+    assert stale_empty.sources['open_orders'].checked_at == T - timedelta(seconds=1)
+    # Valid independent position facts remain applicable even when order input is stale.
+    assert snapshot.positions[0].quantity.value == D('2')
+    # An old whole source also cannot introduce an ID never observed before.
+    stale_base = frame([order(matched='0'), order('O2', matched='0')], checked_at=T - timedelta(seconds=1))
+    stale_with_current_positions = MarketReader.from_captured_sources(CapturedSources('A', {
+        **stale_base.sources,
+        'positions': SourceResult('independent-current-positions', [dict(account_id='A', condition_id='M',
+            token_id='TOKEN', quantity='3', cost_usd='1.50')], checked_at=T + timedelta(seconds=1))}))
+    stale_result = observe(current, stale_with_current_positions, yields={'O1': D('0'), 'O2': D('0.10')})
+    before_empty = current.snapshot()
+    assert tuple(o.key for o in before_empty.active_orders) == (KEY,)
+    assert all(o.key[3] != 'O2' for o in before_empty.orders)
+    assert ('A', 'M', 'TOKEN', 'O2') not in before_empty.yields
+    assert before_empty.yields[KEY] == original.yields[KEY]
+    assert before_empty.yields[KEY].unknown_deadline_monotonic == 700
+    assert before_empty.orders[0].source.checked_at == T
+    assert before_empty.buy_reserved.state == 'unknown'
+    assert before_empty.new_capacity.state == 'unknown'
+    assert before_empty.positions[0].quantity.value == D('3')
+    assert before_empty.positions[0].inventory_cost_usd.value == D('1.50')
+    assert before_empty.positions[0].source.checked_at == T + timedelta(seconds=1)
+    assert stale_result.observation.source_frame is stale_with_current_positions
+    assert stale_with_current_positions.sources['open_orders'].checked_at == T - timedelta(seconds=1)
+    newer_empty = frame([], checked_at=T + timedelta(seconds=1))
+    observe(current, newer_empty, yields={}, capacity=D('19'))
+    empty = current.snapshot()
+    assert empty.active_orders == ()
+    assert empty.yields == {}
+    assert empty.buy_reserved.value == D('0')
+    assert empty.orders[0].terminal_proof is None
+    assert empty.own_fills.get(KEY) is None
+    stale_nonempty = frame(checked_at=T)
+    observe(current, stale_nonempty, yields={'O1': D('0')})
+    final = current.snapshot()
+    assert final.active_orders == ()
+    assert final.yields == {}
+    assert final.orders[0].presence == 'absent'
+    assert final.buy_reserved.state == 'unknown'
+    assert final.new_capacity.state == 'unknown'
+    assert stale_nonempty.sources['open_orders'].checked_at == T
+
+
+def test_old_position_source_cannot_replace_current_inventory_or_budget():
+    current = state()
+
+    def position_frame(at, cost, *, order_time=T):
+        base = frame([order('O2', matched='0')], checked_at=order_time)
+        rows = [] if cost is None else [dict(account_id='A', condition_id='M', token_id='TOKEN',
+            quantity='20' if cost == '10' else '2', cost_usd=cost)]
+        return MarketReader.from_captured_sources(CapturedSources('A', {
+            **base.sources, 'positions': SourceResult('positions-' + at.isoformat(), rows, checked_at=at)}))
+
+    initial = position_frame(T, '10')
+    observe(current, initial, yields={'O2': D('0.10')}, capacity=D('10'))
+    original = current.snapshot().positions
+    assert original[0].inventory_cost_usd.value == D('10')
+    for cost, prepared_inventory, prepared_capacity in (('1', D('1'), D('19')), (None, D('0'), D('20'))):
+        source = position_frame(T - timedelta(seconds=1), cost, order_time=T + timedelta(seconds=1))
+        prepared = calculation(source, {'O2': D('0.10')}, capacity=prepared_capacity)
+        assert prepared.inventory_cost == prepared_inventory
+        ticket = current.begin_observation('opaque-generation', tuple(source.sources))
+        result = current.accept(ticket, source, prepared, evaluated_at=T)
+        snapshot = current.snapshot()
+        assert snapshot.positions == original
+        assert snapshot.positions[0].source.checked_at == T
+        assert snapshot.inventory_cost.state == 'unknown'
+        assert snapshot.inventory_cost.value is None
+        assert snapshot.new_capacity.state == 'unknown'
+        assert snapshot.new_capacity.value is None
+        assert snapshot.yields[('A', 'M', 'TOKEN', 'O2')].yield_pct_per_hour.value == D('0.10')
+        assert result.observation.order_view.orders_complete is True
+        assert result.observation.source_frame is source
+        assert result.observation.calculation is prepared
+        assert source.sources['positions'].checked_at == T - timedelta(seconds=1)
+    newer = position_frame(T + timedelta(seconds=1), '1', order_time=T + timedelta(seconds=1))
+    observe(current, newer, yields={'O2': D('0.10')}, capacity=D('15'))
+    final = current.snapshot()
+    assert final.positions[0].inventory_cost_usd.value == D('1')
+    assert final.positions[0].source.checked_at == T + timedelta(seconds=1)
+    assert final.inventory_cost.value == D('1')
+    assert final.new_capacity.value == D('15')
+
+
+def test_fresh_matching_terminal_source_keeps_valid_financial_capacity():
+    current = state()
+    first_proof = None
+    for index in (0, 1):
+        at = T + timedelta(seconds=index)
+        row = {**order(), 'status': 'CANCELED'}
+        source = MarketReader.from_captured_sources(CapturedSources('A', {
+            'open_orders': SourceResult('terminal-orders-' + str(index), [row], checked_at=at),
+            'positions': SourceResult('terminal-positions-' + str(index), [], checked_at=at),
+            'balance': SourceResult('terminal-balance-' + str(index), ('20', '20'), checked_at=at)}))
+        prepared = calculation(source, {}, capacity=D('20'))
+        ticket = current.begin_observation('opaque-generation', tuple(source.sources))
+        accepted = current.accept(ticket, source, prepared, evaluated_at=at)
+        snapshot = current.snapshot()
+        assert snapshot.buy_reserved.state == 'known'
+        assert snapshot.buy_reserved.value == D('0')
+        assert snapshot.inventory_cost.value == D('0')
+        assert snapshot.new_capacity.state == 'known'
+        assert snapshot.new_capacity.value == D('20')
+        assert accepted.status == 'accepted'
+        assert snapshot.active_orders == ()
+        assert snapshot.yields == {}
+        assert snapshot.unknown_yield_due == ()
+        assert snapshot.orders[0].terminal_proof.status == 'CANCELED'
+        assert snapshot.orders[0].size_matched.value == D('3')
+        assert snapshot.own_fills.get(KEY) is None
+        if first_proof is None:
+            first_proof = snapshot.orders[0].terminal_proof
+        assert snapshot.orders[0].terminal_proof is first_proof
+        assert accepted.observation.source_frame is source
+        assert accepted.observation.calculation is prepared
+        assert source.sources['open_orders'].checked_at == at
+
+
+def test_expanded_fill_coverage_does_not_promote_partial_money_to_totals():
+    current = state()
+    sell_key = KEY
+    scope = ('A', 'M', 'TOKEN', 'opening')
+    source = frame([{**order(side='SELL', matched='1'), 'original_size': '2'}])
+    observe(current, source, yields={})
+    stamp = cs.SourceStamp('exact-fill', checked_at=T, complete=True, state='known')
+    known = lambda value: cs.Fact('known', value, (stamp,))
+    unknown = cs.Fact('unknown', sources=(stamp,))
+    first = cs.OwnFillEvidence(sell_key, known(D('1')), known(D('0.40')), known(D('0.01')),
+        ('fill-1',), stamp, True)
+    attempt = cs.ExitAttempt('sell-request', 'passive_exit', sell_key, 'accepted', False,
+        known(D('2')), known(D('0')), known(D('2')), known(D('0.40')), known('GTC'),
+        known(None), None, first, 'ended')
+    sell = cs.SellState(scope, known(D('2')), known(D('1')), True,
+        current.snapshot().orders, stamp, stamp, attempt, None)
+    guard = cs.ProtectionGuard(scope, 'opaque-generation', 0, ((sell_key, 1),),
+        current.snapshot().observation.observation_id, 'register-fill')
+    assert current.apply_protection(cs.ExitEvidenceUpdate(guard, sell)) == 'applied'
+    register = cs.ReceiptEvidence('canonical-fill', 'sell-request', 'A', 'process', 'opaque-generation',
+        sell_key, 'SELL', 1, own_fill=first, exit_attempt=attempt, scope=scope)
+    assert current.accept_receipt_evidence(register) == 'applied'
+    # Same-coverage sparse evidence may retain exactly its own proven amounts.
+    sparse = replace(first, notional_usd=unknown, fees_usd=unknown, complete_for_target=False)
+    same_coverage = replace(register, event_id='same-coverage-sparse', own_fill=sparse,
+        exit_attempt=replace(attempt, own_fill_evidence=sparse))
+    assert current.accept_receipt_evidence(same_coverage) == 'applied'
+    same = current.snapshot()
+    assert same.sells[scope].passive.own_fill_evidence.notional_usd.value == D('0.40')
+    assert same.sells[scope].passive.own_fill_evidence.fees_usd.value == D('0.01')
+    assert same.own_fills[sell_key] == same.sells[scope].passive.own_fill_evidence
+    expanded = replace(first, quantity=known(D('2')), notional_usd=unknown, fees_usd=unknown,
+        fill_ids=('fill-1', 'fill-2'), complete_for_target=False)
+    final_attempt = replace(attempt, state='terminal', own_fill_evidence=expanded)
+    proof = cs.TerminalProof(sell_key, 'FILLED', known(D('2')), known(D('2')), stamp, True)
+    forward = replace(register, event_id='expanded-coverage', terminal_proof=proof,
+        own_fill=expanded, exit_attempt=final_attempt)
+    assert current.accept_receipt_evidence(forward) == 'applied'
+    snapshot = current.snapshot()
+    canonical = snapshot.own_fills[sell_key]
+    merged = snapshot.sells[scope].passive.own_fill_evidence
+    assert canonical == merged
+    assert merged.fill_ids == ('fill-1', 'fill-2')
+    assert merged.quantity.value == D('2')
+    assert merged.notional_usd.state == 'unknown'
+    assert merged.notional_usd.value is None
+    assert merged.fees_usd.state == 'unknown'
+    assert merged.fees_usd.value is None
+    assert merged.complete_for_target is False
+    assert snapshot.sells[scope].passive.native_state == 'ended'
+    assert snapshot.sells[scope].passive.request_id == 'sell-request'
+    assert snapshot.orders[0].terminal_proof == proof
+    assert first.notional_usd.value == D('0.40')
+    assert expanded.notional_usd.state == 'unknown'

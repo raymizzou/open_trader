@@ -185,7 +185,7 @@ class LPControlOwner:
                             or committed.committed_at is None or not _optional_utc(committed.committed_at)):
                         raise ValueError('invalid_commit_identity')
                 except BaseException as exc:
-                    if self._episode_attempts == 1 and not self.status().fatal and not self._closing:
+                    if self._episode_attempts == 1 and not self.status().fatal:
                         self._set_status(save_state='retry_wait', error_code=type(exc).__name__,
                             retry_at_monotonic=self._completed_monotonic + 1)
                     else:
@@ -198,22 +198,32 @@ class LPControlOwner:
                     if (self._latest == write and write.desired_running
                             and not self._state._current.shutdown_requested and not self._closing):
                         self._activate(True, write.request_version, 'explicit_resume')
-                    if self._latest != write and not self._closing and not self._state._current.shutdown_requested:
+                    if self._latest != write and not self._state._current.shutdown_requested:
                         self._episode_attempts = 0
                         self._start_attempt()
             status = self.status()
             if (self._future is None and status.save_state == 'retry_wait'
-                    and now_monotonic >= status.retry_at_monotonic and not status.fatal and not self._closing):
+                    and now_monotonic >= status.retry_at_monotonic and not status.fatal):
                 self._start_attempt()
             return self.status()
 
     def close(self, timeout_seconds: float) -> ControlCloseReport:
+        deadline = time.monotonic() + max(0, timeout_seconds)
         with self._lock:
             self._closing = True
-            thread = self._thread
-        if thread:
-            thread.join(timeout=max(0, timeout_seconds))
-        with self._lock:
-            self.poll(self._clock())
-            drained = thread is None or not thread.is_alive()
-            return ControlCloseReport(drained, None if drained else self._inflight.request_id, self.status().fatal)
+        while True:
+            with self._lock:
+                status = self.poll(self._clock())
+                thread = self._thread
+                native_pending = self._future is not None or (thread is not None and thread.is_alive())
+                save_pending = status.saved_version != status.requested_version and status.fatal is None
+                drained = not native_pending and not save_pending
+                remaining = deadline - time.monotonic()
+                if drained or remaining <= 0:
+                    return ControlCloseReport(drained,
+                        self._inflight.request_id if self._inflight else None, status.fatal)
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=min(remaining, 0.01))
+            else:
+                # Retry business time may be controlled independently of this bounded wait.
+                time.sleep(min(remaining, 0.01))

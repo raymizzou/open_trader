@@ -365,3 +365,84 @@ def test_running_duplicate_request_has_no_control_transition_or_save():
     assert store.writes == []
     assert not fatal.signals
     assert owner.close(0).writer_drained is True
+
+
+def test_close_persists_latest_pause_after_superseded_resume():
+    owner, state, store, activation, fatal, clock = setup(BlockingStore((True, True, True)))
+    initialize(owner)
+    try:
+        owner.request_running(False)
+        assert store.entered[0].wait(3)
+        store.release[0].set()
+        poll_until(owner, clock, lambda s: s.saved_version == 1)
+        owner.request_running(True)
+        assert store.entered[1].wait(3)
+        assert owner.request_running(False).status == 'accepted'
+        assert owner.status().requested_version == 3
+        assert owner.close(0).writer_drained is False
+        assert owner.request_running(True).reason == 'stopping'
+        store.release[1].set()
+        intermediate = poll_until(owner, clock, lambda s: s.saved_version == 2)
+        assert intermediate.requested_version == 3
+        assert intermediate.current.effective_running is False
+        assert owner.close(0).writer_drained is False
+        assert store.entered[2].wait(3)
+        assert owner.status().native_save_in_flight is True
+        assert owner.status().saved_version == 2
+        assert not store.returned[2].is_set()
+        assert all(t.cause != 'explicit_resume' for t in activation.transitions)
+        store.release[2].set()
+        assert owner.close(3).writer_drained is True
+        final = owner.status()
+        assert final.saved_version == final.requested_version == 3
+        assert final.save_state == 'saved'
+        assert final.current.effective_running is False
+        assert [(w.request_version, w.desired_running) for w in store.writes] == [(1, False), (2, True), (3, False)]
+        assert store.max_active == 1
+        assert fatal.signals == []
+    finally:
+        store.release_all()
+        owner.close(3)
+
+
+def test_close_keeps_pending_pause_retry_and_fatal_contract():
+    owner, state, store, activation, fatal, clock = setup(BlockingStore((False, False)))
+    initialize(owner)
+    try:
+        owner.request_running(False)
+        assert store.entered[0].wait(3)
+        assert owner.close(0).writer_drained is False
+        store.release[0].set()
+        failed = poll_until(owner, clock, lambda s: not s.native_save_in_flight)
+        assert failed.save_state == 'retry_wait'
+        assert failed.retry_at_monotonic == 101
+        assert owner.close(0).writer_drained is False
+        assert failed.saved_version == 0
+        clock.value = 100.999
+        assert owner.close(0).writer_drained is False
+        assert len(store.writes) == 1
+        clock.value = 101
+        owner.poll(clock())
+        assert store.entered[1].wait(3)
+        assert owner.close(0).writer_drained is False
+        assert owner.status().save_state == 'retrying'
+        assert owner.status().saved_version == 0
+        store.release[1].set()
+        assert owner.close(3).writer_drained is True
+        final = owner.status()
+        assert final.save_state == 'failed'
+        assert final.saved_version == 0
+        assert final.requested_version == 1
+        assert final.current.shutdown_requested is True
+        assert final.fatal.origin == 'save_retry_exhausted'
+        assert final.fatal.attempt_number == 2
+        assert len(fatal.signals) == 1
+        clock.value = 200
+        assert owner.close(0).writer_drained is True
+        owner.poll(clock())
+        assert len(store.writes) == 2
+        assert store.max_active == 1
+        assert len(fatal.signals) == 1
+    finally:
+        store.release_all()
+        owner.close(3)
