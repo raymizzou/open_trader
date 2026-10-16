@@ -993,7 +993,12 @@ class PolymarketLPService:
     def _candidate_conditions(self, condition_ids, *, now=None):
         if not self.exclusions_enabled:
             return tuple(condition_ids)
-        return self.store.lp_candidate_conditions(tuple(condition_ids), now=now or self._now())
+        ids, moment = tuple(condition_ids), now or self._now()
+        provider = getattr(self.exchange, "lp_candidate_metadata_tokens", None)
+        if callable(provider):
+            return self.store.lp_candidate_conditions(ids, now=moment,
+                current_tokens=provider(ids, now=moment))
+        return self.store.lp_candidate_conditions(ids, now=moment)
 
     @staticmethod
     def _candidate_global_generation(value: object) -> int:

@@ -245,6 +245,7 @@ def test_public_metadata_write_failure_is_visible_and_next_save_can_succeed(
     tmp_path, monkeypatch, caplog,
 ):
     store = PredictionArbitrageStore(tmp_path)
+    store.initialize_lp_metadata_cache()
     # Public Store schema/prune setup completes before fault injection.
     store.lp_metadata_cache_prune()
     rejected_id, saved_id = "0x" + "c" * 64, "0x" + "d" * 64

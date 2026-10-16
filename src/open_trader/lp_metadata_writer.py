@@ -7,6 +7,7 @@ and completion never changes the client's current metadata facts.
 from collections import deque
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 import json
@@ -34,7 +35,9 @@ def empty_status(*, closed=False):
                 pending_entries=0, inflight_entries=0, pending_bytes=0, inflight_bytes=0,
                 saved_entries=0, failed_entries=0, unknown_outcome_entries=0,
                 dropped_overflow=0, dropped_oversize=0, dropped_inflight_capacity=0,
-                dropped_shutdown=0, dropped_closed=0)
+                dropped_shutdown=0, dropped_closed=0, prune_pending=0, prune_inflight=0,
+                prune_retained_bytes=0, prune_completed_transactions=0, prune_deleted_rows=0,
+                prune_failed=0, prune_unknown_outcome=0, prune_dropped_shutdown=0, prune_dropped_closed=0)
 
 
 def _encode_scalar(value):
@@ -45,6 +48,11 @@ def _encode_scalar(value):
     raise TypeError("metadata snapshot contains an unsupported value")
 
 
+@dataclass(frozen=True)
+class _Prune:
+    cutoff: datetime
+
+
 class LPMetadataWriter:
     def __init__(self, store, *, policy=None):
         self._store = store
@@ -52,6 +60,11 @@ class LPMetadataWriter:
         self._condition = threading.Condition()
         self._pending = deque()
         self._pending_bytes = 0
+        self._pending_entries = 0
+        self._prune_active = False
+        self._prune_inflight = False
+        self._prune_counts = dict(prune_completed_transactions=0, prune_deleted_rows=0,
+            prune_failed=0, prune_unknown_outcome=0, prune_dropped_shutdown=0, prune_dropped_closed=0)
         self._inflight = 0
         self._inflight_bytes = 0
         self._counts = {key: value for key, value in empty_status().items()
@@ -79,25 +92,46 @@ class LPMetadataWriter:
                     continue
 
                 def full():
-                    return (len(self._pending) + self._inflight + 1 > self._policy["max_entries"]
+                    return (self._pending_entries + self._inflight + 1 > self._policy["max_entries"]
                             or self._pending_bytes + self._inflight_bytes + size
                             > self._policy["max_encoded_bytes"])
 
-                while self._pending and full():
-                    _, _, removed_size = self._pending.popleft()
+                while self._pending_entries and full():
+                    index = next(i for i, row in enumerate(self._pending) if not isinstance(row, _Prune))
+                    _, _, removed_size = self._pending[index]
+                    del self._pending[index]
+                    self._pending_entries -= 1
                     self._pending_bytes -= removed_size
                     self._counts["dropped_overflow"] += 1
                 if full():
                     self._counts["dropped_inflight_capacity"] += 1
                     continue
                 self._pending.append((cid, entry, size))
+                self._pending_entries += 1
                 self._pending_bytes += size
             self._condition.notify()
+
+    def enqueue_prune(self, *, now):
+        """Reserve at most one fixed-size maintenance intent, including inflight."""
+        with self._condition:
+            if self._closed:
+                self._prune_counts['prune_dropped_closed'] += 1
+                return False
+            if self._prune_active:
+                return False
+            self._prune_active = True
+            self._pending.append(_Prune(now))
+            self._condition.notify()
+            return True
 
     def stop(self, *, timeout=5):
         with self._condition:
             self._closed = True
-            self._counts["dropped_shutdown"] += len(self._pending)
+            self._counts["dropped_shutdown"] += self._pending_entries
+            self._pending_entries = 0
+            if self._prune_active and not self._prune_inflight:
+                self._prune_counts["prune_dropped_shutdown"] += 1
+                self._prune_active = False
             self._pending.clear()
             self._pending_bytes = 0
             self._condition.notify_all()
@@ -110,9 +144,12 @@ class LPMetadataWriter:
             alive = self._thread.is_alive()
             return dict(
                 state=("STOPPING" if alive else "STOPPED") if self._closed else "RUNNING",
-                thread_alive=alive, pending_entries=len(self._pending),
+                thread_alive=alive, pending_entries=self._pending_entries,
                 inflight_entries=self._inflight, pending_bytes=self._pending_bytes,
                 inflight_bytes=self._inflight_bytes, **self._counts,
+                prune_pending=int(self._prune_active and not self._prune_inflight),
+                prune_inflight=int(self._prune_inflight),
+                prune_retained_bytes=1024 if self._prune_active else 0, **self._prune_counts,
             )
 
     def _run(self):
@@ -121,20 +158,31 @@ class LPMetadataWriter:
                 self._condition.wait_for(lambda: self._closed or self._pending)
                 if self._closed:
                     return
+                prune = self._pending[0] if isinstance(self._pending[0], _Prune) else None
+                if prune is not None:
+                    self._pending.popleft()
+                    self._prune_inflight = True
                 entries = {}
                 batch_bytes = 0
-                while self._pending and len(entries) < self._policy["batch_rows"]:
+                while prune is None and self._pending and len(entries) < self._policy["batch_rows"]:
+                    if isinstance(self._pending[0], _Prune):
+                        break
                     cid, entry, size = self._pending[0]
                     # A Mapping cannot represent repeated IDs. End this batch
                     # before the duplicate, preserving every FIFO entry/write.
                     if cid in entries:
                         break
                     self._pending.popleft()
+                    self._pending_entries -= 1
                     entries[cid] = entry
                     batch_bytes += size
                 self._pending_bytes -= batch_bytes
                 self._inflight = len(entries)
                 self._inflight_bytes = batch_bytes
+            if prune is not None:
+                self._run_prune(prune)
+                prune = None
+                continue
             failed = False
             try:
                 self._store.lp_metadata_cache_store_entries(entries)
@@ -158,3 +206,31 @@ class LPMetadataWriter:
                     else:
                         self._counts["saved_entries"] += count
                     self._inflight = self._inflight_bytes = 0
+
+    def _run_prune(self, intent):
+        failed = False
+        deleted, remaining = 0, False
+        try:
+            result = self._store.lp_metadata_cache_prune(now=intent.cutoff)
+            if isinstance(result, tuple):
+                deleted, remaining = result
+        except Exception as exc:
+            failed = True
+            try:
+                logger.warning('lp_metadata_prune_outcome_unknown error_type=%s', type(exc).__name__)
+            except Exception:
+                pass
+        finally:
+            with self._condition:
+                if failed:
+                    self._prune_counts['prune_failed'] += 1
+                    self._prune_counts['prune_unknown_outcome'] += 1
+                else:
+                    self._prune_counts['prune_completed_transactions'] += 1
+                    self._prune_counts['prune_deleted_rows'] += deleted or 0
+                self._prune_inflight = False
+                if not failed and remaining and not self._closed:
+                    self._pending.append(intent)
+                    self._condition.notify()
+                else:
+                    self._prune_active = False

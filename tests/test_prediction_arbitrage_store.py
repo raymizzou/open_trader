@@ -3555,6 +3555,7 @@ def test_lp_recovery_fences_only_recovered_condition(tmp_path: Path) -> None:
 
 def test_lp_metadata_cache_store_round_trip_and_prune(tmp_path: Path) -> None:
     db = store(tmp_path)
+    db.initialize_lp_metadata_cache()
     now = datetime(2026, 9, 17, 12, tzinfo=UTC)
     now_epoch = now.timestamp()
     payload = {
@@ -3727,6 +3728,7 @@ def test_lp_active_sessions_lists_non_terminal_newest_first(tmp_path: Path) -> N
 @pytest.mark.parametrize("proof", ["{}", '{"closed_checked":false}', '{"closed_checked":1}', '{"closed_checked":"true"}', "bad-json"])
 def test_unproven_negative_metadata_cache_is_not_loaded(tmp_path: Path, proof: str) -> None:
     db = store(tmp_path)
+    db.initialize_lp_metadata_cache()
     expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()
     db.lp_metadata_cache_store_entries({"missing": (expiry, None)})
     with sqlite3.connect(db.path) as connection:

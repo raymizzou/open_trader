@@ -3,6 +3,12 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-16
+
+- #349 评审修正：默认完整 metadata 读取仅在展示投影仍留存时使用旧值回退；缺少展示且 API 失败时保留 UNKNOWN／失败。3000 行限制只用于客户端启动预热，既有 Store 完整读取继续覆盖持仓通知所需的全部有效身份。聚焦回归及直接消费者检查记录在任务证据，精确提交复审／CI 由 Main 继续。
+
+- #349 LP metadata 在客户端启动时一次建表并有界预热；正常读取使用独立 RAM 快照，核心最多 3000 条／16 MiB，展示附属最多 3000 条／4 MiB。计划入口从原始投影跳过展示字段，保留 60 秒动态事实门槛与原正／负 TTL；当前 token 排除使用有效 RAM 身份，不等待持久副本。过期清理进入原 Writer，每事务最多删除 400 行，成功续段排到队尾，失败不重放；退出丢弃待处理项并保留 owner 直到实际 DELETE 结束。真实 SQLite 锁、FIFO、UNKNOWN、身份与停止回归及直接消费者聚焦检查记录在任务证据；独立评审和精确提交 CI 由 Main 继续，未合并或部署。
+
 ## 2026-10-15
 
 - #349 LP metadata 公开读取在当前事实处理完成后异步保存持久缓存，不再等待该保存。普通 FIFO 按 3000 条或 16 MiB（含执行中快照）限额，丢弃最旧待写项；失败记录结果未知且不重放。退出立即丢弃待写项，只回收实际执行中的保存；未结束时保留客户端、Store 与 runtime owner，保存等待不阻止其他生产者停止。原来源时间、正／负缓存 TTL、排除读取及 UNKNOWN 语义保留；聚焦验证记录在任务证据，独立评审与精确提交 CI 由 Main 继续。未合并或部署。
