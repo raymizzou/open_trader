@@ -14,7 +14,7 @@ from polymarket.models.clob.order_book import OrderBookLevel
 from polymarket.models.clob.order_response import AcceptedOrder
 from polymarket.models.clob.rewards import CurrentReward, CurrentRewardConfig
 
-from open_trader import polymarket_lp_market_reader, polymarket_trading
+from open_trader import polymarket_lp_market_reader, polymarket_trading, prediction_arbitrage_store
 from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.polymarket_lp_current_state import ValidatedStartAdmission
 from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
@@ -37,6 +37,7 @@ def manual_runtime(tmp_path,monkeypatch,*,process='manual-P1'):
         def now(cls,tz=None):return clock[0] if tz is not None else clock[0].replace(tzinfo=None)
     monkeypatch.setattr(polymarket_lp_market_reader,'datetime',BusinessDateTime)
     monkeypatch.setattr(polymarket_trading,'datetime',BusinessDateTime)
+    monkeypatch.setattr(prediction_arbitrage_store,'datetime',BusinessDateTime)
     class Public(_SDKPublicClient):
         bid,ask,book_reads=Decimal('.30'),Decimal('.32'),0
         lower_bids=()
@@ -627,5 +628,239 @@ def test_d2_named_stop_projects_review_without_forced_liquidation(tmp_path,monke
         assert execution.lp_status(other)['state']=='entry_open'
         assert execution.lp_submit_augment(dict(session_id=group,quantity='20',price='.28',idempotency_key='stopped'))['reason']=='session_review_exit'
         assert len(sdk.posts)==2 and sdk.market_orders==[]
+    finally:
+        assert live.close(timeout=3);live.trading.close()
+
+
+def test_d2_manual_deadlines_survive_waiting_admission_io(tmp_path,monkeypatch):
+    for variant in ('claim_expired_equal','claim_expired_later','signing_book_stale',
+                    'final_sql_book_stale','final_sql_gtd_minimum','claimed_preview_expired','fresh'):
+        execution,live,sdk,public,clock=manual_runtime(tmp_path/variant,monkeypatch)
+        entered,release,signed=Event(),Event(),Event();worker=None;results=[];errors=[]
+        try:
+            preview=None
+            request=entry(clock,idempotency_key=variant)
+            if variant.startswith('claim_expired') or variant=='claimed_preview_expired':
+                preview=execution.lp_preview(request)
+                assert preview['state']=='previewed',preview
+                clock[0]=NOW+timedelta(seconds=9)
+            if variant=='final_sql_gtd_minimum':
+                request['review_at']=(NOW+timedelta(seconds=121)).isoformat()
+            sign=sdk.create_limit_order
+            def create(**kw):
+                result=sign(**kw);signed.set()
+                if variant in ('signing_book_stale','claimed_preview_expired','fresh'):
+                    entered.set();assert release.wait(6),'actual signing completion watchdog'
+                return result
+            sdk.create_limit_order=create
+            real_connect=sqlite3.connect
+            class WaitingSQL(sqlite3.Connection):
+                def execute(self,sql,*a,**kw):
+                    cursor=super().execute(sql,*a,**kw)
+                    if threading.current_thread().name=='lp-d2-manual-command' and not entered.is_set():
+                        claim=(variant.startswith('claim_expired') and self.in_transaction
+                            and sql.startswith('SELECT * FROM previews WHERE preview_id='))
+                        final=(variant in ('final_sql_book_stale','final_sql_gtd_minimum') and signed.is_set()
+                            and sql.startswith('SELECT * FROM executions WHERE state NOT IN'))
+                        if claim or final:
+                            entered.set();assert release.wait(6),'actual SQLite admission completion watchdog'
+                    return cursor
+            with monkeypatch.context() as patch:
+                patch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=WaitingSQL))))
+                def submit():
+                    try:
+                        results.append(execution.lp_start(preview['preview_id'],variant) if preview else execution.lp_submit_entry(request))
+                    except BaseException as exc:errors.append(exc)
+                worker=threading.Thread(target=submit);worker.start();assert entered.wait(3),variant
+                original=live.state.snapshot().observation
+                if variant in ('claim_expired_equal','claimed_preview_expired','fresh'):clock[0]=NOW+timedelta(seconds=10)
+                elif variant=='final_sql_gtd_minimum':clock[0]=NOW+timedelta(seconds=2)
+                else:clock[0]=NOW+timedelta(seconds=11)
+                release.set();worker.join(4);assert not worker.is_alive() and errors==[],errors
+            result,=results
+            assert live.state.snapshot().observation is original
+            assert live.status()['last_buy_uncertainty'] is None
+            claim=live.store.lp_manual_command(WALLET,variant)
+            if variant.startswith('claim_expired'):
+                assert result['state']=='rejected' and result['reason']=='preview_expired',result
+                assert claim is None and live.store.lp_preview(preview['preview_id'])['consumed_at'] is None
+                assert sdk.posts==[] and live.state.snapshot().openings=={}
+            elif variant=='fresh':
+                assert result['state']=='entry_open' and result['submit_status']=='accepted',result
+                assert len(sdk.posts)==1
+                assert sdk.posts[0]['expiration']==int((NOW+timedelta(minutes=11)).timestamp())
+                assert original.source_frame.sources[f'market:{CONDITION_ID}:{TOKEN_ID}'].checked_at==NOW
+            else:
+                assert result['state']=='rejected' and result['submit_status']=='not_sent',result
+                assert sdk.posts==[] and live.state.snapshot().openings=={}
+                assert claim['outcome']=='not_sent' and claim['command']['idempotency_key']==variant
+                assert claim['command']['price']=='0.29' and claim['command']['quantity']=='20'
+                assert execution.lp_submit_entry(request|dict(price='.28'))==result
+                assert sdk.posts==[]
+                if preview:
+                    assert live.store.lp_preview(preview['preview_id'])['consumed_at'] is not None
+                    assert execution.lp_start(preview['preview_id'],variant)==result
+                    assert execution.lp_start(preview['preview_id'],variant+'-new')['reason']=='preview_expired'
+        finally:
+            release.set()
+            if worker:worker.join(3)
+            assert live.close(timeout=3);live.trading.close()
+
+
+def test_d2_named_augment_rechecks_current_group_after_wait(tmp_path,monkeypatch):
+    for variant in ('scoring_review','unchanged'):
+        execution,previous,sdk,public,clock=manual_runtime(tmp_path/variant,monkeypatch)
+        assert previous.close(timeout=3)
+        monotonic=[0.0]
+        live=LPD2LiveExecution(previous.store,previous.trading,account_id=WALLET,venue='polymarket',
+            process_epoch='scoring-'+variant,policy=CalculationPolicy(None),clock=lambda:monotonic[0],utc_now=lambda:clock[0])
+        live.initialize(ValidatedStartAdmission('scoring-'+variant,'offline-start-permit'))
+        execution=PredictionExecutionService(store=live.store,monitor=object(),trading=live.trading,notifier=_Notifier(),
+            lock_path=tmp_path/variant/'execution.lock',lp=PolymarketLPService(live.store,live.trading,clock=lambda:clock[0]),lp_d2=live)
+        execution._breaker_open=False  # existing startup-clear fixture boundary
+        entered,release,signed=Event(),Event(),Event();worker=None;results=[];errors=[]
+        try:
+            first=execution.lp_submit_entry(entry(clock,price='.30'))
+            second=execution.lp_submit_entry(entry(clock,market_id='market-2',condition_id=OTHER_CID,
+                token_id=OTHER_TOKEN,price='.30',idempotency_key='other-entry'))
+            assert first['state']==second['state']=='entry_open',(first,second)
+            scoring_reads=[]
+            def scoring(*,order_id):
+                scoring_reads.append(order_id)
+                return order_id!=first['entry_order_id']
+            sdk.get_order_scoring=scoring
+            live.run_once();live.run_protection_once()
+            before=live.state.snapshot()
+            original=next(v for v in before.openings.values() if v.scope[2]==TOKEN_ID)
+            other=next(v for v in before.openings.values() if v.scope[2]==OTHER_TOKEN)
+            assert original.phase=='opening' and original.scoring.scoring.value is False
+            assert original.scoring.lost_since_monotonic==0 and sdk.cancels==[]
+            assert set(scoring_reads)=={first['entry_order_id'],second['entry_order_id']}
+            # Separate injected monotonic and UTC clocks keep the real false interval
+            # due while its accepted evidence and original book remain fresh.
+            monotonic[0]=60;clock[0]=NOW+timedelta(seconds=1)
+            sign=sdk.create_limit_order
+            def create(**kw):
+                result=sign(**kw);signed.set();return result
+            sdk.create_limit_order=create
+            real_connect=sqlite3.connect
+            class FinalSQL(sqlite3.Connection):
+                def execute(self,sql,*a,**kw):
+                    cursor=super().execute(sql,*a,**kw)
+                    if signed.is_set() and threading.current_thread().name=='lp-d2-manual-command' and not entered.is_set() and sql.startswith('SELECT * FROM executions WHERE state NOT IN'):
+                        entered.set();assert release.wait(6),'augment final SQL completion watchdog'
+                    return cursor
+            payload=dict(session_id=first['session_id'],quantity='20',price='.28',idempotency_key='waiting-augment')
+            with monkeypatch.context() as patch:
+                patch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=FinalSQL))))
+                def submit():
+                    try:results.append(execution.lp_submit_augment(payload))
+                    except BaseException as exc:errors.append(exc)
+                worker=threading.Thread(target=submit);worker.start();assert entered.wait(3),(results,errors)
+                captured=live.state.snapshot()
+                if variant=='scoring_review':
+                    live.run_protection_once()
+                    changed=live.state.snapshot()
+                    assert changed.observation is captured.observation and changed.trade_version==captured.trade_version
+                    assert tuple((o.key,o.terms_version) for o in changed.orders)==tuple((o.key,o.terms_version) for o in captured.orders)
+                    reviewed=changed.openings[original.scope]
+                    assert reviewed.phase=='review' and reviewed.stop_requested is True
+                    assert reviewed.review_status=='scoring_continuously_lost' and reviewed.stop_loss_latched==original.stop_loss_latched
+                    assert reviewed.review_at.value==clock[0] and reviewed.scope_version>original.scope_version
+                    assert changed.openings[other.scope].phase==other.phase and changed.openings[other.scope].review_at==other.review_at
+                    assert changed.openings[other.scope].stop_loss_latched==other.stop_loss_latched
+                    assert sdk.cancels==[]  # exclusive manual lease blocks native protection dispatch
+                release.set();worker.join(4);assert not worker.is_alive() and errors==[],errors
+            result,=results
+            if variant=='scoring_review':
+                assert result['submit_status']=='not_sent' and result['state']=='rejected',result
+                assert len(sdk.posts)==2 and len(live.state.snapshot().orders)==2
+                assert live.status()['last_buy_uncertainty'] is None
+                assert live.store.lp_manual_command(WALLET,'waiting-augment',session_id=first['session_id'])['outcome']=='not_sent'
+                assert execution.lp_submit_augment(payload|dict(idempotency_key='after-review'))['reason']=='session_review_exit'
+                assert live.state.snapshot().openings[original.scope]==reviewed
+            else:
+                assert result['state']=='entry_open' and result['submit_status']=='accepted',result
+                assert result['entry_order_id']==first['entry_order_id'] and result['augment_order_id']=='manual-order-3'
+                assert len(sdk.posts)==3 and sdk.posts[-1]['expiration']==int((NOW+timedelta(minutes=11)).timestamp())
+                assert live.state.snapshot().openings[other.scope]==other
+        finally:
+            release.set()
+            if worker:worker.join(3)
+            assert live.close(timeout=3);live.trading.close()
+
+
+def test_d2_condition_cancel_reports_discovery_failure(tmp_path,monkeypatch):
+    for variant in ('incomplete_orders','read_busy','closed','complete_empty'):
+        execution,live,sdk,public,clock=manual_runtime(tmp_path/variant,monkeypatch)
+        entered,release=Event(),Event();worker=None;errors=[]
+        try:
+            sdk.orders=()
+            if variant=='incomplete_orders':
+                def unavailable(**kw):
+                    sdk.order_reads+=1
+                    raise RuntimeError('actual current orders unavailable')
+                sdk.list_open_orders=unavailable
+            elif variant=='read_busy':
+                read=sdk.list_open_orders
+                def held(**kw):
+                    entered.set();assert release.wait(6),'actual Reader order discovery completion watchdog'
+                    return read(**kw)
+                sdk.list_open_orders=held
+                def observe():
+                    try:live.run_once(timeout=4)
+                    except BaseException as exc:errors.append(exc)
+                worker=threading.Thread(target=observe);worker.start();assert entered.wait(3)
+            elif variant=='closed':
+                assert live.close(timeout=3)
+            execution._notifier.channel='feishu'  # actual external notifier destination
+            notifications=execution._notifier.calls
+            assert notifications==[]
+            request=dict(confirm=True,condition_id=CONDITION_ID)
+            if variant=='complete_empty':
+                assert execution.lp_cancel_orders(request)==dict(requested=0,canceled=[],not_canceled={},skipped=[])
+                assert notifications==[] and sdk.order_reads==1
+            else:
+                expected={'incomplete_orders':'current_orders_unknown','read_busy':'current_read_in_progress','closed':'program_stopping'}[variant]
+                with pytest.raises(ValueError,match=expected):execution.lp_cancel_orders(request)
+                assert len(notifications)==1 and notifications[0][0]=='LP 撤单失败'
+                if variant=='incomplete_orders':assert sdk.order_reads==1
+            assert sdk.cancels==[] and sdk.posts==[]
+            assert live.status()['last_buy_uncertainty'] is None
+        finally:
+            release.set()
+            if worker:
+                worker.join(4);assert not worker.is_alive() and errors==[],errors
+            assert live.close(timeout=3);live.trading.close()
+
+
+def test_d2_named_augment_preserves_invalid_input_dispositions(tmp_path,monkeypatch):
+    execution,live,sdk,public,clock=manual_runtime(tmp_path,monkeypatch)
+    try:
+        first=execution.lp_submit_entry(entry(clock))
+        assert first['state']=='entry_open',first
+        before=live.state.snapshot()
+        with sqlite3.connect(live.store.path) as connection:
+            preview_count=connection.execute('SELECT COUNT(*) FROM previews').fetchone()[0]
+        for route in ('direct','preview'):
+            for field,value,reason in (('quantity','0','quantity_invalid'),('quantity','invalid','quantity_invalid'),
+                                       ('price','0','price_invalid'),('price','invalid','price_invalid')):
+                key=route+'-'+field+'-'+value
+                payload=dict(session_id=first['session_id'],quantity='20',price='.28',idempotency_key=key)
+                payload[field]=value
+                result=execution.lp_submit_augment(payload) if route=='direct' else execution.lp_augment_preview(payload)
+                assert result==dict(state='rejected',reason=reason),(route,field,value,result)
+                assert live.store.lp_manual_command(WALLET,key,session_id=first['session_id']) is None
+                assert live.state.snapshot()==before and len(sdk.posts)==1
+                with sqlite3.connect(live.store.path) as connection:
+                    assert connection.execute('SELECT COUNT(*) FROM previews').fetchone()[0]==preview_count
+        # Both omitted and explicit default price mean the original entry price,
+        # which is still occupied. Neither can silently select a new price.
+        for route in ('direct','preview'):
+            payload=dict(session_id=first['session_id'],quantity='20',price=None,idempotency_key='default-'+route)
+            result=execution.lp_submit_augment(payload) if route=='direct' else execution.lp_augment_preview(payload)
+            assert result==dict(state='rejected',reason='price_level_active'),result
+            assert live.store.lp_manual_command(WALLET,'default-'+route,session_id=first['session_id']) is None
+        assert len(sdk.posts)==1 and sdk.cancels==[] and sdk.market_orders==[]
     finally:
         assert live.close(timeout=3);live.trading.close()

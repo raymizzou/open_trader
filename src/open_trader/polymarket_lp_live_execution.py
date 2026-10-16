@@ -27,9 +27,9 @@ from .polymarket_lp_current_state import (
     OwnFillEvidence, SellState, ExitAttempt, ExitEvidenceUpdate,
 )
 from .polymarket_lp_market_calculation import CalculationPolicy, calculate_current
-from .polymarket_lp_market_reader import MarketReader, ReadScope
+from .polymarket_lp_market_reader import MarketReader, ReadScope, freeze
 from .polymarket_lp_risk import (estimate_lp_queue_position, first_observation_baseline,
-    _executable_bid_value, _projected_taker_fee, _freshness, _levels, TERMINAL_ORDER_STATES)
+    _executable_bid_value, _projected_taker_fee, _freshness, _levels, _maybe_decimal, TERMINAL_ORDER_STATES)
 from .polymarket_lp import SCORING_POLL_SECONDS, SCORING_STALE_SECONDS, SCORING_FAILURE_WINDOW_SECONDS, STOP_LOSS
 from .polymarket_lp_round import (
     LPRoundCoordinator, CycleStatus, FixedBuyPlan, StartStatus, CancelTarget,
@@ -181,6 +181,13 @@ class _ManualOrigin:
     observation_id: str
     trade_version: int
     order_versions: tuple
+    source_frame: object
+    request: Mapping
+    history: Mapping
+    credential_expires_at: datetime | None
+    allowed_order_ids: tuple
+    named_scope: tuple | None
+    named_scope_version: int | None
 
 
 @dataclass(frozen=True)
@@ -317,12 +324,49 @@ class LPD2LiveExecution:
     def _manual_origin_current(self, origin):
         snapshot = self.state.snapshot()
         observation = snapshot.observation
-        return bool(self._dispatch_current(origin.cycle_generation) and observation is not None
+        current = bool(self._dispatch_current(origin.cycle_generation) and observation is not None
             and observation.observation_id == origin.observation_id
             and snapshot.trade_version == origin.trade_version == observation.read_ticket.trade_version_at_start
             and observation.orders_complete and observation.positions_complete
             and tuple((o.key,o.terms_version) for o in snapshot.orders) == origin.order_versions
             and all(f.state == 'known' for f in (snapshot.buy_reserved,snapshot.inventory_cost,snapshot.current_exposure)))
+        if not current:
+            return False
+        if origin.named_scope is not None:
+            opening = snapshot.openings.get(origin.named_scope)
+            if (opening is None or snapshot.scope_versions.get(origin.named_scope,0) != origin.named_scope_version
+                    or opening.phase != 'opening'
+                    or opening.stop_requested or opening.stop_loss_latched.value is True):
+                return False
+        # Waiting claim/signing/safety I/O does not extend any original authority.
+        # These projections/validators are pure; no source or history is reread.
+        from .polymarket_lp import PolymarketLPService
+        from .polymarket_lp_current_inputs import manual_snapshot
+        from .polymarket_lp_views import lp_history_eligibility
+        now = self._utc_now()
+        if origin.credential_expires_at is not None and now >= origin.credential_expires_at:
+            return False
+        try:
+            values = manual_snapshot(origin.source_frame,origin.request,now)
+            PolymarketLPService._validate_snapshot(origin.request,values,now=now,
+                allowed_open_order_ids=origin.allowed_order_ids,reservations=())
+            if origin.request.get('candidate_policy') == 'best_bid_minimum':
+                from .polymarket_lp_risk import evaluate_lp_entry
+                cid, token = origin.request['condition_id'],origin.request['token_id']
+                catalog = origin.source_frame.sources[f'market:{cid}:{token}'].value['rewards']
+                reward = next(v for v in catalog['markets'] if v['condition_id'] == cid)
+                direction = dict(market=values['market'],book=values['book'],
+                    reward_active=reward.get('reward_active'),daily_pool_usd=reward.get('daily_pool_usd'),
+                    reward_checked_at=reward.get('reward_checked_at',reward.get('checked_at',catalog.get('checked_at'))),
+                    reward_guidance_deadline=PolymarketLPService._reward_guidance_deadline(reward))
+                evaluated = evaluate_lp_entry(direction,account=values['account'],now=now,reservations=(),
+                    candidate=True,bid_level=origin.request.get('candidate_bid_level',1))
+                if evaluated.get('state') != 'eligible':
+                    return False
+        except ValueError:
+            return False
+        return lp_history_eligibility(origin.history,now=now,
+            condition_id=origin.request['condition_id'],token_id=origin.request['token_id']) is None
 
     @staticmethod
     def _manual_json(value):
@@ -339,6 +383,8 @@ class LPD2LiveExecution:
             if not observation.orders_complete:
                 raise ValueError('current_orders_unknown')
         except ValueError as exc:
+            if condition_id is not None:
+                raise  # discovery failed; no authoritative empty selection exists
             return dict(requested=len(requested),canceled=[],not_canceled={oid:str(exc) for oid in requested},skipped=[])
         if permission is not None and not permission():
             return dict(requested=len(requested),canceled=[],not_canceled={oid:'mutation_blocked' for oid in requested},skipped=[])
@@ -544,12 +590,22 @@ class LPD2LiveExecution:
 
     def _manual_augment_request(self, service, group, payload):
         original = group['identity']
+        quantity = _maybe_decimal(payload.get('quantity'))
+        if quantity is None or quantity <= 0:
+            raise ValueError('quantity_invalid')
+        price = _maybe_decimal(original['price'])
+        if payload.get('price') is not None:
+            price = _maybe_decimal(payload['price'])
+            if price is None or price <= 0:
+                raise ValueError('price_invalid')
+        if price is None or price <= 0:
+            raise ValueError('entry_price_unknown')
         for key in ('market_id','condition_id','token_id','outcome','review_at'):
             if key in payload and str(payload[key]) != str(original[key]):
                 raise ValueError('manual_group_identity_mismatch')
         return service._normalize_request({**{k:original[k] for k in
             ('market_id','condition_id','token_id','outcome','review_at','price')},
-            'price':payload.get('price',original['price']), 'quantity':payload.get('quantity')})
+            'price':price, 'quantity':quantity})
 
     def _manual_validate_augment(self, service, group, request, values, as_of):
         ids = tuple(group['entry_order_ids'])+tuple(group['augment_order_ids'])
@@ -655,7 +711,15 @@ class LPD2LiveExecution:
             if credential.get('session_id') != (group['identity']['session_id'] if group else None):
                 return dict(state='rejected',reason='preview_session_mismatch')
             payload = credential
-        request = (self._manual_augment_request(service,group,payload) if group else service._normalize_request(payload))  # malformed public input keeps ValueError/HTTP400
+        if group:
+            try:
+                request = self._manual_augment_request(service,group,payload)
+            except ValueError as exc:
+                return dict(state='rejected',reason=str(exc))
+        else:
+            request = service._normalize_request(payload)  # malformed entry keeps ValueError/HTTP400
+        named_scope = self._manual_groups[group['identity']['session_id']][0] if group else None
+        named_version = self.state.snapshot().scope_versions.get(named_scope,0) if named_scope is not None else None
         try:
             observation, values, as_of = self._manual_observe(request)
             facts = (self._manual_validate_augment(service,group,request,values,as_of) if group else
@@ -671,14 +735,17 @@ class LPD2LiveExecution:
                         raise ValueError('candidate_changed')
             if group is None and any(o.key[1] == request['condition_id'] for o in self.state.snapshot().active_orders):
                 raise ValueError('market_already_participating')
-            _, reason = service._lp_history_fact(request['condition_id'], request['token_id'], now=as_of)
+            history, reason = service._lp_history_fact(request['condition_id'], request['token_id'], now=as_of)
             if reason:
                 raise ValueError(reason)
         except ValueError as exc:
             return dict(state='rejected', reason=str(exc))
         snapshot = self.state.snapshot()
         origin = _ManualOrigin(observation.cycle_generation, observation.observation_id,
-            observation.read_ticket.trade_version_at_start, tuple((o.key,o.terms_version) for o in snapshot.orders))
+            observation.read_ticket.trade_version_at_start, tuple((o.key,o.terms_version) for o in snapshot.orders),
+            observation.source_frame,freeze(request),freeze(history),
+            datetime.fromisoformat(credential['expires_at'].replace('Z','+00:00')) if credential else None,
+            tuple(group['entry_order_ids'])+tuple(group['augment_order_ids']) if group else (),named_scope,named_version)
         sampled_round = self.rounds.snapshot().round_number
         command = {k:request[k] for k in ('market_id','condition_id','token_id','outcome','price','quantity','review_at')}
         command.update(kind='augment' if group else 'start' if preview_id is not None else 'entry',account_id=self.account_id,process_epoch=self.process_epoch,
@@ -687,7 +754,7 @@ class LPD2LiveExecution:
         if request.get('estimated_target_quantity') is not None:
             command['estimated_target_quantity'] = request['estimated_target_quantity']
         try:
-            claimed = self.store.lp_claim_manual_command(command,preview_id=preview_id,now=as_of)
+            claimed = self.store.lp_claim_manual_command(command,preview_id=preview_id)
         except ValueError as exc:
             return dict(state='rejected',reason=str(exc))
         except Exception:
