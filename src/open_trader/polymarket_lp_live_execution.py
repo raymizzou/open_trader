@@ -166,6 +166,7 @@ class _ProtectionCancelOrigin:
     cycle_generation: str
     anchors: tuple[CurrentOrderFact, ...]
     ticket: _DeferredProtectionCancel
+    attempt_order: CurrentOrderFact
 
 
 class _ControlStore:
@@ -982,7 +983,9 @@ class LPD2LiveExecution:
                 or any(t.order_key == origin.ticket.order.key for t in progress.cancel_targets)):
             return False
         orders = {o.key: o for o in snapshot.orders}
-        for original in (*origin.anchors, origin.ticket.order):
+        if origin.attempt_order.key != origin.ticket.order.key:
+            return False
+        for original in (*origin.anchors, origin.attempt_order):
             order = orders.get(original.key)
             if (order is None or order.side != 'BUY' or order.terms_version != original.terms_version
                     or any(getattr(order, field).state != 'known' or getattr(original, field).state != 'known'
@@ -990,7 +993,14 @@ class LPD2LiveExecution:
                         for field in ('price', 'original_size', 'order_type', 'expiration'))):
                 return False
         target = orders[origin.ticket.order.key]
-        if target not in snapshot.active_orders or target.remaining.state != 'known' or target.remaining.value <= 0:
+        # The ticket fixes identity and original terms; matched progress belongs
+        # to this fresh attempt and may advance without replacing that ticket.
+        if (any(getattr(origin.ticket.order, field).state != 'known'
+                    or getattr(target, field).value != getattr(origin.ticket.order, field).value
+                    for field in ('price', 'original_size', 'order_type', 'expiration'))
+                or target not in snapshot.active_orders or target.remaining.state != 'known' or target.remaining.value <= 0
+                or origin.attempt_order.remaining.state != 'known'
+                or target.remaining.value != origin.attempt_order.remaining.value):
             return False
         for original in origin.anchors:
             anchor = orders[original.key]
@@ -1057,7 +1067,7 @@ class LPD2LiveExecution:
                     continue  # a real independent request already owns this exact target
                 origin = _ProtectionCancelOrigin(observation.observation_id, current.trade_version,
                     current.current.cycle_generation, tuple(next(o for o in current.orders if o.key == anchor.key)
-                        for anchor in anchors), ticket)
+                        for anchor in anchors), ticket, order)
                 handle = self.cancel_independent(order.key, protection_key=key, reason=ticket.reason,
                     protection_origin=origin)
                 retained.append(ticket)  # removed only after actual target registration, never on guard denial

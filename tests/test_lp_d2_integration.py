@@ -648,13 +648,17 @@ def _d2_protection_runtime(tmp_path, monkeypatch, *, quantity='2000', submit=Tru
 
 
 def test_d2_queue_protection_cancels_exact_price_bucket_once(tmp_path, monkeypatch):
-    from threading import Event
+    from threading import Event, Condition
     from tests.test_lp_order_registration_contract import _open_order
     live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch)
     entered, release = Event(), Event()
+    changed = Condition()
     def cancel(*, order_ids):
-        sdk.cancels.append(order_ids)
-        entered.set()
+        with changed:
+            sdk.cancels.append(order_ids)
+            if {oid for ids in sdk.cancels for oid in ids} == {'entry-A', 'manual-peer'}:
+                entered.set()
+            changed.notify_all()
         assert release.wait(5), 'exact queue native cancel release watchdog'
         return dict(canceled=order_ids, not_canceled={})
     sdk.cancel_orders = cancel
@@ -688,7 +692,10 @@ def test_d2_queue_protection_cancels_exact_price_bucket_once(tmp_path, monkeypat
         live.run_protection_once()
         assert live.status()['native_inflight'] > 0
         release.set()
-        for attempt in attempts: attempt.result(timeout=3)
+        for attempt in attempts:
+            assert attempt.result(timeout=3).status.value == 'accepted'
+            attempt._thread.join(timeout=2)
+            assert attempt.done(), 'exact queue cancellation must end natively'
         assert live.close(timeout=3)
         assert sorted(oid for ids in sdk.cancels for oid in ids) == ['entry-A', 'manual-peer']
         assert len(sdk.posts) == 1
@@ -764,8 +771,20 @@ def test_d2_queue_outage_nine_ten_keeps_applicability_gates(tmp_path, monkeypatc
 
 
 def test_d2_first_seen_baseline_and_cancel_scope_remain_current(tmp_path, monkeypatch):
+    from threading import Event, Condition
     from tests.test_lp_order_registration_contract import _open_order
     live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch, submit=False)
+    changed, both_entered, entries = Condition(), Event(), set()
+    sdk_cancel = sdk.cancel_orders
+    def cancel(*, order_ids):
+        with changed:
+            entries.update(order_ids)
+            if entries == {'manual-anchor', 'manual-peer'}:
+                both_entered.set()
+            changed.notify_all()
+        assert both_entered.wait(3), 'both exact first-seen SDK entries watchdog'
+        return sdk_cancel(order_ids=order_ids)
+    sdk.cancel_orders = cancel
     try:
         sdk.orders = (_open_order('manual-anchor', 'BUY', price='.30', original='2000'),)
         public.failed = True
@@ -804,7 +823,10 @@ def test_d2_first_seen_baseline_and_cancel_scope_remain_current(tmp_path, monkey
         accepted = live.run_once()
         reads = (sdk.order_reads, public.book_reads)
         attempts = live.run_protection_once()
-        for attempt in attempts: attempt.result(timeout=3)
+        for attempt in attempts:
+            assert attempt.result(timeout=3).status.value == 'accepted'
+            attempt._thread.join(timeout=2)
+            assert attempt.done(), 'first-seen cancellation must end natively'
         snapshot = live.state.snapshot()
         assert snapshot.baselines[first.key] is baseline  # never renew the original baseline
         progress = snapshot.progress[first.key]
@@ -817,6 +839,7 @@ def test_d2_first_seen_baseline_and_cancel_scope_remain_current(tmp_path, monkey
         live.run_protection_once()
         assert len(sdk.cancels) == 2 and sdk.posts == []
     finally:
+        both_entered.set()
         assert live.close(timeout=3)
         live.trading.close()
 

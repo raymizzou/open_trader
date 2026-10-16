@@ -840,3 +840,135 @@ def test_d2_same_tick_scoring_preserves_current_sell_cancel_admission(tmp_path, 
         if worker: worker.join(3)
         assert live.close(timeout=3)
         live.trading.close()
+
+
+@pytest.mark.parametrize('change', ['partial_before_new_attempt', 'partial_during_admission_then_fresh_tick'])
+def test_d2_deferred_target_partial_fill_uses_fresh_attempt_revision(tmp_path, monkeypatch, change):
+    from tests.test_lp_d2_integration import _d2_protection_runtime
+    from tests.test_lp_order_registration_contract import _open_order
+    live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch, submit=False)
+    execution = attach(live, PolymarketLPService(live.store, live.trading), tmp_path)
+    releases = {oid: Event() for oid in ('occupied-X', 'occupied-Y', 'entry-A')}
+    entered = {oid: Event() for oid in releases}
+    sql_entered, sql_release = Event(), Event()
+    terminal, exact_reads, handles, old_attempts, errors = {}, [], {}, [], []
+    worker = None
+    def cancel(*, order_ids):
+        oid, = order_ids
+        sdk.cancels.append(order_ids)
+        if oid in releases:
+            entered[oid].set()
+            assert releases[oid].wait(8), 'real deferred-target capacity completion watchdog'
+        original = next(o for o in sdk.orders if o.id == oid)
+        terminal[oid] = original.model_copy(update={'status': 'CANCELED'})
+        sdk.orders = tuple(o for o in sdk.orders if o.id != oid)
+        return dict(canceled=order_ids, not_canceled={})
+    def exact(*, order_id):
+        exact_reads.append(order_id)
+        return terminal.get(order_id)
+    sdk.cancel_orders, sdk.get_order = cancel, exact
+    def tick():
+        clock[0] += 1
+        live.run_once()
+        return live.run_protection_once()
+    def finish(attempts):
+        for handle in attempts:
+            outcome = handle.result(timeout=3)
+            handle._thread.join(2)
+            assert handle.done()
+            assert outcome.status.value == 'accepted'
+    def partial_fill():
+        sdk.orders = tuple(o.model_copy(update={'size_matched': Decimal('1')})
+            if o.id == 'original-B' else o for o in sdk.orders)
+        sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='1', average_price='.30'),)
+    try:
+        sdk.orders = (_open_order('entry-A', 'BUY', price='.30', original='2000'),)
+        assert tick() == ()
+        baseline = next(b for b in live.state.snapshot().baselines.values() if b.key.episode_id == 'entry-A')
+        sdk.orders += (_open_order('occupied-X', 'BUY', price='.29', original='20'),
+            _open_order('occupied-Y', 'BUY', price='.28', original='20'))
+        live.run_once()
+        for oid in ('occupied-X', 'occupied-Y'):
+            handles[oid] = live.cancel_independent((WALLET, CONDITION_ID, TOKEN_ID, oid))
+            assert entered[oid].wait(2)
+        sdk.orders += (_open_order('original-B', 'BUY', price='.30', original='10'),)
+        public.level = Decimal('4000')
+        assert tick() == ()  # both slots occupied; original A/B tickets accepted
+        original = next(o for o in live.state.snapshot().orders if o.key[3] == 'original-B')
+        assert original.original_size.value == original.remaining.value == 10 and original.size_matched.value == 0
+        assert live.state.snapshot().progress[baseline.key].cancel_targets == ()
+        releases['occupied-X'].set(); finish((handles['occupied-X'],))
+        handles['entry-A'], = tick()
+        assert entered['entry-A'].wait(2)
+        progress = live.state.snapshot().progress[baseline.key]
+        assert {t.order_key[3] for t in progress.cancel_targets} == {'entry-A'}
+        assert live.status()['native_inflight'] == 2 and ('original-B',) not in sdk.cancels
+        # Original registered A makes the bucket ineligible for silent replanning.
+        for oid in ('entry-A', 'occupied-Y'):
+            releases[oid].set(); finish((handles[oid],))
+        assert tick() == ()  # actual Reader obtains A's authoritative final0
+        anchor = next(o for o in live.state.snapshot().orders if o.key[3] == 'entry-A')
+        assert anchor.terminal_proof.identity_verified and anchor.terminal_proof.matched.value == 0
+        assert exact_reads and set(exact_reads) == {'entry-A'}
+        if change == 'partial_before_new_attempt':
+            partial_fill()
+        else:
+            clock[0] += 1
+            live.run_once()
+            real_connect = sqlite3.connect
+            class HeldFinalCancelSQL(sqlite3.Connection):
+                def execute(self, sql, *a, **kw):
+                    cursor = super().execute(sql, *a, **kw)
+                    if (threading.current_thread().name == 'lp-d2-independent-cancel'
+                            and sql.startswith('SELECT * FROM executions WHERE state NOT IN') and not sql_entered.is_set()):
+                        assert not live.state._lock._is_owned()
+                        sql_entered.set()
+                        assert sql_release.wait(8), 'old B attempt final safety SQL watchdog'
+                    return cursor
+            monkeypatch.setattr(sqlite3, 'connect', lambda *a, **kw: real_connect(*a, **(kw|dict(factory=HeldFinalCancelSQL))))
+            def dispatch():
+                try: old_attempts.extend(live.run_protection_once())
+                except BaseException as exc: errors.append(exc)
+            worker = threading.Thread(target=dispatch, name='deferred-target-dispatch'); worker.start()
+            assert sql_entered.wait(3)
+            worker.join(3)
+            assert not worker.is_alive() and errors == [] and len(old_attempts) == 1
+            assert ('original-B',) not in sdk.cancels
+            partial_fill()
+            clock[0] += 1
+            live.run_once()  # genuinely newer ordinary frame, not a forged receipt
+            sql_release.set()
+            old, = old_attempts
+            assert old.result(timeout=3).status.value == 'not_sent'
+            old._thread.join(2)
+            assert old.done() and ('original-B',) not in sdk.cancels
+            assert not any(t.order_key[3] == 'original-B' for t in live.state.snapshot().progress[baseline.key].cancel_targets)
+        clock[0] += 1
+        live.run_once()
+        partial = next(o for o in live.state.snapshot().orders if o.key == original.key)
+        assert partial.terms_version > original.terms_version
+        assert partial.size_matched.value == 1 and partial.remaining.value == 9
+        assert all(getattr(partial, field).value == getattr(original, field).value
+            for field in ('price', 'original_size', 'order_type', 'expiration'))
+        fresh = live.run_protection_once()
+        finish(fresh)
+        assert sdk.cancels.count(('original-B',)) == 1, 'fresh original B remainder9 must not be pinned to trigger-time revision'
+        final = live.state.snapshot()
+        target, = [t for t in final.progress[baseline.key].cancel_targets if t.order_key == original.key]
+        assert target.requested_remaining == partial.remaining and target.requested_remaining.value == 9
+        assert target.native_state == 'ended'
+        current = next(o for o in final.orders if o.key == original.key)
+        assert current.size_matched == partial.size_matched  # lower-bound1 retains its real API source
+        assert current.terminal_proof.matched.state == 'unknown' and current.terminal_proof.identity_verified
+        assert current.original_size == partial.original_size and current.terminal_proof.original_size.value == 10
+        finish(tick())
+        assert sdk.cancels.count(('original-B',)) == 1  # attempted UNKNOWN is not another permission
+        assert live.status()['native_inflight'] == 0 and sdk.posts == []
+        assert live.state.snapshot().openings == {} and live.state.snapshot().own_fills == {}
+    finally:
+        sql_release.set()
+        for event in releases.values(): event.set()
+        if worker: worker.join(3)
+        for handle in (*handles.values(), *old_attempts): handle._thread.join(3)
+        assert live.close(timeout=3)
+        live.trading.close()
