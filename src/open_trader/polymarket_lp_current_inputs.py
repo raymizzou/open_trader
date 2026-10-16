@@ -151,3 +151,41 @@ def prepare_current_inputs(frame, captured_candidates, policy, as_of):
         raise TypeError('captured_candidates_requires_source_result')
     return replace(frame, sources=MappingProxyType({**frame.sources,
         'directions': SourceResult('', freeze(directions)), 'candidates': candidates}))
+
+
+def manual_snapshot(frame, request, as_of):
+    """Project explicit manual validation from this frame, with no source acquisition."""
+    from .polymarket_lp_risk import _freshness
+    account = _current_account(frame, as_of)
+    if not account.complete:
+        raise ValueError('account_facts_unknown')
+    cid, token = request['condition_id'], request['token_id']
+    source = frame.sources.get(f'market:{cid}:{token}')
+    if source is None or not source.complete or source.error or not isinstance(source.value, Mapping):
+        raise ValueError('market_unknown')
+    metadata, catalog, book = (source.value.get(k) for k in ('metadata', 'rewards', 'book'))
+    if not all(isinstance(v, Mapping) for v in (metadata, catalog, book)) or catalog.get('complete') is not True:
+        raise ValueError('market_unknown')
+    selected = metadata.get('outcomes', {}).get(request['outcome'].lower())
+    if (not isinstance(selected, Mapping) or selected.get('token_id') != token
+            or str(selected.get('label', '')).upper() != request['outcome']
+            or metadata.get('condition_id') != cid or metadata.get('market_id') != request['market_id']
+            or book.get('condition_id', book.get('market')) != cid
+            or book.get('token_id', book.get('asset_id')) != token):
+        raise ValueError('market_identity_mismatch')
+    for stamp in (source.checked_at, metadata.get('metadata_checked_at'), metadata.get('fees_checked_at'), catalog.get('checked_at')):
+        _freshness(stamp, as_of, 'market_freshness', max_age=60)
+    rewards = [v for v in catalog.get('markets', ()) if isinstance(v, Mapping) and v.get('condition_id') == cid]
+    if len(rewards) != 1:
+        raise ValueError('reward_unknown')
+    reward = rewards[0]
+    minimum = metadata.get('reward_min_size')
+    if minimum is None:
+        minimum = decimal(reward.get('rewards_min_size'))
+    spread = metadata.get('reward_max_spread')
+    if spread is None:
+        raw = decimal(reward.get('rewards_max_spread'))
+        spread = None if raw is None else raw / 100
+    market = {**metadata, 'token_id': selected['token_id'], 'outcome': str(selected['label']).upper(),
+        'reward_min_size': minimum, 'reward_max_spread': spread}
+    return freeze(dict(account=account.value, market=market, book=book))

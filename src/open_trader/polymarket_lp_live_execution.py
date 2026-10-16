@@ -1,6 +1,6 @@
 """Explicitly constructed D2 composition; no default runtime activation."""
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from collections.abc import Mapping
 import json
@@ -119,6 +119,12 @@ class NativeAttempt:
 
 
 @dataclass(frozen=True)
+class _ManualCancelIdentity:
+    request_id: str
+    order_keys: tuple
+
+
+@dataclass(frozen=True)
 class _ProtectionAction:
     request_id: str
     account_id: str
@@ -167,6 +173,22 @@ class _ProtectionCancelOrigin:
     anchors: tuple[CurrentOrderFact, ...]
     ticket: _DeferredProtectionCancel
     attempt_order: CurrentOrderFact
+
+
+@dataclass(frozen=True)
+class _ManualOrigin:
+    cycle_generation: str
+    observation_id: str
+    trade_version: int
+    order_versions: tuple
+
+
+@dataclass(frozen=True)
+class _ManualContext:
+    cycle_generation: str
+    batch_id: str  # real sealed manual correlation, never a352 batch/token
+    round_number: int
+    observation_id: str
 
 
 class _ControlStore:
@@ -239,6 +261,8 @@ class LPD2LiveExecution:
         self._sealed_candidate_source = None
         self._sealed_candidate_sources = {}
         self._native_jobs = {}
+        self._manual_jobs = {}
+        self._manual_groups = {}
         # Finite dispatch tickets for an already accepted protection trigger.
         # No request/native attempt exists until actual capacity is admitted.
         self._deferred_protection_cancels = {}
@@ -247,6 +271,512 @@ class LPD2LiveExecution:
         self._last_current_evidence = None
         self._last_buy_uncertainty = None
         self._mutation_owner = self._mutation_acquire = None
+
+    def manual_call(self, operation):
+        """Own the whole explicit command, including reliable SQL, until actual end."""
+        with self.state._lock:
+            if self._control_view().fatal:
+                return dict(state='locked', reason='program_stopping')
+            self._manual_jobs = {k:h for k,h in self._manual_jobs.items() if h._thread.is_alive()}
+            identity, future = uuid4().hex, Future()
+            def run():
+                try: result = operation()
+                except BaseException as exc: future.set_exception(exc)
+                else: future.set_result(result)
+            thread = threading.Thread(target=run, name='lp-d2-manual-command', daemon=False)
+            handle = NativeAttempt(identity, future, thread)
+            self._manual_jobs[identity] = handle
+            thread.start()
+        return handle.result()
+
+    def _manual_observe(self, request=None, *, timeout=2, financial=True):
+        if not self._run_lock.acquire(blocking=False):
+            raise ValueError('current_read_in_progress')
+        try:
+            current = self.state.snapshot().current
+            if not current.cycle_generation or self._control_view().fatal:
+                raise ValueError('program_stopping')
+            components = ('balance', 'open_orders', 'positions')
+            if request is not None:
+                components += (f"market:{request['condition_id']}:{request['token_id']}",)
+            ticket = self.state.begin_observation(current.cycle_generation, ('balance','open_orders','positions'))
+            frame = self.reader.read_current(ReadScope(self.account_id, components), time.monotonic()+timeout)
+            as_of = self._utc_now()
+            prepared = prepare_current_inputs(frame, None, self.policy, as_of)
+            accepted = self.state.accept(ticket, frame, calculate_current(prepared, self.policy, as_of), evaluated_at=as_of)
+            if accepted.observation is None or accepted.status not in ('accepted', 'partial'):
+                raise ValueError('current_facts_unknown')
+            snapshot = self.state.snapshot()
+            if financial and any(f.state != 'known' for f in (snapshot.buy_reserved, snapshot.inventory_cost, snapshot.current_exposure)):
+                raise ValueError('financial_facts_unknown')
+            from .polymarket_lp_current_inputs import manual_snapshot
+            return accepted.observation, manual_snapshot(frame, request, as_of) if request is not None else None, as_of
+        finally:
+            self._run_lock.release()
+
+    def _manual_origin_current(self, origin):
+        snapshot = self.state.snapshot()
+        observation = snapshot.observation
+        return bool(self._dispatch_current(origin.cycle_generation) and observation is not None
+            and observation.observation_id == origin.observation_id
+            and snapshot.trade_version == origin.trade_version == observation.read_ticket.trade_version_at_start
+            and observation.orders_complete and observation.positions_complete
+            and tuple((o.key,o.terms_version) for o in snapshot.orders) == origin.order_versions
+            and all(f.state == 'known' for f in (snapshot.buy_reserved,snapshot.inventory_cost,snapshot.current_exposure)))
+
+    @staticmethod
+    def _manual_json(value):
+        if isinstance(value, Decimal): return str(value)
+        if isinstance(value, datetime): return value.isoformat()
+        if isinstance(value, Mapping): return {str(k):LPD2LiveExecution._manual_json(v) for k,v in value.items()}
+        if isinstance(value, (tuple,list)): return [LPD2LiveExecution._manual_json(v) for v in value]
+        return value
+
+    def manual_cancel(self, *, order_ids=None, condition_id=None, displayed_ids=None, permission=None):
+        requested = list(order_ids if order_ids is not None else displayed_ids or ())
+        try:
+            observation, _, as_of = self._manual_observe(financial=False)
+            if not observation.orders_complete:
+                raise ValueError('current_orders_unknown')
+        except ValueError as exc:
+            return dict(requested=len(requested),canceled=[],not_canceled={oid:str(exc) for oid in requested},skipped=[])
+        if permission is not None and not permission():
+            return dict(requested=len(requested),canceled=[],not_canceled={oid:'mutation_blocked' for oid in requested},skipped=[])
+        snapshot = self.state.snapshot()
+        rows = {o.key[3]:o for o in observation.order_view.open_orders}
+        if condition_id is not None:
+            requested = [o.key[3] for o in observation.order_view.open_orders if o.key[1]==condition_id]
+        selected, skipped = [], []
+        for oid in requested:
+            order = rows.get(oid)
+            if order is None:
+                skipped.append(dict(order_id=oid,reason='unknown_order'))
+            elif order not in snapshot.active_orders:
+                skipped.append(dict(order_id=oid,reason='not_active'))
+            elif order not in selected:
+                selected.append(order)
+        if not selected:
+            return dict(requested=len(requested),canceled=[],not_canceled={},skipped=skipped)
+        with self.state._lock:
+            current = self.state.snapshot()
+            keys = [(self.account_id,self.venue,o.key[2],o.key[3]) for o in selected]
+            for order,key in tuple(zip(selected,keys)):
+                handle = self._native_jobs.get(key)
+                if handle is not None and handle._thread.is_alive():
+                    selected.remove(order);skipped.append(dict(order_id=order.key[3],reason='cancel_in_progress'))
+            occupied = {h.identity.request_id for h in self._native_jobs.values() if h._thread.is_alive()}|self._active_sends
+            permitted = (self._dispatch_current(observation.cycle_generation)
+                and current.observation is not None and current.observation.observation_id == observation.observation_id
+                and current.trade_version == observation.read_ticket.trade_version_at_start
+                and all(o in current.active_orders for o in selected) and len(occupied)<2)
+            if not selected:
+                return dict(requested=len(requested),canceled=[],not_canceled={},skipped=skipped)
+            if not permitted:
+                return dict(requested=len(requested),canceled=[],not_canceled={o.key[3]:'native_or_current_not_available' for o in selected},skipped=skipped)
+            identity = _ManualCancelIdentity(uuid4().hex,tuple(o.key for o in selected))
+            selected = tuple(selected)
+            future = Future()
+            def cancel():
+                try:
+                    # This route has no RUN/breaker/nonLP/file-lock prerequisite.
+                    if permission is not None and not permission():
+                        future.set_result(dict(canceled=[],not_canceled={o.key[3]:'mutation_blocked' for o in selected}));return
+                    with self.state._lock:
+                        latest=self.state.snapshot()
+                        if not self._dispatch_current(observation.cycle_generation) or any(o not in latest.active_orders for o in selected):
+                            future.set_result(dict(canceled=[],not_canceled={o.key[3]:'program_stopping' for o in selected}));return
+                    result=self.trading.cancel_orders_detailed(tuple(o.key[3] for o in selected))
+                    canceled=[o.key[3] for o in selected if o.key[3] in result.get('canceled',())]
+                    denied=result.get('not_canceled',{})
+                    not_canceled={o.key[3]:str(denied.get(o.key[3],'cancel_result_unknown')) for o in selected if o.key[3] not in canceled}
+                    stamp=SourceStamp(identity.request_id,checked_at=self._utc_now(),complete=True,state='known')
+                    for order in selected:
+                        if order.key[3] not in canceled:continue
+                        proof=TerminalProof(order.key,'CANCELED',order.original_size,
+                            Fact('unknown',sources=(stamp,),reason_codes=('cancel_final_fill_unknown',)),stamp,True)
+                        disposition=self.state.accept_receipt_evidence(ReceiptEvidence(
+                            identity.request_id+':'+order.key[3],identity.request_id,self.account_id,self.process_epoch,
+                            observation.cycle_generation,order.key,order.side,order.terms_version,terminal_proof=proof))
+                        self._last_current_evidence=(identity.request_id,'manual_cancel',disposition)
+                    future.set_result(dict(canceled=canceled,not_canceled=not_canceled))
+                except BaseException as exc:future.set_exception(exc)
+            thread=threading.Thread(target=cancel,name='lp-d2-manual-cancel',daemon=False)
+            handle=NativeAttempt(identity,future,thread)
+            for order in selected:self._native_jobs[(self.account_id,self.venue,order.key[2],order.key[3])]=handle
+            thread.start()
+        result=handle.result()
+        return dict(requested=len(requested),**result,skipped=skipped)
+
+    def _bind_manual_group(self, group):
+        original = group['identity']
+        observation, values, as_of = self._manual_observe(original)
+        with self.state._lock:
+            snapshot = self.state.snapshot()
+            if not self._protection_frame_current(snapshot):
+                raise ValueError('current_facts_unknown')
+            ids = tuple(group['entry_order_ids'])+tuple(group['augment_order_ids'])
+            orders = tuple(o for o in snapshot.active_orders if o.key[3] in ids)
+            if not ids or len(orders) != len(set(ids)):
+                raise ValueError('manual_order_identity_unknown')
+            scope = (self.account_id,original['condition_id'],original['token_id'],
+                self.process_epoch+':manual:'+original['session_id'])
+            for order in orders:
+                association = self._opening_order_associations.get(order.key)
+                if (order.side != 'BUY' or order.key[:3] != scope[:3]
+                        or order.source != observation.order_view.orders_source
+                        or association is not None and association.scope != scope
+                        or any(f.state != 'known' for f in (order.price,order.original_size,order.size_matched,order.remaining,order.order_type,order.expiration))
+                        or order.order_type.value != 'GTD' or (order.expiration.value.timestamp()
+                            if isinstance(order.expiration.value,datetime) else order.expiration.value) != original['expiration']):
+                    raise ValueError('manual_order_identity_unknown')
+                if order.key[3] in group['entry_order_ids'] and (
+                        order.price.value != Decimal(original['price']) or order.original_size.value != Decimal(original['quantity'])):
+                    raise ValueError('manual_order_terms_mismatch')
+            unknown = Fact('unknown')
+            stamp = SourceStamp('manual-identity:'+original['session_id'],state='known',complete=True)
+            opening = OpeningProtection(scope,'opening',None,ids,unknown,
+                OpeningEconomics(scope,unknown,unknown,unknown,unknown,False),unknown,None,unknown,
+                Fact('known',datetime.fromisoformat(original['review_at']),(stamp,)),'none',False,
+                ScoringState(orders[0].key,'entry',unknown,None,None,None,orders[0].source),
+                snapshot.scope_versions.get(scope,0)+1)
+            if self.state.apply_protection(OpeningProtectionUpdate(
+                    self._protection_guard(snapshot,scope,orders,observation=True),opening)) != 'applied':
+                raise ValueError('manual_group_binding_stale')
+            self._manual_groups[original['session_id']] = (scope,MappingProxyType(dict(original)))
+            for order in orders:
+                self._opening_order_associations[order.key] = _OpeningOrderAssociation(scope,order.key,
+                    original.get('request_id','manual-identity:'+original['session_id']),
+                    observation.observation_id,order.source)
+            return opening
+
+    def manual_status(self, session_id):
+        if not session_id:
+            groups = tuple(self._manual_groups)
+            if len(groups) != 1:
+                return dict(state='none',session_id=None,reason='session_id_required' if groups else 'session_not_found')
+            session_id = groups[0]
+        try:
+            group = self.store.lp_manual_group(self.account_id,str(session_id))
+            if group is None:
+                raise ValueError('session_not_found')
+            if session_id not in self._manual_groups:
+                opening = self._bind_manual_group(group)
+            else:
+                self._manual_observe(financial=False)
+                opening = self.state.snapshot().openings[self._manual_groups[session_id][0]]
+        except ValueError as exc:
+            return dict(state='needs_attention',session_id=session_id,reason=str(exc))
+        def amount(fact):
+            return str(fact.value) if fact.state == 'known' and fact.value is not None else None
+        return dict(state={'opening':'entry_open','closed':'complete'}.get(opening.phase,opening.phase),
+            session_id=session_id,entry_order_id=next(iter(group['entry_order_ids']),None),
+            augment_order_ids=list(group['augment_order_ids']),review_at=opening.review_at.value.isoformat()
+                if opening.review_at.state == 'known' else None,
+            stop_requested=opening.stop_requested,stop_loss_latched=opening.stop_loss_latched.value,
+            buy_cost=amount(opening.economics.buy_cost_usd),fees=amount(opening.economics.fees_usd))
+
+    def manual_stop(self, session_id, permission):
+        if not session_id:
+            snapshot = self.state.snapshot()
+            groups = [sid for sid,(scope,_) in self._manual_groups.items()
+                if scope in snapshot.openings and snapshot.openings[scope].phase != 'closed']
+            if len(groups)>1:
+                return dict(state='rejected',reason='session_ambiguous',session_ids=groups)
+            if not groups:
+                return dict(state='none',session_id=None)
+            session_id=groups[0]
+        try:
+            group=self.store.lp_manual_group(self.account_id,str(session_id))
+        except ValueError as exc:
+            if str(exc)=='manual_group_unavailable':return dict(state='none',session_id=None)
+            return dict(state='needs_attention',session_id=session_id,reason=str(exc))
+        if session_id not in self._manual_groups:
+            try:self._bind_manual_group(group)
+            except ValueError as exc:return dict(state='needs_attention',session_id=session_id,reason=str(exc))
+        try:observation,_,_=self._manual_observe(financial=False)
+        except ValueError as exc:return dict(state='needs_attention',session_id=session_id,reason=str(exc))
+        if not permission():
+            return dict(state='locked',reason='mutation_blocked')
+        self._associate_current_manual_sells()
+        with self.state._lock:
+            snapshot=self.state.snapshot();scope=self._manual_groups[session_id][0]
+            if not self._dispatch_current(observation.cycle_generation) or not self._protection_frame_current(snapshot):
+                return dict(state='needs_attention',session_id=session_id,reason='current_facts_unknown')
+            opening=snapshot.openings[scope]
+            if opening.phase=='closed':return dict(state='complete',session_id=session_id)
+            orders=self._opening_orders(snapshot,opening)
+            review=replace(opening,phase='review',stop_requested=True,review_status='awaiting_reconciliation',
+                scope_version=snapshot.scope_versions.get(scope,0)+1)
+            disposition=self.state.apply_protection(OpeningProtectionUpdate(
+                self._protection_guard(snapshot,scope,orders,observation=True),review))
+            if disposition!='applied':
+                return dict(state='needs_attention',session_id=session_id,reason='current_facts_unknown')
+            targets=[o.key[3] for o in orders if o in snapshot.active_orders]
+        result=self.manual_cancel(order_ids=targets,permission=permission) if targets else dict(not_canceled={})
+        return dict(state='needs_attention' if result['not_canceled'] else 'review',session_id=session_id,
+            stop_requested=True,review_status='awaiting_reconciliation',
+            review_at=opening.review_at.value.isoformat() if opening.review_at.state=='known' else None,
+            stop_loss_latched=opening.stop_loss_latched.value)
+
+    def manual_group(self, session_id):
+        try:
+            group = self.store.lp_manual_group(self.account_id,session_id)
+        except ValueError as exc:
+            reason = str(exc)
+            raise ValueError('session_not_found' if reason == 'manual_group_unavailable' else reason) from exc
+        if group is None:
+            raise ValueError('session_not_found')
+        binding = self._manual_groups.get(session_id)
+        if binding is None:
+            self._bind_manual_group(group)
+            binding = self._manual_groups[session_id]
+        opening = self.state.snapshot().openings.get(binding[0])
+        if opening is None:
+            raise ValueError('session_needs_attention')
+        if opening.stop_requested or opening.phase == 'review':
+            raise ValueError('session_review_exit')
+        if opening.phase != 'opening':
+            raise ValueError({'stop_loss_exit':'session_stop_loss_exit','passive_exit':'session_passive_exit',
+                'complete':'session_not_active'}.get(opening.phase,'session_needs_attention'))
+        if opening.stop_loss_latched.value is True:
+            raise ValueError('session_stop_loss_exit')
+        return group
+
+    def _manual_augment_request(self, service, group, payload):
+        original = group['identity']
+        for key in ('market_id','condition_id','token_id','outcome','review_at'):
+            if key in payload and str(payload[key]) != str(original[key]):
+                raise ValueError('manual_group_identity_mismatch')
+        return service._normalize_request({**{k:original[k] for k in
+            ('market_id','condition_id','token_id','outcome','review_at','price')},
+            'price':payload.get('price',original['price']), 'quantity':payload.get('quantity')})
+
+    def _manual_validate_augment(self, service, group, request, values, as_of):
+        ids = tuple(group['entry_order_ids'])+tuple(group['augment_order_ids'])
+        snapshot = self.state.snapshot()
+        scope = self._manual_groups[group['identity']['session_id']][0]
+        allowed = []
+        for order in snapshot.active_orders:
+            if order.key[3] not in ids:
+                continue
+            association = self._opening_order_associations.get(order.key)
+            if (association is None or association.scope != scope or order.side != 'BUY'
+                    or order.key[1:3] != (request['condition_id'],request['token_id'])):
+                raise ValueError('manual_order_identity_unknown')
+            if order.size_matched.state != 'known' or order.size_matched.value != 0:
+                raise ValueError('session_needs_attention')
+            allowed.append(order.key[3])
+        session = dict(group['identity'],entry_order_id=next(iter(group['entry_order_ids']),None),
+            augment_order_ids=group['augment_order_ids'])
+        reason = service._augment_price_rejection(session,values,request['price'])
+        if reason:
+            raise ValueError(reason)
+        return service._validate_snapshot(request,values,now=as_of,allowed_open_order_ids=allowed,reservations=())
+
+    def manual_augment_preview(self, service, payload):
+        try:
+            group = self.manual_group(str(payload.get('session_id') or ''))
+            request = self._manual_augment_request(service,group,payload)
+            observation,values,as_of = self._manual_observe(request)
+            facts = self._manual_validate_augment(service,group,request,values,as_of)
+        except ValueError as exc:
+            return dict(state='rejected',reason=str(exc))
+        expires = as_of+timedelta(seconds=10)
+        preview_id = self.store.create_preview(self._manual_json(dict(request,
+            session_id=group['identity']['session_id'],preflight=facts)),
+            expires_at=expires.isoformat(),created_at=as_of.isoformat())
+        return dict(state='previewed',preview_id=preview_id,expires_at=expires.isoformat(),
+            request=dict(session_id=group['identity']['session_id'],quantity=request['quantity']),
+            price=request['price'],preflight=facts,
+            queue_protection_estimate=service._queue_protection_preview_estimate(request,values))
+
+    def _manual_candidate_request(self, service, identity, observation, values, as_of):
+        from .polymarket_lp_risk import evaluate_lp_entry
+        from .polymarket_lp_views import _next_review_at
+        cid, token = identity['condition_id'], identity['token_id']
+        if not service._candidate_allowed(((cid, token),)):
+            raise ValueError('candidate_cooling_down')
+        catalog = observation.source_frame.sources[f'market:{cid}:{token}'].value['rewards']
+        reward = next(v for v in catalog['markets'] if v['condition_id'] == cid)
+        direction = dict(market=values['market'], book=values['book'],
+            reward_active=reward.get('reward_active'), daily_pool_usd=reward.get('daily_pool_usd'),
+            reward_checked_at=reward.get('reward_checked_at', reward.get('checked_at', catalog.get('checked_at'))),
+            reward_guidance_deadline=service._reward_guidance_deadline(reward))
+        level = identity.get('candidate_bid_level', identity.get('bid_level', 1))
+        evaluated = evaluate_lp_entry(direction, account=values['account'], now=as_of,
+            reservations=(), candidate=True, bid_level=level)
+        if evaluated.get('state') != 'eligible':
+            raise ValueError(next(iter(evaluated.get('reason_codes', ())), 'candidate_not_eligible'))
+        guide = evaluated['guidance']
+        return service._normalize_request(dict(identity, price=guide['price'], quantity=guide['quantity'],
+            review_at=_next_review_at(as_of), candidate_policy='best_bid_minimum', candidate_bid_level=level))
+
+    def manual_preview(self, service, payload, *, candidate=False):
+        try:
+            if candidate:
+                if not isinstance(payload, Mapping):
+                    raise ValueError('candidate_invalid')
+                request = {}
+                for key in ('market_id', 'condition_id', 'token_id'):
+                    value = str(payload.get(key) or '').strip()
+                    if not value:
+                        raise ValueError(key+'_invalid')
+                    request[key] = value
+                request['outcome'] = str(payload.get('outcome') or '').upper()
+                if request['outcome'] not in ('YES', 'NO'):
+                    raise ValueError('outcome_invalid')
+                if 'candidate_bid_level' in payload:
+                    request['candidate_bid_level'] = payload['candidate_bid_level']
+                observation, values, as_of = self._manual_observe(request)
+                request = self._manual_candidate_request(service, request, observation, values, as_of)
+            else:
+                request = service._normalize_request(payload)
+                observation, values, as_of = self._manual_observe(request)
+            facts = service._validate_snapshot(request, values, now=as_of, reservations=())
+        except ValueError as exc:
+            return dict(state='rejected', reason=str(exc))
+        expires = as_of + timedelta(seconds=10)
+        preview_id = self.store.create_preview(self._manual_json(dict(request, preflight=facts)),
+            expires_at=expires.isoformat(), created_at=as_of.isoformat())
+        return dict(state='previewed', preview_id=preview_id, expires_at=expires.isoformat(),
+            request=request, preflight=facts,
+            queue_protection_estimate=service._queue_protection_preview_estimate(request, values))
+
+    def manual_entry(self, service, payload, key, lease, *, preview_id=None, group=None):
+        credential = None
+        if preview_id is not None:
+            credential = self.store.lp_preview(preview_id)
+            if credential is None:
+                return dict(state='rejected',reason='preview_not_found')
+            if self._utc_now() >= datetime.fromisoformat(credential['expires_at'].replace('Z','+00:00')):
+                return dict(state='rejected',reason='preview_expired')
+            if credential.get('consumed_at') is not None:
+                return dict(state='rejected',reason='preview_consumed')
+            if credential.get('session_id') != (group['identity']['session_id'] if group else None):
+                return dict(state='rejected',reason='preview_session_mismatch')
+            payload = credential
+        request = (self._manual_augment_request(service,group,payload) if group else service._normalize_request(payload))  # malformed public input keeps ValueError/HTTP400
+        try:
+            observation, values, as_of = self._manual_observe(request)
+            facts = (self._manual_validate_augment(service,group,request,values,as_of) if group else
+                service._validate_snapshot(request, values, now=as_of, reservations=()))
+            if credential is not None:
+                prior = credential.get('preflight')
+                best = prior.get('best_bid') if isinstance(prior,Mapping) else None
+                if best is not None and Decimal(str(best)) != facts['best_bid']:
+                    raise ValueError('best_bid_changed')
+                if request.get('candidate_policy') == 'best_bid_minimum':
+                    fresh = self._manual_candidate_request(service,request,observation,values,as_of)
+                    if (fresh['price'],fresh['quantity']) != (request['price'],request['quantity']):
+                        raise ValueError('candidate_changed')
+            if group is None and any(o.key[1] == request['condition_id'] for o in self.state.snapshot().active_orders):
+                raise ValueError('market_already_participating')
+            _, reason = service._lp_history_fact(request['condition_id'], request['token_id'], now=as_of)
+            if reason:
+                raise ValueError(reason)
+        except ValueError as exc:
+            return dict(state='rejected', reason=str(exc))
+        snapshot = self.state.snapshot()
+        origin = _ManualOrigin(observation.cycle_generation, observation.observation_id,
+            observation.read_ticket.trade_version_at_start, tuple((o.key,o.terms_version) for o in snapshot.orders))
+        sampled_round = self.rounds.snapshot().round_number
+        command = {k:request[k] for k in ('market_id','condition_id','token_id','outcome','price','quantity','review_at')}
+        command.update(kind='augment' if group else 'start' if preview_id is not None else 'entry',account_id=self.account_id,process_epoch=self.process_epoch,
+            request_id=uuid4().hex,session_id=group['identity']['session_id'] if group else uuid4().hex,idempotency_key=key,expiration=facts['entry_expiration'],
+            order_type='GTD',post_only=True)
+        if request.get('estimated_target_quantity') is not None:
+            command['estimated_target_quantity'] = request['estimated_target_quantity']
+        try:
+            claimed = self.store.lp_claim_manual_command(command,preview_id=preview_id,now=as_of)
+        except ValueError as exc:
+            return dict(state='rejected',reason=str(exc))
+        except Exception:
+            return dict(state='needs_attention',reason='manual_identity_unknown')
+        if not claimed['claimed']:
+            return claimed['response']
+        command = claimed['command']
+        terms = BuyTerms(Decimal(command['price']),Decimal(command['quantity']),'GTD',command['expiration'],True,())
+        action = ActionIdentity(command['request_id'],self.account_id,BuyTarget(self.venue,command['token_id'],command['market_id'],terms))
+        context = _ManualContext(origin.cycle_generation, 'manual:'+command['request_id'],
+            sampled_round, origin.observation_id)
+        record = RequestRecord(self.account_id,self.process_epoch,action.request_id,'d2:'+action.request_id,
+            command['condition_id'],command['token_id'],'BUY',terms.price,terms.quantity,as_of,
+            venue=self.venue,cycle_generation=context.cycle_generation,batch_id=context.batch_id,
+            round_number=context.round_number,observation_id=context.observation_id,order_type='GTD',
+            expiration=terms.expiration,post_only=True)
+        self.writer.offer(record)
+        with self.state._lock:
+            occupied = {h.identity.request_id for h in self._native_jobs.values() if h._thread.is_alive()} | self._active_sends
+            admitted = len(occupied) < 2 and self._manual_origin_current(origin)
+            if admitted:
+                self._active_sends.add(action.request_id)
+        try:
+            outcome = (self._buy_admitted(context, action, record, lease, manual_origin=origin,
+                manual_command=command, submit_source=observation.source_frame.sources[f"market:{command['condition_id']}:{command['token_id']}"])
+                if admitted else LocalOutcome(action,LocalStatus.NOT_SENT,True))
+        finally:
+            with self.state._lock:
+                self._active_sends.discard(action.request_id)
+        status = ('accepted' if outcome.status == LocalStatus.ACCEPTED else 'rejected'
+            if outcome.status == LocalStatus.REJECTED else 'not_sent' if outcome.status == LocalStatus.NOT_SENT else 'unknown')
+        if status == 'accepted':
+            response = dict(state='entry_open',session_id=command['session_id'],entry_order_id=outcome.venue_order_id,
+                price=command['price'],quantity=command['quantity'],review_at=command['review_at'],
+                entry_expiration=command['expiration'],submit_status='accepted')
+            if group:
+                response.update(entry_order_id=next(iter(group['entry_order_ids']),None),
+                    augment_order_id=outcome.venue_order_id,order_id=outcome.venue_order_id)
+        elif status in ('rejected','not_sent'):
+            response = dict(state='rejected',session_id=command['session_id'],reason='entry_submit_rejected',submit_status=status)
+        else:
+            response = dict(state='needs_attention',session_id=command['session_id'],submit_status='unknown')
+        try:
+            disposition = self.store.lp_finish_manual_command(command,outcome=status,response=response,
+                venue_order_id=outcome.venue_order_id if status != 'not_sent' else None)
+            if disposition == 'rejected':
+                raise ValueError('manual_result_identity_conflict')
+        except Exception:
+            return dict(state='needs_attention',session_id=command['session_id'],submit_status='unknown',reason='manual_result_unknown')
+        return response
+
+    def _register_manual_opening(self, command, order_key, record, source):
+        with self.state._lock:
+            snapshot = self.state.snapshot()
+            scope = (self.account_id,command['condition_id'],command['token_id'],self.process_epoch+':manual:'+command['session_id'])
+            previous = self._opening_order_associations.get(order_key)
+            if previous is not None and previous.scope != scope:
+                raise ValueError('manual_order_already_owned')
+            order = next(o for o in snapshot.orders if o.key == order_key)
+            unknown = Fact('unknown')
+            stamp = SourceStamp(command['request_id'],checked_at=record.requested_at,complete=True,state='known')
+            existing = snapshot.openings.get(scope)
+            if existing is not None:
+                opening = replace(existing,entry_order_ids=tuple(dict.fromkeys((*existing.entry_order_ids,order_key[3]))),
+                    scope_version=snapshot.scope_versions.get(scope,0)+1)
+            else:
+                opening = OpeningProtection(scope,'opening',None,(order_key[3],),order.size_matched,
+                    OpeningEconomics(scope,unknown,unknown,unknown,unknown,False),Fact('known',False,(order.source,)),
+                    None,unknown,Fact('known',datetime.fromisoformat(command['review_at']),(stamp,)),'none',False,
+                    ScoringState(order.key,'entry',unknown,None,None,None,order.source),snapshot.scope_versions.get(scope,0)+1)
+            scope_orders = tuple(o for o in snapshot.orders if o.key[:3] == scope[:3]
+                and o.key[3] in opening.entry_order_ids)
+            if self.state.apply_protection(OpeningProtectionUpdate(self._protection_guard(snapshot,scope,scope_orders),opening)) != 'applied':
+                raise ValueError('manual_opening_not_applied')
+            if command['session_id'] not in self._manual_groups:
+                self._manual_groups[command['session_id']] = (scope, MappingProxyType(dict(command)))
+            self._opening_order_associations[order_key] = _OpeningOrderAssociation(scope,order_key,command['request_id'],
+                record.observation_id,stamp,requested_at=record.requested_at)
+            book = source.value.get('book') if source and source.complete and not source.error else None
+            if not isinstance(book,Mapping):
+                return
+            baseline = first_observation_baseline(book,price=order.price.value,own_remaining=Decimal(0))
+            if baseline['state'] != 'known':
+                return
+            key = ProtectionKey('queue_bucket',scope,order.price.value,None)
+            book_stamp = self._source_stamp(source)
+            fact = ProtectionBaseline(key,(order_key[3],),order.price.value,Fact('known',baseline['baseline_front'],(book_stamp,)),
+                'submit',book.get('received_at'),book.get('timestamp'),book.get('hash'),1,record.requested_at,Decimal('.5'),book_stamp)
+            self.state.apply_protection(SetBaseline(self._protection_guard(self.state.snapshot(),key,(order,)),fact))
 
     def bind_mutation_admission(self, owner, acquire):
         if self._mutation_owner is not None or not callable(acquire):
@@ -746,9 +1276,11 @@ class LPD2LiveExecution:
         finally:
             lease.release()
 
-    def _buy_admitted(self, token, action, record, lease):
+    def _buy_admitted(self, token, action, record, lease, *, manual_origin=None, manual_command=None, submit_source=None):
         terms = action.target.terms
-        if not lease.allowed() or not self._dispatch_current(token.cycle_generation, running=True):
+        def current():
+            return self._manual_origin_current(manual_origin) if manual_origin is not None else self._dispatch_current(token.cycle_generation, running=True)
+        if not lease.allowed() or not current():
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         try:
             signed = self.trading.lp_create_limit_order(token_id=record.token_id, price=terms.price,
@@ -756,7 +1288,7 @@ class LPD2LiveExecution:
                 **dict(terms.send_options))
         except Exception:
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
-        if not lease.allowed() or not self._dispatch_current(token.cycle_generation, running=True):
+        if not lease.allowed() or not current():
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         native_started_at = self._utc_now()
         try:
@@ -807,8 +1339,11 @@ class LPD2LiveExecution:
             self._last_current_evidence = (action.request_id, 'buy_receipt', applied)
             if applied == 'applied':
                 self._record_requests[key] = replace(record, order_id=venue_id)
-                self._register_opening(key)
-                self._register_submit_baseline(token, action, record, key)
+                if manual_command is None:
+                    self._register_opening(key)
+                    self._register_submit_baseline(token, action, record, key)
+                else:
+                    self._register_manual_opening(manual_command,key,record,submit_source)
             elif applied != 'stale_evidence':
                 return self._uncertain_buy(token, action, record, native_started_at, 'invalid_receipt', venue_id, status)
         return LocalOutcome(action, LocalStatus.ACCEPTED, True, venue_id, status)
@@ -1110,7 +1645,9 @@ class LPD2LiveExecution:
             ownership = self._opening_order_associations.get(order_key)
             if ownership is not None:
                 return  # exact IDs never rebind, including closed exclusion tombstones
-            related = tuple(o for o in snapshot.openings.values() if o.scope[:3] == order_key[:3])
+            manual_scopes = {v[0] for v in self._manual_groups.values()}
+            related = tuple(o for o in snapshot.openings.values()
+                if o.scope[:3] == order_key[:3] and o.scope not in manual_scopes)
             active = tuple(o for o in related if o.phase != 'closed')
             if len(active) > 1:
                 raise ValueError('ambiguous_current_opening')
@@ -1876,6 +2413,24 @@ class LPD2LiveExecution:
             self.state.apply_protection(SetBaseline(
                 self._protection_guard(current, key, orders, observation=True), baseline))
 
+    def _manual_review_deadlines(self):
+        with self.state._lock:
+            snapshot = self.state.snapshot()
+            if not self._protection_frame_current(snapshot):
+                return
+            for scope, _ in tuple(self._manual_groups.values()):
+                opening = snapshot.openings.get(scope)
+                if (opening is None or opening.phase == 'closed' or opening.stop_requested
+                        or opening.review_at.state != 'known' or self._utc_now() < opening.review_at.value):
+                    continue
+                orders = tuple(o for o in snapshot.orders if o.key[:3] == scope[:3]
+                    and o.key[3] in opening.entry_order_ids)
+                review = replace(opening,phase='review',stop_requested=True,review_status='awaiting_reconciliation',
+                    scope_version=snapshot.scope_versions.get(scope,0)+1)
+                self.state.apply_protection(OpeningProtectionUpdate(
+                    self._protection_guard(snapshot,scope,orders,observation=True),review))
+                snapshot = self.state.snapshot()
+
     def run_protection_once(self, *, timeout=2):
         """Evaluate the accepted raw frame; protection never acquires a new book."""
         with self._protection_lock:
@@ -1886,6 +2441,7 @@ class LPD2LiveExecution:
                     or observation.cycle_generation != snapshot.current.cycle_generation
                     or observation.read_ticket.trade_version_at_start != snapshot.trade_version):
                 return ()
+            self._manual_review_deadlines()
             deadline = time.monotonic()+timeout
             if self._refresh_protection_evidence(deadline):
                 return ()  # receipts invalidate the old observation; ordinary reader supplies the next one
@@ -1990,7 +2546,7 @@ class LPD2LiveExecution:
         reader_done = self.reader.close(timeout=max(0, deadline-time.monotonic()))
         control_done = self.control.close(max(0, deadline-time.monotonic())).writer_drained
         with self.state._lock:
-            handles = tuple(self._native_jobs.values())
+            handles = (*self._native_jobs.values(), *self._manual_jobs.values())
         for handle in handles:
             handle._thread.join(timeout=max(0, deadline-time.monotonic()))
         with self._settings_lock:
