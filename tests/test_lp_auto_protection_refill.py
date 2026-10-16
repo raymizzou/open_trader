@@ -204,7 +204,8 @@ def test_two_protection_cycles_refill_from_three_api_buys(runtime, monkeypatch, 
         original_thread,records,commits,errors=[],[],[],[]
         armed=[True]
         revision_sql=("SELECT session_id,json_extract(payload,'$._lp_trade_revision') AS revision "
-            "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?)")
+            "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?) "
+            "AND coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true'")
         class NativeCursor(sqlite3.Cursor):
             def execute(self,sql,parameters=()):
                 self.sql,self.parameters=sql,parameters
