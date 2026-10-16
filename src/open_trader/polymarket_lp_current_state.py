@@ -498,6 +498,31 @@ ProtectionUpdate = SetBaseline | QueueProgressUpdate | CancelEvidenceUpdate | Op
 
 
 @dataclass(frozen=True)
+class BuyExecutionUncertainty:
+    event_id: str
+    request_id: str
+    account_id: str
+    process_epoch: str
+    cycle_generation: str
+    batch_id: str
+    round_number: int
+    observation_id: str
+    venue: str
+    condition_id: str
+    token_id: str
+    price: Decimal
+    quantity: Decimal
+    order_type: Literal['GTC', 'GTD', 'FOK', 'FAK']
+    expiration: int | None
+    post_only: bool
+    send_options: tuple[tuple[str, str | int | bool | None], ...]
+    native_started_at: datetime
+    observed_at: datetime
+    reason: Literal['unknown_timeout', 'unknown_error', 'invalid_receipt']
+    venue_order_id: str | None = None
+
+
+@dataclass(frozen=True)
 class ReceiptEvidence:
     event_id: str
     request_id: str
@@ -593,6 +618,9 @@ class CurrentLPState:
         self._positions = ()
         self._yields = {}
         self._receipt_events = set()
+        self._uncertain_buy_events = {}
+        self._uncertain_buy_requests = {}
+        self._financial_uncertainty_at = None
         self._own_fills = {}
         self._baselines, self._progress, self._failures = {}, {}, {}
         self._openings, self._sells, self._scope_versions = {}, {}, {}
@@ -720,12 +748,20 @@ class CurrentLPState:
                     elif previous.terminal_proof is not None:
                         # A fresh confirming terminal row supports its prepared aggregates;
                         # conflicting LIVE/terms still cannot undo the original exact proof.
-                        confirms_terminal = (same and order.terminal_proof is not None
+                        same_terms = (previous.side, previous.price.value, previous.original_size.value,
+                            previous.order_type.value, previous.expiration.value) == (
+                            order.side, order.price.value, order.original_size.value,
+                            order.order_type.value, order.expiration.value)
+                        resolves_terminal = (same_terms and previous.terminal_proof.matched.state != 'known'
+                            and order.terminal_proof is not None
+                            and self._valid_terminal(order.terminal_proof, previous))
+                        confirms_terminal = ((same or resolves_terminal) and order.terminal_proof is not None
                             and order.venue_status == previous.venue_status
                             and (previous.source.checked_at is None or os.checked_at >= previous.source.checked_at))
                         if not confirms_terminal:
                             rejected_order_inputs.add(key)
-                        order = previous
+                        order = (replace(order, terms_version=previous.terms_version + 1)
+                            if confirms_terminal and resolves_terminal else previous)
                     elif previous.source.checked_at and os.checked_at and os.checked_at < previous.source.checked_at:
                         rejected_order_inputs.add(key)
                         order = previous
@@ -786,12 +822,16 @@ class CurrentLPState:
                 yields[k] = BuyYieldState(k, value, yield_sources, evaluated_at, ticket.cycle_generation, since, since_at,
                     previous.current_risk_request_id if previous else None)
             self._yields = yields
-            calculation_orders_valid = orders_complete and not rejected_order_inputs
+            calculation_orders_valid = (orders_complete and not rejected_order_inputs
+                and self._financial_source_current(os, ticket))
+            calculation_positions_valid = positions_complete and self._financial_source_current(ps, ticket)
             self._reserved = _fact(calculation.buy_reserved if calculation_orders_valid else None, os)
-            self._inventory = _fact(calculation.inventory_cost if positions_complete else None, ps)
+            self._inventory = _fact(calculation.inventory_cost if calculation_positions_valid else None, ps)
             balance = stamps.get('balance', SourceStamp(''))
-            self._capacity = _fact(calculation.new_capacity if calculation_orders_valid and positions_complete
-                and balance.state == 'known' and balance.complete else None, *stamps.values())
+            calculation_balance_valid = (balance.state == 'known' and balance.complete
+                and self._financial_source_current(balance, ticket))
+            self._capacity = _fact(calculation.new_capacity if calculation_orders_valid and calculation_positions_valid
+                and calculation_balance_valid else None, *stamps.values())
             self._snapshot_version += 1
             view = CurrentOrderView(self.account_id, self.process_epoch, ticket.cycle_generation,
                 ticket.observation_id, ticket, self._snapshot_version, source_frame, tuple(o for o in orders.values() if o.presence == 'present' and o.terminal_proof is None),
@@ -804,9 +844,14 @@ class CurrentLPState:
                 if pair[0].read_sequence > ticket.read_sequence}
             self._accepted_sequence = ticket.read_sequence
             self._observation = observation
-            partial = (not calculation_orders_valid or not positions_complete
+            partial = (not calculation_orders_valid or not calculation_positions_valid or not calculation_balance_valid
                 or any(s.state != 'known' or not s.complete for s in stamps.values()))
             return Acceptance('partial' if partial else 'accepted', observation)
+
+    def _financial_source_current(self, source: SourceStamp, ticket: ReadTicket) -> bool:
+        floor = self._financial_uncertainty_at
+        return (floor is None or (ticket.started_at > floor
+            and source.checked_at is not None and source.checked_at > floor))
 
     def apply_protection(self, update: ProtectionUpdate) -> str:
         if type(update) not in (SetBaseline, QueueProgressUpdate, CancelEvidenceUpdate,
@@ -1026,7 +1071,13 @@ class CurrentLPState:
     def _valid_terminal(self, proof: TerminalProof, order: CurrentOrderFact) -> bool:
         if (not isinstance(proof, TerminalProof) or not proof.identity_verified
                 or proof.order_key != order.key or proof.status not in _TERMINAL_ORDER_STATES
-                or proof.original_size.state != 'known' or proof.original_size.value != order.original_size.value):
+                or proof.original_size.state != 'known' or proof.original_size.value != order.original_size.value
+                or proof.source.state != 'known' or proof.source.checked_at is None
+                or (order.source.checked_at is not None and proof.source.checked_at < order.source.checked_at)):
+            return False
+        previous = order.terminal_proof
+        if previous is not None and (proof.status != previous.status
+                or (previous.matched.state == 'known' and proof.matched.state != 'known')):
             return False
         if proof.matched.state == 'known':
             if proof.matched.value is None or not 0 <= proof.matched.value <= proof.original_size.value:
@@ -1036,6 +1087,66 @@ class CurrentLPState:
         if proof.status in ('FILLED', 'MATCHED') and proof.matched.value != proof.original_size.value:
             return False
         return True
+
+    def accept_buy_execution_uncertainty(self, evidence: BuyExecutionUncertainty) -> str:
+        with self._lock:
+            if (not isinstance(evidence, BuyExecutionUncertainty)
+                    or evidence.account_id != self.account_id or evidence.process_epoch != self.process_epoch
+                    or not any(generation == evidence.cycle_generation
+                        for _, generation in self._applied_transitions.values())):
+                return 'identity_error'
+            identities = (evidence.event_id, evidence.request_id, evidence.account_id, evidence.process_epoch,
+                evidence.cycle_generation, evidence.batch_id, evidence.observation_id, evidence.venue,
+                evidence.condition_id, evidence.token_id)
+            if (any(not isinstance(value, str) or not value.strip() for value in identities)
+                    or type(evidence.round_number) is not int or evidence.round_number < 0
+                    or not isinstance(evidence.price, Decimal) or not evidence.price.is_finite()
+                    or not 0 < evidence.price < 1
+                    or not isinstance(evidence.quantity, Decimal) or not evidence.quantity.is_finite()
+                    or evidence.quantity <= 0 or evidence.order_type not in ('GTC', 'GTD', 'FOK', 'FAK')
+                    or (evidence.order_type == 'GTD' and (type(evidence.expiration) is not int or evidence.expiration < 0))
+                    or (evidence.order_type != 'GTD' and evidence.expiration is not None)
+                    or type(evidence.post_only) is not bool
+                    or evidence.reason not in ('unknown_timeout', 'unknown_error', 'invalid_receipt')
+                    or (evidence.venue_order_id is not None and (not isinstance(evidence.venue_order_id, str)
+                        or not evidence.venue_order_id.strip()))):
+                return 'identity_error'
+            times = (evidence.native_started_at, evidence.observed_at)
+            if (any(not isinstance(value, datetime) or value.utcoffset() is None
+                    or value.utcoffset().total_seconds() != 0 for value in times)
+                    or evidence.observed_at < evidence.native_started_at):
+                return 'identity_error'
+            options = evidence.send_options
+            if (not isinstance(options, tuple) or any(not isinstance(option, tuple) or len(option) != 2
+                    or not isinstance(option[0], str) or not option[0].strip()
+                    or type(option[1]) not in (str, int, bool, type(None)) for option in options)
+                    or len({option[0] for option in options}) != len(options)):
+                return 'identity_error'
+            # Keep only immutable request identity for process-local replay protection,
+            # never a second workflow or an invented order/venue observation.
+            identity = (evidence.account_id, evidence.process_epoch, evidence.cycle_generation,
+                evidence.batch_id, evidence.round_number, evidence.observation_id, evidence.venue,
+                evidence.condition_id, evidence.token_id, evidence.price, evidence.quantity,
+                evidence.order_type, evidence.expiration, evidence.post_only, tuple(sorted(options)),
+                evidence.native_started_at)
+            event_identity = (evidence.request_id, identity)
+            previous_event = self._uncertain_buy_events.get(evidence.event_id)
+            previous_request = self._uncertain_buy_requests.get(evidence.request_id)
+            if ((previous_event is not None and previous_event != event_identity)
+                    or (previous_request is not None and previous_request != identity)):
+                return 'identity_error'
+            if previous_event is not None or previous_request is not None:
+                return 'stale_evidence'
+            self._uncertain_buy_events[evidence.event_id] = event_identity
+            self._uncertain_buy_requests[evidence.request_id] = identity
+            self._financial_uncertainty_at = (evidence.observed_at if self._financial_uncertainty_at is None
+                else max(self._financial_uncertainty_at, evidence.observed_at))
+            self._reserved = Fact('unknown', sources=self._reserved.sources, reason_codes=('buy_execution_uncertain',))
+            self._inventory = Fact('unknown', sources=self._inventory.sources, reason_codes=('buy_execution_uncertain',))
+            self._capacity = Fact('unknown', sources=self._capacity.sources, reason_codes=('buy_execution_uncertain',))
+            self._trade_version += 1
+            self._snapshot_version += 1
+            return 'applied'
 
     def accept_receipt_evidence(self, evidence: ReceiptEvidence) -> str:
         if not isinstance(evidence, ReceiptEvidence):
@@ -1126,7 +1237,7 @@ class CurrentLPState:
             if proof is not None:
                 matched = proof.matched if proof.matched.state == 'known' else order.size_matched
                 remaining = (_fact(order.original_size.value - matched.value, proof.source)
-                    if matched.state == 'known' else order.remaining)
+                    if proof.matched.state == 'known' else _fact(None, proof.source))
                 order = replace(order, terminal_proof=proof, venue_status=proof.status,
                     size_matched=matched, remaining=remaining, source=proof.source, terms_version=order.terms_version + 1)
                 self._yields.pop(order.key, None)
