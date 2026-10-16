@@ -670,11 +670,29 @@ class LPD2LiveExecution:
                 return attempts
             for key, tickets in tuple(self._deferred_protection_cancels.items()):
                 baseline = snapshot.baselines.get(key)
-                anchors = tuple(o for o in snapshot.active_orders if baseline is not None
-                    and o.key[:3] == key.scope[:3] and o.key[3] in baseline.anchor_order_ids and o.side == 'BUY')
-                if not anchors or any(o.size_matched.state != 'known' or o.size_matched.value != 0 for o in anchors):
+                # Accepted risk cancellation outlives its own anchor's removal.
+                # Resolve the complete exact anchor set from canonical facts;
+                # filtering active_orders could silently drop a terminal member.
+                anchors = tuple(next((o for o in snapshot.orders if o.key == (*key.scope[:3], order_id)), None)
+                    for order_id in baseline.anchor_order_ids) if baseline is not None else ()
+                if not anchors or any(o is None for o in anchors):
+                    continue  # missing identity is unresolved, never a smaller anchor set
+                if any(o.side != 'BUY' or o.price.state == 'known' and o.price.value != key.price
+                        or o.size_matched.state == 'known' and o.size_matched.value > 0
+                        or o.terminal_proof is not None and o.terminal_proof.matched.state == 'known'
+                            and o.terminal_proof.matched.value > 0 for o in anchors):
                     self._deferred_protection_cancels.pop(key, None)
-                    continue
+                    continue  # a real positive fill remains inapplicable
+                if any(o.price.state != 'known' or o.original_size.state != 'known'
+                        or o.size_matched.state != 'known'
+                        or (o.terminal_proof is None and o.presence != 'present')
+                        or (o.terminal_proof is not None and (not o.terminal_proof.identity_verified
+                            or o.terminal_proof.order_key != o.key or o.terminal_proof.matched.state != 'known'
+                            or o.terminal_proof.matched.value != 0 or o.terminal_proof.original_size.state != 'known'
+                            or o.terminal_proof.original_size.value != o.original_size.value
+                            or o.terminal_proof.source.state != 'known' or not o.terminal_proof.source.complete))
+                        for o in anchors):
+                    continue  # terminal UNKNOWN waits; observed lower-bound0 is not final0
                 retained = []
                 for ticket in tickets:
                     current = self.state.snapshot()

@@ -1845,3 +1845,107 @@ def test_d2_resolved_protected_exit_can_sell_only_reconciled_remainder(tmp_path,
         for handle in handles: handle.result(timeout=3)
         assert live.close(timeout=3)
         live.trading.close()
+
+
+@pytest.mark.parametrize('final_matched', ['0', '1'])
+def test_d2_deferred_queue_cancel_survives_successful_anchor_removal(tmp_path, monkeypatch, final_matched):
+    from threading import Event, Condition
+    from tests.test_lp_order_registration_contract import _open_order, CONDITION_ID, TOKEN_ID
+    live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch)
+    releases = {oid: Event() for oid in ('entry-A', 'success-B')}
+    changed, terminal, exact_reads = Condition(), {}, []
+    allow_final = [False]
+    handles = {}
+    def cancel(*, order_ids):
+        oid, = order_ids
+        with changed:
+            sdk.cancels.append(order_ids)
+            changed.notify_all()
+        if oid in releases:
+            assert releases[oid].wait(5), 'actual anchor/peer cancellation completion watchdog'
+        original = next(o for o in sdk.orders if o.id == oid)
+        terminal[oid] = original.model_copy(update={'status': 'CANCELED',
+            'size_matched': Decimal(final_matched) if oid == 'entry-A' else original.size_matched})
+        sdk.orders = tuple(o for o in sdk.orders if o.id != oid)
+        return dict(canceled=order_ids, not_canceled={})  # exact ID ACK has no final quantity
+    def exact(*, order_id):
+        exact_reads.append(order_id)
+        assert order_id == 'entry-A'
+        return terminal.get(order_id) if allow_final[0] else None
+    sdk.cancel_orders, sdk.get_order = cancel, exact
+    def sent(): return [oid for ids in sdk.cancels for oid in ids]
+    try:
+        live.run_once()
+        live.run_protection_once()
+        baseline = next(b for b in live.state.snapshot().baselines.values() if b.key.kind == 'queue_bucket')
+        assert baseline.anchor_order_ids == ('entry-A',)
+        sdk.orders += (_open_order('success-B', 'BUY', price='.30', original='600', matched='100'),
+            _open_order('deferred-C', 'BUY', price='.30', original='100'))
+        public.level, clock[0] = Decimal('4000'), 1
+        live.run_once()
+        attempts = live.run_protection_once()
+        handles = {h.identity.target.existing_order_id: h for h in attempts}
+        with changed: assert changed.wait_for(lambda: set(sent()) == {'entry-A', 'success-B'}, timeout=2)
+        assert len(attempts) == 2 and live.status()['native_inflight'] == 2
+        assert {t.order_key[3] for t in live.state.snapshot().progress[baseline.key].cancel_targets} == {'entry-A', 'success-B'}
+        releases['entry-A'].set()
+        assert handles['entry-A'].result(timeout=3).status.value == 'accepted'
+        handles['entry-A']._thread.join(timeout=2)
+        assert handles['entry-A'].done() and not handles['success-B'].done()
+        assert live.status()['native_inflight'] == 1  # capacity exists; UNKNOWN is the remaining blocker
+        live.run_once()
+        assert live.run_protection_once() == ()
+        snapshot = live.state.snapshot()
+        anchor = next(o for o in snapshot.orders if o.key[3] == 'entry-A')
+        assert anchor not in snapshot.active_orders and anchor.presence == 'absent'
+        assert anchor.terminal_proof.matched.state == 'unknown'
+        unknown_source = anchor.terminal_proof.matched.sources
+        assert unknown_source and anchor.size_matched.value == 0  # observed lower bound is not final0
+        assert sent() == ['entry-A', 'success-B'] or sent() == ['success-B', 'entry-A']
+        assert {t.order_key[3] for t in snapshot.progress[baseline.key].cancel_targets} == {'entry-A', 'success-B'}
+        releases['success-B'].set()
+        handles['success-B'].result(timeout=3)
+        handles['success-B']._thread.join(timeout=2)
+        assert all(h.done() for h in handles.values()) and live.status()['native_inflight'] == 0
+        live.run_once()
+        assert live.run_protection_once() == ()
+        assert set(sent()) == {'entry-A', 'success-B'} and len(sent()) == 2
+        allow_final[0] = True
+        clock[0] += 61  # reader source retry deadline; no source proof is re-stamped by this test
+        live.run_once()
+        before_proof = live.state.snapshot()
+        assert live.run_protection_once() == ()  # real exact final receipt fences old observation
+        proven = live.state.snapshot()
+        anchor = next(o for o in proven.orders if o.key[3] == 'entry-A')
+        assert anchor.terminal_proof.identity_verified and anchor.terminal_proof.matched.value == Decimal(final_matched)
+        assert anchor.terminal_proof.matched.sources != unknown_source
+        assert proven.trade_version > before_proof.trade_version and anchor not in proven.active_orders
+        assert live.run_protection_once() == ()  # no dispatch from the now-stale ordinary frame
+        assert len(sent()) == 2
+        clock[0] += 1
+        live.run_once()
+        remaining = live.run_protection_once()
+        for h in remaining:
+            h.result(timeout=3)
+            h._thread.join(timeout=2)
+            assert h.done()
+        wanted = {'entry-A', 'success-B', 'deferred-C'} if final_matched == '0' else {'entry-A', 'success-B'}
+        assert set(sent()) == wanted and len(sent()) == len(wanted), 'final0 anchor cancellation must preserve the original deferred target'
+        snapshot = live.state.snapshot()
+        assert {t.order_key[3] for t in snapshot.progress[baseline.key].cancel_targets} == wanted
+        assert next(o for o in snapshot.orders if o.key[3] == 'entry-A') not in snapshot.active_orders
+        sdk.orders += (_open_order('new-healthy-after-anchor', 'BUY', price='.30', original='100'),)
+        public.level = Decimal('4000')  # C's genuine first-seen front3900; front3800/level4000=.95
+        for _ in range(2):
+            clock[0] += 1
+            live.run_once()
+            extra = live.run_protection_once()
+            assert extra == (), tuple((p.key.kind, p.key.episode_id, p.reason_codes, p.ratio.value, tuple(t.order_key[3] for t in p.cancel_targets))
+                for p in live.state.snapshot().progress.values())
+        assert set(sent()) == wanted and len(sent()) == len(wanted)
+        assert set(exact_reads) == {'entry-A'} and live.status()['native_inflight'] == 0
+        assert len(sdk.posts) == 1
+    finally:
+        for release in releases.values(): release.set()
+        assert live.close(timeout=3)
+        live.trading.close()
