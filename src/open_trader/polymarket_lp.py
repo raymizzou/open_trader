@@ -9472,7 +9472,8 @@ class PolymarketLPService:
             # ownership/trading state before the single account-wide commit.
             scanned = connection.execute(
                 "SELECT session_id,json_extract(payload,'$._lp_trade_revision') AS revision "
-                "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?)",
+                "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?) "
+                "AND coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true'",
                 (account_id,),
             ).fetchall()
             diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1

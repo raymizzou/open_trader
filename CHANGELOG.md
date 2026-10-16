@@ -3,6 +3,10 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-16
+
+- #351 新增未接入自动运行的同帧输入适配、可丢业务记录 FIFO 与独立可靠控制 Store 端口。适配保留原来源时间、身份及 UNKNOWN；记录容量包含实际写入项，失败不重放，退出丢弃待写项并等待真实写入结束。留档会话只用显式 JSON 布尔标记隔离，不进入旧展示、报表、订单归属、启动恢复、账户发布及修订围栏；不借用真实旧会话。七项组件合同及两项隔离回归保留 RED／GREEN 证据；完整 D2 接线、独立评审及精确提交 CI 尚未完成，未切换或部署。
+
 ## 2026-10-15
 
 - #349 LP metadata 公开读取在当前事实处理完成后异步保存持久缓存，不再等待该保存。普通 FIFO 按 3000 条或 16 MiB（含执行中快照）限额，丢弃最旧待写项；失败记录结果未知且不重放。退出立即丢弃待写项，只回收实际执行中的保存；未结束时保留客户端、Store 与 runtime owner，保存等待不阻止其他生产者停止。原来源时间、正／负缓存 TTL、排除读取及 UNKNOWN 语义保留；聚焦验证记录在任务证据，独立评审与精确提交 CI 由 Main 继续。未合并或部署。

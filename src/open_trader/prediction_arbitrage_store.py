@@ -2951,7 +2951,9 @@ class PredictionArbitrageStore:
 
         with self._read_connection() as connection:
             row = connection.execute(
-                "SELECT * FROM lp_sessions WHERE session_id != ? ORDER BY created_at DESC LIMIT 1",
+                "SELECT * FROM lp_sessions WHERE session_id != ? "
+                "AND coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' "
+                "ORDER BY created_at DESC LIMIT 1",
                 (LP_RESERVED_MANUAL_SESSION_ID,),
             ).fetchone()
         return None if row is None else self._lp_row_result(row)
@@ -2961,7 +2963,8 @@ class PredictionArbitrageStore:
 
         with self._read_connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM lp_sessions ORDER BY created_at, session_id"
+                "SELECT * FROM lp_sessions WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' "
+                "ORDER BY created_at, session_id"
             ).fetchall()
         return [self._lp_row_result(row) for row in rows]
 
@@ -5524,7 +5527,8 @@ class PredictionArbitrageStore:
                 loaded = [
                     (row, _load_payload(str(row["payload"])))
                     for row in tx.execute(
-                        "SELECT * FROM lp_sessions ORDER BY updated_at,session_id"
+                        "SELECT * FROM lp_sessions WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' "
+                        "ORDER BY updated_at,session_id"
                     ).fetchall()
                 ]
                 diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1
@@ -6797,7 +6801,9 @@ class PredictionArbitrageStore:
         )
         now = _utc_now()
         with self._transaction() as tx:
-            for row in tx.execute('SELECT * FROM lp_sessions').fetchall():
+            for row in tx.execute(
+                "SELECT * FROM lp_sessions WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true'"
+            ).fetchall():
                 sid = str(row['session_id'])
                 session = self._lp_row_result(row)
                 payload = _load_payload(str(row['payload']))
@@ -6945,7 +6951,8 @@ class PredictionArbitrageStore:
             document["account_confirmed_fill_facts"] = [dict(trade_id=identity[0], order_id=identity[1],
                 fingerprint=fingerprint) for identity, fingerprint in sorted(frontier.items())]
             loaded = [(row, _load_payload(str(row["payload"]))) for row in tx.execute(
-                "SELECT * FROM lp_sessions ORDER BY session_id"
+                "SELECT * FROM lp_sessions WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' "
+                "ORDER BY session_id"
             ).fetchall()]
             diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1
             diagnostics["session_rows_scanned"] = diagnostics.get("session_rows_scanned", 0) + len(loaded)
@@ -7576,6 +7583,162 @@ class PredictionArbitrageStore:
             ).fetchone()
             assert updated is not None
             return self._lp_row_result(updated)
+
+    @staticmethod
+    def _lp_current_control_values(document, account_id):
+        from types import MappingProxyType
+        if (not isinstance(document, dict) or document.get('account_id') != account_id
+                or type(document.get('desired_running')) is not bool
+                or type(document.get('ever_enabled')) is not bool):
+            raise ValueError('lp_control_identity_or_value_invalid')
+        times = {}
+        for key in ('enabled_at', 'updated_at'):
+            value = document.get(key)
+            if value is None:
+                times[key] = None
+                continue
+            try:
+                stamp = datetime.fromisoformat(value.replace('Z', '+00:00')) if isinstance(value, str) else value
+                if not isinstance(stamp, datetime) or stamp.utcoffset() is None:
+                    raise ValueError
+                times[key] = stamp.astimezone(timezone.utc)
+            except (ValueError, TypeError):
+                raise ValueError('lp_control_timestamp_invalid') from None
+        if ((document['desired_running'] and not document['ever_enabled'])
+                or document['ever_enabled'] != (times['enabled_at'] is not None)):
+            raise ValueError('lp_control_enable_metadata_invalid')
+        return MappingProxyType(dict(account_id=account_id,
+            desired_running=document['desired_running'], ever_enabled=document['ever_enabled'], **times))
+
+    def lp_load_current_control(self, account_id: str):
+        """Load saved control only; a new account starts paused, never running."""
+        if type(account_id) is not str or not account_id.strip():
+            raise ValueError('lp_control_account_required')
+        with self._read_connection() as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+        if row is None:
+            document = dict(account_id=account_id, desired_running=False, ever_enabled=False,
+                            enabled_at=None, updated_at=None)
+        else:
+            document = json.loads(row['payload'])
+        return self._lp_current_control_values(document, account_id)
+
+    def lp_save_current_control(self, write: Mapping[str, object]):
+        """Merge narrow reliable control in the actual transaction, then receipt.
+
+        This port is synchronous and independent of disposable business logging.
+        It neither advances trading generations nor notifies authorization.
+        """
+        from types import MappingProxyType
+        from .polymarket_lp_accounting import default_account_pool_document
+        required = {'account_id', 'process_epoch', 'request_version', 'request_id',
+                    'desired_running', 'requested_at', 'actor'}
+        if not isinstance(write, Mapping) or set(write) != required:
+            raise ValueError('lp_control_write_invalid')
+        values = dict(write)
+        for key in ('account_id', 'process_epoch', 'request_id'):
+            if type(values[key]) is not str or not values[key].strip():
+                raise ValueError('lp_control_identity_required')
+        requested_at = values['requested_at']
+        if (type(values['request_version']) is not int or values['request_version'] < 0
+                or type(values['desired_running']) is not bool
+                or not isinstance(requested_at, datetime) or requested_at.utcoffset() is None
+                or requested_at.utcoffset().total_seconds() != 0
+                or values['actor'] is not None and type(values['actor']) is not str):
+            raise ValueError('lp_control_write_invalid')
+        with self._transaction() as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+            document = (json.loads(row['payload']) if row is not None else
+                        default_account_pool_document(self.path, values['account_id'], datetime.now(timezone.utc)))
+            self._lp_current_control_values(document, values['account_id'])
+            stamp = datetime.now(timezone.utc).isoformat()
+            document.update(desired_running=values['desired_running'], updated_at=stamp)
+            if values['desired_running']:
+                document['ever_enabled'] = True
+                document['enabled_at'] = document['enabled_at'] or stamp
+            connection.execute('INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?) '
+                'ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload',
+                (json.dumps(document),))
+        return MappingProxyType(dict(request_id=values['request_id'], request_version=values['request_version'],
+            desired_running=values['desired_running'], committed_at=datetime.now(timezone.utc)))
+
+    def lp_log_business_record(self, record) -> bool:
+        """Write closed audit values without business permission or notification.
+
+        Only requests may create an inert complete session audit container.
+        Receipt/progress parents are checked in their own actual transaction;
+        an uncertain prior commit is never retried or fabricated here.
+        """
+        from dataclasses import asdict
+        from .lp_business_writer import RequestRecord, ReceiptRecord, ProgressRecord, _encode_scalar
+        from .polymarket_lp_market_reader import CURRENT_ORDER_STATES
+        from .polymarket_lp_risk import TERMINAL_ORDER_STATES
+        if type(record) not in (RequestRecord, ReceiptRecord, ProgressRecord):
+            raise TypeError('closed_business_record_required')
+        def encode(value):
+            return json.dumps(value, ensure_ascii=False, separators=(',', ':'), default=_encode_scalar)
+        values = asdict(record)
+        with self._transaction() as connection:
+            identity = {k: getattr(record, k) for k in (
+                'account_id', 'process_epoch', 'condition_id', 'token_id')}
+            parent_row = connection.execute('SELECT state,payload FROM lp_sessions WHERE session_id=?',
+                                           (record.session_id,)).fetchone()
+            if parent_row is not None:
+                parent = json.loads(parent_row['payload'])
+                # An audit root has only provenance. It must never acquire old
+                # order ownership, reservations, protection or ledger fields.
+                if (parent_row['state'] != 'complete' or parent.get('d2_audit_only') is not True
+                        or set(parent) != set(identity) | {'d2_audit_only'}
+                        or any(parent.get(k) != value for k, value in identity.items())):
+                    return False
+            elif type(record) is not RequestRecord:
+                return False
+            if type(record) is RequestRecord:
+                if parent_row is None:
+                    parent = dict(identity)
+                    parent['d2_audit_only'] = True
+                    stamp = record.requested_at.isoformat()
+                    connection.execute('INSERT INTO lp_sessions VALUES(?,?,?,?,?,?)',
+                        (record.session_id, 'd2-audit:' + record.session_id, 'complete', encode(parent), stamp, stamp))
+                values['d2_record'] = 'request'
+                stamp = record.requested_at.isoformat()
+                existing = connection.execute('SELECT session_id,payload FROM lp_actions WHERE action_key=?',
+                                              (record.request_id,)).fetchone()
+                if existing is not None:
+                    return existing['session_id'] == record.session_id and json.loads(existing['payload']) == json.loads(encode(values))
+                connection.execute('INSERT INTO lp_actions VALUES(?,?,?,?,?,?,?)',
+                    (record.request_id, record.session_id, record.request_id, 'recorded', encode(values), stamp, stamp))
+                return True
+            row = connection.execute('SELECT session_id,payload FROM lp_actions WHERE action_key=?',
+                                     (record.request_id,)).fetchone()
+            if row is None or row['session_id'] != record.session_id:
+                return False
+            original = json.loads(row['payload'])
+            if (original.get('d2_record') != 'request'
+                    or any(original.get(k) != getattr(record, k) for k in (
+                        'account_id', 'process_epoch', 'request_id', 'condition_id', 'token_id'))):
+                return False
+            known_order = original.get('order_id') or (original.get('receipt') or {}).get('order_id')
+            if known_order is not None and record.order_id != known_order:
+                return False
+            if type(record) is ReceiptRecord:
+                original['receipt'] = values
+                stamp = record.received_at.isoformat()
+            else:
+                if (not known_order or not record.order_id
+                        or record.status not in CURRENT_ORDER_STATES | TERMINAL_ORDER_STATES
+                        or record.status in {'FILLED', 'MATCHED'} and record.size_matched != record.original_size
+                        or Decimal(original['quantity']) != record.original_size
+                        or Decimal(original['price']) != record.price):
+                    return False
+                remaining = record.original_size - record.size_matched
+                values['remaining'] = remaining
+                values['reserved_usd'] = remaining * record.price if record.status in CURRENT_ORDER_STATES else Decimal(0)
+                original['progress'] = values
+                stamp = record.checked_at.isoformat()
+            connection.execute('UPDATE lp_actions SET payload=?,updated_at=? WHERE action_key=? AND session_id=?',
+                               (encode(original), stamp, record.request_id, record.session_id))
+        return True
 
     def lp_upsert_action(
         self,
