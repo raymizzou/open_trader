@@ -2606,6 +2606,14 @@ class PolymarketTradingClient:
                     if not metadata or not book or not rewards:
                         raise ValueError('market_source_unknown')
                     return dict(metadata=metadata, rewards=rewards, book=book)
+                if component.startswith('protection:'):
+                    kind, *identity = json.loads(component[len('protection:'):])
+                    if kind == 'scoring' and len(identity) == 1:
+                        return adapter.lp_order_scoring(order_id=identity[0])
+                    if kind == 'order' and len(identity) == 3:
+                        return adapter.lp_protection_order(condition_id=identity[0], token_id=identity[1], order_id=identity[2])
+                    if kind == 'fills' and len(identity) == 2:
+                        return adapter.lp_protection_fills(condition_id=identity[0], token_id=identity[1])
                 raise ValueError('unsupported_current_source')
 
         return CurrentSourcePort()
@@ -6081,6 +6089,47 @@ class PolymarketTradingClient:
 
     def get_order_scoring(self, order_id: str) -> bool:
         return self._client.get_order_scoring(order_id=order_id) is True
+
+    def lp_order_scoring(self, *, order_id: str) -> bool | None:
+        """Exact opt-in protection read; malformed evidence remains UNKNOWN."""
+        if type(order_id) is not str or not order_id:
+            raise ValueError('protection_order_identity')
+        value = self._client.get_order_scoring(order_id=order_id)
+        return value if type(value) is bool else None
+
+    def lp_protection_order(self, *, condition_id: str, token_id: str, order_id: str):
+        """One authoritative exact order; never substitute a credential for a wallet."""
+        raw = self._client.get_order(order_id=order_id)
+        if raw is None:
+            return None
+        original = _model_dict(raw) or {}
+        row = _lp_order(raw)
+        size = _lp_decimal(original.get('original_size'))
+        matched = _lp_decimal(original.get('size_matched'))
+        if (row is None or str(original.get('maker_address') or '').casefold() != self.config.wallet_address.casefold()
+                or row['order_id'] != order_id or row['condition_id'] != condition_id or row['token_id'] != token_id
+                or size is None or matched is None or not 0 <= matched <= size or size <= 0
+                or row['side'] not in ('BUY', 'SELL') or row['price'] is None or not 0 < row['price'] < 1
+                or row['status'] not in ('LIVE', 'OPEN', 'ACCEPTED', 'PARTIALLY_FILLED', 'CANCELED', 'CANCELLED',
+                    'FILLED', 'MATCHED', 'EXPIRED', 'REJECTED', 'FAILED')):
+            raise ValueError('protection_order_unknown')
+        return row
+
+    def lp_protection_fills(self, *, condition_id: str, token_id: str):
+        """Exhaust only this instrument's own trades; SDK list owns pagination."""
+        raw = self._client.list_account_trades(market=condition_id, token_id=token_id,
+            maker_address=self.config.wallet_address)
+        if raw is None:
+            raise ValueError('protection_fills_incomplete')
+        result = []
+        for value in _collect(raw):
+            row, original = _lp_trade(value), _model_dict(value) or {}
+            if row is None or row['condition_id'] != condition_id or row['token_id'] != token_id:
+                raise ValueError('protection_fill_identity')
+            # Keep wallet evidence on taker rows as well. Owner is an API credential.
+            row['maker_address'] = original.get('maker_address')
+            result.append(row)
+        return tuple(result)
 
     def submit_protected_sell(
         self, *, token_id: str, quantity: Decimal, min_price: Decimal

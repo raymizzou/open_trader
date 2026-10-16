@@ -570,3 +570,699 @@ def test_all_uncertain_buy_results_invalidate_financial_authority(tmp_path, monk
             blocker.close()
         assert live.close(timeout=3)
         adapter.close()
+
+
+def _d2_protection_runtime(tmp_path, monkeypatch, *, quantity='2000', submit=True):
+    """Actual D2 components with only SDK responses and business time controlled."""
+    from datetime import timedelta
+    from types import SimpleNamespace
+    from polymarket.models.clob.order_book import OrderBookLevel
+    from polymarket.models.clob.order_response import AcceptedOrder
+    from polymarket.models.clob.rewards import CurrentReward, CurrentRewardConfig
+    from open_trader import polymarket_lp_market_reader, polymarket_trading
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from tests.test_lp_order_registration_contract import _SDKPublicClient, _open_order, CONDITION_ID, TOKEN_ID
+    clock, origin = [0.0], datetime.now(UTC)
+    class ClockMeta(type):
+        def __instancecheck__(cls, value): return isinstance(value, datetime)
+    class BusinessDateTime(datetime, metaclass=ClockMeta):
+        @classmethod
+        def now(cls, tz=None):
+            now = origin + timedelta(seconds=clock[0])
+            return now if tz is not None else now.replace(tzinfo=None)
+    monkeypatch.setattr(polymarket_lp_market_reader, 'datetime', BusinessDateTime)
+    monkeypatch.setattr(polymarket_trading, 'datetime', BusinessDateTime)
+    class Public(_SDKPublicClient):
+        level, bid, ask, reward, failed = Decimal('10000'), Decimal('.30'), Decimal('.32'), Decimal('24'), False
+        book_reads = 0
+        def get_order_book(self, *, token_id):
+            self.book_reads += 1
+            if self.failed:
+                class Unavailable(RuntimeError): retry_after_seconds = 0
+                raise Unavailable('offline current book unavailable')
+            return super().get_order_book(token_id=token_id).model_copy(update={
+                'timestamp': BusinessDateTime.now(UTC),
+                'bids': (OrderBookLevel(price=self.bid, size=self.level),),
+                'asks': (OrderBookLevel(price=self.ask, size=Decimal('10000')),),
+            })
+        def list_market_rewards(self, *, condition_id, sponsored):
+            assert condition_id == CONDITION_ID
+            return (CurrentReward(condition_id=condition_id, rewards_max_spread=10,
+                rewards_min_size=Decimal('1'), rewards_config=(CurrentRewardConfig(
+                    asset_address='0x2791bca1f2de4661ed88a30c99a7a9449aa84174',
+                    start_date=origin-timedelta(days=1), end_date=origin+timedelta(days=1),
+                    rate_per_day=Decimal('0') if sponsored else self.reward),)),)
+    public = Public(origin)
+    adapter, sdk = _adapter(tmp_path, public_client=public)
+    sdk.get_balance_allowance = lambda **kw: SimpleNamespace(balance='100000000000',
+        allowances={sdk.environment.standard_exchange: '100000000000'})
+    sdk.create_limit_order = lambda **kw: dict(kw, order_type='GTC' if kw['expiration'] is None else 'GTD')
+    def post(signed):
+        sdk.posts.append(signed)
+        sdk.orders += (_open_order('entry-A', 'BUY', price=str(signed['price']), original=str(signed['size'])),)
+        return AcceptedOrder(order_id='entry-A', status='live', making_amount=Decimal('0'),
+            taking_amount=Decimal('0'), trade_ids=(), transactions_hashes=())
+    sdk.post_order = post
+    def bounded_empty_trades(**kwargs):
+        assert kwargs == dict(market=CONDITION_ID, token_id=TOKEN_ID, maker_address=WALLET)
+        return ()
+    sdk.list_account_trades = bounded_empty_trades
+    store = PredictionArbitrageStore(tmp_path)
+    seed_running(store)
+    live = LPD2LiveExecution(store, adapter, account_id=WALLET, venue='polymarket',
+        process_epoch='protection-epoch', policy=CalculationPolicy(Decimal('10000'), 1),
+        clock=lambda: clock[0], utc_now=lambda: BusinessDateTime.now(UTC))
+    live.initialize(ValidatedStartAdmission('protection-epoch', 'offline-permit'))
+    live.run_once()  # actual round0 empty cleanup, never seed peer internals
+    if submit:
+        book = adapter.lp_order_books((TOKEN_ID,))[TOKEN_ID]
+        captured = polymarket_lp_market_reader.SourceResult('pre-submit-current-book', (
+            dict(condition_id=CONDITION_ID, market_id='market-1', token_id=TOKEN_ID,
+                venue='polymarket', price=Decimal('.30'), quantity=Decimal(quantity),
+                order_type='GTC', expiration=None, post_only=True, send_options=(),
+                direction=dict(market=dict(reward_min_size=Decimal('1'), reward_max_spread=Decimal('.10')),
+                    book=book, daily_pool_usd=Decimal('24'))),), checked_at=book['received_at'])
+        result = live.run_once(captured)
+        assert [o.status.value for o in result.outcomes] == ['accepted']
+    return live, sdk, public, clock
+
+
+def test_d2_queue_protection_cancels_exact_price_bucket_once(tmp_path, monkeypatch):
+    from threading import Event
+    from tests.test_lp_order_registration_contract import _open_order
+    live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch)
+    entered, release = Event(), Event()
+    def cancel(*, order_ids):
+        sdk.cancels.append(order_ids)
+        entered.set()
+        assert release.wait(5), 'exact queue native cancel release watchdog'
+        return dict(canceled=order_ids, not_canceled={})
+    sdk.cancel_orders = cancel
+    try:
+        live.run_once()
+        before = (sdk.balance_reads, sdk.order_reads, sdk.position_reads, public.book_reads)
+        live.run_protection_once()
+        snap = live.state.snapshot()
+        baseline = next(b for k,b in snap.baselines.items() if k.kind == 'queue_bucket')
+        progress = snap.progress[baseline.key]
+        assert baseline.baseline_front.value == 10000 and baseline.baseline_source == 'submit'
+        assert progress.front_estimate.value == 8000 and progress.level_total.value == 10000
+        assert progress.ratio.value == Decimal('.80') and sdk.cancels == []
+        assert baseline.source.checked_at <= progress.data_time
+        assert before == (sdk.balance_reads, sdk.order_reads, sdk.position_reads, public.book_reads)
+        sdk.orders += (_open_order('manual-peer', 'BUY', price='.30', original='500'),
+            _open_order('other-price', 'BUY', price='.29', original='100'),
+            _open_order('sell-inventory', 'SELL', price='.30', original='100'))
+        public.level = Decimal('5000')
+        live.run_once()
+        before = (sdk.order_reads, public.book_reads)
+        attempts = live.run_protection_once()
+        assert entered.wait(2)
+        snap = live.state.snapshot()
+        progress = snap.progress[baseline.key]
+        assert progress.front_estimate.value == 2500 and progress.level_total.value == 5000
+        assert progress.ratio.value == Decimal('.50')
+        assert {t.order_key[3] for t in progress.cancel_targets} == {'entry-A', 'manual-peer'}
+        assert {oid for ids in sdk.cancels for oid in ids} <= {'entry-A', 'manual-peer'}
+        assert before == (sdk.order_reads, public.book_reads)
+        live.run_protection_once()
+        assert live.status()['native_inflight'] > 0
+        release.set()
+        for attempt in attempts: attempt.result(timeout=3)
+        assert live.close(timeout=3)
+        assert sorted(oid for ids in sdk.cancels for oid in ids) == ['entry-A', 'manual-peer']
+        assert len(sdk.posts) == 1
+    finally:
+        release.set()
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('applicability', ['eligible', 'filled', 'terminal', 'already_requested', 'identity_conflict'])
+def test_d2_queue_outage_nine_ten_keeps_applicability_gates(tmp_path, monkeypatch, applicability):
+    from threading import Event
+    from tests.test_lp_order_registration_contract import CONDITION_ID, TOKEN_ID
+    live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch)
+    release, entered = Event(), Event()
+    pending = None
+    def advance_failed():
+        clock[0] += 1
+        live.run_once()
+        return live.run_protection_once()
+    def failure():
+        return next(f for f in live.state.snapshot().failure_states.values() if f.scope_kind == 'queue_group')
+    try:
+        live.run_once()
+        live.run_protection_once()
+        assert failure().data_failures == 0
+        if applicability == 'eligible':
+            public.failed = True
+            for _ in range(3): advance_failed()
+            assert failure().data_failures == 3
+            public.failed = False
+            clock[0] += 1
+            live.run_once()
+            live.run_protection_once()
+            assert failure().data_failures == 0  # valid evaluation resets the GROUP streak
+        elif applicability == 'filled':
+            sdk.orders = (sdk.orders[0].model_copy(update={'size_matched': Decimal('1')}),)
+        elif applicability == 'terminal':
+            sdk.orders = (sdk.orders[0].model_copy(update={'status': 'CANCELED'}),)
+        elif applicability == 'identity_conflict':
+            sdk.orders = (sdk.orders[0].model_copy(update={'maker_address': '0x'+'f'*40}),)
+        else:
+            def cancel(*, order_ids):
+                sdk.cancels.append(order_ids)
+                entered.set()
+                assert release.wait(5), 'native pre-existing cancel completion watchdog'
+                return dict(canceled=order_ids, not_canceled={})
+            sdk.cancel_orders = cancel
+            pending = live.cancel_independent((WALLET, CONDITION_ID, TOKEN_ID, 'entry-A'))
+            assert entered.wait(2)
+        public.failed = True
+        for _ in range(9): advance_failed()
+        assert failure().data_failures == (9 if applicability == 'eligible' else 0)
+        assert sdk.cancels == ([('entry-A',)] if pending else [])
+        live.run_protection_once()  # same accepted source is not a distinct failed evaluation
+        assert failure().data_failures == (9 if applicability == 'eligible' else 0)
+        attempts = advance_failed()
+        if applicability == 'eligible':
+            for attempt in attempts: attempt.result(timeout=3)
+            assert failure().data_failures == 10
+            assert sdk.cancels == [('entry-A',)]
+            live.run_protection_once()
+            assert sdk.cancels == [('entry-A',)]
+        else:
+            assert attempts == () and failure().data_failures == 0
+            if pending: assert not pending.done() and live.status()['native_inflight'] == 1
+        assert len(sdk.posts) == 1
+    finally:
+        release.set()
+        if pending: pending.result(timeout=3)
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_first_seen_baseline_and_cancel_scope_remain_current(tmp_path, monkeypatch):
+    from tests.test_lp_order_registration_contract import _open_order
+    live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch, submit=False)
+    try:
+        sdk.orders = (_open_order('manual-anchor', 'BUY', price='.30', original='2000'),)
+        public.failed = True
+        clock[0] = 1
+        live.run_once()
+        assert live.run_protection_once() == ()
+        first = next(b for k,b in live.state.snapshot().baselines.items() if k.kind == 'first_seen_episode')
+        assert first.anchor_order_ids == ('manual-anchor',)
+        assert first.baseline_front.state == 'unknown' and first.baseline_front.value is None
+        assert sdk.cancels == []
+        public.failed = False
+        clock[0] = 2
+        valid = live.run_once()
+        live.run_protection_once()
+        snapshot = live.state.snapshot()
+        baseline = snapshot.baselines[first.key]
+        assert baseline.baseline_front.value == 8000 and baseline.baseline_source == 'first_observation'
+        assert baseline.baseline_book_received_at == valid.acceptance.observation.source_frame.sources[
+            'market:'+first.key.scope[1]+':'+first.key.scope[2]].value['book']['received_at']
+        assert snapshot.progress[first.key].ratio.value == Decimal('.80')
+        failure = snapshot.failure_states[first.key]
+        assert failure.scope_kind == 'first_seen_episode' and failure.scope_id == first.key
+        assert first.key.scope not in snapshot.failure_states  # no queue-group counter alias
+        # Foreign current account identity makes the whole list incomplete: no action authority.
+        foreign = _open_order('foreign-buy', 'BUY', price='.30', original='1').model_copy(
+            update={'maker_address': '0x'+'f'*40})
+        sdk.orders += (foreign,)
+        clock[0] = 3
+        live.run_once()
+        assert live.run_protection_once() == () and sdk.cancels == []
+        sdk.orders = (sdk.orders[0], _open_order('manual-peer', 'BUY', price='.30', original='500'),
+            _open_order('another-price', 'BUY', price='.29', original='100'),
+            _open_order('sell-only', 'SELL', price='.30', original='100'))
+        public.level = Decimal('16000')
+        clock[0] = 4
+        accepted = live.run_once()
+        reads = (sdk.order_reads, public.book_reads)
+        attempts = live.run_protection_once()
+        for attempt in attempts: attempt.result(timeout=3)
+        snapshot = live.state.snapshot()
+        assert snapshot.baselines[first.key] is baseline  # never renew the original baseline
+        progress = snapshot.progress[first.key]
+        assert progress.front_estimate.value == 8000 and progress.level_total.value == 16000
+        assert progress.ratio.value == Decimal('.50')
+        assert progress.data_time == accepted.acceptance.observation.source_frame.sources[
+            'market:'+first.key.scope[1]+':'+first.key.scope[2]].value['book']['received_at']
+        assert sorted(oid for ids in sdk.cancels for oid in ids) == ['manual-anchor', 'manual-peer']
+        assert reads == (sdk.order_reads, public.book_reads)
+        live.run_protection_once()
+        assert len(sdk.cancels) == 2 and sdk.posts == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_unknown_yield_protection_cancels_at_600_without_replay(tmp_path, monkeypatch):
+    from tests.test_lp_order_registration_contract import _open_order, CONDITION_ID, TOKEN_ID
+    live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch, submit=False)
+    key = (WALLET, CONDITION_ID, TOKEN_ID, 'unknown-risk')
+    def uncertain_cancel(*, order_ids):
+        sdk.cancels.append(order_ids)
+        raise TimeoutError('offline native cancel outcome unknown')
+    sdk.cancel_orders = uncertain_cancel
+    try:
+        sdk.orders = (_open_order('unknown-risk', 'BUY', price='.30', original='10'),
+            _open_order('sell-no-timer', 'SELL', price='.31', original='10'))
+        public.failed = True
+        live.run_once()
+        live.run_protection_once()
+        assert live.state.snapshot().yields[key].unknown_since_monotonic == 0
+        assert len(live.state.snapshot().yields) == 1 and sdk.cancels == []
+        clock[0] = 500
+        public.failed, public.reward = False, Decimal('0')
+        live.run_once()
+        live.run_protection_once()
+        known = live.state.snapshot().yields[key]
+        assert known.yield_pct_per_hour.value == 0 and known.unknown_since_monotonic is None
+        clock[0] = 501
+        public.failed = True
+        live.run_once()
+        live.run_protection_once()
+        assert live.state.snapshot().yields[key].unknown_since_monotonic == 501
+        live.request_running(False)
+        settle_control(live)
+        clock[0] = 1100
+        candidates, _ = candidates_for_fixed_send()
+        paused = live.run_once(candidates)
+        assert paused.outcomes == () and live.state.snapshot().current.effective_running is False
+        assert live.run_protection_once() == () and sdk.cancels == []  # new UNKNOWN +599
+        clock[0] = 1101
+        live.run_once(candidates)
+        attempts = live.run_protection_once()
+        for attempt in attempts: attempt.result(timeout=3)
+        assert sdk.cancels == [('unknown-risk',)]  # new UNKNOWN +600, even while autoBUY paused
+        assert sdk.posts == [] and sdk.market_orders == []
+        assert next(o for o in live.state.snapshot().orders if o.key == key).terminal_proof is None
+        assert next(o for o in live.state.snapshot().orders if o.key == key).remaining.value == 10
+        live.run_once()
+        live.run_protection_once()
+        assert sdk.cancels == [('unknown-risk',)]  # uncertain result grants no replay
+        assert live.close(timeout=3)
+        before = (sdk.order_reads, public.book_reads, len(sdk.cancels))
+        assert live.run_protection_once() == ()
+        assert before == (sdk.order_reads, public.book_reads, len(sdk.cancels))
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_scoring_review_uses_exact_current_order_and_continuous_window(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from polymarket.models.clob.order_response import AcceptedOrder
+    from open_trader.polymarket_lp_market_reader import SourceResult
+    from tests.test_lp_order_registration_contract import _open_order, CONDITION_ID, TOKEN_ID
+    live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch)
+    entered, release, calls = Event(), Event(), []
+    scope = (WALLET, CONDITION_ID, TOKEN_ID, 'protection-epoch')
+    def score(*, order_id):
+        calls.append((clock[0], order_id))
+        if order_id == 'entry-A':
+            entered.set()
+            assert release.wait(5), 'old scoring native release watchdog'
+            return True
+        assert order_id == 'entry-B'
+        return clock[0] == 35
+    sdk.get_order_scoring = score
+    def opening(): return live.state.snapshot().openings[scope]
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        live.run_once()
+        old = pool.submit(live.run_protection_once)
+        assert entered.wait(2), 'actual exact-order scoring read not started'
+        # A real later BUY receipt changes the target while A is in native I/O.
+        def post(signed):
+            sdk.posts.append(signed)
+            sdk.orders += (_open_order('entry-B', 'BUY', price=str(signed['price']), original=str(signed['size'])),)
+            return AcceptedOrder(order_id='entry-B', status='live', making_amount=Decimal('0'),
+                taking_amount=Decimal('0'), trade_ids=(), transactions_hashes=())
+        sdk.post_order = post
+        book = live.trading.lp_order_books((TOKEN_ID,))[TOKEN_ID]
+        captured = SourceResult('new-current-entry-book', (dict(condition_id=CONDITION_ID,
+            market_id='market-1', token_id=TOKEN_ID, venue='polymarket', price=Decimal('.30'),
+            quantity=Decimal('2000'), order_type='GTC', expiration=None, post_only=True, send_options=(),
+            direction=dict(market=dict(reward_min_size=Decimal('1'), reward_max_spread=Decimal('.10')),
+                book=book, daily_pool_usd=Decimal('24'))),), checked_at=book['received_at'])
+        posted = live.run_once(captured)
+        assert [o.venue_order_id for o in posted.outcomes] == ['entry-B']
+        assert opening().entry_order_ids == ('entry-A', 'entry-B')
+        assert opening().scoring.order_key[3] == 'entry-B'
+        assert opening().scoring.scoring.state == 'unknown' and opening().scoring.checked_at is None
+        release.set()
+        old.result(timeout=3)
+        assert opening().scoring.scoring.state == 'unknown'  # late A=True never attaches to B
+        assert opening().scoring.checked_at is None
+        for second in (0, 30, 35, 40, 99):
+            clock[0] = second
+            live.run_once()
+            live.run_protection_once()
+            current = opening()
+            assert current.scoring.order_key[3] == 'entry-B' and current.scoring.role == 'entry'
+            assert current.scoring.scoring.value is (second == 35)
+            assert current.scoring.lost_since_monotonic == (None if second == 35 else 40 if second >= 40 else 0)
+            assert current.review_status == 'none' and not current.stop_requested
+            assert sdk.cancels == [] and sdk.market_orders == []
+        checked, source = opening().scoring.checked_at, opening().scoring.source
+        clock[0] = 100
+        live.run_once()
+        attempts = live.run_protection_once()
+        for attempt in attempts: attempt.result(timeout=3)
+        current = opening()
+        assert current.phase == 'review' and current.review_status == 'scoring_continuously_lost'
+        assert current.stop_requested and (current.review_at.value-checked).total_seconds() == 1
+        assert current.scoring.checked_at == checked and current.scoring.source == source
+        assert current.scoring.lost_since_monotonic == 40
+        assert calls == [(0, 'entry-A'), (0, 'entry-B'), (30, 'entry-B'), (35, 'entry-B'), (40, 'entry-B'), (99, 'entry-B')]
+        assert sorted(oid for ids in sdk.cancels for oid in ids) == ['entry-A', 'entry-B']
+        assert current.stop_loss_latched.value is False and current.economics.opening_loss_usd.state == 'unknown'
+        assert sdk.market_orders == []  # review alone never forces a sale
+        live.run_protection_once()
+        live.run_once(captured)
+        live.run_protection_once()
+        assert len(sdk.cancels) == 2 and len(sdk.posts) == 2  # no replay or re-entry
+        assert opening().review_at == current.review_at and opening().stop_requested
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def _d2_filled_opening(tmp_path, monkeypatch, *, manual_sale=True):
+    from datetime import timedelta
+    from polymarket.models.clob.order_response import AcceptedOrder
+    from tests.test_lp_order_registration_contract import _open_order, _maker_order, _trade, CONDITION_ID, TOKEN_ID
+    live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch, quantity='100')
+    stamp = next(o.source.checked_at for o in live.state.snapshot().orders if o.key[3] == 'entry-A')
+    clock[0] = 1
+    # A current-process external/manual transaction, observed through the same API.
+    manual = dict(token_id=TOKEN_ID, side='SELL', price=Decimal('.25'), size=Decimal('40'),
+        expiration=None, post_only=False, order_type='GTC')
+    if manual_sale:
+        def manual_post(signed):
+            sdk.posts.append(signed)
+            return AcceptedOrder(order_id='manual-sale', status='matched', making_amount=Decimal('40'),
+                taking_amount=Decimal('10'), trade_ids=('manual-fill',), transactions_hashes=())
+        sdk.post_order = manual_post
+        manual_receipt = sdk.post_order(sdk.create_limit_order(**{k:v for k,v in manual.items() if k != 'order_type'}))
+        assert manual_receipt.making_amount == 40 and manual_receipt.taking_amount == 10
+    sdk.orders = (sdk.orders[0].model_copy(update={'size_matched': Decimal('100'), 'status': 'FILLED'}),
+        _open_order('manual-sale', 'SELL', price='.25', original='40', matched='40', status='FILLED').model_copy(
+            update={'created_at': stamp+timedelta(seconds=1)})) if manual_sale else (sdk.orders[0].model_copy(
+            update={'size_matched': Decimal('100'), 'status': 'FILLED'}),)
+    sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='60' if manual_sale else '100', average_price='.30'),)
+    sdk.trades = tuple(_trade(tid, _maker_order(oid, side, qty, price), size=qty).model_copy(
+        update={'matched_at': stamp+timedelta(seconds=1), 'updated_at': stamp+timedelta(seconds=1)})
+        for tid,oid,side,qty,price in ((('buy-fill','entry-A','BUY','100','.30'), ('manual-fill','manual-sale','SELL','40','.25')) if manual_sale else
+            (('buy-fill','entry-A','BUY','100','.30'),)))
+    sdk.exact_reads, sdk.fill_queries = [], []
+    sdk.allow_exact = False
+    sdk.terminal_orders = {}
+    def exact(*, order_id):
+        sdk.exact_reads.append(order_id)
+        if not sdk.allow_exact: return None
+        return sdk.terminal_orders.get(order_id) or next((o for o in sdk.orders if o.id == order_id), None)
+    sdk.get_order = exact
+    def trades(**kw):
+        sdk.fill_queries.append(kw)
+        assert kw == dict(market=CONDITION_ID, token_id=TOKEN_ID, maker_address=WALLET)
+        return sdk.trades
+    sdk.list_account_trades = trades
+    def post(signed):
+        sdk.posts.append(signed)
+        oid = 'protected-exit' if signed['order_type'] == 'FOK' else 'passive-exit'
+        size = signed.get('size', signed.get('shares'))
+        price = signed.get('price', signed.get('min_price'))
+        sdk.orders += (_open_order(oid, 'SELL', price=str(price), original=str(size),
+            order_type=signed['order_type']),)
+        return AcceptedOrder(order_id=oid, status='live', making_amount=Decimal('0'),
+            taking_amount=Decimal('0'), trade_ids=(), transactions_hashes=())
+    sdk.post_order = post
+    def cancel(*, order_ids):
+        sdk.cancels.append(order_ids)
+        sdk.terminal_orders.update({o.id: o.model_copy(update={'status': 'CANCELED'}) for o in sdk.orders if o.id in order_ids})
+        sdk.orders = tuple(o for o in sdk.orders if o.id not in order_ids)
+        return dict(canceled=order_ids, not_canceled={})
+    sdk.cancel_orders = cancel
+    return live, sdk, public, clock
+
+
+def test_d2_opening_stop_loss_is_current_and_latched_once(tmp_path, monkeypatch):
+    from tests.test_lp_order_registration_contract import CONDITION_ID, TOKEN_ID
+    live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch)
+    scope = (WALLET, CONDITION_ID, TOKEN_ID, 'protection-epoch')
+    def tick():
+        live.run_once()
+        attempts = live.run_protection_once()
+        for attempt in attempts: attempt.result(timeout=3)
+        return live.state.snapshot()
+    try:
+        # Missing actual fee proof remains UNKNOWN; it cannot be defaulted to zero.
+        original = sdk.trades
+        sdk.trades = tuple(t.model_copy(update={'maker_orders': tuple(m.model_copy(
+            update={'fee_rate_bps': None}) for m in t.maker_orders)}) for t in original)
+        tick()
+        unknown = tick().openings[scope]
+        assert unknown.economics.opening_loss_usd.state == 'unknown'
+        assert unknown.stop_loss_latched.value is False and len(sdk.posts) == 2
+        sdk.trades = original
+        public.bid = Decimal('.251')
+        clock[0] = 2
+        tick()  # real own-fill receipt invalidates this accepted observation
+        snapshot = tick()  # only the next ordinary current frame can authorize an exit
+        opening, sell = snapshot.openings[scope], snapshot.sells[scope]
+        assert opening.economics.buy_cost_usd.value == 30
+        assert opening.economics.sold_revenue_usd.value == 10 and opening.economics.fees_usd.value == 0
+        assert opening.economics.residual_exit_value_usd.value == Decimal('15.06')
+        assert opening.economics.opening_loss_usd.value == Decimal('4.94')
+        assert opening.stop_loss_latched.value is False and sell.residual_quantity.value == 60
+        assert sell.passive.submit_quantity.value == 60 and sell.passive.submit_sold_quantity.value == 40
+        assert sell.passive.price.value == Decimal('.32') and sell.passive.order_type.value == 'GTC'
+        assert sdk.posts[-1]['side'] == 'SELL' and sdk.posts[-1]['size'] == 60
+        assert sdk.posts[-1]['expiration'] is None and sdk.posts[-1]['post_only'] is True
+        clock[0] = 3
+        public.bid = Decimal('.25')
+        snapshot = tick()
+        opening = snapshot.openings[scope]
+        assert opening.stop_loss_latched.value is True
+        assert opening.stop_loss_triggered_loss_usd.value == Decimal('5.00')
+        assert sdk.cancels == [('passive-exit',)] and sdk.market_orders == []
+        latched_at = opening.stop_loss_triggered_at
+        assert snapshot.sells[scope].passive.cancel_request_id != snapshot.sells[scope].passive.request_id
+        tick()  # ID-only ACK / missing exact final quantity is not final zero
+        assert sdk.market_orders == []
+        sdk.allow_exact = True
+        tick()  # authoritative exact final matched0 receipt, old frame now stale
+        assert sdk.market_orders == []
+        snapshot = tick()  # joint real native-ended/final0 + fresh order/position reconciliation
+        assert len(sdk.market_orders) == 1
+        assert sdk.market_orders[0]['shares'] == 60 and sdk.market_orders[0]['min_price'] == Decimal('.25')
+        passive, protected = snapshot.sells[scope].passive, snapshot.sells[scope].protected
+        assert passive.state == 'terminal' and passive.native_state == 'ended' and passive.own_fill_evidence is None
+        assert passive.submit_sold_quantity.value == 40 and protected.submit_sold_quantity.value == 40
+        assert protected.submit_quantity.value == protected.submit_residual_quantity.value == 60
+        clock[0] = 4
+        public.bid = Decimal('.30')
+        snapshot = tick()
+        assert snapshot.openings[scope].stop_loss_latched.value is True
+        assert snapshot.openings[scope].stop_loss_triggered_at == latched_at
+        assert len(sdk.market_orders) == 1 and sdk.cancels == [('passive-exit',)]
+        assert set(sdk.exact_reads) == {'passive-exit'}
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_sell_reconciliation_preserves_real_quantity_and_pending_attempt(tmp_path, monkeypatch):
+    from concurrent.futures import TimeoutError as NativeTimeout
+    from threading import Event
+    from polymarket.models.clob.order_response import AcceptedOrder
+    from tests.test_lp_order_registration_contract import _open_order, _maker_order, _trade, CONDITION_ID, TOKEN_ID
+    live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch, manual_sale=False)
+    scope = (WALLET, CONDITION_ID, TOKEN_ID, 'protection-epoch')
+    entered, release = Event(), Event()
+    def post(signed):
+        sdk.posts.append(signed)
+        if signed['order_type'] == 'GTC':
+            sdk.orders += (_open_order('held-passive', 'SELL', price='.32', original='100').model_copy(
+                update={'created_at': live.state.snapshot().orders[0].source.checked_at}),)
+            entered.set()
+            assert release.wait(5), 'passive native post completion watchdog'
+            return AcceptedOrder(order_id='held-passive', status='live', making_amount=Decimal('0'),
+                taking_amount=Decimal('0'), trade_ids=(), transactions_hashes=())
+        sdk.orders += (_open_order('protected-after-held', 'SELL', price=str(signed['min_price']),
+            original=str(signed['shares']), order_type='FOK'),)
+        return AcceptedOrder(order_id='protected-after-held', status='live', making_amount=Decimal('0'),
+            taking_amount=Decimal('0'), trade_ids=(), transactions_hashes=())
+    sdk.post_order = post
+    def tick(*, wait=True):
+        live.run_once()
+        attempts = live.run_protection_once()
+        if wait:
+            for a in attempts: a.result(timeout=3)
+        return attempts
+    try:
+        tick()  # own BUY100 receipt
+        pending, = tick(wait=False)
+        assert entered.wait(2)
+        before = live.state.snapshot()
+        assert before.openings[scope].phase == 'passive_exit'
+        submitted = before.sells[scope].passive
+        assert submitted.submit_quantity.value == submitted.submit_residual_quantity.value == 100
+        assert submitted.submit_sold_quantity.value == 0 and submitted.native_state == 'running'
+        with pytest.raises(NativeTimeout): pending.result(timeout=.01)
+        assert live.status()['native_inflight'] == 1 and not pending.done()
+        # Position60 arrives before this request's sale proof; terminal flag is insufficient.
+        clock[0] = 2
+        public.bid = Decimal('.20')
+        sdk.orders = tuple(o.model_copy(update={'status': 'CANCELED', 'size_matched': Decimal('40')})
+            if o.id == 'held-passive' else o for o in sdk.orders)
+        sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='60', average_price='.30'),)
+        tick()
+        assert live.state.snapshot().sells[scope].position_reconciled is False and sdk.market_orders == []
+        sale = _trade('held-sale40', _maker_order('held-passive', 'SELL', '40', '.32'), size='40')
+        foreign = sale.model_copy(update={'maker_orders': tuple(m.model_copy(
+            update={'maker_address': '0x'+'f'*40, 'owner': WALLET}) for m in sale.maker_orders)})
+        sdk.trades += (foreign,)
+        tick()
+        assert (*scope[:3], 'held-passive') not in live.state.snapshot().own_fills
+        assert sdk.market_orders == []  # credential owner is not wallet evidence
+        # Exact own sale40 arrives while API still says100: opposite mismatch also blocks.
+        sdk.trades = (sdk.trades[0], sale, sale)  # duplicate real trade ID contributes once
+        sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='100', average_price='.30'),)
+        tick()
+        tick()
+        snap = live.state.snapshot()
+        assert snap.own_fills[(*scope[:3], 'held-passive')].quantity.value == 40
+        assert not snap.sells[scope].position_reconciled and sdk.market_orders == []
+        sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='60', average_price='.30'),)
+        tick()
+        assert live.state.snapshot().sells[scope].position_reconciled is True
+        live.request_running(False)
+        settle_control(live)
+        live.request_running(True)
+        settle_control(live)
+        tick()
+        assert not pending.done() and live.status()['native_inflight'] == 1
+        assert sdk.market_orders == [] and live.state.snapshot().sells[scope].passive.request_id == submitted.request_id
+        release.set()
+        pending.result(timeout=3)
+        tick()
+        assert len(sdk.market_orders) == 1 and sdk.market_orders[0]['shares'] == 60
+        snap = live.state.snapshot()
+        passive, protected = snap.sells[scope].passive, snap.sells[scope].protected
+        assert passive.request_id == submitted.request_id and passive.state == 'terminal'
+        assert passive.native_state == 'ended' and passive.submit_sold_quantity.value == 0
+        assert passive.own_fill_evidence.quantity.value == 40 and protected.submit_sold_quantity.value == 40
+        assert protected.submit_quantity.value == protected.submit_residual_quantity.value == 60
+        tick()
+        assert len(sdk.market_orders) == 1  # no duplicate replacement while current protected order unresolved
+    finally:
+        release.set()
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_protection_evidence_is_exact_and_market_bounded(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from tests.test_lp_order_registration_contract import CONDITION_ID, TOKEN_ID
+    live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch, manual_sale=False)
+    scope = (WALLET, CONDITION_ID, TOKEN_ID, 'protection-epoch')
+    release, entered, scoring_calls = Event(), Event(), []
+    pool = ThreadPoolExecutor(max_workers=1)
+    def tick():
+        live.run_once()
+        reads = (sdk.balance_reads, sdk.order_reads, sdk.position_reads, public.book_reads)
+        attempts = live.run_protection_once()
+        for a in attempts: a.result(timeout=3)
+        assert reads == (sdk.balance_reads, sdk.order_reads, sdk.position_reads, public.book_reads)
+        return live.state.snapshot()
+    try:
+        trade = sdk.trades[0]
+        maker = trade.maker_orders[0]
+        bad = (trade.model_copy(update={'maker_orders': (maker.model_copy(update={'maker_address': None, 'owner': WALLET}),)}),
+            trade.model_copy(update={'condition_id': '0x'+'f'*64}),
+            trade.model_copy(update={'token_id': '0x'+'e'*64}),
+            trade.model_copy(update={'maker_orders': (maker.model_copy(update={'price': Decimal('.31')}),)}),
+            None)
+        for malformed in bad:
+            clock[0] += 61
+            sdk.trades = None if malformed is None else (malformed,)
+            snapshot = tick()
+            assert snapshot.openings[scope].economics.opening_loss_usd.state == 'unknown'
+            assert sdk.market_orders == [] and len(sdk.posts) == 1
+        clock[0] += 61
+        sdk.trades = (trade,)
+        tick()  # actual complete own-fill receipt
+        snapshot = tick()
+        assert snapshot.sells[scope].passive.submit_quantity.value == 100
+        assert sdk.exact_reads == []  # complete current terminal BUY is not re-read
+        public.bid = Decimal('.20')
+        tick()
+        assert sdk.cancels == [('passive-exit',)] and sdk.market_orders == []
+        final = sdk.terminal_orders['passive-exit']
+        sdk.allow_exact = True
+        for malformed in (final.model_copy(update={'maker_address': '0x'+'f'*40, 'owner': WALLET}),
+                final.model_copy(update={'token_id': '0x'+'e'*64}),
+                final.model_copy(update={'side': 'BUY'}),
+                final.model_copy(update={'original_size': Decimal('200')}),
+                final.model_copy(update={'size_matched': None})):
+            clock[0] += 61
+            sdk.terminal_orders['passive-exit'] = malformed
+            tick()
+            assert sdk.market_orders == []
+            exact = next(o for o in live.state.snapshot().orders if o.key[3] == 'passive-exit')
+            assert exact.terminal_proof.matched.state == 'unknown'
+        clock[0] += 61
+        sdk.terminal_orders['passive-exit'] = final
+        tick()
+        assert sdk.market_orders == []  # exact receipt invalidates its old ordinary observation
+        tick()
+        assert len(sdk.market_orders) == 1 and sdk.market_orders[0]['shares'] == 100
+        assert set(sdk.exact_reads) == {'passive-exit'}
+        assert all(q == dict(market=CONDITION_ID, token_id=TOKEN_ID, maker_address=WALLET) for q in sdk.fill_queries)
+        # A held scoring native call must time out locally and retain the shared
+        # reader slot. Logical resume cannot release it or start a replacement.
+        def scoring(*, order_id):
+            scoring_calls.append(order_id)
+            assert order_id == 'protected-exit'
+            entered.set()
+            assert release.wait(5), 'protection scoring native completion watchdog'
+            return True
+        sdk.get_order_scoring = scoring
+        clock[0] += 5
+        live.run_once()
+        read = pool.submit(live.run_protection_once, timeout=.02)
+        assert entered.wait(2)
+        assert read.result(timeout=1) == ()  # independent real watchdog; no business-clock sleep
+        assert not live.reader.drain(timeout=0)
+        live.request_running(False)
+        settle_control(live)
+        live.request_running(True)
+        settle_control(live)
+        live.run_once()
+        assert live.run_protection_once(timeout=.02) == ()
+        assert scoring_calls == ['protected-exit'] and not live.reader.drain(timeout=0)
+        assert len(sdk.market_orders) == 1
+        release.set()
+        assert live.reader.drain(timeout=2)
+        clock[0] += 5
+        live.run_once()
+        live.run_protection_once()
+        assert scoring_calls == ['protected-exit', 'protected-exit']
+        assert live.state.snapshot().openings[scope].scoring.role == 'protected_exit'
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+        assert live.close(timeout=3)
+        live.trading.close()

@@ -54,7 +54,7 @@ class RequestRecord:
                 or self.expiration is not None and (type(self.expiration) is not int or self.expiration < 0)
                 or self.post_only is not None and type(self.post_only) is not bool):
             raise ValueError('sealed_record_terms_invalid')
-        if self.kind not in ('BUY', 'CANCEL'):
+        if self.kind not in ('BUY', 'SELL', 'CANCEL'):
             raise ValueError('record_kind_invalid')
         if self.order_id is not None and (type(self.order_id) is not str or not self.order_id.strip()):
             raise ValueError('record_order_identity_invalid')
