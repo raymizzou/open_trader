@@ -1662,10 +1662,11 @@ def serve_prediction_service(
         exit_code=78
     except Exception as exc:
         record_failure = getattr(runtime, "_record_claimed_startup_failure", None)
-        if ready or not callable(record_failure) or not record_failure(exc):
+        if not callable(record_failure) or not record_failure(exc):
             raise
         logging.getLogger(__name__).exception(
-            "prediction_service_fatal origin=startup error=%s", exc)
+            "prediction_service_fatal origin=%s error=%s",
+            "owner_loop" if ready else "startup", exc)
         exit_code = 78
     finally:
         try:
@@ -1738,7 +1739,9 @@ def main(argv: list[str] | None = None) -> int:
             command=[identity.interpreter,'-m','open_trader','prediction-service','--mode','production',
                 '--data-dir',identity.data_dir,'--config',identity.config,'--host',identity.host,
                 '--port',str(identity.port),'--release-manifest',str(actual_manifest)]
-            if args.notifier_config is not None:command.extend(['--notifier-config',str(args.notifier_config)])
+            if args.notifier_config is not None:
+                command.extend(['--notifier-config',str(args.notifier_config.expanduser().absolute())])
+            os.chdir(identity.code_root)
             os.execv(identity.interpreter,command)
             raise RuntimeError('foreground exec returned unexpectedly')
         except (PredictionStartDenied,OSError) as exc:

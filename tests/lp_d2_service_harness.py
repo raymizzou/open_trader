@@ -56,7 +56,7 @@ class ServiceChild:
             shutil.copytree(source/name,self.release_root/name,ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
         tests=self.release_root/'tests';tests.mkdir()
         (tests/'__init__.py').write_text('')
-        for name in ('lp_d2_service_harness.py','test_lp_order_registration_contract.py','test_deployment_preflight.py','test_lp_d2_service_lifecycle.py','test_lp_d2_startup_integration.py'):
+        for name in ('lp_d2_service_harness.py','test_lp_order_registration_contract.py','test_deployment_preflight.py','test_lp_d2_service_lifecycle.py','test_lp_d2_startup_integration.py','test_lp_d2_service_cutover_repairs.py'):
             shutil.copyfile(source/'tests'/name,tests/name)
         for name in ('pyproject.toml','uv.lock','Dockerfile.dev'):
             shutil.copyfile(source/name,self.release_root/name)
@@ -99,7 +99,7 @@ if port:
         self.output=self.root/('child-'+scenario+'.log')
         self.log_handle=self.output.open('w')
         env=dict(os.environ,PYTHONPATH=str(self.release_root/'src')+os.pathsep+str(self.release_root),PYTHONDONTWRITEBYTECODE='1',OPEN_TRADER_NLEG_PAUSED='1',OPEN_TRADER_DISABLE_NLEG_BACKGROUND='1')
-        self.process=subprocess.Popen([sys.executable,'-m','tests.lp_d2_service_harness','child',str(self.runtime_root),str(self.port),scenario,str(self.config_path)],cwd=self.release_root,env=env,stdout=self.log_handle,stderr=subprocess.STDOUT)
+        self.process=subprocess.Popen([sys.executable,'-m','tests.lp_d2_service_harness','child',str(self.runtime_root),str(self.port),scenario,str(self.config_path)],cwd=getattr(self,'caller_cwd',self.release_root),env=env,stdout=self.log_handle,stderr=subprocess.STDOUT)
         self.wait('service-starting')
         if expected_running is not None:
             self.wait_state(lambda s:s.get('effective_running') is expected_running)
@@ -182,6 +182,34 @@ if port:
                 self.marker(name+'-entered').touch();return
             threading.Event().wait(.01)
         raise AssertionError('unfinished HTTP body was not admitted')
+    def begin_held_read_http(self,name='http'):
+        # An actual accepted incomplete GET header holds the handler without
+        # writing control or changing durable RUN during the fault regression.
+        connection=http.client.HTTPConnection('127.0.0.1',self.port,timeout=40)
+        connection.connect()
+        connection.sock.sendall(b'GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nX-Held: ')
+        results,errors=[],[]
+        def finish_header():
+            try:
+                deadline=time.monotonic()+40
+                while not self.marker('release-'+name).exists():
+                    assert time.monotonic()<deadline,'held read-only HTTP real watchdog'
+                    threading.Event().wait(.01)
+                connection.sock.sendall(b'offline\r\n\r\n')
+                response=http.client.HTTPResponse(connection.sock);response.begin()
+                results.append((response.status,response.read()))
+            except BaseException as exc:errors.append(exc)
+            finally:connection.close();self.marker(name+'-ended').touch()
+        thread=threading.Thread(target=finish_header)
+        self.http_handles[name]=(thread,results,errors)
+        thread.start()
+        deadline=time.monotonic()+5
+        while time.monotonic()<deadline:
+            if self.request('/healthz')['http_load']['active']>=1+len(self.http_handles):
+                self.marker(name+'-entered').touch();return
+            threading.Event().wait(.01)
+        raise AssertionError('unfinished read-only HTTP header was not admitted')
+
     def wait_http(self,name='http'):
         thread,results,errors=self.http_handles[name]
         thread.join(5);assert not thread.is_alive()
@@ -227,6 +255,7 @@ def child(runtime_root,port,scenario,config_path):
     from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
     from open_trader.prediction_service import serve_prediction_service
     from tests.test_lp_order_registration_contract import _adapter,_SDKPublicClient,WALLET,CONDITION_ID,TOKEN_ID,NO_TOKEN_ID
+    release_root=Path(__file__).resolve().parents[1]
     root=Path(runtime_root);config_path=Path(config_path);events=root/'events';now=datetime(2026,10,16,12,tzinfo=UTC)
     def mark(name):(events/name).touch()
     control_native=[];owner_clock_observations=[0]
@@ -247,6 +276,32 @@ def child(runtime_root,port,scenario,config_path):
             assert time.monotonic()<deadline,'independent real native watchdog: '+name
             threading.Event().wait(.01)
         mark(name+'-ended')
+    if scenario=='rollback-current-repair-lock-order':
+        from open_trader.polymarket_lp_current_state import CurrentLPState
+        from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+        from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+        snapshot_code=CurrentLPState.snapshot.__code__
+        reservations_code=PredictionExecutionService.lp_auto_reservations.__code__
+        configure_code=LPD2LiveExecution.configure.__code__
+        def observe_lock_order(frame,event,arg):
+            # Observe real native RLock ownership; never wrap/replace a lock
+            # or any authority operation. Only schedule the two HTTP threads.
+            if not (events/'repair-lock-arm').exists():return observe_lock_order
+            if (event=='call' and frame.f_code is snapshot_code
+                    and frame.f_back.f_code is reservations_code
+                    and not (events/'repair-reservations-state-held').exists()):
+                assert frame.f_locals['self']._lock._is_owned()
+                mark('repair-reservations-state-held')
+                deadline=time.monotonic()+10
+                while not (events/'repair-configure-settings-held').exists():
+                    assert time.monotonic()<deadline,'real lock scheduling watchdog'
+                    threading.Event().wait(.001)
+            if (event=='line' and frame.f_code is configure_code
+                    and frame.f_locals['self']._settings_lock._is_owned()
+                    and not (events/'repair-configure-settings-held').exists()):
+                mark('repair-configure-settings-held')
+            return observe_lock_order
+        threading.settrace(observe_lock_order)
     optional_lock=threading.Lock()
     optional_counts=dict(calls=0,active=0,max_active=0)
     def hold_optional():
@@ -506,6 +561,8 @@ def child(runtime_root,port,scenario,config_path):
             if name=='lp-d2-manual-command' and sql=='BEGIN' and scenario=='reader':
                 hold('manual')
             result=super().execute(sql,*a,**kw)
+            if name=='lp-settings-save' and sql=='COMMIT' and 'repair-lock-order' in scenario:
+                mark('repair-settings-commit-'+str(len(list(events.glob('repair-settings-commit-*')))+1))
             if name=='lp-settings-save' and sql=='COMMIT' and scenario=='reader':hold('settings')
             if name=='lp-control-save' and sql=='COMMIT' and scenario=='late_control':
                 control_native.append(threading.current_thread())
@@ -532,6 +589,17 @@ def child(runtime_root,port,scenario,config_path):
         return adapter
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=NativeSQL))))
+        if scenario=='repair-owner-loop-fault':
+            import socketserver
+            native_select=socketserver._ServerSelector.select
+            def external_selector_io(selector,*a,**kw):
+                if (threading.current_thread().name=='MainThread'
+                        and (events/'owner-loop-fault-arm').exists()
+                        and not (events/'owner-loop-fault-fired').exists()):
+                    mark('owner-loop-fault-fired')
+                    raise OSError('offline owner-loop selector failure')
+                return native_select(selector,*a,**kw)
+            patch.setattr(socketserver._ServerSelector,'select',external_selector_io)
         if scenario in ('consumer-core-init-failure','consumer-legacy-no-generation','consumer-incompatible','consumer-reconcile-error','consumer-reconcile-locked'):
             from open_trader import prediction_runtime as runtime_module
             native_start=runtime_module.PredictionRuntime.start
@@ -841,14 +909,14 @@ def child(runtime_root,port,scenario,config_path):
         launchd_plist=root/'com.open-trader.prediction-service.plist'
         launchd_args=[sys.executable,'-m','open_trader','prediction-service','--mode','production',
             '--data-dir',str(root/'data'),'--config',str(config_path),
-            '--host','127.0.0.1','--port',str(port),'--release-manifest',str(Path.cwd()/'ops/prediction-service-release.json')]
+            '--host','127.0.0.1','--port',str(port),'--release-manifest',str(release_root/'ops/prediction-service-release.json')]
         if launchd:
             import plistlib
             launchd_plist.write_bytes(plistlib.dumps(dict(Label='com.open-trader.prediction-service',
                 WorkingDirectory=str(Path.cwd()),ProgramArguments=launchd_args,
                 EnvironmentVariables=dict(PYTHONPATH=str(Path.cwd()/'src')),
                 RunAtLoad=True,KeepAlive={'SuccessfulExit':False},ExitTimeOut=0)))
-        api=(offline_github_fixture(Path.cwd(),root/'ci-api')
+        api=(offline_github_fixture(release_root,root/'ci-api')
             if not scenario.startswith(('automatic','operator')) else None)
         def external_process(command,*a,**kw):
             if (os.environ.get('D2_FIXTURE_FOREGROUND_OLD_PID') and isinstance(command,list)
@@ -878,7 +946,7 @@ def child(runtime_root,port,scenario,config_path):
             if launchd and isinstance(command,list) and command[0]=='/usr/sbin/lsof' and 'cwd' in command:
                 return subprocess.CompletedProcess(command,0,f'p{os.getpid()}\nfcwd\nn{Path.cwd()}\n','')
             if (isinstance(command,list) and len(command)>2
-                    and command[1]==str(Path.cwd()/'scripts/deployment_preflight.py')
+                    and command[1]==str(release_root/'scripts/deployment_preflight.py')
                     and '--expected-sha' in command):
                 import importlib.util,io
                 from contextlib import redirect_stdout,redirect_stderr
@@ -915,7 +983,7 @@ def child(runtime_root,port,scenario,config_path):
             action='--operator-restart' if scenario.startswith('operator-restart') else '--operator-start'
             raise SystemExit(main(['--mode','production',action,'--data-dir',str(root/'data'),
                 '--config',str(config_path),'--host','127.0.0.1','--port',str(port),
-                '--release-manifest',str(Path.cwd()/'ops/prediction-service-release.json')]))
+                '--release-manifest',str(release_root/'ops/prediction-service-release.json')]))
         if not scenario.startswith('automatic'):
             from contextlib import ExitStack
             with ExitStack() as operation:
@@ -941,7 +1009,7 @@ def child(runtime_root,port,scenario,config_path):
                 threading.Event().wait(.01)
         threading.Thread(target=observe_external_writer,daemon=True).start()
         mark('service-starting')
-        result=serve_prediction_service(data_dir=root/'data',prediction_config_path=config_path,host='127.0.0.1',port=port,mode='production',release_manifest_path=Path.cwd()/'ops/prediction-service-release.json',lp_clock=business_clock,lp_utc_now=utc_clock)
+        result=serve_prediction_service(data_dir=root/'data',prediction_config_path=config_path,host='127.0.0.1',port=port,mode='production',release_manifest_path=release_root/'ops/prediction-service-release.json',lp_clock=business_clock,lp_utc_now=utc_clock)
         raise SystemExit(result)
 
 

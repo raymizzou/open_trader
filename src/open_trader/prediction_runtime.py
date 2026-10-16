@@ -1112,11 +1112,11 @@ class PredictionRuntime:
             raise
 
     def _record_claimed_startup_failure(self, cause: Exception) -> bool:
-        """Keep an unsuccessful claimed startup out of normal rearm cleanup."""
+        """Keep claimed production failures out of normal rearm cleanup."""
         if self._mode != "production" or self._lp_start_claim is None:
             return False
         if self._fatal is None:
-            failure = PredictionRuntimeFatal("claimed production startup failed")
+            failure = PredictionRuntimeFatal("claimed production failed")
             failure.__cause__ = cause
             self._fatal = failure
         return True

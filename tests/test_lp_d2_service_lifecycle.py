@@ -311,16 +311,20 @@ def test_supported_rollback_uses_current_api_without_disposable_record_audit(tmp
 
 
 
-def _assert_foreground_operator_entry(root):
+def _assert_foreground_operator_entry(root,*,caller_cwd=None):
     from decimal import Decimal
     import os,sys,subprocess
     with ServiceChild(root,scenario='rollback-current-foreground-cli') as child:
+        if caller_cwd is not None:child.caller_cwd=caller_cwd
         child.release('metadata');child.start(expected_running=False)
         execution=json.loads(child.marker('foreground-native-exec').read_text())
         assert execution['pid']==child.process.pid
         assert not any(value.startswith('--operator-') for value in execution['arguments'])
         health=child.request('/healthz')
         assert health['pid']==child.process.pid and health['production_owner'] is True
+        if caller_cwd is not None:
+            assert health['cwd']==str(child.release_root)
+            assert health['git_sha']==child.sha
         permit=json.loads(child.permit_path.read_text())
         assert permit['state']=='CLAIMED' and permit['pid']==child.process.pid
         state=child.wait_state(lambda s:s.get('current_exposure_usd') is not None)
@@ -339,7 +343,7 @@ def _assert_foreground_operator_entry(root):
             with output.open('w') as handle:
                 process=subprocess.Popen([sys.executable,'-m','tests.lp_d2_service_harness','child',
                     str(child.runtime_root),str(child.port),'operator-'+action+'-foreground-cli',
-                    str(child.config_path)],cwd=child.release_root,env=environment,
+                    str(child.config_path)],cwd=caller_cwd or child.release_root,env=environment,
                     stdout=handle,stderr=subprocess.STDOUT)
             return process,output
         for wrong,expected in ((True,78),(False,0)):
@@ -632,7 +636,7 @@ def _assert_superseded_target_drain(root):
         child.process.terminate();assert child.wait_exit()==0
 
 
-def _assert_systemd_service_identity(child,monkeypatch):
+def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
     """Actual manager/guard/files/flocks, with external OS ownership simulated.
 
     This never changes host ownership or invokes systemd. Metadata returned by
@@ -939,6 +943,11 @@ def _assert_systemd_service_identity(child,monkeypatch):
         with monkeypatch.context() as manager_os:
             manager_os.setattr(Path,'read_text',kernel_text)
             manager_os.setattr(subprocess,'run',manager_process)
+            if restart_recovery is not None:
+                # Reuse the real files/producer/guard/flocks and external OS
+                # view for the accepted explicit absent-restart regression.
+                restart_recovery(c,starts,BeforeExternalServiceCreation)
+                return
             _assert_systemd_stopped_target_transition(child,c,starts,manager_process,monkeypatch)
             unarmed=permit.read_bytes()
             prepared=cloud.operate(c,'prepare-target',prepare_for='start')

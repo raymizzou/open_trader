@@ -1066,7 +1066,7 @@ class PredictionExecutionService:
             live=self._lp_d2
             with live.state._lock:
                 snapshot=live.state.snapshot()
-                state=self.lp_auto_state(include_intents=False)
+                status=live.control.status()
                 rows=[]
                 for order in snapshot.active_orders:
                     if order.side!='BUY':continue
@@ -1077,8 +1077,12 @@ class PredictionExecutionService:
                         amount_usd=str(order.price.value*order.remaining.value) if known else None,
                         releasable=False,reason='current_api_reservations_not_releasable'))
                 return dict(authority='current_api',account_id=live.account_id,
-                    desired_running=state['desired_running'],reservations=rows,
-                    **{k:state[k] for k in ('buy_reserved_usd','inventory_cost_usd','current_exposure_usd','new_capacity_usd')})
+                    desired_running=status.requested_running,reservations=rows,
+                    **{name:str(fact.value) if fact.state=='known' else None
+                        for name,fact in (('buy_reserved_usd',snapshot.buy_reserved),
+                            ('inventory_cost_usd',snapshot.inventory_cost),
+                            ('current_exposure_usd',snapshot.current_exposure),
+                            ('new_capacity_usd',snapshot.new_capacity))})
         return self._lp_auto_pool().reservations()
 
     def lp_auto_release_reservations(self, payload, *, audit=None):

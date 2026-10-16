@@ -1040,6 +1040,13 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
                 run('systemctl','stop',UNIT,timeout=100)
                 absent(c)
                 record(c,'stopped',operation_fd=lock.fileno())
+            elif action=='restart' and c.mode=='production':
+                # A crashed or failed instance can leave its historical label
+                # after the actual process and native owner have disappeared.
+                absent(c)
+                saved=verified_record(c,('ready','failed','stopped','maintenance'))
+                if saved['state'] in ('ready','failed'):
+                    record(c,'stopped',operation_fd=lock.fileno())
             if c.mode == 'shadow' and c.n_leg_paused == 1:
                 from .prediction_shadow_resources import require_host_headroom
                 require_host_headroom(c.memory_max_bytes)
