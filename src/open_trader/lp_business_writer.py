@@ -24,12 +24,36 @@ class RequestRecord:
     quantity: Decimal
     requested_at: datetime
     order_id: str | None = None
+    venue: str | None = None
+    cycle_generation: str | None = None
+    batch_id: str | None = None
+    round_number: int | None = None
+    observation_id: str | None = None
+    order_type: str | None = None
+    expiration: int | None = None
+    post_only: bool | None = None
+    send_options: tuple = ()
 
     def __post_init__(self):
         for value in (self.account_id, self.process_epoch, self.request_id, self.session_id,
                       self.condition_id, self.token_id):
             if type(value) is not str or not value.strip():
                 raise ValueError('record_identity_required')
+        sealed = (self.venue, self.cycle_generation, self.batch_id, self.observation_id)
+        if any(v is not None for v in sealed) and (
+                any(type(v) is not str or not v for v in sealed)
+                or type(self.round_number) is not int or self.round_number < 0):
+            raise ValueError('sealed_record_identity_invalid')
+        if (not isinstance(self.send_options, tuple)
+                or any(not isinstance(item, tuple) or len(item) != 2
+                    or type(item[0]) is not str
+                    or not isinstance(item[1], (str, bool, int, Decimal, type(None)))
+                    for item in self.send_options)):
+            raise ValueError('sealed_record_options_invalid')
+        if (self.order_type is not None and (type(self.order_type) is not str or not self.order_type)
+                or self.expiration is not None and (type(self.expiration) is not int or self.expiration < 0)
+                or self.post_only is not None and type(self.post_only) is not bool):
+            raise ValueError('sealed_record_terms_invalid')
         if self.kind not in ('BUY', 'CANCEL'):
             raise ValueError('record_kind_invalid')
         if self.order_id is not None and (type(self.order_id) is not str or not self.order_id.strip()):
@@ -54,10 +78,15 @@ class ReceiptRecord:
     order_id: str | None
     outcome: str
     received_at: datetime
+    reason_code: str | None = None
 
     def __post_init__(self):
         _validate_evidence(self, self.received_at)
-        if self.outcome not in ('accepted', 'rejected', 'unknown'):
+        if self.reason_code is not None and (type(self.reason_code) is not str or self.reason_code not in {
+                'unsupported_order_shape', 'ambiguous_send_options', 'unsupported_send_option',
+                'invalid_builder_code', 'control_or_native_not_current'}):
+            raise ValueError('record_reason_code_invalid')
+        if self.outcome not in ('accepted', 'rejected', 'unknown', 'not_sent'):
             raise ValueError('record_outcome_invalid')
 
 

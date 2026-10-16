@@ -6058,6 +6058,8 @@ class PolymarketTradingClient:
 
         expiration = kwargs.get("expiration")
         post_only = kwargs.get("post_only")
+        builder = ({"builder_code": cast(str | None, kwargs["builder_code"])}
+                   if "builder_code" in kwargs else {})
         signed = self._client.create_limit_order(
             token_id=str(kwargs["token_id"]),
             price=cast(Decimal, kwargs["price"]),
@@ -6065,6 +6067,7 @@ class PolymarketTradingClient:
             side=cast(str, kwargs["side"]),
             post_only=post_only is True,
             expiration=cast(int | None, expiration),
+            **builder,
         )
         if post_only is not True:
             raise PolymarketTradingError("order_shape_mismatch")

@@ -485,3 +485,113 @@ def test_audit_write_during_account_registration_preserves_real_fences(tmp_path)
         assert not thread.is_alive()
         writer.close(timeout=3)
         adapter.close()
+
+
+def test_missing_request_drops_receipt_without_blocking_live_outcome(tmp_path, monkeypatch):
+    from open_trader.lp_business_writer import LPBusinessWriter
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from open_trader.polymarket_lp_current_state import ValidatedStartAdmission
+    from open_trader.polymarket_lp_market_calculation import CalculationPolicy
+    from tests.test_lp_d2_integration import seed_running
+    from tests.test_lp_order_registration_contract import _adapter, _open_order, WALLET, CONDITION_ID, TOKEN_ID
+    store = PredictionArbitrageStore(tmp_path)
+    seed_running(store)
+    adapter, sdk = _adapter(tmp_path, orders=(_open_order('live-A', 'BUY', price='.40', original='10'),))
+    blocker, entered = blocked_database(store, monkeypatch)
+    writer = LPBusinessWriter(store, policy=dict(max_entries=2, max_encoded_bytes=100_000))
+    live = LPD2LiveExecution(store, adapter, account_id=WALLET, venue='polymarket',
+        process_epoch='live-loss', policy=CalculationPolicy(Decimal('40')), writer=writer)
+    cancel = sdk.cancel_orders
+    def accepted_with_eviction(*, order_ids):
+        # Native SDK boundary evicts the original pending request before receipt.
+        writer.offer(request('eviction-after-seal'))
+        return cancel(order_ids=order_ids)
+    sdk.cancel_orders = accepted_with_eviction
+    try:
+        writer.offer(request('held-inflight'))
+        assert entered.wait(2)
+        live.initialize(ValidatedStartAdmission('live-loss', 'offline-permit'))
+        result = live.run_once()
+        assert result.outcomes[0].status.value == 'accepted'
+        action = result.outcomes[0].identity
+        assert action.target.existing_order_id == 'live-A' and action.account_id == WALLET
+        assert live.rounds.snapshot().round_number == 1
+        key = (WALLET, CONDITION_ID, TOKEN_ID, 'live-A')
+        order = next(o for o in live.state.snapshot().orders if o.key == key)
+        assert order.terminal_proof.status == 'CANCELED'
+        assert sdk.cancels == [('live-A',)] and sdk.posts == []
+        status = writer.status()
+        assert status['inflight_entries'] == 1 and status['dropped_overflow'] >= 1
+        assert stored_actions(store) == []  # business DB has still not committed
+        blocker.execute('COMMIT')
+        wait_status(writer, lambda s: s['pending_entries'] == s['inflight_entries'] == 0)
+        assert writer.status()['dropped_parent'] == 1
+        assert all(identity != action.request_id for identity, _ in stored_actions(store))
+        assert store.lp_session('d2:' + action.request_id) is None
+        assert len(sdk.cancels) == 1  # no history fabrication or replay on drain
+    finally:
+        if blocker.in_transaction: blocker.execute('ROLLBACK')
+        blocker.close()
+        assert live.close(timeout=3)
+        adapter.close()
+
+
+def test_current_api_updates_existing_request_after_missing_receipt(tmp_path, monkeypatch):
+    from open_trader.lp_business_writer import LPBusinessWriter
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from open_trader.polymarket_lp_current_state import ValidatedStartAdmission
+    from open_trader.polymarket_lp_market_calculation import CalculationPolicy
+    from tests.test_lp_d2_integration import seed_running
+    from tests.test_lp_order_registration_contract import _adapter, _open_order, WALLET, TOKEN_ID, CONDITION_ID
+    store = PredictionArbitrageStore(tmp_path)
+    seed_running(store)
+    adapter, sdk = _adapter(tmp_path, orders=(_open_order('api-A', 'BUY', price='.40', original='10'),))
+    writer = LPBusinessWriter(store, policy=dict(max_entries=1, max_encoded_bytes=100_000))
+    live = LPD2LiveExecution(store, adapter, account_id=WALLET, venue='polymarket',
+        process_epoch='api-progress', policy=CalculationPolicy(Decimal('40')), writer=writer)
+    held = []
+    def cancel_with_lost_receipt(*, order_ids):
+        assert order_ids == ('api-A',)
+        sdk.cancels.append(order_ids)
+        wait_status(writer, lambda s: s['saved_entries'] == 1)
+        blocker, entered = blocked_database(store, monkeypatch)
+        held.append(blocker)
+        writer.offer(request('unrelated-inflight'))
+        assert entered.wait(2)
+        raise RuntimeError('offline uncertain local outcome')
+    sdk.cancel_orders = cancel_with_lost_receipt
+    sdk.list_account_trades = lambda: pytest.fail('D2 progress attempted history sweep')
+    try:
+        live.initialize(ValidatedStartAdmission('api-progress', 'offline-permit'))
+        result = live.run_once()
+        [outcome] = result.outcomes
+        assert outcome.status.value == 'unknown_error'
+        assert writer.status()['dropped_inflight_capacity'] == 1
+        action_id = outcome.identity.request_id
+        stored = dict(stored_actions(store))[action_id]
+        assert 'receipt' not in stored and stored['order_id'] == 'api-A'
+        held[0].execute('COMMIT')
+        wait_status(writer, lambda s: s['saved_entries'] == 2)
+        sdk.orders = (_open_order('api-A', 'BUY', price='.40', original='10', matched='3'),)
+        later = live.run_once()
+        snapshot = live.state.snapshot()
+        current = next(o for o in snapshot.orders if o.key == (WALLET, CONDITION_ID, TOKEN_ID, 'api-A'))
+        assert current.remaining.value == 7
+        assert snapshot.buy_reserved.value == Decimal('2.80')
+        wait_status(writer, lambda s: s['saved_entries'] == 3)
+        saved = dict(stored_actions(store))[action_id]
+        assert saved['progress']['order_id'] == 'api-A'
+        assert saved['progress']['remaining'] == '7' and saved['progress']['reserved_usd'] == '2.80'
+        assert 'receipt' not in saved
+        sdk.orders = (_open_order('unrelated-B', 'BUY', price='.40', original='10', matched='3'),)
+        live.run_once()
+        assert dict(stored_actions(store))[action_id] == saved  # matching terms cannot borrow the other ID
+        assert writer.status()['saved_entries'] == 3
+        assert sdk.cancels == [('api-A',)] and sdk.posts == []
+        assert later.acceptance.observation.source_frame.history_fees is None
+    finally:
+        for blocker in held:
+            if blocker.in_transaction: blocker.execute('ROLLBACK')
+            blocker.close()
+        assert live.close(timeout=3)
+        adapter.close()
