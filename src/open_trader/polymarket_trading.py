@@ -42,6 +42,7 @@ from polymarket import BuilderApiKey, PRODUCTION, PublicClient, SecureClient
 from polymarket._internal.wallet import signature_type_for
 
 from .polymarket_lp_errors import LpObservationWait
+from .lp_metadata_cache import DISPLAY_FIELDS, LPMetadataCache, cache_policy
 from .lp_metadata_writer import LPMetadataWriter, empty_status, writer_policy
 from .polymarket_lp_scratch import LPReadRows, LPReadScratch
 from .prediction_arbitrage import (
@@ -1447,12 +1448,12 @@ def _iter_reward_items(value: object, stop_event: threading.Event | None):
 
 
 def _collect_lp_market_pages(
-    value: object, requested: set[str]
+    value: object, requested: set[str], *, planning_only: bool = False
 ) -> tuple[Mapping[str, object], ...]:
     def project(items: object) -> tuple[Mapping[str, object], ...]:
         return tuple(
             facts for item in _collect(items)
-            if (facts := _lp_market_facts(item)) is not None
+            if (facts := _lp_market_facts(item, planning_only=planning_only)) is not None
         )
 
     first_page = getattr(value, "first_page", None)
@@ -1528,7 +1529,7 @@ def _lp_event_facts(value: object) -> Mapping[str, object] | None:
     return None
 
 
-def _lp_market_facts(value: object) -> Mapping[str, object] | None:
+def _lp_market_facts(value: object, *, planning_only: bool = False) -> Mapping[str, object] | None:
     """Project LP inputs before a completed worker can retain the SDK tree."""
     fields = {
         "id", "market_id", "condition_id", "conditionId", "slug", "question",
@@ -1536,6 +1537,8 @@ def _lp_market_facts(value: object) -> Mapping[str, object] | None:
         "prices", "outcomes", "events", "rewards_max_spread", "rewards_min_size",
         "taker_fee_rate",
     }
+    if planning_only:
+        fields -= {"slug", "question", "title", "market_url", "url", "prices"}
     if isinstance(value, Mapping):
         return {key: value[key] for key in fields if key in value}
     model_dump = getattr(value, "model_dump", None)
@@ -2193,6 +2196,7 @@ class PolymarketTradingClient:
         public_client_factory: Callable[[], object] | None = None,
         metadata_cache: object | None = None,
         metadata_writer_policy: Mapping[str, int] | None = None,
+        metadata_cache_policy: Mapping[str, int] | None = None,
     ) -> None:
         self.config = config
         self._client = client
@@ -2211,14 +2215,15 @@ class PolymarketTradingClient:
         self._lp_public_reads: dict[str, Future] = {}
         self._lp_public_read_retry: dict[str, tuple[float, dict[str, object]]] = {}
         self._metadata_cache = metadata_cache
+        self._metadata_cache_policy = cache_policy(metadata_cache_policy)
+        self._metadata_initialization_state = "NOT_ATTACHED"
+        self._metadata_persistence_enabled = False
         self._metadata_writer: LPMetadataWriter | None = None
         self._metadata_writer_closed = False
         self._metadata_closed_drops = 0
         self._metadata_writer_policy = writer_policy(metadata_writer_policy)
         self._candidate_exclusions_enabled = False
-        self._metadata_entries: MutableMapping[
-            str, tuple[float, dict[str, object] | None]
-        ] = LPReadScratch()
+        self._metadata_entries = LPMetadataCache(self._metadata_cache_policy)
         self._metadata_lock = threading.Lock()
         self._lp_order_read_lock = threading.Lock()
         self._lp_order_read_failures = {}
@@ -2230,6 +2235,8 @@ class PolymarketTradingClient:
         self._threshold_readiness_key: ThresholdHedgeIntent | None = None
         self._cross_leg_readiness_key: object | None = None
         self._last_submit_error: dict[str, str] | None = None
+        if metadata_cache is not None:
+            self.attach_metadata_cache(metadata_cache)
 
     @contextmanager
     def _lp_snapshot_public_client(self):
@@ -2455,6 +2462,20 @@ class PolymarketTradingClient:
             ):
                 raise RuntimeError("metadata cache must be attached before first use")
             self._metadata_cache = cache
+            if cache is not None and not self._metadata_warm_loaded:
+                initialize = getattr(cache, "initialize_lp_metadata_cache", None)
+                try:
+                    if callable(initialize):
+                        initialize()
+                except Exception as exc:
+                    self._metadata_warm_loaded = True
+                    self._metadata_initialization_state = "DISABLED"
+                    self._metadata_persistence_enabled = False
+                    logger.warning("lp_metadata_cache_initialization_failed error_type=%s", type(exc).__name__)
+                else:
+                    self._metadata_initialization_state = "READY"
+                    self._metadata_persistence_enabled = True
+                    self._warm_load_metadata_cache(datetime.now(UTC))
 
     def stop_lp_metadata_writer(self, *, timeout=5) -> None:
         """Drop pending saves and join actual in-flight work; timeout is retryable."""
@@ -2472,6 +2493,8 @@ class PolymarketTradingClient:
             closed_drops = self._metadata_closed_drops
         status = empty_status(closed=closed) if writer is None else writer.status()
         status["dropped_closed"] += closed_drops
+        status["persistence_enabled"] = self._metadata_persistence_enabled
+        status["initialization_state"] = self._metadata_initialization_state
         return status
 
     def configure_lp_candidate_exclusions(self, enabled: bool) -> None:
@@ -2479,15 +2502,53 @@ class PolymarketTradingClient:
         if enabled:
             self.evict_lp_candidate_metadata(now=datetime.now(UTC))
 
+    @staticmethod
+    def _metadata_tokens(payload):
+        outcomes = payload.get("outcomes") if isinstance(payload, Mapping) else None
+        if not isinstance(outcomes, Mapping):
+            return ()
+        tokens = tuple(value.get("token_id") for direction in ("yes", "no")
+            if isinstance(value := outcomes.get(direction), Mapping))
+        return tokens if len(tokens) == 2 and all(isinstance(token, str) and token.strip() for token in tokens) else ()
+
+    @staticmethod
+    def _metadata_identity_is_current(payload, cid, expiry, now):
+        if not isinstance(payload, Mapping) or payload.get("condition_id") != cid:
+            return False
+        stamp = _venue_timestamp(payload.get("metadata_checked_at"))
+        return (stamp is not None and expiry > now.timestamp()
+            and 0 <= (now - stamp).total_seconds() < LP_METADATA_CACHE_TTL_SECONDS)
+
+    def lp_candidate_metadata_tokens(self, condition_ids, *, now):
+        """Only live RAM identity is authoritative; missing identity requires refresh."""
+        current = {}
+        with self._metadata_lock:
+            for cid in condition_ids:
+                try:
+                    expiry, payload = self._metadata_entries.get_core(cid)
+                except KeyError:
+                    continue
+                if self._metadata_identity_is_current(payload, cid, expiry, now):
+                    tokens = self._metadata_tokens(payload)
+                    if tokens:
+                        current[cid] = tokens
+        return current
+
     def evict_lp_candidate_metadata(self, *, condition_ids=None, now: datetime) -> None:
         if not self._candidate_exclusions_enabled or self._metadata_cache is None:
             return
+        ids = tuple(self._metadata_entries) if condition_ids is None else tuple(condition_ids)
+        current = self.lp_candidate_metadata_tokens(ids, now=now)
+        allowed = set(self._metadata_cache.lp_candidate_conditions(ids, now=now, current_tokens=current))
         with self._metadata_lock:
-            ids = tuple(self._metadata_entries) if condition_ids is None else tuple(condition_ids)
-            allowed = set(self._metadata_cache.lp_candidate_conditions(ids, now=now))
             for cid in ids:
                 if cid not in allowed:
-                    self._metadata_entries.pop(cid, None)
+                    # Keep bounded current identity for the prefilter; discard candidate/display detail.
+                    self._metadata_entries.discard_display(cid)
+
+    def lp_metadata_cache_status(self) -> dict[str, int]:
+        """Retained-value accounting; excludes bounded management overhead."""
+        return self._metadata_entries.status()
 
     def expire_lp_metadata_cache(self) -> None:
         """Drop all cached LP market metadata so the next read re-fetches."""
@@ -2600,7 +2661,11 @@ class PolymarketTradingClient:
                     return tuple(result)
                 if component.startswith('market:'):
                     _, condition, token = component.split(':', 2)
-                    metadata = adapter.lp_market_metadata_fresh((condition,)).get(condition)
+                    batch = adapter.lp_market_metadata_batch((condition,), planning_only=True)
+                    metadata = (batch["markets"].get(condition)
+                        if condition not in batch["failed_ids"] and condition not in batch["deferred_ids"] else None)
+                    if metadata is None:
+                        raise ValueError("market_source_unknown")
                     rewards = adapter.lp_reward_catalog(condition_ids=(condition,))
                     book = adapter.lp_order_books((token,)).get(token)
                     if not metadata or not book or not rewards:
@@ -3429,6 +3494,7 @@ class PolymarketTradingClient:
         condition_ids: Sequence[str],
         *,
         stop_event: threading.Event | None = None,
+        planning_only: bool = False,
     ) -> dict[str, object]:
         """Read metadata with explicit success, absence, failure, and deferral."""
 
@@ -3455,7 +3521,7 @@ class PolymarketTradingClient:
                 "checked_at": checked_at,
             }
         return self._lp_market_metadata_batch_result(
-            requested, checked_at=checked_at, force_refresh=False, stop_event=stop_event
+            requested, checked_at=checked_at, force_refresh=False, stop_event=stop_event, planning_only=planning_only
         )
 
     def lp_market_metadata_fresh(
@@ -3500,6 +3566,7 @@ class PolymarketTradingClient:
         checked_at: datetime,
         force_refresh: bool,
         stop_event: threading.Event | None,
+        planning_only: bool = False,
     ) -> dict[str, object]:
         if force_refresh:
             fresh: dict[str, dict[str, object] | None] = {}
@@ -3509,7 +3576,7 @@ class PolymarketTradingClient:
             self._prune_metadata_cache(checked_at)
         else:
             fresh, stale, refresh_ids = self._partition_metadata_cache(
-                requested, checked_at
+                requested, checked_at, planning_only=planning_only
             )
             deferred_ids = [
                 condition_id
@@ -3544,7 +3611,7 @@ class PolymarketTradingClient:
             try:
                 public = self._public_client_factory()
                 fetched, failed_ids, fetched_absent = self._fetch_lp_market_metadata(
-                    tuple(refresh_ids), public=public, stop_event=stop_event
+                    tuple(refresh_ids), public=public, stop_event=stop_event, planning_only=planning_only
                 )
             except Exception as exc:
                 reason = _safe_metadata_failure("market", exc)
@@ -3563,6 +3630,7 @@ class PolymarketTradingClient:
                 metadata_checked_at=checked_at,
                 confirmed_absent_ids=fetched_absent,
                 failed_ids=failed_ids,
+                planning_only=planning_only,
             )
 
         accounted = set(markets) | confirmed_absent | set(failed_ids) | set(deferred_ids)
@@ -3622,6 +3690,7 @@ class PolymarketTradingClient:
         self,
         requested: tuple[str, ...],
         now: datetime,
+        *, planning_only: bool = False,
     ) -> tuple[
         dict[str, dict[str, object] | None],
         dict[str, dict[str, object] | None],
@@ -3641,12 +3710,17 @@ class PolymarketTradingClient:
         stale: dict[str, dict[str, object] | None] = {}
         refresh: list[tuple[float, int, str]] = []
         with self._metadata_lock:
-            self._warm_load_metadata_cache(now)
             for index, condition_id in enumerate(requested):
-                entry = self._metadata_entries.get(condition_id)
+                try:
+                    entry = (self._metadata_entries.get_core(condition_id) if planning_only
+                             else self._metadata_entries[condition_id])
+                except KeyError:
+                    entry = None
                 if entry is None:
                     refresh.append((float("-inf"), index, condition_id))
-                elif entry[0] > now_epoch:
+                elif entry[0] > now_epoch and (entry[1] is None or (
+                    self._planning_metadata_is_current(entry[1], condition_id, now) if planning_only
+                    else self._metadata_entries.has_display(condition_id))):
                     fresh[condition_id] = entry[1]
                 else:
                     refresh.append((entry[0], index, condition_id))
@@ -3654,12 +3728,26 @@ class PolymarketTradingClient:
         refresh_ids = [
             condition_id for _expires_at, _index, condition_id in refresh
         ]
-        for condition_id in refresh_ids:
-            entry = self._metadata_entries.get(condition_id)
-            if entry is not None and entry[1] is not None:
-                stale[condition_id] = entry[1]
+        if not planning_only:
+            with self._metadata_lock:
+                for condition_id in refresh_ids:
+                    if not self._metadata_entries.has_display(condition_id):
+                        continue
+                    entry = self._metadata_entries.get(condition_id)
+                    if entry is not None and entry[1] is not None:
+                        stale[condition_id] = entry[1]
         capped = refresh_ids[:LP_METADATA_MAX_REFRESH_IDS_PER_CALL]
         return fresh, stale, capped
+
+    @staticmethod
+    def _planning_metadata_is_current(payload, condition_id, now):
+        if payload.get("condition_id") != condition_id:
+            return False
+        for key in ("metadata_checked_at", "fees_checked_at"):
+            stamp = _venue_timestamp(payload.get(key))
+            if stamp is None or not 0 <= (now - stamp).total_seconds() <= 60:
+                return False
+        return True
 
     def _warm_load_metadata_cache(self, now: datetime) -> None:
         """Bulk-load non-expired persisted entries once per process.
@@ -3678,7 +3766,8 @@ class PolymarketTradingClient:
         try:
             reader = getattr(cache_store, "lp_metadata_cache_items", None)
             if callable(reader):
-                items = reader(now=now, exclude_candidates=True) if self._candidate_exclusions_enabled else reader(now=now)
+                items = reader(now=now, limit=min(3000, self._metadata_cache_policy["max_entries"]),
+                    exclude_candidates=self._candidate_exclusions_enabled)
             else:
                 warm = cache_store.lp_metadata_cache_entries(now=now)
                 if not isinstance(warm, Mapping):
@@ -3686,7 +3775,9 @@ class PolymarketTradingClient:
                 items = warm.items()
 
             def valid_entries():
-                for key, value in items:
+                for index, (key, value) in enumerate(items):
+                    if index >= min(3000, self._metadata_cache_policy["max_entries"]):
+                        break
                     if not (isinstance(key, str) and key):
                         continue
                     if not isinstance(value, tuple) or len(value) != 2:
@@ -3707,25 +3798,16 @@ class PolymarketTradingClient:
 
 
     def _prune_metadata_cache(self, now: datetime) -> None:
-        """Prune the backing store at most once per process per hour."""
-
-        cache_store = self._metadata_cache
-        if cache_store is None:
-            return
-        now_epoch = now.timestamp()
+        """Schedule physical expiry at most once per positive cache TTL."""
         with self._metadata_lock:
-            due = (
-                now_epoch - self._metadata_last_prune_epoch
-                >= LP_METADATA_CACHE_TTL_SECONDS
-            )
-            if due:
-                self._metadata_last_prune_epoch = now_epoch
-        if not due:
-            return
-        try:
-            cache_store.lp_metadata_cache_prune(now=now)
-        except Exception:
-            logger.warning("lp_metadata_cache_prune_failed", exc_info=True)
+            if not self._metadata_persistence_enabled or self._metadata_writer_closed:
+                return
+            if now.timestamp() - self._metadata_last_prune_epoch < LP_METADATA_CACHE_TTL_SECONDS:
+                return
+            self._metadata_last_prune_epoch = now.timestamp()
+            if self._metadata_writer is None:
+                self._metadata_writer = LPMetadataWriter(self._metadata_cache, policy=self._metadata_writer_policy)
+            self._metadata_writer.enqueue_prune(now=now)
 
     def _record_metadata_entries(
         self,
@@ -3735,6 +3817,7 @@ class PolymarketTradingClient:
         metadata_checked_at: datetime,
         confirmed_absent_ids: frozenset[str] = frozenset(),
         failed_ids: Mapping[str, object] | None = None,
+        planning_only: bool = False,
     ) -> None:
         """Write a completed refresh into the in-memory TTL cache.
 
@@ -3755,21 +3838,31 @@ class PolymarketTradingClient:
                 updated[condition_id] = (expires_at, value)
             elif condition_id in confirmed_absent_ids:
                 updated[condition_id] = (negative_expires_at, None)
+        excluded = set()
         if self._candidate_exclusions_enabled and self._metadata_cache is not None:
-            allowed = set(self._metadata_cache.lp_candidate_conditions(tuple(updated), now=datetime.now(UTC)))
-            updated = {cid: row for cid, row in updated.items() if cid in allowed}
+            now = datetime.now(UTC)
+            current = {cid: self._metadata_tokens(payload) for cid, (expiry, payload) in updated.items()
+                if self._metadata_identity_is_current(payload, cid, expiry, now)}
+            allowed = set(self._metadata_cache.lp_candidate_conditions(tuple(updated), now=now, current_tokens=current))
+            excluded = set(updated).difference(allowed)
         if not updated:
             return
         with self._metadata_lock:
-            self._metadata_entries.update(updated)
-            if self._metadata_cache is not None and self._metadata_writer_closed:
+            for cid, entry in updated.items():
+                self._metadata_entries.put(cid, entry, planning_only=planning_only or cid in excluded)
+            if self._metadata_persistence_enabled and self._metadata_writer_closed:
                 self._metadata_closed_drops += len(updated)
-            elif self._metadata_cache is not None:
+            elif self._metadata_persistence_enabled:
                 if self._metadata_writer is None:
                     self._metadata_writer = LPMetadataWriter(
                         self._metadata_cache, policy=self._metadata_writer_policy,
                     )
-                self._metadata_writer.enqueue(updated)
+                persisted = {cid: (expiry, None if payload is None else
+                    ({**{k: v for k, v in payload.items() if k not in DISPLAY_FIELDS},
+                      "_lp_metadata_projection": "planning"}
+                     if planning_only or cid in excluded else payload))
+                    for cid, (expiry, payload) in updated.items()}
+                self._metadata_writer.enqueue(persisted)
 
     def _fetch_lp_market_metadata(
         self,
@@ -3778,6 +3871,7 @@ class PolymarketTradingClient:
         public: object,
         stop_event: threading.Event | None = None,
         closed_query: bool = False,
+        planning_only: bool = False,
     ) -> tuple[dict[str, dict[str, object]], dict[str, object], frozenset[str]]:
         """Fetch LP market facts while preserving each completed sub-read."""
 
@@ -3803,7 +3897,7 @@ class PolymarketTradingClient:
                         condition_ids=batch, page_size=100,
                         **({"closed": True} if closed_query else {}),
                     ),
-                    set(batch),
+                    set(batch), planning_only=planning_only,
                 ),
                 True,
             )
@@ -3879,6 +3973,8 @@ class PolymarketTradingClient:
                 ("sports", {"game_id", "game_start_time"}),
                 ("prices", {"one_day_price_change"}),
             ):
+                if name == "prices" and planning_only:
+                    continue
                 facts[name] = project(facts.get(name), keys)
             trading = facts["trading"]
             if isinstance(trading, dict):
@@ -4050,8 +4146,8 @@ class PolymarketTradingClient:
             condition_id = row.get("condition_id", row.get("conditionId"))
             if not isinstance(condition_id, str) or condition_id not in requested:
                 continue
-            slug = row.get("slug")
-            market_url = row.get("market_url", row.get("url"))
+            slug = None if planning_only else row.get("slug")
+            market_url = None if planning_only else row.get("market_url", row.get("url"))
             state = _model_dict(row.get("state")) or {}
             trading = _model_dict(row.get("trading")) or {}
             rewards = _model_dict(row.get("rewards")) or {}
@@ -4091,7 +4187,7 @@ class PolymarketTradingClient:
             sports = _model_dict(row.get("sports")) or {}
             event_state = _model_dict(event.get("state")) or {} if event else {}
             event_schedule = _model_dict(event.get("schedule")) or {} if event else {}
-            prices = _model_dict(row.get("prices")) or {}
+            prices = {} if planning_only else (_model_dict(row.get("prices")) or {})
             one_day_price_change = _lp_decimal(prices.get("one_day_price_change"))
             event_slug = (
                 event.get("slug")
@@ -4115,20 +4211,12 @@ class PolymarketTradingClient:
                 "condition_id": condition_id,
                 "metadata_checked_at": metadata_checked_at,
                 "fees_checked_at": metadata_checked_at,
-                "market_title": row.get("question", row.get("title")),
-                "market_url": market_url,
                 "event_id": event_id,
                 "game_id": sports.get("game_id"),
                 "game_start_time": sports.get("game_start_time"),
                 "event_start_time": event_schedule.get("start_time"),
                 "event_ended": event_state.get("ended"),
                 "event_finished_at": event_schedule.get("finished_at"),
-                "price_change_24h": one_day_price_change,
-                "price_change_24h_source": (
-                    "polymarket.prices.one_day_price_change"
-                    if one_day_price_change is not None
-                    else None
-                ),
                 "accepting_orders": state.get("accepting_orders"),
                 "closed": state.get("closed"),
                 "resolved": state.get("resolved"),
@@ -4153,6 +4241,11 @@ class PolymarketTradingClient:
                 ),
                 "outcomes": outcomes,
             }
+            if not planning_only:
+                result[condition_id].update(market_title=row.get("question", row.get("title")),
+                    market_url=market_url, price_change_24h=one_day_price_change,
+                    price_change_24h_source=("polymarket.prices.one_day_price_change"
+                        if one_day_price_change is not None else None))
         confirmed_absent_ids = frozenset(
             condition_id
             for condition_id in completed_market_ids
@@ -4163,7 +4256,7 @@ class PolymarketTradingClient:
             missing = tuple(value for value in requested if value in confirmed_absent_ids)
             try:
                 closed_markets, closed_failed, confirmed_absent_ids = self._fetch_lp_market_metadata(
-                    missing, public=public, stop_event=stop_event, closed_query=True,
+                    missing, public=public, stop_event=stop_event, closed_query=True, planning_only=planning_only,
                 )
             except Exception as exc:
                 reason = _safe_metadata_failure("market", exc)
@@ -4806,7 +4899,6 @@ class PolymarketTradingClient:
             return ()
         now = datetime.now(UTC)
         with self._metadata_lock:
-            self._warm_load_metadata_cache(now)
             cached = tuple(
                 self._metadata_entries.get(condition_id, (0.0, None))[1]
                 for condition_id in requested

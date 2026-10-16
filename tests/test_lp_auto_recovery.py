@@ -2359,6 +2359,7 @@ def test_history_probe_has_constant_http_budget_and_rotates(tmp_path: Path) -> N
         )
 
     store = PredictionArbitrageStore(tmp_path / "rotating-history-probe")
+    store.initialize_lp_metadata_cache()
     # 机制实证（2026-09-21，时间炸弹修复）：history 探针解析 token 走
     # `_cached_lp_token_ids`（polymarket_trading），其 warm load 用真实时钟
     # `datetime.now(UTC)`（服务注入的 clock 不参与），store 侧过滤是

@@ -600,6 +600,7 @@ def test_legacy_exact_id_and_new_id_keep_lifecycle_ownership(tmp_path, state, le
 def test_old_negative_metadata_rechecks_closed_market_without_losing_positive_cache(tmp_path) -> None:
     from test_polymarket_trading import _wait_lp_metadata_persistence
     store = PredictionArbitrageStore(tmp_path / "state.sqlite")
+    store.initialize_lp_metadata_cache()
     closed_id, absent_id = "0x" + "d" * 64, "0x" + "e" * 64
     expiry = (datetime.now(UTC) + timedelta(hours=1)).timestamp()
     positive = {"market_id": "cached-open", "condition_id": CONDITION_ID, "metadata_checked_at": NOW.isoformat()}
