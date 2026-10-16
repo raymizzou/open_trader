@@ -3720,10 +3720,14 @@ class PolymarketTradingClient:
         refresh_ids = [
             condition_id for _expires_at, _index, condition_id in refresh
         ]
-        for condition_id in refresh_ids:
-            entry = self._metadata_entries.get(condition_id)
-            if not planning_only and entry is not None and entry[1] is not None:
-                stale[condition_id] = entry[1]
+        if not planning_only:
+            with self._metadata_lock:
+                for condition_id in refresh_ids:
+                    if not self._metadata_entries.has_display(condition_id):
+                        continue
+                    entry = self._metadata_entries.get(condition_id)
+                    if entry is not None and entry[1] is not None:
+                        stale[condition_id] = entry[1]
         capped = refresh_ids[:LP_METADATA_MAX_REFRESH_IDS_PER_CALL]
         return fresh, stale, capped
 
@@ -3754,7 +3758,8 @@ class PolymarketTradingClient:
         try:
             reader = getattr(cache_store, "lp_metadata_cache_items", None)
             if callable(reader):
-                items = reader(now=now, exclude_candidates=True) if self._candidate_exclusions_enabled else reader(now=now)
+                items = reader(now=now, limit=min(3000, self._metadata_cache_policy["max_entries"]),
+                    exclude_candidates=self._candidate_exclusions_enabled)
             else:
                 warm = cache_store.lp_metadata_cache_entries(now=now)
                 if not isinstance(warm, Mapping):

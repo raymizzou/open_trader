@@ -3583,6 +3583,7 @@ class PredictionArbitrageStore:
         self,
         *,
         now: datetime | None = None,
+        limit: int | None = None,
     ) -> dict[str, tuple[float, dict[str, object] | None]]:
         """Bulk-read non-expired rows with their persisted `expires_at`.
 
@@ -3590,12 +3591,15 @@ class PredictionArbitrageStore:
         expiry stamp; a ``None`` payload marks a confirmed-missing row.
         """
 
-        return dict(self.lp_metadata_cache_items(now=now))
+        return dict(self.lp_metadata_cache_items(now=now, limit=limit))
 
     def lp_metadata_cache_items(
         self, *, now: datetime | None = None, exclude_candidates: bool = False,
+        limit: int | None = None,
     ) -> Iterator[tuple[str, tuple[float, dict[str, object] | None]]]:
-        """Stream warm-cache rows without materializing the entire universe."""
+        """Stream complete compatible reads; startup requests an explicit row bound."""
+        if limit is not None and (type(limit) is not int or limit < 1):
+            raise ValueError("lp_metadata_cache_read_limit_invalid")
         horizon = self._lp_metadata_cache_horizon(now)
         with self._read_connection() as connection:
             if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lp_market_metadata_cache'").fetchone():
@@ -3610,10 +3614,11 @@ class PredictionArbitrageStore:
                 WHERE expires_at > ? AND (?=0 OR NOT EXISTS (
                   SELECT 1 FROM lp_market_exclusions e WHERE e.condition_id=m.condition_id
                     AND e.token_id='' AND e.cooldown_until>?))
-                ORDER BY expires_at DESC, condition_id LIMIT 3000
-                """,
+                ORDER BY expires_at DESC, condition_id
+                """ + (" LIMIT ?" if limit is not None else ""),
                 (int(exclude_candidates), _canonical_timestamp(now or datetime.now(timezone.utc)),
-                 horizon, int(exclude_candidates), _canonical_timestamp(now or datetime.now(timezone.utc))),
+                 horizon, int(exclude_candidates), _canonical_timestamp(now or datetime.now(timezone.utc)))
+                + ((limit,) if limit is not None else ()),
             )
             for row in rows:
                 condition_id = str(row["condition_id"])

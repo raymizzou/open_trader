@@ -11184,6 +11184,7 @@ def test_legacy_first_seen_notice_uses_local_identity_and_observed_lifetime(
     store.lp_update_first_seen_episode(
         "ep-legacy", patch={"first_seen_at": first_seen.isoformat()}
     )
+    store.initialize_lp_metadata_cache()
     store.lp_metadata_cache_store_entries(
         {
             condition: (
@@ -15736,3 +15737,101 @@ def test_unverified_closed_or_active_sdk_market_keeps_book_fault(variant, caplog
         assert 'sensitive book body' not in caplog.text
     finally:
         adapter.close()
+
+
+def test_queue_protection_notification_uses_held_metadata_beyond_warm_limit(tmp_path, monkeypatch) -> None:
+    """Complete durable identity reads remain independent of bounded adapter startup."""
+    import sqlite3
+    from test_lp_metadata_cache_followup import _adapter
+    now = datetime(2026, 10, 16, 4, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(tmp_path, now, key='metadata-held-beyond-warm')
+    session_id = str(started['session_id'])
+    session = store.lp_update_session(session_id, patch={
+        'market_title': None, 'question': None, 'market_url': None,
+    })
+    condition, token = str(session['condition_id']), str(session['token_id'])
+    assert session['outcome'] == 'YES'
+    store.initialize_lp_metadata_cache()
+    unrelated_expiry = (now + timedelta(hours=2)).timestamp()
+    held_expiry = (now + timedelta(hours=1)).timestamp()
+    store.lp_metadata_cache_store_entries({
+        **{f'a-unrelated-{index:04}': (unrelated_expiry, {
+            'condition_id': f'a-unrelated-{index:04}', 'market_title': 'Unrelated literal',
+            'metadata_checked_at': now.isoformat(),
+        }) for index in range(3000)},
+        condition: (held_expiry, {'condition_id': condition, 'market_title': 'Held literal',
+            'market_url': 'https://example.invalid/held',
+            'outcomes': {'yes': {'token_id': token, 'label': 'YES'}}}),
+    })
+    # Later expiry puts all unrelated rows before held, independently of its ID.
+    with sqlite3.connect(store.path) as connection:
+        ordered = connection.execute('SELECT condition_id FROM lp_market_metadata_cache ORDER BY expires_at DESC, condition_id').fetchall()
+        assert len(ordered) == 3001 and ordered[3000] == (condition,)
+    complete = store.lp_metadata_cache_entries(now=now)
+    assert len(complete) == 3001 and complete[condition][0] == held_expiry
+    streamed = dict(store.lp_metadata_cache_items(now=now))
+    assert len(streamed) == 3001
+    assert streamed[condition][1]['market_title'] == 'Held literal'
+    assert complete[condition][1]['outcomes'] == streamed[condition][1]['outcomes'] == {
+        'yes': {'token_id': token, 'label': 'YES'},
+    }
+
+    notes = []
+    notified = threading.Event()
+
+    def notify(title, message, voice):
+        notes.append((title, message, voice))
+        notified.set()
+        return True
+
+    service.set_protection_notifier(notify)
+    completed = _cancel_notice_completion(service, monkeypatch)
+    live = _queue_receipt('order-1')
+    canceled = _queue_receipt('order-1', status='CANCELED')
+    trigger = _queue_runtime_snapshot(now, bid_size='4000', orders=[live])
+    terminal = _queue_runtime_snapshot(now, bid_size='4000', orders=[canceled])
+    exchange.snapshots, exchange.snapshot_calls = [trigger, trigger, terminal], 0
+    service.tick()
+    assert notified.wait(2)
+    assert completed()
+    assert exchange.cancels == ['order-1']
+    assert len(notes) == 1
+    title, message, voice = notes[0]
+    assert title == 'YES 0.3 位置保护已触发撤单'
+    assert '市场：Held literal' in message
+    assert 'https://example.invalid/held' in message
+    assert '未知市场' not in message and '选项未知' not in message
+    assert voice == 'YES 0.3 位置保护已触发撤单，1 张买单已撤'
+    service.tick()
+    restarted = PolymarketLPService(store, exchange, clock=lambda: now)
+    restarted.set_protection_notifier(notify)
+    restart_jobs = _observe_cancel_jobs(restarted, monkeypatch)
+    restarted.tick()
+    assert completed()
+    # Restart must not enqueue a second cancellation or notification.
+    assert exchange.cancels == ['order-1'] and len(notes) == 1
+    assert restart_jobs == []
+    actions = [action for action in store.lp_actions(session_id) if action.get('role') == 'entry-protection-cancel']
+    assert len(actions) == 1
+    assert actions[0]['state'] == 'accepted' and actions[0]['targets'] == ['order-1']
+
+    # The same >3000-row fixture remains bounded specifically at startup SQL.
+    real_connect, sql = sqlite3.connect, []
+
+    def connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        connection.set_trace_callback(sql.append)
+        return connection
+
+    monkeypatch.setattr(sqlite3, 'connect', connect)
+    for count in (3, 3000):
+        sql.clear()
+        adapter = _adapter(store, monkeypatch, clock=[now], metadata_cache_policy={'max_entries': count})
+        try:
+            assert adapter.lp_metadata_cache_status()['core_entries'] == count
+            warm_selects = [statement for statement in sql if 'FROM lp_market_metadata_cache m' in statement]
+            assert len(warm_selects) == 1
+            assert f'LIMIT {count}' in warm_selects[0]
+            assert adapter.lp_market_metadata_batch(('a-unrelated-0000',))['markets']['a-unrelated-0000']['market_title'] == 'Unrelated literal'
+        finally:
+            adapter.close()

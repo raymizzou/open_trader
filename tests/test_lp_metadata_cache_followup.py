@@ -93,31 +93,47 @@ def test_startup_initializes_metadata_once_and_preserves_existing_rows(tmp_path,
 def test_startup_metadata_failure_degrades_only_disposable_cache(tmp_path, monkeypatch):
     store = PredictionArbitrageStore(tmp_path)
     real_connect = sqlite3.connect
-    attempts = []
+    authorizer_callbacks, ddl_submissions = [], []
     deny_exclusions = [False]
 
     def authorize(action, arg1, arg2, database, trigger):
         if action == sqlite3.SQLITE_CREATE_TABLE and arg1 == 'lp_market_metadata_cache':
-            attempts.append(arg1)
+            authorizer_callbacks.append(arg1)
             return sqlite3.SQLITE_DENY
         if deny_exclusions[0] and action == sqlite3.SQLITE_READ and arg1 == 'lp_market_exclusions':
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 
+    class ObservedConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if 'CREATE TABLE IF NOT EXISTS lp_market_metadata_cache' in ' '.join(sql.split()):
+                ddl_submissions.append(sql)
+            return super().execute(sql, parameters)
+
     def connect(*args, **kwargs):
+        from pathlib import Path
+        observed = Path(args[0]) == store.path
+        if observed:
+            kwargs['factory'] = ObservedConnection
         connection = real_connect(*args, **kwargs)
-        connection.set_authorizer(authorize)
+        if observed:
+            connection.set_authorizer(authorize)
         return connection
 
     monkeypatch.setattr(sqlite3, 'connect', connect)
     adapter = _adapter(store, monkeypatch)
     try:
+        assert len(ddl_submissions) == 1
+        first_callbacks = len(authorizer_callbacks)
+        assert first_callbacks >= 1
         status = adapter.lp_metadata_persistence_status()
         assert status['persistence_enabled'] is False
         assert status['initialization_state'] == 'DISABLED'
         adapter.attach_metadata_cache(store)
         assert adapter.lp_market_metadata_batch((A,))['markets'][A]['outcomes']['no']['token_id'] == 'no-current'
         assert adapter.lp_market_metadata_fresh((A,))[A]['outcomes']['yes']['token_id'] == 'yes-current'
+        assert len(ddl_submissions) == 1
+        assert len(authorizer_callbacks) == first_callbacks  # attach/read never retry schema
         # An independent adapter's transport failure never proves absence.
         failing = _adapter(store, monkeypatch, rows=RuntimeError('offline transport'))
         try:
@@ -128,11 +144,15 @@ def test_startup_metadata_failure_degrades_only_disposable_cache(tmp_path, monke
             assert B in result['failed_ids']
         finally:
             failing.stop_lp_metadata_writer()
-        assert len(attempts) == 2  # once per adapter lifecycle, never per read/attach
+        # SQLite may consult the authorizer more than once per execute submission.
+        # The external driver boundary measures the actual lifecycle SQL attempts.
+        assert len(ddl_submissions) == 2
+        assert len(authorizer_callbacks) > first_callbacks
         assert adapter.lp_metadata_persistence_status()['saved_entries'] == 0
         deny_exclusions[0] = True
         with pytest.raises(sqlite3.DatabaseError):
             adapter.configure_lp_candidate_exclusions(True)
+        assert len(ddl_submissions) == 2
     finally:
         adapter.stop_lp_metadata_writer()
 
@@ -801,3 +821,63 @@ def test_runtime_stop_retains_owner_until_actual_prune_exit(tmp_path, monkeypatc
         cross.stop()
         monitor.stop()
         assert not stopper.is_alive()
+
+
+@pytest.mark.parametrize('missing_detail', ('planning-refresh', 'planning-restart', 'display-eviction'))
+def test_full_metadata_transport_failure_never_returns_core_only_payload(tmp_path, monkeypatch, missing_detail):
+    from datetime import timedelta
+    from decimal import Decimal
+    clock, fail = [T], [False]
+
+    def rows(ids):
+        if fail[0]:
+            raise RuntimeError('offline transport')
+        return tuple({'id': '349', 'condition_id': cid, 'question': 'Complete literal title',
+            'market_url': 'https://example.invalid/literal', 'prices': {'one_day_price_change': '0.12'},
+            'events': [], 'outcomes': {'yes': {'token_id': 'yes-current', 'label': 'YES'},
+                                     'no': {'token_id': 'no-current', 'label': 'NO'}}} for cid in ids)
+
+    store = PredictionArbitrageStore(tmp_path) if missing_detail == 'planning-restart' else None
+    policy = {'display_max_entries': 1} if missing_detail == 'display-eviction' else None
+    adapter = _adapter(store, monkeypatch, rows=rows, clock=clock, metadata_cache_policy=policy)
+    try:
+        complete = adapter.lp_market_metadata((A,))[A]
+        assert complete['market_title'] == 'Complete literal title'
+        assert complete['market_url'] == 'https://example.invalid/literal'
+        assert complete['price_change_24h'] == Decimal('0.12')
+        if missing_detail == 'display-eviction':
+            adapter.lp_market_metadata((B,))
+        else:
+            clock[0] = T + timedelta(seconds=61)
+            narrow = adapter.lp_market_metadata_batch((A,), planning_only=True)
+            assert narrow['state'] == 'known'
+            assert not {'market_title', 'market_url', 'price_change_24h', 'price_change_24h_source'} & narrow['markets'][A].keys()
+            if missing_detail == 'planning-restart':
+                _wait_status(adapter, lambda status: status['saved_entries'] == 2)
+                adapter.close()
+                adapter = _adapter(store, monkeypatch, rows=rows, clock=clock)
+        fail[0] = True
+        failed = adapter.lp_market_metadata_batch((A,))
+        assert failed['markets'] == {}, 'core-only cache rows cannot satisfy the complete API'
+        assert failed['state'] == 'unknown'
+        assert failed['confirmed_absent_ids'] == ()
+        assert failed['failed_ids'] == {A: 'market_read_RuntimeError'}
+        with pytest.raises(RuntimeError, match='market read failed'):
+            adapter.lp_market_metadata((A,))
+    finally:
+        adapter.close()
+
+    # Complete stale values retain the legacy diagnostic/mapping fallback.
+    clock[0], fail[0] = T, False
+    control = _adapter(None, monkeypatch, rows=rows, clock=clock)
+    try:
+        original = control.lp_market_metadata((A,))[A]
+        clock[0], fail[0] = T + timedelta(seconds=43201), True
+        stale = control.lp_market_metadata_batch((A,))
+        assert stale['markets'] == {A: original}
+        assert stale['markets'][A]['metadata_checked_at'] == stale['markets'][A]['fees_checked_at'] == T
+        assert stale['failed_ids'] == {A: 'market_read_RuntimeError'}
+        assert stale['confirmed_absent_ids'] == ()
+        assert control.lp_market_metadata((A,)) == {A: original}
+    finally:
+        control.close()
