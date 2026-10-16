@@ -884,3 +884,483 @@ def test_old_generation_buy_uncertainty_and_receipt_preserve_resumed_control():
     assert final.yields[o2].unknown_since_monotonic == 103 and final.yields[o2].unknown_deadline_monotonic == 703
     assert final.buy_reserved.value == D('6.80') and final.inventory_cost.value == D('0')
     assert final.new_capacity.value == D('33.20')
+
+
+EXIT_SCOPE = ('A', 'M', 'TOKEN', 'exit-episode')
+
+
+def exact_exit_attempt(request_id, order_id, *, quantity='100', sold='0', residual='100',
+                       kind='protected_exit', disposition='terminal', native='ended', own=None):
+    def submitted(name, value):
+        stamp = cs.SourceStamp(f'{request_id}:submit:{name}', checked_at=T - timedelta(seconds=5),
+            complete=True, state='known')
+        return cs.Fact('known', value, (stamp,))
+    return cs.ExitAttempt(request_id, kind, None if order_id is None else ('A', 'M', 'TOKEN', order_id),
+        disposition, False, submitted('quantity', D(quantity)), submitted('sold', D(sold)),
+        submitted('residual', D(residual)), submitted('price', D('0.40')),
+        submitted('type', 'FOK' if kind == 'protected_exit' else 'GTC'), submitted('expiry', None),
+        None, own, native)
+
+
+def exit_guard(current, scope=EXIT_SCOPE, *, event='exit-update', observation=False):
+    snapshot = current.snapshot()
+    return cs.ProtectionGuard(scope, snapshot.current.cycle_generation,
+        snapshot.scope_versions.get(scope, 0), tuple((o.key, o.terms_version)
+            for o in snapshot.orders if o.key[:3] == scope[:3]),
+        snapshot.observation.observation_id if observation and snapshot.observation else None, event)
+
+
+def exit_fixture(*, disposition='terminal', native='ended'):
+    current = state()
+    rows = [dict(order('S1', side='SELL', matched='40'), original_size='100', status='CANCELED', order_type='FOK'),
+        dict(order('S2', side='SELL', matched='0'), original_size='60', status='CANCELED', order_type='FOK'),
+        dict(order('S3', side='SELL', matched='0'), original_size='60', status='CANCELED', order_type='FOK')]
+    source = MarketReader.from_captured_sources(CapturedSources('A', {
+        'open_orders': SourceResult('exit-orders', rows, checked_at=T),
+        'positions': SourceResult('exit-positions', [dict(account_id='A', condition_id='M', token_id='TOKEN',
+            quantity='60', cost_usd='24', average_price='0.40', redeemable=False)], checked_at=T),
+        'balance': SourceResult('exit-balance', ('40', '40'), checked_at=T)}))
+    observe(current, source, yields={}, capacity=D('16'))
+    snapshot = current.snapshot()
+    stamp = snapshot.orders[0].source
+    known = lambda value: cs.Fact('known', value, (stamp,))
+    fill = cs.OwnFillEvidence(('A', 'M', 'TOKEN', 'S1'), known(D('40')), known(D('16')),
+        known(D('0.10')), ('S1-fill40',), stamp, True)
+    p1 = exact_exit_attempt('P1', 'S1', own=fill, disposition=disposition, native=native)
+    sell = cs.SellState(EXIT_SCOPE, known(D('60')), known(D('24')), True, snapshot.orders,
+        snapshot.observation.components['open_orders'], snapshot.observation.components['positions'], None, p1)
+    assert current.apply_protection(cs.ExitEvidenceUpdate(exit_guard(current, event='introduce-P1'), sell)) == 'applied'
+    return current, p1
+
+
+def replace_exit(current, attempt, *, scope=EXIT_SCOPE, event='replace-exit', passive=None):
+    sell = current.snapshot().sells[scope]
+    return current.apply_protection(cs.ExitEvidenceUpdate(exit_guard(current, scope, event=event),
+        replace(sell, protected=attempt, passive=passive)))
+
+
+def test_resolved_exit_replacement_retains_exact_submit_facts():
+    import pytest
+    current, p1 = exit_fixture()
+    before = current.snapshot()
+    p2 = exact_exit_attempt('P2', 'S2', quantity='60', sold='40', residual='60')
+    assert replace_exit(current, p2, event='P1-to-P2') == 'applied'
+    replaced = current.snapshot()
+    assert replaced.sells[EXIT_SCOPE].protected == p2
+    retained = replaced.resolved_exit_attempts[(EXIT_SCOPE, 'P1')]
+    assert retained == p1
+    for name in ('submit_quantity', 'submit_sold_quantity', 'submit_residual_quantity', 'price', 'order_type', 'expiration'):
+        assert getattr(retained, name) is getattr(p1, name)
+        assert getattr(retained, name).sources[0].source_id.startswith('P1:submit:')
+    assert retained.submit_quantity.value == D('100') and retained.submit_sold_quantity.value == D('0')
+    assert retained.submit_residual_quantity.value == D('100')
+    assert replaced.sells[EXIT_SCOPE].residual_quantity.value == D('60')
+    assert replaced.orders == before.orders and replaced.own_fills == before.own_fills
+    assert (EXIT_SCOPE, 'P2') not in replaced.resolved_exit_attempts
+    assert not before.resolved_exit_attempts
+    with pytest.raises(TypeError):
+        replaced.resolved_exit_attempts[(EXIT_SCOPE, 'fake')] = p1
+    p3 = exact_exit_attempt('P3', 'S3', quantity='60', sold='40', residual='60')
+    assert replace_exit(current, p3, event='P2-to-P3') == 'applied'
+    assert current.snapshot().resolved_exit_attempts == {(EXIT_SCOPE, 'P1'): p1, (EXIT_SCOPE, 'P2'): p2}
+    assert replace_exit(current, None, event='remove-P3') == 'applied'
+    final = current.snapshot()
+    assert final.resolved_exit_attempts == {(EXIT_SCOPE, 'P1'): p1, (EXIT_SCOPE, 'P2'): p2, (EXIT_SCOPE, 'P3'): p3}
+    assert final.sells[EXIT_SCOPE].protected is None
+    assert list(replaced.resolved_exit_attempts) == [(EXIT_SCOPE, 'P1')]
+    assert final.sells[EXIT_SCOPE].residual_quantity == before.sells[EXIT_SCOPE].residual_quantity
+    assert final.orders == before.orders and final.own_fills == before.own_fills
+
+
+def test_resolved_exit_replacement_rejects_unresolved_and_request_reuse():
+    p2 = exact_exit_attempt('P2', 'S2', quantity='60', sold='40', residual='60')
+    for disposition, native in [('terminal', 'running'), ('unknown', 'ended'),
+            ('accepted_without_order_id', 'ended'), ('accepted', 'ended')]:
+        current, p1 = exit_fixture(disposition=disposition, native=native)
+        before = current.snapshot()
+        for replacement in (p2, None):
+            assert replace_exit(current, replacement, event='unresolved-replacement') == 'stale'
+            assert current.snapshot() == before
+            assert not current.snapshot().resolved_exit_attempts
+    current, p1 = exit_fixture()
+    assert replace_exit(current, p2, event='resolved-replacement') == 'applied'
+    before = current.snapshot()
+    assert replace_exit(current, p1, event='replay-P1') in ('stale', 'invalid_identity')
+    assert current.snapshot() == before
+    # Moving a retired request to another kind or episode is not a new send.
+    moved = replace(p1, kind='passive_exit')
+    assert replace_exit(current, p2, passive=moved, event='move-P1-kind') in ('stale', 'invalid_identity')
+    assert current.snapshot() == before
+    other_scope = ('A', 'M', 'TOKEN', 'another-episode')
+    assert current.apply_protection(cs.ExitEvidenceUpdate(exit_guard(current, other_scope, event='rebind-P1'),
+        replace(before.sells[EXIT_SCOPE], scope=other_scope, protected=p1))) in ('stale', 'invalid_identity')
+    assert current.snapshot() == before
+
+    q1 = exact_exit_attempt('Q1', 'S3', quantity='60', sold='40', residual='60', kind='passive_exit')
+    assert replace_exit(current, p2, passive=q1, event='introduce-passive') == 'applied'
+    before = current.snapshot()
+    q2 = exact_exit_attempt('Q2', 'S3', quantity='60', sold='40', residual='60', kind='passive_exit')
+    invalid = exact_exit_attempt('invalid-P3', 'S3', quantity='61', sold='40', residual='60')
+    assert replace_exit(current, invalid, passive=q2, event='two-slot-atomic') == 'invalid_identity'
+    assert current.snapshot() == before
+    assert (EXIT_SCOPE, 'Q1') not in current.snapshot().resolved_exit_attempts
+    # A still-current request is also bound to its first exact scope/kind.
+    assert current.apply_protection(cs.ExitEvidenceUpdate(exit_guard(current, other_scope, event='rebind-current-P2'),
+        replace(before.sells[EXIT_SCOPE], scope=other_scope))) in ('stale', 'invalid_identity')
+    assert current.snapshot() == before
+
+
+def test_late_resolved_exit_receipt_updates_exact_old_attempt_only():
+    current, p1 = exit_fixture()
+    p2 = exact_exit_attempt('P2', 'S2', quantity='60', sold='40', residual='60')
+    assert replace_exit(current, p2, event='archive-P1') == 'applied'
+    before = current.snapshot()
+    old_map = before.resolved_exit_attempts
+    stamp = cs.SourceStamp('late-P1-fill', checked_at=T + timedelta(seconds=1), complete=True, state='known')
+    known = lambda value: cs.Fact('known', value, (stamp,))
+    fill = replace(p1.own_fill_evidence, quantity=known(D('45')), notional_usd=known(D('18')),
+        fees_usd=known(D('0.11')), fill_ids=('S1-fill40', 'S1-fill5'), source=stamp)
+    proof = cs.TerminalProof(p1.order_key, 'CANCELED', before.orders[0].original_size, known(D('45')), stamp, True)
+    late = replace(p1, own_fill_evidence=fill)
+    receipt = cs.ReceiptEvidence('late-P1-explicit', 'P1', 'A', 'process', 'old-issued-generation',
+        p1.order_key, 'SELL', 1, terminal_proof=proof, own_fill=fill, exit_attempt=late, scope=EXIT_SCOPE)
+    assert current.accept_receipt_evidence(receipt) == 'applied'
+    after = current.snapshot()
+    assert after.resolved_exit_attempts[(EXIT_SCOPE, 'P1')] == late
+    assert after.own_fills[p1.order_key] == fill
+    assert after.sells[EXIT_SCOPE] == before.sells[EXIT_SCOPE]
+    assert after.sells[EXIT_SCOPE].protected == p2
+    assert after.orders[0].terminal_proof == proof
+    assert after.current == before.current
+    assert after.trade_version == before.trade_version + 1 and after.snapshot_version == before.snapshot_version + 1
+    assert after.new_capacity.state == 'unknown'
+    assert old_map[(EXIT_SCOPE, 'P1')] == p1
+    newer_stamp = replace(stamp, source_id='late-P1-fees', checked_at=T + timedelta(seconds=2))
+    final_fill = replace(fill, fees_usd=cs.Fact('known', D('0.12'), (newer_stamp,)), source=newer_stamp)
+    own_only = replace(receipt, event_id='late-P1-own-only', exit_attempt=None, terminal_proof=None, own_fill=final_fill)
+    assert current.accept_receipt_evidence(own_only) == 'applied'
+    final = current.snapshot()
+    final_attempt = final.resolved_exit_attempts[(EXIT_SCOPE, 'P1')]
+    assert final_attempt.own_fill_evidence == final.own_fills[p1.order_key] == final_fill
+    assert final.sells[EXIT_SCOPE] == before.sells[EXIT_SCOPE]
+    assert final_attempt.submit_sold_quantity is p1.submit_sold_quantity
+    assert final_attempt.submit_residual_quantity is p1.submit_residual_quantity
+    assert current.accept_receipt_evidence(own_only) == 'stale_evidence'
+    assert current.snapshot() == final
+    invalid_attempts = [replace(final_attempt, native_state='running'),
+        replace(final_attempt, submit_sold_quantity=known(D('1'))),
+        replace(final_attempt, submit_residual_quantity=known(D('60'))),
+        replace(final_attempt, submit_quantity=known(D('100'))),
+        replace(final_attempt, own_fill_evidence=replace(final_fill, fill_ids=('S1-fill5',)))]
+    for index, attempt in enumerate(invalid_attempts):
+        invalid = replace(receipt, event_id=f'invalid-retained-{index}', terminal_proof=None,
+            own_fill=None, exit_attempt=attempt)
+        assert current.accept_receipt_evidence(invalid) in ('identity_error', 'stale_evidence')
+        assert current.snapshot() == final
+    for changes in ({'scope': ('A', 'M', 'TOKEN', 'wrong')}, {'scope': None},
+            {'request_id': 'wrong-request'}, {'order_key': ('A', 'M', 'TOKEN', 'S2')},
+            {'own_fill': replace(final_fill, fees_usd=known(D('9')))}):
+        fields = dict(event_id='conflicting-retained', terminal_proof=None, own_fill=final_fill, exit_attempt=final_attempt)
+        fields.update(changes)
+        assert current.accept_receipt_evidence(replace(receipt, **fields)) in ('identity_error', 'stale_evidence')
+        assert current.snapshot() == final
+    wrong_scope_own = replace(own_only, event_id='own-only-wrong-scope', scope=('A', 'M', 'TOKEN', 'wrong'))
+    assert current.accept_receipt_evidence(wrong_scope_own) == 'identity_error'
+    assert current.snapshot() == final
+    # A different event with unchanged exact evidence keeps existing receipt semantics.
+    assert current.accept_receipt_evidence(replace(own_only, event_id='new-event-same-proof')) == 'applied'
+    assert current.snapshot().sells[EXIT_SCOPE] == before.sells[EXIT_SCOPE]
+
+
+def test_resolved_no_id_local_rejection_retains_truth_without_venue_fact():
+    current = state()
+    observe(current, frame([]), yields={})
+    snapshot = current.snapshot()
+    stamp = snapshot.observation.components['positions']
+    known = lambda value: cs.Fact('known', value, (stamp,))
+    local = exact_exit_attempt('not-sent-local', None, quantity='2', sold='0', residual='2', disposition='rejected')
+    sell = cs.SellState(EXIT_SCOPE, known(D('2')), known(D('1')), True, (),
+        snapshot.observation.components['open_orders'], stamp, None, local)
+    assert current.apply_protection(cs.ExitEvidenceUpdate(exit_guard(current, event='local-rejected'), sell)) == 'applied'
+    before = current.snapshot()
+    next_attempt = exact_exit_attempt('fresh-after-local', None, quantity='2', sold='0', residual='2',
+        disposition='unknown', native='running')
+    assert replace_exit(current, next_attempt, event='replace-local-rejection') == 'applied'
+    retained = current.snapshot()
+    assert retained.resolved_exit_attempts[(EXIT_SCOPE, local.request_id)] == local
+    assert retained.resolved_exit_attempts[(EXIT_SCOPE, local.request_id)].submit_quantity is local.submit_quantity
+    assert local.order_key is None and local.own_fill_evidence is None
+    assert retained.orders == before.orders == () and not retained.own_fills
+    assert replace_exit(current, None, event='remove-actual-unknown') == 'stale'
+    assert replace_exit(current, replace(local, request_id='another-local'), event='replace-actual-unknown') == 'stale'
+    assert current.snapshot() == retained
+    fake_key = ('A', 'M', 'TOKEN', 'invented-venue-ID')
+    fake_order = cs.CurrentOrderFact(fake_key, 'SELL', 'LIVE', known(D('0.40')), known(D('2')),
+        known(D('0')), known(D('2')), 'present', None, known('FOK'), known(None), 1, stamp)
+    receipt = cs.ReceiptEvidence('fabricated-local-order', local.request_id, 'A', 'process', 'opaque-generation',
+        fake_key, 'SELL', 1, order_fact=fake_order, exit_attempt=replace(local, order_key=fake_key), scope=EXIT_SCOPE)
+    assert current.accept_receipt_evidence(receipt) == 'identity_error'
+    assert current.snapshot() == retained
+    # Omitting rich attempt context cannot smuggle an order onto the known NOT_SENT request.
+    assert current.accept_receipt_evidence(replace(receipt, event_id='fabricated-order-only', exit_attempt=None)) == 'identity_error'
+    assert current.snapshot() == retained
+
+
+def completed_exit_fixture(*, phase='closed', p2_disposition='terminal', p2_native='ended',
+                           entry_unknown=False, position='0', complete_entry_fill=True,
+                           current_local_rejection=False, p2_order_id='S2', p2_price=None):
+    current, p1 = exit_fixture()
+    p2 = exact_exit_attempt('P2', None if current_local_rejection else p2_order_id, quantity='60', sold='40', residual='60',
+        disposition='rejected' if current_local_rejection else p2_disposition, native=p2_native)
+    if p2_price is not None:
+        p2 = replace(p2, price=replace(p2.price, value=D(p2_price)))
+    assert replace_exit(current, p2, event='archive-for-completion') == 'applied'
+    entry_key = ('A', 'M', 'TOKEN', 'ENTRY')
+    rows = [dict(order('S1', side='SELL', matched='40'), original_size='100', status='CANCELED', order_type='FOK'),
+        dict(order('S2', side='SELL', matched='0'), original_size='60', status='CANCELED', order_type='FOK'),
+        dict(order('S3', side='SELL', matched='0'), original_size='60', status='CANCELED', order_type='FOK')]
+    entry_row = dict(order('ENTRY', matched='100'), original_size='100', status='LIVE' if entry_unknown else 'FILLED')
+    def final_source(second, include_entry=True):
+        return MarketReader.from_captured_sources(CapturedSources('A', {
+            'open_orders': SourceResult('completion-orders', rows + ([entry_row] if include_entry else []),
+                checked_at=T + timedelta(seconds=second)),
+            'positions': SourceResult('completion-positions', [] if position == '0' else [dict(account_id='A',
+                condition_id='M', token_id='TOKEN', quantity=position, cost_usd='0.40', average_price='0.40', redeemable=False)],
+                checked_at=T + timedelta(seconds=second)),
+            'balance': SourceResult('completion-balance', ('40', '40'), checked_at=T + timedelta(seconds=second))}))
+    observe(current, final_source(10), yields={}, capacity=D('40'))
+    stamp = current.snapshot().observation.components['open_orders']
+    known = lambda value: cs.Fact('known', value, (stamp,))
+    entry_fill = cs.OwnFillEvidence(entry_key, known(D('100')), known(D('40')), known(D('0.10')),
+        ('entry-fill100',), stamp, complete_entry_fill)
+    unknown_proof = None
+    if entry_unknown:
+        entry = next(o for o in current.snapshot().orders if o.key == entry_key)
+        unknown_proof = cs.TerminalProof(entry_key, 'CANCELED', entry.original_size,
+            cs.Fact('unknown', sources=(stamp,)), stamp, True)
+    assert current.accept_receipt_evidence(cs.ReceiptEvidence('entry-complete-fill', 'entry-request', 'A', 'process',
+        'opaque-generation', entry_key, 'BUY', 1, own_fill=entry_fill, terminal_proof=unknown_proof)) == 'applied'
+    observe(current, final_source(11, include_entry=not entry_unknown), yields={}, capacity=D('40'))
+    snapshot = current.snapshot()
+    orders_source, positions_source = snapshot.observation.components['open_orders'], snapshot.observation.components['positions']
+    sell = replace(snapshot.sells[EXIT_SCOPE], residual_quantity=known(D('0')), inventory_cost_usd=known(D('0')),
+        position_reconciled=True, current_sells=tuple(o for o in snapshot.orders if o.side == 'SELL'),
+        orders_source=orders_source, positions_source=positions_source)
+    assert current.apply_protection(cs.ExitEvidenceUpdate(exit_guard(current, event='complete-sell-projection', observation=True), sell)) == 'applied'
+    economics = cs.OpeningEconomics(EXIT_SCOPE, known(D('40')), known(D('16')), known(D('0.20')), known(D('0')), True)
+    scoring = cs.ScoringState(None, None, cs.Fact('unknown'), None, None, None, orders_source)
+    guard = exit_guard(current, event='complete-opening-projection', observation=True)
+    opening = cs.OpeningProtection(EXIT_SCOPE, phase, None, ('ENTRY',), known(D('100')), economics,
+        known(False), None, cs.Fact('unknown'), cs.Fact('unknown'), 'none', False, scoring, guard.expected_scope_version + 1)
+    assert current.apply_protection(cs.OpeningProtectionUpdate(guard, opening)) == 'applied'
+    return current, p1, p2
+
+
+def test_exit_attempt_retirement_requires_closed_reconciled_scope():
+    current, p1 = exit_fixture()
+    p2 = exact_exit_attempt('P2', 'S2', quantity='60', sold='40', residual='60')
+    assert replace_exit(current, p2, event='archive-before-retire') == 'applied'
+    before = current.snapshot()
+    assert current.retire_exit_attempts(exit_guard(current, event='no-closed-opening', observation=True)) == 'stale'
+    assert current.snapshot() == before
+    for options in ({'phase': 'protected_exit'}, {'p2_disposition': 'unknown'}, {'p2_disposition': 'accepted'},
+            {'p2_native': 'running'}, {'entry_unknown': True}, {'position': '1'}, {'complete_entry_fill': False},
+            {'p2_order_id': 'ENTRY'}, {'p2_price': '0.50'}):
+        candidate, _, _ = completed_exit_fixture(**options)
+        snapshot = candidate.snapshot()
+        assert candidate.retire_exit_attempts(exit_guard(candidate, event='unproven-retire', observation=True)) == 'stale', options
+        assert candidate.snapshot() == snapshot, options
+
+    contradictory, _, p2 = completed_exit_fixture()
+    snapshot = contradictory.snapshot()
+    stamp = snapshot.observation.components['open_orders']
+    known = lambda value: cs.Fact('known', value, (stamp,))
+    conflicting_fill = cs.OwnFillEvidence(p2.order_key, known(D('1')), known(D('0.40')), known(D('0.01')),
+        ('actual-S2-fill1',), stamp, True)
+    assert contradictory.accept_receipt_evidence(cs.ReceiptEvidence('contradict-terminal-zero', p2.request_id,
+        'A', 'process', 'opaque-generation', p2.order_key, 'SELL', 1, own_fill=conflicting_fill, scope=EXIT_SCOPE)) == 'applied'
+    assert observe(contradictory, snapshot.observation.source_frame, yields={}, capacity=D('40')).status == 'accepted'
+    before_conflict = contradictory.snapshot()
+    assert contradictory.retire_exit_attempts(exit_guard(contradictory, event='refuse-conflicting-zero', observation=True)) == 'stale'
+    assert contradictory.snapshot() == before_conflict
+
+    current, p1, p2 = completed_exit_fixture()
+    base = current.snapshot()
+    sell = base.sells[EXIT_SCOPE]
+    bad_source = replace(sell.orders_source, complete=False)
+    sell_variants = [replace(sell, residual_quantity=cs.Fact('unknown')),
+        replace(sell, residual_quantity=cs.Fact('known', D('1'))), replace(sell, position_reconciled=False),
+        replace(sell, orders_source=bad_source), replace(sell, positions_source=replace(sell.positions_source, checked_at=None)),
+        replace(sell, orders_source=replace(sell.orders_source, source_id='unaccepted-order-source'))]
+    for index, variant in enumerate(sell_variants):
+        assert current.apply_protection(cs.ExitEvidenceUpdate(exit_guard(current, event=f'bad-completion-{index}'), variant)) == 'applied'
+        snapshot = current.snapshot()
+        assert current.retire_exit_attempts(exit_guard(current, event=f'refuse-completion-{index}', observation=True)) == 'stale'
+        assert current.snapshot() == snapshot
+        assert current.apply_protection(cs.ExitEvidenceUpdate(exit_guard(current, event=f'restore-completion-{index}'), sell)) == 'applied'
+    opening = current.snapshot().openings[EXIT_SCOPE]
+    economics_variants = [replace(opening.economics, position_reconciled=False)] + [
+        replace(opening.economics, **{name: cs.Fact('unknown')}) for name in
+        ('buy_cost_usd', 'sold_revenue_usd', 'fees_usd', 'residual_exit_value_usd')]
+    for index, economics in enumerate(economics_variants):
+        guard = exit_guard(current, event=f'bad-economics-{index}')
+        assert current.apply_protection(cs.OpeningProtectionUpdate(guard,
+            replace(opening, economics=economics, scope_version=guard.expected_scope_version + 1))) == 'applied'
+        snapshot = current.snapshot()
+        assert current.retire_exit_attempts(exit_guard(current, event=f'refuse-economics-{index}', observation=True)) == 'stale'
+        assert current.snapshot() == snapshot
+    guard = exit_guard(current, event='missing-entry')
+    assert current.apply_protection(cs.OpeningProtectionUpdate(guard,
+        replace(opening, entry_order_ids=('missing-entry-ID',), scope_version=guard.expected_scope_version + 1))) == 'applied'
+    snapshot = current.snapshot()
+    assert current.retire_exit_attempts(exit_guard(current, event='refuse-missing-entry', observation=True)) == 'stale'
+    assert current.snapshot() == snapshot
+    guard = exit_guard(current, event='restore-closed-opening')
+    assert current.apply_protection(cs.OpeningProtectionUpdate(guard,
+        replace(opening, scope_version=guard.expected_scope_version + 1))) == 'applied'
+    valid_guard = exit_guard(current, event='retire-fully-discharged', observation=True)
+    for guard, status in [(replace(valid_guard, expected_scope_version=0), 'stale'),
+            (replace(valid_guard, cycle_generation='old-generation'), 'stale'),
+            (replace(valid_guard, observation_id='wrong-observation'), 'stale'),
+            (replace(valid_guard, observation_id=None), 'stale'),
+            (replace(valid_guard, scope=('wrong-account', 'M', 'TOKEN', 'episode')), 'invalid_identity'),
+            (replace(valid_guard, scope=cs.ProtectionKey('queue_bucket', EXIT_SCOPE, D('0.40'), None)), 'invalid_identity')]:
+        snapshot = current.snapshot()
+        assert current.retire_exit_attempts(guard) == status
+        assert current.snapshot() == snapshot
+    before = current.snapshot()
+    captured = before.resolved_exit_attempts
+    assert current.retire_exit_attempts(valid_guard) == 'applied'
+    after = current.snapshot()
+    assert not after.resolved_exit_attempts
+    assert after.sells[EXIT_SCOPE] == replace(before.sells[EXIT_SCOPE], passive=None, protected=None)
+    assert after.orders == before.orders and after.own_fills == before.own_fills and after.openings == before.openings
+    assert after.current == before.current and after.trade_version == before.trade_version
+    assert after.buy_reserved == before.buy_reserved and after.inventory_cost == before.inventory_cost and after.new_capacity == before.new_capacity
+    assert after.scope_versions[EXIT_SCOPE] == before.scope_versions[EXIT_SCOPE] + 1
+    assert after.snapshot_version == before.snapshot_version + 1
+    assert captured[(EXIT_SCOPE, 'P1')] == p1
+    assert current.retire_exit_attempts(exit_guard(current, event='duplicate-retire', observation=True)) == 'stale'
+    assert current.snapshot() == after
+    # A completed local rejection needs no invented order/fill to be discharged.
+    local, _, p2 = completed_exit_fixture(current_local_rejection=True)
+    assert p2.order_key is None and p2.own_fill_evidence is None
+    assert local.retire_exit_attempts(exit_guard(local, event='retire-local-rejection', observation=True)) == 'applied'
+
+
+def test_retired_exit_scope_rejects_recreation_and_keeps_independent_facts():
+    import pytest
+    current, p1, p2 = completed_exit_fixture()
+    opening = current.snapshot().openings[EXIT_SCOPE]
+    guard = exit_guard(current, event='latch-old-episode')
+    assert current.apply_protection(cs.OpeningProtectionUpdate(guard, replace(opening,
+        stop_loss_latched=cs.Fact('known', True), stop_loss_triggered_at=T,
+        stop_loss_triggered_loss_usd=cs.Fact('known', D('24')), scope_version=guard.expected_scope_version + 1))) == 'applied'
+    captured = current.snapshot().resolved_exit_attempts
+    assert current.retire_exit_attempts(exit_guard(current, event='retire-old-episode', observation=True)) == 'applied'
+    retired = current.snapshot()
+    stamp = cs.SourceStamp('late-retired-proof', checked_at=T + timedelta(seconds=12), complete=True, state='known')
+    known = lambda value: cs.Fact('known', value, (stamp,))
+    fill = replace(p1.own_fill_evidence, quantity=known(D('45')), notional_usd=known(D('18')),
+        fees_usd=known(D('0.12')), fill_ids=('S1-fill40', 'S1-fill5'), source=stamp)
+    proof = cs.TerminalProof(p1.order_key, 'CANCELED', retired.orders[0].original_size, known(D('45')), stamp, True)
+    late = cs.ReceiptEvidence('late-retired-explicit', 'P1', 'A', 'process', 'old-generation', p1.order_key,
+        'SELL', 1, terminal_proof=proof, own_fill=fill, exit_attempt=replace(p1, own_fill_evidence=fill), scope=EXIT_SCOPE)
+    assert current.accept_receipt_evidence(late) == 'stale_evidence'
+    assert current.snapshot() == retired
+    unknown = replace(late, event_id='never-registered-attempt', request_id='never-registered',
+        exit_attempt=replace(p1, request_id='never-registered', own_fill_evidence=fill))
+    assert current.accept_receipt_evidence(unknown) == 'identity_error'
+    assert current.snapshot() == retired
+    assert replace_exit(current, p2, event='recreate-retired-slot') == 'stale'
+    guard = exit_guard(current, event='reopen-retired')
+    assert current.apply_protection(cs.OpeningProtectionUpdate(guard, replace(opening,
+        phase='opening', scope_version=guard.expected_scope_version + 1))) == 'stale'
+    assert current.snapshot() == retired
+    new_scope = ('A', 'M', 'TOKEN', 'genuine-next-episode')
+    reused_sell = replace(retired.sells[EXIT_SCOPE], scope=new_scope, protected=p1)
+    assert current.apply_protection(cs.ExitEvidenceUpdate(exit_guard(current, new_scope, event='old-request-new-episode'),
+        reused_sell)) == 'stale'
+    assert current.snapshot() == retired
+
+    # Dropping rich context does not block independent factual improvements.
+    independent = replace(late, event_id='independent-late-facts', exit_attempt=None)
+    assert current.accept_receipt_evidence(independent) == 'applied'
+    factual = current.snapshot()
+    assert not factual.resolved_exit_attempts
+    assert factual.sells == retired.sells and factual.openings == retired.openings and factual.current == retired.current
+    assert factual.orders[0].terminal_proof == proof and factual.own_fills[p1.order_key] == fill
+    assert factual.new_capacity.state == 'unknown'
+    assert factual.trade_version == retired.trade_version + 1
+    fee_fill = replace(fill, fees_usd=known(D('0.13')))
+    assert current.accept_receipt_evidence(replace(independent, event_id='independent-own-fill',
+        terminal_proof=None, own_fill=fee_fill)) == 'applied'
+    factual = current.snapshot()
+    assert factual.own_fills[p1.order_key] == fee_fill and not factual.resolved_exit_attempts
+    assert factual.sells == retired.sells
+    # An independent order proof can also progress without any submit-context reconstruction.
+    later_proof = replace(proof, source=replace(stamp, checked_at=T + timedelta(seconds=13)))
+    assert current.accept_receipt_evidence(replace(independent, event_id='independent-order-proof',
+        terminal_proof=later_proof, own_fill=None)) == 'applied'
+    assert current.snapshot().sells == retired.sells and not current.snapshot().resolved_exit_attempts
+    assert captured[(EXIT_SCOPE, 'P1')] == p1
+    with pytest.raises(TypeError):
+        captured[(EXIT_SCOPE, 'P2')] = p2
+
+    # A distinct episode/request has independent current facts and retention.
+    rows = [dict(row) for row in current.snapshot().observation.source_frame.orders]
+    rows = [dict(row, size_matched=D('45')) if row['order_id'] == 'S1' else row for row in rows]
+    rows.append(dict(order('NEXT-ENTRY', matched='2'), original_size='2', status='FILLED'))
+    next_source = MarketReader.from_captured_sources(CapturedSources('A', {
+        'open_orders': SourceResult('next-episode-orders', rows, checked_at=T + timedelta(seconds=14)),
+        'positions': SourceResult('next-episode-positions', [dict(account_id='A', condition_id='M', token_id='TOKEN',
+            quantity='2', cost_usd='0.80', average_price='0.40', redeemable=False)], checked_at=T + timedelta(seconds=14)),
+        'balance': SourceResult('next-episode-balance', ('40', '40'), checked_at=T + timedelta(seconds=14))}))
+    assert observe(current, next_source, yields={}, capacity=D('39.20')).status == 'accepted'
+    latest = current.snapshot()
+    next_known = lambda value: cs.Fact('known', value, (latest.observation.components['positions'],))
+    next_sell = cs.SellState(new_scope, next_known(D('2')), next_known(D('0.80')), True, (),
+        latest.observation.components['open_orders'], latest.observation.components['positions'], None,
+        exact_exit_attempt('new-local', None, quantity='2', residual='2', disposition='rejected'))
+    assert current.apply_protection(cs.ExitEvidenceUpdate(exit_guard(current, new_scope, event='new-episode-local'), next_sell)) == 'applied'
+    new_active = exact_exit_attempt('new-actual-send', None, quantity='2', residual='2', disposition='unknown', native='running')
+    assert replace_exit(current, new_active, scope=new_scope, event='new-episode-send') == 'applied'
+    new_opening_guard = exit_guard(current, new_scope, event='new-opening')
+    new_opening = replace(opening, scope=new_scope, phase='opening', entry_order_ids=('NEXT-ENTRY',),
+        buy_filled_quantity=next_known(D('2')),
+        economics=cs.OpeningEconomics(new_scope, next_known(D('0.80')), next_known(D('0')),
+            next_known(D('0')), next_known(D('0.80')), True), stop_loss_latched=cs.Fact('known', False),
+        stop_loss_triggered_at=None, stop_loss_triggered_loss_usd=cs.Fact('unknown'),
+        scope_version=new_opening_guard.expected_scope_version + 1)
+    assert current.apply_protection(cs.OpeningProtectionUpdate(new_opening_guard, new_opening)) == 'applied'
+    before_control = current.snapshot()
+    assert before_control.openings[new_scope].stop_loss_latched.value is False
+    assert before_control.openings[EXIT_SCOPE].stop_loss_latched.value is True
+    retained_new = before_control.resolved_exit_attempts[(new_scope, 'new-local')]
+    current.apply_effective_control(cs.EffectiveControlTransition('A', 'process', ('process', 1),
+        1, 0, True, False, 'pause'), 'opaque-generation')
+    current.apply_effective_control(cs.EffectiveControlTransition('A', 'process', ('process', 2),
+        2, 1, False, True, 'explicit_resume'), 'new-generation')
+    resumed = current.snapshot()
+    assert resumed.resolved_exit_attempts[(new_scope, 'new-local')] == retained_new
+    assert (EXIT_SCOPE, 'P1') not in resumed.resolved_exit_attempts
+    assert resumed.sells[new_scope] == before_control.sells[new_scope]
+    assert replace_exit(current, p1, event='retired-after-resume') == 'stale'
+    assert current.accept_receipt_evidence(replace(late, event_id='retired-receipt-after-resume')) == 'stale_evidence'
+    # A still-current real no-ID send can later return its genuine exact order.
+    returned_key = ('A', 'M', 'TOKEN', 'new-real-order')
+    returned_order = cs.CurrentOrderFact(returned_key, 'SELL', 'LIVE', known(D('0.40')), known(D('2')),
+        known(D('1')), known(D('1')), 'present', None, known('FOK'), known(None), 1, stamp)
+    returned_attempt = replace(new_active, order_key=returned_key, state='accepted', native_state='ended')
+    returned_receipt = cs.ReceiptEvidence('late-new-real-ID', new_active.request_id, 'A', 'process',
+        'opaque-generation', returned_key, 'SELL', 1, order_fact=returned_order,
+        exit_attempt=returned_attempt, scope=new_scope)
+    assert current.accept_receipt_evidence(returned_receipt) == 'applied'
+    received = current.snapshot()
+    assert received.sells[new_scope].protected == returned_attempt
+    assert received.current == resumed.current
+    assert received.resolved_exit_attempts[(new_scope, 'new-local')] == retained_new
+    assert (EXIT_SCOPE, 'P1') not in received.resolved_exit_attempts
+    fresh_process = cs.CurrentLPState('A', 'another-process')
+    fresh = fresh_process.snapshot()
+    assert not fresh.resolved_exit_attempts and not fresh.sells and not fresh.openings and not fresh.own_fills
