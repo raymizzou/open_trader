@@ -522,3 +522,365 @@ def test_expanded_fill_coverage_does_not_promote_partial_money_to_totals():
     assert snapshot.orders[0].terminal_proof == proof
     assert first.notional_usd.value == D('0.40')
     assert expanded.notional_usd.state == 'unknown'
+
+
+def test_id_only_cancel_unknown_final_quantity_resolves_from_fresh_terminal():
+    current = state()
+    original_frame = frame([order(matched='0')])
+    observe(current, original_frame, yields={'O1': None})
+    before = current.snapshot()
+    original = before.orders[0]
+    ack_stamp = cs.SourceStamp('cancel-ID-only', checked_at=T + timedelta(seconds=1),
+        complete=True, state='known')
+    proof = cs.TerminalProof(KEY, 'CANCELED', original.original_size,
+        cs.Fact('unknown', sources=(ack_stamp,)), ack_stamp, True)
+    assert current.accept_receipt_evidence(cs.ReceiptEvidence('cancel-unknown', 'cancel-O1',
+        'A', 'process', 'opaque-generation', KEY, 'BUY', original.terms_version,
+        terminal_proof=proof)) == 'applied'
+    acknowledged = current.snapshot()
+    canceled = acknowledged.orders[0]
+    assert canceled.terminal_proof is proof
+    assert canceled.terminal_proof.matched.state == 'unknown'
+    assert canceled.original_size is original.original_size
+    assert canceled.size_matched is original.size_matched
+    assert canceled.size_matched.value == D('0')
+    assert canceled.size_matched.sources[0].checked_at == T
+    assert canceled.remaining.state == 'unknown' and canceled.remaining.value is None
+    assert acknowledged.active_orders == acknowledged.ordinary_poll_order_keys == ()
+    assert KEY not in acknowledged.yields and not acknowledged.own_fills
+    assert acknowledged.observation is before.observation
+
+    terminal_frame = frame([dict(order(matched='3'), status='CANCELED')],
+        checked_at=T + timedelta(seconds=2))
+    prepared = calculation(terminal_frame, {}, D('19'))
+    ticket = current.begin_observation('opaque-generation', tuple(terminal_frame.sources))
+    assert current.accept(ticket, terminal_frame, prepared, evaluated_at=T + timedelta(seconds=2)).status == 'accepted'
+    resolved = current.snapshot()
+    final = resolved.orders[0]
+    assert final.venue_status == 'CANCELED'
+    assert final.terminal_proof.matched.value == final.size_matched.value == D('3')
+    assert final.remaining.value == D('7')
+    assert final.source.checked_at == T + timedelta(seconds=2)
+    assert resolved.buy_reserved.value == D('0') and resolved.new_capacity.value == D('19')
+    assert not resolved.own_fills and not resolved.yields and not resolved.active_orders
+    assert resolved.observation.source_frame is terminal_frame
+    assert resolved.observation.calculation is prepared
+    assert before.observation.source_frame is original_frame
+    assert before.orders[0].size_matched.value == D('0')
+
+
+def test_cancel_unknown_final_quantity_preserves_progress_and_terminal_guards():
+    def acknowledged_state():
+        current = state()
+        observe(current)
+        initial = current.snapshot().orders[0]
+        stamp = cs.SourceStamp('ID-only', checked_at=T + timedelta(seconds=1), complete=True, state='known')
+        proof = cs.TerminalProof(KEY, 'CANCELED', initial.original_size,
+            cs.Fact('unknown', sources=(stamp,)), stamp, True)
+        assert current.accept_receipt_evidence(cs.ReceiptEvidence('ack', 'cancel', 'A', 'process',
+            'opaque-generation', KEY, 'BUY', initial.terms_version, terminal_proof=proof)) == 'applied'
+        canceled = current.snapshot().orders[0]
+        assert canceled.size_matched is initial.size_matched
+        assert canceled.size_matched.value == D('3') and canceled.size_matched.sources[0].checked_at == T
+        assert canceled.terminal_proof.matched.state == canceled.remaining.state == 'unknown'
+        return current
+
+    current = acknowledged_state()
+    acknowledged = current.snapshot().orders[0]
+    for second, changes in [(0, {}), (2, {'status': 'LIVE'}), (3, {'price': '0.50'}),
+            (4, {'original_size': '11'}), (5, {'order_type': 'GTD', 'expiration': 123}),
+            (6, {'size_matched': '2'})]:
+        row = dict(order(matched='4'), status='CANCELED')
+        row.update(changes)
+        source = frame([row], checked_at=T + timedelta(seconds=second))
+        assert observe(current, source).status == 'partial'
+        snapshot = current.snapshot()
+        assert snapshot.orders[0] is acknowledged
+        assert snapshot.orders[0].terminal_proof.matched.state == 'unknown'
+        assert snapshot.orders[0].source.checked_at == T + timedelta(seconds=1)
+        assert snapshot.buy_reserved.state == snapshot.new_capacity.state == 'unknown'
+    source = frame([dict(order(matched='4'), status='CANCELED')], checked_at=T + timedelta(seconds=7))
+    assert observe(current, source, capacity=D('19')).status == 'accepted'
+    final = current.snapshot().orders[0]
+    assert final.terminal_proof.matched.value == final.size_matched.value == D('4')
+    assert final.remaining.value == D('6')
+    for index, (second, value) in enumerate([(6, '4'), (8, None), (9, '3')]):
+        stamp = cs.SourceStamp('late-proof', checked_at=T + timedelta(seconds=second), complete=True, state='known')
+        proof = cs.TerminalProof(KEY, 'CANCELED', final.original_size,
+            cs.Fact('unknown', sources=(stamp,)) if value is None else cs.Fact('known', D(value), (stamp,)), stamp, True)
+        before = current.snapshot()
+        result = current.accept_receipt_evidence(cs.ReceiptEvidence(f'late-{index}', 'cancel', 'A', 'process',
+            'opaque-generation', KEY, 'BUY', 1, terminal_proof=proof))
+        assert result in ('stale_evidence', 'identity_error')
+        after = current.snapshot()
+        assert after.orders == before.orders and after.snapshot_version == before.snapshot_version
+        assert after.new_capacity == before.new_capacity
+
+    receipt_state = acknowledged_state()
+    acknowledged = receipt_state.snapshot().orders[0]
+    for second, value in [(0, '4'), (2, '2')]:
+        stamp = cs.SourceStamp('unusable-proof', checked_at=T + timedelta(seconds=second), complete=True, state='known')
+        proof = cs.TerminalProof(KEY, 'CANCELED', acknowledged.original_size, cs.Fact('known', D(value), (stamp,)), stamp, True)
+        before = receipt_state.snapshot()
+        assert receipt_state.accept_receipt_evidence(cs.ReceiptEvidence(f'bad-{second}', 'cancel', 'A', 'process',
+            'opaque-generation', KEY, 'BUY', 1, terminal_proof=proof)) in ('stale_evidence', 'identity_error')
+        assert receipt_state.snapshot().snapshot_version == before.snapshot_version
+        assert receipt_state.snapshot().orders[0] is acknowledged
+    stamp = cs.SourceStamp('final-proof', checked_at=T + timedelta(seconds=3), complete=True, state='known')
+    proof = cs.TerminalProof(KEY, 'CANCELED', acknowledged.original_size, cs.Fact('known', D('4'), (stamp,)), stamp, True)
+    assert receipt_state.accept_receipt_evidence(cs.ReceiptEvidence('final', 'cancel', 'A', 'process',
+        'opaque-generation', KEY, 'BUY', 1, terminal_proof=proof)) == 'applied'
+    final = receipt_state.snapshot().orders[0]
+    assert final.terminal_proof is proof and final.size_matched.value == D('4') and final.remaining.value == D('6')
+    assert final.size_matched.sources == (stamp,)
+    assert not receipt_state.snapshot().own_fills
+
+
+class ExecutionClock:
+    def __init__(self):
+        self.second = 0
+
+    def utc_now(self):
+        return T + timedelta(seconds=self.second)
+
+    def monotonic(self):
+        return 100 + self.second
+
+
+def execution_state():
+    clock = ExecutionClock()
+    current = cs.CurrentLPState('A', 'process', clock=clock.monotonic, utc_now=clock.utc_now)
+    current.apply_effective_control(cs.EffectiveControlTransition('A', 'process',
+        ('process', 0), 0, None, None, True, 'startup'), 'opaque-generation')
+    source = cash_frame()
+    ticket = current.begin_observation('opaque-generation', tuple(source.sources))
+    assert current.accept(ticket, source, calculation(source, {}, D('40')), evaluated_at=T).status == 'accepted'
+    return current, clock
+
+
+def cash_frame(orders=(), *, orders_at=T, positions_at=None, balance_at=None):
+    return MarketReader.from_captured_sources(CapturedSources('A', {
+        'open_orders': SourceResult('cash-orders', list(orders), checked_at=orders_at),
+        'positions': SourceResult('cash-positions', [], checked_at=positions_at or orders_at),
+        'balance': SourceResult('cash-balance', ('40', '40'), checked_at=balance_at or orders_at),
+    }))
+
+
+def buy_uncertainty(**changes):
+    values = dict(event_id='uncertain-1', request_id='native-buy-1', account_id='A',
+        process_epoch='process', cycle_generation='opaque-generation', batch_id='batch-1',
+        round_number=0, observation_id='sealed-observation', venue='polymarket',
+        condition_id='M', token_id='TOKEN', price=D('0.40'), quantity=D('10'),
+        order_type='GTC', expiration=None, post_only=True,
+        send_options=(('tick_size', '0.01'), ('neg_risk', False)),
+        native_started_at=T + timedelta(seconds=1), observed_at=T + timedelta(seconds=2),
+        reason='unknown_timeout', venue_order_id=None)
+    values.update(changes)
+    return cs.BuyExecutionUncertainty(**values)
+
+
+def test_uncertain_buy_without_order_id_invalidates_financial_authority_and_prior_read():
+    current, clock = execution_state()
+    before = current.snapshot()
+    assert [f.value for f in (before.buy_reserved, before.inventory_cost, before.current_exposure,
+        before.new_capacity)] == [D('0'), D('0'), D('0'), D('40')]
+    historical = before.observation
+    old_ticket = current.begin_observation('opaque-generation', tuple(historical.source_frame.sources))
+    clock.second = 2
+    event = buy_uncertainty()
+    assert current.accept_buy_execution_uncertainty(event) == 'applied'
+    after = current.snapshot()
+    assert after.trade_version == before.trade_version + 1
+    assert after.snapshot_version == before.snapshot_version + 1
+    for fact in (after.buy_reserved, after.inventory_cost, after.current_exposure, after.new_capacity):
+        assert fact.state == 'unknown' and fact.value is None
+    assert after.orders == after.positions == () and not after.own_fills
+    assert after.current == before.current and after.yields == before.yields
+    assert after.observation is historical
+    assert after.observation.source_frame is historical.source_frame
+    assert after.observation.calculation is historical.calculation
+    assert after.observation.components is historical.components
+    assert historical.calculation.new_capacity == D('40')
+    assert current.accept(old_ticket, historical.source_frame, historical.calculation, evaluated_at=clock.utc_now()).status == 'stale'
+    assert current.snapshot().snapshot_version == after.snapshot_version
+
+
+def test_uncertain_buy_unusable_receipt_identity_and_replay_are_guarded():
+    current, clock = execution_state()
+    clock.second = 2
+    evidence = buy_uncertainty(reason='invalid_receipt', venue_order_id='real-venue-ID')
+    assert current.accept_buy_execution_uncertainty(evidence) == 'applied'
+    after = current.snapshot()
+    assert not after.orders and not after.own_fills
+    assert after.new_capacity.state == after.buy_reserved.state == after.inventory_cost.state == 'unknown'
+    for replay in (evidence, replace(evidence, event_id='same-request-new-event', observed_at=T + timedelta(seconds=3))):
+        assert current.accept_buy_execution_uncertainty(replay) == 'stale_evidence'
+        assert current.snapshot() == after
+    for conflict in (replace(evidence, event_id='conflicting-request', quantity=D('11')),
+            replace(evidence, request_id='different-request-same-event')):
+        assert current.accept_buy_execution_uncertainty(conflict) == 'identity_error'
+        assert current.snapshot() == after
+    malformed = [
+        {'account_id': 'foreign'}, {'process_epoch': 'foreign'}, {'cycle_generation': 'unissued'},
+        *[{name: ''} for name in ('event_id', 'request_id', 'batch_id', 'observation_id', 'venue', 'condition_id', 'token_id')],
+        {'condition_id': '   '}, {'round_number': True}, {'round_number': -1}, {'round_number': '0'},
+        {'price': D('NaN')}, {'price': D('Infinity')}, {'price': D('0')}, {'price': D('1')}, {'price': '0.40'},
+        {'quantity': D('0')}, {'quantity': D('-1')}, {'quantity': D('NaN')}, {'quantity': 10},
+        {'order_type': 'gtc'}, {'expiration': True}, {'expiration': 123},
+        {'order_type': 'GTD', 'expiration': None}, {'order_type': 'GTD', 'expiration': -1},
+        {'order_type': 'GTD', 'expiration': '123'}, {'order_type': 'GTD', 'expiration': True}, {'post_only': 1},
+        {'send_options': [('tick_size', '0.01')]}, {'send_options': (('x', 1), ('x', 2))},
+        {'send_options': (('', True),)}, {'send_options': (('x', D('1')),)},
+        {'send_options': (('x',),)}, {'native_started_at': None}, {'native_started_at': T.replace(tzinfo=None)},
+        {'observed_at': T}, {'observed_at': 'later'}, {'reason': 'not_sent'},
+        {'venue_order_id': ''}, {'venue_order_id': 1},
+    ]
+    for index, changes in enumerate(malformed):
+        fields = dict(event_id=f'bad-event-{index}', request_id=f'bad-request-{index}')
+        fields.update(changes)
+        candidate = replace(evidence, **fields)
+        assert current.accept_buy_execution_uncertainty(candidate) == 'identity_error', changes
+        assert current.snapshot() == after, changes
+    # Canonical GTD scalar expiry and all allowed option scalar types remain valid.
+    valid = buy_uncertainty(event_id='valid-gtd', request_id='valid-gtd-request', order_type='GTD',
+        expiration=123, send_options=(('s', 'x'), ('i', 1), ('b', True), ('n', None)))
+    assert current.accept_buy_execution_uncertainty(valid) == 'applied'
+    assert current.snapshot().trade_version == after.trade_version + 1
+
+    # This records an actual post using the consumer's nonnegative GTD expiry.
+    zero_state, zero_clock = execution_state()
+    zero_clock.second = 2
+    before_zero = zero_state.snapshot()
+    assert before_zero.new_capacity.value == D('40')
+    zero_expiry = buy_uncertainty(event_id='actual-gtd-zero', request_id='native-gtd-zero',
+        order_type='GTD', expiration=0)
+    assert zero_state.accept_buy_execution_uncertainty(zero_expiry) == 'applied'
+    after_zero = zero_state.snapshot()
+    for fact in (after_zero.buy_reserved, after_zero.inventory_cost,
+            after_zero.current_exposure, after_zero.new_capacity):
+        assert fact.state == 'unknown' and fact.value is None
+    assert after_zero.trade_version == before_zero.trade_version + 1
+    assert after_zero.snapshot_version == before_zero.snapshot_version + 1
+    assert not after_zero.orders and not after_zero.own_fills
+    assert after_zero.observation is before_zero.observation
+
+
+def test_uncertain_buy_financial_reconciliation_requires_fresh_sources():
+    current, clock = execution_state()
+    historical = current.snapshot().observation
+    clock.second = 2
+    evidence = buy_uncertainty()
+    assert current.accept_buy_execution_uncertainty(evidence) == 'applied'
+    clock.second = 3
+    cached = cash_frame(orders_at=T + timedelta(seconds=1))
+    cached_calculation = calculation(cached, {}, D('40'))
+    ticket = current.begin_observation('opaque-generation', tuple(cached.sources))
+    assert current.accept(ticket, cached, cached_calculation, evaluated_at=clock.utc_now()).status == 'partial'
+    cached_snapshot = current.snapshot()
+    for fact in (cached_snapshot.buy_reserved, cached_snapshot.inventory_cost,
+            cached_snapshot.current_exposure, cached_snapshot.new_capacity):
+        assert fact.state == 'unknown' and fact.value is None
+    assert cached_snapshot.observation.source_frame is cached
+    assert cached_snapshot.observation.calculation is cached_calculation
+    assert cached.sources['balance'].checked_at == T + timedelta(seconds=1)
+    assert historical.calculation.new_capacity == D('40')
+
+    # Both source time and ticket start must be strictly after the uncertainty.
+    clock.second = 2
+    ticket = current.begin_observation('opaque-generation', tuple(cached.sources))
+    clock.second = 3
+    later_sources = cash_frame(orders_at=T + timedelta(seconds=3))
+    assert current.accept(ticket, later_sources, calculation(later_sources, {}, D('40')),
+        evaluated_at=clock.utc_now()).status == 'partial'
+    assert current.snapshot().buy_reserved.state == current.snapshot().inventory_cost.state == current.snapshot().new_capacity.state == 'unknown'
+
+    clock.second = 4
+    partial = cash_frame([order('O2', matched='3')], orders_at=clock.utc_now(),
+        balance_at=T + timedelta(seconds=1))
+    ticket = current.begin_observation('opaque-generation', tuple(partial.sources))
+    prepared = calculation(partial, {'O2': D('0.10')}, D('37.20'))
+    assert current.accept(ticket, partial, prepared, evaluated_at=clock.utc_now()).status == 'partial'
+    snapshot = current.snapshot()
+    o2 = ('A', 'M', 'TOKEN', 'O2')
+    assert snapshot.orders[0].key == o2 and snapshot.orders[0].size_matched.value == D('3')
+    assert snapshot.yields[o2].yield_pct_per_hour.value == D('0.10')
+    assert snapshot.buy_reserved.value == D('2.80') and snapshot.inventory_cost.value == D('0')
+    assert snapshot.current_exposure.value == D('2.80')
+    assert snapshot.new_capacity.state == 'unknown' and snapshot.new_capacity.value is None
+    assert snapshot.observation.source_frame is partial and snapshot.observation.calculation is prepared
+    assert partial.sources['balance'].checked_at == T + timedelta(seconds=1)
+
+    clock.second = 5
+    fresh = cash_frame([order('O2', matched='3')], orders_at=clock.utc_now())
+    prepared = calculation(fresh, {'O2': D('0.10')}, D('37.20'))
+    ticket = current.begin_observation('opaque-generation', tuple(fresh.sources))
+    assert current.accept(ticket, fresh, prepared, evaluated_at=clock.utc_now()).status == 'accepted'
+    reconciled = current.snapshot()
+    assert reconciled.buy_reserved.value == D('2.80') and reconciled.inventory_cost.value == D('0')
+    assert reconciled.new_capacity.value == D('37.20')
+    assert reconciled.observation.source_frame is fresh and reconciled.observation.calculation is prepared
+    assert current.accept_buy_execution_uncertainty(replace(evidence, event_id='replayed-after-reconciliation')) == 'stale_evidence'
+    assert current.snapshot() == reconciled
+
+
+def test_old_generation_buy_uncertainty_and_receipt_preserve_resumed_control():
+    current, clock = execution_state()
+    # The real native request started under the issued original generation.
+    clock.second = 2
+    current.apply_effective_control(cs.EffectiveControlTransition('A', 'process',
+        ('process', 1), 1, 0, True, False, 'pause'), 'opaque-generation')
+    clock.second = 3
+    current.apply_effective_control(cs.EffectiveControlTransition('A', 'process',
+        ('process', 2), 2, 1, False, True, 'explicit_resume'), 'resumed-generation')
+    source = cash_frame([order('O2', matched='0')], orders_at=clock.utc_now())
+    ticket = current.begin_observation('resumed-generation', tuple(source.sources))
+    assert current.accept(ticket, source, calculation(source, {'O2': None}, D('36')),
+        evaluated_at=clock.utc_now()).status == 'accepted'
+    before = current.snapshot()
+    o2 = ('A', 'M', 'TOKEN', 'O2')
+    timer = before.yields[o2]
+    assert timer.unknown_since_monotonic == 103 and timer.unknown_deadline_monotonic == 703
+    clock.second = 4
+    evidence = buy_uncertainty(observed_at=clock.utc_now())
+    assert evidence.native_started_at == T + timedelta(seconds=1)
+    assert current.accept_buy_execution_uncertainty(evidence) == 'applied'
+    uncertain = current.snapshot()
+    assert uncertain.current == before.current
+    assert uncertain.current.cycle_generation == 'resumed-generation' and uncertain.current.transition_id == ('process', 2)
+    assert uncertain.yields[o2] is timer
+    assert uncertain.buy_reserved.state == uncertain.inventory_cost.state == uncertain.new_capacity.state == 'unknown'
+    assert uncertain.trade_version == before.trade_version + 1
+    assert uncertain.snapshot_version == before.snapshot_version + 1
+
+    clock.second = 5
+    stamp = cs.SourceStamp('real-late-BUY-receipt', checked_at=clock.utc_now(), complete=True, state='known')
+    def known(value):
+        return cs.Fact('known', value, (stamp,))
+    incoming = cs.CurrentOrderFact(KEY, 'BUY', 'LIVE', known(D('0.40')), known(D('10')),
+        known(D('3')), known(D('7')), 'present', None, known('GTC'), known(None), 1, stamp)
+    receipt = cs.ReceiptEvidence('real-receipt', evidence.request_id, 'A', 'process',
+        evidence.cycle_generation, KEY, 'BUY', 1, order_fact=incoming)
+    assert current.accept_receipt_evidence(receipt) == 'applied'
+    received = current.snapshot()
+    assert next(o for o in received.orders if o.key == KEY).size_matched.value == D('3')
+    assert next(o for o in received.orders if o.key == KEY).source is stamp
+    assert received.current == before.current and received.yields[o2] is timer
+    assert received.inventory_cost.state == received.new_capacity.state == 'unknown'
+    assert received.observation is before.observation
+    for changes in ({'process_epoch': 'foreign'}, {'cycle_generation': 'never-issued'}):
+        invalid = replace(evidence, event_id='foreign-event', request_id='foreign-request', **changes)
+        assert current.accept_buy_execution_uncertainty(invalid) == 'identity_error'
+        assert current.snapshot() == received
+    assert current.accept_buy_execution_uncertainty(evidence) == 'stale_evidence'
+    assert current.snapshot() == received
+
+    clock.second = 6
+    source = cash_frame([order(), order('O2', matched='0')], orders_at=clock.utc_now())
+    ticket = current.begin_observation('resumed-generation', tuple(source.sources))
+    assert current.accept(ticket, source, calculation(source, {'O1': D('0.20'), 'O2': None}, D('33.20')),
+        evaluated_at=clock.utc_now()).status == 'accepted'
+    final = current.snapshot()
+    assert final.current == before.current
+    assert final.yields[o2].unknown_since_monotonic == 103 and final.yields[o2].unknown_deadline_monotonic == 703
+    assert final.buy_reserved.value == D('6.80') and final.inventory_cost.value == D('0')
+    assert final.new_capacity.value == D('33.20')
