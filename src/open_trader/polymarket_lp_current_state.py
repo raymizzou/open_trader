@@ -6,7 +6,7 @@ owner supplies the original frame and its already prepared calculation.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
@@ -561,6 +561,8 @@ class CurrentSnapshot:
     openings: Mapping[ScopeKey, OpeningProtection]
     sells: Mapping[ScopeKey, SellState]
     scope_versions: Mapping[ScopeKey | OrderKey | ProtectionKey, int]
+    resolved_exit_attempts: Mapping[tuple[ScopeKey, str], ExitAttempt] = field(
+        default_factory=lambda: MappingProxyType({}))
 
     @property
     def active_orders(self) -> tuple[CurrentOrderFact, ...]:
@@ -625,6 +627,9 @@ class CurrentLPState:
         self._baselines, self._progress, self._failures = {}, {}, {}
         self._openings, self._sells, self._scope_versions = {}, {}, {}
         self._protection_events = set()
+        self._resolved_exit_attempts = {}
+        self._exit_request_identities = {}
+        self._retired_exit_scopes = set()
         self._reserved = self._inventory = self._capacity = Fact('not_read')
 
     def apply_effective_control(self, transition: EffectiveControlTransition,
@@ -859,25 +864,12 @@ class CurrentLPState:
             return 'invalid_identity'
         with self._lock:
             g = update.guard
-            if not isinstance(g, ProtectionGuard):
-                return 'invalid_identity'
+            status = self._protection_guard_status(g)
+            if status != 'applied':
+                return status
             scope = g.scope.scope if isinstance(g.scope, ProtectionKey) else g.scope
-            if (not isinstance(scope, tuple) or len(scope) != 4 or scope[0] != self.account_id
-                    or not g.event_id or g.expected_scope_version < 0):
-                return 'invalid_identity'
-            if (g.cycle_generation != self._current.cycle_generation
-                    or (g.scope, g.event_id) in self._protection_events
-                    or g.expected_scope_version != self._scope_versions.get(g.scope, 0)
-                    or (g.observation_id is not None and (self._observation is None
-                        or g.observation_id != self._observation.observation_id
-                        or self._observation.read_ticket.trade_version_at_start != self._trade_version))):
+            if g.scope in self._retired_exit_scopes and isinstance(update, (OpeningProtectionUpdate, ExitEvidenceUpdate)):
                 return 'stale'
-            for key, version in g.expected_order_terms_versions:
-                order = self._orders.get(key)
-                if key[:3] != scope[:3] or order is None:
-                    return 'invalid_identity'
-                if order.terms_version != version:
-                    return 'stale'
             version = g.expected_scope_version + 1
             if isinstance(update, SetBaseline):
                 b = update.baseline
@@ -958,15 +950,30 @@ class CurrentLPState:
                     return 'invalid_identity'
                 previous = self._sells.get(g.scope)
                 own_updates = {}
+                resolved_updates = {}
+                request_updates = {}
                 for name in ('passive', 'protected'):
                     attempt = getattr(sell, name)
                     old = getattr(previous, name) if previous else None
                     if old and (old.native_state != 'ended' or old.state not in ('terminal', 'rejected')) and (attempt is None or attempt.request_id != old.request_id):
                         return 'stale'
+                    if old and (attempt is None or attempt.request_id != old.request_id):
+                        resolved_updates[(g.scope, old.request_id)] = old
                     if attempt:
                         if (not attempt.request_id or (attempt.order_key is not None and attempt.order_key[:3] != scope[:3])
-                                or attempt.native_state not in ('pending', 'running', 'ended')):
+                                or attempt.native_state not in ('pending', 'running', 'ended')
+                                or attempt.kind != ('passive_exit' if name == 'passive' else 'protected_exit')):
                             return 'invalid_identity'
+                        identity = (g.scope, attempt.kind)
+                        registered = self._exit_request_identities.get(attempt.request_id)
+                        if registered is not None and registered[0] in self._retired_exit_scopes:
+                            return 'stale'
+                        if ((registered is not None and registered != identity)
+                                or attempt.request_id in request_updates):
+                            return 'invalid_identity'
+                        if (g.scope, attempt.request_id) in self._resolved_exit_attempts:
+                            return 'stale'
+                        request_updates[attempt.request_id] = identity
                         if (attempt.submit_quantity.state == 'known' and attempt.submit_residual_quantity.state == 'known'
                                 and not 0 <= attempt.submit_quantity.value <= attempt.submit_residual_quantity.value):
                             return 'invalid_identity'
@@ -984,8 +991,115 @@ class CurrentLPState:
                         sell = replace(sell, **{name: attempt})
                 self._sells[g.scope] = sell
                 self._own_fills.update(own_updates)
+                self._resolved_exit_attempts.update(resolved_updates)
+                self._exit_request_identities.update(request_updates)
             self._scope_versions[g.scope] = version
             self._protection_events.add((g.scope, g.event_id))
+            self._snapshot_version += 1
+            return 'applied'
+
+    def _protection_guard_status(self, guard: ProtectionGuard) -> str:
+        if not isinstance(guard, ProtectionGuard):
+            return 'invalid_identity'
+        scope = guard.scope.scope if isinstance(guard.scope, ProtectionKey) else guard.scope
+        if (not isinstance(scope, tuple) or len(scope) != 4 or scope[0] != self.account_id
+                or any(not isinstance(part, str) or not part for part in scope)
+                or not isinstance(guard.event_id, str) or not guard.event_id
+                or type(guard.expected_scope_version) is not int or guard.expected_scope_version < 0):
+            return 'invalid_identity'
+        if (guard.cycle_generation != self._current.cycle_generation
+                or (guard.scope, guard.event_id) in self._protection_events
+                or guard.expected_scope_version != self._scope_versions.get(guard.scope, 0)
+                or (guard.observation_id is not None and (self._observation is None
+                    or guard.observation_id != self._observation.observation_id
+                    or self._observation.read_ticket.trade_version_at_start != self._trade_version))):
+            return 'stale'
+        for key, version in guard.expected_order_terms_versions:
+            order = self._orders.get(key)
+            if key[:3] != scope[:3] or order is None:
+                return 'invalid_identity'
+            if order.terms_version != version:
+                return 'stale'
+        return 'applied'
+
+    def _exit_order_discharged(self, key: OrderKey) -> bool:
+        order = self._orders.get(key)
+        proof = order.terminal_proof if order is not None else None
+        if (proof is None or not self._valid_terminal(proof, order)
+                or not proof.source.complete or proof.matched.state != 'known'
+                or order.size_matched.state != 'known' or order.size_matched.value != proof.matched.value):
+            return False
+        own = self._own_fills.get(key)
+        if proof.matched.value == 0:
+            return own is None or (own.quantity.state == 'known' and own.quantity.value == 0)
+        return (own is not None and own.order_key == key and own.complete_for_target
+            and own.source.state == 'known' and own.source.complete and own.source.checked_at is not None
+            and own.quantity.state == 'known' and own.quantity.value == proof.matched.value
+            and all(fact.state == 'known' and fact.value is not None for fact in (own.notional_usd, own.fees_usd)))
+
+    def retire_exit_attempts(self, guard: ProtectionGuard) -> str:
+        with self._lock:
+            if not isinstance(guard, ProtectionGuard) or not isinstance(guard.scope, tuple):
+                return 'invalid_identity'
+            status = self._protection_guard_status(guard)
+            if status != 'applied':
+                return status
+            scope = guard.scope
+            if scope in self._retired_exit_scopes or guard.observation_id is None:
+                return 'stale'
+            opening, sell = self._openings.get(scope), self._sells.get(scope)
+            if (opening is None or sell is None or opening.phase != 'closed'
+                    or opening.scope != scope or sell.scope != scope or opening.economics.scope != scope
+                    or sell.residual_quantity.state != 'known' or sell.residual_quantity.value != 0
+                    or sell.position_reconciled is not True or opening.economics.position_reconciled is not True
+                    or any(fact.state != 'known' or fact.value is None for fact in (
+                        opening.economics.buy_cost_usd, opening.economics.sold_revenue_usd,
+                        opening.economics.fees_usd, opening.economics.residual_exit_value_usd))):
+                return 'stale'
+            observation = self._observation
+            if (not observation.orders_complete or not observation.positions_complete
+                    or any(source.state != 'known' or not source.complete or source.checked_at is None
+                        or source != observation.components.get(name) for name, source in (
+                            ('open_orders', sell.orders_source), ('positions', sell.positions_source)))
+                    or any(position.quantity.state != 'known' or position.quantity.value != 0
+                        for position in self._positions if (position.account_id, position.condition_id,
+                            position.token_id) == scope[:3])):
+                return 'stale'
+            attempts = [attempt for (episode, _), attempt in self._resolved_exit_attempts.items() if episode == scope]
+            attempts.extend(attempt for attempt in (sell.passive, sell.protected) if attempt is not None)
+            for attempt in attempts:
+                if (attempt.native_state != 'ended' or attempt.state not in ('terminal', 'rejected')
+                        or self._exit_request_identities.get(attempt.request_id) != (scope, attempt.kind)):
+                    return 'stale'
+                if attempt.order_key is None:
+                    if attempt.state != 'rejected' or attempt.own_fill_evidence is not None:
+                        return 'stale'
+                else:
+                    order = self._orders.get(attempt.order_key)
+                    if (order is None or order.side != 'SELL' or not self._exit_order_discharged(attempt.order_key)
+                            or any(submitted.state != 'known' or actual.state != 'known' or submitted.value != actual.value
+                                for submitted, actual in ((attempt.submit_quantity, order.original_size),
+                                    (attempt.price, order.price), (attempt.order_type, order.order_type),
+                                    (attempt.expiration, order.expiration)))):
+                        return 'stale'
+            for order_id in opening.entry_order_ids:
+                if not isinstance(order_id, str) or not order_id:
+                    return 'invalid_identity'
+                key = (*scope[:3], order_id)
+                order = self._orders.get(key)
+                if order is None or order.side != 'BUY' or not self._exit_order_discharged(key):
+                    return 'stale'
+            if any(order != self._orders.get(order.key) or not self._exit_order_discharged(order.key)
+                    for order in sell.current_sells):
+                return 'stale'
+            # Rich records end only at explicit, proven discharge. Identity-only
+            # tombstones remain for this process so cleanup cannot permit a replay.
+            self._resolved_exit_attempts = {key: attempt for key, attempt in self._resolved_exit_attempts.items()
+                if key[0] != scope}
+            self._sells[scope] = replace(sell, passive=None, protected=None)
+            self._retired_exit_scopes.add(scope)
+            self._scope_versions[scope] = guard.expected_scope_version + 1
+            self._protection_events.add((scope, guard.event_id))
             self._snapshot_version += 1
             return 'applied'
 
@@ -1157,6 +1271,43 @@ class CurrentLPState:
                 return 'identity_error'
             if evidence.event_id in self._receipt_events:
                 return 'stale_evidence'
+            sell = self._sells.get(evidence.scope)
+            previous_attempt = None
+            attempt_name = None
+            retained_attempt = False
+            registered = self._exit_request_identities.get(evidence.request_id)
+            if evidence.exit_attempt is not None:
+                if (not isinstance(evidence.exit_attempt, ExitAttempt) or registered is None
+                        or evidence.exit_attempt.request_id != evidence.request_id
+                        or registered != (evidence.scope, evidence.exit_attempt.kind)):
+                    return 'identity_error'
+                if registered[0] in self._retired_exit_scopes:
+                    return 'stale_evidence'
+            # Retirement deliberately removes submit context. Independent receipts
+            # may improve canonical facts, but cannot reconstruct that context.
+            if registered is not None and registered[0] in self._retired_exit_scopes:
+                registered = None
+            if evidence.exit_attempt is not None or evidence.own_fill is not None or registered is not None:
+                if registered is not None and registered[0] != evidence.scope:
+                    return 'identity_error'
+                if sell is not None:
+                    for name in ('passive', 'protected'):
+                        candidate = getattr(sell, name)
+                        if candidate is not None and candidate.request_id == evidence.request_id:
+                            previous_attempt, attempt_name = candidate, name
+                            break
+                if previous_attempt is None:
+                    previous_attempt = self._resolved_exit_attempts.get((evidence.scope, evidence.request_id))
+                    retained_attempt = previous_attempt is not None
+                    if retained_attempt:
+                        attempt_name = 'passive' if previous_attempt.kind == 'passive_exit' else 'protected'
+                if evidence.exit_attempt is not None and (registered is None or previous_attempt is None):
+                    return 'identity_error'
+                if previous_attempt is not None:
+                    if ((previous_attempt.order_key is not None and previous_attempt.order_key != evidence.order_key)
+                            or (previous_attempt.order_key is None
+                                and (retained_attempt or previous_attempt.state == 'rejected'))):
+                        return 'identity_error'
             order = self._orders.get(evidence.order_key)
             incoming = evidence.order_fact
             if incoming is not None:
@@ -1199,19 +1350,11 @@ class CurrentLPState:
                         or (target.canceled_remaining.state == 'known' and target.canceled_remaining.value > 0
                             and target.venue_terminal is None)):
                     return 'identity_error'
-            sell = self._sells.get(evidence.scope)
             attempt = evidence.exit_attempt
-            attempt_name = None
-            if attempt is None and own is not None and sell is not None:
-                for name in ('passive', 'protected'):
-                    current_attempt = getattr(sell, name)
-                    if (current_attempt is not None and current_attempt.request_id == evidence.request_id
-                            and current_attempt.order_key == order.key):
-                        attempt = replace(current_attempt, own_fill_evidence=own)
-                        break
+            if attempt is None and own is not None and previous_attempt is not None:
+                attempt = replace(previous_attempt, own_fill_evidence=own)
             if attempt is not None:
-                attempt_name = 'passive' if attempt.kind == 'passive_exit' else 'protected'
-                previous = getattr(sell, attempt_name) if sell else None
+                previous = previous_attempt
                 if (previous is None or attempt.request_id != evidence.request_id or previous.request_id != attempt.request_id
                         or (previous.order_key is not None and attempt.order_key != previous.order_key)
                         or attempt.order_key != evidence.order_key or attempt.submit_quantity != previous.submit_quantity
@@ -1250,7 +1393,10 @@ class CurrentLPState:
                     target if t.request_id == target.request_id else t for t in progress.cancel_targets))
                 self._scope_versions[evidence.scope] = scope_version
             if attempt is not None:
-                self._sells[evidence.scope] = replace(sell, **{attempt_name: attempt})
+                if retained_attempt:
+                    self._resolved_exit_attempts[(evidence.scope, evidence.request_id)] = attempt
+                else:
+                    self._sells[evidence.scope] = replace(sell, **{attempt_name: attempt})
                 self._scope_versions[evidence.scope] = self._scope_versions.get(evidence.scope, 0) + 1
             self._receipt_events.add(evidence.event_id)
             self._trade_version += 1
@@ -1279,4 +1425,5 @@ class CurrentLPState:
                     and self._clock() >= y.unknown_deadline_monotonic),
                 MappingProxyType(self._baselines.copy()), MappingProxyType(self._progress.copy()),
                 MappingProxyType(self._failures.copy()), MappingProxyType(self._openings.copy()),
-                MappingProxyType(self._sells.copy()), MappingProxyType(self._scope_versions.copy()))
+                MappingProxyType(self._sells.copy()), MappingProxyType(self._scope_versions.copy()),
+                MappingProxyType(self._resolved_exit_attempts.copy()))
