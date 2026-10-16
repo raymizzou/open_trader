@@ -1446,7 +1446,7 @@ def test_invalidated_observation_cannot_authorize_new_round(runtime, tmp_path, m
     native_connect = sqlite3.connect
     revision_sql = ("SELECT session_id,json_extract(payload,'$._lp_trade_revision') AS revision "
         "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?) "
-        "AND coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true'")
+        "AND coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true'")
 
     class ObservedCursor(sqlite3.Cursor):
         def execute(self, sql, parameters=()):

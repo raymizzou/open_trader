@@ -78,7 +78,7 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
         armed=[True]
         revision_sql=("SELECT session_id,json_extract(payload,'$._lp_trade_revision') AS revision "
             "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?) "
-            "AND coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true'")
+            "AND coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true'")
         class NativeCursor(sqlite3.Cursor):
             def execute(self,sql,parameters=()):
                 self.sql,self.parameters=sql,parameters
