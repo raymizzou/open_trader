@@ -2380,3 +2380,113 @@ def test_captured_production_candidates_seal_real_gtd_terms_without_legacy_gates
     finally:
         assert live.close(timeout=3)
         adapter.close()
+
+
+@pytest.mark.parametrize('proof_case', ['final0_complete_absent', 'final0_explicit_zero',
+    'unknown_final', 'native_pending', 'positive_residual', 'incomplete_positions'])
+def test_trading_settings_accept_conclusive_zero_fill_without_discarding_obligations(tmp_path, monkeypatch, proof_case):
+    import hashlib, sqlite3, threading
+    from threading import Event
+    from tests.test_lp_order_registration_contract import CONDITION_ID, TOKEN_ID
+    live,sdk,public,clock = _d2_protection_runtime(tmp_path,monkeypatch,quantity='20')
+    account=hashlib.sha256(WALLET.strip().casefold().encode()).hexdigest()
+    entered,release=Event(),Event()
+    original=sdk.orders[0]
+    terminal=original.model_copy(update={'status':'CANCELED','size_matched':Decimal('0')})
+    exact_reads,position_queries,trade_queries,settings_commits=[],[],[],[]
+    def cancel(*,order_ids):
+        assert order_ids==('entry-A',)
+        sdk.cancels.append(order_ids);entered.set()
+        assert release.wait(5),'actual cancel native completion watchdog'
+        return dict(canceled=order_ids,not_canceled={})
+    def exact(*,order_id):
+        exact_reads.append(order_id);assert order_id=='entry-A'
+        return None if proof_case=='unknown_final' else terminal
+    def positions(**kwargs):
+        position_queries.append(kwargs);assert kwargs==dict(size_threshold=0)
+        return sdk.positions
+    def trades(**kwargs):
+        trade_queries.append(kwargs);assert kwargs==dict(market=CONDITION_ID)
+        return ()
+    sdk.cancel_orders,sdk.get_order,sdk.list_positions,sdk.list_account_trades=cancel,exact,positions,trades
+    real_connect=sqlite3.connect
+    class SettingsCommit(sqlite3.Connection):
+        def execute(self,sql,*args,**kwargs):
+            result=super().execute(sql,*args,**kwargs)
+            if sql=='COMMIT' and threading.current_thread().name=='lp-settings-save':settings_commits.append(sql)
+            return result
+    def connect(*args,**kwargs):return real_connect(*args,**(kwargs|dict(factory=SettingsCommit)))
+    try:
+        live.store.lp_save_current_settings(account,expected_config_version=0,
+            changes=dict(budget_usd='40',target_buy_count=2,buy_price_level=1))
+        old=live.load_settings()
+        live.run_once()
+        assert live.state.snapshot().buy_reserved.value==Decimal('6')  # actual20*.30
+        handle=live.cancel_independent((WALLET,CONDITION_ID,TOKEN_ID,'entry-A'))
+        assert entered.wait(2) and not handle.done()
+        live.request_running(False);paused=settle_control(live)
+        assert paused.current.effective_running is False and paused.requested_running is False
+        cycle=live.state.snapshot().current.cycle_generation
+        sdk.orders=()  # current API excludes the externally terminal exact order
+        sdk.positions=(dict(condition_id=CONDITION_ID,token_id=TOKEN_ID,size='0',average_price='.30'),) if proof_case=='final0_explicit_zero' else (
+            (dict(condition_id=CONDITION_ID,token_id=TOKEN_ID,size='1',average_price='.30'),) if proof_case=='positive_residual' else None if proof_case=='incomplete_positions' else ())
+        if proof_case!='native_pending':
+            release.set();assert handle.result(timeout=3).status.value=='accepted'
+            handle._thread.join(timeout=2);assert handle.done()
+        clock[0]+=1
+        live.run_once()
+        assert live.run_protection_once()==()  # exact receipt invalidates old ordinary frame
+        clock[0]+=1
+        live.run_once()
+        assert live.run_protection_once()==()
+        before=live.state.snapshot();opening,=before.openings.values()
+        order=next(o for o in before.orders if o.key[3]=='entry-A')
+        assert opening.phase!='closed' and opening.entry_order_ids==('entry-A',)
+        assert before.own_fills=={} and opening.economics.buy_cost_usd.state=='unknown'
+        assert opening.economics.fees_usd.state=='unknown' and trade_queries==[]
+        assert exact_reads and set(exact_reads)=={'entry-A'}
+        if proof_case=='unknown_final':
+            assert order.terminal_proof.matched.state=='unknown' and order.size_matched.value==0
+        else:
+            assert order.terminal_proof.identity_verified and order.terminal_proof.matched.value==0
+            assert order.terminal_proof.original_size.value==Decimal('20')
+            assert before.observation.order_view.orders_source.checked_at>=order.terminal_proof.source.checked_at
+        if proof_case=='native_pending':
+            assert not handle.done() and live.status()['native_inflight']==1
+        if proof_case=='positive_residual':
+            assert next(p for p in before.positions if p.token_id==TOKEN_ID).quantity.value==Decimal('1')
+        if proof_case=='incomplete_positions':assert not before.observation.positions_complete
+        positive=proof_case in ('final0_complete_absent','final0_explicit_zero')
+        if positive:
+            assert all(f.state=='known' and f.value==0 for f in (before.buy_reserved,before.inventory_cost,before.current_exposure))
+            assert before.new_capacity.value==Decimal('40') and handle.done()
+            assert before.observation.orders_complete and before.observation.positions_complete
+            if proof_case=='final0_complete_absent':assert before.positions==()
+            else:assert before.positions[0].quantity.value==0
+        monkeypatch.setattr(sqlite3,'connect',connect)
+        if positive:
+            live.configure(dict(budget_usd='50',target_buy_count=3,buy_price_level=2,expected_config_version=1))
+            deadline=time.monotonic()+3
+            while live.settings_status()['pending'] and time.monotonic()<deadline:time.sleep(.001)
+            new=live.settings_status()['effective']
+            assert (new.budget,new.target_count,new.buy_price_level,new.config_version,new.trading_config_version)==(Decimal('50'),3,2,2,2)
+            assert settings_commits==['COMMIT']
+        else:
+            with pytest.raises(ValueError):live.configure(dict(budget_usd='50',target_buy_count=3,buy_price_level=2,expected_config_version=1))
+            assert live.policy is old and live.settings_status()['pending'] is False
+            assert settings_commits==[]
+        saved=live.store.lp_load_current_settings(account)
+        assert (saved['budget_usd'],saved['config_version'],saved['trading_config_version'])==(('50',2,2) if positive else ('40',1,1))
+        after=live.state.snapshot()
+        assert after.openings==before.openings and after.sells==before.sells
+        assert after.own_fills==before.own_fills and after.resolved_exit_attempts==before.resolved_exit_attempts
+        assert after.positions==before.positions and after.orders==before.orders
+        assert after.trade_version==before.trade_version and after.current==before.current
+        assert after.current.cycle_generation==cycle and after.current.effective_running is False
+        assert live.control.status().requested_version==paused.requested_version
+        assert sdk.cancels==[('entry-A',)] and len(sdk.posts)==1 and position_queries
+        if proof_case=='native_pending':assert not handle.done() and live.status()['native_inflight']==1
+    finally:
+        release.set()
+        assert live.close(timeout=3)
+        live.trading.close()

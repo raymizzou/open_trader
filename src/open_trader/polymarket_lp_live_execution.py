@@ -376,7 +376,8 @@ class LPD2LiveExecution:
                             or self.rounds.snapshot().active_batch_id is not None
                             or self._active_sends or any(h._thread.is_alive() for h in self._native_jobs.values())
                             or any(o.side == 'BUY' for o in snapshot.active_orders)
-                            or any(o.phase != 'closed' for o in snapshot.openings.values())):
+                            or any(o.phase != 'closed' and not self._settings_zero_fill_resolved(snapshot, o)
+                                for o in snapshot.openings.values())):
                         raise ValueError('pause_and_finish_automatic_buys_before_configuring')
                     observation = snapshot.observation
                     from .polymarket_lp_current_inputs import _current_account
@@ -401,6 +402,59 @@ class LPD2LiveExecution:
             self._settings_thread = threading.Thread(target=save, name='lp-settings-save', daemon=False)
             self._settings_thread.start()
         return self.settings_status()
+
+    def _settings_zero_fill_resolved(self, snapshot, opening):
+        """Admission proof only; an unfilled opening keeps its lifecycle/economics."""
+        scope, observation = opening.scope, snapshot.observation
+        if (scope[0] != self.account_id or not opening.entry_order_ids or observation is None
+                or observation.cycle_generation != snapshot.current.cycle_generation
+                or observation.read_ticket.trade_version_at_start != snapshot.trade_version
+                or not observation.orders_complete or not observation.positions_complete):
+            return False
+        sources = (observation.order_view.orders_source, observation.components['positions'])
+        def complete(source):
+            return bool(source.source_id and source.state == 'known' and source.complete
+                and not source.error_code and source.checked_at is not None)
+        if not all(complete(source) for source in sources):
+            return False
+        keys = {a.order_key for a in self._opening_order_associations.values() if a.scope == scope}
+        entries = {(*scope[:3], oid) for oid in opening.entry_order_ids}
+        orders = {o.key: o for o in snapshot.orders if o.key in keys}
+        if not entries <= keys or set(orders) != keys:
+            return False
+        for key, order in orders.items():
+            proof = order.terminal_proof
+            if (key[:3] != scope[:3] or key in entries and order.side != 'BUY'
+                    or any(f.state != 'known' for f in (order.price, order.original_size,
+                        order.order_type, order.expiration, order.size_matched))
+                    or order.original_size.value <= 0 or order.size_matched.value != 0
+                    or proof is None or not proof.identity_verified or proof.order_key != key
+                    or proof.status not in TERMINAL_ORDER_STATES or order.venue_status != proof.status
+                    or proof.original_size.state != 'known' or proof.original_size.value != order.original_size.value
+                    or proof.matched.state != 'known' or proof.matched.value != 0
+                    or not complete(proof.source)
+                    or any(source.checked_at < proof.source.checked_at for source in sources)):
+                return False
+            own = snapshot.own_fills.get(key)
+            if own is not None and (not own.complete_for_target or not complete(own.source)
+                    or any(f.state != 'known' or f.value != 0
+                        for f in (own.quantity, own.notional_usd, own.fees_usd))):
+                return False
+        positions = tuple(p for p in snapshot.positions
+            if (p.account_id, p.condition_id, p.token_id) == scope[:3])
+        if (len(positions) > 1 or not positions and not self._positions_full_coverage
+                or any(p.quantity.state != 'known' or p.quantity.value != 0 for p in positions)
+                or any(o.side == 'SELL' and o.key[:3] == scope[:3] for o in snapshot.active_orders)):
+            return False
+        sell = snapshot.sells.get(scope)
+        if sell is not None and (not sell.position_reconciled
+                or sell.residual_quantity.state != 'known' or sell.residual_quantity.value != 0
+                or sell.current_sells):
+            return False
+        attempts = tuple(a for a in (sell.passive, sell.protected) if a) if sell else ()
+        attempts += tuple(a for (episode, _), a in snapshot.resolved_exit_attempts.items() if episode == scope)
+        return all(a.native_state == 'ended' and (a.state == 'rejected' and a.order_key is None
+            or a.state == 'terminal' and a.order_key in orders) for a in attempts)
 
     def request_running(self, running, *, actor=None):
         with self._settings_lock:
