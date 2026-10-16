@@ -414,3 +414,429 @@ def test_d2_execution_native_lease_drains_all_actual_calls_before_release(tmp_pa
     finally:
         assert live.close(timeout=3)
         live.trading.close()
+
+
+@pytest.mark.parametrize('transition', ['BUYpause', 'BUYresume', 'BUYfatal', 'BUYclose',
+    'independentBUYcancelpause', 'protectedSELLclose', 'SELLcancelclose'])
+def test_d2_final_safety_sql_cannot_outlive_current_dispatch_permission(tmp_path, monkeypatch, transition):
+    from tests.test_lp_d2_integration import _d2_filled_opening
+    from tests.test_lp_order_registration_contract import _open_order
+    entered, release, signed = Event(), Event(), Event()
+    failures, completed, errors, phase_reads = [], [], [], []
+    business_clock = [0.0]
+    worker = handle = None
+    if transition.startswith('BUY') or transition == 'independentBUYcancelpause':
+        live, producer, sdk, public, now = bridge_runtime(tmp_path, monkeypatch)
+        if transition == 'BUYfatal':
+            assert live.close(timeout=3)
+            live = LPD2LiveExecution(live.store, live.trading, account_id=WALLET, venue='polymarket',
+                process_epoch='fatal-sql-window', policy=CalculationPolicy(None),
+                clock=lambda: business_clock[0], utc_now=lambda: now)
+            live.load_settings(); live.initialize(ValidatedStartAdmission('fatal-sql-window', 'offline-permit'))
+        execution = attach(live, producer, tmp_path)
+        execution.lp_auto_scheduled_check()
+        if transition == 'independentBUYcancelpause':
+            sdk.orders = (_open_order('cancel-window', 'BUY', price='.40', original='20'),)
+            execution.lp_auto_scheduled_check()
+        create = sdk.create_limit_order
+        def observed_create(**kw):
+            result = create(**kw); signed.set(); return result
+        sdk.create_limit_order = observed_create
+    else:
+        live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch, manual_sale=False)
+        producer = PolymarketLPService(live.store, live.trading)
+        execution = attach(live, producer, tmp_path)
+        execution.lp_auto_scheduled_check()  # actual own-fill receipt
+        if transition == 'SELLcancelclose':
+            execution.lp_auto_scheduled_check()  # real passive SELL response
+            deadline = time.monotonic()+3
+            while live.status()['native_inflight'] and time.monotonic() < deadline: time.sleep(.001)
+            assert live.status()['native_inflight'] == 0 and len(sdk.posts) == 2
+        public.bid = Decimal('.20'); clock[0] += 1
+    before_posts, before_cancels = len(sdk.posts), len(sdk.cancels)
+    generation = live.state.snapshot().current.cycle_generation
+    real_connect = sqlite3.connect
+    class LastSafetySQL(sqlite3.Connection):
+        def execute(self, sql, *a, **kw):
+            thread = threading.current_thread().name
+            if sql == 'COMMIT' and thread == 'lp-control-save' and transition == 'BUYfatal':
+                failures.append(sql); raise sqlite3.OperationalError('actual control save rejected')
+            cursor = super().execute(sql, *a, **kw)
+            safety = sql.startswith('SELECT * FROM executions WHERE state NOT IN')
+            selected = (transition.startswith('BUY') and thread == 'e1-dispatch' and signed.is_set()
+                or transition == 'independentBUYcancelpause' and thread == 'lp-d2-independent-cancel'
+                or transition in ('protectedSELLclose', 'SELLcancelclose') and thread == 'lp-d2-protection-send')
+            if safety and selected and not entered.is_set():
+                assert not live.state._lock._is_owned(), 'safety SQL must not hold CurrentState lock'
+                phase_reads.append((thread, sql))
+                # FOK has no limit-sign phase: the second actual safety read is
+                # its last pre-post check, selected by the real pending attempt.
+                if transition == 'protectedSELLclose':
+                    attempt, = (s.protected for s in live.state.snapshot().sells.values())
+                    assert attempt.kind == 'protected_exit' and attempt.native_state == 'running'
+                    if len(phase_reads) < 2: return cursor
+                entered.set(); assert release.wait(8), 'final safety SQL watchdog'
+            return cursor
+    def run():
+        try: completed.append(execution.lp_auto_scheduled_check())
+        except BaseException as exc: errors.append(exc)
+    try:
+        monkeypatch.setattr(sqlite3, 'connect', lambda *a, **kw: real_connect(*a, **(kw|dict(factory=LastSafetySQL))))
+        if transition == 'independentBUYcancelpause':
+            handle = live.cancel_independent((WALLET, CONDITION_ID, TOKEN_ID, 'cancel-window'))
+        else:
+            worker = threading.Thread(target=run, name='e1-dispatch'); worker.start()
+        assert entered.wait(3), 'last actual safety SQL was not reached'
+        assert len(sdk.posts) == before_posts and len(sdk.cancels) == before_cancels
+        if transition in ('BUYpause', 'BUYresume', 'independentBUYcancelpause'):
+            assert live.request_running(False).status == 'accepted'; settle_control(live)
+            if transition == 'BUYresume':
+                assert live.request_running(True).status == 'accepted'; settle_control(live)
+                assert live.state.snapshot().current.cycle_generation != generation
+        elif transition == 'BUYfatal':
+            assert live.request_running(False).status == 'accepted'
+            deadline = time.monotonic()+3
+            while live.poll().save_state != 'retry_wait' and time.monotonic() < deadline: time.sleep(.001)
+            assert live.control.status().save_state == 'retry_wait' and len(failures) == 1
+            business_clock[0] = 1.0
+            deadline = time.monotonic()+3
+            while live.poll().fatal is None and time.monotonic() < deadline: time.sleep(.001)
+            assert live.control.status().fatal.origin == 'save_retry_exhausted' and len(failures) == 2
+        else:
+            assert live.close(timeout=.01) is False
+        release.set()
+        if worker: worker.join(3); assert not worker.is_alive() and errors == []
+        if handle:
+            assert handle.result(timeout=3).status.value == 'not_sent'
+            handle._thread.join(2); assert handle.done()
+        deadline = time.monotonic()+3
+        while live.status()['native_inflight'] and time.monotonic() < deadline: time.sleep(.001)
+        assert live.status()['native_inflight'] == 0
+        assert len(sdk.posts) == before_posts and len(sdk.cancels) == before_cancels
+        assert live.status()['last_buy_uncertainty'] is None
+        if transition.startswith('BUY'):
+            result, = completed
+            outcome, = result.outcomes
+            assert outcome.status.value == 'not_sent'
+            assert outcome.identity == result.start.token.actions[0]
+            terms = outcome.identity.target.terms
+            assert (terms.price, terms.quantity, terms.expiration, terms.send_options) == (Decimal('.40'), Decimal('20'), 1792195260, ())
+        if transition == 'BUYfatal': assert live.control.status().fatal.origin == 'save_retry_exhausted'
+        if transition == 'protectedSELLclose':
+            attempt, = (s.protected for s in live.state.snapshot().sells.values())
+            assert attempt.state == 'rejected' and attempt.native_state == 'ended' and attempt.order_key is None
+        if transition == 'SELLcancelclose':
+            attempt, = (s.passive for s in live.state.snapshot().sells.values())
+            assert attempt.cancel_request_id is None
+    finally:
+        release.set()
+        if worker: worker.join(3)
+        if handle: handle._thread.join(3)
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('change', ['positive_anchor_fill', 'unknown_terminal_anchor',
+    'changed_target_terms', 'new_observation_only'])
+def test_d2_deferred_cancel_revalidates_original_trigger_after_admission_io(tmp_path, monkeypatch, change):
+    from tests.test_lp_d2_integration import _d2_protection_runtime
+    from tests.test_lp_order_registration_contract import _open_order
+    live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch, submit=False)
+    producer = PolymarketLPService(live.store, live.trading)
+    execution = attach(live, producer, tmp_path)
+    releases = {oid: Event() for oid in ('occupied-X', 'occupied-Y', 'entry-A')}
+    entered = {oid: Event() for oid in releases}
+    sql_entered, sql_release = Event(), Event()
+    terminal, exact_reads, handles, outcomes, errors = {}, [], {}, [], []
+    worker = None
+    def cancel(*, order_ids):
+        oid, = order_ids; sdk.cancels.append(order_ids)
+        if oid in releases:
+            entered[oid].set(); assert releases[oid].wait(8), 'actual retained anchor/capacity watchdog'
+        original = next(o for o in sdk.orders if o.id == oid)
+        terminal[oid] = original.model_copy(update={'status': 'CANCELED'})
+        sdk.orders = tuple(o for o in sdk.orders if o.id != oid)
+        return dict(canceled=order_ids, not_canceled={})  # genuine ID-only ACK never proves final0
+    def exact(*, order_id):
+        exact_reads.append(order_id)
+        return terminal.get(order_id)
+    sdk.cancel_orders, sdk.get_order = cancel, exact
+    def tick():
+        live.run_once()
+        return live.run_protection_once()
+    def finish(attempts):
+        for handle in attempts:
+            handle.result(timeout=3); handle._thread.join(2); assert handle.done()
+    try:
+        sdk.orders = (_open_order('entry-A', 'BUY', price='.30', original='2000'),)
+        tick()
+        baseline = next(b for b in live.state.snapshot().baselines.values() if b.key.episode_id == 'entry-A')
+        assert baseline.anchor_order_ids == ('entry-A',) and live.state.snapshot().openings == {}
+        sdk.orders += (_open_order('occupied-X', 'BUY', price='.29', original='20'),
+            _open_order('occupied-Y', 'BUY', price='.28', original='20'))
+        live.run_once()
+        for oid in ('occupied-X', 'occupied-Y'):
+            handles[oid] = live.cancel_independent((WALLET, CONDITION_ID, TOKEN_ID, oid))
+            assert entered[oid].wait(2)
+        sdk.orders += (_open_order('retained-B', 'BUY', price='.30', original='500'),)
+        public.level, clock[0] = Decimal('5000'), 1
+        assert tick() == ()
+        progress = live.state.snapshot().progress[baseline.key]
+        assert progress.state == 'triggered' and progress.ratio.value == Decimal('.50') and progress.cancel_targets == ()
+        for oid in ('occupied-X', 'occupied-Y'):
+            releases[oid].set(); handles[oid].result(timeout=3); handles[oid]._thread.join(2)
+            assert handles[oid].done()
+        clock[0] += 1; live.run_once()
+        handles['entry-A'] = live.cancel_independent((WALLET, CONDITION_ID, TOKEN_ID, 'entry-A'))
+        assert entered['entry-A'].wait(2)
+        live.request_running(False); settle_control(live)
+        clock[0] += 1; live.run_once()
+        original = live.state.snapshot()
+        assert original.observation.read_ticket.trade_version_at_start == original.trade_version
+        assert not original.progress[baseline.key].cancel_targets and live.status()['native_inflight'] == 1
+        real_connect = sqlite3.connect
+        class WaitingAdmission(sqlite3.Connection):
+            def execute(self, sql, *a, **kw):
+                cursor = super().execute(sql, *a, **kw)
+                if (threading.current_thread().name == 'e2-dispatch' and not sql_entered.is_set()
+                        and sql.startswith('SELECT * FROM executions WHERE state NOT IN')):
+                    assert not live.state._lock._is_owned()
+                    sql_entered.set(); assert sql_release.wait(8), 'real B lease acquisition watchdog'
+                return cursor
+        monkeypatch.setattr(sqlite3, 'connect', lambda *a, **kw: real_connect(*a, **(kw|dict(factory=WaitingAdmission))))
+        def dispatch():
+            try: outcomes.extend(live.run_protection_once())
+            except BaseException as exc: errors.append(exc)
+        worker = threading.Thread(target=dispatch, name='e2-dispatch'); worker.start()
+        assert sql_entered.wait(3)
+        assert ('retained-B',) not in sdk.cancels
+        if change == 'positive_anchor_fill':
+            sdk.orders = tuple(o.model_copy(update={'size_matched': Decimal('1')}) if o.id == 'entry-A' else o for o in sdk.orders)
+            sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='1', average_price='.30'),)
+        elif change == 'unknown_terminal_anchor':
+            releases['entry-A'].set()
+            assert handles['entry-A'].result(timeout=3).status.value == 'accepted'
+            anchor = next(o for o in live.state.snapshot().orders if o.key[3] == 'entry-A')
+            assert anchor.terminal_proof.matched.state == 'unknown' and anchor.size_matched.value == 0
+        elif change == 'changed_target_terms':
+            sdk.orders = tuple(o.model_copy(update={'price': Decimal('.29'), 'original_size': Decimal('600')})
+                if o.id == 'retained-B' else o for o in sdk.orders)
+        clock[0] += 1
+        accepted = live.run_once().acceptance.observation
+        assert accepted.observation_id != original.observation.observation_id
+        assert live.state.snapshot().current.effective_running is False
+        if change == 'positive_anchor_fill':
+            assert next(o for o in live.state.snapshot().orders if o.key[3] == 'entry-A').size_matched.value == 1
+        if change == 'changed_target_terms':
+            changed = next(o for o in live.state.snapshot().orders if o.key[3] == 'retained-B')
+            assert changed.price.value == Decimal('.29') and changed.original_size.value == Decimal('600')
+        sql_release.set(); worker.join(3); assert not worker.is_alive() and errors == []
+        finish(outcomes)
+        assert ('retained-B',) not in sdk.cancels, 'old original trigger cannot be re-stamped after admission I/O'
+        snapshot = live.state.snapshot()
+        assert not any(t.order_key[3] == 'retained-B' for p in snapshot.progress.values() for t in p.cancel_targets)
+        assert snapshot.openings == {} and snapshot.own_fills == {} and sdk.posts == []
+        if change == 'unknown_terminal_anchor':
+            handles['entry-A']._thread.join(2); assert handles['entry-A'].done()
+            # Exact authoritative final0 is a new Reader receipt, not the old ID ACK.
+            terminal['entry-A'] = terminal['entry-A'].model_copy(update={'size_matched': Decimal('0')})
+            clock[0] += 1
+            assert tick() == ()
+            assert next(o for o in live.state.snapshot().orders if o.key[3] == 'entry-A').terminal_proof.matched.value == 0
+            assert ('retained-B',) not in sdk.cancels
+        clock[0] += 1
+        later = tick(); finish(later)
+        expected = 1 if change in ('unknown_terminal_anchor', 'new_observation_only') else 0
+        assert sdk.cancels.count(('retained-B',)) == expected
+        clock[0] += 1
+        finish(tick())
+        assert sdk.cancels.count(('retained-B',)) == expected  # attempted/ID-only UNKNOWN never replays
+        if expected:
+            target, = [t for p in live.state.snapshot().progress.values() for t in p.cancel_targets if t.order_key[3] == 'retained-B']
+            assert target.requested_remaining.value == Decimal('500') and target.native_state == 'ended'
+        assert sdk.posts == [] and live.state.snapshot().own_fills == {}
+    finally:
+        sql_release.set()
+        for event in releases.values(): event.set()
+        if worker: worker.join(3)
+        for handle in handles.values(): handle._thread.join(3)
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('change', ['passive_position_decreased', 'protected_position_decreased', 'protected_manual_sell'])
+def test_d2_sell_dispatch_revalidates_original_financial_origin_after_safety_sql(tmp_path, monkeypatch, change):
+    import fcntl
+    from tests.test_lp_d2_integration import _d2_filled_opening
+    from tests.test_lp_order_registration_contract import _open_order
+    live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch, manual_sale=False)
+    producer = PolymarketLPService(live.store, live.trading)
+    execution = attach(live, producer, tmp_path)
+    entered, release, signed = Event(), Event(), Event()
+    scope = (WALLET, CONDITION_ID, TOKEN_ID, 'protection-epoch')
+    phase_reads, errors, results = [], [], []
+    worker = None
+    try:
+        execution.lp_auto_scheduled_check()  # real own BUY100 receipt
+        if change.startswith('protected'): public.bid = Decimal('.20')
+        before_posts = len(sdk.posts)
+        assert before_posts == 1 and sdk.market_orders == []
+        create = sdk.create_limit_order
+        def create_phase(**kw):
+            result = create(**kw)
+            if kw['side'] == 'SELL': signed.set()
+            return result
+        sdk.create_limit_order = create_phase
+        real_connect = sqlite3.connect
+        class FinalSellSQL(sqlite3.Connection):
+            def execute(self, sql, *a, **kw):
+                cursor = super().execute(sql, *a, **kw)
+                if (threading.current_thread().name == 'lp-d2-protection-send' and not entered.is_set()
+                        and sql.startswith('SELECT * FROM executions WHERE state NOT IN')):
+                    assert not live.state._lock._is_owned()
+                    attempt = live.state.snapshot().sells[scope].passive if change.startswith('passive') else live.state.snapshot().sells[scope].protected
+                    assert attempt.submit_quantity.value == attempt.submit_residual_quantity.value == 100
+                    assert attempt.submit_sold_quantity.value == 0 and attempt.native_state == 'running'
+                    phase_reads.append(sql)
+                    if change.startswith('passive') and not signed.is_set(): return cursor
+                    if change.startswith('protected') and len(phase_reads) < 2: return cursor
+                    entered.set(); assert release.wait(8), 'last actual financial SELL safety SQL watchdog'
+                return cursor
+        monkeypatch.setattr(sqlite3, 'connect', lambda *a, **kw: real_connect(*a, **(kw|dict(factory=FinalSellSQL))))
+        control = live.state.snapshot().current
+        def dispatch():
+            try: results.append(execution.lp_auto_scheduled_check())
+            except BaseException as exc: errors.append(exc)
+        worker = threading.Thread(target=dispatch, name='sell-refinement-dispatch'); worker.start()
+        assert entered.wait(3)
+        original = live.state.snapshot()
+        pending = original.sells[scope].passive if change.startswith('passive') else original.sells[scope].protected
+        assert pending.state == 'pending' and pending.order_key is None
+        assert len(sdk.posts) == before_posts and sdk.market_orders == []
+        with (tmp_path/'execution.lock').open('a+') as foreign:
+            with pytest.raises(BlockingIOError): fcntl.flock(foreign.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)
+        if change.endswith('position_decreased'):
+            sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='60', average_price='.30'),)
+        else:
+            sdk.orders += (_open_order('actual-manual-sell40', 'SELL', price='.25', original='40').model_copy(
+                update={'created_at': original.observation.accepted_at}),)
+        clock[0] += 1
+        accepted = live.run_once().acceptance.observation  # no new protection tick or rewritten submit facts
+        changed = live.state.snapshot()
+        assert accepted.observation_id != original.observation.observation_id and changed.current == control
+        if change.endswith('position_decreased'):
+            assert changed.positions[0].quantity.value == Decimal('60')
+        else:
+            manual, = [o for o in changed.active_orders if o.key[3] == 'actual-manual-sell40']
+            assert manual.side == 'SELL' and manual.remaining.value == Decimal('40')
+            assert changed.positions[0].quantity.value == Decimal('100')
+        release.set(); worker.join(3); assert not worker.is_alive() and errors == []
+        deadline = time.monotonic()+3
+        while live.status()['native_inflight'] and time.monotonic() < deadline: time.sleep(.001)
+        assert live.status()['native_inflight'] == 0
+        assert len(sdk.posts) == before_posts and sdk.market_orders == [], 'old SELL100 must not post against later financial facts'
+        final = live.state.snapshot()
+        attempt = final.sells[scope].passive if change.startswith('passive') else final.sells[scope].protected
+        assert attempt.request_id == pending.request_id and attempt.state == 'rejected' and attempt.native_state == 'ended'
+        assert attempt.order_key is None and attempt.own_fill_evidence is None
+        for field in ('submit_quantity', 'submit_sold_quantity', 'submit_residual_quantity', 'price', 'order_type', 'expiration'):
+            assert getattr(attempt, field) == getattr(pending, field)
+        assert final.positions == changed.positions and final.orders == changed.orders
+        assert final.own_fills == changed.own_fills and final.current == control
+        assert final.trade_version == changed.trade_version and live.status()['last_buy_uncertainty'] is None
+        with (tmp_path/'execution.lock').open('a+') as foreign:
+            fcntl.flock(foreign.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)
+            fcntl.flock(foreign.fileno(), fcntl.LOCK_UN)
+    finally:
+        release.set()
+        if worker: worker.join(3)
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_same_tick_scoring_preserves_current_sell_cancel_admission(tmp_path, monkeypatch):
+    import fcntl
+    from tests.test_lp_d2_integration import _d2_filled_opening
+    live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch, manual_sale=False)
+    execution = attach(live, PolymarketLPService(live.store, live.trading), tmp_path)
+    scope = (WALLET, CONDITION_ID, TOKEN_ID, 'protection-epoch')
+    scoring_entered, scoring_release, sql_entered, sql_release = (Event() for _ in range(4))
+    results, errors, scoring_calls = [], [], []
+    worker = None
+    try:
+        execution.lp_auto_scheduled_check()  # real BUY100 own-fill receipt
+        live.run_once()
+        for handle in live.run_protection_once():
+            assert handle.result(timeout=3).status == 'accepted'
+            handle._thread.join(2)
+            assert handle.done()
+        live.run_once()  # real current passive-exit order after its native receipt
+        original = live.state.snapshot()
+        passive = original.sells[scope].passive
+        assert passive.order_key[3] == 'passive-exit' and passive.submit_quantity.value == 100
+        assert passive.native_state == 'ended' and sdk.cancels == [] and sdk.market_orders == []
+        clock[0] += 5
+        public.bid = Decimal('.20')
+        live.run_once()
+        original = live.state.snapshot()
+        def scoring(*, order_id):
+            scoring_calls.append(order_id)
+            assert order_id == 'passive-exit'
+            scoring_entered.set()
+            assert scoring_release.wait(8), 'same-tick scoring completion watchdog'
+            return True
+        sdk.get_order_scoring = scoring
+        real_connect = sqlite3.connect
+        class CancelSafetySQL(sqlite3.Connection):
+            def execute(self, sql, *a, **kw):
+                cursor = super().execute(sql, *a, **kw)
+                if (threading.current_thread().name == 'lp-d2-protection-send'
+                        and sql.startswith('SELECT * FROM executions WHERE state NOT IN') and not sql_entered.is_set()):
+                    assert not live.state._lock._is_owned()
+                    sql_entered.set()
+                    assert sql_release.wait(8), 'same-tick native cancel SQL watchdog'
+                return cursor
+        monkeypatch.setattr(sqlite3, 'connect', lambda *a, **kw: real_connect(*a, **(kw|dict(factory=CancelSafetySQL))))
+        def dispatch():
+            try: results.extend(live.run_protection_once())
+            except BaseException as exc: errors.append(exc)
+        worker = threading.Thread(target=dispatch, name='same-tick-protection'); worker.start()
+        assert scoring_entered.wait(3)
+        scoring_release.set()
+        assert sql_entered.wait(3)
+        worker.join(3)
+        assert not worker.is_alive() and errors == [] and len(results) == 1
+        scored = live.state.snapshot()
+        assert scoring_calls == ['passive-exit']
+        assert scored.openings[scope].scoring.order_key == passive.order_key
+        assert scored.openings[scope].scoring.role == 'passive_exit'
+        assert scored.openings[scope].scoring.scoring.value is True
+        assert scored.openings[scope].scoring.checked_at == original.observation.accepted_at
+        assert scored.observation is original.observation and scored.trade_version == original.trade_version
+        assert scored.openings[scope].stop_loss_latched.value is True
+        assert sdk.cancels == [] and sdk.market_orders == []
+        handle, = results
+        assert not handle.done() and live.status()['native_inflight'] == 1
+        with (tmp_path/'execution.lock').open('a+') as foreign:
+            with pytest.raises(BlockingIOError): fcntl.flock(foreign.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)
+        sql_release.set()
+        outcome = handle.result(timeout=3)
+        handle._thread.join(2)
+        assert handle.done() and live.status()['native_inflight'] == 0
+        assert outcome.status == 'accepted', 'same-tick scoring must not invalidate the original passive cancellation'
+        assert outcome.order_id == 'passive-exit' and sdk.cancels == [('passive-exit',)]
+        final = live.state.snapshot()
+        order = next(o for o in final.orders if o.key == passive.order_key)
+        assert order.terminal_proof.identity_verified and order.terminal_proof.matched.state == 'unknown'
+        assert final.sells[scope].passive.request_id == passive.request_id
+        assert final.sells[scope].passive.submit_quantity == passive.submit_quantity
+        assert final.sells[scope].passive.submit_sold_quantity == passive.submit_sold_quantity
+        assert sdk.market_orders == [] and len(sdk.posts) == 2
+        with (tmp_path/'execution.lock').open('a+') as foreign:
+            fcntl.flock(foreign.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)
+            fcntl.flock(foreign.fileno(), fcntl.LOCK_UN)
+    finally:
+        scoring_release.set(); sql_release.set()
+        if worker: worker.join(3)
+        assert live.close(timeout=3)
+        live.trading.close()

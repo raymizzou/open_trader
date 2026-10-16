@@ -159,6 +159,15 @@ class _DeferredProtectionCancel:
     reason: str
 
 
+@dataclass(frozen=True)
+class _ProtectionCancelOrigin:
+    observation_id: str
+    trade_version: int
+    cycle_generation: str
+    anchors: tuple[CurrentOrderFact, ...]
+    ticket: _DeferredProtectionCancel
+
+
 class _ControlStore:
     def __init__(self, store, account_id):
         self.store = store
@@ -574,6 +583,13 @@ class LPD2LiveExecution:
             current.cycle_generation, current.effective_running,
             current.fatal_id is not None or current.shutdown_requested or self._closed)
 
+    def _dispatch_current(self, generation, *, running=False):
+        """Final memory-only linearization, after any waiting admission I/O."""
+        with self.state._lock:
+            current = self._control_view()
+            return (not current.fatal and current.cycle_generation == generation
+                and (not running or current.effective_running))
+
     def _fixed_plan(self, observation, prepared, calculation):
         source = prepared.sources['candidates']
         if (self._settings_required and not self._settings_loaded
@@ -613,7 +629,8 @@ class LPD2LiveExecution:
         with self.state._lock:
             return self.rounds.finish_local_attempts(self._control_view(), token, outcomes)
 
-    def _attempt(self, token, action, observation, *, cancel_order=None, mutation_lease=None, protection_target=None):
+    def _attempt(self, token, action, observation, *, cancel_order=None, mutation_lease=None, protection_target=None,
+                 protection_origin=None):
         target = action.target
         if isinstance(target, CancelTarget):
             order = cancel_order if cancel_order is not None else next(
@@ -664,7 +681,8 @@ class LPD2LiveExecution:
         else:
             try:
                 outcome = self._cancel(action, observation, order, protection=protection, lease=mutation_lease,
-                    protection_key=token.protection_key if protection else None, protection_target=protection_target) if isinstance(target, CancelTarget) else self._buy(token, action, record)
+                    protection_key=token.protection_key if protection else None, protection_target=protection_target,
+                    protection_origin=protection_origin) if isinstance(target, CancelTarget) else self._buy(token, action, record)
             finally:
                 with self.state._lock:
                     self._active_sends.discard(action.request_id)
@@ -729,7 +747,7 @@ class LPD2LiveExecution:
 
     def _buy_admitted(self, token, action, record, lease):
         terms = action.target.terms
-        if not lease.allowed():
+        if not lease.allowed() or not self._dispatch_current(token.cycle_generation, running=True):
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         try:
             signed = self.trading.lp_create_limit_order(token_id=record.token_id, price=terms.price,
@@ -737,11 +755,7 @@ class LPD2LiveExecution:
                 **dict(terms.send_options))
         except Exception:
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
-        with self.state._lock:
-            current = self._control_view()
-            if not current.effective_running or current.fatal or current.cycle_generation != token.cycle_generation:
-                return LocalOutcome(action, LocalStatus.NOT_SENT, True)
-        if not lease.allowed():
+        if not lease.allowed() or not self._dispatch_current(token.cycle_generation, running=True):
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         native_started_at = self._utc_now()
         try:
@@ -799,33 +813,35 @@ class LPD2LiveExecution:
         return LocalOutcome(action, LocalStatus.ACCEPTED, True, venue_id, status)
 
     def _cancel(self, action, observation, order, *, protection=False, lease=None,
-                protection_key=None, protection_target=None):
+                protection_key=None, protection_target=None, protection_origin=None):
         owned = lease is None
         lease = self._acquire_mutation('CANCEL') if owned else lease
         if lease is None:
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         try:
             return self._cancel_admitted(action, observation, order, protection=protection, lease=lease,
-                protection_key=protection_key, protection_target=protection_target)
+                protection_key=protection_key, protection_target=protection_target, protection_origin=protection_origin)
         finally:
             if owned:
                 lease.release()
 
-    def _cancel_admitted(self, action, observation, order, *, protection, lease, protection_key, protection_target):
+    def _cancel_admitted(self, action, observation, order, *, protection, lease, protection_key, protection_target,
+                         protection_origin):
         target = action.target
         if not isinstance(target, CancelTarget) or target.venue != self.venue:
-            return LocalOutcome(action, LocalStatus.NOT_SENT, True)
-        control = self._control_view()
-        if (not (control.effective_running or protection) or control.fatal
-                or control.cycle_generation != observation.cycle_generation):
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         if (order.key[0] != self.account_id or order.key[2:] != (target.token_id, target.existing_order_id)
                 or order.side != 'BUY'):
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         if not lease.allowed():
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
-        if protection_target is not None:
-            with self.state._lock:
+        with self.state._lock:
+            if not self._dispatch_current(observation.cycle_generation, running=not protection):
+                return LocalOutcome(action, LocalStatus.NOT_SENT, True)
+            if protection_origin is not None and not self._protection_cancel_origin_current(
+                    self.state.snapshot(), protection_key, protection_origin):
+                return LocalOutcome(action, LocalStatus.NOT_SENT, True)
+            if protection_target is not None:
                 snapshot = self.state.snapshot()
                 guard = self._protection_guard(snapshot, protection_key, (order,))
                 if self.state.apply_protection(CancelEvidenceUpdate(guard, protection_target)) != 'applied':
@@ -860,7 +876,7 @@ class LPD2LiveExecution:
                 last_current_evidence=self._last_current_evidence,
                 last_buy_uncertainty=self._last_buy_uncertainty)
 
-    def cancel_independent(self, order_key, *, protection_key=None, reason=None):
+    def cancel_independent(self, order_key, *, protection_key=None, reason=None, protection_origin=None):
         """Normal exact-ID BUY cancellation outside the sealed BUY barrier.
 
         This native handle remains owned across logical control transitions.
@@ -887,6 +903,9 @@ class LPD2LiveExecution:
                     return existing
                 self._native_jobs = {k: h for k, h in self._native_jobs.items() if h._thread.is_alive()}
                 snapshot = self.state.snapshot()
+                if protection_origin is not None and not self._protection_cancel_origin_current(
+                        snapshot, protection_key, protection_origin):
+                    return None  # the original never-started ticket remains deferred
                 control = self._control_view()
                 observation = snapshot.observation
                 # A receipt may have added this immutable fact after the last API
@@ -915,7 +934,7 @@ class LPD2LiveExecution:
                 def run():
                     try:
                         outcome = self._attempt(context, identity, observation, cancel_order=current_order,
-                            mutation_lease=lease, protection_target=target)
+                            mutation_lease=lease, protection_target=target, protection_origin=protection_origin)
                     except BaseException as exc:
                         future.set_exception(exc)
                     else:
@@ -941,6 +960,49 @@ class LPD2LiveExecution:
         snapshot = self.state.snapshot()
         return (any(t.order_key == order_key for p in snapshot.progress.values() for t in p.cancel_targets)
             or any(t.order.key == order_key for tickets in self._deferred_protection_cancels.values() for t in tickets))
+
+    def _protection_frame_current(self, snapshot):
+        current = self.state.snapshot()
+        observation = current.observation
+        return bool(observation is not None and snapshot.observation is not None
+            and observation.observation_id == snapshot.observation.observation_id
+            and current.trade_version == snapshot.trade_version == observation.read_ticket.trade_version_at_start
+            and current.current.cycle_generation == snapshot.current.cycle_generation == observation.cycle_generation)
+
+    def _protection_cancel_origin_current(self, snapshot, key, origin):
+        observation, baseline = snapshot.observation, snapshot.baselines.get(key)
+        progress = snapshot.progress.get(key)
+        if (observation is None or baseline is None or progress is None
+                or observation.observation_id != origin.observation_id
+                or snapshot.trade_version != origin.trade_version or observation.read_ticket.trade_version_at_start != origin.trade_version
+                or snapshot.current.cycle_generation != origin.cycle_generation or observation.cycle_generation != origin.cycle_generation
+                or not observation.orders_complete
+                or origin.ticket not in self._deferred_protection_cancels.get(key, ())
+                or tuple(o.key for o in origin.anchors) != tuple((*key.scope[:3], oid) for oid in baseline.anchor_order_ids)
+                or any(t.order_key == origin.ticket.order.key for t in progress.cancel_targets)):
+            return False
+        orders = {o.key: o for o in snapshot.orders}
+        for original in (*origin.anchors, origin.ticket.order):
+            order = orders.get(original.key)
+            if (order is None or order.side != 'BUY' or order.terms_version != original.terms_version
+                    or any(getattr(order, field).state != 'known' or getattr(original, field).state != 'known'
+                        or getattr(order, field).value != getattr(original, field).value
+                        for field in ('price', 'original_size', 'order_type', 'expiration'))):
+                return False
+        target = orders[origin.ticket.order.key]
+        if target not in snapshot.active_orders or target.remaining.state != 'known' or target.remaining.value <= 0:
+            return False
+        for original in origin.anchors:
+            anchor = orders[original.key]
+            proof = anchor.terminal_proof
+            if (anchor.size_matched.state != 'known' or anchor.size_matched.value != 0
+                    or anchor.price.value != key.price or proof is None and anchor.presence != 'present'
+                    or proof is not None and (not proof.identity_verified or proof.order_key != anchor.key
+                        or proof.matched.state != 'known' or proof.matched.value != 0
+                        or proof.original_size.state != 'known' or proof.original_size.value != anchor.original_size.value
+                        or proof.source.state != 'known' or not proof.source.complete)):
+                return False
+        return True
 
     def _dispatch_protection_cancels(self):
         attempts = []
@@ -978,6 +1040,8 @@ class LPD2LiveExecution:
             retained = []
             for ticket in tickets:
                 current = self.state.snapshot()
+                if not self._protection_frame_current(snapshot):
+                    return attempts  # a later normal tick may validate the unchanged original tickets
                 progress = current.progress.get(key)
                 if progress is None or any(t.order_key == ticket.order.key for t in progress.cancel_targets):
                     continue
@@ -991,7 +1055,11 @@ class LPD2LiveExecution:
                 if existing and existing._thread.is_alive():
                     retained.append(ticket)
                     continue  # a real independent request already owns this exact target
-                handle = self.cancel_independent(order.key, protection_key=key, reason=ticket.reason)
+                origin = _ProtectionCancelOrigin(observation.observation_id, current.trade_version,
+                    current.current.cycle_generation, tuple(next(o for o in current.orders if o.key == anchor.key)
+                        for anchor in anchors), ticket)
+                handle = self.cancel_independent(order.key, protection_key=key, reason=ticket.reason,
+                    protection_origin=origin)
                 retained.append(ticket)  # removed only after actual target registration, never on guard denial
                 if handle is not None:
                     attempts.append(handle)
@@ -1533,6 +1601,23 @@ class LPD2LiveExecution:
             and observation.orders_complete and observation.positions_complete
             and all(terms.get(key) == version for key, version in guard.expected_order_terms_versions))
 
+    def _sell_dispatch_current(self, scope, attempt, generation, origin):
+        with self.state._lock:
+            snapshot = self.state.snapshot()
+            sell = snapshot.sells.get(scope)
+            pending = (sell.passive if attempt.kind == 'passive_exit' else sell.protected) if sell else None
+            positions = tuple(p for p in snapshot.positions
+                if (p.account_id, p.condition_id, p.token_id) == scope[:3])
+            return bool(self._dispatch_current(generation) and self._sell_origin_current(snapshot, scope, origin)
+                and pending == attempt and sell.position_reconciled
+                and sell.residual_quantity.state == 'known' and sell.residual_quantity.value == origin.residual
+                and attempt.submit_residual_quantity.state == 'known' and attempt.submit_residual_quantity.value == origin.residual
+                and attempt.submit_sold_quantity.state == 'known' and attempt.submit_sold_quantity.value == origin.sold
+                and attempt.submit_quantity.state == 'known' and 0 < attempt.submit_quantity.value <= origin.residual
+                and len(positions) == 1 and positions[0].quantity.state == 'known' and positions[0].quantity.value == origin.residual
+                and not sell.current_sells
+                and not any(o.side == 'SELL' and o.key[:3] == scope[:3] for o in snapshot.active_orders))
+
     def _start_exit(self, scope, kind, quantity, sold, price, origin):
         lease = self._acquire_mutation('SELL')
         if lease is None:
@@ -1571,6 +1656,10 @@ class LPD2LiveExecution:
                 if self.state.apply_protection(OpeningProtectionUpdate(
                         self._protection_guard(current, scope, orders, observation=True), changed)) != 'applied':
                     raise ValueError('exit_role_not_current')
+                # Only our pending-attempt/role writes advance this expectation.
+                # Observation/trade/terms/quantity and their sources stay original.
+                dispatch_origin = replace(origin, guard=replace(origin.guard,
+                    expected_scope_version=self.state.snapshot().scope_versions[scope]))
                 generation = snapshot.current.cycle_generation
                 record = RequestRecord(self.account_id, self.process_epoch, identity.request_id, 'd2:'+identity.request_id,
                     scope[1], scope[2], 'SELL', price, quantity, self._utc_now(), None, self.venue, generation,
@@ -1578,7 +1667,7 @@ class LPD2LiveExecution:
                     snapshot.observation.observation_id, attempt.order_type.value, None, kind == 'passive_exit', ())
                 self.writer.offer(record)
                 handle = self._start_protection_native(identity,
-                    lambda: self._execute_exit(scope, attempt, record, generation, lease), lease=lease)
+                    lambda: self._execute_exit(scope, attempt, record, generation, lease, dispatch_origin), lease=lease)
                 transferred = True
                 return handle
         finally:
@@ -1602,17 +1691,17 @@ class LPD2LiveExecution:
         thread.start()
         return handle
 
-    def _execute_exit(self, scope, attempt, record, generation, lease):
+    def _execute_exit(self, scope, attempt, record, generation, lease, origin):
         outcome, venue_id, signed = 'not_sent', None, None
         try:
-            if self._control_view().fatal or self._control_view().cycle_generation != generation or not lease.allowed():
+            if not lease.allowed() or not self._sell_dispatch_current(scope, attempt, generation, origin):
                 with self.state._lock:
                     self._publish_sell_attempt(scope, replace(attempt, state='rejected', native_state='ended'))
                 return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
             signed = (self.trading.lp_create_limit_order(token_id=scope[2], side='SELL', price=attempt.price.value,
                 quantity=attempt.submit_quantity.value, expiration=None, post_only=True)
                 if attempt.kind == 'passive_exit' else None)
-            if self._control_view().fatal or self._control_view().cycle_generation != generation or not lease.allowed():
+            if not lease.allowed() or not self._sell_dispatch_current(scope, attempt, generation, origin):
                 with self.state._lock:
                     self._publish_sell_attempt(scope, replace(attempt, state='rejected', native_state='ended'))
                 return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
@@ -1695,12 +1784,13 @@ class LPD2LiveExecution:
                 def cancel():
                     outcome = 'unknown'
                     try:
-                        if self._control_view().fatal or not lease.allowed():
+                        if not lease.allowed():
                             outcome = 'not_sent'
                         else:
                             with self.state._lock:
                                 current = self.state.snapshot()
-                                if not self._sell_origin_current(current, scope, origin):
+                                if (not self._dispatch_current(record.cycle_generation)
+                                        or not self._sell_origin_current(current, scope, origin)):
                                     return _ProtectionOutcome(identity.request_id, 'not_sent', attempt.order_key[3])
                                 self._publish_sell_attempt(scope, updated, observation=True)
                             result = self.trading.cancel_orders_detailed((attempt.order_key[3],))
@@ -1792,6 +1882,8 @@ class LPD2LiveExecution:
             self._register_first_seen(snapshot)
             snapshot = self.state.snapshot()
             attempts = self._dispatch_protection_cancels()
+            if not self._protection_frame_current(snapshot):
+                return tuple(attempts)
             for key, baseline in snapshot.baselines.items():
                 current = self.state.snapshot()
                 progress = current.progress.get(key)
@@ -1845,6 +1937,8 @@ class LPD2LiveExecution:
                     self._deferred_protection_cancels[key] = tuple(_DeferredProtectionCancel(
                         order, observation.observation_id, reason) for order in orders)
                     attempts.extend(self._dispatch_protection_cancels())
+                    if not self._protection_frame_current(snapshot):
+                        return tuple(a for a in attempts if a is not None)
             current = self.state.snapshot()
             for order_key in current.unknown_yield_due:
                 if any(t.order_key == order_key for progress in current.progress.values() for t in progress.cancel_targets):
@@ -1868,9 +1962,9 @@ class LPD2LiveExecution:
                         continue
                 attempts.append(self.cancel_independent(order_key,
                     protection_key=key, reason='buy_yield_unknown_timeout'))
+            self._evaluate_scoring(deadline)
             for scope in tuple(self.state.snapshot().openings):
                 attempts.extend(self._evaluate_opening(scope))
-            self._evaluate_scoring(deadline)
             attempts.extend(self._cancel_review_entries())
             return tuple(a for a in attempts if a is not None)
 

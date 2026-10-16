@@ -1190,7 +1190,11 @@ def test_d2_protection_evidence_is_exact_and_market_bounded(tmp_path, monkeypatc
         live.run_once()
         reads = (sdk.balance_reads, sdk.order_reads, sdk.position_reads, public.book_reads)
         attempts = live.run_protection_once()
-        for a in attempts: a.result(timeout=3)
+        for a in attempts:
+            outcome = a.result(timeout=3)
+            assert getattr(outcome.status, 'value', outcome.status) == 'accepted'
+            a._thread.join(timeout=2)
+            assert a.done(), 'protection tick must await actual native completion'
         assert reads == (sdk.balance_reads, sdk.order_reads, sdk.position_reads, public.book_reads)
         return live.state.snapshot()
     try:
@@ -1976,6 +1980,7 @@ def test_d2_deferred_manual_anchor_proof_is_not_gated_by_prior_dispatch(tmp_path
     releases = {oid: Event() for oid in ('unrelated-X', 'unrelated-Y')}
     changed, exact_reads, terminal, trade_queries = Condition(), [], {}, []
     allow_final = [False]
+    b_entered, c_entered = Event(), Event()
     trades = sdk.list_account_trades
     def account_trades(**kwargs):
         trade_queries.append(kwargs)
@@ -1989,6 +1994,12 @@ def test_d2_deferred_manual_anchor_proof_is_not_gated_by_prior_dispatch(tmp_path
             changed.notify_all()
         if oid in releases:
             assert releases[oid].wait(5), 'unrelated native cancellation completion watchdog'
+        elif oid == 'success-B':
+            b_entered.set()
+            assert c_entered.wait(5), 'original second native target entry watchdog'
+        elif oid == 'deferred-C':
+            assert b_entered.wait(5), 'original first native target entry watchdog'
+            c_entered.set()
         with changed:
             sdk.orders = tuple(o for o in sdk.orders if o.id != oid)
         return dict(canceled=order_ids, not_canceled={})
@@ -2075,6 +2086,7 @@ def test_d2_deferred_manual_anchor_proof_is_not_gated_by_prior_dispatch(tmp_path
         assert live.state.snapshot().openings == {} and live.state.snapshot().own_fills == {}
         assert sdk.posts == [] and trade_queries == []
     finally:
+        b_entered.set(); c_entered.set()
         for release in releases.values(): release.set()
         assert live.close(timeout=3)
         live.trading.close()
