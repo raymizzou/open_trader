@@ -2580,7 +2580,7 @@ class PolymarketTradingClient:
                     return adapter._collateral_balance_allowance()
                 if component in ('open_orders', 'positions'):
                     raw = (adapter._client.list_open_orders() if component == 'open_orders'
-                        else adapter._client.list_positions())
+                        else adapter._client.list_positions(size_threshold=0))
                     if raw is None:
                         return None
                     result = []
@@ -6116,15 +6116,18 @@ class PolymarketTradingClient:
         return row
 
     def lp_protection_fills(self, *, condition_id: str, token_id: str):
-        """Exhaust only this instrument's own trades; SDK list owns pagination."""
-        raw = self._client.list_account_trades(market=condition_id, token_id=token_id,
-            maker_address=self.config.wallet_address)
+        """Exhaust related-condition trades; attribute exact own legs locally.
+
+        Complementary trades can describe the other token on the outer row.
+        Token/wallet query filters cannot establish nested maker-leg coverage.
+        """
+        raw = self._client.list_account_trades(market=condition_id)
         if raw is None:
             raise ValueError('protection_fills_incomplete')
         result = []
         for value in _collect(raw):
             row, original = _lp_trade(value), _model_dict(value) or {}
-            if row is None or row['condition_id'] != condition_id or row['token_id'] != token_id:
+            if row is None or row['condition_id'] != condition_id:
                 raise ValueError('protection_fill_identity')
             # Keep wallet evidence on taker rows as well. Owner is an API credential.
             row['maker_address'] = original.get('maker_address')

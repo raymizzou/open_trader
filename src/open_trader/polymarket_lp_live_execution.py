@@ -131,6 +131,32 @@ class _ProtectionOutcome:
     order_id: str | None
 
 
+@dataclass(frozen=True)
+class _OpeningOrderAssociation:
+    scope: tuple
+    order_key: tuple
+    request_id: str | None
+    observation_id: str
+    source: SourceStamp
+    requested_at: datetime | None = None
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class _SellCalculationOrigin:
+    guard: ProtectionGuard
+    trade_version: int
+    residual: Decimal
+    sold: Decimal
+
+
+@dataclass(frozen=True)
+class _DeferredProtectionCancel:
+    order: CurrentOrderFact
+    trigger_observation_id: str
+    reason: str
+
+
 class _ControlStore:
     def __init__(self, store, account_id):
         self.store = store
@@ -170,6 +196,7 @@ class LPD2LiveExecution:
         self.store, self.trading, self.account_id, self.venue = store, trading, account_id, venue
         self.process_epoch, self.policy = process_epoch, policy
         self._clock, self._utc_now = clock, utc_now
+        self._positions_full_coverage = reader is None  # owned adapter requests threshold0
         self.reader = reader if reader is not None else MarketReader(trading.lp_reader_source_port(), clock=clock)
         self.writer = writer if writer is not None else LPBusinessWriter(store)
         self.state = CurrentLPState(account_id, process_epoch, clock=clock, utc_now=utc_now)
@@ -181,9 +208,15 @@ class LPD2LiveExecution:
         self._closed = False
         self._admission = None
         self._record_requests = {}
+        # Immutable current-process ownership/provenance only. All business
+        # quantities, statuses and latches remain exclusively in CurrentLPState.
+        self._opening_order_associations = {}
         self._sealed_candidates = {}
         self._sealed_candidate_source = None
         self._native_jobs = {}
+        # Finite dispatch tickets for an already accepted protection trigger.
+        # No request/native attempt exists until actual capacity is admitted.
+        self._deferred_protection_cancels = {}
         self._active_sends = set()
         self._last_preparation_rejection = None
         self._last_current_evidence = None
@@ -260,6 +293,7 @@ class LPD2LiveExecution:
                     _Order(o.key[0], self.venue, o.key[2], o.key[3], o.side)
                     for o in observation.order_view.open_orders))
             if orders_current and observation.orders_complete:
+                self._associate_current_manual_sells()
                 self._offer_progress(frame)
             fixed = self._fixed_plan(observation, prepared, calculation)
             # LPControlOwner uses this same peer coordination lock while its
@@ -325,7 +359,7 @@ class LPD2LiveExecution:
             if len(rows) != 1:
                 return None  # ambiguous identity is not an empty fixed plan
             row = rows[0]
-            if any(o.stop_requested and o.scope[1:3] == (row.get('condition_id'), row.get('token_id'))
+            if any(o.phase != 'closed' and o.stop_requested and o.scope[1:3] == (row.get('condition_id'), row.get('token_id'))
                     for o in self.state.snapshot().openings.values()):
                 continue
             try:
@@ -380,6 +414,10 @@ class LPD2LiveExecution:
                 existing = self._native_jobs.get((self.account_id, target.venue, target.token_id, target.existing_order_id))
                 permitted = permitted and not (existing and existing._thread.is_alive()
                     and existing.identity.request_id != action.request_id)
+                if not isinstance(token, _IndependentContext):
+                    # Resume cleanup cannot steal a deferred protection target
+                    # or replay an already attempted (including UNKNOWN) one.
+                    permitted = permitted and not self._protection_cancel_owned(order.key)
             permitted = permitted and len(occupied) < 2
             if permitted:
                 self._active_sends.add(action.request_id)
@@ -583,6 +621,8 @@ class LPD2LiveExecution:
                     or current_order is None):
                 raise ValueError('independent_cancel_not_current')
             if len({h.identity.request_id for h in self._native_jobs.values()} | self._active_sends) >= 2:
+                if protection:
+                    return None  # no fabricated request or attempt on deferral
                 raise RuntimeError('native_capacity')
             identity = ActionIdentity(str(uuid4()), self.account_id,
                 CancelTarget(self.venue, order_key[2], order_key[3]))
@@ -614,6 +654,53 @@ class LPD2LiveExecution:
             snapshot.scope_versions.get(scope, 0), tuple((o.key, o.terms_version) for o in orders),
             snapshot.observation.observation_id if observation else None, uuid4().hex)
 
+    def _protection_cancel_owned(self, order_key):
+        snapshot = self.state.snapshot()
+        return (any(t.order_key == order_key for p in snapshot.progress.values() for t in p.cancel_targets)
+            or any(t.order.key == order_key for tickets in self._deferred_protection_cancels.values() for t in tickets))
+
+    def _dispatch_protection_cancels(self):
+        attempts = []
+        with self.state._lock:
+            snapshot = self.state.snapshot()
+            observation = snapshot.observation
+            if (self._control_view().fatal or observation is None or not observation.orders_complete
+                    or observation.cycle_generation != snapshot.current.cycle_generation
+                    or observation.read_ticket.trade_version_at_start != snapshot.trade_version):
+                return attempts
+            for key, tickets in tuple(self._deferred_protection_cancels.items()):
+                baseline = snapshot.baselines.get(key)
+                anchors = tuple(o for o in snapshot.active_orders if baseline is not None
+                    and o.key[:3] == key.scope[:3] and o.key[3] in baseline.anchor_order_ids and o.side == 'BUY')
+                if not anchors or any(o.size_matched.state != 'known' or o.size_matched.value != 0 for o in anchors):
+                    self._deferred_protection_cancels.pop(key, None)
+                    continue
+                retained = []
+                for ticket in tickets:
+                    current = self.state.snapshot()
+                    progress = current.progress.get(key)
+                    if progress is None or any(t.order_key == ticket.order.key for t in progress.cancel_targets):
+                        continue
+                    order = next((o for o in current.active_orders if o.key == ticket.order.key), None)
+                    if (order is None or order.side != 'BUY' or order.remaining.state != 'known' or order.remaining.value <= 0
+                            or any(getattr(order, name).value != getattr(ticket.order, name).value
+                                for name in ('price', 'original_size', 'order_type', 'expiration'))
+                            or order.price.value != key.price):
+                        continue  # never replace the original target with a new/changed order
+                    existing = self._native_jobs.get((self.account_id, self.venue, order.key[2], order.key[3]))
+                    if existing and existing._thread.is_alive():
+                        continue  # a real independent request already owns this exact target
+                    handle = self.cancel_independent(order.key, protection_key=key, reason=ticket.reason)
+                    if handle is None:
+                        retained.append(ticket)
+                    else:
+                        attempts.append(handle)
+                if retained:
+                    self._deferred_protection_cancels[key] = tuple(retained)
+                else:
+                    self._deferred_protection_cancels.pop(key, None)
+        return attempts
+
     def _register_submit_baseline(self, token, action, record, order_key):
         row = self._sealed_candidates[(token.batch_id, action.request_id)]
         source = self._sealed_candidate_source
@@ -641,8 +728,16 @@ class LPD2LiveExecution:
         """Only a real current-process BUY receipt starts an opening."""
         with self.state._lock:
             snapshot = self.state.snapshot()
-            scope = (*order_key[:3], self.process_epoch)
-            previous = snapshot.openings.get(scope)
+            ownership = self._opening_order_associations.get(order_key)
+            if ownership is not None:
+                return  # exact IDs never rebind, including closed exclusion tombstones
+            related = tuple(o for o in snapshot.openings.values() if o.scope[:3] == order_key[:3])
+            active = tuple(o for o in related if o.phase != 'closed')
+            if len(active) > 1:
+                raise ValueError('ambiguous_current_opening')
+            previous = active[0] if active else None
+            scope = previous.scope if previous else (*order_key[:3],
+                self.process_epoch if not related else self.process_epoch+':'+uuid4().hex)
             order = next(o for o in snapshot.orders if o.key == order_key)
             unknown = Fact('unknown')
             scoring = ScoringState(order_key, 'entry', unknown, None, None, None, order.source)
@@ -661,6 +756,9 @@ class LPD2LiveExecution:
                 self._protection_guard(snapshot, scope, orders), opening))
             if disposition != 'applied':
                 raise ValueError('opening_receipt_not_registered:' + disposition)
+            record = self._record_requests[order_key]
+            self._opening_order_associations[order_key] = _OpeningOrderAssociation(scope, order_key,
+                record.request_id, record.observation_id, order.source, requested_at=record.requested_at)
 
     @staticmethod
     def _scoring_target(snapshot, opening):
@@ -678,6 +776,8 @@ class LPD2LiveExecution:
         for scope in tuple(self.state.snapshot().openings):
             snapshot = self.state.snapshot()
             opening = snapshot.openings[scope]
+            if opening.phase == 'closed':
+                continue
             order, role = self._scoring_target(snapshot, opening)
             if order is None:
                 continue
@@ -756,17 +856,38 @@ class LPD2LiveExecution:
             complete=source.complete, state='known' if source.complete and not source.error and source.value is not None else 'unknown',
             error_code=source.error, retry_at=source.retry_at)
 
+    def _associate_current_manual_sells(self):
+        with self.state._lock:
+            snapshot = self.state.snapshot()
+            observation = snapshot.observation
+            if observation is None or not observation.orders_complete:
+                return
+            stamp = observation.order_view.orders_source
+            for raw in observation.source_frame.orders:
+                key = (self.account_id, raw['condition_id'], raw['token_id'], raw['order_id'])
+                if raw['side'] != 'SELL' or key in self._opening_order_associations:
+                    continue
+                active = tuple(o for o in snapshot.openings.values() if o.scope[:3] == key[:3] and o.phase != 'closed')
+                if len(active) != 1:
+                    continue
+                opening = active[0]
+                entry_proofs = tuple(a for a in self._opening_order_associations.values()
+                    if a.scope == opening.scope and a.order_key[3] in opening.entry_order_ids)
+                floor = min((a.requested_at for a in entry_proofs if a.requested_at is not None), default=None)
+                created = raw.get('created_at')
+                order = next((o for o in snapshot.orders if o.key == key), None)
+                if (floor is None or not isinstance(created, datetime) or stamp.checked_at is None
+                        or not floor <= created <= stamp.checked_at or order is None
+                        or order.side != 'SELL' or order.presence != 'present'):
+                    continue
+                self._opening_order_associations[key] = _OpeningOrderAssociation(opening.scope, key, None,
+                    observation.observation_id, stamp, created_at=created)
+
     def _opening_orders(self, snapshot, opening):
-        records = tuple(r for r in self._record_requests.values() if r.kind == 'BUY'
-            and (r.condition_id, r.token_id) == opening.scope[1:3])
-        floor = min((r.requested_at for r in records), default=None)
-        raw = snapshot.observation.source_frame.orders if snapshot.observation else ()
-        current_manual = {r['order_id'] for r in raw if r['side'] == 'SELL'
-            and floor is not None and isinstance(r.get('created_at'), datetime) and r['created_at'] >= floor}
-        sell = snapshot.sells.get(opening.scope)
-        registered = {a.order_key[3] for a in (sell.passive, sell.protected) if a and a.order_key} if sell else set()
-        return tuple(o for o in snapshot.orders if o.key[:3] == opening.scope[:3]
-            and (o.key[3] in opening.entry_order_ids or o.key[3] in current_manual | registered))
+        # Raw open_orders is a current view, never a history/ownership store.
+        # Missing and terminal exact facts remain with their original episode.
+        keys = {a.order_key for a in self._opening_order_associations.values() if a.scope == opening.scope}
+        return tuple(o for o in snapshot.orders if o.key in keys)
 
     def _own_fills_from_source(self, source, orders):
         if not source.complete or source.error or not isinstance(source.value, tuple):
@@ -819,6 +940,8 @@ class LPD2LiveExecution:
         for scope in tuple(self.state.snapshot().openings):
             snapshot = self.state.snapshot()
             opening = snapshot.openings[scope]
+            if opening.phase == 'closed':
+                continue
             orders = self._opening_orders(snapshot, opening)
             for order in orders:
                 if (order.terminal_proof is not None and order.terminal_proof.matched.state == 'known'):
@@ -862,6 +985,13 @@ class LPD2LiveExecution:
                 order = next(o for o in current.orders if o.key == own.order_key)
                 sell = current.sells.get(scope)
                 attempt = next((a for a in (sell.passive, sell.protected) if a and a.order_key == own.order_key), None) if sell else None
+                association = self._opening_order_associations.get(own.order_key)
+                if attempt is None:
+                    retained = tuple(a for (episode, _), a in current.resolved_exit_attempts.items()
+                        if episode == scope and a.order_key == own.order_key)
+                    if len(retained) > 1:
+                        continue  # ambiguous request ownership never becomes fill authority
+                    attempt = retained[0] if retained else None
                 record = self._record_requests.get(own.order_key)
                 request = attempt.request_id if attempt else record.request_id if record else source.source_id
                 disposition = self.state.accept_receipt_evidence(ReceiptEvidence(uuid4().hex, request,
@@ -874,6 +1004,8 @@ class LPD2LiveExecution:
     def _evaluate_opening(self, scope):
         snapshot = self.state.snapshot()
         opening = snapshot.openings[scope]
+        if opening.phase == 'closed':
+            return ()
         observation = snapshot.observation
         orders = self._opening_orders(snapshot, opening)
         entries = tuple(o for o in orders if o.side == 'BUY' and o.key[3] in opening.entry_order_ids)
@@ -888,8 +1020,30 @@ class LPD2LiveExecution:
         positions = tuple(p for p in snapshot.positions if (p.account_id, p.condition_id, p.token_id) == scope[:3])
         position = positions[0] if len(positions) == 1 else None
         residual = position.quantity if position else Fact('unknown')
+        position_source = observation.components['positions']
+        monetary_fills = tuple(o for o in (*buys, *sales) if o is not None)
+        final_coverage = bool(orders) and all(o.terminal_proof is not None
+            and o.terminal_proof.identity_verified and o.terminal_proof.matched.state == 'known'
+            and o.terminal_proof.source.checked_at is not None
+            and position_source.checked_at is not None
+            and position_source.checked_at >= o.terminal_proof.source.checked_at
+            and observation.order_view.orders_source.checked_at >= o.terminal_proof.source.checked_at for o in orders)
+        previous_sell = snapshot.sells.get(scope)
+        attempts = tuple(a for a in (previous_sell.passive, previous_sell.protected) if a) if previous_sell else ()
+        no_native = all(a.native_state == 'ended' for a in attempts) and not any(h._thread.is_alive()
+            and (getattr(h.identity, 'scope', None) == scope
+                or any(h is self._native_jobs.get((self.account_id, self.venue, o.key[2], o.key[3])) for o in orders))
+            for h in self._native_jobs.values())
+        absent_zero = bool(not positions and self._positions_full_coverage and observation.positions_complete
+            and observation.orders_complete and complete and bought is not None and bought == sold
+            and final_coverage and no_native and all(o.complete_for_target and all(f.state == 'known'
+                for f in (o.quantity, o.notional_usd, o.fees_usd)) for o in monetary_fills))
+        if absent_zero:
+            # Same-frame complete threshold0 coverage plus fully resolved exact
+            # obligations projects zero locally; never invent a canonical row.
+            residual = Fact('known', Decimal(0), (position_source,))
         reconciled = bool(complete and bought is not None and sold is not None and bought >= sold
-            and position and observation.positions_complete and observation.orders_complete
+            and (position is not None or absent_zero) and observation.positions_complete and observation.orders_complete
             and residual.state == 'known' and residual.value == bought-sold)
         source = observation.source_frame.sources.get(f'market:{scope[1]}:{scope[2]}')
         data = source.value if source and source.complete and not source.error and isinstance(source.value, Mapping) else {}
@@ -914,6 +1068,8 @@ class LPD2LiveExecution:
         revenue = sum((o.notional_usd.value for o in sales if o), Decimal(0)) if amounts_known and bought else None
         exit_value = _executable_bid_value(risk_input, residual.value) if book and residual.state == 'known' else None
         projected = _projected_taker_fee(risk_input, residual.value) if book and residual.state == 'known' else None
+        if residual.state == 'known' and residual.value == 0:
+            exit_value, projected = Decimal(0), Decimal(0)
         fees = sum((o.fees_usd.value for o in own), Decimal(0))+projected if (
             complete and bought and all(o.fees_usd.state == 'known' for o in own) and projected is not None) else None
         economics = OpeningEconomics(scope, fact(cost, sources), fact(revenue, sources), fact(fees, (*sources, stamp)),
@@ -925,36 +1081,76 @@ class LPD2LiveExecution:
             stop_loss_triggered_at=self._utc_now() if latch else opening.stop_loss_triggered_at,
             stop_loss_triggered_loss_usd=loss if latch else opening.stop_loss_triggered_loss_usd,
             scope_version=snapshot.scope_versions.get(scope, 0)+1)
-        if self.state.apply_protection(OpeningProtectionUpdate(
-                self._protection_guard(snapshot, scope, orders, observation=True), updated)) != 'applied':
-            return ()
-        snapshot = self.state.snapshot()
-        old = snapshot.sells.get(scope)
-        def current_attempt(attempt):
-            if attempt is None or attempt.native_state != 'ended': return attempt
-            cancel = self._native_jobs.get((self.account_id, self.venue, scope[2], attempt.cancel_request_id))
-            if cancel is not None and cancel._thread.is_alive(): return attempt
-            order = next((o for o in snapshot.orders if o.key == attempt.order_key), None)
-            own = snapshot.own_fills.get(attempt.order_key)
-            proof = order.terminal_proof if order else None
-            # None is not zero. All final0, exact request, native end, original
-            # terms, fresh complete positions/orders and reconciliation agree.
-            zero = bool(proof and proof.identity_verified and proof.matched.state == 'known' and proof.matched.value == 0
-                and proof.original_size.value == attempt.submit_quantity.value and reconciled
-                and observation.order_view.orders_source.checked_at >= proof.source.checked_at
-                and position.source.checked_at >= proof.source.checked_at)
-            filled = bool(proof and own and own.complete_for_target and own.quantity.state == 'known'
-                and proof.matched.state == 'known' and own.quantity.value == proof.matched.value and reconciled)
-            return replace(attempt, state='terminal', own_fill_evidence=own) if zero or filled else attempt
-        sell = SellState(scope, residual, position.inventory_cost_usd if position else Fact('unknown'), reconciled,
-            tuple(o for o in snapshot.active_orders if o.key[:3] == scope[:3] and o.side == 'SELL'),
-            observation.order_view.orders_source, observation.components['positions'],
-            current_attempt(old.passive) if old else None, current_attempt(old.protected) if old else None)
-        if self.state.apply_protection(ExitEvidenceUpdate(
-                self._protection_guard(snapshot, scope, orders, observation=True), sell)) != 'applied':
-            return ()
-        snapshot = self.state.snapshot()
-        opening, sell = snapshot.openings[scope], snapshot.sells[scope]
+        with self.state._lock:
+            if self.state.apply_protection(OpeningProtectionUpdate(
+                    self._protection_guard(snapshot, scope, orders, observation=True), updated)) != 'applied':
+                return ()
+            snapshot = self.state.snapshot()
+            old = snapshot.sells.get(scope)
+            def current_attempt(attempt):
+                if attempt is None or attempt.native_state != 'ended': return attempt
+                cancel = self._native_jobs.get((self.account_id, self.venue, scope[2], attempt.cancel_request_id))
+                if cancel is not None and cancel._thread.is_alive(): return attempt
+                order = next((o for o in snapshot.orders if o.key == attempt.order_key), None)
+                own = snapshot.own_fills.get(attempt.order_key)
+                proof = order.terminal_proof if order else None
+                # None is not zero. All final0, exact request, native end, original
+                # terms, fresh complete positions/orders and reconciliation agree.
+                zero = bool(proof and proof.identity_verified and proof.matched.state == 'known' and proof.matched.value == 0
+                    and proof.original_size.value == attempt.submit_quantity.value and reconciled
+                    and observation.order_view.orders_source.checked_at >= proof.source.checked_at
+                    and position_source.checked_at >= proof.source.checked_at)
+                filled = bool(proof and own and own.complete_for_target and own.quantity.state == 'known'
+                    and proof.matched.state == 'known' and own.quantity.value == proof.matched.value and reconciled)
+                return replace(attempt, state='terminal', own_fill_evidence=own) if zero or filled else attempt
+            sell = SellState(scope, residual, position.inventory_cost_usd if position else Fact('unknown'), reconciled,
+                tuple(o for o in snapshot.active_orders if o.key[:3] == scope[:3] and o.side == 'SELL'),
+                observation.order_view.orders_source, observation.components['positions'],
+                current_attempt(old.passive) if old else None, current_attempt(old.protected) if old else None)
+            if self.state.apply_protection(ExitEvidenceUpdate(
+                    self._protection_guard(snapshot, scope, orders, observation=True), sell)) != 'applied':
+                return ()
+            snapshot = self.state.snapshot()
+            opening, sell = snapshot.openings[scope], snapshot.sells[scope]
+            origin = _SellCalculationOrigin(self._protection_guard(snapshot, scope, orders, observation=True),
+                snapshot.trade_version, residual.value, sold)
+            attempts = tuple(a for a in (sell.passive, sell.protected) if a)
+            final_orders = bool(orders) and all(o.terminal_proof is not None
+                and o.terminal_proof.identity_verified and o.terminal_proof.matched.state == 'known'
+                and o.terminal_proof.source.checked_at is not None
+                and observation.order_view.orders_source.checked_at >= o.terminal_proof.source.checked_at
+                and position_source.checked_at is not None and position_source.checked_at >= o.terminal_proof.source.checked_at
+                for o in orders)
+            monetary = complete and all(o is not None and o.complete_for_target
+                and all(f.state == 'known' for f in (o.quantity, o.notional_usd, o.fees_usd))
+                for order,o in (*zip(entries, buys), *zip(sales_orders, sales))
+                if order.size_matched.value != 0)
+            native_ended = all(a.native_state == 'ended' and a.state in ('terminal', 'rejected') for a in attempts)
+            native_pending = any(h._thread.is_alive() and (getattr(h.identity, 'scope', None) == scope
+                or any(h is self._native_jobs.get((self.account_id, self.venue, o.key[2], o.key[3])) for o in orders))
+                for h in self._native_jobs.values())
+            if (reconciled and bought and residual.state == 'known' and residual.value == 0
+                    and final_orders and monetary and native_ended and not native_pending):
+                closed = replace(opening, phase='closed', scope_version=snapshot.scope_versions.get(scope, 0)+1)
+                if self.state.apply_protection(OpeningProtectionUpdate(origin.guard, closed)) != 'applied':
+                    return ()
+                closing = self.state.snapshot()
+                disposition = self.state.retire_exit_attempts(
+                    self._protection_guard(closing, scope, orders, observation=True))
+                self._last_current_evidence = (scope, 'exit_retirement', disposition)
+                if disposition != 'applied':
+                    # No observer can see an unconfirmed completion: this whole
+                    # projection/retirement sequence holds the state owner lock.
+                    # Restore the prior role through the public guard, preserving
+                    # every quantity, latch and unresolved obligation for retry.
+                    current = self.state.snapshot()
+                    pending = replace(current.openings[scope], phase=opening.phase,
+                        scope_version=current.scope_versions.get(scope, 0)+1)
+                    restored = self.state.apply_protection(OpeningProtectionUpdate(
+                        self._protection_guard(current, scope, orders, observation=True), pending))
+                    if restored != 'applied':
+                        raise RuntimeError('exit_retirement_refusal_not_restored:' + restored)
+                return ()
         if not reconciled or residual.state != 'known' or residual.value <= 0 or not book:
             return ()
         if len({h.identity.request_id for h in self._native_jobs.values() if h._thread.is_alive()} | self._active_sends) >= 2:
@@ -963,9 +1159,10 @@ class LPD2LiveExecution:
         if opening.stop_loss_latched.value:
             if passive and (passive.native_state != 'ended' or passive.state not in ('terminal', 'rejected')):
                 if passive.order_key and not passive.cancel_request_id and passive.native_state == 'ended':
-                    return (self._cancel_exit(scope, passive),)
+                    return (self._cancel_exit(scope, passive, origin),)
                 return ()
-            if sell.protected is not None or sell.current_sells:
+            if (sell.protected is not None and (sell.protected.native_state != 'ended'
+                    or sell.protected.state not in ('terminal', 'rejected'))) or sell.current_sells:
                 return ()
             bids = sorted(((Decimal(str(r['price'])), Decimal(str(r['size']))) for r in book['bids']), reverse=True)
             remaining, quantity, price = residual.value, Decimal(0), None
@@ -976,7 +1173,7 @@ class LPD2LiveExecution:
                 if remaining <= 0: break
             minimum = book.get('min_order_size')
             if price and quantity > 0 and (minimum is None or quantity >= minimum):
-                return (self._start_exit(scope, 'protected_exit', quantity, sold, price),)
+                return (self._start_exit(scope, 'protected_exit', quantity, sold, price, origin),)
         elif economics.opening_loss_usd.state == 'known' and not opening.stop_requested:
             asks = sorted((Decimal(str(r['price'])), Decimal(str(r['size']))) for r in book['asks'])
             own_at_price = {}
@@ -986,10 +1183,10 @@ class LPD2LiveExecution:
             if passive and (passive.state not in ('terminal', 'rejected') or passive.native_state != 'ended'):
                 if (price is not None and price != passive.price.value and passive.native_state == 'ended'
                         and passive.order_key and not passive.cancel_request_id):
-                    return (self._cancel_exit(scope, passive),)
+                    return (self._cancel_exit(scope, passive, origin),)
                 return ()
             if price and not sell.current_sells:
-                return (self._start_exit(scope, 'passive_exit', residual.value, sold, price),)
+                return (self._start_exit(scope, 'passive_exit', residual.value, sold, price, origin),)
         return ()
 
     def _publish_sell_attempt(self, scope, attempt, *, observation=False):
@@ -1003,9 +1200,30 @@ class LPD2LiveExecution:
         if result != 'applied':
             raise ValueError('exit_attempt_not_applied:' + result)
 
-    def _start_exit(self, scope, kind, quantity, sold, price):
+    def _sell_origin_current(self, snapshot, scope, origin):
+        guard, observation = origin.guard, snapshot.observation
+        terms = {o.key: o.terms_version for o in snapshot.orders}
+        return bool(guard.scope == scope and observation is not None
+            and guard.observation_id == observation.observation_id
+            and guard.cycle_generation == snapshot.current.cycle_generation
+            and guard.expected_scope_version == snapshot.scope_versions.get(scope, 0)
+            and origin.trade_version == snapshot.trade_version == observation.read_ticket.trade_version_at_start
+            and observation.orders_complete and observation.positions_complete
+            and all(terms.get(key) == version for key, version in guard.expected_order_terms_versions))
+
+    def _start_exit(self, scope, kind, quantity, sold, price, origin):
         with self.state._lock:
             snapshot = self.state.snapshot()
+            if not self._sell_origin_current(snapshot, scope, origin):
+                return None
+            sell = snapshot.sells.get(scope)
+            positions = tuple(p for p in snapshot.positions if (p.account_id, p.condition_id, p.token_id) == scope[:3])
+            if (sell is None or not sell.position_reconciled or len(positions) != 1
+                    or positions[0].quantity.state != 'known' or positions[0].quantity.value != origin.residual
+                    or sell.residual_quantity.state != 'known' or sell.residual_quantity.value != origin.residual
+                    or sold != origin.sold or not 0 < quantity <= origin.residual
+                    or any(o.side == 'SELL' and o.key[:3] == scope[:3] for o in snapshot.active_orders)):
+                return None
             if self._control_view().fatal or len({h.identity.request_id for h in self._native_jobs.values()
                     if h._thread.is_alive()} | self._active_sends) >= 2:
                 return None
@@ -1073,21 +1291,38 @@ class LPD2LiveExecution:
                 outcome = 'rejected'
             elif type(venue_id) is str and venue_id:
                 outcome = 'accepted'
+                key = (*scope[:3], venue_id)
+                with self.state._lock:
+                    association = self._opening_order_associations.get(key)
+                    current = self.state.snapshot()
+                    sell = current.sells[scope]
+                    previous_requests = tuple(a for a in (sell.passive, sell.protected) if a)
+                    previous_requests += tuple(a for (episode, _), a in current.resolved_exit_attempts.items() if episode == scope)
+                    if (association is not None and (association.scope != scope
+                            or association.request_id not in (None, attempt.request_id))
+                            or any(a.order_key == key and a.request_id != attempt.request_id for a in previous_requests)):
+                        raise ValueError('exit_order_identity_already_owned')
+                    # First observation may precede this native receipt. Its
+                    # immutable same-episode provenance is retained; the real
+                    # request/order binding lives in the state-owned attempt.
+                stamp = SourceStamp(attempt.request_id, checked_at=self._utc_now(), complete=True, state='known')
                 amount = value('making_amount')
                 try: matched = Decimal(str(amount))
                 except ArithmeticError: matched = None
                 if matched is not None and matched.is_finite() and 0 <= matched <= attempt.submit_quantity.value:
-                    stamp = SourceStamp(attempt.request_id, checked_at=self._utc_now(), complete=True, state='known')
                     fact = lambda v: Fact('known', v, (stamp,))
                     key = (*scope[:3], venue_id)
                     incoming = CurrentOrderFact(key, 'SELL', str(value('status', 'ACCEPTED')).upper(),
                         attempt.price, attempt.submit_quantity, fact(matched), fact(attempt.submit_quantity.value-matched),
                         'present', None, attempt.order_type, attempt.expiration, 1, stamp)
                     result = self.state.accept_receipt_evidence(ReceiptEvidence(uuid4().hex, attempt.request_id,
-                        self.account_id, self.process_epoch, generation, key, 'SELL', 0, order_fact=incoming))
+                        self.account_id, self.process_epoch, generation, key, 'SELL', 0, order_fact=incoming, scope=scope))
                     self._last_current_evidence = (attempt.request_id, 'sell_receipt', result)
                 with self.state._lock:
-                    self._publish_sell_attempt(scope, replace(attempt, state='accepted', order_key=(*scope[:3], venue_id), native_state='ended'))
+                    key = (*scope[:3], venue_id)
+                    self._publish_sell_attempt(scope, replace(attempt, state='accepted', order_key=key, native_state='ended'))
+                    self._opening_order_associations.setdefault(key, _OpeningOrderAssociation(scope, key,
+                        attempt.request_id, record.observation_id, stamp, requested_at=record.requested_at))
                 return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
         except Exception:
             pass  # actual post uncertainty retains this exact attempt; never replay it
@@ -1099,12 +1334,14 @@ class LPD2LiveExecution:
                 state='rejected' if outcome in ('rejected', 'not_sent') else 'unknown', native_state='ended'))
         return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
 
-    def _cancel_exit(self, scope, attempt):
+    def _cancel_exit(self, scope, attempt, origin):
         with self.state._lock:
             if self._control_view().fatal or len({h.identity.request_id for h in self._native_jobs.values()
                     if h._thread.is_alive()} | self._active_sends) >= 2:
                 return None
             snapshot = self.state.snapshot()
+            if not self._sell_origin_current(snapshot, scope, origin):
+                return None
             identity = _ProtectionAction(uuid4().hex, self.account_id, scope, 'cancel_exit')
             updated = replace(attempt, cancel_request_id=identity.request_id)
             self._publish_sell_attempt(scope, updated, observation=True)
@@ -1201,7 +1438,7 @@ class LPD2LiveExecution:
                 return ()  # receipts invalidate the old observation; ordinary reader supplies the next one
             self._register_first_seen(snapshot)
             snapshot = self.state.snapshot()
-            attempts = []
+            attempts = self._dispatch_protection_cancels()
             for key, baseline in snapshot.baselines.items():
                 current = self.state.snapshot()
                 progress = current.progress.get(key)
@@ -1251,9 +1488,10 @@ class LPD2LiveExecution:
                 if disposition != 'applied':
                     continue
                 if triggered:
-                    for order in orders:
-                        attempts.append(self.cancel_independent(order.key,
-                            protection_key=key, reason='queue_data_failure_limit' if failure.data_failures >= 10 else 'queue_threshold'))
+                    reason = 'queue_data_failure_limit' if failure.data_failures >= 10 else 'queue_threshold'
+                    self._deferred_protection_cancels[key] = tuple(_DeferredProtectionCancel(
+                        order, observation.observation_id, reason) for order in orders)
+                    attempts.extend(self._dispatch_protection_cancels())
             current = self.state.snapshot()
             for order_key in current.unknown_yield_due:
                 if any(t.order_key == order_key for progress in current.progress.values() for t in progress.cancel_targets):
