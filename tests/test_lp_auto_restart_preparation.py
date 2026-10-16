@@ -107,26 +107,217 @@ def dead_preparation(tmp_path, runtime, request):
 
 
 def _new_owner(runtime, monkeypatch, tmp_path, *, orders=None):
-    import open_trader.prediction_runtime as module
+    """Explicit legacy components under one real exclusive file lock.
+
+    This object has no Runtime state/start/production-owner facade. Default
+    D2/native lifecycle evidence is supplied by each node's real clean child.
+    """
     public = RefillPublic(runtime.clock)
-    store, adapter, account, _, _ = runtime(public_client=public, orders=_four_buys() if orders is None else orders)
-    monkeypatch.setattr(module, 'load_trading_config', lambda _: adapter.config)
-    monkeypatch.setattr(module.PolymarketTradingClient, 'from_keychain', lambda _: adapter)
-    monkeypatch.setattr(module, 'PolymarketMonitor', lambda **_: SimpleNamespace(stop=lambda: None))
-    def legacy_startup(execution):
-        # This scenario concerns LP recovery, not the unrelated legacy venue gate.
-        execution._breaker_open = False
-        return {'state': 'ready'}
-    monkeypatch.setattr(module.PredictionExecutionService, 'reconcile_startup', legacy_startup)
-    for name in ('_start_lp_monitor', '_start_lp_auto_monitor', '_start_lp_daily_report_monitor',
-        '_start_history_monitor', '_start_candidate_scan_monitor', '_start_candidate_maintenance_monitor',
-        '_start_candidate_competition_monitor', '_start_lp_dashboard_monitor', '_start_reward_monitor',
-        '_start_lp_share_watch'):
-        monkeypatch.setattr(PredictionRuntime, name, lambda self: None)
-    owner = PredictionRuntime(data_dir=store.data_dir, prediction_config_path=tmp_path/'offline.json',
-        dashboard_url='http://offline.invalid/', n_leg_paused=True,
-        history_clock=lambda: runtime.clock[0])
-    return owner, store, adapter, account, public
+    store, adapter, account, lp, execution = runtime(public_client=public,
+        orders=_four_buys() if orders is None else orders)
+    class LegacyComponents:
+        def __init__(self):
+            self.store,self.adapter,self.lp,self.execution=store,adapter,lp,execution
+            self.owner_lock=_RuntimeOwnershipLock(store.path.parent/'runtime.lock')
+            self.admitting=Event()
+            lp.owner_lock=self.owner_lock
+            lp.set_mutation_guard(lambda action:self.owner_lock.held and self.admitting.is_set())
+        def open(self):
+            self.owner_lock.acquire()
+            # Acquiring this exact exclusive lock proves the prior owner has
+            # actually ended. This recovery is legacy component-only.
+            store.lp_recover_interrupted_submissions()
+            attach=getattr(adapter,'attach_metadata_cache',None)
+            if callable(attach):attach(store)
+            self.admitting.set()
+        def close(self):
+            if not self.owner_lock.held:return
+            self.admitting.clear()
+            lp.drain_submissions(timeout=0)
+            adapter.close()
+            self.owner_lock.release()
+    return LegacyComponents(), store, adapter, account, public
+
+
+def _assert_current_after_legacy(root,store,account,public,*,mode='known',restart=False,manual=False):
+    """Current API exposure despite old audit rows; no legacy money/authority."""
+    import hashlib,json,sqlite3
+    from datetime import UTC,datetime
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    from tests.lp_d2_service_harness import ServiceChild
+    old_actions={row['session_id']:deepcopy(store.lp_actions(row['session_id'])) for row in store.lp_sessions()}
+    class CurrentChild(ServiceChild):
+        def __exit__(self,*args):
+            self.release('ci-current-scheduler')
+            return super().__exit__(*args)
+        def launch(self,scenario,*,expected_running=None):
+            # Source owner/native are already ended; copy an actual SQLite
+            # snapshot, including the immutable old audit, into this new root.
+            if not (self.data_dir/'prediction_arbitrage/prediction_arbitrage.sqlite3').exists():
+                target=PredictionArbitrageStore(self.data_dir)
+                source=sqlite3.connect(store.path);destination=sqlite3.connect(target.path)
+                try:source.backup(destination)
+                finally:source.close();destination.close()
+                target=PredictionArbitrageStore(self.data_dir)
+                aid=hashlib.sha256(WALLET.encode()).hexdigest()
+                target.lp_save_current_control(dict(account_id=aid,process_epoch='current-fixture',request_id='explicit-pause',
+                    request_version=1,desired_running=False,
+                    requested_at=datetime(2026,10,16,12,tzinfo=UTC),actor='offline operator'))
+                settings=target.lp_load_current_settings(aid)
+                target.lp_save_current_settings(aid,expected_config_version=0 if settings is None else settings['config_version'],
+                    changes=dict(budget_usd='100',target_buy_count=5),actor='offline operator')
+            super().launch(scenario,expected_running=expected_running)
+    def encode(row):return row.model_dump(mode='json')
+    # Market terms are static inputs; books/timestamps originate from a NEW
+    # current SDK response. Old snapshots/receipts are never retimestamped.
+    payload=dict(mode=mode,orders=[encode(row) for row in account.orders],
+        positions=[encode(row) for row in account.positions],
+        markets=[encode(public.get_market(id=f'market-{i}')) for i in range(1,7)])
+    with CurrentChild(root,scenario='consumer-ci-current-'+mode) as child:
+        child.marker('ci-current-input.json').write_text(json.dumps(payload))
+        child.release('business');child.release('metadata');child.start(expected_running=False);child.wait('ci-current-observed.json')
+        expected_ids={row.id for row in account.orders}
+        def captured(state):
+            if mode=='known':return {str(row['key'][3]) for row in state['account_buys']}==expected_ids and state['current_exposure_usd'] is not None
+            return state['current_exposure_usd'] is None
+        state=child.wait_state(captured)
+        assert child.request('/healthz')['runtime_state']=='RUNNING'
+        assert state['effective_running'] is False
+        if mode=='known':
+            reserved=sum(((row.original_size-row.size_matched)*row.price for row in account.orders if row.side=='BUY'),Decimal(0))
+            inventory=sum((row.size*row.avg_price for row in account.positions),Decimal(0))
+            assert Decimal(state['buy_reserved_usd'])==reserved
+            assert Decimal(state['inventory_cost_usd'])==inventory
+            assert len(state['account_buys'])==len(expected_ids)
+            for row in state['account_buys']:
+                original=next(value for value in account.orders if value.id==row['key'][3])
+                assert row['key'][2]==original.token_id and row['key'][1]==original.condition_id
+        else:
+            assert state['current_exposure_usd'] is None and state['new_capacity_usd'] is None
+            observed=json.loads(child.marker('ci-current-observed.json').read_text())
+            assert not observed['orders_complete'] or not observed['positions_complete']
+        assert child.actual_posts()==0 and not list(child.events.glob('cancel-call-*'))
+        if manual:
+            child.wait('ci-current-history-produced.json')
+            from open_trader.lp_auto_cli import _Client
+            client=_Client(child.base,10);bootstrap=client.request('/api/prediction-arbitrage/venues')
+            market,condition,token=_refill_identity(6)
+            request=dict(market_id=market,condition_id=condition,token_id=token,outcome='YES',price='.40',quantity='20',
+                review_at=(datetime(2026,10,16,12,tzinfo=UTC)+timedelta(hours=4)).isoformat(),idempotency_key='manual-new-token')
+            child.release('post')
+            result=client.request('/api/prediction-arbitrage/lp/orders',request,csrf=bootstrap['csrf_token'])
+            assert result['state']=='entry_open' and result['submit_status']=='accepted',(result,
+                child.marker('ci-current-source-errors.jsonl').read_text() if child.marker('ci-current-source-errors.jsonl').exists() else None,
+                child.marker('ci-manual-frame.json').read_text() if child.marker('ci-manual-frame.json').exists() else None)
+            repeated=client.request('/api/prediction-arbitrage/lp/orders',request,csrf=bootstrap['csrf_token'])
+            assert repeated==result and child.actual_posts()==1
+            # The reliable key can only replay its original immutable result;
+            # altered terms cannot authorize another SDK call.
+            altered=client.request('/api/prediction-arbitrage/lp/orders',dict(request,quantity='21'),csrf=bootstrap['csrf_token'])
+            assert altered==result and child.actual_posts()==1
+            command=PredictionArbitrageStore(child.data_dir).lp_manual_command(WALLET,'manual-new-token')
+            assert command['response']==result and command['command']['quantity']=='20'
+            assert Decimal(command['command']['price'])==Decimal('.40') and command['command']['idempotency_key']=='manual-new-token'
+        child.release('ci-current-scheduler')
+        child.process.terminate();assert child.wait_exit()==0,child.output.read_text();child.assert_owner_available()
+        saved=PredictionArbitrageStore(child.data_dir)
+        assert {sid:saved.lp_actions(sid) for sid in old_actions}==old_actions
+        if restart:
+            child.marker('ci-current-observed.json').unlink()
+            child.launch('automatic-consumer-ci-current-'+mode,expected_running=False);child.wait('ci-current-observed.json')
+            state=child.wait_state(captured)
+            assert state['effective_running'] is False
+            assert child.actual_posts()==0 and not list(child.events.glob('cancel-call-*'))
+            child.process.terminate();assert child.wait_exit()==0;child.assert_owner_available()
+            assert {sid:saved.lp_actions(sid) for sid in old_actions}==old_actions
+
+
+def _assert_current_control_fence(root,fence):
+    """Real manual-config denial or real automatic RUN-to-pause; no fake token."""
+    import json,hashlib,time
+    from datetime import UTC,datetime
+    from tests.lp_d2_service_harness import ServiceChild
+    from tests.test_prediction_service import _production_request,_response
+    from tests.test_lp_order_registration_contract import CONDITION_ID,TOKEN_ID
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    from open_trader.lp_auto_cli import _Client
+    automatic=fence=='pause'
+    scenario='consumer-ci-native-auto-signing-pause' if automatic else 'consumer-ci-native-config-signing'
+    with ServiceChild(root,scenario=scenario) as child:
+        child.release('business');child.release('metadata')
+        if automatic:child.marker('ci-arm').touch()
+        child.start(expected_running=automatic)
+        if not automatic:child.wait('ci-current-completed')
+        client=_Client(child.base,15);boot=client.request('/api/prediction-arbitrage/venues')
+        headers={'Cookie':'; '.join(c.name+'='+c.value for c in client.cookies),'X-CSRF-Token':boot['csrf_token']}
+        def send(path,payload):
+            return _response(_production_request(child.base,path,data=json.dumps(payload).encode(),headers=headers),timeout=12)
+        store=PredictionArbitrageStore(child.data_dir);account=hashlib.sha256(WALLET.encode()).hexdigest()
+        before=child.state();saved=dict(store.lp_load_current_settings(account))
+        assert before['effective_running'] is automatic and before['desired_running'] is automatic
+        assert not before['settings_pending'] and before['control_save_state']=='saved'
+        request=dict(market_id='market-1',condition_id=CONDITION_ID,token_id=TOKEN_ID,outcome='YES',price='.40',quantity='20',
+            review_at=(datetime(2026,10,16,12,tzinfo=UTC)+timedelta(hours=4)).isoformat(),idempotency_key='new-current-fenced-buy')
+        with ThreadPoolExecutor(1) as workers:
+            pending=None
+            if not automatic:
+                child.marker('ci-arm').touch();pending=workers.submit(send,'/api/prediction-arbitrage/lp/orders',request)
+            try:
+                child.wait('ci-native-entered');child.assert_owned()
+                original=json.loads(child.marker('ci-native-identity.json').read_text())
+                signed=json.loads(child.marker('ci-last-sign.json').read_text())
+                assert original['request_id'] and original['batch_id']
+                assert Decimal(original['price'])==Decimal(signed['price']) and Decimal(original['quantity'])==Decimal(signed['size'])
+                assert original['expiration']==signed['expiration'] and original['token_id']==signed['token_id']
+                assert signed['post_only'] is True
+                if automatic:
+                    paused=child.pause()
+                    assert paused['effective_running'] is False and paused['desired_running'] is False
+                    assert paused['round']['cycle_generation']==original['cycle_generation']
+                    assert child.actual_posts()==0 and not child.marker('ci-sdk-ended').exists()
+                else:
+                    identity=store.lp_manual_command(WALLET,'new-current-fenced-buy')['command']
+                    status,denied=send('/api/prediction-arbitrage/lp/auto/config',dict(budget_usd='50',target_buy_count=2,
+                        expected_config_version=before['config_version']))
+                    assert status==400 and denied==dict(status='error',error_type='ValueError',
+                        message='pause_and_finish_automatic_buys_before_configuring'),denied
+                    after=child.state()
+                    for key in ('effective_settings','pending_settings','settings_pending','config_version',
+                            'trading_config_version','effective_running','desired_running'):
+                        assert after[key]==before[key],(key,before,after)
+                    assert after['round']['cycle_generation']==before['round']['cycle_generation']==original['cycle_generation']
+                    assert dict(store.lp_load_current_settings(account))==saved
+                    assert store.lp_manual_command(WALLET,'new-current-fenced-buy')['command']==identity
+                    assert Decimal(signed['price'])==Decimal('.40') and Decimal(signed['size'])==20
+                    assert signed['post_only'] is True and signed['expiration']==identity['expiration']
+                    assert identity['request_id']==original['request_id'] and identity['review_at']==request['review_at']
+                    assert not pending.done() and child.actual_posts()==0
+                assert not child.marker('ci-client-closed').exists()
+                child.release('ci-native')
+                child.wait('ci-buy-completed.json')
+                completed=json.loads(child.marker('ci-buy-completed.json').read_text())
+                assert completed==dict(request_id=original['request_id'],status='not_sent' if automatic else 'accepted',ended=True)
+                if automatic:
+                    assert child.actual_posts()==0
+                    child.wait('ci-current-completed')
+                else:
+                    status,result=pending.result(timeout=5)
+                    assert status==200 and result['state']=='entry_open' and result['submit_status']=='accepted',result
+                    final=store.lp_manual_command(WALLET,'new-current-fenced-buy')
+                    assert final['command']==identity and final['response']==result and final['outcome']=='accepted'
+                    assert child.actual_posts()==1
+                    assert json.loads(child.marker('ci-last-sign.json').read_text())==signed
+                assert not list(child.events.glob('cancel-call-*'))
+                assert json.loads(child.marker('ci-last-sign.json').read_text())==signed
+                assert json.loads(child.marker('ci-native-identity.json').read_text())==original
+                assert len(list(child.events.glob('ci-sign-call-*')))==1
+            finally:
+                child.release('ci-native');child.release('ci-scheduler')
+                if pending is not None:pending.result(timeout=5)
+        child.process.terminate();assert child.wait_exit()==0,child.output.read_text();child.assert_owner_available()
+        assert json.loads(child.marker('ci-stopped.json').read_text())==dict(state='STOPPED',owner=False)
+        assert child.marker('ci-sdk-ended').exists() and child.marker('ci-client-closed').exists()
+        assert child.actual_posts()==(0 if automatic else 1)
 
 
 def _terminate_old(child):
@@ -220,7 +411,7 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
     assert not store.lp_session(sid).get('submit_post_started_at')
     # A still-live owner excludes startup even though this reader has no send lane.
     with pytest.raises(PredictionRuntimeOwnershipError):
-        owner.start()
+        owner.open()
     assert store.lp_actions(sid) == audit
     _terminate_old(child)
     if shape == 'observed-review':
@@ -233,9 +424,9 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         assert session['submit_stage'] == 'preparing' and session['post_started'] is False
         assert audit[0]['submit_stage'] == 'preparing' and audit[0]['post_started'] is False
     owner, store, adapter, account, public = _new_owner(runtime, monkeypatch, tmp_path)
-    owner.start()
+    owner.open()
     try:
-        assert owner.state == 'RUNNING'
+        assert owner.owner_lock.held and owner.admitting.is_set()
         original_plan = deepcopy(owner.execution.lp_auto_state()['active_plan'])
         original_action = next(a for a in original_plan['actions'] if a['kind'] == 'buy')
         original_terms = [(t['token_id'], t['price'], t['quantity']) for t in original_plan['targets']]
@@ -311,9 +502,9 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         orders = account.orders
     finally:
         persist('prepost')
-        owner.stop()
+        owner.close()
     owner, store, adapter, account, _ = _new_owner(runtime, monkeypatch, tmp_path, orders=orders)
-    owner.start()
+    owner.open()
     try:
         _advance(runtime)
         owner.execution.refresh_lp_dashboard_snapshot()
@@ -337,7 +528,9 @@ def test_dead_prepost_owner_recovers_with_fresh_api_and_refills_without_replayin
         assert account.posts == account.cancels == []
     finally:
         persist('prepost')
-        owner.stop()
+        owner.close()
+
+    _assert_current_after_legacy(tmp_path/'actual-current',store,account,public,restart=True)
 
 
 @pytest.mark.parametrize('invalid', ['session-post', 'session-post-time', 'action-unknown',
@@ -375,7 +568,7 @@ def test_restart_covers_dead_buy_only_with_consistent_identity(
             payload={**action, 'token_id': _refill_identity(6)[2] if invalid == 'action-token' else action['token_id'],
                 'submit_stage': None if invalid == 'action-no-stage' else action['submit_stage']})
     audit = deepcopy(store.lp_actions(sid))
-    owner.start()
+    owner.open()
     try:
         _advance(runtime)
         owner.execution.refresh_lp_dashboard_snapshot()
@@ -396,7 +589,9 @@ def test_restart_covers_dead_buy_only_with_consistent_identity(
         assert store.lp_actions(sid) == audit
         assert account.posts == account.cancels == []
     finally:
-        owner.stop()
+        owner.close()
+
+    _assert_current_after_legacy(tmp_path/'actual-current',store,account,RefillPublic(runtime.clock))
 
 
 @pytest.mark.parametrize('invalid', ['incomplete-orders', 'incomplete-positions', 'stale',
@@ -408,7 +603,7 @@ def test_recovered_preparation_still_requires_valid_unchanged_fresh_account_publ
     child, original, _ = dead_preparation
     _terminate_old(child)
     owner, store, adapter, account, _ = _new_owner(runtime, monkeypatch, tmp_path)
-    owner.start()
+    owner.open()
     sid = original['session_id']
     try:
         marker = next(iter(store.lp_session(sid)['submission_owner_exit'].values()))
@@ -456,7 +651,14 @@ def test_recovered_preparation_still_requires_valid_unchanged_fresh_account_publ
         assert state['funds']['status'] == 'unknown'
         assert account.posts == account.cancels == []
     finally:
-        owner.stop()
+        owner.close()
+
+    current_mode='incomplete-orders' if invalid=='incomplete-orders' else 'incomplete-positions' if invalid=='incomplete-positions' else 'foreign' if invalid=='account' else 'known'
+    if invalid in {'stale','generation'}:
+        from tests.test_lp_api_authority_owner_handoff import _assert_current_http_native
+        _assert_current_http_native(tmp_path/'actual-current',kind='manual',phase='signing',invalidity=invalid)
+    else:
+        _assert_current_after_legacy(tmp_path/'actual-current',store,account,RefillPublic(runtime.clock),mode=current_mode)
 
 
 @pytest.mark.parametrize('identity', ['registered-order', 'entry-id', 'owned-ids', 'history'])
@@ -466,7 +668,7 @@ def test_api_added_session_identity_does_not_defeat_owner_ended_coverage(
     child, original, _ = dead_preparation
     _terminate_old(child)
     owner, store, adapter, account, _ = _new_owner(runtime, monkeypatch, tmp_path)
-    owner.start()
+    owner.open()
     sid = original['session_id']
     try:
         assert store.lp_session(sid)['submission_owner_exit']
@@ -515,7 +717,9 @@ def test_api_added_session_identity_does_not_defeat_owner_ended_coverage(
         assert store.lp_actions(sid) == audit
         assert account.posts == account.cancels == []
     finally:
-        owner.stop()
+        owner.close()
+
+    _assert_current_after_legacy(tmp_path/'actual-current',store,account,RefillPublic(runtime.clock))
 
 
 @pytest.mark.parametrize('dead_preparation', ['awaiting-receipt'], indirect=True)
@@ -569,7 +773,7 @@ def test_dead_post_started_sender_with_lagging_preparing_action_is_covered_after
     assert audit[0]['state'] == 'pending' and audit[0]['submit_stage'] == 'preparing'
     assert audit[0]['post_started'] is False
     assert store.lp_session(sid)['post_started'] is True
-    owner.start()
+    owner.open()
     try:
         original_plan = deepcopy(owner.execution.lp_auto_state()['active_plan'])
         _advance(runtime)
@@ -614,7 +818,9 @@ def test_dead_post_started_sender_with_lagging_preparing_action_is_covered_after
             assert len(account.posts) == 1 and store.lp_actions(sid) == audit
     finally:
         persist('awaiting-receipt')
-        owner.stop()
+        owner.close()
+
+    _assert_current_after_legacy(tmp_path/'actual-current',store,account,public,restart=True)
 
 
 @pytest.mark.parametrize('fence, reason', [('pause', 'manually_paused'), ('config', 'config_version_changed')])
@@ -665,7 +871,7 @@ def test_recovery_preserves_new_submission_pause_and_configuration_fences(
     _terminate_old(child)
     owner, store, adapter, account, public = _new_owner(runtime, monkeypatch, tmp_path)
     old_audit = deepcopy(store.lp_actions(original['session_id']))
-    owner.start()
+    owner.open()
     entered, release = Event(), Event()
     try:
         _advance(runtime)
@@ -767,4 +973,6 @@ def test_recovery_preserves_new_submission_pause_and_configuration_fences(
     finally:
         release.set()
         persist('control')
-        owner.stop()
+        owner.close()
+
+    _assert_current_control_fence(tmp_path/'actual-current',fence)

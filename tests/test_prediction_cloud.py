@@ -304,12 +304,19 @@ def test_systemd_identity_and_stop_use_actual_process_listener_and_lock(tmp_path
     import open_trader.prediction_cloud as cloud
     if sys.platform != 'linux':
         pytest.skip('Linux /proc evidence is tested in isolated Docker')
-    import pwd
+    import pwd, grp, fcntl
     from types import SimpleNamespace
     service_user = 'daemon'  # Existing non-root user/group in the read-only dev image.
-    user = SimpleNamespace(pw_uid=os.getuid(),pw_gid=os.getgid())
-    monkeypatch.setattr(pwd,'getpwnam',lambda name:user)
-    monkeypatch.setattr(cloud,'service_user',lambda c:user)  # SETUID is unavailable in dev Docker.
+    actual_user = pwd.getpwnam(service_user)
+    service_uid, service_gid = actual_user.pw_uid, actual_user.pw_gid
+    assert service_uid > 0 and os.geteuid() == 0
+    user = SimpleNamespace(pw_uid=service_uid,pw_gid=service_gid)
+    native_user, native_group = pwd.getpwnam, grp.getgrnam
+    monkeypatch.setattr(pwd,'getpwnam',lambda name:user if name==service_user else native_user(name))
+    monkeypatch.setattr(grp,'getgrnam',lambda name:SimpleNamespace(gr_gid=user.pw_gid) if name==service_user else native_group(name))
+    operation = tmp_path/'root-operation.lock'
+    operation.touch(mode=0o600)
+    monkeypatch.setattr(cloud,'OPERATION_LOCK',operation)
     for parent in (tmp_path, *tmp_path.parents):
         if parent != Path('/tmp') and parent != Path('/'):
             parent.chmod(parent.stat().st_mode | 0o055)
@@ -345,6 +352,49 @@ server.serve_forever()
         subprocess.run(['git','-C',str(release),*args],check=True,capture_output=True)
     sha = subprocess.check_output(['git','-C',str(release),'rev-parse','HEAD'],text=True).strip()
     cfg = CloudConfig(release,runtime,Path(sys.executable),service_user,sha,'','','','','shadow',1)
+    # This is a manager-port component fixture, not a D2 Runtime. Preserve
+    # actual kernel PID/cwd/cmdline/listener/flock while modeling only its
+    # unavailable SETUID account view at the exact fixture paths/PID.
+    native_stat, native_lstat, native_read_text = Path.stat, Path.lstat, Path.read_text
+    native_fstat, native_fchown = os.fstat, os.fchown
+    published_owners = {}
+    def metadata(info, owner):
+        fields={key:getattr(info,key) for key in dir(info) if key.startswith('st_')}
+        fields.update(st_uid=owner[0],st_gid=owner[1])
+        return SimpleNamespace(**fields)
+    def account_view(path, info):
+        if (info.st_dev,info.st_ino) in published_owners:
+            return metadata(info,published_owners[(info.st_dev,info.st_ino)])
+        if path in (runtime,runtime/'config',runtime/'config/prediction_arbitrage.json'):
+            return metadata(info,(service_uid,service_gid))
+        return info
+    def descriptor_owner(fd,uid,gid):
+        # CI drops CHOWN along with SETUID. Model only this writer's actual
+        # temporary record inode; native chmod/replace/fsync still execute.
+        target=Path(os.readlink('/proc/self/fd/'+str(fd)))
+        if (target.parent==runtime and target.name.startswith('.prediction-systemd-release.json.')
+                and target.name.endswith('.tmp')):
+            assert (uid,gid)==(0,service_gid)
+            info=native_fstat(fd)
+            published_owners[(info.st_dev,info.st_ino)]=(uid,gid)
+            return None
+        return native_fchown(fd,uid,gid)
+    def descriptor_stat(fd):
+        info=native_fstat(fd)
+        owner=published_owners.get((info.st_dev,info.st_ino))
+        return metadata(info,owner) if owner is not None else info
+    monkeypatch.setattr(os,'fchown',descriptor_owner)
+    monkeypatch.setattr(os,'fstat',descriptor_stat)
+    monkeypatch.setattr(Path,'stat',lambda path,*a,**kw:account_view(path,native_stat(path,*a,**kw)))
+    monkeypatch.setattr(Path,'lstat',lambda path,*a,**kw:account_view(path,native_lstat(path,*a,**kw)))
+    def process_account(path,*a,**kw):
+        value=native_read_text(path,*a,**kw)
+        if path==Path('/proc')/str(proc.pid)/'status':
+            value='\n'.join('Uid:\t'+'\t'.join([str(service_uid)]*4) if line.startswith('Uid:')
+                else 'Gid:\t'+'\t'.join([str(service_gid)]*4) if line.startswith('Gid:')
+                else line for line in value.splitlines())+'\n'
+        return value
+    monkeypatch.setattr(Path,'read_text',process_account)
     unit = tmp_path/'open-trader-prediction.service';unit.write_text(render_unit(cfg))
     monkeypatch.setattr(cloud,'UNIT_PATH',unit)
     for folder in (runtime, runtime/'config', runtime/'data', runtime/'data/prediction_arbitrage'):
@@ -443,7 +493,13 @@ server.serve_forever()
         command=render_unit(cfg).split('ExecStart=',1)[1].splitlines()[0].split()
         proc=launch()
         wait_ready()
-        cloud.record(cfg,'ready')
+        # The real writer adopts this actual root-held private operation FD;
+        # it atomically publishes root:service 0640 before replacement.
+        with operation.open('r+') as held:
+            fcntl.flock(held.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+            cloud.record(cfg,'ready',operation_fd=held.fileno())
+        assert cfg.record.stat().st_uid==0 and cfg.record.stat().st_gid==service_gid
+        assert cfg.record.stat().st_mode & 0o777==0o640
         assert cloud.operate(cfg,'status')['status']=='RUNNING'
         assert cloud.operate(cfg,'smoke')['status']=='BACKEND_SMOKE_OK'
         cfg = CloudConfig(**{**cfg.__dict__, 'mode':'shadow',
@@ -461,7 +517,7 @@ server.serve_forever()
         wait_ready()
         user.pw_gid=999999
         with pytest.raises(ValueError,match='user/group mismatch'): cloud.operate(cfg,'status')
-        user.pw_gid=os.getgid()
+        user.pw_gid=service_gid
         loaded_version='old-version'
         with pytest.raises(ValueError,match='loaded unit'): cloud.operate(cfg,'stop')
         assert mutations==[]
@@ -483,9 +539,8 @@ server.serve_forever()
         with pytest.raises(ValueError,match='transition record'): cloud.operate(cfg,'status')
         assert cloud.operate(cfg,'stop')['status']=='STOPPED'
         assert cloud.operate(cfg,'status')['status']=='STOPPED'
-        # Path trust has separate filesystem tests; this fixture process runs as
-        # the container user because the dev gate deliberately drops SETUID.
-        monkeypatch.setattr(cloud,'trusted_layout',lambda c:None)
+        # Keep the real strict layout validation for the following Shadow
+        # install/start manager operations too; no trusted-layout success stub.
         assert cloud.operate(cfg,'install')['status']=='INSTALLED_STOPPED'
         assert proc.poll() is not None
         assert cloud.operate(cfg,'start')['status']=='RUNNING'

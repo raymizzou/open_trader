@@ -120,7 +120,10 @@ def test_complete_ranking_trace_matches_issue249_minimum_order_contract(tmp_path
                 assert Decimal(row['estimated_target_capital_usd']) == 10
                 assert Decimal(row['estimated_yield_pct_per_hour']) == (pool * Decimal(81) / (24 * 1616 * 10) * 100).quantize(Decimal('.000001'))
         _assert_level_one_provenance(actual)
+        assert type(actual['preparation']['global_recovery_generation']) is int
+        assert actual['preparation']['global_recovery_generation'] == 1
         legacy = _legacy_strategy_trace(actual)
+        del legacy['preparation']['global_recovery_generation']
         assert _trace_hash(_unchanged_contract(legacy)) == expected['unchanged_contract_sha256'], expected['step']
         assert _trace_hash(legacy) == expected['sha256'], (expected['step'], actual)
 
@@ -134,12 +137,16 @@ def test_full_normal_and_backup_traversal_matches_issue249_minimum_order_contrac
     for field, counts in [('unknown', [1, 1, 1]), ('rejected', [1, 2, 3]), ('backup_read', [0, 6, 12])]:
         assert [step['funnel'][field] for step in trace] == expected[field] == counts
     for step in trace:
+        assert type(step['preparation']['global_recovery_generation']) is int
+        assert step['preparation']['global_recovery_generation'] == 1
         for row in step['candidates']:
             assert Decimal(row['estimated_target_quantity']) == 20
             assert Decimal(row['estimated_target_capital_usd']) == Decimal('6.80')
             assert Decimal(row['estimated_yield_pct_per_hour']) == (Decimal(100) * 81 / (24 * 1616 * Decimal('6.80')) * 100).quantize(Decimal('.000001'))
     _assert_level_one_provenance(trace)
     legacy = _legacy_strategy_trace(trace)
+    for step in legacy:
+        del step['preparation']['global_recovery_generation']
     assert _trace_hash(_unchanged_contract(legacy)) == contract['backfill_unchanged_contract_sha256']
     assert _trace_hash(legacy) == contract['backfill_sha256']
 

@@ -332,6 +332,7 @@ def child(runtime_root,port,scenario,config_path):
             return (CurrentReward(condition_id=CONDITION_ID,rewards_max_spread=10,rewards_min_size=Decimal('1'),
                 rewards_config=(CurrentRewardConfig(id=1,asset_address='0x2791bca1f2de4661ed88a30c99a7a9449aa84174',start_date=now-timedelta(days=1),end_date=now+timedelta(days=1),rate_per_day=Decimal('24')),)),)
         def list_current_rewards(self,*,sponsored):
+            if scenario=='consumer-ci-http-empty':return ()
             if 'optional-hourly' in scenario and threading.current_thread().name=='prediction-lp-history-monitor' and (events/'hourly-first-source-complete').exists() and not sponsored:
                 hold_optional()
             if 'producer-prep-absent' in scenario:
@@ -344,6 +345,11 @@ def child(runtime_root,port,scenario,config_path):
                 hold_optional()
             return self.list_market_rewards(condition_id=CONDITION_ID,sponsored=sponsored) if not sponsored else ()
         def list_markets(self,**kwargs):
+            if scenario.startswith('consumer-ci-metadata-'):
+                from polymarket.models.gamma.market import Market
+                return tuple(Market.parse_response(dict(id=cid[-4:],conditionId=cid,
+                    slug='metadata-349',question='Metadata snapshot',outcomes='["Yes", "No"]',
+                    clobTokenIds='["349001", "349002"]',events=[])) for cid in kwargs.get('condition_ids',()))
             if 'optional-metadata' in scenario:hold_optional()
             if 'producer-prep-metadata' in scenario:
                 try:raise TimeoutError('offline bounded metadata unavailable')
@@ -364,6 +370,34 @@ def child(runtime_root,port,scenario,config_path):
             if token_id==NO_TOKEN_ID and scenario=='reader' and threading.current_thread().name=='lp-reader-source':hold('reader')
             book=super().get_order_book(token_id=token_id)
             return book.model_copy(update={'timestamp':utc_clock(),'bids':(OrderBookLevel(price=Decimal('.39'),size=Decimal('1000')),OrderBookLevel(price=Decimal('.38'),size=Decimal('1000'))),'asks':(OrderBookLevel(price=Decimal('.41'),size=Decimal('1000')),)})
+    if scenario.startswith(('consumer-ci-current-','automatic-consumer-ci-current-')):
+        # Immutable external SDK fixture data for the current counterpart of
+        # the restart cases. Fresh source reads are made by the real Reader.
+        ci_payload=json.loads((events/'ci-current-input.json').read_text())
+        market_model=type(_SDKPublicClient(now).get_market(id='market-1'))
+        ci_markets=tuple(market_model.model_validate(row) for row in ci_payload['markets'])
+        def ci_get_market(public,*,id):
+            return next(row for row in ci_markets if str(row.id)==str(id) or row.condition_id==id)
+        def ci_get_book(public,*,token_id):
+            from polymarket.models.clob.order_book import OrderBook
+            market=next(row for row in ci_markets if token_id in (row.outcomes.yes.token_id,row.outcomes.no.token_id))
+            return OrderBook(market=market.condition_id,asset_id=token_id,timestamp=utc_clock(),
+                bids=(OrderBookLevel(price=Decimal('.39'),size=Decimal('1000')),),
+                asks=(OrderBookLevel(price=Decimal('.41'),size=Decimal('1000')),),
+                min_order_size=Decimal('1'),tick_size=Decimal('.01'),neg_risk=False,hash='actual-current-fixture')
+        Public.get_market=ci_get_market;Public.get_order_book=ci_get_book
+        Public.list_markets=lambda public,**kw:ci_markets
+        def ci_market_rewards(public,*,condition_id,sponsored):
+            # Selected sponsored=True is the provider's COMBINED total, so
+            # its native-only market still repeats the exact native config.
+            assert condition_id in {row.condition_id for row in ci_markets}
+            return (CurrentReward(condition_id=condition_id,rewards_max_spread=10,rewards_min_size=Decimal('20'),
+                rewards_config=(CurrentRewardConfig(id=next(i for i,row in enumerate(ci_markets,1) if row.condition_id==condition_id),
+                    asset_address='0x2791bca1f2de4661ed88a30c99a7a9449aa84174',start_date=now-timedelta(days=1),
+                    end_date=now+timedelta(days=1),rate_per_day=Decimal('24')),)),)
+        Public.list_market_rewards=ci_market_rewards
+        Public.list_current_rewards=lambda public,*,sponsored:() if sponsored else tuple(reward for market in ci_markets
+            for reward in ci_market_rewards(public,condition_id=market.condition_id,sponsored=sponsored))
     import io
     from open_trader.polymarket_trading import PolymarketTradingClient,TradingConfig
     from tests.test_lp_order_registration_contract import _SDKAccountClient
@@ -396,9 +430,38 @@ def child(runtime_root,port,scenario,config_path):
         # Candidate exploration excludes already-participating markets.
         # This current account is truthfully empty; persisted LP PAUSE prevents buys.
         sdk.orders=();sdk.positions=()
+    if scenario=='consumer-ci-independent-cancel':
+        from tests.test_lp_order_registration_contract import _open_order
+        model=type(_open_order('fixture-type','BUY',price='.40',original='20'))
+        sdk.orders=tuple(model.model_validate(row) for row in json.loads((events/'ci-current-orders.json').read_text()))
+        sdk.positions=()
+    if 'ci-http-empty' in scenario:sdk.orders=();sdk.positions=()
+    if scenario=='consumer-ci-http-legacy-manual':
+        from tests.test_lp_order_registration_contract import _open_order
+        sdk.orders=(_open_order('manual-order','BUY',price='.36',original='100',token_id=NO_TOKEN_ID,outcome='NO'),)
+        sdk.positions=()
+    if scenario.startswith(('consumer-ci-current-','automatic-consumer-ci-current-')):
+        from tests.test_lp_order_registration_contract import _open_order
+        from polymarket.models.data.portfolio import Position
+        order_model=type(_open_order('fixture-type','BUY',price='.40',original='20'))
+        sdk.orders=tuple(order_model.model_validate(row) for row in ci_payload['orders'])
+        sdk.positions=tuple(Position.model_validate(row) for row in ci_payload['positions'])
+        if ci_payload['mode']=='incomplete-positions':sdk.positions=None
+        if ci_payload['mode']=='incomplete-orders':sdk.list_open_orders=lambda **kw:None
+        if ci_payload['mode']=='foreign':
+            sdk.orders=tuple(row.model_copy(update={'maker_address':'0x'+'b'*40}) for row in sdk.orders)
     native_cancel=sdk.cancel_orders
     def cancel_orders(**kwargs):
         mark('cancel-call-'+str(len(list(events.glob('cancel-call-*')))+1))
+        if scenario=='consumer-ci-independent-cancel':
+            (events/'ci-exact-cancel-ids.json').write_text(json.dumps(list(kwargs['order_ids'])))
+            mark('ci-cancel-entered');deadline=time.monotonic()+5
+            try:
+                while not (events/'release-ci-cancel').exists():
+                    assert time.monotonic()<deadline,'Independent runtime-owned cancel watchdog'
+                    threading.Event().wait(.01)
+                return native_cancel(**kwargs)
+            finally:mark('ci-cancel-ended')
         return native_cancel(**kwargs)
     sdk.cancel_orders=cancel_orders
     read_balance=sdk.get_balance_allowance
@@ -421,6 +484,10 @@ def child(runtime_root,port,scenario,config_path):
         if scenario=='reader' and threading.current_thread().name=='lp-reader-source':hold('reader')
         return read_balance(**kw)
     sdk.get_balance_allowance=balance
+    if scenario.startswith('consumer-ci-metadata-'):
+        def unavailable_financial_facts(**kwargs):
+            raise OSError('offline account financial facts unavailable')
+        sdk.get_balance_allowance=unavailable_financial_facts
     native_orders=sdk.list_open_orders
     reader_order_calls=[0]
     def current_orders(**kw):
@@ -445,6 +512,12 @@ def child(runtime_root,port,scenario,config_path):
             (events/'public-client-created').write_text(public.fixture_identity)
         return public
     adapter=PolymarketTradingClient(TradingConfig(WALLET,WALLET),sdk,urlopen_fn=public_http,public_client_factory=public_factory)
+    if scenario=='consumer-ci-independent-cancel':
+        native_ci_close=adapter.close
+        def close_ci_adapter():
+            if (events/'ci-cancel-entered').exists():assert (events/'ci-cancel-ended').exists()
+            result=native_ci_close();mark('ci-client-closed');return result
+        adapter.close=close_ci_adapter
     def sign_limit(**kw):
         mark('sdk-sign-entered')
         return dict(kw,order_type='GTC' if kw.get('expiration') is None else 'GTD')
@@ -453,13 +526,57 @@ def child(runtime_root,port,scenario,config_path):
         number=len(list(events.glob('post-call-*')))+1;mark('post-call-'+str(number));hold('post')
         return AcceptedOrder(order_id='child-order-'+str(number),status='live',making_amount=Decimal('0'),taking_amount=Decimal('0'),trade_ids=(),transactions_hashes=())
     sdk.post_order=post
+    if scenario.startswith('consumer-ci-native-'):
+        # New scenario-only external SDK timing. Normal ServiceChild paths
+        # above retain their original native behavior.
+        native_phase='signing' if '-signing' in scenario else 'post'
+        def ci_native_sign(**kw):
+            mark('ci-sign-call-'+str(len(list(events.glob('ci-sign-call-*')))+1))
+            (events/'ci-last-sign.json').write_text(json.dumps(kw,default=str))
+            caller=sys._getframe(1)
+            while caller and caller.f_code.co_name!='_buy_admitted':caller=caller.f_back
+            assert caller is not None
+            actual=caller.f_locals;record=actual['record'];action=actual['action'];token=actual['token']
+            (events/'ci-native-identity.json').write_text(json.dumps(dict(request_id=action.request_id,
+                cycle_generation=token.cycle_generation,batch_id=token.batch_id,round_number=token.round_number,
+                price=str(record.price),quantity=str(record.quantity),expiration=record.expiration,
+                condition_id=record.condition_id,token_id=record.token_id,requested_at=str(record.requested_at))))
+            if native_phase=='signing' and (events/'ci-arm').exists():
+                try:hold('ci-native')
+                finally:mark('ci-sdk-ended')
+                if not any(tag in scenario for tag in ('-config-','-auto-','-stale-','-generation-')):
+                    raise TimeoutError('offline current signing completed without POST')
+            return dict(kw,order_type='GTC' if kw.get('expiration') is None else 'GTD')
+        def ci_native_post(order):
+            number=len(list(events.glob('post-call-*')))+1;mark('post-call-'+str(number))
+            if native_phase=='post' and (events/'ci-arm').exists():
+                try:hold('ci-native')
+                finally:mark('ci-sdk-ended')
+                raise TimeoutError('offline current entered POST receipt unknown')
+            # An actual API order after this successful external POST is
+            # independent complete venue evidence, including explicit matched0.
+            from tests.test_lp_order_registration_contract import _open_order
+            oid='child-order-'+str(number)
+            row=_open_order(oid,'BUY',price=str(order['price']),original=str(order['size']),
+                token_id=order['token_id'],order_type=order['order_type'],expiration=order.get('expiration')).model_copy(update={'created_at':utc_clock()})
+            sdk.orders=(*sdk.orders,row)
+            return AcceptedOrder(order_id=oid,status='live',making_amount=Decimal('0'),taking_amount=Decimal('0'),trade_ids=(),transactions_hashes=())
+        sdk.create_limit_order=ci_native_sign;sdk.post_order=ci_native_post
+        native_ci_adapter_close=adapter.close
+        def ci_native_close():
+            if (events/'ci-native-entered').exists():assert (events/'ci-sdk-ended').exists()
+            result=native_ci_adapter_close();mark('ci-client-closed');return result
+        adapter.close=ci_native_close
     import atexit
     atexit.register(lambda:mark('process-finalizing'))
     if not (root/'data/prediction_arbitrage/prediction_arbitrage.sqlite3').exists():
         store=PredictionArbitrageStore(root/'data')
+        if scenario.startswith('consumer-ci-fence-'):
+            expected_fence=1 if scenario=='consumer-ci-fence-1' else 2
+            assert store.advance_minimum_reader_generation(expected_fence)==expected_fence
         import hashlib
         account=hashlib.sha256(WALLET.encode()).hexdigest()
-        store.lp_save_current_control(dict(account_id=account,process_epoch='seed',request_id='running',request_version=1,desired_running=(scenario.endswith('consumer-nleg-paused-run') or not (scenario.startswith('rollback-current') or scenario.startswith('consumer-'))),requested_at=now,actor=None))
+        store.lp_save_current_control(dict(account_id=account,process_epoch='seed',request_id='running',request_version=1,desired_running=(scenario.startswith('consumer-ci-native-auto-') or scenario.endswith('consumer-nleg-paused-run') or not (scenario.startswith('rollback-current') or scenario.startswith('consumer-'))),requested_at=now,actor=None))
         if not any(name in scenario for name in ('startup-unconfigured','manual-preserved','nleg-paused-run')):
             store.lp_save_current_settings(account,expected_config_version=0,changes=dict(budget_usd='40',target_buy_count=1),actor='offline operator')
         if scenario.endswith('consumer-nleg-paused-run'):
@@ -476,7 +593,7 @@ def child(runtime_root,port,scenario,config_path):
             store.n_leg_acknowledge_incident('nleg-accounting-batch',
                 acknowledgement=dict(actor='test',reconciliation='fresh_clean'))
         if scenario=='consumer-incompatible':store.advance_minimum_reader_generation(2)
-        if scenario=='consumer-reconcile-locked':
+        if scenario=='consumer-reconcile-locked' or scenario.startswith('consumer-ci-metadata-'):
             recovery=store.create_recovery_execution({'reason':'offline unresolved non-LP incident'},idempotency_key='actual-incident-seed')
             store.open_incident(recovery['execution_id'],{'reason':'offline unresolved non-LP incident'})
         if 'stale-report' in scenario:
@@ -545,7 +662,7 @@ def child(runtime_root,port,scenario,config_path):
                     raise sqlite3.OperationalError('actual startup control unavailable')
             if name=='lp-control-save' and sql.startswith('INSERT INTO lp_auto_pool'):
                 failures[0]+=1;mark('control-call-'+str(failures[0]))
-                if scenario!='late_control' and not scenario.startswith('resume-'):
+                if scenario!='late_control' and not scenario.startswith('resume-') and not scenario.startswith('consumer-ci-native-'):
                     mark('control-failure-'+str(failures[0]))
                     raise sqlite3.OperationalError('actual control save failure')
             if (name=='MainThread' or ('rollback-current' in scenario and 'producer-' not in scenario)) and (
@@ -589,6 +706,153 @@ def child(runtime_root,port,scenario,config_path):
         return adapter
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=NativeSQL))))
+        if scenario.startswith('consumer-ci-native-'):
+            from open_trader import prediction_runtime as ci_native_runtime
+            from open_trader.prediction_service import _PredictionHTTPServer
+            ci_http_init=_PredictionHTTPServer.__init__
+            def ci_http_created(server,*args,**kwargs):
+                result=ci_http_init(server,*args,**kwargs)
+                (events/'ci-real-http-server.json').write_text(json.dumps(dict(daemon_threads=server.daemon_threads)))
+                return result
+            patch.setattr(_PredictionHTTPServer,'__init__',ci_http_created)
+            original_start=ci_native_runtime.PredictionRuntime.start
+            original_begin_stop=ci_native_runtime.PredictionRuntime.begin_stop
+            original_ci_stop=ci_native_runtime.PredictionRuntime.stop
+            ci_started_resources=[]
+            def ci_started(runtime):
+                result=original_start(runtime)
+                ci_started_resources.append((runtime.store,runtime.lp))
+                (events/'ci-started.json').write_text(json.dumps(dict(state=runtime.state,owner=runtime.production_owner)))
+                return result
+            def ci_begin_stop(runtime):
+                result=original_begin_stop(runtime)
+                mark('release-ci-scheduler')
+                (events/'ci-normal-stop-context.json').write_text(json.dumps(dict(
+                    fatal_id=runtime.lp_d2.state.snapshot().current.fatal_id,
+                    control_fatal=runtime.lp_d2.control.status().fatal)))
+                (events/'ci-stopping.json').write_text(json.dumps(dict(state=runtime.state,
+                    owner=runtime.production_owner,store_retained=runtime.store is ci_started_resources[0][0],
+                    lp_retained=runtime.lp is ci_started_resources[0][1],
+                    client_retained=runtime._prediction_trading is adapter)))
+                return result
+            def ci_stopped(runtime):
+                result=original_ci_stop(runtime)
+                (events/'ci-stopped.json').write_text(json.dumps(dict(state=runtime.state,owner=runtime.production_owner)))
+                return result
+            patch.setattr(ci_native_runtime.PredictionRuntime,'stop',ci_stopped)
+            patch.setattr(ci_native_runtime.PredictionRuntime,'start',ci_started)
+            patch.setattr(ci_native_runtime.PredictionRuntime,'begin_stop',ci_begin_stop)
+            from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+            ci_run_code=LPD2LiveExecution.run_once.__code__
+            ci_buy_code=LPD2LiveExecution._buy_admitted.__code__
+            def ci_completed_current(frame,event,arg):
+                if event=='return' and frame.f_code is ci_buy_code and arg is not None:
+                    (events/'ci-buy-completed.json').write_text(json.dumps(dict(request_id=arg.identity.request_id,
+                        status=arg.status.value,ended=(events/'ci-sdk-ended').exists())))
+                if (event=='return' and frame.f_code is ci_run_code
+                        and threading.current_thread().name=='prediction-lp-auto'
+                        and frame.f_locals['self'].state.snapshot().observation is not None
+                        and ('-auto-' not in scenario or (events/'ci-native-entered').exists())
+                        and not (events/'ci-current-completed').exists()):
+                    # The actual run has released its native lock. Park only
+                    # this scenario's next scheduler invocation, not its read.
+                    mark('ci-current-completed');hold('ci-scheduler')
+                return ci_completed_current
+            threading.settrace(ci_completed_current)
+            if '-captured-' in scenario:
+                from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+                from open_trader.prediction_service import _PredictionHTTPServer
+                ci_original_submit=PredictionExecutionService.lp_submit_entry
+                ci_original_load=_PredictionHTTPServer.http_load_snapshot
+                def ci_captured_submit(execution,payload):
+                    if payload.get('idempotency_key')=='queued-http-entry':hold('ci-captured')
+                    return ci_original_submit(execution,payload)
+                def ci_actual_load(server):
+                    result=ci_original_load(server)
+                    if (events/'ci-stopping.json').exists():
+                        temp=events/'ci-http-load.new';temp.write_text(json.dumps(result));temp.replace(events/'ci-http-load.json')
+                    return result
+                patch.setattr(PredictionExecutionService,'lp_submit_entry',ci_captured_submit)
+                patch.setattr(_PredictionHTTPServer,'http_load_snapshot',ci_actual_load)
+        if scenario=='consumer-ci-independent-cancel':
+            from open_trader import prediction_runtime as ci_runtime
+            native_ci_start=ci_runtime.PredictionRuntime.start
+            ci_resources=[]
+            def observe_ci_start(runtime):
+                result=native_ci_start(runtime)
+                ci_resources.append((runtime.store,runtime.lp))
+                return result
+            patch.setattr(ci_runtime.PredictionRuntime,'start',observe_ci_start)
+            native_ci_begin_stop=ci_runtime.PredictionRuntime.begin_stop
+            def observe_ci_stop(runtime):
+                result=native_ci_begin_stop(runtime)
+                if (events/'ci-cancel-entered').exists() and not (events/'ci-cancel-ended').exists():
+                    (events/'ci-native-stopping.json').write_text(json.dumps(dict(state=runtime.state,
+                        production_owner=runtime.production_owner,store_retained=runtime.store is ci_resources[0][0],
+                        lp_retained=runtime.lp is ci_resources[0][1],client_retained=runtime._prediction_trading is adapter)))
+                return result
+            patch.setattr(ci_runtime.PredictionRuntime,'begin_stop',observe_ci_stop)
+            from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+            current_run=LPD2LiveExecution.run_once.__code__
+            def exact_current_boundary(frame,event,arg):
+                if (event=='return' and frame.f_code is current_run
+                        and threading.current_thread().name=='prediction-lp-auto'
+                        and not (events/'ci-current-captured').exists()
+                        and len(frame.f_locals['self'].state.snapshot().active_orders)==5):
+                    mark('ci-current-captured');deadline=time.monotonic()+15
+                    while not (events/'release-ci-scheduler').exists():
+                        assert time.monotonic()<deadline,'actual completed current observation watchdog'
+                        threading.Event().wait(.01)
+                return exact_current_boundary
+            threading.settrace(exact_current_boundary)
+        if scenario.startswith(('consumer-ci-current-','automatic-consumer-ci-current-')):
+            from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+            ci_snapshot_run=LPD2LiveExecution.run_once.__code__
+            from open_trader.polymarket_lp import PolymarketLPService
+            ci_history_code=PolymarketLPService.refresh_price_history.__code__
+            ci_port_code=type(adapter.lp_reader_source_port()).read.__code__
+            ci_manual_code=LPD2LiveExecution.manual_entry.__code__
+            def ci_observed_frame(frame,event,arg):
+                if event=='exception' and frame.f_code is ci_port_code:
+                    with (events/'ci-current-source-errors.jsonl').open('a') as out:
+                        out.write(json.dumps(dict(component=frame.f_locals.get('component'),error=repr(arg[1])))+'\n')
+                if event=='return' and frame.f_code is ci_manual_code:
+                    observed=frame.f_locals['self'].state.snapshot().observation
+                    if observed is not None:
+                        (events/'ci-manual-frame.json').write_text(json.dumps({name:dict(complete=value.complete,
+                            error=value.error,value=str(value.value)) for name,value in observed.source_frame.sources.items()}))
+                if event=='return' and frame.f_code is ci_history_code and isinstance(arg,dict) and arg.get('preparation_outcome')=='success':
+                    (events/'ci-current-history-produced.json').write_text(json.dumps(arg,default=str))
+                if (event=='return' and frame.f_code is ci_snapshot_run
+                        and threading.current_thread().name=='prediction-lp-auto'
+                        and not (events/'ci-current-observed.json').exists()):
+                    snapshot=frame.f_locals['self'].state.snapshot()
+                    observation=snapshot.observation
+                    if observation is not None:
+                        raw=observation.source_frame
+                        (events/'ci-current-observed.json').write_text(json.dumps(dict(account=raw.account,
+                            order_ids=[row['order_id'] for row in raw.orders],orders_complete=raw.orders_complete,
+                            positions_complete=raw.positions_complete,sources={name:dict(complete=value.complete,
+                                error=value.error,checked_at=str(value.checked_at)) for name,value in raw.sources.items()})))
+                        hold('ci-current-scheduler')
+                return ci_observed_frame
+            threading.settrace(ci_observed_frame)
+        if scenario.startswith('consumer-ci-fence-'):
+            _install_ci_fence_observers(patch,events,scenario,consumer_observations)
+        if scenario.startswith('consumer-ci-metadata-'):
+            from open_trader import prediction_runtime as runtime_module
+            from tests.test_lp_metadata_async_persistence import _exercise_actual_runtime_metadata_stop
+            native_metadata_start=runtime_module.PredictionRuntime.start
+            def actual_metadata_start(runtime):
+                result=native_metadata_start(runtime)
+                _exercise_actual_runtime_metadata_stop(runtime,adapter,patch,
+                    scenario.endswith('-active'),real_connect)
+                (events/'ci-metadata-observations.json').write_text(json.dumps(dict(
+                    state=runtime.state,production_owner=runtime.production_owner,
+                    active_producers=scenario.endswith('-active'))))
+                mark('ci-metadata-assertions-passed')
+                return result
+            patch.setattr(runtime_module.PredictionRuntime,'start',actual_metadata_start)
         if scenario=='repair-owner-loop-fault':
             import socketserver
             native_select=socketserver._ServerSelector.select
@@ -761,6 +1025,13 @@ def child(runtime_root,port,scenario,config_path):
             patch.setattr(runtime_module.PredictionRuntime,'stop',optional_stopped)
             patch.setattr(PolymarketTradingClient,'close',optional_closed)
             patch.setattr(runtime_module._RuntimeOwnershipLock,'release',optional_released)
+        if scenario.startswith('consumer-ci-http-'):
+            from open_trader import prediction_runtime as ci_http_runtime
+            def forbidden_ci_nleg(*args,**kwargs):
+                mark('unexpected-nleg-construction')
+                raise AssertionError('paused current HTTP must not construct N-leg client or solver')
+            patch.setattr(ci_http_runtime.SolverServerOwner,'__init__',forbidden_ci_nleg)
+            patch.setattr(ci_http_runtime.PredictTradingClient,'from_keychain',forbidden_ci_nleg)
         if scenario.endswith('consumer-nleg-paused-run'):
             from open_trader import prediction_runtime as runtime_module
             def forbidden(*args,**kwargs):
@@ -911,6 +1182,11 @@ def child(runtime_root,port,scenario,config_path):
             '--data-dir',str(root/'data'),'--config',str(config_path),
             '--host','127.0.0.1','--port',str(port),'--release-manifest',str(release_root/'ops/prediction-service-release.json')]
         if launchd:
+            # Model only the guard's Darwin view for these launchd scenarios.
+            # The interpreter and process-global Linux stdlib remain real.
+            if sys.platform.startswith('linux'):
+                from types import SimpleNamespace
+                patch.setattr(prediction_start_guard,'sys',SimpleNamespace(**{**vars(sys),'platform':'darwin'}))
             import plistlib
             launchd_plist.write_bytes(plistlib.dumps(dict(Label='com.open-trader.prediction-service',
                 WorkingDirectory=str(Path.cwd()),ProgramArguments=launchd_args,
@@ -943,6 +1219,26 @@ def child(runtime_root,port,scenario,config_path):
             if launchd and isinstance(command,list) and command[:2]==['/bin/ps','-p']:
                 import shlex
                 return subprocess.CompletedProcess(command,0,f'{os.getpid()} {os.getuid()} '+shlex.join(launchd_args)+'\n','')
+            if (launchd and sys.platform.startswith('linux') and isinstance(command,list)
+                    and command==['/usr/sbin/lsof','-Fpn','--',str(root/'data/prediction_arbitrage/runtime.lock')]):
+                # Translate actual Linux kernel ownership to the modeled lsof
+                # format; never supply a canned owner for a free/wrong file.
+                path=Path(command[-1]);info=path.stat();holders=set()
+                for line in Path('/proc/locks').read_text().splitlines():
+                    fields=line.split()
+                    if len(fields)>5 and fields[1]=='FLOCK' and fields[3]=='WRITE':
+                        major,minor,inode=fields[5].split(':')
+                        if (int(inode)==info.st_ino and int(major,16)==os.major(info.st_dev)
+                                and int(minor,16)==os.minor(info.st_dev)):
+                            holders.add(int(fields[4]))
+                if holders!={os.getpid()}:return subprocess.CompletedProcess(command,1,'','no exact self flock')
+                descriptor=os.open(path,os.O_RDWR|os.O_NOFOLLOW)
+                try:
+                    try:fcntl.flock(descriptor,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    except BlockingIOError:pass
+                    else:raise AssertionError('kernel owner must exclude an independent descriptor')
+                finally:os.close(descriptor)
+                return subprocess.CompletedProcess(command,0,f'p{os.getpid()}\nn{path}\n','')
             if launchd and isinstance(command,list) and command[0]=='/usr/sbin/lsof' and 'cwd' in command:
                 return subprocess.CompletedProcess(command,0,f'p{os.getpid()}\nfcwd\nn{Path.cwd()}\n','')
             if (isinstance(command,list) and len(command)>2
@@ -1012,6 +1308,62 @@ def child(runtime_root,port,scenario,config_path):
         result=serve_prediction_service(data_dir=root/'data',prediction_config_path=config_path,host='127.0.0.1',port=port,mode='production',release_manifest_path=release_root/'ops/prediction-service-release.json',lp_clock=business_clock,lp_utc_now=utc_clock)
         raise SystemExit(result)
 
+
+
+def _install_ci_fence_observers(patch,events,scenario,observations):
+    """Call through real fence/observer/lifecycle ports in only CI fence children."""
+    import asyncio,json
+    from open_trader import prediction_runtime as module
+    from open_trader.polymarket_monitor import PolymarketMonitor
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    names=[];observations['events']=names
+    def save():(events/'ci-fence-observations.json').write_text(json.dumps(observations))
+    native_generation=module.read_minimum_reader_generation
+    def generation(*args,**kwargs):
+        result=native_generation(*args,**kwargs);names.append('fence.read');return result
+    patch.setattr(module,'read_minimum_reader_generation',generation)
+    class Stream:
+        async def __anext__(self):await asyncio.Future()
+        async def close(self):pass
+    class Public:
+        async def list_events(self,**kwargs):return []
+        async def get_order_books(self,**kwargs):return []
+        async def subscribe(self,*args,**kwargs):return Stream()
+        async def close(self):pass
+    native_monitor=PolymarketMonitor.__init__
+    def monitor(instance,*args,**kwargs):
+        return native_monitor(instance,*args,**(kwargs|dict(public_client_factory=Public)))
+    patch.setattr(PolymarketMonitor,'__init__',monitor)
+    def observe_setter(name,label):
+        native=getattr(PolymarketMonitor,name)
+        def setter(instance,*args,**kwargs):
+            result=native(instance,*args,**kwargs);names.append(label);return result
+        patch.setattr(PolymarketMonitor,name,setter)
+    for kind in ('ready','observation','auto_eat','failure'):
+        observe_setter('set_'+kind+'_observer',kind+'.bind')
+    native_store=PredictionArbitrageStore.__init__
+    def store(instance,*args,**kwargs):
+        observations['writable_store_constructed']=True
+        return native_store(instance,*args,**kwargs)
+    patch.setattr(PredictionArbitrageStore,'__init__',store)
+    native_start=module.PredictionRuntime.start
+    def start(runtime):
+        try:
+            result=native_start(runtime)
+            observations.update(state=runtime.state,production_owner=runtime.production_owner,
+                legacy_retired=runtime.legacy_retired,reader_generation=runtime._reader_generation,
+                n_leg_paused=runtime.n_leg_paused)
+            save();return result
+        except Exception as exc:
+            observations.update(state=runtime.state,production_owner=runtime.production_owner,
+                error_type=type(exc).__name__,error=str(exc))
+            save();raise
+    patch.setattr(module.PredictionRuntime,'start',start)
+    native_stop=module.PredictionRuntime.stop
+    def stop(runtime):
+        result=native_stop(runtime)
+        observations['after_stop']=runtime.state;save();return result
+    patch.setattr(module.PredictionRuntime,'stop',stop)
 
 def offline_github_fixture(release,scratch):
     """Controlled external GitHub data, checked by the unchanged real verifier.

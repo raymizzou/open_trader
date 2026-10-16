@@ -460,27 +460,41 @@ def test_completed_background_save_restores_original_ttl_after_restart(
 def test_runtime_stop_retains_owner_until_actual_metadata_writer_exit(
     tmp_path, monkeypatch, active_producers, request,
 ):
+    import json, shutil, subprocess
+    from tests.lp_d2_service_harness import ServiceChild
+    class MetadataChild(ServiceChild):
+        def launch(self,scenario,*,expected_running=None):
+            # Only this scenario copies its assertion helper into the actual
+            # selected clean release before the real producer/verifier runs.
+            shutil.copyfile(Path(__file__),self.release_root/'tests'/Path(__file__).name)
+            for args in (['add','tests/'+Path(__file__).name],
+                ['-c','user.name=CI metadata fixture','-c','user.email=fixture@invalid','commit','-qm','actual metadata assertion helper']):
+                subprocess.run(['git','-C',str(self.release_root),*args],check=True,capture_output=True)
+            self.sha=subprocess.check_output(['git','-C',str(self.release_root),'rev-parse','HEAD'],text=True).strip()
+            return super().launch(scenario,expected_running=expected_running)
+    scenario='consumer-ci-metadata-active' if active_producers else 'consumer-ci-metadata-idle'
+    with MetadataChild(tmp_path,scenario=scenario) as child:
+        child.release('metadata');child.start(expected_running=None)
+        child.wait('ci-metadata-assertions-passed')
+        assert child.wait_exit()==78,child.output.read_text()
+        result=json.loads(child.marker('ci-metadata-observations.json').read_text())
+        assert result['state']=='STOPPED' and result['production_owner'] is False
+        assert result['active_producers'] is active_producers
+        assert child.actual_posts()==0
+        child.assert_owner_available()
+
+
+def _exercise_actual_runtime_metadata_stop(runtime, adapter, monkeypatch, active_producers, real_connect):
+    """Original writer/producer/native assertions against the actual claimed Runtime."""
     import asyncio
     from types import SimpleNamespace
     from open_trader import prediction_runtime as runtime_module
     from open_trader.polymarket_monitor import PolymarketMonitor
     from open_trader.predict_cross_venue import PredictCrossVenueMonitor
-
-    # The credential/config factory supplies a real adapter with offline SDK
-    # boundaries. Real runtime startup owns and attaches the real Store.
-    adapter = _adapter(None, monkeypatch)
-    monkeypatch.setattr(runtime_module, "load_trading_config", lambda path: adapter.config)
-    monkeypatch.setattr(runtime_module, "PolymarketTradingClient",
-                        SimpleNamespace(from_keychain=lambda config: adapter))
-    runtime = runtime_module.PredictionRuntime(
-        data_dir=tmp_path, prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8766/", n_leg_paused=True,
-        enable_n_leg_background=False,
-    )
-    request.addfinalizer(runtime.stop)
-    runtime.start()
-    # Missing account SDK facts keep startup NOT_READY. The original variant
-    # has no monitor loops; the active variant composes real producers below.
+    # Unavailable financial facts remain independently unavailable. A genuine
+    # unrelated persisted incident supplies the NOT_READY trigger.
+    with pytest.raises(OSError,match='offline account financial facts unavailable'):
+        adapter.lp_reader_source_port().read('balance',SimpleNamespace(account=adapter.config.wallet_address))
     assert runtime.state == "NOT_READY"
     assert runtime.production_owner is True
     store = runtime.store
@@ -531,12 +545,10 @@ def test_runtime_stop_retains_owner_until_actual_metadata_writer_exit(
         monitor_trading = PolymarketTradingClient(
             adapter.config, client=object(), urlopen_fn=offline_http,
         )
-        request.addfinalizer(monitor_trading.close)
         monitor = PolymarketMonitor(
             store=store, trading=monitor_trading,
             public_client_factory=OfflineMonitorPublic,
         )
-        request.addfinalizer(monitor.stop)
         monitor.set_cross_venue_tokens(("offline-monitor-token",))
         runtime.monitor = monitor
         monitor.start()
@@ -547,7 +559,6 @@ def test_runtime_stop_retains_owner_until_actual_metadata_writer_exit(
             validator=object(), gamma_lookup=lambda *args, **kwargs: (),
         )
         cross = runtime_module._CrossVenueRuntime(cross_monitor)
-        request.addfinalizer(cross.stop)
         runtime._cross_runtime = cross
         cross.start()
         assert source_started.wait(2), "real cross producer did not begin offline I/O"
@@ -556,7 +567,6 @@ def test_runtime_stop_retains_owner_until_actual_metadata_writer_exit(
     _prime(adapter)
     inflight_id, pending_id = "0x" + "a" * 64, "0x" + "b" * 64
     at_commit, release_commit = threading.Event(), threading.Event()
-    real_connect = sqlite3.connect
 
     class CommitGate(sqlite3.Connection):
         metadata_write = False
