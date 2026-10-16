@@ -1,4 +1,5 @@
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
 
@@ -207,3 +208,116 @@ def test_resume_restarts_unknown_timer_at_first_new_observation():
     assert current.snapshot().unknown_yield_due == ()
     clock.value = 1500
     assert current.snapshot().unknown_yield_due == (KEY,)
+
+
+
+def test_rejected_order_terms_cannot_clear_unknown_yield_timer():
+    clock = Clock(100)
+    current = state(clock)
+    observe(current, yields={'O1': None})
+    original_yield = current.snapshot().yields[KEY]
+    clock.value = 600
+    source = frame([order(matched='0'), order('O2', matched='0')], checked_at=T - timedelta(seconds=1))
+    prepared = calculation(source, {'O1': D('0'), 'O2': D('0.10')}, capacity=D('11'))
+    ticket = current.begin_observation('opaque-generation', tuple(source.sources))
+    result = current.accept(ticket, source, prepared, evaluated_at=T)
+    snapshot = current.snapshot()
+    retained = next(o for o in snapshot.orders if o.key == KEY)
+    assert retained.size_matched.value == D('3')
+    assert retained.source.checked_at == T
+    assert snapshot.yields[KEY].yield_pct_per_hour.state == 'unknown'
+    assert snapshot.yields[KEY].unknown_since_monotonic == 100
+    assert snapshot.yields[KEY].unknown_deadline_monotonic == 700
+    assert snapshot.yields[KEY] == original_yield
+    independent = snapshot.yields[('A', 'M', 'TOKEN', 'O2')]
+    assert independent.yield_pct_per_hour.state == 'known'
+    assert independent.yield_pct_per_hour.value == D('0.10')
+    assert snapshot.buy_reserved.state == 'unknown'
+    assert snapshot.buy_reserved.value is None
+    assert snapshot.new_capacity.state == 'unknown'
+    assert snapshot.new_capacity.value is None
+    assert result.observation.source_frame is source
+    assert result.observation.calculation is prepared
+    assert source.orders[0]['size_matched'] == '0'
+    assert prepared.yields['O1'] == D('0')
+    assert prepared.buy_reserved == D('8.00')
+
+
+def test_terminal_order_list_echo_cannot_restore_calculated_reservation():
+    current = state()
+    source = frame()
+    observe(current, source)
+    stamp = cs.SourceStamp('exact-terminal', checked_at=T, complete=True, state='known')
+    proof = cs.TerminalProof(KEY, 'CANCELED', cs.Fact('known', D('10'), (stamp,)),
+        cs.Fact('known', D('3'), (stamp,)), stamp, True)
+    receipt = cs.ReceiptEvidence('terminal', 'cancel-O1', 'A', 'process',
+        'opaque-generation', KEY, 'BUY', 1, terminal_proof=proof)
+    assert current.accept_receipt_evidence(receipt) == 'applied'
+    assert current.snapshot().buy_reserved.value == D('0')
+    prepared = calculation(source, {'O1': D('0')}, capacity=D('17.20'))
+    ticket = current.begin_observation('opaque-generation', tuple(source.sources))
+    result = current.accept(ticket, source, prepared, evaluated_at=T)
+    snapshot = current.snapshot()
+    assert snapshot.active_orders == ()
+    assert snapshot.orders[0].terminal_proof is proof
+    assert snapshot.orders[0].source == stamp
+    assert snapshot.buy_reserved.state == 'unknown'
+    assert snapshot.buy_reserved.value is None
+    assert snapshot.new_capacity.state == 'unknown'
+    assert snapshot.new_capacity.value is None
+    assert KEY not in snapshot.yields
+    assert snapshot.unknown_yield_due == ()
+    assert result.observation.source_frame is source
+    assert result.observation.calculation is prepared
+    assert source.orders[0]['status'] == 'LIVE'
+    assert prepared.buy_reserved == D('2.80')
+    assert prepared.new_capacity == D('17.20')
+
+
+def test_late_exit_receipt_cannot_regress_completed_native_state():
+    current = state()
+    sell_row = {**order('SELL1', matched='1', side='SELL'), 'original_size': '2'}
+    observe(current, frame([sell_row]), yields={})
+    sell_key = ('A', 'M', 'TOKEN', 'SELL1')
+    scope = ('A', 'M', 'TOKEN', 'opening')
+    stamp = cs.SourceStamp('exact-sell', checked_at=T, complete=True, state='known')
+    known = lambda value: cs.Fact('known', value, (stamp,))
+    fill = cs.OwnFillEvidence(sell_key, known(D('1')), known(D('0.40')), known(D('0.01')),
+        ('fill-1',), stamp, False)
+    attempt = cs.ExitAttempt('sell-request', 'passive_exit', sell_key, 'accepted', False,
+        known(D('2')), known(D('0')), known(D('2')), known(D('0.40')), known('GTC'),
+        known(None), None, fill, 'ended')
+    sell = cs.SellState(scope, known(D('2')), known(D('1.00')), True,
+        current.snapshot().orders, stamp, stamp, attempt, None)
+    guard = cs.ProtectionGuard(scope, 'opaque-generation', 0, ((sell_key, 1),),
+        current.snapshot().observation.observation_id, 'exit-created')
+    assert current.apply_protection(cs.ExitEvidenceUpdate(guard, sell)) == 'applied'
+    old_attempt = replace(attempt, native_state='running', own_fill_evidence=None)
+    old_guard = replace(guard, expected_scope_version=1, event_id='guarded-old-status')
+    assert current.apply_protection(cs.ExitEvidenceUpdate(old_guard, replace(sell, passive=old_attempt))) == 'invalid_identity'
+    receipt = cs.ReceiptEvidence('late-native-running', 'sell-request', 'A', 'process', 'old-cycle',
+        sell_key, 'SELL', 1, exit_attempt=old_attempt, scope=scope)
+    assert current.accept_receipt_evidence(receipt) == 'stale_evidence'
+    snapshot = current.snapshot()
+    assert snapshot.sells[scope].passive == attempt
+    assert snapshot.sells[scope].passive.own_fill_evidence == fill
+    assert snapshot.sells[scope].protected is None
+    wrong_terms = replace(receipt, event_id='wrong-price', exit_attempt=replace(attempt, price=known(D('0.50'))))
+    assert current.accept_receipt_evidence(wrong_terms) == 'identity_error'
+    # Actual forward terminal/fill evidence is still admitted for this same request.
+    final_fill = replace(fill, quantity=known(D('2')), notional_usd=known(D('0.80')),
+        fees_usd=known(D('0.02')), fill_ids=('fill-1', 'fill-2'), complete_for_target=True)
+    proof = cs.TerminalProof(sell_key, 'FILLED', known(D('2')), known(D('2')), stamp, True)
+    final_attempt = replace(attempt, state='terminal', own_fill_evidence=final_fill)
+    forward = replace(receipt, event_id='actual-terminal', terminal_proof=proof,
+        own_fill=final_fill, exit_attempt=final_attempt)
+    assert current.accept_receipt_evidence(forward) == 'applied'
+    final = current.snapshot()
+    assert final.sells[scope].passive == final_attempt
+    assert final.orders[0].terminal_proof == proof
+    assert final.own_fills[sell_key] == final_fill
+    late = replace(receipt, event_id='late-pre-terminal', exit_attempt=replace(attempt, own_fill_evidence=None))
+    assert current.accept_receipt_evidence(late) == 'stale_evidence'
+    assert current.snapshot().sells[scope].passive == final_attempt
+    assert current.snapshot().orders[0].terminal_proof == proof
+    assert current.snapshot().own_fills[sell_key] == final_fill

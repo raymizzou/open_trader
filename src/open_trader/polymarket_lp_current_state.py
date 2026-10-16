@@ -675,6 +675,7 @@ class CurrentLPState:
             orders_complete = source_frame.orders_complete and os.state == 'known' and os.complete
             positions_complete = source_frame.positions_complete and ps.state == 'known' and ps.complete
             orders = {}
+            rejected_order_inputs = set()
             for row in source_frame.orders:
                 key = (self.account_id, row['condition_id'], row['token_id'], row['order_id'])
                 original = _decimal(row.get('original_size', row.get('quantity')))
@@ -706,8 +707,10 @@ class CurrentLPState:
                         order.order_type.value, order.expiration.value)
                     if previous.terminal_proof is not None:
                         # Exact terminal evidence cannot be undone by an eventual-consistency list.
+                        rejected_order_inputs.add(key)
                         order = previous
                     elif previous.source.checked_at and os.checked_at and os.checked_at < previous.source.checked_at:
+                        rejected_order_inputs.add(key)
                         order = previous
                         orders_complete = False
                     else:
@@ -736,8 +739,13 @@ class CurrentLPState:
             for k, o in orders.items():
                 if o.side != 'BUY' or o.terminal_proof is not None or o.presence == 'absent' or o.remaining.value == 0:
                     continue
-                value = _fact(_decimal(calculation.yields.get(k[3])) if o.presence == 'present' else None, *yield_sources)
                 previous = self._yields.get(k)
+                if k in rejected_order_inputs:
+                    # The prepared result belongs to the rejected row, not the retained facts.
+                    if previous is not None:
+                        yields[k] = previous
+                    continue
+                value = _fact(_decimal(calculation.yields.get(k[3])) if o.presence == 'present' else None, *yield_sources)
                 since = since_at = None
                 if value.state != 'known':
                     since = previous.unknown_since_monotonic if previous else None
@@ -747,10 +755,11 @@ class CurrentLPState:
                 yields[k] = BuyYieldState(k, value, yield_sources, evaluated_at, ticket.cycle_generation, since, since_at,
                     previous.current_risk_request_id if previous else None)
             self._yields = yields
-            self._reserved = _fact(calculation.buy_reserved if orders_complete else None, os)
+            calculation_orders_valid = orders_complete and not rejected_order_inputs
+            self._reserved = _fact(calculation.buy_reserved if calculation_orders_valid else None, os)
             self._inventory = _fact(calculation.inventory_cost if positions_complete else None, ps)
             balance = stamps.get('balance', SourceStamp(''))
-            self._capacity = _fact(calculation.new_capacity if orders_complete and positions_complete
+            self._capacity = _fact(calculation.new_capacity if calculation_orders_valid and positions_complete
                 and balance.state == 'known' and balance.complete else None, *stamps.values())
             self._snapshot_version += 1
             view = CurrentOrderView(self.account_id, self.process_epoch, ticket.cycle_generation,
@@ -764,7 +773,7 @@ class CurrentLPState:
                 if pair[0].read_sequence > ticket.read_sequence}
             self._accepted_sequence = ticket.read_sequence
             self._observation = observation
-            partial = (not orders_complete or not positions_complete
+            partial = (not calculation_orders_valid or not positions_complete
                 or any(s.state != 'known' or not s.complete for s in stamps.values()))
             return Acceptance('partial' if partial else 'accepted', observation)
 
@@ -884,19 +893,61 @@ class CurrentLPState:
                         if (attempt.submit_quantity.state == 'known' and attempt.submit_residual_quantity.state == 'known'
                                 and not 0 <= attempt.submit_quantity.value <= attempt.submit_residual_quantity.value):
                             return 'invalid_identity'
-                        if old and old.request_id == attempt.request_id and (old.order_type != attempt.order_type
-                                or old.expiration != attempt.expiration
-                                or old.submit_quantity != attempt.submit_quantity or old.price != attempt.price
-                                or (old.native_state == 'ended' and attempt.native_state != 'ended')):
+                        same_request = old if old and old.request_id == attempt.request_id else None
+                        result, attempt = self._merge_exit_attempt(same_request, attempt)
+                        if result != 'applied':
                             return 'invalid_identity'
-                        own = attempt.own_fill_evidence
-                        if own and (own.order_key != attempt.order_key or not own.fill_ids):
-                            return 'invalid_identity'
+                        sell = replace(sell, **{name: attempt})
                 self._sells[g.scope] = sell
             self._scope_versions[g.scope] = version
             self._protection_events.add((g.scope, g.event_id))
             self._snapshot_version += 1
             return 'applied'
+
+    def _merge_exit_attempt(self, previous: ExitAttempt | None,
+                            attempt: ExitAttempt) -> tuple[str, ExitAttempt]:
+        """Keep exact request terms and actual completion monotonic on both paths."""
+        native_rank = {'pending': 0, 'running': 1, 'ended': 2}
+        if (attempt.kind not in ('passive_exit', 'protected_exit')
+                or attempt.native_state not in native_rank
+                or attempt.state not in ('pending', 'unknown', 'accepted_without_order_id', 'accepted', 'rejected', 'terminal')):
+            return 'identity_error', attempt
+        if previous is not None:
+            immutable = ('request_id', 'kind', 'submit_quantity', 'submit_sold_quantity',
+                'submit_residual_quantity', 'price', 'order_type', 'expiration')
+            if any(getattr(previous, name) != getattr(attempt, name) for name in immutable):
+                return 'identity_error', attempt
+            if previous.order_key is not None and attempt.order_key != previous.order_key:
+                return 'identity_error', attempt
+            if (native_rank[attempt.native_state] < native_rank[previous.native_state]
+                    or (previous.state in ('terminal', 'rejected') and attempt.state != previous.state)
+                    or (previous.state in ('accepted', 'accepted_without_order_id')
+                        and attempt.state in ('pending', 'unknown', 'rejected'))
+                    or (previous.state == 'accepted' and attempt.state == 'accepted_without_order_id')):
+                return 'stale_evidence', attempt
+        own = attempt.own_fill_evidence
+        old_own = previous.own_fill_evidence if previous else None
+        if own is not None:
+            if (own.order_key != attempt.order_key or not own.fill_ids
+                    or len(set(own.fill_ids)) != len(own.fill_ids)
+                    or (own.quantity.state == 'known' and (own.quantity.value is None or own.quantity.value < 0))):
+                return 'identity_error', attempt
+            if old_own is not None:
+                if (not set(old_own.fill_ids) <= set(own.fill_ids)
+                        or (old_own.quantity.state == own.quantity.state == 'known'
+                            and own.quantity.value < old_own.quantity.value)):
+                    return 'stale_evidence', attempt
+                # Sparse forward evidence cannot erase already proven fill amounts.
+                retained = {name: getattr(old_own, name) for name in ('quantity', 'notional_usd', 'fees_usd')
+                    if getattr(old_own, name).state == 'known' and getattr(own, name).state != 'known'}
+                own = replace(own, **retained,
+                    complete_for_target=own.complete_for_target or old_own.complete_for_target)
+        elif old_own is not None:
+            own = old_own
+        attempt = replace(attempt, own_fill_evidence=own)
+        if previous and previous.cancel_request_id and attempt.cancel_request_id is None:
+            attempt = replace(attempt, cancel_request_id=previous.cancel_request_id)
+        return 'applied', attempt
 
     def _valid_scoring(self, scoring, scope, guard):
         if scoring.order_key is None:
@@ -996,6 +1047,13 @@ class CurrentLPState:
                         or attempt.order_key != evidence.order_key or attempt.submit_quantity != previous.submit_quantity
                         or attempt.order_type != previous.order_type or attempt.expiration != previous.expiration):
                     return 'identity_error'
+                if own is not None:
+                    if attempt.own_fill_evidence is not None and attempt.own_fill_evidence != own:
+                        return 'identity_error'
+                    attempt = replace(attempt, own_fill_evidence=own)
+                result, attempt = self._merge_exit_attempt(previous, attempt)
+                if result != 'applied':
+                    return result
             if proof is None and own is None and incoming is None and target is None and attempt is None:
                 return 'identity_error'
             if proof is not None:
