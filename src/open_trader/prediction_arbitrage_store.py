@@ -5067,6 +5067,7 @@ class PredictionArbitrageStore:
         payload: Mapping[str, object],
         *,
         expected_generation: int | None = None,
+        initialize_global_fence: bool = False,
     ) -> dict[str, object] | None:
         """Persist one preparation snapshot with an optional cycle guard.
 
@@ -5074,7 +5075,9 @@ class PredictionArbitrageStore:
         keep that generation; a stale worker cannot overwrite a newer cycle.
         """
 
-        encoded = _dump_payload(payload)
+        if type(initialize_global_fence) is not bool:
+            raise ValueError('initialize_global_fence_invalid')
+        proposed = dict(payload)
         requested_generation = payload.get("generation")
         if type(requested_generation) is not int or requested_generation < 1:
             requested_generation = 1
@@ -5087,6 +5090,9 @@ class PredictionArbitrageStore:
                 if expected_generation is not None:
                     return None
                 generation = requested_generation
+                if initialize_global_fence and 'global_recovery_generation' not in proposed:
+                    proposed['global_recovery_generation'] = generation
+                encoded = _dump_payload(proposed)
                 connection.execute(
                     "INSERT INTO lp_preparation(singleton,generation,payload,updated_at) VALUES (1,?,?,?)",
                     (generation, encoded, updated_at),
@@ -5101,6 +5107,15 @@ class PredictionArbitrageStore:
                     saved["generation"] = current_generation
                     return saved
                 generation = requested_generation
+                if initialize_global_fence:
+                    stored = _load_payload(str(current['payload']))
+                    if 'global_recovery_generation' in stored:
+                        # Progress cannot replace a real recovery floor, or
+                        # repair an explicitly malformed floor by guessing.
+                        proposed['global_recovery_generation'] = stored['global_recovery_generation']
+                    elif 'global_recovery_generation' not in proposed:
+                        proposed['global_recovery_generation'] = generation
+                encoded = _dump_payload(proposed)
                 connection.execute(
                     "UPDATE lp_preparation SET generation=?,payload=?,updated_at=? WHERE singleton=1",
                     (generation, encoded, updated_at),

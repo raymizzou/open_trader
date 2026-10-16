@@ -128,6 +128,36 @@ Cloud deployment must use the cloud readiness and Smoke gates on both machines.
 The wrapper never auto-stops, auto-rolls back, starts a missing check, or submits
 orders beyond the explicitly selected existing install/start action.
 
+## Prediction D2 target binding
+
+Prediction production managers additionally require the tracked, closed
+`ops/lp-runtime-contract.json` capability. The three-key reader manifest stays
+unchanged. Capability alone, old READY evidence and caller-supplied JSON do not
+authorize a start. The manager captures the actual preflight result internally
+and binds its exact source SHA, selected interpreter/runtime report, lock and
+capability digests, CI run/attempt and artifact identities to an operation nonce
+in the existing management record. One prospective binding may be forwarded;
+installers receive its opaque nonce, not a replacement proof.
+
+The binding also fixes the canonical selected config path and its SHA-256.
+Managers recheck the actual bytes and file metadata under the existing operation
+lock before promotion, stop, arm and claim. Systemd uses its strict nested
+config; launchd supports its nested default or an explicitly selected same-user
+private sibling config. A changed selection or mismatched forwarded nonce
+fails closed. A new explicit operator operation can select valid current config
+with a new nonce while independently rechecking retained unchanged source/runtime
+evidence. It cannot reinterpret a mismatched forwarded operation.
+
+A previously validated compatible D2 rollback may reuse its retained CI binding
+after checking the actual unchanged local release, capability, interpreter and
+lock, plus fresh process/listener/owner absence. This does not depend on expired
+forward artifacts and does not rerun backend tests. Missing trusted retained
+evidence requires fresh trusted verification or rejection. D1/old unsupported
+targets are rejected before stopping or arming; a first D2 release with no
+validated compatible predecessor requires stop and fix-forward. There is no
+automatic rollback or request-history reconstruction. Current API facts and
+reliable pause still govern after an authorized rollback.
+
 ## Rollback
 
 The low-level installers remain available for the existing, explicitly authorized

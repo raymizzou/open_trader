@@ -199,8 +199,9 @@ class _ManualContext:
 
 
 class _ControlStore:
-    def __init__(self, store, account_id):
+    def __init__(self, store, account_id, settings_loader=None):
         self.store = store
+        self.settings_loader = settings_loader
         self.account_id = account_id
         # The legacy pool persists a normalized wallet hash. Current API facts
         # and the state owner retain the wallet itself as their account identity.
@@ -212,6 +213,8 @@ class _ControlStore:
         saved = dict(self.store.lp_load_current_control(self.pool_account_id))
         if saved['account_id'] != self.pool_account_id:
             raise ValueError('d2_control_pool_identity')
+        if self.settings_loader is not None:
+            self.settings_loader()
         return StoredControl(**{**saved, 'account_id': self.account_id})
 
     def save(self, write):
@@ -234,7 +237,7 @@ class _StandaloneMutationLease:
 class LPD2LiveExecution:
     def __init__(self, store, trading, *, account_id, venue, process_epoch, policy,
                  reader=None, writer=None, clock=time.monotonic,
-                 utc_now=lambda: datetime.now(UTC)):
+                 utc_now=lambda: datetime.now(UTC), load_settings_on_start=False):
         if (venue != 'polymarket' or type(account_id) is not str or not account_id
                 or account_id != trading.config.wallet_address
                 or type(process_epoch) is not str or not process_epoch):
@@ -247,7 +250,7 @@ class LPD2LiveExecution:
         self.writer = writer if writer is not None else LPBusinessWriter(store)
         self.state = CurrentLPState(account_id, process_epoch, clock=clock, utc_now=utc_now)
         self.rounds = LPRoundCoordinator()
-        self.control = LPControlOwner(self.state, _ControlStore(store, account_id), self, self,
+        self.control = LPControlOwner(self.state, _ControlStore(store, account_id, self.load_settings if load_settings_on_start else None), self, self,
                                       clock=clock, utc_now=utc_now)
         self._run_lock = threading.Lock()
         self._settings_lock = threading.RLock()

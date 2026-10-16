@@ -4596,24 +4596,40 @@ function lpBudgetLineMarkup(budget, checkedAt) {
   return "<p class=\"pm-lp-budget-line\">" + availableText + stamp + "</p>";
 }
 
+function lpAutoUsesCurrentControl(auto) {
+  return auto && (Object.hasOwn(auto, "effective_running") || Object.hasOwn(auto, "control_save_state"));
+}
+
+function lpAutoControlSaved(auto) {
+  return Number.isInteger(auto.requested_control_version) && auto.requested_control_version >= 0
+    && Number.isInteger(auto.saved_control_version) && auto.saved_control_version === auto.requested_control_version
+    && auto.control_save_state === "saved" && auto.control_native_inflight === false && auto.fatal === null;
+}
+
 function predictionLpAutoControls(auto, stale) {
   if (!auto || typeof auto !== "object") return "<p class=\"sub\">自动补位状态 UNKNOWN</p>";
   const prediction = state.predictionMarket;
   const running = auto.desired_running === true;
   const schedulerRunning = auto.scheduler_running === true;
+  const currentControl = lpAutoUsesCurrentControl(auto);
+  const pending = currentControl && (!lpAutoControlSaved(auto)
+    || auto.settings_pending === true || auto.settings_native_inflight === true);
+  const fatal = currentControl && auto.fatal != null;
   const serviceBlocked = predictionWritesBlocked();
   const busy = prediction.lpAutoBusy || !prediction.csrfToken || serviceBlocked;
   const blocked = Array.isArray(auto.block_reasons) ? auto.block_reasons : [];
   const draft = prediction.lpAutoDraft || auto;
-  const locked = busy || stale || running || auto.pause_confirmed !== true || auto.slots?.occupied !== 0;
+  const locked = busy || stale || running || auto.pause_confirmed !== true
+    || (currentControl ? pending || fatal || auto.effective_running !== false : auto.slots?.occupied !== 0);
   const action = running ? "pause" : auto.ever_enabled ? "resume" : "enable";
   const actionLabel = running ? "暂停新增" : auto.ever_enabled ? "恢复新增" : "启用自动补位";
   const status = !schedulerRunning ? "调度未运行" : running ? "持续运行" : auto.ever_enabled ? "新增已暂停" : "尚未启用";
   const reasons = blocked.length ? ` · 系统受阻：${escapeHtml(blocked.join("、"))}` : "";
   return `<section aria-label="自动补位控制"><h3>自动补位 · ${status}</h3>
     <p>人工意愿：${running ? "运行" : "暂停"}${reasons}${stale ? " · 状态已过期" : ""}</p>
+    ${currentControl ? `<p>有效状态：${auto.effective_running === true ? "运行" : auto.effective_running === false ? "暂停" : "UNKNOWN"} · 请求版本 ${escapeHtml(String(auto.requested_control_version ?? "UNKNOWN"))} · 已保存版本 ${escapeHtml(String(auto.saved_control_version ?? "UNKNOWN"))} · ${fatal ? "故障停机" : pending ? "保存待确认" : "已可靠保存"}${auto.control_error ? ` · ${escapeHtml(auto.control_error)}` : ""}</p>` : ""}
     <p class="sub">每分钟检查，跨日持续。暂停保留 BUY；挂单保护、库存退出和在途核对继续。</p>
-    <button type="button" class="pm-button" data-lp-auto-action="${action}"${busy || (!running && (stale || !schedulerRunning)) ? " disabled" : ""}>${actionLabel}</button>
+    <button type="button" class="pm-button" data-lp-auto-action="${action}"${busy || (!running && (stale || !schedulerRunning || pending || fatal || (currentControl && auto.effective_running !== false))) ? " disabled" : ""}>${actionLabel}</button>
     <div class="pm-check"><label>策略总资金（USDC） <input data-lp-auto-field="budget_usd" aria-label="策略总资金" type="number" min="0" step="0.01" value="${escapeHtml(String(draft.budget_usd ?? ""))}"${locked ? " disabled" : ""}></label>
     <label>目标 BUY 数 <input data-lp-auto-field="target_buy_count" aria-label="目标 BUY 数" type="number" min="0" step="1" value="${escapeHtml(String(draft.target_buy_count ?? 0))}"${locked ? " disabled" : ""}></label>
     <button type="button" class="pm-button" data-lp-auto-action="config"${locked ? " disabled" : ""}>保存配置</button></div>
@@ -4647,14 +4663,20 @@ async function controlLpAuto(action) {
   renderPredictionMarket();
   try {
     const result = await predictionPost(`/api/prediction-arbitrage/lp/auto/${action}`, body);
-    if (action === "pause" && (result.desired_running !== false || result.pause_confirmed !== true)) throw new Error("暂停未获可靠确认");
-    if ((action === "enable" || action === "resume") && result.desired_running !== true) throw new Error("运行意愿未获确认");
     prediction.lpDashboardRequestSeq = (prediction.lpDashboardRequestSeq || 0) + 1;
     if (predictionSplit()) {
       prediction.lpAutoRequestSeq = (prediction.lpAutoRequestSeq || 0) + 1;
       prediction.lpAutoPayload = {...prediction.lpAutoPayload, ...result};
       prediction.lpAutoError = "";
     } else prediction.lpDashboard = {...prediction.lpDashboard, auto: {...prediction.lpDashboard?.auto, ...result}};
+    const currentControl = lpAutoUsesCurrentControl(result);
+    if (action === "pause" && (result.desired_running !== false || result.pause_confirmed !== true
+      || (currentControl && (!lpAutoControlSaved(result) || result.effective_running !== false)))) throw new Error("暂停未获可靠确认");
+    if ((action === "enable" || action === "resume") && (result.desired_running !== true
+      || (currentControl && (!lpAutoControlSaved(result) || result.effective_running !== true
+        || result.settings_pending === true || result.settings_native_inflight === true)))) throw new Error("运行意愿未获可靠确认");
+    if (action === "config" && (result.settings_pending === true || result.settings_native_inflight === true
+      || result.settings_error != null || result.fatal != null)) throw new Error("配置未获可靠确认");
     if (action === "config") prediction.lpAutoDraft = null;
     prediction.lpAutoMessage = action === "pause" ? "新增已暂停；已有挂单和仓位继续保护。" : action === "config" ? "配置已保存，未触发交易。" : "运行意愿已保存，立即核对；系统受阻时等待核清。";
   } catch (error) {

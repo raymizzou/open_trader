@@ -1515,7 +1515,7 @@ class PolymarketLPService:
                 expected_generation if isinstance(existing, Mapping) else None
             )
             saved = (
-                writer(merged, expected_generation=store_expected)
+                writer(merged, expected_generation=store_expected, initialize_global_fence=True)
                 if callable(writer)
                 else merged
             )

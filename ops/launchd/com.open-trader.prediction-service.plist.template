@@ -19,7 +19,7 @@
     <string>--notifier-config</string><string>OPEN_TRADER_NOTIFIER_CONFIG</string>
     <string>--release-manifest</string><string>OPEN_TRADER_RELEASE_MANIFEST</string>
   </array>
-  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ProcessType</key><string>Interactive</string><key>ThrottleInterval</key><integer>5</integer>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ExitTimeOut</key><integer>0</integer><key>ProcessType</key><string>Interactive</string><key>ThrottleInterval</key><integer>5</integer>
   <key>StandardOutPath</key><string>OPEN_TRADER_RUNTIME_ROOT/logs/prediction_service/launchd.out.log</string>
   <key>StandardErrorPath</key><string>OPEN_TRADER_RUNTIME_ROOT/logs/prediction_service/launchd.err.log</string>
 </dict></plist>

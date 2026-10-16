@@ -19,6 +19,13 @@ from .notifications import NullNotifier
 from .daily_premarket import send_notification_with_results
 from .polymarket_monitor import PolymarketMonitor
 from .polymarket_lp_scheduler import LPAutoScheduler
+from .polymarket_lp_live_execution import LPD2LiveExecution
+from .polymarket_lp_market_calculation import CalculationPolicy
+from .polymarket_lp_current_state import ValidatedStartAdmission
+from .prediction_start_guard import (PredictionStartDenied, PredictionStartSuperseded, identity_for_runtime,
+    claim_for_start, rearm_after_clean_drain)
+from urllib.parse import urlparse
+from uuid import uuid4
 from .polymarket_lp import (
     _LP_CANDIDATE_BATCH_MIN_INTERVAL_SECONDS,
     _LP_COMPETITION_REFRESH_SECONDS,
@@ -111,6 +118,10 @@ class PredictionRuntimeOwnershipError(RuntimeError):
 
 class PredictionRuntimeCompatibilityError(RuntimeError):
     pass
+
+
+class PredictionRuntimeFatal(RuntimeError):
+    """Current reliable control/startup authority requires drained process exit78."""
 
 
 class _RuntimeOwnershipLock:
@@ -488,6 +499,7 @@ class PredictionRuntime:
         n_leg_paused: bool | None = None,
         history_clock: Callable[[], datetime] | None = None,
         history_wait: Callable[[threading.Event, float], bool] | None = None,
+        lp_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if mode not in {"production", "shadow"}:
             raise ValueError("prediction runtime mode must be production or shadow")
@@ -526,6 +538,12 @@ class PredictionRuntime:
             self._data_dir / "prediction_arbitrage" / "runtime.lock"
         )
         self._state = "NEW"
+        self.lp_d2 = None
+        self._lp_clock = lp_clock
+        self._lp_start_claim = None
+        self._launchd_fatal_exit_verified = False
+        self._lp_process_epoch = uuid4().hex
+        self._fatal = None
         self._prediction_trading: object | None = None
         self._predict_trading: object | None = None
         self._cross_runtime: _CrossVenueRuntime | None = None
@@ -736,6 +754,13 @@ class PredictionRuntime:
             return
         try:
             self._owner.acquire()
+            endpoint=urlparse(self._dashboard_url)
+            identity=identity_for_runtime(data_dir=self._data_dir,
+                prediction_config_path=self._prediction_config_path,
+                host=endpoint.hostname or '127.0.0.1',port=endpoint.port or 8769)
+            from .prediction_start_guard import verify_launchd_self_context
+            self._launchd_fatal_exit_verified=verify_launchd_self_context(identity)
+            self._lp_start_claim=claim_for_start(identity,self._lp_process_epoch)
             if self._reader_generation is not None:
                 minimum_reader_generation = read_minimum_reader_generation(
                     self._data_dir
@@ -754,9 +779,7 @@ class PredictionRuntime:
             self.store = PredictionArbitrageStore(self._data_dir)
             # Prior ownership ends only after local senders drain or process exit.
             # Run before constructing LP/execution or starting any send lane.
-            recover_submissions = getattr(self.store, 'lp_recover_interrupted_submissions', None)
-            if callable(recover_submissions):
-                recover_submissions()
+            # D2 starts from current API facts; disposable LP sends are never recovered.
             # #104: idempotent startup seed; failures are logged inside and
             # never block startup.
             if not self._n_leg_paused and ensure_same_event_same_venue_scope(self.store):
@@ -766,7 +789,8 @@ class PredictionRuntime:
                 )
             if not self._n_leg_paused:
                 self.relation_catalog = RelationCatalog(self._data_dir)
-            trading_config = load_trading_config(self._prediction_config_path)
+            from .prediction_start_guard import selected_trading_config
+            trading_config = selected_trading_config(identity)
             apply_safety_policy = getattr(self.store, "apply_safety_policy", None)
             if callable(apply_safety_policy):
                 apply_safety_policy(
@@ -789,7 +813,14 @@ class PredictionRuntime:
                 self._prediction_trading,
                 owner_lock=self._owner,
             )
-            self._attach_lp_reader_comparison()
+            self.lp_d2=LPD2LiveExecution(self.store,self._prediction_trading,
+                account_id=trading_config.wallet_address,venue='polymarket',
+                process_epoch=self._lp_process_epoch,policy=CalculationPolicy(None),
+                clock=self._lp_clock,utc_now=self._history_clock,load_settings_on_start=True)
+            self.lp_d2.initialize(ValidatedStartAdmission(self._lp_process_epoch,self._lp_start_claim.claim_id))
+            if self.lp_d2.control.status().fatal is not None:
+                self._fatal=self.lp_d2.control.status().fatal
+                raise PredictionRuntimeFatal('D2 reliable startup read failed')
             if self._history_clock_injected:
                 # Keep the production constructor seam compatible with the
                 # existing test doubles while allowing the history scheduler
@@ -839,6 +870,7 @@ class PredictionRuntime:
                 predict_trading=self._predict_trading,
                 legacy_retired=self.legacy_retired,
                 lp=self.lp,
+                lp_d2=self.lp_d2,
             )
             setattr(self.execution, "_n_leg_paused", self._n_leg_paused)
             set_mutation_guard = getattr(self.lp, "set_mutation_guard", None)
@@ -912,14 +944,20 @@ class PredictionRuntime:
                 set_cross_venue_monitor(
                     self._cross_runtime or self.cross_venue_monitor
                 )
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc,(PredictionStartDenied,PredictionRuntimeFatal)):
+                self._fatal=self._fatal or exc
+            self._record_claimed_startup_failure(exc)
             self._state = "FAILED"
-            self._cleanup_resources()
+            if not self._cleanup_resources():
+                self._state = "FAILED"
             raise
 
         try:
             reconcile = self.execution.reconcile_startup()
             if isinstance(reconcile, Mapping) and reconcile.get("state") == "locked":
+                self._record_claimed_startup_failure(RuntimeError(
+                    str(reconcile.get("reason", "reconcile_locked"))))
                 self._state = "NOT_READY"
                 logger.warning(
                     "prediction_runtime_state state=NOT_READY pid=%s data_dir=%s reason=%s",
@@ -928,7 +966,8 @@ class PredictionRuntime:
                     reconcile.get("reason", "reconcile_locked"),
                 )
                 return
-        except Exception:
+        except Exception as exc:
+            self._record_claimed_startup_failure(exc)
             self._state = "NOT_READY"
             logger.exception(
                 "prediction_runtime_state state=NOT_READY pid=%s data_dir=%s",
@@ -1050,9 +1089,8 @@ class PredictionRuntime:
                     reconciliation_context_factory=reconciliation_factory,
                 )
                 self.n_leg_order_queue_driver.start()
-            self._start_lp_monitor()
+            # The sole Scheduler owns current observation, rounds and protection.
             self._start_lp_auto_monitor()
-            self._start_lp_daily_report_monitor()
             self._start_history_monitor()
             self._start_candidate_scan_monitor()
             self._start_candidate_maintenance_monitor()
@@ -1066,15 +1104,27 @@ class PredictionRuntime:
                 os.getpid(),
                 self._data_dir,
             )
-        except Exception:
+        except Exception as exc:
+            self._record_claimed_startup_failure(exc)
             self._state = "FAILED"
-            self._cleanup_resources()
+            if not self._cleanup_resources():
+                self._state = "FAILED"
             raise
+
+    def _record_claimed_startup_failure(self, cause: Exception) -> bool:
+        """Keep an unsuccessful claimed startup out of normal rearm cleanup."""
+        if self._mode != "production" or self._lp_start_claim is None:
+            return False
+        if self._fatal is None:
+            failure = PredictionRuntimeFatal("claimed production startup failed")
+            failure.__cause__ = cause
+            self._fatal = failure
+        return True
 
     def _start_lp_auto_monitor(self) -> None:
         if self.execution is None or self._lp_auto_scheduler is not None:
             return
-        self._lp_auto_scheduler = LPAutoScheduler(self.execution)
+        self._lp_auto_scheduler = LPAutoScheduler(self.execution,clock=self._history_clock)
         set_scheduler = getattr(self.execution, "set_lp_auto_scheduler", None)
         if callable(set_scheduler):
             set_scheduler(self._lp_auto_scheduler)
@@ -1100,7 +1150,7 @@ class PredictionRuntime:
             raise RuntimeError("LP automatic scheduler is unavailable")
         result = self.execution.lp_auto_set_desired_running(running, audit=audit)
         if result.get("desired_running") is not running or (
-            not running and result.get("pause_confirmed") is not True
+            self.lp_d2 is None and not running and result.get("pause_confirmed") is not True
         ):
             raise RuntimeError("LP automatic control result is unconfirmed")
         if running:
@@ -1899,7 +1949,8 @@ class PredictionRuntime:
                 )
         except Exception:
             self._state = "FAILED"
-            self._cleanup_resources()
+            if not self._cleanup_resources():
+                self._state = "FAILED"
             raise
 
         try:
@@ -1923,7 +1974,8 @@ class PredictionRuntime:
             )
         except Exception:
             self._state = "FAILED"
-            self._cleanup_resources()
+            if not self._cleanup_resources():
+                self._state = "FAILED"
             raise
 
     def _configure_n_leg_shadow(self) -> Callable[[Mapping[str, object], str], object]:
@@ -1943,13 +1995,45 @@ class PredictionRuntime:
             set_shadow_observer(observe)
         return observe
 
+    @property
+    def launchd_fatal_exit_verified(self):
+        return self._launchd_fatal_exit_verified
+
+    def poll_fatal(self):
+        """Owner-loop control progress/fatal observation, independent of Scheduler I/O."""
+        if threading.get_ident()!=self._owner_thread_id:
+            raise RuntimeError('D2 fatal poll requires runtime owner thread')
+        if self.lp_d2 is not None:
+            self.lp_d2.poll()
+            self._fatal=self._fatal or self.lp_d2.control.status().fatal
+        if self._fatal is not None:
+            self.begin_stop()
+        return self._fatal
+
+    def begin_stop(self):
+        """Close admission and notify independent producers before any blocking join."""
+        if self._state in ('NEW','STOPPED'):
+            return
+        self._state='STOPPING'
+        for event in (self._reward_stop_event,self._lp_share_stop_event,self._history_stop_event,
+                self._history_wakeup_event,self._history_initial_done,self._lp_candidate_refresh_requested,
+                self._candidate_maintenance_wakeup,self._lp_stop_event,self._lp_report_stop_event,self._book_sample_stop_event):
+            event.set()
+        guard=getattr(self.lp,'set_mutation_guard',None)
+        if callable(guard):guard(lambda *args:False)
+        stop_metadata=getattr(self._prediction_trading,'stop_lp_metadata_writer',None)
+        if callable(stop_metadata):
+            try:stop_metadata(timeout=0)
+            except TimeoutError:pass
+        if self.lp_d2 is not None:self.lp_d2.close(timeout=0)
+
     def stop(self) -> None:
         if self._state == "STOPPED":
             return
         if self._state == "NEW":
             self._state = "STOPPED"
             return
-        self._state = "STOPPING"
+        self.begin_stop()
         errors = self._cleanup_resources()
         if errors:
             self._state = "STOPPING"
@@ -2021,6 +2105,9 @@ class PredictionRuntime:
 
     def _cleanup_resources(self) -> list[BaseException]:
         errors: list[BaseException] = []
+        drained_cross_error: BaseException | None = None
+        try:self.begin_stop()
+        except BaseException as exc:errors.append(exc)
         if self._lp_reader_comparison is not None:
             # Only frozen values remain in flight; real SDK/sender drains below
             # continue to own the trading resources and runtime lock.
@@ -2170,7 +2257,10 @@ class PredictionRuntime:
                 self._cross_runtime.stop()
             except BaseException as exc:
                 errors.append(exc)
-                uncertain_thread = True
+                if self._cross_runtime.thread_alive:
+                    uncertain_thread = True
+                else:
+                    drained_cross_error = exc
             finally:
                 if not self._cross_runtime.thread_alive:
                     self._cross_runtime = None
@@ -2225,6 +2315,9 @@ class PredictionRuntime:
         if self._lp_auto_scheduler is not None:
             # A pending exchange read/send still owns these collaborators.
             return errors
+        if self.lp_d2 is not None and not self.lp_d2.close(timeout=0):
+            errors.append(RuntimeError('D2 native resources are still stopping'))
+            return errors
         drain_submissions = getattr(self.lp, 'drain_submissions', None)
         if callable(drain_submissions):
             try:
@@ -2241,6 +2334,10 @@ class PredictionRuntime:
             except BaseException as exc:
                 errors.append(exc)
                 return errors
+        # A reported cross-monitor failure can outlive its ended native thread.
+        # Close the other resources, but retain the owner and failure below.
+        if uncertain_thread or (errors and errors != [drained_cross_error]):
+            return errors
         for resource in (
             ("n_leg_shadow", self.n_leg_shadow),
             ("solver_server", self.solver_server),
@@ -2257,8 +2354,20 @@ class PredictionRuntime:
                     close()
                 except BaseException as exc:
                     errors.append(exc)
-                finally:
+                else:
                     setattr(self, name, None)
+        if errors:
+            return errors
+        if self._lp_start_claim is not None and self._fatal is None:
+            try:rearm_after_clean_drain(self._lp_start_claim)
+            except PredictionStartSuperseded as exc:
+                # All native resources above have actually ended. Preserve the
+                # consumed claim for diagnostics; only explicit management can arm.
+                self._fatal=exc
+            except BaseException as exc:
+                errors.append(exc)
+                return errors
+            else:self._lp_start_claim=None
         if not uncertain_thread:
             self._owner.release()
         return errors

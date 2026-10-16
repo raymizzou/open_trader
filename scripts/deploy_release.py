@@ -24,6 +24,23 @@ def run_preflight(args):
         raise ValueError('deployment preflight failed; no installer was run')
 
 
+def prepare_prediction_operation(command, args, environment, *, prepare_command=None):
+    """Ask the existing manager to retain its own trusted operation binding."""
+    result = subprocess.run([*command, '--prepare-target'] if prepare_command is None else prepare_command, cwd=args.release_root,
+                            env=environment, capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise ValueError('LP manager preparation failed before service handoff')
+    operation = json.loads(result.stdout)
+    if type(operation) is not dict or set(operation) != {'status', 'operation_nonce'}:
+        raise ValueError('LP manager preparation result is invalid')
+    if operation['status'] == 'NOOP' and operation['operation_nonce'] is None:
+        return None
+    nonce = operation['operation_nonce']
+    if operation['status'] != 'PREPARED' or type(nonce) is not str or not nonce:
+        raise ValueError('LP manager did not prepare an exact operation')
+    return nonce
+
+
 def absolute_path(value):
     path = Path(value)
     if not path.is_absolute():
@@ -50,9 +67,10 @@ def main(argv=None):
     prediction.add_argument('--config', type=absolute_path)
     prediction.add_argument('--n-leg-paused', choices=['0', '1'])
     prediction.add_argument('--https-proxy')
+    prediction.add_argument('--restart', action='store_true')
     cloud = kinds.add_parser('prediction-systemd')
     cloud.add_argument('--config', required=True, type=absolute_path)
-    cloud.add_argument('--action', choices=['install', 'start'], default='install')
+    cloud.add_argument('--action', choices=['install', 'start', 'restart'], default='install')
     args = parser.parse_args(argv)
     args.release_root = args.release_root.resolve()
     args.runtime_root = args.runtime_root.resolve()
@@ -60,6 +78,8 @@ def main(argv=None):
         common = ['--repo-root', str(args.release_root), '--runtime-root', str(args.runtime_root),
                   '--python', str(args.python)]
         config_bytes = None
+        native_prediction = False
+        prepare_command = None
         if args.kind == 'prediction-systemd':
             config_bytes = args.config.read_bytes()
             config = json.loads(config_bytes)
@@ -69,6 +89,12 @@ def main(argv=None):
                 raise ValueError('cloud config does not bind the selected SHA, release, runtime and interpreter')
             command = ['bash', str(args.release_root / 'scripts/prediction-systemd.sh'),
                        args.action, '--config', str(args.config)]
+            if config.get('mode') not in ('production','shadow'):
+                raise ValueError('cloud service mode must be explicit production or shadow')
+            native_prediction = config['mode']=='production'
+            if native_prediction:
+                for extra in args.extra:command.extend(['--extra',extra])
+                prepare_command=[*command[:2],'prepare-target',*command[3:],'--prepare-for',args.action]
         elif args.kind == 'dashboard':
             command = ['bash', str(args.release_root / 'scripts/install_dashboard_launchd.sh'),
                        *common, '--mode', args.mode]
@@ -85,11 +111,24 @@ def main(argv=None):
                 command.extend(['--n-leg-paused', args.n_leg_paused])
             if args.https_proxy is not None:
                 command.extend(['--https-proxy', args.https_proxy])
-        run_preflight(args)
-        if config_bytes is not None and args.config.read_bytes() != config_bytes:
-            raise ValueError('cloud config changed during preflight')
+            if args.restart:
+                if args.mode != 'production':
+                    raise ValueError('LP restart requires production mode')
+                command.append('--restart')
+            native_prediction = args.mode == 'production'
+            if native_prediction:
+                for extra in args.extra:
+                    command.extend(['--extra', extra])
         environment = dict(os.environ, OPEN_TRADER_PYTHON=str(args.python),
                            PYTHONPATH=str(args.release_root / 'src'), PYTHONDONTWRITEBYTECODE='1')
+        if native_prediction:
+            nonce = prepare_prediction_operation(command, args, environment,prepare_command=prepare_command)
+            if nonce is not None:command.extend(['--operation-nonce', nonce])
+        else:
+            run_preflight(args)
+        if config_bytes is not None and args.config.read_bytes() != config_bytes:
+            raise ValueError('cloud config changed during preflight')
+        if native_prediction and nonce is None:return 0
         return subprocess.run(command, cwd=args.release_root, env=environment, check=False).returncode
     except (OSError, ValueError) as error:
         print(f'BLOCKED: {error}', file=sys.stderr)

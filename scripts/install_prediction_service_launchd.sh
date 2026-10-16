@@ -3,6 +3,10 @@ set -euo pipefail
 
 DRY_RUN=0
 PREFLIGHT=0
+RESTART=0
+PREPARE_TARGET=0
+OPERATION_NONCE=""
+LP_EXTRAS=()
 MODE="shadow"
 MANAGER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$MANAGER_ROOT"
@@ -25,7 +29,7 @@ HTTPS_PROXY_REQUESTED=0
 HTTPS_PROXY_OVERRIDE=""
 
 usage() {
-  echo "usage: $0 --runtime-root PATH [--dry-run] [--preflight] [--mode shadow|production] [--n-leg-paused 0|1] [--https-proxy URL] [--repo-root PATH] [--python PATH] [--config PATH] [--notifier-config PATH] [--launch-agents-dir PATH] [--wait-seconds N] [--release-manifest PATH] [--expected-sha SHA]" >&2
+  echo "usage: $0 --runtime-root PATH [--dry-run] [--preflight] [--restart] [--prepare-target] [--operation-nonce NONCE] [--extra cloud-ssm|browser] [--mode shadow|production] [--n-leg-paused 0|1] [--https-proxy URL] [--repo-root PATH] [--python PATH] [--config PATH] [--notifier-config PATH] [--launch-agents-dir PATH] [--wait-seconds N] [--release-manifest PATH] [--expected-sha SHA]" >&2
 }
 
 fail() {
@@ -37,6 +41,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
     --preflight) PREFLIGHT=1; shift ;;
+    --restart) RESTART=1; shift ;;
+    --prepare-target) PREPARE_TARGET=1; shift ;;
+    --operation-nonce) [[ $# -ge 2 && -n "$2" ]] || { usage; exit 2; }; OPERATION_NONCE="$2"; shift 2 ;;
+    --extra) [[ $# -ge 2 && ( "$2" == "cloud-ssm" || "$2" == "browser" ) ]] || { usage; exit 2; }; LP_EXTRAS+=("$2"); shift 2 ;;
     --mode) [[ $# -ge 2 ]] || { usage; exit 2; }; MODE="$2"; shift 2 ;;
     --n-leg-paused) [[ $# -ge 2 ]] || { usage; exit 2; }; N_LEG_PAUSED_OVERRIDE="$2"; shift 2 ;;
     --https-proxy) [[ $# -ge 2 ]] || { usage; exit 2; }; HTTPS_PROXY_REQUESTED=1; HTTPS_PROXY_OVERRIDE="$2"; shift 2 ;;
@@ -59,7 +67,14 @@ N_LEG_PAUSED_REQUESTED="$N_LEG_PAUSED_OVERRIDE"
 
 [[ -n "$RUNTIME_ROOT" && "$WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] || { usage; exit 2; }
 [[ "$MODE" == "shadow" || "$MODE" == "production" ]] || { usage; exit 2; }
+[[ ${#LP_EXTRAS[@]} -eq 0 || "$MODE" == "production" ]] || { usage; exit 2; }
 [[ "$PREFLIGHT" -eq 0 || "$MODE" == "production" ]] || { usage; exit 2; }
+[[ "$RESTART" -eq 0 && -z "$OPERATION_NONCE" ]] || {
+  [[ "$MODE" == "production" && "$DRY_RUN" -eq 0 && "$PREFLIGHT" -eq 0 ]] || { usage; exit 2; }
+}
+[[ "$PREPARE_TARGET" -eq 0 ]] || {
+  [[ "$MODE" == "production" && "$DRY_RUN" -eq 0 && "$PREFLIGHT" -eq 0 && -z "$OPERATION_NONCE" ]] || { usage; exit 2; }
+}
 [[ -z "$N_LEG_PAUSED_OVERRIDE" || "$N_LEG_PAUSED_OVERRIDE" == "0" || "$N_LEG_PAUSED_OVERRIDE" == "1" ]] \
   || { echo "OPEN_TRADER_NLEG_PAUSED must be 0 or 1" >&2; exit 2; }
 
@@ -149,7 +164,12 @@ sed_escape() {
 }
 
 render_plist() {
+  local shadow_policy=''
+  if [[ "$MODE" == "shadow" ]]; then
+    shadow_policy='s|<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ExitTimeOut</key><integer>0</integer>|<key>KeepAlive</key><true/>|'
+  fi
   sed \
+    -e "$shadow_policy" \
     -e "s|OPEN_TRADER_PYTHON|$(sed_escape "$PYTHON_BIN")|g" \
     -e "s|OPEN_TRADER_DATA_DIR|$(sed_escape "$DATA_DIR")|g" \
     -e "s|OPEN_TRADER_PREDICTION_CONFIG|$(sed_escape "$CONFIG")|g" \
@@ -960,7 +980,7 @@ import json
 import sys
 try:
     record, observed = map(json.loads, sys.argv[1:])
-    matches = record.get("state") == "ready" and record.get("candidate") == observed
+    matches = record.get("state") == "ready" and isinstance(record.get("candidate"),dict) and {k:v for k,v in record["candidate"].items() if k not in ("lp_validation","manifest")} == observed
 except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
     matches = False
 raise SystemExit(0 if matches else 1)
@@ -1013,11 +1033,74 @@ if [[ "$PREFLIGHT" -eq 1 ]]; then
   exit 0
 fi
 
-if [[ "$MANAGED_OLD" -eq 1 \
+refresh_record_snapshot() {
+  CURRENT_RECORD_JSON="$(PYTHONPATH="$MANAGER_SRC" "$PYTHON_BIN" - "$RUNTIME_RECORD" <<'PYCODE'
+import json,sys
+from pathlib import Path
+from open_trader.prediction_release import load_prediction_runtime_record
+print(json.dumps(load_prediction_runtime_record(Path(sys.argv[1])),separators=(",",":")))
+PYCODE
+)"
+}
+
+emit_prepare_result() {
+  "$PYTHON_BIN" - "$1" "$2" <<'PYCODE'
+import json,sys
+print(json.dumps(dict(status=sys.argv[1],operation_nonce=sys.argv[2] or None),separators=(",",":")))
+PYCODE
+}
+
+# Forwarded operations are exact pending selections, never permission to
+# replace a stale nonce with a fresh verification or silently take a no-op.
+if [[ -n "$OPERATION_NONCE" ]]; then
+  PYTHONPATH="$MANAGER_SRC" "$PYTHON_BIN" - "$RUNTIME_RECORD" "$CURRENT_RECORD_JSON" \
+    "$REPO_ROOT" "$RUNTIME_ROOT" "$PYTHON_BIN" "$CONFIG" "$OPERATION_NONCE" "$OPERATION_LOCK_PATH" ${LP_EXTRAS[@]+"${LP_EXTRAS[@]}"} 9>&9 <<'PYCODE'
+import json,os,sys
+from pathlib import Path
+from open_trader.prediction_release import (load_prediction_runtime_record,validate_lp_validation,
+    lp_operation_descriptor)
+record,expected,release,runtime,python,config,nonce,lock,*extras=sys.argv[1:]
+with lp_operation_descriptor(lock,owner_uid=os.getuid(),descriptor=9):
+    actual=load_prediction_runtime_record(Path(record))
+    if actual!=json.loads(expected):raise ValueError('prediction runtime selection changed')
+    binding=(actual or {}).get('pending_lp_validation')
+    if not isinstance(binding,dict) or binding.get('operation_nonce')!=nonce:
+        raise ValueError('forwarded LP operation nonce changed')
+    validate_lp_validation(binding,release_root=release,runtime_root=runtime,python=python,config_path=config)
+    if not set(extras)<=set(binding['runtime']['extras']):raise ValueError('forwarded runtime extras changed')
+PYCODE
+fi
+LP_SELECTION_CURRENT=0
+if [[ -z "$OPERATION_NONCE" && "$MANAGED_OLD" -eq 1 && "$RESTART" -eq 0 \
+  && "$CANDIDATE_JSON" == "$OBSERVED_RELEASE_FOR_RECORD" \
+  && "$N_LEG_PAUSED_CHANGED" -eq 0 && "$HTTPS_PROXY_CHANGED" -eq 0 ]] \
+  && PYTHONPATH="$MANAGER_SRC" "$PYTHON_BIN" - \
+  "$RUNTIME_RECORD" "$RUNTIME_ROOT" "$CONFIG" "$REPO_ROOT" "$PYTHON_BIN" \
+  "$PLIST_PATH" "$CURRENT_RECORD_JSON" 9>&9 <<'PYCODE'
+import json,sys
+from pathlib import Path
+from open_trader.prediction_release import validate_lp_management_refresh
+try:
+    record,runtime,config,release,python,plist,expected=sys.argv[1:]
+    validate_lp_management_refresh(runtime_root=runtime,release_root=release,python=python,
+        config_path=config,manager_identity=plist,record_path=record,operation_fd=9,
+        expected_record=json.loads(expected))
+except Exception:
+    raise SystemExit(1)
+PYCODE
+then
+  LP_SELECTION_CURRENT=1
+fi
+
+if [[ "$RESTART" -eq 0 && "$LP_SELECTION_CURRENT" -eq 1 && "$MANAGED_OLD" -eq 1 \
   && "$CANDIDATE_JSON" == "$OBSERVED_RELEASE_FOR_RECORD" \
   && "$N_LEG_PAUSED_CHANGED" -eq 0 && "$HTTPS_PROXY_CHANGED" -eq 0 ]] && record_matches_observed \
   && record_ready_matches_observed; then
-  echo "prediction release already ready: $ACTUAL_SHA"
+  if [[ "$PREPARE_TARGET" -eq 1 ]]; then
+    emit_prepare_result NOOP ""
+  else
+    echo "prediction release already ready: $ACTUAL_SHA"
+  fi
   exit 0
 fi
 
@@ -1054,12 +1137,14 @@ write_record() {
   if ! PYTHONPATH="$MANAGER_SRC" "$PYTHON_BIN" - \
     "$RUNTIME_RECORD" "$CURRENT_RECORD_JSON" "$state" "$CANDIDATE_JSON" "$PREVIOUS_JSON" \
     "$TRANSITION_STARTED_AT" "$failure_reason" "$ready_json" \
-    "$OBSERVED_RECOVERY_REASON" <<'PY'
+    "$OBSERVED_RECOVERY_REASON" "$PLIST_PATH" "$LP_SELECTION_CURRENT" \
+    "$RUNTIME_ROOT" "$REPO_ROOT" "$PYTHON_BIN" "$CONFIG" 9>&9 <<'PY'
 import json, sys
 from datetime import datetime
 from pathlib import Path
-from open_trader.prediction_release import load_prediction_runtime_record, write_prediction_runtime_record
-path, expected_raw, state, candidate, previous, started, failure, ready, recovery_reason = sys.argv[1:]
+from open_trader.prediction_release import (load_prediction_runtime_record,
+    write_prediction_runtime_record,validate_lp_management_refresh)
+path, expected_raw, state, candidate, previous, started, failure, ready, recovery_reason, plist, refresh, runtime, release, python, config = sys.argv[1:]
 current = load_prediction_runtime_record(Path(path))
 expected = None if expected_raw == "null" else json.loads(expected_raw)
 if current != expected:
@@ -1072,10 +1157,26 @@ payload = {
     "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     "failure_reason": failure,
 }
+def source_identity(value):
+    return {k:v for k,v in value.items() if k not in ('lp_validation','manifest')} if isinstance(value,dict) else None
+for field in ('candidate','previous_release'):
+    value=payload[field]
+    if not isinstance(value,dict):continue
+    for saved in ((current or {}).get('candidate'),(current or {}).get('previous_release')):
+        if source_identity(saved)==source_identity(value) and saved.get('lp_validation') is not None:
+            payload[field]={**value,'lp_validation':saved['lp_validation']}
+            break
+payload.update(manager='launchd',manager_identity=plist)
+if current is not None and 'pending_lp_validation' in current:
+    payload['pending_lp_validation']=current['pending_lp_validation']
 if ready != "null":
     payload["ready"] = json.loads(ready)
 if recovery_reason:
     payload["recovery_reason"] = recovery_reason
+if refresh=='1' and recovery_reason and state=='ready':
+    validate_lp_management_refresh(runtime_root=runtime,release_root=release,python=python,
+        config_path=config,manager_identity=plist,record_path=path,operation_fd=9,
+        expected_record=current)
 write_prediction_runtime_record(Path(path), payload)
 PY
   then
@@ -1098,7 +1199,7 @@ import json
 import sys
 try:
     record, expected = map(json.loads, sys.argv[1:])
-    matches = isinstance(record, dict) and record.get("candidate") == expected
+    matches = isinstance(record, dict) and isinstance(record.get("candidate"),dict) and {k:v for k,v in record["candidate"].items() if k not in ("lp_validation","manifest")} == expected
 except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
     matches = False
 raise SystemExit(0 if matches else 1)
@@ -1210,12 +1311,12 @@ TARGET_CANDIDATE_OBSERVED=0
 if [[ "$MANAGED_OLD" -eq 1 ]] && [[ "$CANDIDATE_JSON" == "$OBSERVED_RELEASE_FOR_RECORD" ]]; then
   TARGET_CANDIDATE_OBSERVED=1
 fi
-if [[ "$MANAGED_OLD" -eq 1 && "$RECORD_CANDIDATE_OBSERVED" -eq 0 ]]; then
+if [[ "$PREPARE_TARGET" -eq 0 && "$MANAGED_OLD" -eq 1 && "$RECORD_CANDIDATE_OBSERVED" -eq 0 ]]; then
   OBSERVED_RECOVERY_REASON="stale runtime record recovered from verified live release"
   archive_record "$OBSERVED_RECOVERY_REASON" \
     || fail "prediction runtime record recovery archive could not be written"
 fi
-if [[ "$TARGET_CANDIDATE_OBSERVED" -eq 1 && "$N_LEG_PAUSED_CHANGED" -eq 0 && "$HTTPS_PROXY_CHANGED" -eq 0 ]]; then
+if [[ "$RESTART" -eq 0 && "$LP_SELECTION_CURRENT" -eq 1 && "$TARGET_CANDIDATE_OBSERVED" -eq 1 && "$N_LEG_PAUSED_CHANGED" -eq 0 && "$HTTPS_PROXY_CHANGED" -eq 0 ]]; then
   RECORD_STATE="$("$PYTHON_BIN" - "$CURRENT_RECORD_JSON" <<'PY'
 import json
 import sys
@@ -1234,6 +1335,10 @@ PY
   fi
   if ! recheck_managed_identity_before_handoff; then
     fail "managed release evidence changed before recovery publication"
+  fi
+  if [[ "$PREPARE_TARGET" -eq 1 ]]; then
+    emit_prepare_result NOOP ""
+    exit 0
   fi
   if ! write_record ready "" "$OBSERVED_READY_JSON"; then
     fail "prediction release recovery failed: runtime_record_write_failed"
@@ -1257,12 +1362,72 @@ setup_failed_and_exit() {
   record_failed_and_exit "$reason"
 }
 
+# Compatibility and selected config are proved before stopping the old owner.
+# The producer adopts FD9, which this installer already holds for the operation.
+if ! OPERATION_NONCE="$(PYTHONPATH="$MANAGER_SRC" "$PYTHON_BIN" - \
+  "$RUNTIME_RECORD" "$CURRENT_RECORD_JSON" "$RUNTIME_ROOT" "$REPO_ROOT" "$PYTHON_BIN" \
+  "$CONFIG" "$PLIST_PATH" "$OPERATION_NONCE" "$ACTUAL_SHA" ${LP_EXTRAS[@]+"${LP_EXTRAS[@]}"} 9>&9 <<'PYCODE'
+import json,sys
+from pathlib import Path
+from uuid import uuid4
+from open_trader.prediction_release import load_prediction_runtime_record,prepare_lp_target
+record,expected,runtime,release,python,config,plist,nonce,sha,*extras=sys.argv[1:]
+if load_prediction_runtime_record(Path(record))!=json.loads(expected):
+    raise ValueError('prediction runtime selection changed before preparation')
+forwarded=bool(nonce)
+nonce=nonce or uuid4().hex
+prepare_lp_target(runtime_root=runtime,release_root=release,python=python,config_path=config,
+    manager='launchd',manager_identity=plist,operation_fd=9,operation_nonce=nonce,
+    require_prepared=forwarded,expected_sha=sha,extras=extras)
+print(nonce)
+PYCODE
+)"; then
+  fail "LP selected target validation failed before handoff"
+fi
+refresh_record_snapshot
+if [[ "$PREPARE_TARGET" -eq 1 ]]; then
+  emit_prepare_result PREPARED "$OPERATION_NONCE"
+  exit 0
+fi
+if record_candidate_equals "$CANDIDATE_JSON"; then
+  PREVIOUS_JSON="$(record_previous_json)"
+fi
+
 write_record maintenance "" "$PREVIOUS_READY_JSON" \
   || record_failed_and_exit "runtime_record_write_failed"
 
 if [[ "$MANAGED_OLD" -eq 1 ]]; then
   recheck_managed_identity_before_handoff \
     || fail "managed release evidence changed before handoff"
+fi
+# The final OS/health observation can cross an operator config change. Keep
+# the existing operation lock and recheck the exact selected bytes and nonce
+# after that observation, before any old owner is stopped.
+if ! PYTHONPATH="$MANAGER_SRC" "$PYTHON_BIN" - \
+  "$RUNTIME_RECORD" "$CURRENT_RECORD_JSON" "$DATA_DIR" "$CONFIG" "$REPO_ROOT" \
+  "$PLIST_PATH" "$OPERATION_NONCE" 9>&9 <<'PYCODE'
+import json,os,sys
+from pathlib import Path
+from open_trader.prediction_release import load_prediction_runtime_record,lp_operation_descriptor,lp_launchd_operation_lock
+from open_trader.prediction_start_guard import identity_for_runtime
+record,expected,data,config,release,plist,nonce=sys.argv[1:]
+expected=json.loads(expected)
+with lp_operation_descriptor(lp_launchd_operation_lock(plist,uid=os.getuid()),owner_uid=os.getuid(),descriptor=9):
+    if load_prediction_runtime_record(Path(record))!=expected:
+        raise ValueError('LP selection changed before old-owner stop')
+    binding=expected.get('pending_lp_validation')
+    if not isinstance(binding,dict) or binding.get('operation_nonce')!=nonce:
+        raise ValueError('LP operation changed before old-owner stop')
+    identity=identity_for_runtime(data_dir=data,prediction_config_path=config,code_root=release)
+    if identity.manager!='launchd' or identity.manager_identity!=plist:
+        raise ValueError('LP manager changed before old-owner stop')
+    if load_prediction_runtime_record(Path(record))!=expected:
+        raise ValueError('LP selection changed during final validation')
+PYCODE
+then
+  fail "LP selected target changed before handoff"
+fi
+if [[ "$MANAGED_OLD" -eq 1 ]]; then
   bootout_if_loaded \
     || record_failed_and_exit "candidate_cleanup_not_proven"
 fi
@@ -1546,6 +1711,18 @@ PY
   fi
   record_failed_and_exit "$FAILURE_REASON"
 }
+
+if ! PYTHONPATH="$MANAGER_SRC" "$PYTHON_BIN" - "$DATA_DIR" "$CONFIG" "$REPO_ROOT" \
+  "$OPERATION_NONCE" 9>&9 <<'PYCODE'
+import sys
+from open_trader.prediction_start_guard import identity_for_runtime,arm_for_operator_start
+identity=identity_for_runtime(data_dir=sys.argv[1],prediction_config_path=sys.argv[2],code_root=sys.argv[3])
+arm_for_operator_start(identity,sys.argv[4],operation_fd=9)
+PYCODE
+then
+  setup_failed_and_exit "lp_start_permission_not_armed"
+fi
+refresh_record_snapshot
 
 if ! bootstrap_and_wait_for_exact_ready; then
   finish_candidate_failure "$FAILURE_REASON"

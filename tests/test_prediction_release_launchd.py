@@ -8,6 +8,7 @@ import plistlib
 import shutil
 import subprocess
 import signal
+import stat
 
 from timing_support import supervised_process
 import sys
@@ -68,6 +69,38 @@ def observation_state():
     if state.get("lock_barrier_phase") == "frozen":
         return {**state, **state["lock_barrier_snapshot"]}
     return state
+
+if command == "gh":
+    from urllib.parse import urlsplit, parse_qs
+    path = sys.argv[-1]
+    assert sys.argv[1:3] == ["api", "--hostname"] and sys.argv[3] == "github.com"
+    assert "--method" in sys.argv and sys.argv[sys.argv.index("--method") + 1] == "GET"
+    assert path.startswith("repos/raymizzou/open_trader/")
+    fixture = Path(os.environ["FAKE_GITHUB_DIR"])
+    data = json.loads((fixture / "api.json").read_text())
+    if path.endswith("/zip"):
+        artifact_id = path.split("/")[-2]
+        sys.stdout.buffer.write((fixture / (artifact_id + ".zip")).read_bytes())
+    else:
+        route = path.split("?", 1)[0]
+        if "/compare/" in route:
+            result = {"status": "identical", "merge_base_commit": {"sha": data["tip"]}}
+        elif route.endswith("/git/ref/heads/main"):
+            result = {"object": {"sha": data["tip"]}}
+        elif route.endswith("/actions/workflows/ci.yml"):
+            result = {"id": 11, "path": ".github/workflows/ci.yml", "state": "active"}
+        elif route.endswith("/actions/runs/22"):
+            result = data["run"]
+        else:
+            key = ("workflow_runs" if route.endswith("/actions/workflows/11/runs") else
+                   "jobs" if route.endswith("/jobs") else
+                   "check_runs" if route.endswith("/check-runs") else
+                   "artifacts" if route.endswith("/artifacts") else None)
+            assert key, path
+            page = int(parse_qs(urlsplit(path).query).get("page", ["1"])[0])
+            result = {"total_count": len(data[key]), key: data[key][(page-1)*100:page*100]}
+        print(json.dumps(result))
+    raise SystemExit(0)
 
 if command == "launchctl":
     action = sys.argv[1]
@@ -302,6 +335,39 @@ if command == "owner-probe":
 '''
 
 
+MANAGER_EXTERNAL_BOUNDARIES = r'''"""Only the fixture OS/GitHub boundary is modeled; guard and verifier stay real."""
+import errno, json, os, signal, socket, subprocess
+from pathlib import Path
+from open_trader import prediction_cloud
+prediction_cloud.UNIT_PATH = Path(__file__).parent / "fixture-absent-systemd.service"
+state_file = os.environ.get("FAKE_STATE")
+if state_file:
+    def state(): return json.loads(Path(state_file).read_text())
+    native_connect = socket.socket.connect_ex
+    def connect(sock, address):
+        if address == ("127.0.0.1", 8769):
+            observed = state()
+            if observed.get("listener_inspection_error_after_bootout") and observed.get("bootout_seen"):
+                return errno.EACCES
+            return 0 if observed["listener"] else errno.ECONNREFUSED
+        raise AssertionError("uncontrolled native socket probe: " + repr(address))
+    socket.socket.connect_ex = connect
+    native_kill = os.kill
+    def kill(pid, signum):
+        if signum != 0:
+            raise AssertionError("fixture manager cannot signal any actual process")
+        if state()["pid"] == pid: return None
+        raise ProcessLookupError(errno.ESRCH, "modeled fixture PID is absent")
+    os.kill = kill
+    native_run = subprocess.run
+    def run(command, *args, **kwargs):
+        if isinstance(command, list) and command and command[0] in ("/usr/sbin/lsof", "/bin/ps", "/bin/launchctl"):
+            command = [str(Path(os.environ["LAUNCHCTL_BIN"]).parent / Path(command[0]).name), *command[1:]]
+        return native_run(command, *args, **kwargs)
+    subprocess.run = run
+'''
+
+
 class ReleaseHarness:
     def __init__(self, tmp_path: Path) -> None:
         self.root = tmp_path
@@ -313,35 +379,37 @@ class ReleaseHarness:
         self.fake_bin = tmp_path / "fake-bin"
         self.fake_bin.mkdir()
         self._write_dispatcher()
+        self.config = self.root / "prediction.json"
+        self.config.write_text(json.dumps(dict(signer_address="0x" + "a"*40, wallet_address="0x" + "a"*40)))
+        self.config.chmod(0o600)
         self.candidate = self.make_checkout("candidate")
+        # A separate unchanged manager checkout preserves the poisoned candidate
+        # PYTHONPATH oracle and isolates every newly native OS boundary too.
+        self.manager = self.make_checkout("manager")
         self.configure("absent")
 
     def make_checkout(self, name: str) -> ReleaseCheckout:
         path = self.root / name
-        (path / "scripts").mkdir(parents=True)
-        (path / "ops" / "launchd").mkdir(parents=True)
-        (path / "src").mkdir(parents=True)
-        shutil.copytree(
-            ROOT / "src" / "open_trader",
-            path / "src" / "open_trader",
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-        )
-        (path / ".gitignore").write_text(
-            "__pycache__/\n*.pyc\n", encoding="utf-8"
-        )
-        for script in (
-            "install_prediction_service_launchd.sh",
-            "uninstall_prediction_service_launchd.sh",
-        ):
-            shutil.copy2(ROOT / "scripts" / script, path / "scripts" / script)
-        shutil.copy2(
-            ROOT / "ops" / "launchd" / f"{LABEL}.plist.template",
-            path / "ops" / "launchd" / f"{LABEL}.plist.template",
-        )
-        shutil.copy2(
-            ROOT / "ops" / "prediction-service-release.json",
-            path / "ops" / "prediction-service-release.json",
-        )
+        for directory in ("src", "ops", "scripts"):
+            shutil.copytree(ROOT / directory, path / directory,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        (path / ".gitignore").write_text("__pycache__/\n*.pyc\n", encoding="utf-8")
+        for name in ("pyproject.toml", "uv.lock", "Dockerfile.dev"):
+            shutil.copyfile(ROOT / name, path / name)
+        tests = path / "tests"; tests.mkdir()
+        (tests / "__init__.py").write_text("")
+        for name in ("lp_d2_service_harness.py", "test_lp_order_registration_contract.py",
+                     "test_deployment_preflight.py", "test_lp_d2_service_lifecycle.py",
+                     "test_lp_d2_startup_integration.py"):
+            shutil.copyfile(ROOT / "tests" / name, tests / name)
+        from tests.test_deployment_preflight import evidence
+        # Use the existing external artifact fixture's minimal source partition.
+        scratch = self.root / (path.name + "-partition")
+        scratch.mkdir()
+        evidence.__wrapped__(scratch)
+        for extra in (scratch / "tests").glob("*.py"):
+            if not (tests / extra.name).exists(): shutil.copyfile(extra, tests / extra.name)
+        (path / "src" / "sitecustomize.py").write_text(MANAGER_EXTERNAL_BOUNDARIES)
         release = load_prediction_release_manifest(
             path / "ops" / "prediction-service-release.json"
         )
@@ -349,13 +417,14 @@ class ReleaseHarness:
         subprocess.run(["git", "-C", str(path), "add", "."], check=True)
         subprocess.run(
             ["git", "-C", str(path), "-c", "user.name=test", "-c",
-             "user.email=test@example.com", "commit", "-qm", name],
+             "user.email=test@example.com", "commit", "-qm", path.name],
             check=True,
         )
         sha = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "HEAD"],
             check=True, capture_output=True, text=True,
         ).stdout.strip()
+        subprocess.run(["git", "-C", str(path), "checkout", "--detach", "-q"], check=True)
         return ReleaseCheckout(
             path=path,
             sha=sha,
@@ -367,7 +436,7 @@ class ReleaseHarness:
         dispatcher = self.fake_bin / "fake-command"
         dispatcher.write_text(FAKE_COMMAND_SOURCE, encoding="utf-8")
         dispatcher.chmod(0o755)
-        for name in ("launchctl", "lsof", "curl", "ps", "owner-probe", "sleep"):
+        for name in ("launchctl", "lsof", "curl", "ps", "owner-probe", "sleep", "gh"):
             (self.fake_bin / name).symlink_to(dispatcher)
 
     def configure(self, case: str) -> None:
@@ -403,8 +472,19 @@ class ReleaseHarness:
     def _env(
         self, checkout: ReleaseCheckout, *, release_manifest: Path | None = None,
     ) -> dict[str, str]:
+        from tests.lp_d2_service_harness import offline_github_fixture
+        actual_sha = subprocess.check_output(["git", "-C", str(checkout.path), "rev-parse", "HEAD"], text=True).strip()
+        fixture = self.root / ("github-" + actual_sha)
+        if not fixture.exists():
+            api = offline_github_fixture(checkout.path, fixture)
+            payload = dict(tip=api.tip, run=api.run, workflow_runs=api.runs,
+                jobs=api.jobs, check_runs=api.checks, artifacts=api.artifacts)
+            (fixture / "api.json").write_text(json.dumps(payload))
+            for artifact_id, data in api.downloads.items():
+                (fixture / (str(artifact_id) + ".zip")).write_bytes(data)
         return {
             **os.environ,
+            "FAKE_GITHUB_DIR": str(fixture),
             "PATH": f"{self.fake_bin}:{os.environ['PATH']}",
             "PYTHONPATH": str(checkout.path / "src"),
             "LAUNCHCTL_BIN": str(self.fake_bin / "launchctl"),
@@ -497,7 +577,7 @@ class ReleaseHarness:
     ) -> subprocess.CompletedProcess[str]:
         return supervised_process(
             [
-                str(ROOT / "scripts" / "install_prediction_service_launchd.sh"),
+                str(self.manager.path / "scripts" / "install_prediction_service_launchd.sh"),
                 "--mode", "production", "--repo-root", str(checkout.path),
                 "--runtime-root", str(self.runtime_root), "--python", sys.executable,
                 "--config", str(self.root / "prediction.json"),
@@ -513,7 +593,7 @@ class ReleaseHarness:
     ) -> subprocess.CompletedProcess[str]:
         return supervised_process(
             [
-                str(ROOT / "scripts" / "uninstall_prediction_service_launchd.sh"),
+                str(self.manager.path / "scripts" / "uninstall_prediction_service_launchd.sh"),
                 "--mode", "production", "--runtime-root", str(self.runtime_root),
                 "--launch-agents-dir", str(self.agents), "--python", sys.executable,
             ],
@@ -670,18 +750,47 @@ def test_production_dry_run_is_side_effect_free(release_harness: ReleaseHarness)
 def test_production_first_install_records_only_observed_ready_evidence(
     release_harness: ReleaseHarness,
 ) -> None:
+    assert not release_harness.runtime_root.exists()
     result = release_harness.install(mode="production")
-    assert result.returncode == 0
+    assert result.returncode == 0, result.stdout + result.stderr
+    info = release_harness.runtime_root.lstat()
+    assert info.st_uid == os.getuid() and info.st_mode & 0o777 == 0o700
     record = release_harness.runtime_record
     assert record is not None
     assert record["state"] == "ready"
+    binding = record["candidate"]["lp_validation"]
     assert record["candidate"] == {
+        "lp_validation": binding,
         "checkout": str(release_harness.candidate.path),
         "git_sha": release_harness.sha,
         "source_state": "clean",
         "reader_generation": release_harness.candidate.reader_generation,
         "contract_generation": release_harness.candidate.contract_generation,
     }
+    import hashlib
+    assert set(binding) == {"schema_version", "source_sha", "release_root", "runtime_root",
+        "python", "capability_digest", "config_selection", "runtime", "ci", "operation_nonce"}
+    assert binding["schema_version"] == "open_trader.lp.validation.v1"
+    assert binding["source_sha"] == release_harness.sha
+    assert binding["release_root"] == str(release_harness.candidate.path)
+    assert binding["runtime_root"] == str(release_harness.runtime_root)
+    assert binding["python"] == sys.executable
+    assert binding["capability_digest"] == hashlib.sha256((release_harness.candidate.path / "ops/lp-runtime-contract.json").read_bytes()).hexdigest()
+    assert binding["config_selection"] == dict(path=str(release_harness.config),
+        sha256=hashlib.sha256(release_harness.config.read_bytes()).hexdigest())
+    runtime = binding["runtime"]
+    assert runtime["source_root"] == str(release_harness.candidate.path)
+    assert runtime["python"] == sys.executable and runtime["dependencies"]
+    assert runtime["lock_sha256"] == hashlib.sha256((release_harness.candidate.path / "uv.lock").read_bytes()).hexdigest()
+    fixture = release_harness.root / ("github-" + release_harness.sha)
+    expected_artifacts = [dict(scope=scope, id=index,
+        digest="sha256:" + hashlib.sha256((fixture / (str(index) + ".zip")).read_bytes()).hexdigest())
+        for index, scope in enumerate(("gateway", "legacy", "account", "prediction", "portable"), 1)]
+    assert binding["ci"] == dict(run_id=22, run_attempt=2, artifact_role="test-only",
+        run_url="https://github.com/raymizzou/open_trader/actions/runs/22", artifacts=expected_artifacts)
+    permit = json.loads((release_harness.runtime_root / "lp-start-guard/permit.json").read_text())
+    assert permit["state"] == "ARMED"
+    assert binding["operation_nonce"] == permit["operation_nonce"]
     assert record["previous_release"] is None
     assert record["ready"]["pid"] == release_harness.pid
     assert record["ready"]["cwd"] == str(release_harness.candidate.path)
@@ -1792,6 +1901,14 @@ def test_verified_stale_release_record_is_recovered(
     record_path = release_harness.runtime_root / "prediction-service-runtime.json"
     stale_record_bytes = record_path.read_bytes()
     release_harness.install(live, check=True)
+    live_entry = release_harness.runtime_record["candidate"]
+    permit_path = release_harness.runtime_root / "lp-start-guard/permit.json"
+    live_permit_bytes = permit_path.read_bytes()
+    # A stale return-to-old selection can retain its actually running previous
+    # release. Both entries and their validation receipts come from real installs.
+    stale_record = json.loads(stale_record_bytes)
+    stale_record["previous_release"] = live_entry
+    stale_record_bytes = json.dumps(stale_record).encode("utf-8")
     record_path.write_bytes(stale_record_bytes)
     state_after_live = release_harness.state
     state_after_live["bootout_pids"] = []
@@ -1820,6 +1937,9 @@ def test_verified_stale_release_record_is_recovered(
         assert all(" bootstrap " not in f" {call} " for call in release_harness.calls.all())
         assert record["state"] == "ready"
         assert record["candidate"]["git_sha"] == live.sha
+        assert record["candidate"]["lp_validation"] == live_entry["lp_validation"]
+        assert "pending_lp_validation" not in record
+        assert permit_path.read_bytes() == live_permit_bytes
     elif operation == "upgrade":
         assert release_harness.state["bootout_pids"] == [4242]
         assert record["candidate"]["git_sha"] == target.sha
@@ -1838,6 +1958,7 @@ def _write_interrupted_record(
     state: str = "maintenance",
 ) -> None:
     release_harness.runtime_root.mkdir(parents=True, exist_ok=True)
+    existing = release_harness.runtime_record or {}
     record = {
         "schema_version": "open_trader.prediction_service.runtime.v1",
         "state": state,
@@ -1857,9 +1978,24 @@ def _write_interrupted_record(
         "updated_at": "2026-09-09T10:55:00+08:00",
         "failure_reason": "" if state == "maintenance" else "candidate_timeout",
     }
-    (release_harness.runtime_root / "prediction-service-runtime.json").write_text(
-        json.dumps(record), encoding="utf-8"
-    )
+    for name in ("manager", "manager_identity"):
+        if name in existing:
+            record[name] = existing[name]
+    for destination in ("candidate", "previous_release"):
+        identity = record[destination]
+        source_identity = dict(identity)
+        for source in (existing.get("candidate"), existing.get("previous_release")):
+            if (isinstance(source, dict)
+                    and {key: value for key, value in source.items()
+                         if key not in ("lp_validation", "manifest")} == source_identity
+                    and "lp_validation" in source):
+                if "lp_validation" in identity:
+                    assert identity["lp_validation"] == source["lp_validation"]
+                identity["lp_validation"] = source["lp_validation"]
+    record_path = release_harness.runtime_root / "prediction-service-runtime.json"
+    with open(record_path, "w", encoding="utf-8",
+              opener=lambda path, flags: os.open(path, flags, 0o600)) as output:
+        output.write(json.dumps(record))
 
 
 # Approved TDD case C: retry follows the observed interrupted phase.
@@ -1883,9 +2019,12 @@ def test_interrupted_release_retry_uses_observed_phase(
         release_harness.install(candidate, check=True)
     else:
         release_harness.configure("absent")
+        assert not (release_harness.runtime_root / "data").exists()
     _write_interrupted_record(
         release_harness, candidate=candidate, previous=old, state=record_state
     )
+    permit_path = release_harness.runtime_root / "lp-start-guard/permit.json"
+    prior_permit = permit_path.read_bytes() if phase == "candidate_ready" else None
     release_harness.calls.clear()
 
     result = release_harness.install(candidate)
@@ -1899,11 +2038,18 @@ def test_interrupted_release_retry_uses_observed_phase(
     if phase == "candidate_ready":
         assert all(" bootout " not in f" {call} " for call in release_harness.calls.all())
         assert all(" bootstrap " not in f" {call} " for call in release_harness.calls.all())
+        assert permit_path.read_bytes() == prior_permit
+        assert "pending_lp_validation" not in record
     elif phase == "old_running":
         assert release_harness.state["bootout_pids"] == [4242]
     else:
         assert sum(" bootstrap " in f" {call} " for call in release_harness.calls.all()) == 1
         assert release_harness.state["max_pids"] == 1
+        for directory in (release_harness.runtime_root / "data",
+                          release_harness.runtime_root / "data/prediction_arbitrage"):
+            assert directory.is_dir()
+            assert directory.stat().st_uid == os.getuid()
+            assert stat.S_IMODE(directory.stat().st_mode) == 0o700
 
 
 # Approved TDD case D: shadow commands cannot manage a live production label.

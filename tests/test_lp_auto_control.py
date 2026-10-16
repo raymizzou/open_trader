@@ -207,13 +207,38 @@ await controlLpAuto("pause");
 const unconfirmed = state.predictionMarket.lpAutoMessage;
 predictionPost = async (path, body) => { calls.push({path, body}); return auto; };
 await controlLpAuto("config");
-console.log(JSON.stringify({before, draft, running, unconfirmed, calls}));
+const d2 = {desired_running: false, effective_running: false, pause_confirmed: true,
+  scheduler_running: true, budget_usd: '100', target_buy_count: 3, config_version: 7,
+  control_save_state: 'saved', requested_control_version: 2, saved_control_version: 2,
+  control_native_inflight: false, settings_pending: false, fatal: null};
+state.predictionMarket.lpAutoDraft = null;
+const d2Paused = predictionLpAutoControls(d2, false);
+const d2Pending = predictionLpAutoControls({...d2, desired_running: true, effective_running: true,
+  control_save_state: 'pending', requested_control_version: 3, saved_control_version: 2,
+  control_native_inflight: true}, false);
+const d2Fatal = predictionLpAutoControls({...d2, fatal: {origin: 'control_save'}}, false);
+state.predictionMarket.lpDashboard = {auto: {...d2, desired_running: true, effective_running: true}};
+predictionPost = async () => ({...d2, pause_confirmed: false, control_save_state: 'pending',
+  requested_control_version: 3, saved_control_version: 2, control_native_inflight: true});
+await controlLpAuto('pause');
+console.log(JSON.stringify({before, draft, running, unconfirmed, calls, d2Paused, d2Pending,
+  d2Fatal, immediate: state.predictionMarket.lpDashboard.auto, pendingMessage: state.predictionMarket.lpAutoMessage}));
 '''))
     assert "启用自动补位" in result["before"]
     assert 'value="120"' in result["draft"]
     assert "暂停新增" in result["running"]
     assert "操作未确认" in result["unconfirmed"]
     assert result["calls"][1]["body"] == {"budget_usd": "120", "target_buy_count": 3, "expected_config_version": 7}
+    assert 'data-lp-auto-field="budget_usd"' in result['d2Paused']
+    assert 'value="100" disabled' not in result['d2Paused']
+    assert '有效状态：暂停' in result['d2Paused']
+    assert '请求版本 3 · 已保存版本 2' in result['d2Pending']
+    assert '保存待确认' in result['d2Pending'] and '故障停机' in result['d2Fatal']
+    assert 'data-lp-auto-action="enable" disabled' in result['d2Fatal']
+    assert result['immediate']['effective_running'] is False
+    assert result['immediate']['control_native_inflight'] is True
+    assert result['immediate']['saved_control_version'] == 2
+    assert '操作未确认' in result['pendingMessage']
 
 
 def test_old_dashboard_poll_cannot_overwrite_confirmed_manual_pause():

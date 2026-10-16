@@ -1,4 +1,4 @@
-"""Startup and resume compose the real owners without active runtime wiring."""
+"""Startup and resume compose the real owners through current state and actual service ownership."""
 from decimal import Decimal
 import time
 from threading import Event
@@ -192,3 +192,138 @@ def test_existing_pool_control_identity_load_save_preserves_pause(tmp_path, save
     finally:
         assert live.close(timeout=3)
         adapter.close()
+
+
+def test_startup_read_failure_stays_stopped_after_relaunch(tmp_path):
+    """A failed claimed startup cannot turn later dependency recovery into RUN."""
+    import hashlib
+    import json
+    from datetime import UTC, datetime
+    from tests.lp_d2_service_harness import ServiceChild
+    for fault in ('control', 'settings', 'sdk'):
+        scenario = 'startup-' + fault + '-failure'
+        with ServiceChild(tmp_path / fault, scenario=scenario) as child:
+            child.release('metadata')
+            child.start(expected_running=None)
+            code = child.wait_exit()
+            original = json.loads(child.permit_path.read_text())
+            assert child.marker('actual-store-sql-' + scenario).exists()
+            if fault == 'sdk':
+                assert child.marker('external-sdk-init-failed').exists()
+            else:
+                assert child.marker('startup-' + fault + '-read-' + scenario).exists()
+            print('actual failed startup', fault, code, original['state'])
+            assert (code, original['state']) == (78, 'CLAIMED'), child.output.read_text()
+            child.assert_owner_available()
+            assert child.actual_posts() == 0
+            # Only the failed external dependency changes. The real source,
+            # database and original permit remain the same across processes.
+            recovered = 'automatic-startup-' + fault + '-recovered'
+            child.launch(recovered)
+            assert child.wait_exit() == 78, child.output.read_text()
+            assert json.loads(child.permit_path.read_text()) == original
+            for boundary in ('runtime-sdk-factory-', 'startup-control-read-', 'startup-settings-read-'):
+                assert not child.marker(boundary + recovered).exists()
+            assert child.actual_posts() == 0
+            child.assert_owner_available()
+            # Human recovery removes the fault prohibition, never a saved pause.
+            store = PredictionArbitrageStore(child.data_dir)
+            store.lp_save_current_control(dict(account_id=hashlib.sha256(WALLET.encode()).hexdigest(),
+                process_epoch='offline-paused-recovery', request_version=2,
+                request_id='operator-pause', desired_running=False,
+                requested_at=datetime(2026, 10, 16, 12, tzinfo=UTC), actor='operator'))
+            child.launch('operator-recovery-' + fault + '-foreground-cli', expected_running=False)
+            current = child.wait_state(lambda state: state.get('effective_running') is False
+                and state.get('current_exposure_usd') == '3.80')
+            assert current['desired_running'] is False and current['fatal'] is None
+            replacement = json.loads(child.permit_path.read_text())
+            assert replacement['state'] == 'CLAIMED'
+            assert replacement['claim_id'] != original['claim_id']
+            assert replacement['process_epoch'] != original['process_epoch']
+            assert child.actual_posts() == 0
+            child.process.terminate()
+            assert child.wait_exit() == 0, child.output.read_text()
+            child.assert_owner_available()
+    # A valid unset budget is unconfigured, not a failed settings read or zero.
+    with ServiceChild(tmp_path / 'unconfigured', scenario='rollback-current-startup-unconfigured') as child:
+        child.release('metadata')
+        child.start(expected_running=False)
+        state = child.wait_state(lambda state: state.get('current_exposure_usd') == '3.80')
+        assert state['fatal'] is None and state['budget_usd'] is None
+        assert state['new_capacity_usd'] is None
+        assert state['desired_running'] is False and child.actual_posts() == 0
+        child.process.terminate()
+        assert child.wait_exit() == 0, child.output.read_text()
+        child.assert_owner_available()
+
+
+def test_native_inflight_survives_logical_resume_and_shutdown(tmp_path):
+    """Logical control generations do not end real reader or sender ownership."""
+    import json
+    from tests.lp_d2_service_harness import ServiceChild
+    for lane in ('reader', 'sender'):
+        with ServiceChild(tmp_path / lane, scenario='resume-' + lane) as child:
+            child.start()
+            native = 'reader' if lane == 'reader' else 'post'
+            child.wait(native + '-entered')
+            if lane == 'reader':
+                # The same sole Scheduler started a later real order read while
+                # its first balance call still owns a native reader slot.
+                child.wait('native-reader-orders-2')
+                assert not child.marker('reader-ended').exists()
+                assert not child.marker('native-balance-call-2').exists()
+            else:
+                assert child.actual_posts() == 1
+                child.wait('business-entered')
+            child.wait('metadata-entered')
+            before = child.state()
+            original_generation = before['round']['cycle_generation']
+            paused = child.pause()
+            assert paused['effective_running'] is False
+            child.wait_state(lambda s: s['pause_confirmed'] is True)
+            child.advance(20)
+            resumed = child.request('enable', {'confirm': True})
+            assert resumed['desired_running'] is True
+            current = child.wait_state(lambda s: s['effective_running'] is True
+                and s['saved_control_version'] == s['requested_control_version'] == 2)
+            generation = current['round']['cycle_generation']
+            assert generation != original_generation and current['fatal'] is None
+            assert not child.marker(native + '-ended').exists()
+            child.assert_owned()
+            if lane == 'reader':
+                assert not child.marker('native-balance-call-2').exists()
+                child.advance(25)
+                child.release('reader'); child.wait('reader-ended')
+                child.wait('new-provider-limit-observed')
+                child.advance(26)
+                child.wait('native-reader-orders-at-26.0')
+                noop = child.request('enable', {'confirm': True})
+                assert noop['control_request_status'] == 'noop'
+                assert noop['round']['cycle_generation'] == generation
+                child.advance(144)
+                child.wait('native-reader-orders-at-144.0')
+                assert not child.marker('native-balance-call-2').exists()
+                child.advance(145)
+                child.wait('reader-shutdown-entered')
+                assert child.marker('native-balance-call-2').read_text() == '145.0'
+                native = 'reader-shutdown'
+            else:
+                assert child.actual_posts() == 1
+            # Accepted HTTP work is a separate real owner, not a completed
+            # Future or a client close event. Each native owner ends separately.
+            child.begin_held_http()
+            child.process.terminate(); child.wait('metadata-admission-closed')
+            child.assert_owned()
+            assert not child.marker('public-client-closed').exists()
+            for resource in (('metadata', native) if lane == 'reader'
+                    else ('business', 'metadata', native)):
+                child.release(resource); child.wait(resource + '-ended')
+                child.assert_owned()
+                assert not child.marker('process-finalizing').exists()
+                assert not child.marker('public-client-closed').exists()
+            child.release('http'); child.wait_http()
+            assert child.wait_exit() == 0, child.output.read_text()
+            child.assert_owner_available()
+            assert json.loads(child.permit_path.read_text())['state'] == 'ARMED'
+            assert child.actual_posts() == (0 if lane == 'reader' else 1)
+            assert child.marker('public-client-closed').read_text() == child.marker('public-client-created').read_text()

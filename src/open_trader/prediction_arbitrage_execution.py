@@ -882,6 +882,8 @@ class PredictionExecutionService:
             self._lp._facts_publisher = self._auto_pool.publish_session
             self._lp._facts_validator = self._validate_lp_facts
             self._lp._facts_attention_flusher = self._auto_pool.flush_attention
+        elif self._lp is not None:
+            self._lp.set_candidate_buy_price_level_reader(lambda:self._lp_d2.policy.buy_price_level)
         self._threads: dict[str, threading.Thread] = {}
         self._clock = time.monotonic
         self._sleep = time.sleep
@@ -1060,9 +1062,39 @@ class PredictionExecutionService:
         _freshness(account.get('checked_at'), self._lp._now(), 'account_facts', max_age=Decimal(60))
 
     def lp_auto_reservations(self):
+        if self._lp_d2 is not None:
+            live=self._lp_d2
+            with live.state._lock:
+                snapshot=live.state.snapshot()
+                state=self.lp_auto_state(include_intents=False)
+                rows=[]
+                for order in snapshot.active_orders:
+                    if order.side!='BUY':continue
+                    known=order.price.state==order.remaining.state=='known'
+                    rows.append(dict(order_id=order.key[3],condition_id=order.key[1],token_id=order.key[2],
+                        remaining_quantity=str(order.remaining.value) if order.remaining.state=='known' else None,
+                        price=str(order.price.value) if order.price.state=='known' else None,
+                        amount_usd=str(order.price.value*order.remaining.value) if known else None,
+                        releasable=False,reason='current_api_reservations_not_releasable'))
+                return dict(authority='current_api',account_id=live.account_id,
+                    desired_running=state['desired_running'],reservations=rows,
+                    **{k:state[k] for k in ('buy_reserved_usd','inventory_cost_usd','current_exposure_usd','new_capacity_usd')})
         return self._lp_auto_pool().reservations()
 
     def lp_auto_release_reservations(self, payload, *, audit=None):
+        if self._lp_d2 is not None:
+            if not isinstance(payload,Mapping):raise ValueError('manual_release_selection_or_confirmation_invalid')
+            single='intent_id' in payload
+            expected={'confirm','reason','intent_id' if single else 'all_releasable'}
+            if set(payload)!=expected or payload.get('confirm') is not True:
+                raise ValueError('manual_release_selection_or_confirmation_invalid')
+            if single:
+                if type(payload['intent_id']) is not str or not payload['intent_id'].strip():raise ValueError('intent_id_invalid')
+            elif payload['all_releasable'] is not True:raise ValueError('all_releasable_must_be_true')
+            if type(payload['reason']) is not str or not payload['reason'].strip() or len(payload['reason'])>500:
+                raise ValueError('manual_release_reason_invalid')
+            return dict(released=[],already_released=[],skipped=[],released_amount_usd='0',
+                reason='current_api_reservations_not_releasable',state=self.lp_auto_state())
         result = self._lp_auto_pool().release_reservations(payload, audit=audit)
         if result['released'] and result['state']['desired_running']:
             scheduler = getattr(self._lp_auto_scheduler, 'request_check', None)
@@ -1110,6 +1142,8 @@ class PredictionExecutionService:
         return {'state': 'scheduled' if scheduler is not None else 'idle'}
 
     def lp_auto_report_facts(self, period_start=None, period_end=None):
+        if self._lp_d2 is not None:
+            return dict(state='paused',reason='lp_auto_reporting_paused')
         return self._lp_auto_pool().report_facts(period_start, period_end)
 
     def lp_preview(self, request: Mapping[str, object]) -> dict[str, object]:
@@ -1982,7 +2016,7 @@ class PredictionExecutionService:
         thread has not published yet. Key-complete, value-empty."""
 
         try:
-            buy_price_level = self._lp_auto_pool().buy_price_level()
+            buy_price_level = self._lp_d2.policy.buy_price_level if self._lp_d2 is not None else self._lp_auto_pool().buy_price_level()
         except Exception:
             buy_price_level = None
         return {
@@ -2126,7 +2160,7 @@ class PredictionExecutionService:
             result = deepcopy(cached)
             if self._lp is not None and hasattr(self._lp, "set_candidate_buy_price_level_reader"):
                 try:
-                    level = self._auto_pool.buy_price_level()
+                    level = self._lp_d2.policy.buy_price_level if self._lp_d2 is not None else self._auto_pool.buy_price_level()
                 except Exception:
                     level = None
                 if result.get("buy_price_level", 1) != level:
@@ -2702,7 +2736,7 @@ class PredictionExecutionService:
                 registration_reader = getattr(
                     self._lp, "register_account_snapshot", None
                 )
-                if callable(registration_reader) and not getattr(self, "_display_only", False):
+                if self._lp_d2 is None and callable(registration_reader) and not getattr(self, "_display_only", False):
                     registration = _call(registration_reader, snapshot)
                     if isinstance(registration, Mapping) and (
                         registration.get("reason") == "account_round_invalid"
@@ -6749,6 +6783,13 @@ class PredictionExecutionService:
     def reconcile_startup(self) -> dict[str, object]:
         """Reconcile live account state before allowing a new opportunity."""
         self._breaker_open = True
+        if self._lp_d2 is not None and self._store.active_execution() is None:
+            if self._store.unacknowledged_incident() is not None:
+                return {'state':'locked','reason':'unacknowledged_incident'}
+            # The sole current Reader/Scheduler observes LP account facts; old
+            # registration/session bookkeeping is no primary startup authority.
+            self._breaker_open=False
+            return {'state':'ready','readiness':'current_api'}
         snapshot = self._fresh_account_snapshot()
         if snapshot is None:
             return {"state": "locked", "reason": "account_unavailable"}

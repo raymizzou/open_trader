@@ -413,6 +413,9 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
         return _response_with_headers(base + "/api/prediction-arbitrage/state", timeout=60)
 
     monkeypatch.setattr(prediction_service, "prediction_state_payload", blocked_state_payload)
+    # Hold all 48 clients at the application limit, not the OS listen backlog.
+    # The production request semaphore still has exactly eight slots.
+    monkeypatch.setattr(prediction_service._PredictionHTTPServer, "request_queue_size", 48)
     with _running_server(_Runtime()) as (base, server):
         baseline_handler_ids = _handler_thread_ids()
         baseline_socket_fds = _socket_fd_count()
@@ -427,7 +430,14 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
                     )
                     for _ in range(8)
                 ]
-                assert entered.wait(timeout=30)
+                assert entered.wait(timeout=30), {
+                    "counts": dict(counts),
+                    "http_load": server.http_load_snapshot(),
+                    "leaders": [
+                        future.result() if future.done() else "pending"
+                        for future in leaders
+                    ],
+                }
                 overflow = [clients.submit(overflow_request, base) for _ in range(40)]
                 assert overflow_attempted.wait(timeout=30)
 
@@ -11880,6 +11890,8 @@ class FakeRuntime:
         self.production_owner = self.mode == "production"
     def poll_shadow_failure(self):
         return None
+    def poll_fatal(self):
+        return None
     def stop(self):
         self.state = "STOPPED"
         self._lock.release()
@@ -12095,6 +12107,9 @@ def test_production_owner_must_be_ready_before_server_bind(
             self.state = state
             self.production_owner = owner
 
+        def poll_fatal(self) -> None:
+            return None
+
         def stop(self) -> None:
             self.state = "STOPPED"
 
@@ -12191,6 +12206,9 @@ def test_production_service_injects_notifier_from_notifier_config(
             self.state = "RUNNING"
             self.production_owner = True
 
+        def poll_fatal(self) -> None:
+            return None
+
         def stop(self) -> None:
             self.state = "STOPPED"
 
@@ -12251,6 +12269,9 @@ def test_production_bind_failure_stops_runtime_and_uses_one_metadata_snapshot(
         def start(self) -> None:
             self.state = "RUNNING"
             self.production_owner = True
+
+        def poll_fatal(self) -> None:
+            return None
 
         def stop(self) -> None:
             self.state = "STOPPED"
