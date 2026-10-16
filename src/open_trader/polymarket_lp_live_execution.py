@@ -953,8 +953,50 @@ class LPD2LiveExecution:
                     tuple(ids), stamp, True))
         return tuple(result)
 
+    def _refresh_protection_order(self, order, deadline):
+        if (order.terminal_proof is not None and order.terminal_proof.matched.state == 'known'):
+            return False  # final authoritative quantities are not ordinary polling targets
+        if order.presence == 'present' and order.terminal_proof is None:
+            return False
+        source = self._read_protection('order', order.key[1:], deadline)
+        row = source.value
+        if (not source.complete or source.error or not isinstance(row, Mapping)
+                or (row['side'], row['price'], row['original_size']) != (order.side, order.price.value, order.original_size.value)):
+            return False
+        stamp = self._source_stamp(source)
+        fact = lambda v: Fact('known', v, (stamp,))
+        proof = TerminalProof(order.key, row['status'], fact(row['original_size']), fact(row['size_matched']), stamp, True) if row['status'] in TERMINAL_ORDER_STATES else None
+        incoming = None if proof else CurrentOrderFact(order.key, order.side, row['status'],
+            fact(row['price']), fact(row['original_size']), fact(row['size_matched']), fact(row['remaining_size']),
+            'present', None, fact(row['order_type']), fact(row['expiration']), order.terms_version, stamp)
+        with self.state._lock:
+            current = self.state.snapshot()
+            disposition = self.state.accept_receipt_evidence(ReceiptEvidence(uuid4().hex, source.source_id,
+                self.account_id, self.process_epoch, current.current.cycle_generation, order.key, order.side,
+                order.terms_version, terminal_proof=proof, order_fact=incoming))
+            self._last_current_evidence = (source.source_id, 'protection_exact_order', disposition)
+            return disposition == 'applied'
+
     def _refresh_protection_evidence(self, deadline):
-        changed = False
+        changed, checked_orders = False, set()
+        def refresh_order(order):
+            if order.key in checked_orders:
+                return False
+            checked_orders.add(order.key)
+            return self._refresh_protection_order(order, deadline)
+
+        snapshot = self.state.snapshot()
+        deferred_anchors = set()
+        for key, tickets in tuple(self._deferred_protection_cancels.items()):
+            baseline, progress = snapshot.baselines.get(key), snapshot.progress.get(key)
+            if tickets and baseline is not None and progress is not None:
+                deferred_anchors.update((*key.scope[:3], oid) for oid in baseline.anchor_order_ids)
+        # These exact registered IDs have accepted pending cancel obligations,
+        # independently of any current-process BUY/opening association. The same
+        # Reader/deadline and canonical receipt guards own their final proof.
+        for order in snapshot.orders:
+            if order.key in deferred_anchors:
+                changed |= refresh_order(order)
         for scope in tuple(self.state.snapshot().openings):
             snapshot = self.state.snapshot()
             opening = snapshot.openings[scope]
@@ -962,28 +1004,7 @@ class LPD2LiveExecution:
                 continue
             orders = self._opening_orders(snapshot, opening)
             for order in orders:
-                if (order.terminal_proof is not None and order.terminal_proof.matched.state == 'known'):
-                    continue  # final authoritative quantities are not ordinary polling targets
-                if order.presence == 'present' and order.terminal_proof is None:
-                    continue
-                source = self._read_protection('order', order.key[1:], deadline)
-                row = source.value
-                if (not source.complete or source.error or not isinstance(row, Mapping)
-                        or (row['side'], row['price'], row['original_size']) != (order.side, order.price.value, order.original_size.value)):
-                    continue
-                stamp = self._source_stamp(source)
-                fact = lambda v: Fact('known', v, (stamp,))
-                proof = TerminalProof(order.key, row['status'], fact(row['original_size']), fact(row['size_matched']), stamp, True) if row['status'] in TERMINAL_ORDER_STATES else None
-                incoming = None if proof else CurrentOrderFact(order.key, order.side, row['status'],
-                    fact(row['price']), fact(row['original_size']), fact(row['size_matched']), fact(row['remaining_size']),
-                    'present', None, fact(row['order_type']), fact(row['expiration']), order.terms_version, stamp)
-                with self.state._lock:
-                    current = self.state.snapshot()
-                    disposition = self.state.accept_receipt_evidence(ReceiptEvidence(uuid4().hex, source.source_id,
-                        self.account_id, self.process_epoch, current.current.cycle_generation, order.key, order.side,
-                        order.terms_version, terminal_proof=proof, order_fact=incoming))
-                    self._last_current_evidence = (source.source_id, 'protection_exact_order', disposition)
-                    changed |= disposition == 'applied'
+                changed |= refresh_order(order)
             snapshot = self.state.snapshot()
             orders = self._opening_orders(snapshot, snapshot.openings[scope])
             needed = tuple(o for o in orders if o.size_matched.state == 'known' and o.size_matched.value > 0
