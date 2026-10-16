@@ -766,6 +766,26 @@ def _call(method: object, *args: object, **kwargs: object) -> object:
     return value
 
 
+class _D2MutationLease:
+    """One actual call's share of this D2 owner's process/file exclusion."""
+    def __init__(self, execution):
+        self.execution, self.released = execution, False
+
+    def allowed(self):
+        return not self.released and self.execution._lp_d2_permission()
+
+    def release(self):
+        if self.released:
+            return
+        self.released = True
+        execution = self.execution
+        with execution._lp_d2_lease_lock:
+            execution._lp_d2_lease_users -= 1
+            if execution._lp_d2_lease_users == 0:
+                lock, execution._lp_d2_lease = execution._lp_d2_lease, None
+                execution._release_global_lock(lock)
+
+
 class PredictionExecutionService:
     """One process/file-serialized pair execution state machine."""
 
@@ -781,6 +801,7 @@ class PredictionExecutionService:
         predict_trading: object | None = None,
         legacy_retired: bool = False,
         lp: object | None = None,
+        lp_d2: object | None = None,
     ) -> None:
         self._store = store
         self._monitor = monitor
@@ -790,6 +811,15 @@ class PredictionExecutionService:
         # the existing execution path.  Keep the collaborator optional so
         # shadow and legacy test fixtures retain their read-only surface.
         self._lp = lp
+        if lp_d2 is not None and (lp is None or lp_d2.store is not store
+                or lp_d2.trading is not trading or lp_d2.account_id != trading.config.wallet_address
+                or lp.store is not store or lp.exchange is not trading):
+            raise ValueError("lp_d2_attachment_identity")
+        self._lp_d2 = lp_d2
+        self._lp_d2_control_request = (None, None)
+        self._lp_d2_lease_lock = threading.Lock()
+        self._lp_d2_lease = None
+        self._lp_d2_lease_users = 0
         self._lp_dashboard_lock = threading.RLock()
         self._lp_reward_percentage_lock = threading.Lock()
         self._lp_share_watch_notification_lock = threading.Lock()
@@ -839,9 +869,9 @@ class PredictionExecutionService:
         self._cross_breaker_open = False
         self._first_live_order_verified = False
         set_lp_guard = getattr(self._lp, "set_mutation_guard", None)
-        if callable(set_lp_guard):
+        if callable(set_lp_guard) and lp_d2 is None:
             set_lp_guard(self.lp_mutation_allowed)
-        if self._lp is not None:
+        if self._lp is not None and lp_d2 is None:
             from .polymarket_lp_auto import LPAutoPool
             self._auto_pool = LPAutoPool(self)
             level_reader_setter = getattr(self._lp, "set_candidate_buy_price_level_reader", None)
@@ -860,6 +890,36 @@ class PredictionExecutionService:
         # LP_RESERVED_MANUAL_SESSION_ID session; the anchor row is created
         # once, lazily, before the first audit write.
         self._lp_manual_audit_ready = False
+        if lp_d2 is not None:
+            lp_d2.bind_mutation_admission(self, self._lp_d2_acquire)
+
+    def _lp_d2_permission(self):
+        live = self._lp_d2
+        current = live.state.snapshot().current
+        if live._closed or current.shutdown_requested or current.fatal_id is not None:
+            return False
+        try:
+            return not self._breaker_is_open() and self._store.active_execution() is None
+        except Exception:
+            return False  # unavailable mutation safety is never an SDK permission
+
+    def _lp_d2_acquire(self, action):
+        # These existing incident/execution SQL reads and nonblocking mutex
+        # acquisition always run outside CurrentLPState's coordination lock.
+        del action
+        with self._lp_d2_lease_lock:
+            if not self._lp_d2_permission():
+                return None
+            if self._lp_d2_lease is None:
+                lock = self._acquire_global_lock()
+                if lock is None:
+                    return None
+                if not self._lp_d2_permission():
+                    self._release_global_lock(lock)
+                    return None
+                self._lp_d2_lease = lock
+            self._lp_d2_lease_users += 1
+            return _D2MutationLease(self)
 
     def _lp_auto_pool(self):
         if self._lp is None:
@@ -867,10 +927,63 @@ class PredictionExecutionService:
         return self._auto_pool
 
     def lp_auto_state(self, *, include_intents=True):
+        if self._lp_d2 is not None:
+            return self._lp_d2_projection(include_intents=include_intents)
         return self._lp_auto_pool().state(include_intents=include_intents)
 
+    def _lp_d2_projection(self, *, include_intents):
+        live = self._lp_d2
+        settings = live.settings_status()
+        def policy_view(policy):
+            return dict(budget_usd=None if policy.budget is None else str(policy.budget),
+                target_buy_count=policy.target_count, buy_price_level=policy.buy_price_level,
+                config_version=policy.config_version, trading_config_version=policy.trading_config_version,
+                api_retry_interval_seconds=policy.api_retry_interval_seconds,
+                order_check_interval_seconds=policy.order_check_interval_seconds,
+                round_interval_seconds=policy.round_interval_seconds)
+        def json_value(value):
+            if isinstance(value, Decimal): return str(value)
+            if isinstance(value, datetime): return value.isoformat()
+            if hasattr(value, '__dataclass_fields__'):
+                return {f.name: json_value(getattr(value, f.name)) for f in fields(value)}
+            if isinstance(value, Mapping): return {str(k): json_value(v) for k, v in value.items()}
+            if isinstance(value, (tuple, list)): return [json_value(v) for v in value]
+            return value
+        with live.state._lock:
+            status = live.control.status()
+            snapshot = live.state.snapshot()
+            round_state = live.rounds.snapshot() if snapshot.current.cycle_generation else None
+            result = policy_view(settings['effective'])
+            result.update(desired_running=status.requested_running,
+                effective_running=snapshot.current.effective_running,
+                pause_confirmed=(status.requested_running is False and snapshot.current.effective_running is False
+                    and status.saved_version == status.requested_version and status.save_state == 'saved'
+                    and not status.native_save_in_flight and status.fatal is None),
+                control_request_status=self._lp_d2_control_request[0],
+                control_request_reason=self._lp_d2_control_request[1],
+                control_save_state=status.save_state, control_error=status.error_code,
+                requested_control_version=status.requested_version, saved_control_version=status.saved_version,
+                control_native_inflight=status.native_save_in_flight, fatal=json_value(status.fatal),
+                current_phase=snapshot.current.phase, round=json_value(round_state),
+                effective_settings=policy_view(settings['effective']),
+                pending_settings=policy_view(settings['requested']) if settings['pending'] else None,
+                settings_pending=settings['pending'], settings_native_inflight=settings['native_inflight'],
+                settings_error=settings['error'], effective_round_interval_seconds=None,
+                check_interval_seconds=None, cycle_mode='continuous')
+            for name, fact in (('buy_reserved_usd', snapshot.buy_reserved),
+                    ('inventory_cost_usd', snapshot.inventory_cost), ('current_exposure_usd', snapshot.current_exposure),
+                    ('new_capacity_usd', snapshot.new_capacity)):
+                result[name] = str(fact.value) if fact.state == 'known' else None
+            if include_intents:
+                result['account_buys'] = [json_value(o) for o in snapshot.active_orders if o.side == 'BUY']
+                result['intents'] = [dict(request_id=request_id) for request_id in sorted(
+                    live._active_sends | {h.identity.request_id for h in live._native_jobs.values() if h._thread.is_alive()})]
+            return result
+
     def set_lp_auto_wakeup(self, wakeup):
-        if self._lp is not None:
+        if self._lp_d2 is not None:
+            self._lp.set_candidate_preparation_wakeup(wakeup)
+        elif self._lp is not None:
             self._lp._facts_wakeup = wakeup
 
     def set_lp_auto_scheduler(self, scheduler):
@@ -902,19 +1015,43 @@ class PredictionExecutionService:
         return result
 
     def lp_auto_configure(self, payload, *, audit=None):
+        if self._lp_d2 is not None:
+            self._lp_d2.configure(payload, actor=(audit or {}).get('actor'))
+            self._lp_d2_wake()
+            return self.lp_auto_state(include_intents=False)
         return self._lp_auto_pool().configure(payload, audit=audit)
 
     def lp_auto_set_desired_running(self, running, *, audit=None):
+        if self._lp_d2 is not None:
+            result = self._lp_d2.request_running(running, actor=(audit or {}).get('actor'))
+            self._lp_d2_control_request = (result.status, result.reason)
+            self._lp_d2_wake()
+            return self.lp_auto_state(include_intents=False)
         return self._lp_auto_pool().set_desired_running(running, audit=audit)
 
     def lp_auto_scheduled_check(self):
+        if self._lp_d2 is not None:
+            self._lp_d2.poll()
+            result = self._lp_d2.run_once(self._lp.capture_qualified_pool())
+            self._lp_d2.run_protection_once()
+            return result
         return self._lp_auto_pool().run_once(reuse_facts=True)
 
     def lp_auto_run_once(self, *, round_id=None):
+        if self._lp_d2 is not None:
+            return self._lp_d2_wake()
         return self._lp_auto_pool().run_once(round_id=round_id)
 
     def lp_auto_reconcile_unknown(self):
+        if self._lp_d2 is not None:
+            return self._lp_d2_wake()
         return self._lp_auto_pool().reconcile_unknown()
+
+    def _lp_d2_wake(self):
+        scheduler = self._lp_auto_scheduler
+        if scheduler is not None:
+            scheduler.request_check()
+        return {'state': 'scheduled' if scheduler is not None else 'idle'}
 
     def lp_auto_report_facts(self, period_start=None, period_end=None):
         return self._lp_auto_pool().report_facts(period_start, period_end)
@@ -4683,6 +4820,8 @@ class PredictionExecutionService:
         venue while another submission is in flight.
         """
 
+        if self._lp_d2 is not None:
+            return self._lp_d2_wake()
         service = self._lp
         tick_with_lock = getattr(service, "tick_with_apply_lock", None)
         if callable(tick_with_lock):
