@@ -1809,8 +1809,90 @@ def test_release_operations_are_exclusive(
     release_harness: ReleaseHarness, contender: str, monkeypatch, request,
 ) -> None:
     old = release_harness.candidate
-    next_release = release_harness.make_checkout("exclusive-next")
-    final_release = release_harness.make_checkout("exclusive-final")
+    # This node defers real cloud loading and retains opt-in observation.
+    # Select its fixture bootstrap before disposable source commit/artifact assembly.
+    bootstrap_recording = r'''import os as _phase_os
+_phase_path = _phase_os.environ.get('LP_EXCLUSIVE_BOOTSTRAP_PHASES')
+if _phase_path:
+    import atexit as _phase_atexit, json as _phase_json, sys as _phase_sys, time as _phase_time
+    _phase_fd = _phase_os.open(_phase_path, _phase_os.O_WRONLY | _phase_os.O_APPEND | _phase_os.O_CREAT, 0o600)
+    def _phase_record(phase, **facts):
+        raw = _phase_json.dumps(dict(phase=phase, pid=_phase_os.getpid(),
+            ppid=_phase_os.getppid(), pgid=_phase_os.getpgid(0),
+            monotonic_ns=_phase_time.monotonic_ns(), bootstrap=__file__,
+            argv0=_phase_sys.argv[0], **facts), separators=(',', ':')).encode() + b'\n'
+        _phase_os.write(_phase_fd, raw)
+    def _phase_finish():
+        try: _phase_record('atexit')
+        finally: _phase_os.close(_phase_fd)
+    _phase_record('entry')
+    _phase_atexit.register(_phase_finish)
+'''
+    cloud_import = 'from open_trader import prediction_cloud'
+    assert MANAGER_EXTERNAL_BOUNDARIES.count(cloud_import) == 1
+    cloud_setup = cloud_import + '\nprediction_cloud.UNIT_PATH = Path(__file__).parent / "fixture-absent-systemd.service"'
+    assert MANAGER_EXTERNAL_BOUNDARIES.count(cloud_setup) == 1
+    lazy_cloud_setup = r'''import sys as _cloud_sys
+_cloud_name = 'open_trader.prediction_cloud'
+_cloud_finders = tuple(_cloud_sys.meta_path)
+def _cloud_isolate(module, loader, requester):
+    # The real module code has run. Preserve its actual file/spec/loader and
+    # set the original external fixture boundary before import returns.
+    module.UNIT_PATH = Path(__file__).parent / 'fixture-absent-systemd.service'
+    if _phase_path:
+        _phase_record('cloud_isolated', module_file=module.__file__,
+            spec_origin=module.__spec__.origin, spec_name=module.__spec__.name,
+            unit_path=str(module.UNIT_PATH), native_loader=type(loader).__name__,
+            loader_identity_preserved=(module.__loader__ is loader and module.__spec__.loader is loader),
+            requester_module=requester[0], requester_function=requester[1],
+            requester_file=requester[2])
+class _CloudPostLoadFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != _cloud_name:
+            return None
+        requester = ('', '', '')
+        frame = _cloud_sys._getframe(1)
+        while frame is not None:
+            if frame.f_globals.get('__name__') == 'open_trader.prediction_start_guard':
+                requester = (frame.f_globals['__name__'], frame.f_code.co_name, frame.f_code.co_filename)
+                break
+            frame = frame.f_back
+        for finder in _cloud_finders:
+            spec = finder.find_spec(fullname, path, target)
+            if spec is None:
+                continue
+            loader = spec.loader
+            native_exec = loader.exec_module
+            def execute(module):
+                if _phase_path: _phase_record('before_cloud')
+                try:
+                    result = native_exec(module)
+                finally:
+                    # Keep the original loader object/interface and metadata.
+                    loader.exec_module = native_exec
+                if _phase_path: _phase_record('after_cloud', module_file=module.__file__,
+                    spec_origin=module.__spec__.origin, native_exec_restored=(loader.exec_module is native_exec))
+                _cloud_isolate(module, loader, requester)
+                return result
+            loader.exec_module = execute
+            return spec
+        return None
+if _cloud_name in _cloud_sys.modules:
+    _cloud_existing = _cloud_sys.modules[_cloud_name]
+    if _cloud_existing is None:
+        raise ModuleNotFoundError('real cloud import blocked in sys.modules', name=_cloud_name)
+    if _phase_path: _phase_record('cloud_already_loaded', module_file=_cloud_existing.__file__)
+    _cloud_isolate(_cloud_existing, _cloud_existing.__loader__, ('already_loaded', '', ''))
+_cloud_sys.meta_path.insert(0, _CloudPostLoadFinder())
+'''
+    observed_bootstrap = bootstrap_recording + MANAGER_EXTERNAL_BOUNDARIES.replace(
+        cloud_setup, lazy_cloud_setup)
+    observed_bootstrap += "\nif _phase_path: _phase_record('installed')\n"
+    with monkeypatch.context() as bootstrap_selection:
+        bootstrap_selection.setitem(globals(), 'MANAGER_EXTERNAL_BOUNDARIES', observed_bootstrap)
+        next_release = release_harness.make_checkout("exclusive-next")
+        final_release = release_harness.make_checkout("exclusive-final")
+    bootstrap_phase_path = release_harness.root / 'exclusive-bootstrap-phases.jsonl'
     release_harness.install(old, check=True)
     record_path = release_harness.runtime_root / "prediction-service-runtime.json"
     data_sentinel = release_harness.runtime_root / "data" / "sentinel"
@@ -1911,7 +1993,8 @@ def test_release_operations_are_exclusive(
         if isinstance(command,list) and command and command[0]==str(
                 next_release.path/'scripts/install_prediction_service_launchd.sh'):
             command=[*command,'--operation-nonce',operation_nonce]
-            kwargs['env']={**kwargs['env'],'BASH_ENV':str(trace_setup)}
+            kwargs['env']={**kwargs['env'],'BASH_ENV':str(trace_setup),
+                'LP_EXCLUSIVE_BOOTSTRAP_PHASES':str(bootstrap_phase_path)}
             kwargs['pass_fds']=(*kwargs.get('pass_fds',()),trace_fd)
         return native_popen(command,*args,**kwargs)
     process_started=time.monotonic()
@@ -1921,7 +2004,8 @@ def test_release_operations_are_exclusive(
     identity_path=release_harness.root/'exclusive-native-process.json'
     process_identity=dict(pid=process.pid,pgid=process.pid,started_at=process_started,
         trace_path=str(trace_path),selected_target=str(next_release.path),
-        selected_sha=next_release.sha,operation_nonce=operation_nonce)
+        selected_sha=next_release.sha,operation_nonce=operation_nonce,
+        bootstrap_phase_path=str(bootstrap_phase_path))
     identity_path.write_text(json.dumps(process_identity))
     try:
         deadline = time.monotonic() + 10
@@ -1985,6 +2069,29 @@ def test_release_operations_are_exclusive(
         process_identity.update(returncode=process.returncode,ended_at=time.monotonic())
         identity_path.write_text(json.dumps(process_identity))
 
+    phase_records=[json.loads(line) for line in bootstrap_phase_path.read_text().splitlines()]
+    assert phase_records and all(row['pgid']==process.pid for row in phase_records)
+    assert all(Path(row['bootstrap']).resolve()==(next_release.path/'src/sitecustomize.py').resolve()
+        for row in phase_records)
+    known_os={'launchctl','lsof','curl','owner-probe','ps'}
+    os_pids={row['pid'] for row in phase_records if Path(row['argv0']).name in known_os}
+    assert os_pids
+    cloud_phases={'before_cloud','after_cloud','cloud_isolated','cloud_already_loaded'}
+    assert not any(row['pid'] in os_pids and row['phase'] in cloud_phases for row in phase_records)
+    actual_cloud=[row for row in phase_records if row['phase']=='cloud_isolated']
+    assert actual_cloud and any(row['requester_module']=='open_trader.prediction_start_guard'
+        and row['requester_function']=='_installed_systemd_selects' for row in actual_cloud)
+    for row in actual_cloud:
+        assert Path(row['module_file']).resolve()==(next_release.path/'src/open_trader/prediction_cloud.py').resolve()
+        assert row['spec_origin']==row['module_file'] and row['spec_name']=='open_trader.prediction_cloud'
+        assert row['loader_identity_preserved'] is True
+        assert Path(row['unit_path'])==next_release.path/'src/fixture-absent-systemd.service'
+        same_pid={event['phase']:event for event in phase_records if event['pid']==row['pid']}
+        assert ('cloud_already_loaded' in same_pid or
+            {'before_cloud','after_cloud'}<=set(same_pid))
+        if 'after_cloud' in same_pid:
+            assert same_pid['after_cloud']['native_exec_restored'] is True
+            assert same_pid['after_cloud']['monotonic_ns']<=row['monotonic_ns']
     assert release_harness.calls.named('gh')==prepared_remote_calls
     assert release_harness.runtime_record['candidate']['lp_validation']['operation_nonce']==operation_nonce
     assert release_harness.state["max_pids"] == 1
