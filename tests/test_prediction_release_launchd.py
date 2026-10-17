@@ -1806,7 +1806,7 @@ def test_release_recheck_ignores_http_load_changes(
 
 @pytest.mark.parametrize("contender", ["upgrade", "uninstall"])
 def test_release_operations_are_exclusive(
-    release_harness: ReleaseHarness, contender: str,
+    release_harness: ReleaseHarness, contender: str, monkeypatch, request,
 ) -> None:
     old = release_harness.candidate
     next_release = release_harness.make_checkout("exclusive-next")
@@ -1816,6 +1816,68 @@ def test_release_operations_are_exclusive(
     data_sentinel = release_harness.runtime_root / "data" / "sentinel"
     data_sentinel.parent.mkdir(parents=True, exist_ok=True)
     data_sentinel.write_bytes(b"keep")
+    # Prepare through the actual public installer before installing contention.
+    # Only its pending selection may change; the old owner stays untouched.
+    import hashlib
+    from open_trader.prediction_release import validate_lp_validation
+    before_prepare=release_harness.runtime_record
+    prior_pending=before_prepare.get('pending_lp_validation')
+    state_before_prepare=release_harness.state
+    calls_before_prepare=release_harness.calls.all()
+    plist_before_prepare=release_harness.plist.read_bytes()
+    permit_path=release_harness.runtime_root/'lp-start-guard/permit.json'
+    permit_before_prepare=permit_path.read_bytes()
+    native_popen=subprocess.Popen
+    prepare_commands=[]
+    def prepare_popen(command,*args,**kwargs):
+        if isinstance(command,list) and command and command[0]==str(
+                next_release.path/'scripts/install_prediction_service_launchd.sh'):
+            command=[*command,'--prepare-target']
+            prepare_commands.append(command)
+        return native_popen(command,*args,**kwargs)
+    with monkeypatch.context() as preparation:
+        preparation.setattr(subprocess,'Popen',prepare_popen)
+        prepared_result=release_harness.install(next_release)
+    proof_path=release_harness.root/'exclusive-preparation.json'
+    prepared_record=release_harness.runtime_record
+    proof=dict(commands=prepare_commands,returncode=prepared_result.returncode,
+        stdout=prepared_result.stdout,stderr=prepared_result.stderr,
+        record_before=before_prepare,record_after=prepared_record,
+        prior_pending=prior_pending,state_before=state_before_prepare,
+        state_after=release_harness.state,
+        calls=release_harness.calls.all()[len(calls_before_prepare):])
+    proof_path.write_text(json.dumps(proof))
+    assert prepared_result.returncode==0,prepared_result.stderr
+    prepared=json.loads(prepared_result.stdout)
+    assert prepared['status']=='PREPARED'
+    operation_nonce=prepared['operation_nonce']
+    assert isinstance(operation_nonce,str) and operation_nonce
+    assert len(prepare_commands)==1 and prepare_commands[0][-1]=='--prepare-target'
+    assert {k:v for k,v in prepared_record.items() if k!='pending_lp_validation'}=={
+        k:v for k,v in before_prepare.items() if k!='pending_lp_validation'}
+    pending=prepared_record['pending_lp_validation']
+    assert pending['operation_nonce']==operation_nonce
+    assert pending['source_sha']==next_release.sha
+    assert pending['release_root']==str(next_release.path.resolve())
+    assert pending['runtime_root']==str(release_harness.runtime_root.resolve())
+    assert pending['python']==sys.executable
+    assert pending['config_selection']==dict(path=str(release_harness.config.resolve()),
+        sha256=hashlib.sha256(release_harness.config.read_bytes()).hexdigest())
+    assert validate_lp_validation(pending,release_root=next_release.path,
+        runtime_root=release_harness.runtime_root,python=sys.executable,
+        config_path=release_harness.config)==pending
+    assert state_before_prepare['loaded'] is True
+    assert state_before_prepare['owner_available'] is False
+    assert state_before_prepare['cwd']==str(old.path)
+    assert release_harness.state==state_before_prepare
+    assert [call for call in release_harness.calls.all() if ' bootout ' in f' {call} '
+        or ' bootstrap ' in f' {call} ']==[call for call in calls_before_prepare
+        if ' bootout ' in f' {call} ' or ' bootstrap ' in f' {call} ']
+    assert release_harness.plist.read_bytes()==plist_before_prepare
+    assert permit_path.read_bytes()==permit_before_prepare
+    assert data_sentinel.read_bytes()==b'keep'
+    prepared_remote_calls=release_harness.calls.named('gh')
+    assert len(prepared_remote_calls)>len([call for call in calls_before_prepare if call.startswith('gh ')])
     state = release_harness.state
     state.update(
         print_barrier_count=1,
@@ -1828,7 +1890,39 @@ def test_release_operations_are_exclusive(
     release = Path(state["print_barrier_release"])
     record_bytes = record_path.read_bytes()
     plist_bytes = release_harness.plist.read_bytes()
-    process = release_harness.install_process(next_release)
+    # Opt-in observation for this node only. Keep the actual shebang/installer
+    # and native verifier untouched; Bash builtins write to a separate file FD.
+    trace_path=release_harness.root/'exclusive-native-trace.log'
+    trace_handle=trace_path.open('ab',buffering=0)
+    request.addfinalizer(trace_handle.close)
+    trace_fd=trace_handle.fileno()
+    trace_setup=release_harness.root/'exclusive-native-trace-env.sh'
+    debug=("printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "
+        '"$SECONDS" "${BASHPID:-$$}" "${BASH_SOURCE[0]}" "$LINENO" "$?" "$BASH_COMMAND" '
+        f'>&{trace_fd}')
+    import shlex
+    trace_setup.write_text(f"if {{ : >&{trace_fd}; }} 2>/dev/null; then\n"
+        f"  printf 'BASH_START %s %s\\n' \"$BASH_VERSION\" \"$$\" >&{trace_fd}\n"
+        "  set -o functrace\n"
+        f"  trap {shlex.quote(debug)} DEBUG\n"
+        "fi\n")
+    native_popen=subprocess.Popen
+    def observed_popen(command,*args,**kwargs):
+        if isinstance(command,list) and command and command[0]==str(
+                next_release.path/'scripts/install_prediction_service_launchd.sh'):
+            command=[*command,'--operation-nonce',operation_nonce]
+            kwargs['env']={**kwargs['env'],'BASH_ENV':str(trace_setup)}
+            kwargs['pass_fds']=(*kwargs.get('pass_fds',()),trace_fd)
+        return native_popen(command,*args,**kwargs)
+    process_started=time.monotonic()
+    with monkeypatch.context() as observation:
+        observation.setattr(subprocess,'Popen',observed_popen)
+        process = release_harness.install_process(next_release)
+    identity_path=release_harness.root/'exclusive-native-process.json'
+    process_identity=dict(pid=process.pid,pgid=process.pid,started_at=process_started,
+        trace_path=str(trace_path),selected_target=str(next_release.path),
+        selected_sha=next_release.sha,operation_nonce=operation_nonce)
+    identity_path.write_text(json.dumps(process_identity))
     try:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and not marker.exists():
@@ -1856,16 +1950,43 @@ def test_release_operations_are_exclusive(
         assert release_harness.plist.read_bytes() == plist_bytes
         assert data_sentinel.read_bytes() == b"keep"
     finally:
+        process_identity['released_at']=time.monotonic()
         release.touch()
         try:
             stdout, stderr = process.communicate(timeout=10)
         except subprocess.TimeoutExpired:
+            # Preserve actual native descendant identity before existing kill.
+            # This is an observation, never a completion/readiness substitute.
+            try:
+                native_ps=subprocess.run(['/bin/ps','-axo','pid=,ppid=,pgid=,stat=,etime=,args='],
+                    capture_output=True,text=True,timeout=1)
+                members=[]
+                for line in native_ps.stdout.splitlines():
+                    fields=line.split(None,5)
+                    if len(fields)==6 and int(fields[2])==process.pid:
+                        members.append(dict(zip(('pid','ppid','pgid','state','elapsed','command'),fields)))
+                process_identity['timeout_observation']=dict(observed_at=time.monotonic(),
+                    ps_returncode=native_ps.returncode,ps_stderr=native_ps.stderr,members=members)
+            except Exception as exc:
+                process_identity['timeout_observation']=dict(error_type=type(exc).__name__,error=str(exc))
+            identity_path.write_text(json.dumps(process_identity))
             os.killpg(process.pid, signal.SIGKILL)
             stdout, stderr = process.communicate(timeout=5)
+            process_identity.update(returncode=process.returncode,killed_after_timeout=True)
+            identity_path.write_text(json.dumps(process_identity))
+            # CI retains test.log/JUnit, not pytest's temporary directory.
+            # Emit only after native termination; never fill child pipes.
+            print('F_NATIVE_TIMEOUT '+json.dumps(process_identity),flush=True)
+            try:print('F_NATIVE_TRACE_TAIL\n'+trace_path.read_text()[-32768:],flush=True)
+            except OSError as exc:print('F_NATIVE_TRACE_UNKNOWN '+repr(exc),flush=True)
             raise AssertionError("installer did not stop after release:\n" + stdout + stderr)
         if process.returncode != 0:
             raise AssertionError(stdout + stderr)
+        process_identity.update(returncode=process.returncode,ended_at=time.monotonic())
+        identity_path.write_text(json.dumps(process_identity))
 
+    assert release_harness.calls.named('gh')==prepared_remote_calls
+    assert release_harness.runtime_record['candidate']['lp_validation']['operation_nonce']==operation_nonce
     assert release_harness.state["max_pids"] == 1
     lock_path = release_harness.agents / f".{LABEL}.release.lock"
     assert lock_path.exists()

@@ -152,12 +152,19 @@ def test_public_metadata_returns_while_sqlite_cache_write_is_blocked(
         TradingConfig("0x" + "1" * 40, "0x" + "2" * 40),
         client=object(), public_client_factory=OfflinePublic, metadata_cache=store,
     )
-    # Warm restore, pruning and schema setup stay synchronous. Complete them
-    # through the public reader without producing an entry to save.
+    # Schema/warm restore is synchronous; physical pruning is native writer
+    # work. Prime without saving a row, then prove that maintenance completed.
     prime = adapter.lp_market_metadata_batch((prime_id,))
     assert prime["state"] == "unknown"
     assert prime["confirmed_absent_ids"] == ()
     assert prime["failed_ids"] == {prime_id: "market_read_RuntimeError"}
+    prime_status = _wait_status(adapter, lambda status:
+        status["prune_completed_transactions"] == 1
+        and status["prune_pending"] == status["prune_inflight"] == 0
+        and status["pending_entries"] == status["inflight_entries"] == 0)
+    assert prime_status["prune_failed"] == prime_status["prune_unknown_outcome"] == 0
+    assert prime_status["saved_entries"] == 0
+    (tmp_path / "prime-maintenance-proof.json").write_text(__import__('json').dumps(prime_status))
 
     write_started = threading.Event()
     write_finished = threading.Event()

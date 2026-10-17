@@ -283,24 +283,80 @@ def child(runtime_root,port,scenario,config_path):
         snapshot_code=CurrentLPState.snapshot.__code__
         reservations_code=PredictionExecutionService.lp_auto_reservations.__code__
         configure_code=LPD2LiveExecution.configure.__code__
+        reservations_admitted=threading.Event()
+        configure_admitted=threading.Event()
+        admitted={}
+        reservations_observed=threading.Event()
+        configure_observed=threading.Event()
+        def wait_phase(phase):
+            deadline=time.monotonic()+10
+            while not phase.is_set():
+                assert time.monotonic()<deadline,'real lock scheduling watchdog'
+                threading.Event().wait(.001)
+        def record_admission(frame,name,live):
+            caller=frame.f_back
+            while caller is not None and caller.f_code.co_name not in ('do_GET','do_POST'):
+                caller=caller.f_back
+            assert caller is not None
+            handler=caller.f_locals['self']
+            expected=('/api/prediction-arbitrage/lp/auto/reservations' if name=='reservations'
+                else '/api/prediction-arbitrage/lp/auto/config')
+            assert handler.path==expected
+            assert not live.state._lock._is_owned()
+            assert not live._settings_lock._is_owned()
+            proof=dict(method=frame.f_code.co_name,self_id=id(frame.f_locals['self']),
+                live_id=id(live),request_path=handler.path,handler_id=id(handler),
+                thread_id=threading.get_ident(),entered_at=time.monotonic())
+            (events/('repair-'+name+'-admission.json')).write_text(json.dumps(proof))
+            mark('repair-'+name+'-admitted')
+        observation_done=threading.Event()
+        def finish_observation():
+            if reservations_observed.is_set() and configure_observed.is_set():
+                observation_done.set()
+                threading.settrace(None)
+        def configure_lines(frame,event,arg):
+            if observation_done.is_set():
+                frame.f_trace=None
+                return None
+            if event=='line' and frame.f_locals['self']._settings_lock._is_owned():
+                mark('repair-configure-settings-held')
+                configure_observed.set()
+                finish_observation()
+                frame.f_trace=None
+                return None
+            return configure_lines
         def observe_lock_order(frame,event,arg):
-            # Observe real native RLock ownership; never wrap/replace a lock
-            # or any authority operation. Only schedule the two HTTP threads.
-            if not (events/'repair-lock-arm').exists():return observe_lock_order
-            if (event=='call' and frame.f_code is snapshot_code
-                    and frame.f_back.f_code is reservations_code
-                    and not (events/'repair-reservations-state-held').exists()):
+            # Only actual target/caller frames can perform an arm-file read.
+            # One-shot memory phases end all line/FS tracing after observation.
+            if observation_done.is_set() or event!='call':return None
+            if (frame.f_code is snapshot_code and frame.f_back.f_code is reservations_code
+                    and not reservations_observed.is_set()):
+                if not (events/'repair-lock-arm').exists():return None
                 assert frame.f_locals['self']._lock._is_owned()
                 mark('repair-reservations-state-held')
-                deadline=time.monotonic()+10
-                while not (events/'repair-configure-settings-held').exists():
-                    assert time.monotonic()<deadline,'real lock scheduling watchdog'
-                    threading.Event().wait(.001)
-            if (event=='line' and frame.f_code is configure_code
-                    and frame.f_locals['self']._settings_lock._is_owned()
-                    and not (events/'repair-configure-settings-held').exists()):
-                mark('repair-configure-settings-held')
-            return observe_lock_order
+                reservations_observed.set()
+                finish_observation()
+                assert frame.f_locals['self'] is admitted['live'].state
+                wait_phase(configure_observed)
+                return None
+            if frame.f_code is reservations_code and not reservations_admitted.is_set():
+                if not (events/'repair-lock-arm').exists():return None
+                execution=frame.f_locals['self'];live=execution._lp_d2
+                record_admission(frame,'reservations',live)
+                admitted.update(execution=execution,live=live)
+                reservations_admitted.set()
+                wait_phase(configure_admitted)
+                return None
+            if frame.f_code is configure_code and not configure_observed.is_set():
+                if not (events/'repair-lock-arm').exists():return None
+                live=frame.f_locals['self']
+                assert reservations_admitted.is_set() and live is admitted['live']
+                assert frame.f_back.f_locals['self'] is admitted['execution']
+                record_admission(frame,'configure',live)
+                configure_admitted.set()
+                wait_phase(reservations_observed)
+                return configure_lines
+            return None
         threading.settrace(observe_lock_order)
     optional_lock=threading.Lock()
     optional_counts=dict(calls=0,active=0,max_active=0)
@@ -706,6 +762,16 @@ def child(runtime_root,port,scenario,config_path):
         return adapter
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=NativeSQL))))
+        if scenario=='rollback-current-repair-lock-order':
+            native_thread_join=threading.Thread.join
+            def observed_settings_join(thread,*args,**kwargs):
+                result=native_thread_join(thread,*args,**kwargs)
+                if thread.name=='lp-settings-save':
+                    (events/'repair-settings-native-join.json').write_text(json.dumps(dict(
+                        ident=thread.ident,alive_after_join=thread.is_alive(),
+                        committed=len(list(events.glob('repair-settings-commit-*'))))))
+                return result
+            patch.setattr(threading.Thread,'join',observed_settings_join)
         if scenario.startswith('consumer-ci-native-'):
             from open_trader import prediction_runtime as ci_native_runtime
             from open_trader.prediction_service import _PredictionHTTPServer

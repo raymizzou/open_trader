@@ -660,7 +660,7 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
         'ap-hongkong','wallet','v1','reader','production',1)
     unit=child.root/'installed.service';unit.write_text(cloud.render_unit(c));unit.chmod(0o644)
     operation=child.root/'systemd-operation.lock';operation.touch(mode=0o600)
-    actor=[0,0];owners={};actual_stat=os.stat;actual_lstat=os.lstat;actual_fstat=os.fstat
+    actor=[0,0];owners={};owner_paths={};actual_stat=os.stat;actual_lstat=os.lstat;actual_fstat=os.fstat
     actual_connect=socket.socket.connect_ex;actual_open=os.open;actual_mkdir=os.mkdir;actual_replace=os.replace
     base_process=subprocess.run;native_io_open=io.open
     manager_state=dict(LoadState='loaded',ActiveState='inactive',SubState='dead',MainPID='0',
@@ -672,9 +672,20 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
             return subprocess.CompletedProcess(command,0,'\n'.join(k+'='+v for k,v in manager_state.items()),'')
         return base_process(command,*a,**kw)
     service=(9123,9124)
+    def associate(path,info,owner):
+        key=(info.st_dev,info.st_ino)
+        owners[key]=owner;owner_paths[key]=Path(path)
     def metadata(info,path=None):
         key=(info.st_dev,info.st_ino)
-        if key in owners:uid,gid=owners[key]
+        registered=owner_paths.get(key)
+        associated=False
+        if registered is not None and (path is None or Path(path)==registered):
+            try:
+                current=actual_lstat(registered)
+                associated=(current.st_dev,current.st_ino)==key
+            except FileNotFoundError:
+                pass
+        if associated and key in owners:uid,gid=owners[key]
         elif path is not None and (Path(path)==root or Path(path).is_relative_to(root)):
             uid,gid=((0,service[1]) if Path(path)==c.record else service)
         else:uid,gid=0,0
@@ -692,15 +703,15 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
     def native_chown(fd,uid,gid):
         info=actual_fstat(fd);owners[(info.st_dev,info.st_ino)]=(uid,gid)
     def path_chown(path,uid,gid,**kw):
-        info=actual_lstat(path);owners[(info.st_dev,info.st_ino)]=(uid,gid)
+        info=actual_lstat(path);associate(path,info,(uid,gid))
     def native_open(path,*a,**kw):
         try:actual_lstat(path);existed=True
         except FileNotFoundError:existed=False
         fd=actual_open(path,*a,**kw)
         info=actual_fstat(fd);key=(info.st_dev,info.st_ino)
-        if not existed:owners[key]=tuple(actor)
-        elif key not in owners:
-            selected=metadata(info,path);owners[key]=(selected.st_uid,selected.st_gid)
+        if not existed:associate(path,info,tuple(actor))
+        else:
+            selected=metadata(info,path);associate(path,info,(selected.st_uid,selected.st_gid))
         return fd
     def native_io(file,*a,**kw):
         tracked=isinstance(file,(str,os.PathLike)) and Path(file)==c.runtime_lock
@@ -709,20 +720,46 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
             except FileNotFoundError:existed=False
         handle=native_io_open(file,*a,**kw)
         if tracked and not existed:
-            info=actual_fstat(handle.fileno());owners[(info.st_dev,info.st_ino)]=tuple(actor)
+            info=actual_fstat(handle.fileno());associate(file,info,tuple(actor))
         return handle
     def native_mkdir(path,*a,**kw):
         actual_mkdir(path,*a,**kw)
-        info=actual_lstat(path);owners[(info.st_dev,info.st_ino)]=tuple(actor)
+        info=actual_lstat(path);associate(path,info,tuple(actor))
     def publish(source,destination):
         if Path(destination) in (c.record,child.permit_path):
             info=os.stat(source)
             expected=(0,9124,0o640) if Path(destination)==c.record else (9123,9124,0o600)
             assert (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))==expected
+        info=actual_lstat(source);key=(info.st_dev,info.st_ino)
         actual_replace(source,destination)
+        if owner_paths.get(key)==Path(source):owner_paths[key]=Path(destination)
     # Assemble native file timestamps before the isolated ownership/stat view.
     shutil.copytree(child.release_root,child.root/'next-compatible-release',
         ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
+    # Controlled association oracle, not a claim that this run reused an inode.
+    # These two actual native objects differ. A foreign cached service owner
+    # cannot override the declared root release object or its native mode/type.
+    probe=child.root/'next-compatible-release/.git/objects'
+    native=actual_lstat(probe);key=(native.st_dev,native.st_ino)
+    foreign=actual_lstat(config)
+    assert key!=(foreign.st_dev,foreign.st_ino)
+    owners[key]=service;owner_paths[key]=config
+    observed=metadata(native,probe)
+    assert (observed.st_uid,observed.st_gid)==(0,0)
+    assert (observed.st_dev,observed.st_ino,observed.st_mode)==(native.st_dev,native.st_ino,native.st_mode)
+    if native.st_uid==0:
+        assert (observed.st_uid,observed.st_gid)==(native.st_uid,native.st_gid)
+    (child.root/'owner-association-proof.json').write_text(json.dumps(dict(
+        path=str(probe),foreign_path=str(config),
+        native=dict(dev=native.st_dev,ino=native.st_ino,uid=native.st_uid,gid=native.st_gid,mode=oct(native.st_mode)),
+        foreign=dict(dev=foreign.st_dev,ino=foreign.st_ino),
+        returned=dict(uid=observed.st_uid,gid=observed.st_gid,mode=oct(observed.st_mode)),
+        simulated_foreign_owner=service,actual_inode_reuse_claimed=False)))
+    # A still-associated service-owned object remains service-owned; this
+    # fixture must never turn an actually unsafe selected object into root.
+    owner_paths[key]=probe
+    assert (metadata(native,probe).st_uid,metadata(native,probe).st_gid)==service
+    owners.pop(key);owner_paths.pop(key)
     with monkeypatch.context() as boundary:
         boundary.setattr(os,'geteuid',lambda:actor[0]);boundary.setattr(os,'getuid',lambda:actor[0])
         boundary.setattr(os,'getegid',lambda:actor[1]);boundary.setattr(os,'getgid',lambda:actor[1])
@@ -805,7 +842,8 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
             # actual operation lock; the retained-record phase below also
             # independently exercises the guard's fresh owner-file creation.
             for temporary in (c.record,c.runtime_lock):
-                info=actual_lstat(temporary);temporary.unlink();owners.pop((info.st_dev,info.st_ino),None)
+                info=actual_lstat(temporary);temporary.unlink();key=(info.st_dev,info.st_ino)
+                owners.pop(key,None);owner_paths.pop(key,None)
         # Real management publication must retain validation and publish the
         # root-write/service-read metadata before the atomic replace.
         write_prediction_runtime_record(c.record,{**retained,'manager':'systemd'},owner=(0,service[1]),mode=0o640)

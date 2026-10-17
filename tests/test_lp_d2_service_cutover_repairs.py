@@ -14,7 +14,16 @@ from tests.lp_d2_service_harness import ServiceChild
 
 def test_reservations_and_settings_configuration_complete_concurrently(tmp_path):
     threads=[]
-    with ServiceChild(tmp_path,scenario='rollback-current-repair-lock-order') as child:
+    class ObservedLockChild(ServiceChild):
+        def request(self,path,payload=None):
+            try:return super().request(path,payload)
+            except (OSError,ValueError) as exc:
+                with (self.events/'repair-http-errors.jsonl').open('a') as out:
+                    out.write(json.dumps(dict(path=path,error_type=type(exc).__name__,
+                        error=str(exc),status=getattr(exc,'code',None),
+                        errno=getattr(exc,'errno',None),observed_at=time.monotonic()))+'\n')
+                raise
+    with ObservedLockChild(tmp_path,scenario='rollback-current-repair-lock-order') as child:
         try:
             child.release('metadata')
             child.start(expected_running=False)
@@ -32,11 +41,12 @@ def test_reservations_and_settings_configuration_complete_concurrently(tmp_path)
             reservations=threading.Thread(target=request,args=('reservations',
                 '/api/prediction-arbitrage/lp/auto/reservations'),daemon=True)
             threads.append(reservations);reservations.start()
-            child.wait('repair-reservations-state-held',timeout=5)
+            child.wait('repair-reservations-admitted',timeout=5)
             configure=threading.Thread(target=request,args=('configure',
                 '/api/prediction-arbitrage/lp/auto/config',
                 {'api_retry_interval_seconds':61,'expected_config_version':1}),daemon=True)
             threads.append(configure);configure.start()
+            child.wait('repair-reservations-state-held',timeout=5)
             child.wait('repair-configure-settings-held',timeout=5)
             deadline=time.monotonic()+5
             for thread in threads:thread.join(max(0,deadline-time.monotonic()))
@@ -75,6 +85,15 @@ def test_reservations_and_settings_configuration_complete_concurrently(tmp_path)
             assert child.wait_exit()==0
             child.assert_owner_available()
             assert json.loads(child.permit_path.read_text())['state']=='ARMED'
+        except BaseException:
+            if child.process.poll() is None:
+                child.process.send_signal(signal.SIGUSR1)
+            (child.events/'repair-state-failure.json').write_text(json.dumps(dict(
+                child_pid=child.process.pid,returncode=child.process.poll(),
+                native_commit_files=[f.name for f in child.events.glob('repair-settings-commit-*')],
+                native_join=(json.loads(child.marker('repair-settings-native-join.json').read_text())
+                    if child.marker('repair-settings-native-join.json').exists() else None))))
+            raise
         finally:
             # A real deadlock cannot obey SIGTERM. The independent watchdog
             # owns this disposable child PID only; never target a host service.
