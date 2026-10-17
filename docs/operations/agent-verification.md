@@ -136,7 +136,7 @@ Actual reads, edits or tool execution establish progress; a `working` badge alon
 does not prove recovery. After 10 continuous minutes without actual progress,
 Main proactively reports the specific blocker and recommends waiting or changing
 the implementation model. Do not continue blind retriggers indefinitely. The
-user decides any model change; the independent reviewer model rule is unchanged.
+user decides any model change; this does not authorize model changes for other roles.
 This threshold is not a test/CI timeout and does not authorize interrupting active
 processes.
 
@@ -419,7 +419,7 @@ as pending permission. Claim dots has started only with observed evidence.
 ### Parallel post-publication review and CI
 
 Immediately after publication, start a distinct independent Herdr
-GLM-5.3/max reviewer pane alongside remote CI. Use a fresh reviewer for the initial
+reviewer pane alongside remote CI. Use a fresh reviewer for the initial
 independent review; reuse it for this target's in-scope repairs. An explicitly
 local-only unpublished review uses the staged diff; published reviews use the
 exact PR head/base range. Required final independent review remains a merge gate.
@@ -427,14 +427,8 @@ Give the reviewer the issue requirements, repository/worktree, PR URL, immutable
 published head/base SHAs, applicable checks and verification limits. Review
 `git diff <base>...<head>` against that scope. Record actual startup evidence;
 opening the PR or issuing a launch command does not prove review started.
-Track GLM review and CI separately. A changed head or base requires refreshed
+Track independent review and CI separately. A changed head or base requires refreshed
 applicable reviews and CI; an old review comment is not evidence for a new SHA.
-
-**GLM prerequisite:** verify the local Herdr installation/help, an available pane
-at its shell prompt, and the actual Codex executable/version and effective
-`CODEX_HOME` in the reviewer launch environment, including the Herdr pane/host.
-Check that executable's installed `--help` for supported profile semantics;
-do not assume that sessions or hosts use the same executable or environment.
 
 Before creating the reviewer, resolve the owning task's current workspace, tab,
 and pane from live Herdr state and corroborate its task/session identity with
@@ -452,53 +446,13 @@ the missing identity instead of guessing. Record placement with startup
 evidence, do not create a new task or tab unprompted, and never reuse a stale ID
 after a move.
 
-For the currently verified CLI (`codex-cli 0.161.0`), `--profile glm-review`
-layers `$CODEX_HOME/glm-review.config.toml` over the base user config;
-`CODEX_HOME` defaults to `$HOME/.codex` when unset. The independent profile file
-can define `[model_providers.bigmodel]`. Absence of `[profiles.glm-review]` or
-`[model_providers.bigmodel]` from the main `config.toml` alone does not establish
-a missing profile or provider. For another CLI version, use its installed help;
-report unsupported semantics or `UNKNOWN` when not established, rather than
-inventing missing configuration.
+Before task assignment, confirm interactive readiness and verify actual startup
+through the pane read, not just an issued start command. Use a separate reviewer
+from the implementer. Record actual startup evidence and report `UNKNOWN` for
+anything not established. A failed check does not authorize configuration
+rewrites, credential reads/re-entry or model reinstallation.
 
-Use the same actual executable and environment for supported read-only
-config-load validation. The verified command for this CLI is:
-
-```sh
-codex --profile glm-review mcp list --json >/dev/null
-```
-
-Capture output when inspecting its format; do not expose raw configuration,
-MCP environment or credentials. Exit zero proves configuration loading only.
-It does not verify credentials, API connectivity, the effective selected
-model/provider/reasoning, interactive readiness, actual review startup or
-completion. Verify a `glm-review` profile configured for `bigmodel`, `glm-5.3`
-and max reasoning, including default subagents if used. Verify required
-credential access without reading or exposing credentials. Do not assume a
-profile on one workstation exists on another. Installed Herdr help supports
-native Codex options after `--`:
-
-```sh
-herdr agent start <reviewer-name> --kind codex --pane <available-pane-id> -- --profile glm-review -m glm-5.3 -c 'model_reasoning_effort="max"'
-herdr agent read <reviewer-name>
-```
-
-Before task assignment, confirm interactive readiness and the displayed actual
-`glm-5.3` model and max reasoning, plus the `glm-review` profile and `bigmodel`
-provider where available; retain profile/provider configuration evidence for
-fields not displayed. Verify actual startup through the pane read, not just an
-issued start command. Use a separate reviewer from the implementer.
-Distinguish confirmed missing files, parse/load errors, unsupported CLI semantics,
-credential errors, API/network failures and startup/readiness failures. Record
-the actual evidence and report `UNKNOWN` for anything not established.
-Missing Herdr, profile, credentials, model or readiness is blocked; do not silently
-substitute Flash or another model. A failed check does not authorize automatic
-configuration rewrites, credential reads/re-entry or model reinstallation.
-This review exception does not change the
-`gpt-6.1-sol`/high implementation-worker default or other roles. This is a process
-contract, not installation or configuration migration authority.
-
-The GLM reviewer makes no code or Git mutations and never executes GitHub APPROVE
+The independent reviewer makes no code or Git mutations and never executes GitHub APPROVE
 or merge. For `raymizzou/open_trader`, the recorded standing USER authorization
 dated 2026-10-09 in the [OpenTrader PR review publication](#open-trader-pr-review-publication)
 section permits the assigned independent reviewer, for the named PR and reviewed
@@ -565,7 +519,7 @@ publication for polish.
 
 A review-ready handoff requires successful current applicable push-head and
 PR-merge `required` checks from GitHub Actions (app ID 15368), completed required
-independent GLM review of the current published target, no known unresolved
+independent review of the current published target, no known unresolved
 blockers, and fresh feedback and
 mergeability checks. Record the PR head/base, synthetic merge SHA and Actions
 run/check identities; see [CI identity](ci.md). Unknown, pending, cancelled, failed
@@ -611,8 +565,8 @@ Worktree/branch/SHA; dirty or unsaved edits; active commands/handles; session/pa
 PR URL; immutable head/base; synthetic merge SHA; Actions run/check IDs/URLs:
 Local focused/security checks: command, environment, identity, result, limits:
 Independent review: published head/base (or unpublished local-only staged tree), result/evidence:
-GLM: pane, actual model/reasoning/profile/provider, status, PR/head/base:
-GLM comment: URL, verified author/body/identities, Main's accepted handoff:
+Reviewer: pane, actual model/reasoning/profile/provider, status, PR/head/base:
+Reviewer comment: URL, verified author/body/identities, Main's accepted handoff:
 Feedback: retrieval time, latest PR/head/base, complete paginated collections:
 Threads/comments: URL, resolved/unresolved state or disposition, blocking decision/owner:
 Repairs: fix commits, checks, independent review, update/reply evidence:
@@ -626,7 +580,7 @@ Workers: saved work, exclusive duties/new owner, accepted handoff, lifecycle sta
 The delivery path is isolated branch/worktree from freshly fetched
 `origin/main` → focused local development/security checks and dated `CHANGELOG.md`
 entry → Main stages/commits task-only files → prompt task-branch push/normal PR
-→ parallel GLM review and CI → feedback/repair loop → review-ready handoff
+→ parallel independent review and CI → feedback/repair loop → review-ready handoff
 → explicit user approval → GitHub merge. Follow the
 [delivery procedure](#authorized-pr-delivery-loop). Local `main` is
 only a synchronized copy of GitHub `main`, never an integration or repair path.
