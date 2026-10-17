@@ -258,6 +258,18 @@ def child(runtime_root,port,scenario,config_path):
     release_root=Path(__file__).resolve().parents[1]
     root=Path(runtime_root);config_path=Path(config_path);events=root/'events';now=datetime(2026,10,16,12,tzinfo=UTC)
     def mark(name):(events/name).touch()
+    def publish_snapshot(path,serialized):
+        from tempfile import NamedTemporaryFile
+        temporary=None
+        try:
+            with NamedTemporaryFile('w',dir=path.parent,prefix='.'+path.name+'.',
+                    suffix='.tmp',encoding='utf-8',delete=False) as handle:
+                temporary=Path(handle.name)
+                handle.write(serialized)
+            temporary.replace(path)
+            temporary=None
+        finally:
+            if temporary is not None:temporary.unlink(missing_ok=True)
     control_native=[];owner_clock_observations=[0]
     def business_clock():
         # The injected clock observes real native-thread completion. Two
@@ -796,7 +808,7 @@ def child(runtime_root,port,scenario,config_path):
                 (events/'ci-normal-stop-context.json').write_text(json.dumps(dict(
                     fatal_id=runtime.lp_d2.state.snapshot().current.fatal_id,
                     control_fatal=runtime.lp_d2.control.status().fatal)))
-                (events/'ci-stopping.json').write_text(json.dumps(dict(state=runtime.state,
+                publish_snapshot(events/'ci-stopping.json',json.dumps(dict(state=runtime.state,
                     owner=runtime.production_owner,store_retained=runtime.store is ci_started_resources[0][0],
                     lp_retained=runtime.lp is ci_started_resources[0][1],
                     client_retained=runtime._prediction_trading is adapter)))
@@ -1034,7 +1046,7 @@ def child(runtime_root,port,scenario,config_path):
                 native_history=runtime_module.PolymarketLPService.refresh_price_history
                 def observed_history(lp,*args,**kwargs):
                     result=native_history(lp,*args,**kwargs)
-                    (events/'producer-preparation-result.json').write_text(json.dumps(result,default=str))
+                    publish_snapshot(events/'producer-preparation-result.json',json.dumps(result,default=str))
                     return result
                 patch.setattr(runtime_module.PolymarketLPService,'refresh_price_history',observed_history)
             if 'producer-trial' in scenario:
