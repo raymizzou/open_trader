@@ -825,7 +825,7 @@ def child(runtime_root,port,scenario,config_path):
             ci_buy_code=LPD2LiveExecution._buy_admitted.__code__
             def ci_completed_current(frame,event,arg):
                 if event=='return' and frame.f_code is ci_buy_code and arg is not None:
-                    (events/'ci-buy-completed.json').write_text(json.dumps(dict(request_id=arg.identity.request_id,
+                    publish_snapshot(events/'ci-buy-completed.json',json.dumps(dict(request_id=arg.identity.request_id,
                         status=arg.status.value,ended=(events/'ci-sdk-ended').exists())))
                 if (event=='return' and frame.f_code is ci_run_code
                         and threading.current_thread().name=='prediction-lp-auto'
