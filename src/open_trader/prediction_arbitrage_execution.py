@@ -2046,6 +2046,9 @@ class PredictionExecutionService:
             "candidate_checked_at": None,
             "candidate_last_success_at": None,
             "candidate_last_attempt_at": None,
+            "maintenance_diagnostics": None,
+            "maintenance_next_attempt_at": None,
+            "maintenance_consecutive_failures": None,
             "missing_metadata_condition_ids": [],
             "missing_book_token_ids": [],
             "catalog_complete": False,
@@ -3337,6 +3340,15 @@ class PredictionExecutionService:
                     "candidate_checked_at": candidate_snapshot.get("checked_at"),
                     "candidate_last_success_at": candidate_snapshot.get("last_success_at"),
                     "candidate_last_attempt_at": candidate_snapshot.get("last_attempt_at"),
+                    "maintenance_diagnostics": candidate_snapshot.get(
+                        "maintenance_diagnostics"
+                    ),
+                    "maintenance_next_attempt_at": candidate_snapshot.get(
+                        "maintenance_next_attempt_at"
+                    ),
+                    "maintenance_consecutive_failures": candidate_snapshot.get(
+                        "maintenance_consecutive_failures"
+                    ),
                     "candidate_valid_count": candidate_snapshot.get(
                         "candidate_valid_count", 0
                     ),
@@ -3491,6 +3503,15 @@ class PredictionExecutionService:
                     "candidate_checked_at": candidate_snapshot.get("checked_at"),
                     "candidate_last_success_at": candidate_snapshot.get("last_success_at"),
                     "candidate_last_attempt_at": candidate_snapshot.get("last_attempt_at"),
+                    "maintenance_diagnostics": candidate_snapshot.get(
+                        "maintenance_diagnostics"
+                    ),
+                    "maintenance_next_attempt_at": candidate_snapshot.get(
+                        "maintenance_next_attempt_at"
+                    ),
+                    "maintenance_consecutive_failures": candidate_snapshot.get(
+                        "maintenance_consecutive_failures"
+                    ),
                     "candidate_valid_count": candidate_snapshot.get(
                         "candidate_valid_count", 0
                     ),

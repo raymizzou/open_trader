@@ -3,6 +3,10 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-18
+
+- #149 LP 看板透传维护耗时、下次重试时间和连续失败次数；首访默认值为 null，账户读取失败时仍保留候选维护诊断。直接 pytest 验证维护诊断、空首访与候选新鲜度合同；不改变维护或交易语义。
+
 ## 2026-10-16
 
 - #351 服务评审修复：当前预留读取与设置提交并发完成，金额保持同一 API 快照；显式 systemd 重启在精确缺席证明后恢复历史 ready／failed 记录；前台启动固定到已验证发布目录；READY 后意外 owner 循环故障保留 CLAIMED，真实 HTTP／原生工作排空后以致命状态退出，人工恢复继续遵守持久暂停。逐案及直接消费者证据见任务记录；未安装或部署。
