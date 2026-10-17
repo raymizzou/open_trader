@@ -345,7 +345,7 @@ def child(runtime_root,port,scenario,config_path):
                 hold_optional()
             return self.list_market_rewards(condition_id=CONDITION_ID,sponsored=sponsored) if not sponsored else ()
         def list_markets(self,**kwargs):
-            if scenario.startswith('consumer-ci-metadata-'):
+            if scenario.startswith('consumer-ci-metadata-') or scenario=='consumer-ci-prune-stop':
                 from polymarket.models.gamma.market import Market
                 return tuple(Market.parse_response(dict(id=cid[-4:],conditionId=cid,
                     slug='metadata-349',question='Metadata snapshot',outcomes='["Yes", "No"]',
@@ -484,7 +484,7 @@ def child(runtime_root,port,scenario,config_path):
         if scenario=='reader' and threading.current_thread().name=='lp-reader-source':hold('reader')
         return read_balance(**kw)
     sdk.get_balance_allowance=balance
-    if scenario.startswith('consumer-ci-metadata-'):
+    if scenario.startswith('consumer-ci-metadata-') or scenario=='consumer-ci-prune-stop':
         def unavailable_financial_facts(**kwargs):
             raise OSError('offline account financial facts unavailable')
         sdk.get_balance_allowance=unavailable_financial_facts
@@ -593,7 +593,7 @@ def child(runtime_root,port,scenario,config_path):
             store.n_leg_acknowledge_incident('nleg-accounting-batch',
                 acknowledgement=dict(actor='test',reconciliation='fresh_clean'))
         if scenario=='consumer-incompatible':store.advance_minimum_reader_generation(2)
-        if scenario=='consumer-reconcile-locked' or scenario.startswith('consumer-ci-metadata-'):
+        if scenario=='consumer-reconcile-locked' or scenario.startswith('consumer-ci-metadata-') or scenario=='consumer-ci-prune-stop':
             recovery=store.create_recovery_execution({'reason':'offline unresolved non-LP incident'},idempotency_key='actual-incident-seed')
             store.open_incident(recovery['execution_id'],{'reason':'offline unresolved non-LP incident'})
         if 'stale-report' in scenario:
@@ -839,6 +839,18 @@ def child(runtime_root,port,scenario,config_path):
             threading.settrace(ci_observed_frame)
         if scenario.startswith('consumer-ci-fence-'):
             _install_ci_fence_observers(patch,events,scenario,consumer_observations)
+        if scenario=='consumer-ci-prune-stop':
+            from open_trader import prediction_runtime as runtime_module
+            from tests.test_lp_metadata_cache_followup import _exercise_actual_runtime_prune_stop
+            native_prune_start=runtime_module.PredictionRuntime.start
+            def actual_prune_start(runtime):
+                result=native_prune_start(runtime)
+                _exercise_actual_runtime_prune_stop(runtime,adapter,patch,real_connect)
+                (events/'ci-prune-observations.json').write_text(json.dumps(dict(
+                    state=runtime.state,production_owner=runtime.production_owner)))
+                mark('ci-prune-assertions-passed')
+                return result
+            patch.setattr(runtime_module.PredictionRuntime,'start',actual_prune_start)
         if scenario.startswith('consumer-ci-metadata-'):
             from open_trader import prediction_runtime as runtime_module
             from tests.test_lp_metadata_async_persistence import _exercise_actual_runtime_metadata_stop

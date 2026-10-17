@@ -367,6 +367,12 @@ server.serve_forever()
             return metadata(info,published_owners[(info.st_dev,info.st_ino)])
         if path in (runtime,runtime/'config',runtime/'config/prediction_arbitrage.json'):
             return metadata(info,(service_uid,service_gid))
+        if path == Path(sys.executable).parent.parent/'.lock':
+            # Only the configured dev-venv lock has an external private mode
+            # view; every other path retains its actual permission bits.
+            fields={key:getattr(info,key) for key in dir(info) if key.startswith('st_')}
+            fields['st_mode']=(info.st_mode & ~0o777)|0o600
+            return SimpleNamespace(**fields)
         return info
     def descriptor_owner(fd,uid,gid):
         # CI drops CHOWN along with SETUID. Model only this writer's actual

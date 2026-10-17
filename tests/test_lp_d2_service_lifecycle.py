@@ -681,7 +681,14 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
         values=list(info);values[4]=uid;values[5]=gid
         if path is not None and Path(path)==Path(sys.executable).parent.parent/'.lock':
             values[0]=(info.st_mode & ~0o777)|0o600
-        return os.stat_result(values)
+        result=os.stat_result(values)
+        if (path is not None and Path(path).is_relative_to(child.root/'next-compatible-release')
+                and (stat.S_ISLNK(result.st_mode) or result.st_uid!=0 or result.st_mode & 0o022)):
+            print('STOPPED_TARGET_METADATA '+json.dumps(dict(path=str(path),
+                native=dict(dev=info.st_dev,ino=info.st_ino,uid=info.st_uid,gid=info.st_gid,mode=oct(info.st_mode)),
+                returned=dict(uid=result.st_uid,gid=result.st_gid,mode=oct(result.st_mode)),
+                cached_owner=owners.get(key),actor=list(actor))),flush=True)
+        return result
     def native_chown(fd,uid,gid):
         info=actual_fstat(fd);owners[(info.st_dev,info.st_ino)]=(uid,gid)
     def path_chown(path,uid,gid,**kw):
