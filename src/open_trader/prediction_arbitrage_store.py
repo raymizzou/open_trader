@@ -2837,6 +2837,338 @@ class PredictionArbitrageStore:
         )
         return payload
 
+    @staticmethod
+    def _lp_manual_text(value):
+        if type(value) is not str or not value.strip():
+            raise ValueError('manual_identity_invalid')
+        return value.strip()
+
+    @staticmethod
+    def _lp_manual_time(value):
+        try:
+            result = value if isinstance(value, datetime) else datetime.fromisoformat(value)
+            if result.tzinfo is None or result.utcoffset() is None:
+                raise ValueError
+            return result.astimezone(UTC)
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError('manual_deadline_invalid') from exc
+
+    @staticmethod
+    def _lp_manual_decimal(value):
+        if type(value) not in (str, int, Decimal):
+            raise ValueError('manual_terms_invalid')
+        try:
+            number = Decimal(value)
+            if not number.is_finite() or number <= 0:
+                raise ValueError
+            encoded = format(number, 'f')
+            return encoded.rstrip('0').rstrip('.') if '.' in encoded else encoded
+        except (ValueError, InvalidOperation) as exc:
+            raise ValueError('manual_terms_invalid') from exc
+
+    @classmethod
+    def _lp_manual_validate(cls, command):
+        fields = {'kind', 'account_id', 'process_epoch', 'request_id', 'session_id', 'idempotency_key',
+            'market_id', 'condition_id', 'token_id', 'outcome', 'price', 'quantity', 'review_at',
+            'expiration', 'order_type', 'post_only'}
+        if not isinstance(command, Mapping) or not fields <= command.keys() or command.keys()-fields-{'estimated_target_quantity'}:
+            raise ValueError('manual_command_invalid')
+        result = {k: cls._lp_manual_text(command[k]) for k in fields-{
+            'price', 'quantity', 'review_at', 'expiration', 'post_only'}}
+        if result['kind'] not in {'entry', 'start', 'augment'} or result['outcome'] not in {'YES', 'NO'}:
+            raise ValueError('manual_command_invalid')
+        if result['order_type'] != 'GTD' or command['post_only'] is not True:
+            raise ValueError('manual_terms_invalid')
+        expiration = command['expiration']
+        review = cls._lp_manual_time(command['review_at'])
+        if type(expiration) is not int or expiration <= 0 or expiration <= review.timestamp():
+            raise ValueError('manual_deadline_invalid')
+        result.update(account_id=result['account_id'].casefold(), price=cls._lp_manual_decimal(command['price']),
+            quantity=cls._lp_manual_decimal(command['quantity']), review_at=review.isoformat(),
+            expiration=expiration, post_only=True)
+        if 'estimated_target_quantity' in command:
+            result['estimated_target_quantity'] = cls._lp_manual_decimal(command['estimated_target_quantity'])
+        return result
+
+    @classmethod
+    def _lp_manual_carrier(cls, payload):
+        keys = {'d2_manual_identity_only', 'schema_version', 'account_id', 'process_epoch', 'condition_id',
+            'token_id', 'command', 'outcome', 'response', 'venue_order_id', 'result_recorded'}
+        if (set(payload) != keys or payload.get('d2_manual_identity_only') is not True
+                or type(payload.get('schema_version')) is not int or payload['schema_version'] != 1
+                or type(payload.get('result_recorded')) is not bool):
+            raise ValueError('manual_provenance_invalid')
+        command = cls._lp_manual_validate(payload['command'])
+        if command != payload['command'] or any(payload[k] != command[k]
+                for k in ('account_id', 'process_epoch', 'condition_id', 'token_id')):
+            raise ValueError('manual_provenance_invalid')
+        if type(payload['outcome']) is not str or payload['outcome'] not in {'unknown', 'accepted', 'rejected', 'not_sent'}:
+            raise ValueError('manual_result_invalid')
+        venue = payload['venue_order_id']
+        if venue is not None and (cls._lp_manual_text(venue) != venue or payload['outcome'] == 'not_sent'):
+            raise ValueError('manual_result_invalid')
+        if not payload['result_recorded'] and (payload['outcome'] != 'unknown' or venue is not None):
+            raise ValueError('manual_result_invalid')
+        return dict(claimed=False, role='manual_identity', command=command, outcome=payload['outcome'],
+            response=cls._lp_manual_response(payload['response']), venue_order_id=venue)
+
+    def _lp_manual_group_read(self, connection, account, session_id):
+        row = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?', (session_id,)).fetchone()
+        if row is None:
+            raise ValueError('manual_group_unavailable')
+        value = _load_payload(str(row['payload']))
+        if self._lp_manual_text(value.get('account_id')).casefold() != account or 'd2_audit_only' in value:
+            raise ValueError('manual_provenance_invalid')
+        pool = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+        if pool is not None:
+            intents = _load_payload(str(pool['payload'])).get('intents', {})
+            if not isinstance(intents, Mapping) or any(isinstance(i, Mapping) and i.get('session_id') == session_id
+                    for i in intents.values()):
+                raise ValueError('automatic_session_augmentation_disabled')
+        if 'd2_manual_identity_only' in value:
+            result = self._lp_manual_carrier(value)
+            identity = result['command']
+            if (row['state'] != 'complete' or identity['session_id'] != session_id
+                    or identity['idempotency_key'] != row['idempotency_key'] or identity['kind'] not in {'entry', 'start'}):
+                raise ValueError('manual_provenance_invalid')
+            role = 'manual_identity'
+            entries = [] if result['venue_order_id'] is None else [self._lp_manual_text(result['venue_order_id'])]
+            augments = []
+        else:
+            identity = {k:self._lp_manual_text(value.get(k)) for k in ('market_id', 'condition_id', 'token_id', 'outcome')}
+            if identity['outcome'] not in {'YES', 'NO'}:
+                raise ValueError('manual_group_unavailable')
+            review = self._lp_manual_time(value.get('review_at'))
+            expiration = value.get('entry_expiration')
+            if type(expiration) is not int or expiration <= review.timestamp():
+                raise ValueError('manual_group_unavailable')
+            identity.update(account_id=account, session_id=session_id,
+                price=self._lp_manual_decimal(value.get('price')), quantity=self._lp_manual_decimal(value.get('quantity')),
+                review_at=review.isoformat(), expiration=expiration)
+            role = 'legacy_identity'
+            entries = [] if value.get('entry_order_id') is None else [self._lp_manual_text(value['entry_order_id'])]
+            augments = value.get('augment_order_ids', [])
+            if not isinstance(augments, list):
+                raise ValueError('manual_group_unavailable')
+            augments = [self._lp_manual_text(v) for v in augments]
+        rows = connection.execute('SELECT * FROM lp_actions WHERE session_id=? ORDER BY created_at,action_id',
+            (session_id,)).fetchall()
+        for action in rows:
+            payload = _load_payload(str(action['payload']))
+            if 'd2_manual_identity_only' in payload:
+                result = self._lp_manual_carrier(payload)
+                original = result['command']
+                if (original['kind'] != 'augment' or original['session_id'] != session_id
+                        or action['action_key'] != session_id+':augment-submit:'+original['idempotency_key']
+                        or any(original[k] != identity[k] for k in ('account_id','market_id','condition_id','token_id','outcome','review_at','expiration'))):
+                    raise ValueError('manual_provenance_invalid')
+                oid = result['venue_order_id']
+            else:
+                if (payload.get('role') != 'augment' or payload.get('side') != 'BUY'
+                        or payload.get('token_id') != identity['token_id']
+                        or not str(action['action_key']).startswith(session_id+':augment-submit:')):
+                    continue
+                oid = payload.get('order_id')
+            if oid is not None:
+                augments.append(self._lp_manual_text(oid))
+        return dict(role=role, identity=identity, entry_order_ids=list(dict.fromkeys(entries)),
+            augment_order_ids=list(dict.fromkeys(augments)))
+
+    def lp_manual_group(self, account_id, session_id):
+        """Read original group identity and real venue associations, never financial state."""
+        account = self._lp_manual_text(account_id).casefold()
+        sid = self._lp_manual_text(session_id)
+        with self._read_connection() as connection:
+            connection.execute('BEGIN')
+            return self._lp_manual_group_read(connection, account, sid)
+
+    def _lp_manual_existing(self, connection, account, key, session_id=None):
+        if session_id is not None:
+            session_id = self._lp_manual_text(session_id)
+            group = self._lp_manual_group_read(connection, account, session_id)
+            action_key = session_id+':augment-submit:'+key
+            row = connection.execute('SELECT * FROM lp_actions WHERE action_key=?', (action_key,)).fetchone()
+            if row is None:
+                return None
+            payload = _load_payload(str(row['payload']))
+            if row['session_id'] != session_id:
+                raise ValueError('manual_provenance_invalid')
+            if 'd2_manual_identity_only' in payload:
+                result = self._lp_manual_carrier(payload)
+                original = result['command']
+                if (original['account_id'] != account or original['session_id'] != session_id
+                        or original['kind'] != 'augment' or original['idempotency_key'] != key):
+                    raise ValueError('manual_provenance_invalid')
+                return result
+            if (payload.get('role') != 'augment' or payload.get('side') != 'BUY'
+                    or payload.get('token_id') != group['identity']['token_id']):
+                raise ValueError('manual_provenance_invalid')
+            response = dict(payload, action_id=str(row['action_id']), session_id=session_id,
+                action_key=action_key, state=str(row['state']))
+            identity = {k:group['identity'][k] for k in ('account_id','session_id','market_id','condition_id','token_id','outcome','review_at','expiration')}
+            identity.update({k:payload[k] for k in ('price','quantity') if k in payload})
+            identity.update(idempotency_key=key, action_id=str(row['action_id']))
+            return dict(claimed=False, role='legacy_response', command=identity,
+                outcome=str(row['state']) if row['state'] in {'accepted','rejected'} else 'unknown',
+                response=response, venue_order_id=payload.get('order_id'))
+        row = connection.execute('SELECT * FROM lp_sessions WHERE idempotency_key=?', (key,)).fetchone()
+        if row is None:
+            return None
+        payload = _load_payload(str(row['payload']))
+        if self._lp_manual_text(payload.get('account_id')).casefold() != account or 'd2_audit_only' in payload:
+            raise ValueError('manual_provenance_invalid')
+        if 'd2_manual_identity_only' in payload:
+            result = self._lp_manual_carrier(payload)
+            if (row['state'] != 'complete' or result['command']['session_id'] != row['session_id']
+                    or result['command']['idempotency_key'] != row['idempotency_key']
+                    or result['command']['kind'] not in {'entry', 'start'}):
+                raise ValueError('manual_provenance_invalid')
+            return result
+        identity = {k: payload[k] for k in ('account_id', 'market_id', 'condition_id', 'token_id', 'outcome',
+            'price', 'quantity', 'review_at', 'entry_expiration') if k in payload}
+        identity.update(account_id=account, session_id=str(row['session_id']), idempotency_key=key)
+        state = str(row['state'])
+        outcome = 'rejected' if state == 'entry_rejected' else (
+            'accepted' if state == 'entry_open' and payload.get('entry_order_id') else 'unknown')
+        return dict(claimed=False, role='legacy_response', command=identity, outcome=outcome,
+            response=self._lp_row_result(row), venue_order_id=payload.get('entry_order_id'))
+
+    def lp_manual_command(self, account_id, idempotency_key, *, session_id=None):
+        """Replay one explicit manual key; the result grants no current send permission."""
+        account = self._lp_manual_text(account_id).casefold()
+        key = self._lp_manual_text(idempotency_key)
+        with self._read_connection() as connection:
+            connection.execute('BEGIN')
+            return self._lp_manual_existing(connection, account, key, session_id)
+
+    def _lp_manual_consume_preview(self, connection, original, preview_id, now):
+        preview_id = self._lp_manual_text(preview_id)
+        row = connection.execute('SELECT * FROM previews WHERE preview_id=?', (preview_id,)).fetchone()
+        if row is None:
+            raise ValueError('preview_not_found')
+        current = self._lp_manual_time(now if now is not None else datetime.now(UTC))
+        if current >= self._lp_manual_time(row['expires_at']):
+            raise ValueError('preview_expired')
+        if row['consumed_at'] is not None:
+            raise ValueError('preview_consumed')
+        value = _load_payload(str(row['payload']))
+        if any(value.get(k) != original[k] for k in ('market_id', 'condition_id', 'token_id', 'outcome')):
+            raise ValueError('preview_identity_mismatch')
+        if (any(self._lp_manual_decimal(value.get(k)) != original[k] for k in ('price', 'quantity'))
+                or self._lp_manual_time(value.get('review_at')).isoformat() != original['review_at']
+                or value.get('session_id') != (original['session_id'] if original['kind'] == 'augment' else None)
+                or 'account_id' in value and self._lp_manual_text(value['account_id']).casefold() != original['account_id']
+                or 'expiration' in value and (type(value['expiration']) is not int or value['expiration'] != original['expiration'])):
+            raise ValueError('preview_identity_mismatch')
+        if connection.execute('UPDATE previews SET consumed_at=? WHERE preview_id=? AND consumed_at IS NULL',
+                (current.isoformat(), preview_id)).rowcount != 1:
+            raise ValueError('preview_consumed')
+
+    def lp_claim_manual_command(self, command, *, preview_id=None, now=None):
+        """Atomically preserve one original explicit manual identity, never auto intent."""
+        if (not isinstance(command, Mapping) or type(command.get('kind')) is not str
+                or command['kind'] not in {'entry', 'start', 'augment'}):
+            raise ValueError('manual_command_invalid')
+        account = self._lp_manual_text(command.get('account_id')).casefold()
+        key = self._lp_manual_text(command.get('idempotency_key'))
+        sid = self._lp_manual_text(command.get('session_id')) if command['kind'] == 'augment' else None
+        with self._transaction() as connection:
+            existing = self._lp_manual_existing(connection, account, key, sid)
+            if existing is not None:
+                return existing
+            original = self._lp_manual_validate(command)
+            if sid is not None:
+                group = self._lp_manual_group_read(connection, account, sid)
+                if any(original[k] != group['identity'][k] for k in (
+                        'account_id','market_id','condition_id','token_id','outcome','review_at','expiration')):
+                    raise ValueError('manual_group_identity_mismatch')
+            if preview_id is not None:
+                self._lp_manual_consume_preview(connection, original, preview_id, now)
+            n_leg = connection.execute('SELECT active_batch_id FROM n_leg_controls WHERE singleton=1').fetchone()
+            if n_leg is not None and n_leg['active_batch_id'] is not None:
+                raise ValueError('active_n_leg_batch')
+            response = (dict(state='needs_attention', session_id=sid, reason='augment_submit_unknown')
+                if sid is not None else dict(state='needs_attention', session_id=original['session_id'], submit_status='unknown'))
+            payload = dict(d2_manual_identity_only=True, schema_version=1,
+                **{k:original[k] for k in ('account_id','process_epoch','condition_id','token_id')},
+                command=original, outcome='unknown', response=response, venue_order_id=None, result_recorded=False)
+            stamp = _utc_now()
+            if sid is None:
+                connection.execute('INSERT INTO lp_sessions(session_id,idempotency_key,state,payload,created_at,updated_at) VALUES(?,?,?,?,?,?)',
+                    (original['session_id'], key, 'complete', json.dumps(payload, allow_nan=False), stamp, stamp))
+            else:
+                connection.execute('INSERT INTO lp_actions(action_id,session_id,action_key,state,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',
+                    (_new_id(), sid, sid+':augment-submit:'+key, 'unknown', json.dumps(payload, allow_nan=False), stamp, stamp))
+            result = self._lp_manual_carrier(payload)
+            result['claimed'] = True
+            return result
+
+    @staticmethod
+    def _lp_manual_response(response):
+        def valid(value):
+            if value is None or type(value) in (str, bool, int):
+                return True
+            if type(value) is float:
+                return math.isfinite(value)
+            if type(value) is list:
+                return all(valid(v) for v in value)
+            if type(value) is dict:
+                return all(type(k) is str and valid(v) for k, v in value.items())
+            return False
+        if type(response) is not dict or not valid(response):
+            raise ValueError('manual_response_invalid')
+        return json.loads(json.dumps(response, allow_nan=False))
+
+    def lp_finish_manual_command(self, command, *, outcome, response, venue_order_id=None):
+        """Associate an actual result with its exact claim; never create a request."""
+        try:
+            original = self._lp_manual_validate(command)
+        except ValueError:
+            return 'rejected'
+        if type(outcome) is not str or outcome not in {'unknown', 'accepted', 'rejected', 'not_sent'}:
+            raise ValueError('manual_result_invalid')
+        returned = self._lp_manual_response(response)
+        venue = None if venue_order_id is None else self._lp_manual_text(venue_order_id)
+        if outcome == 'not_sent' and venue is not None:
+            return 'rejected'
+        account, key = original['account_id'], original['idempotency_key']
+        sid = original['session_id'] if original['kind'] == 'augment' else None
+        with self._transaction() as connection:
+            try:
+                existing = self._lp_manual_existing(connection, account, key, sid)
+            except ValueError:
+                return 'rejected'
+            if existing is None or existing['role'] != 'manual_identity' or existing['command'] != original:
+                return 'rejected'
+            if sid is None:
+                row = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?', (original['session_id'],)).fetchone()
+            else:
+                row = connection.execute('SELECT * FROM lp_actions WHERE action_key=?',
+                    (sid+':augment-submit:'+key,)).fetchone()
+            if row is None:
+                return 'rejected'
+            payload = _load_payload(str(row['payload']))
+            old_id = existing['venue_order_id']
+            if old_id is not None and venue is not None and old_id != venue:
+                return 'rejected'
+            venue = old_id if venue is None else venue
+            if (outcome == 'not_sent' and venue is not None
+                    or existing['outcome'] != 'unknown' and (outcome != existing['outcome'] or returned != existing['response'])
+                    or payload['result_recorded'] and existing['outcome'] == 'unknown' and outcome == 'not_sent'):
+                return 'rejected'
+            if (payload['result_recorded'] and existing['outcome'] == outcome
+                    and returned == existing['response'] and venue == old_id):
+                return 'replay'
+            payload.update(outcome=outcome, response=returned, venue_order_id=venue, result_recorded=True)
+            stamp = _utc_now()
+            if sid is None:
+                connection.execute('UPDATE lp_sessions SET payload=?,updated_at=? WHERE session_id=?',
+                    (json.dumps(payload, allow_nan=False), stamp, original['session_id']))
+            else:
+                connection.execute('UPDATE lp_actions SET state=?,payload=?,updated_at=? WHERE action_id=?',
+                    (outcome, json.dumps(payload, allow_nan=False), stamp, row['action_id']))
+            return 'applied'
+
     def lp_session_by_idempotency(self, idempotency_key: str) -> dict[str, object] | None:
         with self._read_connection() as connection:
             row = connection.execute(
@@ -2951,7 +3283,9 @@ class PredictionArbitrageStore:
 
         with self._read_connection() as connection:
             row = connection.execute(
-                "SELECT * FROM lp_sessions WHERE session_id != ? ORDER BY created_at DESC LIMIT 1",
+                "SELECT * FROM lp_sessions WHERE session_id != ? "
+                "AND coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true' "
+                "ORDER BY created_at DESC LIMIT 1",
                 (LP_RESERVED_MANUAL_SESSION_ID,),
             ).fetchone()
         return None if row is None else self._lp_row_result(row)
@@ -2961,7 +3295,8 @@ class PredictionArbitrageStore:
 
         with self._read_connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM lp_sessions ORDER BY created_at, session_id"
+                "SELECT * FROM lp_sessions WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true' "
+                "ORDER BY created_at, session_id"
             ).fetchall()
         return [self._lp_row_result(row) for row in rows]
 
@@ -4752,6 +5087,7 @@ class PredictionArbitrageStore:
         payload: Mapping[str, object],
         *,
         expected_generation: int | None = None,
+        initialize_global_fence: bool = False,
     ) -> dict[str, object] | None:
         """Persist one preparation snapshot with an optional cycle guard.
 
@@ -4759,7 +5095,9 @@ class PredictionArbitrageStore:
         keep that generation; a stale worker cannot overwrite a newer cycle.
         """
 
-        encoded = _dump_payload(payload)
+        if type(initialize_global_fence) is not bool:
+            raise ValueError('initialize_global_fence_invalid')
+        proposed = dict(payload)
         requested_generation = payload.get("generation")
         if type(requested_generation) is not int or requested_generation < 1:
             requested_generation = 1
@@ -4772,6 +5110,9 @@ class PredictionArbitrageStore:
                 if expected_generation is not None:
                     return None
                 generation = requested_generation
+                if initialize_global_fence and 'global_recovery_generation' not in proposed:
+                    proposed['global_recovery_generation'] = generation
+                encoded = _dump_payload(proposed)
                 connection.execute(
                     "INSERT INTO lp_preparation(singleton,generation,payload,updated_at) VALUES (1,?,?,?)",
                     (generation, encoded, updated_at),
@@ -4786,6 +5127,15 @@ class PredictionArbitrageStore:
                     saved["generation"] = current_generation
                     return saved
                 generation = requested_generation
+                if initialize_global_fence:
+                    stored = _load_payload(str(current['payload']))
+                    if 'global_recovery_generation' in stored:
+                        # Progress cannot replace a real recovery floor, or
+                        # repair an explicitly malformed floor by guessing.
+                        proposed['global_recovery_generation'] = stored['global_recovery_generation']
+                    elif 'global_recovery_generation' not in proposed:
+                        proposed['global_recovery_generation'] = generation
+                encoded = _dump_payload(proposed)
                 connection.execute(
                     "UPDATE lp_preparation SET generation=?,payload=?,updated_at=? WHERE singleton=1",
                     (generation, encoded, updated_at),
@@ -5544,7 +5894,8 @@ class PredictionArbitrageStore:
                 loaded = [
                     (row, _load_payload(str(row["payload"])))
                     for row in tx.execute(
-                        "SELECT * FROM lp_sessions ORDER BY updated_at,session_id"
+                        "SELECT * FROM lp_sessions WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true' "
+                        "ORDER BY updated_at,session_id"
                     ).fetchall()
                 ]
                 diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1
@@ -6817,7 +7168,9 @@ class PredictionArbitrageStore:
         )
         now = _utc_now()
         with self._transaction() as tx:
-            for row in tx.execute('SELECT * FROM lp_sessions').fetchall():
+            for row in tx.execute(
+                "SELECT * FROM lp_sessions WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true'"
+            ).fetchall():
                 sid = str(row['session_id'])
                 session = self._lp_row_result(row)
                 payload = _load_payload(str(row['payload']))
@@ -6965,7 +7318,8 @@ class PredictionArbitrageStore:
             document["account_confirmed_fill_facts"] = [dict(trade_id=identity[0], order_id=identity[1],
                 fingerprint=fingerprint) for identity, fingerprint in sorted(frontier.items())]
             loaded = [(row, _load_payload(str(row["payload"]))) for row in tx.execute(
-                "SELECT * FROM lp_sessions ORDER BY session_id"
+                "SELECT * FROM lp_sessions WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true' "
+                "ORDER BY session_id"
             ).fetchall()]
             diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1
             diagnostics["session_rows_scanned"] = diagnostics.get("session_rows_scanned", 0) + len(loaded)
@@ -7596,6 +7950,232 @@ class PredictionArbitrageStore:
             ).fetchone()
             assert updated is not None
             return self._lp_row_result(updated)
+
+    @staticmethod
+    def _lp_current_control_values(document, account_id):
+        from types import MappingProxyType
+        if (not isinstance(document, dict) or document.get('account_id') != account_id
+                or type(document.get('desired_running')) is not bool
+                or type(document.get('ever_enabled')) is not bool):
+            raise ValueError('lp_control_identity_or_value_invalid')
+        times = {}
+        for key in ('enabled_at', 'updated_at'):
+            value = document.get(key)
+            if value is None:
+                times[key] = None
+                continue
+            try:
+                stamp = datetime.fromisoformat(value.replace('Z', '+00:00')) if isinstance(value, str) else value
+                if not isinstance(stamp, datetime) or stamp.utcoffset() is None:
+                    raise ValueError
+                times[key] = stamp.astimezone(timezone.utc)
+            except (ValueError, TypeError):
+                raise ValueError('lp_control_timestamp_invalid') from None
+        if ((document['desired_running'] and not document['ever_enabled'])
+                or document['ever_enabled'] != (times['enabled_at'] is not None)):
+            raise ValueError('lp_control_enable_metadata_invalid')
+        return MappingProxyType(dict(account_id=account_id,
+            desired_running=document['desired_running'], ever_enabled=document['ever_enabled'], **times))
+
+    @staticmethod
+    def _lp_current_settings_values(document, account_id):
+        from types import MappingProxyType
+        from decimal import Decimal, InvalidOperation
+        if (type(account_id) is not str or len(account_id) != 64
+                or any(c not in '0123456789abcdef' for c in account_id)
+                or not isinstance(document, dict) or document.get('account_id') != account_id):
+            raise ValueError('lp_settings_account_identity')
+        values = {key: document.get(key, default) for key, default in dict(
+            budget_usd=None, target_buy_count=0, buy_price_level=1, config_version=0,
+            trading_config_version=document.get('config_version', 0),
+            round_interval_seconds=30, api_retry_interval_seconds=60, order_check_interval_seconds=10).items()}
+        raw = values['budget_usd']
+        if raw is not None:
+            try:
+                if isinstance(raw, bool):
+                    raise ValueError
+                budget = Decimal(str(raw))
+                if not budget.is_finite() or budget < 0:
+                    raise ValueError
+            except (InvalidOperation, ValueError, TypeError):
+                raise ValueError('lp_settings_budget_invalid') from None
+            values['budget_usd'] = str(budget)
+        for key in ('target_buy_count', 'config_version', 'trading_config_version'):
+            if type(values[key]) is not int or values[key] < 0:
+                raise ValueError('lp_settings_integer_invalid')
+        if type(values['buy_price_level']) is not int or values['buy_price_level'] not in (1, 2):
+            raise ValueError('lp_settings_price_level_invalid')
+        for key in ('round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds'):
+            if type(values[key]) is not int or values[key] <= 0:
+                raise ValueError('lp_settings_timing_invalid')
+        return MappingProxyType(dict(account_id=account_id, **values))
+
+    def lp_load_current_settings(self, account_id: str):
+        """Read policy only; never reconstruct financial or send authority."""
+        from .polymarket_lp_accounting import default_account_pool_document
+        with self._read_connection() as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+        document = (json.loads(row['payload']) if row is not None else
+            default_account_pool_document(self.path, account_id, datetime.now(timezone.utc)))
+        return self._lp_current_settings_values(document, account_id)
+
+    def lp_save_current_settings(self, account_id: str, *, expected_config_version, changes, actor=None):
+        """CAS a narrow settings merge, returning only after actual commit."""
+        from .polymarket_lp_accounting import default_account_pool_document
+        fields = {'budget_usd', 'target_buy_count', 'buy_price_level',
+                  'api_retry_interval_seconds', 'order_check_interval_seconds'}
+        if (not isinstance(changes, Mapping) or not changes or set(changes) - fields
+                or type(expected_config_version) is not int or expected_config_version < 0
+                or actor is not None and type(actor) is not str
+                or 'budget_usd' in changes and changes['budget_usd'] is None):
+            raise ValueError('lp_settings_changes_invalid')
+        with self._transaction() as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+            document = (json.loads(row['payload']) if row is not None else
+                default_account_pool_document(self.path, account_id, datetime.now(timezone.utc)))
+            current = self._lp_current_settings_values(document, account_id)
+            if current['config_version'] != expected_config_version:
+                raise ValueError('config_version_changed')
+            trading = bool(set(changes) & {'budget_usd', 'target_buy_count', 'buy_price_level'})
+            proposed = {**document, **changes, 'config_version': current['config_version'] + 1,
+                        'trading_config_version': current['trading_config_version'] + int(trading)}
+            saved = self._lp_current_settings_values(proposed, account_id)
+            # Merge fields only, preserving any concurrent control/legacy data.
+            document.update({key: saved[key] for key in (*fields, 'config_version', 'trading_config_version')})
+            document.update(settings_updated_at=datetime.now(timezone.utc).isoformat(), settings_actor=actor)
+            connection.execute('INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?) '
+                'ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload', (json.dumps(document),))
+        return saved
+
+    def lp_load_current_control(self, account_id: str):
+        """Load saved control only; a new account starts paused, never running."""
+        if type(account_id) is not str or not account_id.strip():
+            raise ValueError('lp_control_account_required')
+        with self._read_connection() as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+        if row is None:
+            document = dict(account_id=account_id, desired_running=False, ever_enabled=False,
+                            enabled_at=None, updated_at=None)
+        else:
+            document = json.loads(row['payload'])
+        return self._lp_current_control_values(document, account_id)
+
+    def lp_save_current_control(self, write: Mapping[str, object]):
+        """Merge narrow reliable control in the actual transaction, then receipt.
+
+        This port is synchronous and independent of disposable business logging.
+        It neither advances trading generations nor notifies authorization.
+        """
+        from types import MappingProxyType
+        from .polymarket_lp_accounting import default_account_pool_document
+        required = {'account_id', 'process_epoch', 'request_version', 'request_id',
+                    'desired_running', 'requested_at', 'actor'}
+        if not isinstance(write, Mapping) or set(write) != required:
+            raise ValueError('lp_control_write_invalid')
+        values = dict(write)
+        for key in ('account_id', 'process_epoch', 'request_id'):
+            if type(values[key]) is not str or not values[key].strip():
+                raise ValueError('lp_control_identity_required')
+        requested_at = values['requested_at']
+        if (type(values['request_version']) is not int or values['request_version'] < 0
+                or type(values['desired_running']) is not bool
+                or not isinstance(requested_at, datetime) or requested_at.utcoffset() is None
+                or requested_at.utcoffset().total_seconds() != 0
+                or values['actor'] is not None and type(values['actor']) is not str):
+            raise ValueError('lp_control_write_invalid')
+        with self._transaction() as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+            document = (json.loads(row['payload']) if row is not None else
+                        default_account_pool_document(self.path, values['account_id'], datetime.now(timezone.utc)))
+            self._lp_current_control_values(document, values['account_id'])
+            stamp = datetime.now(timezone.utc).isoformat()
+            document.update(desired_running=values['desired_running'], updated_at=stamp)
+            if values['desired_running']:
+                document['ever_enabled'] = True
+                document['enabled_at'] = document['enabled_at'] or stamp
+            connection.execute('INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?) '
+                'ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload',
+                (json.dumps(document),))
+        return MappingProxyType(dict(request_id=values['request_id'], request_version=values['request_version'],
+            desired_running=values['desired_running'], committed_at=datetime.now(timezone.utc)))
+
+    def lp_log_business_record(self, record) -> bool:
+        """Write closed audit values without business permission or notification.
+
+        Only requests may create an inert complete session audit container.
+        Receipt/progress parents are checked in their own actual transaction;
+        an uncertain prior commit is never retried or fabricated here.
+        """
+        from dataclasses import asdict
+        from .lp_business_writer import RequestRecord, ReceiptRecord, ProgressRecord, _encode_scalar
+        from .polymarket_lp_market_reader import CURRENT_ORDER_STATES
+        from .polymarket_lp_risk import TERMINAL_ORDER_STATES
+        if type(record) not in (RequestRecord, ReceiptRecord, ProgressRecord):
+            raise TypeError('closed_business_record_required')
+        def encode(value):
+            return json.dumps(value, ensure_ascii=False, separators=(',', ':'), default=_encode_scalar)
+        values = asdict(record)
+        with self._transaction() as connection:
+            identity = {k: getattr(record, k) for k in (
+                'account_id', 'process_epoch', 'condition_id', 'token_id')}
+            parent_row = connection.execute('SELECT state,payload FROM lp_sessions WHERE session_id=?',
+                                           (record.session_id,)).fetchone()
+            if parent_row is not None:
+                parent = json.loads(parent_row['payload'])
+                # An audit root has only provenance. It must never acquire old
+                # order ownership, reservations, protection or ledger fields.
+                if (parent_row['state'] != 'complete' or parent.get('d2_audit_only') is not True
+                        or set(parent) != set(identity) | {'d2_audit_only'}
+                        or any(parent.get(k) != value for k, value in identity.items())):
+                    return False
+            elif type(record) is not RequestRecord:
+                return False
+            if type(record) is RequestRecord:
+                if parent_row is None:
+                    parent = dict(identity)
+                    parent['d2_audit_only'] = True
+                    stamp = record.requested_at.isoformat()
+                    connection.execute('INSERT INTO lp_sessions VALUES(?,?,?,?,?,?)',
+                        (record.session_id, 'd2-audit:' + record.session_id, 'complete', encode(parent), stamp, stamp))
+                values['d2_record'] = 'request'
+                stamp = record.requested_at.isoformat()
+                existing = connection.execute('SELECT session_id,payload FROM lp_actions WHERE action_key=?',
+                                              (record.request_id,)).fetchone()
+                if existing is not None:
+                    return existing['session_id'] == record.session_id and json.loads(existing['payload']) == json.loads(encode(values))
+                connection.execute('INSERT INTO lp_actions VALUES(?,?,?,?,?,?,?)',
+                    (record.request_id, record.session_id, record.request_id, 'recorded', encode(values), stamp, stamp))
+                return True
+            row = connection.execute('SELECT session_id,payload FROM lp_actions WHERE action_key=?',
+                                     (record.request_id,)).fetchone()
+            if row is None or row['session_id'] != record.session_id:
+                return False
+            original = json.loads(row['payload'])
+            if (original.get('d2_record') != 'request'
+                    or any(original.get(k) != getattr(record, k) for k in (
+                        'account_id', 'process_epoch', 'request_id', 'condition_id', 'token_id'))):
+                return False
+            known_order = original.get('order_id') or (original.get('receipt') or {}).get('order_id')
+            if known_order is not None and record.order_id != known_order:
+                return False
+            if type(record) is ReceiptRecord:
+                original['receipt'] = values
+                stamp = record.received_at.isoformat()
+            else:
+                if (not known_order or not record.order_id
+                        or record.status not in CURRENT_ORDER_STATES | TERMINAL_ORDER_STATES
+                        or record.status in {'FILLED', 'MATCHED'} and record.size_matched != record.original_size
+                        or Decimal(original['quantity']) != record.original_size
+                        or Decimal(original['price']) != record.price):
+                    return False
+                remaining = record.original_size - record.size_matched
+                values['remaining'] = remaining
+                values['reserved_usd'] = remaining * record.price if record.status in CURRENT_ORDER_STATES else Decimal(0)
+                original['progress'] = values
+                stamp = record.checked_at.isoformat()
+            connection.execute('UPDATE lp_actions SET payload=?,updated_at=? WHERE action_key=? AND session_id=?',
+                               (encode(original), stamp, record.request_id, record.session_id))
+        return True
 
     def lp_upsert_action(
         self,

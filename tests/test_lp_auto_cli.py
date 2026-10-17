@@ -148,6 +148,15 @@ def test_status_reports_service_state_without_mutation(service, capsys):
     output = capsys.readouterr().out
     assert 'budget_usd: UNKNOWN' in output and 'active: UNKNOWN' in output
     assert 'desired_running: OFF' in output and 'runtime_state: PAUSED' in output
+    service.state = dict(desired_running=False, effective_running=False,
+        control_save_state='pending', requested_control_version=3, saved_control_version=2,
+        control_native_inflight=True, settings_pending=True, fatal={'origin': 'control_save'})
+    assert invoke(service, 'status') == 0
+    output = capsys.readouterr().out
+    for literal in ('effective_running: OFF', 'control_save_state: pending',
+            'requested_control_version: 3', 'saved_control_version: 2',
+            'control_native_inflight: True', 'settings_pending: True', 'fatal:'):
+        assert literal in output
 
 
 @pytest.mark.parametrize('fields,expected', [
@@ -469,6 +478,19 @@ def test_off_and_pause_preserve_orders_and_require_confirmation(service, capsys,
     ('config', {'config_version': '8'}), ('config', {'config_version': None}),
     ('config', {'desired_running': 'false'}), ('config', {'desired_running': True}),
     ('config', {'pause_confirmed': False}),
+    ('on', dict(desired_running=True, effective_running=True, pause_confirmed=False,
+        control_save_state='pending', requested_control_version=3, saved_control_version=2,
+        control_native_inflight=True, fatal=None)),
+    ('on', dict(desired_running=True, effective_running=True, pause_confirmed=False,
+        control_save_state='unknown', requested_control_version=3, saved_control_version=2,
+        control_native_inflight=False, fatal=None)),
+    ('on', dict(desired_running=True, effective_running=False, pause_confirmed=False,
+        control_save_state='saved', requested_control_version=3, saved_control_version=3,
+        control_native_inflight=False, fatal={'origin': 'control_save'})),
+    ('off', dict(desired_running=False, effective_running=False, pause_confirmed=True,
+        control_save_state='pending', requested_control_version=3, saved_control_version=2,
+        control_native_inflight=True, fatal=None)),
+    ('config', {'settings_pending': True, 'settings_native_inflight': True}),
     ('on', []), ('off', 'not-a-state'), ('config', []),
 ])
 def test_unconfirmed_control_results_are_unknown(service, capsys, action, patch):

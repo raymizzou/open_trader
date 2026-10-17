@@ -118,6 +118,12 @@ def _emit(result: str, state: dict[str, object] | None, reason: str | None, json
         return
     desired = state.get('desired_running')
     print('desired_running: ' + ('ON' if desired is True else 'OFF' if desired is False else 'UNKNOWN'))
+    effective = state.get('effective_running')
+    print('effective_running: ' + ('ON' if effective is True else 'OFF' if effective is False else 'UNKNOWN'))
+    for key in ('control_save_state', 'requested_control_version', 'saved_control_version',
+                'control_native_inflight', 'settings_pending', 'settings_native_inflight', 'fatal'):
+        value = state.get(key)
+        print(f'{key}: {value if value is not None else "NONE" if key in state else "UNKNOWN"}')
     for key in ('runtime_state', 'budget_usd', 'target_buy_count', 'buy_price_level', 'config_version',
             'cycle_mode', 'api_retry_interval_seconds', 'order_check_interval_seconds'):
         value = state.get(key)
@@ -186,12 +192,28 @@ def _config_payload(budget: str | None, target_buys: str | None, bid_level: str 
     return payload
 
 
+def _control_saved(state: dict[str, object], running: bool) -> bool:
+    if not any(key in state for key in ('effective_running', 'control_save_state',
+            'requested_control_version', 'saved_control_version', 'fatal')):
+        return True  # Existing legacy HTTP contract has no D2 version fields.
+    requested, saved = state.get('requested_control_version'), state.get('saved_control_version')
+    return (type(requested) is int and requested >= 0 and type(saved) is int and saved == requested
+        and state.get('control_save_state') == 'saved'
+        and state.get('control_native_inflight') is False
+        and 'fatal' in state and state['fatal'] is None
+        and state.get('effective_running') is running)
+
+
 def _pause_confirmed(state: dict[str, object]) -> bool:
     return (state.get('desired_running') is False and state.get('pause_confirmed') is True
-            and state.get('runtime_state') in (None, 'paused'))
+            and state.get('runtime_state') in (None, 'paused') and _control_saved(state, False))
 
 
 def _config_confirmed(state: dict[str, object], payload: dict[str, object], previous: dict[str, object]) -> bool:
+    if (state.get('settings_pending', False) is not False
+            or state.get('settings_native_inflight', False) is not False
+            or state.get('settings_error') is not None or state.get('fatal') is not None):
+        return False
     if 'budget_usd' not in payload:
         return (type(state.get('config_version')) is int
             and state['config_version'] == payload['expected_config_version'] + 1
@@ -267,7 +289,9 @@ def run(action: str, url: str, timeout: float | str, *, json_output: bool = Fals
             state = client.write('enable', {'confirm': True})
             if (state.get('desired_running') is not True
                 or state.get('pause_confirmed', False) is not False
-                or state.get('runtime_state') == 'paused'):
+                or state.get('runtime_state') == 'paused' or not _control_saved(state, True)
+                or state.get('settings_pending', False) is not False
+                or state.get('settings_native_inflight', False) is not False):
                 raise ValueError('LP enable result is unconfirmed')
             result = 'ON'
         elif action == 'status':

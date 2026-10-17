@@ -531,11 +531,11 @@ def test_begin_preparation_write_failure_cannot_pause_recovered_generation(tmp_p
         # This identifies the exception window, not a production writer.
         with store._transaction() as connection:
             connection.execute('SELECT * FROM missing_private_fixture_table')
-    def delayed_writer(payload, *, expected_generation=None):
+    def delayed_writer(payload, *, expected_generation=None, initialize_global_fence=False):
         if payload.get('state') == 'preparing':
             assert expected_generation == 1
             fail_after_release()
-        return writer(payload, expected_generation=expected_generation)
+        return writer(payload, expected_generation=expected_generation, initialize_global_fence=initialize_global_fence)
     if boundary == 'begin-write':
         monkeypatch.setattr(store, 'lp_save_preparation', delayed_writer)
     else:

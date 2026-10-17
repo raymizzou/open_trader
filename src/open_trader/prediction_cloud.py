@@ -21,6 +21,7 @@ import stat
 import sys
 import tempfile
 import time
+from uuid import uuid4
 
 from .prediction_release import RUNTIME_SCHEMA, RELEASE_SCHEMA, inspect_prediction_release_checkout, write_prediction_runtime_record, load_prediction_runtime_record
 
@@ -209,7 +210,7 @@ Environment=OPEN_TRADER_NLEG_PAUSED={c.n_leg_paused}
 ExecStart={c.python} -m open_trader prediction-service --mode {c.mode} --data-dir {c.runtime_root}/data --config {c.runtime_root}/config/prediction_arbitrage.json --host 127.0.0.1 --port 8769 --release-manifest {c.release_root}/ops/prediction-service-release.json
 {resources}Restart={'no' if guarded else 'on-failure'}
 RestartSec=30
-TimeoutStopSec={20 if guarded else 90}
+{('RestartPreventExitStatus=78' + chr(10)) if c.mode == 'production' else ''}TimeoutStopSec={20 if guarded else 'infinity' if c.mode == 'production' else 90}
 SendSIGKILL={'yes' if guarded else 'no'}
 KillMode=control-group
 UMask=0077
@@ -409,21 +410,77 @@ def preflight(c: CloudConfig) -> None:
         raise ValueError('less than 1 GiB free runtime storage')
 
 
-def record(c: CloudConfig, state: str, **extra):
+def systemd_record_identity(c):
+    user=service_user(c)
+    return dict(manager='systemd',manager_identity=str(UNIT_PATH),runtime_root=str(c.runtime_root),
+        config=str(c.runtime_root/'config/prediction_arbitrage.json'),python=str(c.python),
+        service_identity=dict(user=c.user,uid=user.pw_uid,gid=user.pw_gid),unit_text=render_unit(c))
+
+
+def _same_candidate(candidate,c):
+    return isinstance(candidate,dict) and candidate.get('checkout')==str(c.release_root) and candidate.get('git_sha')==c.expected_sha
+
+
+def systemd_record_metadata(c, *, allow_legacy=False):
+    info=c.record.lstat();user=service_user(c)
+    valid=(info.st_uid==0 and info.st_gid==user.pw_gid and stat.S_IMODE(info.st_mode)==0o640)
+    legacy=(allow_legacy and os.geteuid()==0 and info.st_uid==0 and info.st_gid==0
+        and stat.S_IMODE(info.st_mode)==0o600)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or not (valid or legacy):
+        raise ValueError('systemd record metadata invalid')
+
+
+def _prepared_lp_validation(c,nonce):
+    from .prediction_release import validate_lp_validation
+    if type(nonce) is not str or not nonce:raise ValueError('exact LP operation nonce required')
+    systemd_record_metadata(c)
+    saved=load_prediction_runtime_record(c.record)
+    if saved.get('manager')!='systemd' or saved.get('manager_identity')!=str(UNIT_PATH):
+        raise ValueError('LP systemd manager selection changed')
+    binding=saved.get('pending_lp_validation')
+    if (not isinstance(binding,dict) or binding.get('operation_nonce')!=nonce
+            or binding.get('source_sha')!=c.expected_sha):
+        raise ValueError('LP prospective target selection changed')
+    user=service_user(c)
+    return validate_lp_validation(binding,release_root=c.release_root,runtime_root=c.runtime_root,
+        python=str(c.python),config_path=c.runtime_root/'config/prediction_arbitrage.json',
+        config_uid=user.pw_uid,config_gid=user.pw_gid)
+
+
+def record(c: CloudConfig, state: str, *, operation_fd=None, promote_lp_nonce=None, **extra):
+    if c.mode=='production':
+        if os.geteuid()!=0 or operation_fd is None:raise ValueError('systemd record publication requires root operation')
+        from .prediction_release import lp_operation_descriptor
+        with lp_operation_descriptor(OPERATION_LOCK,owner_uid=0,descriptor=operation_fd):pass
+        trusted_layout(c)
+        if c.record.exists() or c.record.is_symlink():systemd_record_metadata(c,allow_legacy=True)
+    if promote_lp_nonce is not None and c.mode!='production':raise ValueError('LP promotion requires production')
     previous = load_prediction_runtime_record(c.record)
     candidate = {'checkout': str(c.release_root), 'git_sha': c.expected_sha}
-    old = None if previous is None else (previous.get('previous_release')
-        if previous.get('candidate') == candidate else previous.get('candidate'))
-    write_prediction_runtime_record(c.record, dict(state=state, manager='systemd',
-        candidate=candidate, previous_release=old, unit_text=render_unit(c), **extra))
+    same=previous is not None and _same_candidate(previous.get('candidate'),c)
+    old = None if previous is None else (previous.get('previous_release') if same else previous.get('candidate'))
+    if same and c.mode=='production':candidate=dict(previous['candidate'])
+    if promote_lp_nonce is not None:candidate['lp_validation']=dict(_prepared_lp_validation(c,promote_lp_nonce))
+    document=dict(state=state,manager='systemd',candidate=candidate,previous_release=old,unit_text=render_unit(c),**extra)
+    publication={}
+    if c.mode=='production':
+        document.update(systemd_record_identity(c))
+        if promote_lp_nonce is None and previous is not None and previous.get('pending_lp_validation') is not None:
+            document['pending_lp_validation']=previous['pending_lp_validation']
+        publication=dict(owner=(0,service_user(c).pw_gid),mode=0o640,migrate_root_private=True)
+    write_prediction_runtime_record(c.record,document,**publication)
 
 
 def verified_record(c: CloudConfig, states: tuple[str, ...], *, contents: bytes | None = None) -> dict:
+    if c.mode=='production':
+        systemd_record_metadata(c)
     saved = load_prediction_runtime_record(c.record) if contents is None else json.loads(contents)
     if (not isinstance(saved, dict) or saved.get('schema_version') != RUNTIME_SCHEMA or saved.get('manager') != 'systemd' or saved.get('state') not in states
-        or saved.get('candidate') != {'checkout':str(c.release_root),'git_sha':c.expected_sha}
+        or (not _same_candidate(saved.get('candidate'),c) if c.mode=='production' else saved.get('candidate')!={'checkout':str(c.release_root),'git_sha':c.expected_sha})
         or saved.get('unit_text') != render_unit(c)):
         raise ValueError('managed release transition record not verified')
+    if c.mode=='production' and any(saved.get(k)!=v for k,v in systemd_record_identity(c).items()):
+        raise ValueError('managed systemd identity changed')
     return saved
 
 
@@ -824,7 +881,27 @@ def recover_stopped_preparation(config: Path, *, expected_sha: str,
 
 
 
-def operate(c: CloudConfig, action: str) -> dict:
+def _verified_current_lp_start(c):
+    from .prediction_start_guard import identity_for_runtime
+    systemd_record_metadata(c)
+    saved=load_prediction_runtime_record(c.record)
+    if saved.get('pending_lp_validation') is not None:raise ValueError('pending target requires explicit restart')
+    identity_for_runtime(data_dir=c.runtime_root/'data',
+        prediction_config_path=c.runtime_root/'config/prediction_arbitrage.json',code_root=c.release_root)
+
+
+def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=None, extras=None) -> dict:
+    mutations=('install','start','restart')
+    if prepare_for is not None and (action!='prepare-target' or prepare_for not in mutations):
+        raise ValueError('prepare-for requires a supported prepared operation')
+    if action=='prepare-target' and (c.mode!='production' or prepare_for not in mutations):
+        raise ValueError('production prepared operation required')
+    if operation_nonce is not None and (action not in mutations or c.mode!='production'
+            or type(operation_nonce) is not str or not operation_nonce):
+        raise ValueError('forwarded nonce requires a production mutation')
+    if extras is not None and (c.mode!='production' or action not in (*mutations,'prepare-target')
+            or type(extras) not in (list,tuple) or any(v not in ('cloud-ssm','browser') for v in extras)):
+        raise ValueError('runtime extras require a production mutation')
     if action == 'preflight':
         preflight(c)
         return {'status': 'PRECHECK_OK', 'git_sha': c.expected_sha, 'mode': c.mode,
@@ -881,8 +958,28 @@ def operate(c: CloudConfig, action: str) -> dict:
     # Same global lock for all runtime roots/configurations of this unit.
     with OPERATION_LOCK.open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if action=='prepare-target':
+            if prepare_for=='install':preflight(c)
+            else:
+                installed_unit(c)
+                if prepare_for=='start' and unit_state()['MainPID']!='0':
+                    _verified_current_lp_start(c)
+                    operate(c,'status')
+                    return dict(status='NOOP',operation_nonce=None)
+            from .prediction_release import prepare_lp_target
+            nonce=uuid4().hex
+            prepare_lp_target(runtime_root=c.runtime_root,release_root=c.release_root,python=c.python,
+                operation_nonce=nonce,manager='systemd',systemd_config=c,operation_fd=lock.fileno(),extras=extras)
+            return dict(status='PREPARED',operation_nonce=nonce)
         if action == 'install':
             preflight(c)
+            nonce=None
+            if c.mode=='production':
+                from .prediction_release import prepare_lp_target
+                nonce=operation_nonce or uuid4().hex
+                prepare_lp_target(runtime_root=c.runtime_root,release_root=c.release_root,python=c.python,
+                    operation_nonce=nonce,manager='systemd',systemd_config=c,
+                    operation_fd=lock.fileno(),require_prepared=operation_nonce is not None,extras=extras)
             if UNIT_PATH.exists():
                 trusted_root_path(UNIT_PATH)
                 saved = load_prediction_runtime_record(c.record)
@@ -898,12 +995,13 @@ def operate(c: CloudConfig, action: str) -> dict:
             if UNIT_PATH.exists():
                 with tempfile.NamedTemporaryFile(dir=c.runtime_root, prefix='unit-backup-', suffix='.service', mode='wb', delete=False) as backup:
                     backup.write(UNIT_PATH.read_bytes())
+            if c.mode=='production':_prepared_lp_validation(c,nonce)
             temp = UNIT_PATH.with_suffix('.service.tmp')
             temp.write_text(unit)
             temp.chmod(0o644)
             os.replace(temp, UNIT_PATH)
             run('systemctl', 'daemon-reload')
-            record(c, 'stopped')
+            record(c, 'stopped', operation_fd=lock.fileno(),promote_lp_nonce=nonce)
             return {'status': 'INSTALLED_STOPPED', 'git_sha': c.expected_sha}
         installed_unit(c)
         if action == 'stop':
@@ -911,42 +1009,76 @@ def operate(c: CloudConfig, action: str) -> dict:
                 absent(c)
                 saved = verified_record(c, ('ready','maintenance','failed','stopped'))
                 if saved['state'] != 'stopped':
-                    record(c, 'stopped')
+                    record(c, 'stopped', operation_fd=lock.fileno())
                 return {'status':'STOPPED', 'git_sha':c.expected_sha}
             verified_record(c, ('ready','maintenance','failed'))
             live = live_identity(c)
-            record(c, 'maintenance', ready=live)
+            record(c, 'maintenance', ready=live, operation_fd=lock.fileno())
             run('systemctl', 'stop', UNIT, timeout=100)
             absent(c)
-            record(c, 'stopped', ready=live)
+            record(c, 'stopped', ready=live, operation_fd=lock.fileno())
             return {'status': 'STOPPED', 'exchange_orders': 'unchanged'}
-        if action == 'start':
-            if unit_state()['MainPID'] != '0':
-                return operate(c, 'status')
+        if action in ('start','restart'):
+            current=unit_state()
+            if action=='start' and current['MainPID']!='0':
+                if operation_nonce is not None:raise ValueError('forwarded start cannot replace a running owner')
+                if c.mode=='production':_verified_current_lp_start(c)
+                return operate(c,'status')
+            nonce=None
+            if c.mode=='production':
+                from .prediction_release import prepare_lp_target
+                # Target compatibility precedes any old-owner disturbance.
+                nonce=operation_nonce or uuid4().hex
+                prepare_lp_target(runtime_root=c.runtime_root,release_root=c.release_root,python=c.python,
+                    operation_nonce=nonce,manager='systemd',systemd_config=c,operation_fd=lock.fileno(),
+                    require_prepared=operation_nonce is not None,extras=extras)
+            if current['MainPID']!='0':
+                verified_record(c,('ready','maintenance','failed'))
+                live=live_identity(c)
+                record(c,'maintenance',ready=live,operation_fd=lock.fileno())
+                if c.mode=='production':_prepared_lp_validation(c,nonce)
+                run('systemctl','stop',UNIT,timeout=100)
+                absent(c)
+                record(c,'stopped',operation_fd=lock.fileno())
+            elif action=='restart' and c.mode=='production':
+                # A crashed or failed instance can leave its historical label
+                # after the actual process and native owner have disappeared.
+                absent(c)
+                saved=verified_record(c,('ready','failed','stopped','maintenance'))
+                if saved['state'] in ('ready','failed'):
+                    record(c,'stopped',operation_fd=lock.fileno())
             if c.mode == 'shadow' and c.n_leg_paused == 1:
                 from .prediction_shadow_resources import require_host_headroom
                 require_host_headroom(c.memory_max_bytes)
             preflight(c)
-            verified_record(c, ('stopped',))
-            record(c, 'maintenance')
+            verified_record(c, ('stopped','maintenance'))
+            record(c, 'maintenance', operation_fd=lock.fileno())
+            if c.mode=='production':
+                from .prediction_start_guard import identity_for_runtime,arm_for_operator_start
+                identity=identity_for_runtime(data_dir=c.runtime_root/'data',
+                    prediction_config_path=c.runtime_root/'config/prediction_arbitrage.json',code_root=c.release_root)
+                arm_for_operator_start(identity,nonce,operation_fd=lock.fileno())
             run('systemctl', 'start', UNIT)
             deadline = time.monotonic()+120
             while time.monotonic() < deadline:
                 try:
                     live = live_identity(c)
-                    record(c, 'ready', ready=live)
+                    record(c, 'ready', ready=live, operation_fd=lock.fileno())
                     return {'status': 'RUNNING', **live}
                 except (OSError, ValueError):
                     time.sleep(2)
-            record(c, 'failed', failure_reason='candidate_readiness_not_proven')
+            record(c, 'failed', failure_reason='candidate_readiness_not_proven', operation_fd=lock.fileno())
             raise ValueError('candidate readiness not proven; inspect service, no automatic rollback')
     raise ValueError('unsupported action')
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['render','preflight','install','start','status','stop','smoke','recover-preparation'])
+    parser.add_argument('action', choices=['render','preflight','install','start','restart','prepare-target','status','stop','smoke','recover-preparation'])
     parser.add_argument('--config', type=Path, default=CONFIG_PATH)
+    parser.add_argument('--operation-nonce')
+    parser.add_argument('--prepare-for',choices=['install','start','restart'])
+    parser.add_argument('--extra',action='append',choices=['cloud-ssm','browser'],default=None)
     parser.add_argument('--expected-sha')
     parser.add_argument('--expected-generation', type=int)
     parser.add_argument('--backup-root', type=Path)
@@ -956,6 +1088,8 @@ def main(argv=None):
             value is not None for value in (args.expected_sha, args.expected_generation, args.backup_root)
         ):
             raise ValueError('recovery arguments require recover-preparation')
+        if args.action in ('render','recover-preparation') and any(v is not None for v in (args.operation_nonce,args.prepare_for,args.extra)):
+            raise ValueError('LP operation arguments require production management')
         if args.action == 'recover-preparation':
             if args.expected_sha is None or args.expected_generation is None or args.backup_root is None:
                 raise ValueError('explicit SHA, generation and backup root required')
@@ -968,7 +1102,8 @@ def main(argv=None):
         if args.action == 'render':
             print(render_unit(config), end='')
         else:
-            print(json.dumps({**operate(config, args.action),
+            result=operate(config,args.action,operation_nonce=args.operation_nonce,prepare_for=args.prepare_for,extras=args.extra)
+            print(json.dumps(result if args.action=='prepare-target' else {**result,
                               'mode': config.mode, 'candidate_exclusions': config.candidate_exclusions,
                               'release_root': str(config.release_root),
                               'runtime_root': str(config.runtime_root)}))

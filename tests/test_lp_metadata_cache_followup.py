@@ -702,20 +702,42 @@ def test_current_token_exclusions_ignore_lagging_or_dropped_replica(tmp_path, mo
 
 
 def test_runtime_stop_retains_owner_until_actual_prune_exit(tmp_path, monkeypatch, request):
+    import shutil, subprocess
+    from pathlib import Path
+    from tests.lp_d2_service_harness import ServiceChild
+
+    class PruneChild(ServiceChild):
+        def launch(self, scenario, *, expected_running=None):
+            # Commit only this helper into the disposable selected release.
+            shutil.copyfile(Path(__file__), self.release_root/'tests'/Path(__file__).name)
+            for args in (['add', 'tests/'+Path(__file__).name],
+                    ['-c', 'user.name=CI prune fixture', '-c', 'user.email=fixture@invalid',
+                     'commit', '-qm', 'actual prune assertion helper']):
+                subprocess.run(['git', '-C', str(self.release_root), *args], check=True, capture_output=True)
+            self.sha=subprocess.check_output(['git', '-C', str(self.release_root), 'rev-parse', 'HEAD'], text=True).strip()
+            return super().launch(scenario, expected_running=expected_running)
+
+    with PruneChild(tmp_path, scenario='consumer-ci-prune-stop') as child:
+        child.release('metadata')
+        child.start(expected_running=None)
+        child.wait('ci-prune-assertions-passed')
+        assert child.wait_exit()==78, child.output.read_text()
+        result=json.loads(child.marker('ci-prune-observations.json').read_text())
+        assert result['state']=='STOPPED' and result['production_owner'] is False
+        assert child.actual_posts()==0
+        child.assert_owner_available()
+
+
+def _exercise_actual_runtime_prune_stop(runtime, adapter, monkeypatch, real_connect):
+    """Original prune/native/owner assertions against the actual claimed Runtime."""
     import asyncio
     import threading
     from types import SimpleNamespace
     from open_trader import prediction_runtime as runtime_module
     from open_trader.polymarket_monitor import PolymarketMonitor
     from open_trader.predict_cross_venue import PredictCrossVenueMonitor
-    adapter = _adapter(None, monkeypatch)
-    monkeypatch.setattr(runtime_module, 'load_trading_config', lambda path: adapter.config)
-    monkeypatch.setattr(runtime_module, 'PolymarketTradingClient', SimpleNamespace(from_keychain=lambda config: adapter))
-    runtime = runtime_module.PredictionRuntime(data_dir=tmp_path,
-        prediction_config_path=tmp_path / 'prediction.json', dashboard_url='http://127.0.0.1:8766/',
-        n_leg_paused=True, enable_n_leg_background=False)
-    request.addfinalizer(runtime.stop)
-    runtime.start()
+    with pytest.raises(OSError, match='offline account financial facts unavailable'):
+        adapter.lp_reader_source_port().read('balance', SimpleNamespace(account=adapter.config.wallet_address))
     assert runtime.state == 'NOT_READY' and runtime.production_owner is True
     store = runtime.store
     assert isinstance(store, PredictionArbitrageStore)
@@ -742,7 +764,6 @@ def test_runtime_stop_retains_owner_until_actual_prune_exit(tmp_path, monkeypatc
     runtime._cross_runtime = cross
     cross.start()
     assert source_started.wait(5)
-    real_connect = sqlite3.connect
     with real_connect(store.path) as connection:
         connection.executemany('INSERT INTO lp_market_metadata_cache VALUES (?,?,?,1)',
             [(f'expired-{index}', '{}', T.timestamp()-1) for index in range(401)])

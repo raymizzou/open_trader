@@ -85,6 +85,7 @@ class MarketReader:
         self._lock = threading.Lock()
         self._jobs = {}
         self._retry = {}
+        self._wait_epoch = 0
         self._closed = False
 
     @staticmethod
@@ -147,19 +148,28 @@ class MarketReader:
                 value = self._port.read(key[1], scope)
                 result = SourceResult(source_id, freeze(value), checked_at=datetime.now(UTC))
             except BaseException as exc:
+                # A response belongs to the reset epoch in which it arrives,
+                # even when its native request started before that reset.
+                # Capture under the same lock as reset; formatting a response
+                # observed before reset must not reinstall its old deadline.
+                with self._lock:
+                    response_epoch = self._wait_epoch
+                    response_at = self._clock()
+                    failed_at = datetime.now(UTC)
                 from .polymarket_trading import _safe_history_response_facts
                 facts = _safe_history_response_facts(exc)
                 facts.update(getattr(exc, 'response_facts', {}) or {})
                 seconds = facts.get('retry_after_seconds', getattr(exc, 'retry_after_seconds', None))
                 if seconds is None and isinstance(facts.get('retry_after_at'), datetime):
-                    seconds = max(0, (facts['retry_after_at'] - datetime.now(UTC)).total_seconds())
+                    seconds = max(0, (facts['retry_after_at'] - failed_at).total_seconds())
                 if seconds is None: seconds = 60
                 if not isinstance(seconds, (int, float)) or not 0 <= seconds < float('inf'):
                     seconds = 60
                 result = SourceResult(source_id, complete=False, error=type(exc).__name__,
-                    retry_at=self._clock() + seconds, failed_at=datetime.now(UTC), error_facts=freeze(facts))
+                    retry_at=response_at + seconds, failed_at=failed_at, error_facts=freeze(facts))
                 with self._lock:
-                    self._retry[key] = result
+                    if response_epoch == self._wait_epoch:
+                        self._retry[key] = result
             future.set_result(result)
         threading.Thread(target=run, daemon=True, name='lp-reader-source').start()
         return future
@@ -209,6 +219,16 @@ class MarketReader:
                 markets = self.read_current(market_scope, deadline)
                 frame = self.from_captured_sources(CapturedSources(scope.account, {**sources, **markets.sources}))
         return frame
+
+    def reset_provider_wait(self):
+        """Discard old provider waits, retaining every actual native job.
+
+        Responses observed before reset cannot reinstall their old deadlines.
+        Responses arriving after reset keep new limits, including older jobs.
+        """
+        with self._lock:
+            self._wait_epoch += 1
+            self._retry.clear()
 
     def drain(self, *, timeout=0) -> bool:
         with self._lock:

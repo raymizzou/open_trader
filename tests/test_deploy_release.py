@@ -51,7 +51,7 @@ class DeploymentWiringTests(unittest.TestCase):
     @patch.object(MODULE.subprocess, 'run')
     def test_cloud_config_mismatch_blocks_before_preflight_or_install(self, run, preflight):
         config = self.root / 'cloud.json'
-        config.write_text(json.dumps({'expected_sha': 'b' * 40, 'release_root': str(self.root),
+        config.write_text(json.dumps({'mode': 'production', 'expected_sha': 'b' * 40, 'release_root': str(self.root),
                                      'runtime_root': str(self.runtime), 'python': str(self.python)}))
         self.assertEqual(MODULE.main(self.args('prediction-systemd', '--config', str(config))), 2)
         preflight.assert_not_called()
@@ -60,13 +60,18 @@ class DeploymentWiringTests(unittest.TestCase):
     @patch.object(MODULE, 'run_preflight')
     @patch.object(MODULE.subprocess, 'run')
     def test_cloud_binds_selected_interpreter_and_exact_config(self, run, preflight):
-        run.return_value.returncode = 0
+        nonce = 'selected-operation-nonce'
+        run.side_effect = [SimpleNamespace(returncode=0, stdout=json.dumps(dict(status='PREPARED', operation_nonce=nonce))),
+                           SimpleNamespace(returncode=0)]
         config = self.root / 'cloud.json'
-        config.write_text(json.dumps({'expected_sha': self.sha, 'release_root': str(self.root),
+        config.write_text(json.dumps({'mode': 'production', 'expected_sha': self.sha, 'release_root': str(self.root),
                                      'runtime_root': str(self.runtime), 'python': str(self.python)}))
         self.assertEqual(MODULE.main(self.args('prediction-systemd', '--config', str(config), '--action', 'start')), 0)
         command = run.call_args.args[0]
-        self.assertEqual(command[-3:], ['start', '--config', str(config)])
+        self.assertEqual(run.call_args_list[0].args[0][2], 'prepare-target')
+        self.assertEqual(command[2:5], ['start', '--config', str(config)])
+        self.assertEqual(command[-2:], ['--operation-nonce', nonce])
+        preflight.assert_not_called()
         self.assertEqual(run.call_args.kwargs['env']['OPEN_TRADER_PYTHON'], str(self.python))
 
     @patch.object(MODULE, 'run_preflight')
@@ -80,12 +85,17 @@ class DeploymentWiringTests(unittest.TestCase):
     @patch.object(MODULE.subprocess, 'run')
     def test_changed_cloud_config_blocks_installer(self, run, preflight):
         config = self.root / 'cloud.json'
-        initial = {'expected_sha': self.sha, 'release_root': str(self.root),
+        initial = {'mode': 'production', 'expected_sha': self.sha, 'release_root': str(self.root),
                    'runtime_root': str(self.runtime), 'python': str(self.python)}
         config.write_text(json.dumps(initial))
-        preflight.side_effect = lambda args: config.write_text('{}')
+        def prepared(*args, **kwargs):
+            config.write_text('{}')
+            return SimpleNamespace(returncode=0, stdout=json.dumps(dict(status='PREPARED', operation_nonce='original-selected-nonce')))
+        run.side_effect = prepared
         self.assertEqual(MODULE.main(self.args('prediction-systemd', '--config', str(config))), 2)
-        run.assert_not_called()
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][2], 'prepare-target')
+        preflight.assert_not_called()
 
     @patch.object(MODULE, 'run_preflight')
     @patch.object(MODULE.subprocess, 'run')

@@ -850,6 +850,7 @@ class PolymarketLPService:
         if type(self.exclusions_enabled) is not bool:
             raise ValueError("exclusions_enabled must be a boolean")
         self._candidate_exclusion_revision = 0
+        self._qualified_pool_generation = None
         self._candidate_preparation_wakeup = None
         self.owner_lock = owner_lock
         self._mutation_guard = mutation_guard
@@ -1005,18 +1006,22 @@ class PolymarketLPService:
         return value if type(value) is int and value >= 0 else 0
 
     def _current_candidate_global_generation(self) -> int | None:
-        reader = getattr(self.store, "lp_preparation", None)
-        if not callable(reader):
-            return 0
-        try:
-            preparation = reader()
-        except Exception:
-            return None
-        return (
-            self._candidate_global_generation(preparation.get("global_recovery_generation"))
-            if isinstance(preparation, Mapping)
-            else 0
-        )
+        # Producer reads publish their actual fence for the memory-only port.
+        # Legacy generation defaults retain their old meaning only for legacy
+        # publication; an absent/failed fence never certifies a D2 capture.
+        with self._candidate_state_lock:
+            reader = getattr(self.store, "lp_preparation", None)
+            if not callable(reader):
+                self._qualified_pool_generation = None
+                return 0
+            try:
+                preparation = reader()
+            except Exception:
+                self._qualified_pool_generation = None
+                return None
+            raw = preparation.get("global_recovery_generation") if isinstance(preparation, Mapping) else None
+            self._qualified_pool_generation = raw if type(raw) is int and raw >= 0 else None
+            return self._candidate_global_generation(raw)
 
     def _candidate_generation_allowed(self, expected: int | None) -> bool:
         current = self._current_candidate_global_generation()
@@ -1460,6 +1465,9 @@ class PolymarketLPService:
                 saved = reader()
             except Exception:
                 saved = None
+        raw_fence = saved.get("global_recovery_generation") if isinstance(saved, Mapping) else None
+        with self._candidate_state_lock:
+            self._qualified_pool_generation = raw_fence if type(raw_fence) is int and raw_fence >= 0 else None
         with self._preparation_lock:
             if isinstance(saved, Mapping):
                 state = self._new_preparation_state()
@@ -1512,7 +1520,7 @@ class PolymarketLPService:
                 expected_generation if isinstance(existing, Mapping) else None
             )
             saved = (
-                writer(merged, expected_generation=store_expected)
+                writer(merged, expected_generation=store_expected, initialize_global_fence=True)
                 if callable(writer)
                 else merged
             )
@@ -2473,6 +2481,41 @@ class PolymarketLPService:
                       "estimated_exit_loss", "estimated_exit_loss_ratio"):
             projected[field] = None
         return projected
+
+    def capture_qualified_pool(self):
+        """Copy the complete producer inventory; no acquisition or eviction."""
+        from uuid import uuid4
+        from .polymarket_lp_current_inputs import QualifiedPoolCapture
+        from .polymarket_lp_market_reader import SourceResult, freeze
+        with self._candidate_state_lock:
+            now = self._now()
+            generation = self._qualified_pool_generation
+            prepared_fence = (self._preparation or {}).get("global_recovery_generation")
+            if generation is not None and type(prepared_fence) is int and prepared_fence > generation:
+                generation = prepared_fence
+            error = "producer_fence_unknown" if generation is None else None
+            rows = {}
+            for cid, row in self._candidate_pool.items():
+                facts = self._candidate_qualification_facts.get(cid)
+                reason = error
+                if reason is None and (row.get("global_recovery_generation") != generation
+                        or isinstance(facts, Mapping) and facts.get("global_recovery_generation") != generation):
+                    reason = "producer_fence_changed"
+                if reason is None and not isinstance(facts, Mapping):
+                    reason = "qualification_missing"
+                if reason is None and _candidate_pool_row_expired(row, now):
+                    reason = "qualification_expired"
+                checked = None
+                if isinstance(facts, Mapping):
+                    try:
+                        checked = _timestamp(facts.get("checked_at"), name="qualification_checked_at")
+                    except ValueError:
+                        reason = reason or "qualification_time_unknown"
+                rows[cid] = SourceResult(f"qualified:{cid}:{row.get('updated_at')}",
+                    freeze(dict(row=row, facts=facts)), complete=reason is None,
+                    checked_at=checked, error=reason, error_facts=freeze({}))
+            return QualifiedPoolCapture(str(uuid4()), now, True, generation,
+                self._candidate_exclusion_revision, MappingProxyType(rows), error)
 
     def candidate_snapshot(self) -> dict[str, object]:
         """Project the rolling candidate pool without external reads.
@@ -9477,7 +9520,8 @@ class PolymarketLPService:
             # ownership/trading state before the single account-wide commit.
             scanned = connection.execute(
                 "SELECT session_id,json_extract(payload,'$._lp_trade_revision') AS revision "
-                "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?)",
+                "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?) "
+                "AND coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true'",
                 (account_id,),
             ).fetchall()
             diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1

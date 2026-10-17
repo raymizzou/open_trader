@@ -278,10 +278,17 @@ def _complete_projection_trace(path, monkeypatch):
 
 def test_compact_direction_projection_matches_complete_queues_and_overrides(tmp_path, monkeypatch):
     trace = _complete_projection_trace(tmp_path, monkeypatch)
-    assert [state.pop("competition_version") for state in trace["states"]] == [1, 1, 1]
-    assert [state.pop("build_sequence") for state in trace["states"]] == [1, 3, 4]
-    # The two internal queue fences are checked separately; keep the complete business golden.
-    digest = hashlib.sha256(json.dumps(trace, default=str, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert len(trace["states"]) == 3
+    for state in trace["states"]:
+        assert type(state["global_recovery_generation"]) is int
+        assert state["global_recovery_generation"] == 1
+    historical = deepcopy(trace)
+    assert [state.pop("competition_version") for state in historical["states"]] == [1, 1, 1]
+    assert [state.pop("build_sequence") for state in historical["states"]] == [1, 3, 4]
+    # Assert the current producer fence above; retain the independent historical representation.
+    for state in historical["states"]:
+        state["global_recovery_generation"] = 0
+    digest = hashlib.sha256(json.dumps(historical, default=str, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     # Recorded independently with this fixture against read-only 3ad0d3ec source.
     assert digest == "ffbde7cce77aa091183c50a0d355b9f5a59d7f8111053cb2315dbfc51bde2bdb"
 

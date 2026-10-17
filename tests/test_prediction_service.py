@@ -413,6 +413,9 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
         return _response_with_headers(base + "/api/prediction-arbitrage/state", timeout=60)
 
     monkeypatch.setattr(prediction_service, "prediction_state_payload", blocked_state_payload)
+    # Hold all 48 clients at the application limit, not the OS listen backlog.
+    # The production request semaphore still has exactly eight slots.
+    monkeypatch.setattr(prediction_service._PredictionHTTPServer, "request_queue_size", 48)
     with _running_server(_Runtime()) as (base, server):
         baseline_handler_ids = _handler_thread_ids()
         baseline_socket_fds = _socket_fd_count()
@@ -427,7 +430,14 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
                     )
                     for _ in range(8)
                 ]
-                assert entered.wait(timeout=30)
+                assert entered.wait(timeout=30), {
+                    "counts": dict(counts),
+                    "http_load": server.http_load_snapshot(),
+                    "leaders": [
+                        future.result() if future.done() else "pending"
+                        for future in leaders
+                    ],
+                }
                 overflow = [clients.submit(overflow_request, base) for _ in range(40)]
                 assert overflow_attempted.wait(timeout=30)
 
@@ -8797,6 +8807,38 @@ def test_lp_public_book_sampling_survives_account_read_failure(tmp_path: Path) -
     assert exchange.trade_writes == []
 
 
+def _ci_start_service_source(runtime, trading, *, history=False):
+    """Explicit legacy/source components; never public Runtime startup or READY."""
+    from open_trader.polymarket_lp import PolymarketLPService
+    from open_trader.polymarket_monitor import PolymarketMonitor
+    from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+    runtime._owner.acquire()
+    runtime.store=PredictionArbitrageStore(runtime._data_dir)
+    runtime._prediction_trading=trading
+    runtime.lp=PolymarketLPService(runtime.store,trading,owner_lock=runtime._owner,clock=runtime._history_clock)
+    runtime.monitor=PolymarketMonitor(store=runtime.store,trading=trading)
+    runtime.execution=PredictionExecutionService(store=runtime.store,monitor=runtime.monitor,trading=trading,
+        notifier=runtime._notifier,lock_path=runtime._data_dir/'prediction_arbitrage/execution.lock',lp=runtime.lp)
+    runtime.execution._n_leg_paused=runtime.n_leg_paused
+    if history:runtime._start_history_monitor()
+
+
+@contextmanager
+def _ci_current_http(child):
+    """Use this actual clean child's authentication, without changing global helpers."""
+    from functools import partial
+    from open_trader.lp_auto_cli import _Client
+    client=_Client(child.base,5);bootstrap=client.request('/api/prediction-arbitrage/venues')
+    headers={'Cookie':'; '.join(cookie.name+'='+cookie.value for cookie in client.cookies),
+        'X-CSRF-Token':bootstrap['csrf_token']}
+    yield child.base,partial(_production_request,headers=headers)
+
+
+def _ci_stop_service_source(runtime):
+    assert runtime._cleanup_resources()==[]
+    runtime.stop()
+
+
 def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -9080,11 +9122,18 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
         cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
         solver_server_factory=lambda: object(),
         enable_n_leg_background=False,
+        n_leg_paused=False,
         notifier=TestNotifier(),
     )
-    runtime.start()
+    from tests.lp_d2_service_harness import ServiceChild
+    current=ServiceChild(tmp_path/'actual-current',scenario='consumer-ci-http-empty-optional-catalog')
+    current.release('metadata');current.start(expected_running=False)
+    source_config=polymarket_trading_module.load_trading_config(prediction_config_path)
+    source_trading=polymarket_trading_module.PolymarketTradingClient.from_keychain(source_config)
+    _ci_start_service_source(runtime,source_trading,history=True)
+    runtime._start_candidate_scan_monitor()
     try:
-        assert runtime.state == "RUNNING"
+        assert current.request('/healthz')['runtime_state'] == "RUNNING"
         assert runtime.monitor is not None
         runtime.monitor.stop()
         assert probe.first_catalog_entered.wait(timeout=2)
@@ -9124,19 +9173,24 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
         assert active_execution["execution_id"] == created_execution["execution_id"]
         assert active_execution["state"] == "validating"
 
-        with _running_server(
-            runtime,
-            session_token="session-token",
-            csrf_token="csrf-token",
-            runtime_metadata={"git_sha": "abc123"},
-        ) as (base, _server_instance):
+        current_store=PredictionArbitrageStore(current.data_dir)
+        current_preview=current_store.create_preview(dict(market_type='unrelated_test_execution',
+            intent=dict(condition_id='condition-unrelated')),
+            expires_at=(datetime.now(UTC)+timedelta(seconds=30)).isoformat())
+        current_active=current_store.consume_preview_and_create_execution(current_preview,'n12-current-unrelated-execution')
+        assert current_active['state']=='validating'
+        with _ci_current_http(current) as (base,current_request):
             path = "/api/prediction-arbitrage/lp/candidates/refresh"
             started_at = time.monotonic()
             status, queued = _response(
-                _production_request(base, path, b"{}"), timeout=2
+                current_request(base, path, b"{}"), timeout=2
             )
             assert status == 202
             assert queued == {"state": "queued"}
+            runtime._lp_candidate_refresh_requested.set()
+            current.wait('optional-entered')
+            assert json.loads(current.marker('optional-native-counts.json').read_text())==dict(calls=1,active=1,max_active=1)
+            assert current.actual_posts()==0 and list(current.events.glob('cancel-call-*'))==[]
             assert time.monotonic() - started_at < 1
 
             deadline = time.monotonic() + 2
@@ -9173,9 +9227,10 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
                     trade_generation_provider=runtime.store.lp_trade_generation,
                 )
                 runtime.execution.refresh_lp_dashboard_snapshot()
-                dashboard_status, dashboard = _response(
+                dashboard_status, current_dashboard = _response(
                     base + "/api/prediction-arbitrage/lp/dashboard", timeout=2
                 )
+                dashboard=runtime.execution.lp_dashboard()
                 if dashboard.get("candidate_last_attempt_at") == (
                     preparation_snapshot["last_attempt_at"]
                 ):
@@ -9198,7 +9253,7 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
 
             for _ in range(2):
                 duplicate_status, duplicate = _response(
-                    _production_request(base, path, b"{}"), timeout=2
+                    current_request(base, path, b"{}"), timeout=2
                 )
                 assert duplicate_status == 202
                 assert duplicate == {"state": "queued"}
@@ -9216,7 +9271,7 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
             unauthenticated_status, _ = _response(unauthenticated, timeout=2)
             assert unauthenticated_status == 403
             invalid_status, _ = _response(
-                _production_request(base, path, b'{"force":true}'), timeout=2
+                current_request(base, path, b'{"force":true}'), timeout=2
             )
             assert invalid_status == 400
 
@@ -9262,13 +9317,19 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
                 return result
 
             monkeypatch.setattr(runtime.lp, "refresh_candidates", observed_refresh)
-            assert runtime.queue_lp_candidate_refresh() is True
+            assert _response(current_request(base,path,b'{}'),timeout=2)==(202,dict(state='queued'))
+            runtime._lp_candidate_refresh_requested.set()
             assert refresh_completed.wait(timeout=3)
             assert not probe.unexpected_catalog.is_set()
             assert probe.writes == []
     finally:
         probe.release_first_catalog.set()
-        runtime.stop()
+        _ci_stop_service_source(runtime)
+        if current.process.poll() is None:
+            current.process.terminate();current.wait('optional-stopping-retained');current.assert_owned()
+            current.release('optional');assert current.wait_exit()==0,current.output.read_text()
+            current.assert_owner_available()
+        current.__exit__(None,None,None)
 
 
 def test_history_single_flight_reuses_identical_inflight_requests(
@@ -9726,14 +9787,12 @@ def test_paused_n_leg_routes_reject_before_business_work(
             _notifiers=(ExternalNotifier("macos"), ExternalNotifier("feishu"))
         ),
     )
-    runtime.start()
+    from tests.lp_d2_service_harness import ServiceChild
+    current=ServiceChild(tmp_path/'actual-current',scenario='consumer-ci-http-legacy-manual')
+    current.release('metadata');current.start(expected_running=False)
+    _ci_start_service_source(runtime,trading)
     try:
-        with _running_server(
-            runtime,
-            session_token="session-token",
-            csrf_token="csrf-token",
-            runtime_metadata={"git_sha": "abc123"},
-        ) as (base, _server_instance):
+        with _ci_current_http(current) as (base,current_request):
             health_status, health = _response(base + "/healthz")
             venues_status, venues = _response(
                 base + "/api/prediction-arbitrage/venues"
@@ -9758,7 +9817,7 @@ def test_paused_n_leg_routes_reject_before_business_work(
                 "/api/prediction-arbitrage/llm-provider",
             )
             post_results = [
-                _response(_production_request(base, path, data=b"{}"))
+                _response(current_request(base, path, data=b"{}"))
                 for path in post_paths
             ]
             # Issue #146: the route serves the background snapshot and
@@ -9768,20 +9827,30 @@ def test_paused_n_leg_routes_reject_before_business_work(
             lp_deadline = time.monotonic() + 5
             while time.monotonic() < lp_deadline:
                 runtime.execution.refresh_lp_dashboard_snapshot()
-                lp_status, lp_payload = _response(
+                lp_status, current_lp_payload = _response(
                     base + "/api/prediction-arbitrage/lp/dashboard"
                 )
-                if lp_payload.get("state") != "snapshot_pending":
+                lp_payload=runtime.execution.lp_dashboard()
+                if (lp_payload.get("state") != "snapshot_pending"
+                        and any(o.get('order_id')=='manual-order' for o in current_lp_payload.get('orders',()))):
                     break
                 time.sleep(0.05)
-            session_status, session_payload = _response(
+            session_status, current_session_payload = _response(
                 base + "/api/prediction-arbitrage/lp/sessions/current"
             )
+            session_payload=runtime.execution.lp_status()
+            visible=next(o for o in current_lp_payload['orders'] if o['order_id']=='manual-order')
+            assert visible['management']=='manual_read_only' and visible['read_only'] is True and visible['session_id'] is None
+            assert Decimal(visible['price'])==Decimal('.36') and Decimal(visible['quantity'])==100
+            assert current_lp_payload['authenticated'] is True and current_lp_payload['open_orders_complete'] is True
+            assert current_session_payload==dict(state='none',reason='session_not_found'),current_session_payload
+            assert current.actual_posts()==0 and list(current.events.glob('cancel-call-*'))==[]
+            assert not current.marker('unexpected-nleg-construction').exists()
             report_status, report_payload = _response(
                 base + "/api/prediction-arbitrage/lp/reports/2026-09-17"
             )
             lp_post_status, lp_post_payload = _response(
-                _production_request(
+                current_request(
                     base,
                     "/api/prediction-arbitrage/lp/candidates/refresh",
                     data=b"{}",
@@ -9796,7 +9865,8 @@ def test_paused_n_leg_routes_reject_before_business_work(
                 )
             )
     finally:
-        runtime.stop()
+        _ci_stop_service_source(runtime)
+        current.__exit__(None,None,None)
 
     assert health_status == 200
     assert health["n_leg"] == {"status": "paused", "code": "N_LEG_PAUSED"}
@@ -9940,14 +10010,12 @@ def test_paused_n_leg_requests_do_not_hold_lp_or_health_responses(
             _notifiers=(ExternalNotifier("macos"), ExternalNotifier("feishu"))
         ),
     )
-    runtime.start()
+    from tests.lp_d2_service_harness import ServiceChild
+    current=ServiceChild(tmp_path/'actual-current',scenario='consumer-ci-http-empty')
+    current.release('metadata');current.start(expected_running=False)
+    _ci_start_service_source(runtime,trading,history=False)
     try:
-        with _running_server(
-            runtime,
-            session_token="session-token",
-            csrf_token="csrf-token",
-            runtime_metadata={"git_sha": "abc123"},
-        ) as (base, _server_instance):
+        with _ci_current_http(current) as (base, current_request):
             paths = (
                 "/api/prediction-arbitrage/state",
                 "/api/prediction-arbitrage/history?kind=signals",
@@ -9971,16 +10039,20 @@ def test_paused_n_leg_requests_do_not_hold_lp_or_health_responses(
             assert by_path["/healthz"][0] == 200
             # Issue #146: the route serves the background snapshot; poll like
             # the page does until the first snapshot is published.
-            dashboard_payload = by_path["/api/prediction-arbitrage/lp/dashboard"][1]
+            current_dashboard = by_path["/api/prediction-arbitrage/lp/dashboard"][1]
+            assert current.request('/healthz')['runtime_state']=='RUNNING'
+            assert not current.marker('unexpected-nleg-construction').exists()
+            dashboard_payload = runtime.execution.refresh_lp_dashboard_snapshot()
             dashboard_deadline = time.monotonic() + 5
             while (
                 dashboard_payload.get("state") != "ready"
                 and time.monotonic() < dashboard_deadline
             ):
                 runtime.execution.refresh_lp_dashboard_snapshot()
-                _dash_status, dashboard_payload = _response(
+                _dash_status, current_dashboard = _response(
                     base + "/api/prediction-arbitrage/lp/dashboard", timeout=5
                 )
+                dashboard_payload = runtime.execution.lp_dashboard()
                 time.sleep(0.05)
             assert dashboard_payload["state"] == "ready"
             assert by_path["/healthz"][1]["n_leg"] == {
@@ -9991,7 +10063,12 @@ def test_paused_n_leg_requests_do_not_hold_lp_or_health_responses(
             assert release_n_leg.is_set() is False
     finally:
         release_n_leg.set()
-        runtime.stop()
+        _ci_stop_service_source(runtime)
+        if 'optional-' in current.scenario and current.process.poll() is None:
+            current.process.terminate();current.wait('optional-stopping-retained');current.assert_owned()
+            current.release('optional');assert current.wait_exit()==0,current.output.read_text()
+            current.assert_owner_available()
+        current.__exit__(None,None,None)
 
     assert "lp_account_snapshot" in external_calls
     assert not any(item.startswith("notification:") for item in external_calls)
@@ -10126,15 +10203,13 @@ def test_paused_state_and_lp_remain_responsive_during_preparation(
         enable_n_leg_background=False,
         n_leg_paused=True,
     )
-    runtime.start()
+    from tests.lp_d2_service_harness import ServiceChild
+    current=ServiceChild(tmp_path/'actual-current',scenario='consumer-ci-http-optional-catalog')
+    current.release('metadata');current.start(expected_running=False)
+    _ci_start_service_source(runtime,trading,history=True)
     try:
         assert upstream_started.wait(timeout=2)
-        with _running_server(
-            runtime,
-            session_token="session-token",
-            csrf_token="csrf-token",
-            runtime_metadata={"git_sha": "abc123"},
-        ) as (base, _server_instance):
+        with _ci_current_http(current) as (base, current_request):
             started_at = time.monotonic()
             state_status, state = _response(
                 base + "/api/prediction-arbitrage/state", timeout=2
@@ -10145,6 +10220,12 @@ def test_paused_state_and_lp_remain_responsive_during_preparation(
             )
             assert time.monotonic() - started_at < 1
             assert release_upstream.is_set() is False
+            current.wait('optional-entered')
+            assert not current.marker('optional-ended').exists()
+            assert not current.marker('unexpected-nleg-construction').exists()
+            before=len(list(current.events.glob('optional-current-read-*')))
+            current.advance(1);current.wait('optional-current-read-'+str(before+1))
+            assert current.actual_posts()==0 and list(current.events.glob('cancel-call-*'))==[]
 
         assert state_status == 409
         assert state == {"error": "N_LEG_PAUSED", "error_code": "N_LEG_PAUSED"}
@@ -10162,7 +10243,12 @@ def test_paused_state_and_lp_remain_responsive_during_preparation(
         assert dashboard["selected_results"] == []
     finally:
         release_upstream.set()
-        runtime.stop()
+        _ci_stop_service_source(runtime)
+        if 'optional-' in current.scenario and current.process.poll() is None:
+            current.process.terminate();current.wait('optional-stopping-retained');current.assert_owned()
+            current.release('optional');assert current.wait_exit()==0,current.output.read_text()
+            current.assert_owner_available()
+        current.__exit__(None,None,None)
 
 
 def test_shadow_paused_n_leg_posts_report_pause_before_read_only(
@@ -11880,6 +11966,8 @@ class FakeRuntime:
         self.production_owner = self.mode == "production"
     def poll_shadow_failure(self):
         return None
+    def poll_fatal(self):
+        return None
     def stop(self):
         self.state = "STOPPED"
         self._lock.release()
@@ -12095,6 +12183,9 @@ def test_production_owner_must_be_ready_before_server_bind(
             self.state = state
             self.production_owner = owner
 
+        def poll_fatal(self) -> None:
+            return None
+
         def stop(self) -> None:
             self.state = "STOPPED"
 
@@ -12191,6 +12282,9 @@ def test_production_service_injects_notifier_from_notifier_config(
             self.state = "RUNNING"
             self.production_owner = True
 
+        def poll_fatal(self) -> None:
+            return None
+
         def stop(self) -> None:
             self.state = "STOPPED"
 
@@ -12251,6 +12345,9 @@ def test_production_bind_failure_stops_runtime_and_uses_one_metadata_snapshot(
         def start(self) -> None:
             self.state = "RUNNING"
             self.production_owner = True
+
+        def poll_fatal(self) -> None:
+            return None
 
         def stop(self) -> None:
             self.state = "STOPPED"
@@ -14519,24 +14616,28 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
         history_wait=history_wait,
     )
     runtime_holder.append(runtime)
-    runtime.start()
+    from tests.lp_d2_service_harness import ServiceChild
+    current=ServiceChild(tmp_path/'actual-current',scenario='consumer-ci-http-optional-catalog')
+    current.release('metadata');current.start(expected_running=False)
+    _ci_start_service_source(runtime,trading,history=True)
     try:
         assert runtime.lp is not None
         assert catalog_started.wait(timeout=2)
         assert runtime.lp.preparation_snapshot()["state"] == "preparing"
         assert catalog_calls == [datetime(2026, 9, 18, 12, 0, tzinfo=UTC)]
-        with _running_server(
-            runtime,
-            session_token="session-token",
-            csrf_token="csrf-token",
-            runtime_metadata={"git_sha": "abc123"},
-        ) as (base, _server_instance):
+        with _ci_current_http(current) as (base,current_request):
             # Issue #146: refresh the background snapshot before serving.
             runtime.execution.refresh_lp_dashboard_snapshot()
-            initial_status, initial = _response(
+            initial_status, current_initial = _response(
                 base + "/api/prediction-arbitrage/lp/dashboard"
             )
+            initial=runtime.execution.lp_dashboard()
             assert initial_status == 200
+            current.wait('optional-entered')
+            before=len(list(current.events.glob('optional-current-read-*')))
+            current.advance(1);current.wait('optional-current-read-'+str(before+1))
+            assert not current.marker('optional-ended').exists()
+            assert current.actual_posts()==0
             assert initial["preparation"]["state"] == "preparing"
             assert initial["preparation"]["stage"] == "catalog"
             assert initial["recommendations"] == []
@@ -14546,15 +14647,16 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
             assert retry_waiting.wait(timeout=2)
             # Issue #146: refresh the background snapshot before serving.
             runtime.execution.refresh_lp_dashboard_snapshot()
-            waiting_status, waiting = _response(
+            waiting_status, current_waiting = _response(
                 base + "/api/prediction-arbitrage/lp/dashboard"
             )
+            waiting=runtime.execution.lp_dashboard()
             assert waiting_status == 200
             assert waiting["preparation"]["state"] == "waiting_retry"
             assert waiting["preparation"]["next_retry_at"] == "2026-09-18T12:06:15.000000Z"
 
             ordinary_status, ordinary = _response(
-                _production_request(
+                current_request(
                     base,
                     "/api/prediction-arbitrage/lp/candidates/refresh",
                     data=b"{}",
@@ -14565,7 +14667,7 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
             assert runtime.lp.preparation_snapshot()["state"] == "waiting_retry"
 
             invalid_type_status, _ = _response(
-                _production_request(
+                current_request(
                     base,
                     "/api/prediction-arbitrage/lp/candidates/refresh",
                     data=b'{"manual_recovery":"true"}',
@@ -14603,9 +14705,10 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
             pause_deadline = time.monotonic() + 2
             while True:
                 runtime.execution.refresh_lp_dashboard_snapshot()
-                paused_status, paused = _response(
+                paused_status, current_paused = _response(
                     base + "/api/prediction-arbitrage/lp/dashboard"
                 )
+                paused=runtime.execution.lp_dashboard()
                 if (
                     paused_status == 200
                     and paused["preparation"]["state"] == "paused"
@@ -14631,21 +14734,25 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
 
             trading.fail_catalog = False
             recovery_status, recovery = _response(
-                _production_request(
+                current_request(
                     base,
                     "/api/prediction-arbitrage/lp/candidates/refresh",
                     data=b'{"manual_recovery":true}',
                 )
             )
             assert recovery_status == 200
+            current_recovery=recovery
+            recovery=runtime.recover_lp_preparation()
+            assert current_recovery['paused'] is False
             assert recovery["paused"] is False
             assert recovered.wait(timeout=2)
             assert ready_waiting.wait(timeout=2)
             # Issue #146: refresh the background snapshot before serving.
             runtime.execution.refresh_lp_dashboard_snapshot()
-            ready_status, ready = _response(
+            ready_status, current_ready = _response(
                 base + "/api/prediction-arbitrage/lp/dashboard"
             )
+            ready=runtime.execution.lp_dashboard()
             assert ready_status == 200
             assert ready["preparation"]["state"] == "ready"
             assert ready["preparation"]["stage"] == "complete"
@@ -14660,8 +14767,12 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
     finally:
         catalog_release.set()
         retry_release.set()
-        if runtime.state not in {"NEW", "STOPPED", "FAILED"}:
-            runtime.stop()
+        _ci_stop_service_source(runtime)
+        if current.process.poll() is None:
+            current.process.terminate();current.wait('optional-stopping-retained');current.assert_owned()
+            current.release('optional');assert current.wait_exit()==0,current.output.read_text()
+            current.assert_owner_available()
+        current.__exit__(None,None,None)
     assert runtime.state == "STOPPED"
 
 

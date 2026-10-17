@@ -481,113 +481,84 @@ from tests.test_lp_order_registration_contract import _adapter
 
 
 def test_independent_cancel_preserves_native_inflight_lifetime(runtime, tmp_path, monkeypatch):
-    # Startup's account-age clock shares the fixture's controlled business
-    # time. Native thread/Event watchdogs retain real monotonic time.
-    from open_trader import prediction_arbitrage_execution as execution_module
-    class ClockMeta(type):
-        def __instancecheck__(cls, value):
-            return isinstance(value, datetime)
-    class BusinessDateTime(datetime, metaclass=ClockMeta):
-        @classmethod
-        def now(cls, tz=None):
-            return runtime.clock[0] if tz is not None else runtime.clock[0].replace(tzinfo=None)
-    monkeypatch.setattr(execution_module, 'datetime', BusinessDateTime)
-    public = ColdPublic(runtime.clock)
-    public.rates = {1: '1000', 2: '900', 3: '800', 4: '700', 5: '1', 6: '100'}
-    originals = tuple(_open_order(f'original-{letter}', 'BUY', price='.40', original='20',
-        token_id=_refill_identity(i)[2]).model_copy(update={
-            'market': _refill_identity(i)[1], 'condition_id': _refill_identity(i)[1]})
-        for i, letter in enumerate('ABCDE', 1))
-    adapter, account = _adapter(tmp_path, orders=originals, public_client=public)
-    entered, release, finished, closed = Event(), Event(), Event(), Event()
-    def cancel(*, order_ids):
-        account.cancels.append(order_ids)
-        entered.set()
+    # Preserve the independent logical BUY-plan contract at the explicit
+    # None-facade source component, then prove actual current/native ownership.
+    store, adapter, account, lp, engine, public = _five_resting(runtime)
+    entered, release, finished = Event(), Event(), Event()
+    def cancel(*,order_ids):
+        account.cancels.append(order_ids);entered.set()
         try:
-            assert release.wait(5), 'Independent runtime-owned cancel watchdog'
-            return CancelOrdersResponse(canceled=order_ids, not_canceled={})
+            assert release.wait(5),'Independent external cancel watchdog'
+            return CancelOrdersResponse(canceled=order_ids,not_canceled={})
+        finally:finished.set()
+    account.cancel_orders=cancel
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        future=workers.submit(engine.lp_auto_run_once,round_id='runtime-current')
+        try:
+            assert entered.wait(5)
+            state=future.result(timeout=1)
+            assert state['active_plan'] is None
+            assert not finished.is_set()
+            engine.lp_auto_set_desired_running(False)
+            assert not finished.is_set()
+            assert account.cancels==[('original-E',)] and account.posts==[]
+            with pytest.raises(RuntimeError,match='sender did not stop'):
+                lp.drain_submissions(timeout=0)
         finally:
-            finished.set()
-    account.cancel_orders = cancel
-    account.get_order = lambda *, order_id: next(o for o in account.orders if o.id == order_id)
-    native_close = adapter.close
-    def observed_close():
-        closed.set()
-        return native_close()
-    adapter.close = observed_close
-    account.is_gasless_ready = lambda: True
-    monkeypatch.setattr(PolymarketTradingClient, 'from_keychain', classmethod(lambda cls, config: adapter))
-    config = tmp_path / 'prediction.json'
-    config.write_text(json.dumps({'signer_address': WALLET, 'wallet_address': WALLET}))
-    # All HTTP lanes use the established offline external carrier, including
-    # runtime background competition/history reads.
-    from tests.test_lp_auto_current_facts_cycle import _prepare_public_inputs
-    from contextlib import contextmanager
-    from types import SimpleNamespace
-    @contextmanager
-    def http(request, **kwargs):
-        if request.data:
-            body = json.loads(request.data)
-            payload = {'history': {t: [dict(t=body['start_ts'], p='.40'), dict(t=body['end_ts'], p='.401')]
-                for t in body['markets']}}
-        else:
-            payload = {'data': [dict(condition_id=_refill_identity(i)[1], market_competitiveness='2.5')
-                for i in range(1, 7)], 'next_cursor': 'LTE='}
-        yield SimpleNamespace(read=lambda: json.dumps(payload).encode())
-    adapter._urlopen_fn = http
-    markets = public.list_markets
-    class Pages:
-        def __init__(self, rows): self.rows = rows
-        def iter_items(self): yield from self.rows
-        def first_page(self): return SimpleNamespace(items=self.rows, has_more=False)
-    public.list_markets = lambda **kwargs: Pages(markets(**kwargs))
-    host = PredictionRuntime(data_dir=tmp_path / 'host', prediction_config_path=config,
-        dashboard_url='http://127.0.0.1:8766/', n_leg_paused=True, history_clock=lambda: runtime.clock[0],
-        notifier=SimpleNamespace(_notifiers=(SimpleNamespace(channel='macos'), SimpleNamespace(channel='feishu'))))
-    try:
-        host.start()
-        assert host.state == 'RUNNING'
-        engine, lp, store = host.execution, host.lp, host.store
-        engine.lp_auto_configure({'budget_usd': '40', 'target_buy_count': 5})
-        deadline = monotonic() + 5
-        while lp.preparation_snapshot().get('state') != 'ready':
-            assert monotonic() < deadline, lp.preparation_snapshot()
-            Event().wait(.01)
-        lp.refresh_competition_cache()
-        lp.refresh_candidates(force=True)
-        engine.lp_auto_set_desired_running(True)
-        waiting = engine.lp_auto_state()['plan_wait']
-        if waiting:
-            runtime.clock[0] = datetime.fromisoformat(waiting['deadline']) + timedelta(microseconds=1)
-        engine.lp_auto_run_once(round_id='runtime-current')
-        assert entered.wait(5)
-        deadline = monotonic() + 5
-        while engine.lp_auto_state()['active_plan'] is not None:
-            assert monotonic() < deadline, 'BUY plan completion watchdog'
-            Event().wait(.01)
-        assert not finished.is_set()
-        engine.lp_auto_set_desired_running(False)
-        assert not finished.is_set() and not closed.is_set()
-        with pytest.raises(RuntimeError, match='sender did not stop'):
-            host.stop()
-        assert host.state == 'STOPPING' and not closed.is_set()
-        assert host.store is store and host.lp is lp
-        contender = PredictionRuntime(data_dir=tmp_path / 'host', prediction_config_path=config,
-            dashboard_url='http://127.0.0.1:8766/', n_leg_paused=True)
-        with pytest.raises(PredictionRuntimeOwnershipError):
-            contender.start()
-        assert account.cancels == [('original-E',)]
-        release.set()
-        assert finished.wait(5)
-        _wait_audits(store, lambda rows: all(a['state'] != 'pending' for a in rows))
-        deadline = monotonic() + 5
-        while host.state != 'STOPPED':
-            try:
-                host.stop()
-            except RuntimeError:
-                assert monotonic() < deadline, 'Actual sender drain and runtime shutdown watchdog'
-        assert closed.is_set() and account.cancels == [('original-E',)]
-    finally:
-        release.set()
-        host.stop()
-        adapter.close()
+            release.set();assert finished.wait(5);future.result(timeout=5)
+        _wait_audits(store,lambda rows:all(row['state']!='pending' for row in rows))
+    import json,threading
+    from open_trader.prediction_runtime import _RuntimeOwnershipLock
+    from open_trader.lp_auto_cli import _Client
+    from tests.lp_d2_service_harness import ServiceChild
+    originals=tuple(_open_order(f'original-{letter}','BUY',price='.40',original='20',
+        token_id=_refill_identity(i)[2]).model_copy(update={
+            'market':_refill_identity(i)[1],'condition_id':_refill_identity(i)[1]})
+        for i,letter in enumerate('ABCDE',1))
+    with ServiceChild(tmp_path/'current-native',scenario='consumer-ci-independent-cancel') as child:
+        child.marker('ci-current-orders.json').write_text(json.dumps([o.model_dump(mode='json') for o in originals]))
+        child.release('metadata');child.start(expected_running=False)
+        child.wait_state(lambda s:len(s['account_buys'])==5)
+        child.wait('ci-current-captured')
+        assert child.request('/healthz')['runtime_state']=='RUNNING'
+        client=_Client(child.base,10);bootstrap=client.request('/api/prediction-arbitrage/venues')
+        results=[];errors=[]
+        def send_cancel():
+            try:results.append(client.request('/api/prediction-arbitrage/lp/orders/cancel',
+                dict(confirm=True,order_ids=['original-E']),csrf=bootstrap['csrf_token']))
+            except BaseException as exc:errors.append(exc)
+            finally:
+                child.marker('ci-cancel-http-result.json').write_text(json.dumps(dict(results=results,errors=[repr(e) for e in errors])))
+        native=threading.Thread(target=send_cancel)
+        try:
+            native.start();deadline=monotonic()+5
+            while not child.marker('ci-cancel-entered').exists():
+                assert native.is_alive(),dict(results=results,errors=[repr(e) for e in errors])
+                assert monotonic()<deadline,'Original exact SDK cancel did not enter'
+                Event().wait(.01)
+            child.release('ci-scheduler')
+            assert not child.marker('ci-cancel-ended').exists()
+            paused=child.pause()
+            assert paused['effective_running'] is False
+            assert not child.marker('ci-cancel-ended').exists() and not child.marker('ci-client-closed').exists()
+            child.process.terminate();child.wait('metadata-admission-closed',timeout=5)
+            child.assert_owned()
+            child.wait('ci-native-stopping.json',timeout=5)
+            stopping=json.loads(child.marker('ci-native-stopping.json').read_text())
+            assert stopping==dict(state='STOPPING',production_owner=True,store_retained=True,lp_retained=True,client_retained=True)
+            assert not child.marker('ci-client-closed').exists()
+            contender=_RuntimeOwnershipLock(child.data_dir/'prediction_arbitrage/runtime.lock')
+            with pytest.raises(PredictionRuntimeOwnershipError):contender.acquire()
+            assert json.loads(child.marker('ci-exact-cancel-ids.json').read_text())==['original-E']
+            deadline=monotonic()+5
+            child.release('ci-cancel');native.join(5)
+            assert not native.is_alive() and not errors,errors
+            assert results[0]['canceled']==['original-E']
+            assert child.process.wait(timeout=max(0,deadline-monotonic()))==0,child.output.read_text()
+            assert monotonic()<deadline,'Actual sender drain and runtime shutdown watchdog'
+            assert child.marker('ci-cancel-ended').exists() and child.marker('ci-client-closed').exists()
+            assert child.actual_posts()==0 and len(list(child.events.glob('cancel-call-*')))==1
+            child.assert_owner_available();contender.acquire();contender.release()
+        finally:
+            child.release('ci-cancel');child.release('ci-scheduler')
+            if native.ident is not None:native.join(5)

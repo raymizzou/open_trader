@@ -9,11 +9,11 @@ from threading import Event
 
 import pytest
 
-from open_trader.prediction_runtime import _RuntimeOwnershipLock
+from open_trader.prediction_runtime import _RuntimeOwnershipLock, PredictionRuntimeOwnershipError
 from tests.test_lp_account_reservation_reconciliation import runtime, _advance, _refill_identity, _position
 from tests.test_lp_auto_refill_contract import prepare, RefillPublic, _historical_api_buy_intents
 from tests.test_lp_auto_restart_preparation import _four_buys, _new_owner, _terminate_old, _arm_refill
-from tests.test_lp_auto_restart_preparation import dead_preparation
+from tests.test_lp_auto_restart_preparation import dead_preparation, _assert_current_after_legacy
 from tests.test_lp_order_registration_contract import _open_order
 
 
@@ -99,7 +99,7 @@ def test_dead_manual_and_augment_buy_are_covered_once_and_refill_from_current_ap
     child, sid, orders, audit = interrupted_buy_owner
     _terminate_old(child)
     owner, store, _, account, _ = _new_owner(runtime, monkeypatch, tmp_path, orders=orders)
-    owner.start()
+    owner.open()
     try:
         _advance(runtime)
         assert owner.execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
@@ -122,9 +122,9 @@ def test_dead_manual_and_augment_buy_are_covered_once_and_refill_from_current_ap
         assert len(account.posts) == 1
         current_orders = account.orders
     finally:
-        owner.stop()
+        owner.close()
     owner, store, _, account, _ = _new_owner(runtime, monkeypatch, tmp_path, orders=current_orders)
-    owner.start()
+    owner.open()
     try:
         _advance(runtime)
         owner.execution.refresh_lp_dashboard_snapshot()
@@ -134,7 +134,9 @@ def test_dead_manual_and_augment_buy_are_covered_once_and_refill_from_current_ap
         assert store.lp_actions(sid) == audit
         assert account.posts == account.cancels == []
     finally:
-        owner.stop()
+        owner.close()
+
+    _assert_current_after_legacy(tmp_path/'actual-current',store,account,RefillPublic(runtime.clock),restart=True)
 
 
 @pytest.mark.parametrize('lifecycle', ['unknown', 'sending'])
@@ -214,7 +216,7 @@ def test_dead_post_api_exposure_is_managed_once_without_replaying_unknown_reques
     else:
         account.positions = (_position(size='5').model_copy(update={
             'token_id': original['token_id'], 'condition_id': original['condition_id']}),)
-    owner.start()
+    owner.open()
     try:
         _advance(runtime)
         owner.execution.refresh_lp_dashboard_snapshot()
@@ -228,7 +230,9 @@ def test_dead_post_api_exposure_is_managed_once_without_replaying_unknown_reques
         assert store.lp_actions(sid) == audit
         assert account.posts == account.cancels == []
     finally:
-        owner.stop()
+        owner.close()
+
+    _assert_current_after_legacy(tmp_path/'actual-current',store,account,public)
 
 
 @pytest.mark.parametrize('interrupted_buy_owner', ['manual-signing', 'manual-post', 'augment-signing', 'augment-post'], indirect=True)
@@ -263,7 +267,7 @@ def test_owner_ended_buy_still_requires_post_boundary_and_valid_unchanged_api(
     assert live_execution.lp_auto_state()['funds']['status'] == 'unknown'
     _terminate_old(child)
     owner, store, adapter, account, _ = _new_owner(runtime, monkeypatch, tmp_path, orders=orders)
-    owner.start()
+    owner.open()
     pending = next(a for a in audit if a['state'] == 'pending')
     try:
         certificate = store.lp_session(sid)['submission_owner_exit'][pending['action_id']]
@@ -291,7 +295,13 @@ def test_owner_ended_buy_still_requires_post_boundary_and_valid_unchanged_api(
         assert owner.execution.lp_auto_state()['funds']['status'] == 'unknown'
         assert account.posts == account.cancels == []
     finally:
-        owner.stop()
+        owner.close()
+
+    current_mode='incomplete-positions' if invalid=='incomplete' else 'foreign' if invalid=='account' else 'known'
+    if invalid in {'stale','generation'}:
+        _assert_current_http_native(tmp_path/'actual-current',kind='manual',phase='signing',invalidity=invalid)
+    else:
+        _assert_current_after_legacy(tmp_path/'actual-current',store,account,RefillPublic(runtime.clock),mode=current_mode)
 
 
 @pytest.mark.parametrize('interrupted_buy_owner', ['augment-post'], indirect=True)
@@ -301,7 +311,7 @@ def test_new_live_augment_after_coverage_keeps_its_own_risk_and_never_reuses_old
     _terminate_old(child)
     owner, store, adapter, account, public = _new_owner(runtime, monkeypatch, tmp_path, orders=orders)
     public.prices[5] = '.89'
-    owner.start()
+    owner.open()
     entered, release = Event(), Event()
     old = next(a for a in audit if a['role'] == 'augment')
     try:
@@ -336,7 +346,9 @@ def test_new_live_augment_after_coverage_keeps_its_own_risk_and_never_reuses_old
             future.result(timeout=5)
     finally:
         release.set()
-        owner.stop()
+        owner.close()
+
+    _assert_current_http_native(tmp_path/'actual-current',kind='augment',phase='signing')
 
 
 @pytest.mark.parametrize('missing', ['price', 'quantity', 'condition'])
@@ -393,17 +405,102 @@ def test_same_id_unknown_is_deduplicated_but_true_independent_risk_stays_separat
     assert account.posts == account.cancels == []
 
 
+def _assert_current_http_native(root,*,kind,phase,invalidity=None):
+    """Actual default service counterpart; source-only money is checked separately."""
+    import json,signal,time
+    from datetime import UTC,datetime
+    from open_trader.lp_auto_cli import _Client
+    from tests.lp_d2_service_harness import ServiceChild
+    from tests.test_prediction_service import _production_request,_response
+    from tests.test_lp_order_registration_contract import CONDITION_ID,TOKEN_ID
+    with ServiceChild(root,scenario=f'consumer-ci-native-{invalidity+"-" if invalidity else ""}{kind}-{phase}') as child:
+        child.release('metadata');child.release('business')
+        child.start(expected_running=False);child.wait('ci-current-completed')
+        assert json.loads(child.marker('ci-started.json').read_text())==dict(state='RUNNING',owner=True)
+        assert json.loads(child.marker('ci-real-http-server.json').read_text())==dict(daemon_threads=True)
+        client=_Client(child.base,15)
+        bootstrap=client.request('/api/prediction-arbitrage/venues')
+        headers={'Cookie':'; '.join(c.name+'='+c.value for c in client.cookies),
+            'X-CSRF-Token':bootstrap['csrf_token']}
+        def send(path,payload):
+            return _response(_production_request(child.base,path,data=json.dumps(payload).encode(),headers=headers),timeout=12)
+        # This is a NEW current command at the real child's fresh business
+        # time/market; no old observation or receipt is retimestamped.
+        request=dict(market_id='market-1',condition_id=CONDITION_ID,token_id=TOKEN_ID,outcome='YES',
+            price='.40',quantity='20',review_at=(datetime(2026,10,16,12,tzinfo=UTC)+timedelta(hours=4)).isoformat(),
+            idempotency_key='http-interrupted-buy')
+        path='/api/prediction-arbitrage/lp/orders'
+        if kind=='augment':
+            status,base=send(path,dict(request,idempotency_key='http-existing-entry'))
+            assert status==200 and base['state']=='entry_open',base
+            request=dict(session_id=base['session_id'],quantity='20',price='.39',idempotency_key='http-interrupted-buy')
+            path='/api/prediction-arbitrage/lp/augment'
+        initial_posts=child.actual_posts()
+        child.marker('ci-arm').touch()
+        with ThreadPoolExecutor(1) as workers:
+            pending=workers.submit(send,path,request)
+            try:
+                child.wait('ci-native-entered')
+                child.assert_owned();assert not pending.done()
+                if invalidity=='stale':
+                    # SDK remains truly pending under an independent real
+                    # watchdog; only business freshness advances.
+                    child.advance(61)
+                elif invalidity=='generation':
+                    original_generation=child.state()['round']['cycle_generation']
+                    resumed=child.request('resume',{'confirm':True})
+                    active=child.wait_state(lambda state:state['effective_running'] is True)
+                    assert active['round']['cycle_generation']!=original_generation
+                    paused=child.pause()
+                    assert paused['effective_running'] is False
+                    assert paused['round']['cycle_generation']==active['round']['cycle_generation']
+                else:
+                    child.process.send_signal(signal.SIGTERM)
+                    child.wait('ci-stopping.json')
+                    assert json.loads(child.marker('ci-stopping.json').read_text())==dict(state='STOPPING',owner=True,
+                        store_retained=True,lp_retained=True,client_retained=True)
+                child.assert_owned();assert not child.marker('ci-client-closed').exists()
+                assert not pending.done()
+                assert child.actual_posts()==initial_posts+(phase=='post')
+            finally:
+                child.release('ci-native');child.release('ci-scheduler')
+            status,result=pending.result(timeout=15)
+            assert status==200,result
+            assert result['state']==('rejected' if phase=='signing' else 'needs_attention'),result
+            if phase=='signing':assert result['reason']=='entry_submit_rejected',result
+            assert result['submit_status']==('not_sent' if phase=='signing' else 'unknown'),result
+        if invalidity is not None:child.process.terminate()
+        assert child.wait_exit()==0,child.output.read_text()
+        child.assert_owner_available()
+        assert child.marker('ci-sdk-ended').exists() and child.marker('ci-client-closed').exists()
+        assert child.actual_posts()==initial_posts+(phase=='post')
+        assert not list(child.events.glob('cancel-call-*'))
+        from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+        from tests.test_lp_order_registration_contract import WALLET
+        store=PredictionArbitrageStore(child.data_dir)
+        command=store.lp_manual_command(WALLET,'http-interrupted-buy',**({'session_id':request['session_id']} if kind=='augment' else {}))
+        assert command and command['command']['kind']==('entry' if kind=='manual' else 'augment'),command
+        assert command['response']==result and command['command']['idempotency_key']=='http-interrupted-buy'
+        assert command['command']['request_id'] and command['command']['token_id']==TOKEN_ID
+        assert Decimal(command['command']['price'])==Decimal('.40' if kind=='manual' else '.39')
+        assert Decimal(command['command']['quantity'])==20
+        assert command['command']['review_at']==(datetime(2026,10,16,12,tzinfo=UTC)+timedelta(hours=4)).isoformat()
+        assert command['command']['expiration']==int((datetime(2026,10,16,12,tzinfo=UTC)+timedelta(hours=4,minutes=1)).timestamp())
+        assert json.loads(child.marker('ci-stopped.json').read_text())==dict(state='STOPPED',owner=False)
+        assert json.loads(child.marker('ci-normal-stop-context.json').read_text())==dict(fatal_id=None,control_fatal=None)
+
+
 @pytest.mark.parametrize('kind', ['manual', 'augment'])
 @pytest.mark.parametrize('phase', ['signing', 'post'])
 def test_http_buy_sender_keeps_runtime_owner_until_drain_then_account_coverage(
         runtime, monkeypatch, tmp_path, kind, phase):
-    from tests.test_prediction_service import _running_server, _production_request, _response
-    from open_trader.prediction_runtime import PredictionRuntimeOwnershipError
+    # All old legacy entry/augment/audit/account-coverage oracles execute at
+    # the explicit None-facade component seam, not a fabricated Runtime.
     public = RefillPublic(runtime.clock)
     prepare(runtime, count=6, public=public)
     orders = _four_buys()[:3] if kind == 'augment' else _four_buys()
-    owner, store, _, account, public = _new_owner(runtime, monkeypatch, tmp_path, orders=orders)
-    owner.start()
+    owner, store, adapter, account, public = _new_owner(runtime, monkeypatch, tmp_path, orders=orders)
+    owner.open()
     _arm_refill(runtime, owner, account, index=5)
     market, condition, token = _refill_identity(5)
     request = dict(market_id=market, condition_id=condition, token_id=token, outcome='YES',
@@ -421,138 +518,177 @@ def test_http_buy_sender_keeps_runtime_owner_until_drain_then_account_coverage(
         assert release.wait(10), 'Independent HTTP sender watchdog'
         _advance(runtime)
         raise TimeoutError('offline HTTP sender completed')
-    if phase == 'signing':
-        account.create_limit_order = interrupted
-    else:
-        account.post_order = interrupted
-    old_lp = owner.lp
+    if phase == 'signing':account.create_limit_order = interrupted
+    else:account.post_order = interrupted
+    old_lp=owner.lp
     try:
-        with _running_server(owner, session_token='session-token', csrf_token='csrf-token') as (url, server):
-            with ThreadPoolExecutor(1) as workers:
-                import json
-                future = workers.submit(_response, _production_request(url,
-                    '/api/prediction-arbitrage/lp/orders' if kind == 'manual' else '/api/prediction-arbitrage/lp/augment',
-                    data=json.dumps(request).encode()), timeout=12)
-                try:
-                    assert entered.wait(5), 'HTTP route must reach real signing/POST'
-                    sid = next(s['session_id'] for s in store.lp_sessions() if s['token_id'] == token)
-                    audit = deepcopy(store.lp_actions(sid))
-                    assert any(a['state'] == 'pending' for a in audit)
-                    assert server.daemon_threads, 'Exercise the real HTTP shutdown gap'
-                    with pytest.raises(RuntimeError, match='sender'):
-                        owner.stop()
-                    assert owner.state == 'STOPPING' and owner.production_owner
-                    assert owner.store is not None and owner._prediction_trading is not None
-                    assert not old_lp._mutation_allowed('submit')
-                    challenger, _, _, _, _ = _new_owner(runtime, monkeypatch, tmp_path, orders=account.orders)
-                    with pytest.raises(PredictionRuntimeOwnershipError):
-                        challenger.start()
-                    assert not store.lp_session(sid).get('submission_owner_exit')
-                    assert store.lp_actions(sid) == audit
-                    assert not future.done() and account.posts == []
-                finally:
-                    release.set()
-                status, result = future.result(timeout=5)
-                local_prepost_failure = kind == 'manual' and phase == 'signing'
-                assert status == 200 and result['state'] == ('entry_rejected' if local_prepost_failure else 'needs_attention'), result
-                finished = deepcopy(store.lp_actions(sid))
-                assert any(a['state'] == ('rejected' if local_prepost_failure else 'unknown') for a in finished)
-                current_orders = account.orders
-                owner.stop()
-                assert owner.state == 'STOPPED' and not owner.production_owner
-                assert account.posts == []
-        new, store, _, account, _ = _new_owner(runtime, monkeypatch, tmp_path, orders=current_orders)
-        new.start()
+        with ThreadPoolExecutor(1) as workers:
+            submit=owner.execution.lp_submit_entry if kind=='manual' else owner.execution.lp_submit_augment
+            future=workers.submit(submit,request)
+            try:
+                assert entered.wait(5),'Original actual source signing/POST entered'
+                sid=next(s['session_id'] for s in store.lp_sessions() if s['token_id']==token)
+                audit=deepcopy(store.lp_actions(sid))
+                assert any(a['state']=='pending' for a in audit)
+                with pytest.raises(RuntimeError,match='sender'):owner.close()
+                assert not owner.admitting.is_set() and owner.owner_lock.held
+                assert owner.store is store and owner.adapter is adapter
+                assert not old_lp._mutation_allowed('submit')
+                challenger,_,_,_,_=_new_owner(runtime,monkeypatch,tmp_path,orders=account.orders)
+                with pytest.raises(PredictionRuntimeOwnershipError):challenger.open()
+                assert not store.lp_session(sid).get('submission_owner_exit')
+                assert store.lp_actions(sid)==audit
+                assert not future.done() and account.posts==[]
+            finally:release.set()
+            result=future.result(timeout=5)
+            local_prepost_failure=kind=='manual' and phase=='signing'
+            assert result['state']==('entry_rejected' if local_prepost_failure else 'needs_attention'),result
+            finished=deepcopy(store.lp_actions(sid))
+            assert any(a['state']==('rejected' if local_prepost_failure else 'unknown') for a in finished)
+            current_orders=account.orders
+            owner.close();assert not owner.owner_lock.held
+            assert account.posts==[]
+        new,store,_,account,_=_new_owner(runtime,monkeypatch,tmp_path,orders=current_orders)
+        new.open()
         try:
             _advance(runtime)
-            refreshed = new.execution.refresh_lp_dashboard_snapshot()
-            assert refreshed['state'] == 'ready', refreshed
-            state = new.execution.lp_auto_state()
-            assert state['funds']['status'] == 'known'
-            assert state['slots']['occupied'] == 4, state
-            assert store.lp_actions(sid) == finished
-            if not local_prepost_failure:
-                assert store.lp_session(sid)['account_action_coverage']
-            assert account.posts == account.cancels == []
-        finally:
-            new.stop()
+            refreshed=new.execution.refresh_lp_dashboard_snapshot()
+            assert refreshed['state']=='ready',refreshed
+            state=new.execution.lp_auto_state()
+            assert state['funds']['status']=='known'
+            assert state['slots']['occupied']==4,state
+            assert store.lp_actions(sid)==finished
+            if not local_prepost_failure:assert store.lp_session(sid)['account_action_coverage']
+            assert account.posts==account.cancels==[]
+        finally:new.close()
     finally:
-        release.set()
-        owner.stop()
+        release.set();owner.close()
+    _assert_current_http_native(tmp_path/'actual-current',kind=kind,phase=phase)
+
+
+def _assert_current_captured_http(root,boundary):
+    import json,signal,time
+    from datetime import UTC,datetime
+    from open_trader.lp_auto_cli import _Client
+    from tests.lp_d2_service_harness import ServiceChild
+    from tests.test_prediction_service import _production_request,_response
+    from tests.test_lp_order_registration_contract import WALLET,CONDITION_ID,TOKEN_ID
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    with ServiceChild(root,scenario=f'consumer-ci-native-captured-signing-{boundary}') as child:
+        child.release('business');child.release('metadata')
+        child.start(expected_running=False);child.wait('ci-current-completed')
+        client=_Client(child.base,15);boot=client.request('/api/prediction-arbitrage/venues')
+        headers={'Cookie':'; '.join(c.name+'='+c.value for c in client.cookies),'X-CSRF-Token':boot['csrf_token']}
+        def send(key):
+            payload=dict(market_id='market-1',condition_id=CONDITION_ID,token_id=TOKEN_ID,outcome='YES',
+                price='.40',quantity='20',review_at=(datetime(2026,10,16,12,tzinfo=UTC)+timedelta(hours=4)).isoformat(),
+                idempotency_key=key)
+            return _response(_production_request(child.base,'/api/prediction-arbitrage/lp/orders',
+                data=json.dumps(payload).encode(),headers=headers),timeout=12)
+        child.marker('ci-arm').touch()
+        with ThreadPoolExecutor(2) as workers:
+            first=workers.submit(send,'active-http-entry');late=None
+            try:
+                child.wait('ci-native-entered')
+                late=workers.submit(send,'queued-http-entry');child.wait('ci-captured-entered')
+                child.process.send_signal(signal.SIGTERM);child.wait('ci-stopping.json')
+                assert json.loads(child.marker('ci-stopping.json').read_text())==dict(state='STOPPING',owner=True,
+                    store_retained=True,lp_retained=True,client_retained=True)
+                child.assert_owned();assert not child.marker('ci-client-closed').exists()
+                if boundary=='handed-off':
+                    child.release('ci-native')
+                    status,original=first.result(timeout=5)
+                    assert status==200 and original['state']=='rejected' and original['submit_status']=='not_sent',original
+                    child.wait('ci-sdk-ended')
+                    deadline=time.monotonic()+5
+                    while True:
+                        path=child.marker('ci-http-load.json')
+                        load=json.loads(path.read_text()) if path.exists() else {}
+                        if load.get('active')==1:break
+                        assert time.monotonic()<deadline,load
+                        Event().wait(.01)
+                    # Even with native/first HTTP ended, this captured real
+                    # accepted handler still owns the default service lifetime.
+                    child.assert_owned();assert not late.done()
+                    assert not child.marker('ci-client-closed').exists()
+                else:assert not first.done() and not child.marker('ci-sdk-ended').exists()
+                child.release('ci-captured');status,result=late.result(timeout=5)
+                assert status==200 and result==dict(state='locked',reason='program_stopping'),result
+                assert child.actual_posts()==0 and len(list(child.events.glob('ci-sign-call-*')))==1
+                child.release('ci-native');status,original=first.result(timeout=5)
+                assert status==200 and original['state']=='rejected' and original['submit_status']=='not_sent',original
+            finally:
+                child.release('ci-native');child.release('ci-captured');child.release('ci-scheduler')
+                first.result(timeout=5)
+                if late is not None:late.result(timeout=5)
+        assert child.wait_exit()==0,child.output.read_text()
+        child.assert_owner_available()
+        contender=_RuntimeOwnershipLock(child.data_dir/'prediction_arbitrage/runtime.lock')
+        contender.acquire();assert contender.held;contender.release()
+        assert child.marker('ci-client-closed').exists() and child.actual_posts()==0
+        assert json.loads(child.marker('ci-stopped.json').read_text())==dict(state='STOPPED',owner=False)
+        assert json.loads(child.marker('ci-normal-stop-context.json').read_text())==dict(fatal_id=None,control_fatal=None)
+        assert json.loads(child.marker('ci-real-http-server.json').read_text())==dict(daemon_threads=True)
+        store=PredictionArbitrageStore(child.data_dir)
+        assert store.lp_manual_command(WALLET,'queued-http-entry') is None
+        assert not store.lp_session_by_idempotency('queued-http-entry')
+        assert len(list(child.events.glob('ci-sign-call-*')))==1
 
 
 @pytest.mark.parametrize('boundary', ['stopping', 'handed-off'])
 def test_http_request_with_execution_reference_cannot_begin_buy_after_shutdown(
         runtime, monkeypatch, tmp_path, boundary):
-    from tests.test_prediction_service import _running_server, _production_request, _response
-    import json
-    public = RefillPublic(runtime.clock)
-    prepare(runtime, count=6, public=public)
-    owner, store, _, account, _ = _new_owner(runtime, monkeypatch, tmp_path)
-    owner.start()
-    _arm_refill(runtime, owner, account, index=5)
-    def body(index, key):
-        market, condition, token = _refill_identity(index)
-        return dict(market_id=market, condition_id=condition, token_id=token, outcome='YES',
-            price='.40', quantity='20', review_at=(runtime.clock[0]+timedelta(hours=4)).isoformat(),
-            idempotency_key=key)
-    entered, release = Event(), Event()
-    queued, resume = Event(), Event()
+    # Retained old handed-off-before-resume is a real component/lock oracle.
+    # The default-service HTTP counterpart below has its stronger drain rule.
+    public=RefillPublic(runtime.clock)
+    prepare(runtime,count=6,public=public)
+    owner,store,_,account,_=_new_owner(runtime,monkeypatch,tmp_path)
+    owner.open();_arm_refill(runtime,owner,account,index=5)
+    def body(index,key):
+        market,condition,token=_refill_identity(index)
+        return dict(market_id=market,condition_id=condition,token_id=token,outcome='YES',
+            price='.40',quantity='20',review_at=(runtime.clock[0]+timedelta(hours=4)).isoformat(),idempotency_key=key)
+    entered,release,queued,resume=Event(),Event(),Event(),Event()
     def signing(**kwargs):
-        entered.set()
-        assert release.wait(10), 'Independent sender watchdog'
-        _advance(runtime)
-        raise TimeoutError('offline original sender ended')
-    account.create_limit_order = signing
-    execution = owner.execution
-    submit = execution.lp_submit_entry
+        entered.set();assert release.wait(10),'Independent sender watchdog'
+        _advance(runtime);raise TimeoutError('offline original sender ended')
+    account.create_limit_order=signing
+    execution=owner.execution;submit=execution.lp_submit_entry
     def delayed(payload):
-        if payload['idempotency_key'] == 'queued-http-entry':
-            queued.set()
-            assert resume.wait(10), 'Independent captured-execution watchdog'
+        queued.set();assert resume.wait(10),'Independent captured-execution watchdog'
         return submit(payload)
-    execution.lp_submit_entry = delayed
-    new = None
+    new=None
     try:
-        with _running_server(owner, session_token='session-token', csrf_token='csrf-token') as (url, _):
-            with ThreadPoolExecutor(2) as workers:
-                first = workers.submit(_response, _production_request(url,
-                    '/api/prediction-arbitrage/lp/orders', data=json.dumps(body(5, 'active-http-entry')).encode()), timeout=12)
-                late = None
-                try:
-                    assert entered.wait(5)
-                    late = workers.submit(_response, _production_request(url,
-                        '/api/prediction-arbitrage/lp/orders', data=json.dumps(body(6, 'queued-http-entry')).encode()), timeout=12)
-                    assert queued.wait(5), 'Handler obtained execution before STOPPING'
-                    with pytest.raises(RuntimeError, match='sender'):
-                        owner.stop()
-                    release.set()
-                    assert first.result(timeout=5)[0] == 200
-                    if boundary == 'handed-off':
-                        owner.stop()
-                        new, _, _, _, _ = _new_owner(runtime, monkeypatch, tmp_path)
-                        new.start()
-                        assert new.production_owner and not owner.production_owner
-                    else:
-                        assert owner.state == 'STOPPING' and owner.production_owner
-                    resume.set()
-                    status, result = late.result(timeout=5)
-                    assert status == 200 and result['state'] == 'locked', result
-                    assert result['reason'] == 'mutation_blocked'
-                    assert not store.lp_session_by_idempotency('queued-http-entry')
-                    assert account.posts == []
-                finally:
-                    release.set()
-                    resume.set()
-                    first.result(timeout=5)
-                    if late is not None:
-                        late.result(timeout=5)
+        with ThreadPoolExecutor(2) as workers:
+            first=workers.submit(submit,body(5,'active-http-entry'))
+            late=None
+            try:
+                assert entered.wait(5)
+                late=workers.submit(delayed,body(6,'queued-http-entry'))
+                assert queued.wait(5),'Captured original Execution before admission closes'
+                with pytest.raises(RuntimeError,match='sender'):owner.close()
+                assert owner.owner_lock.held and not owner.admitting.is_set()
+                release.set();assert first.result(timeout=5)['state']=='entry_rejected'
+                if boundary=='handed-off':
+                    owner.close()
+                    new,_,_,_,_=_new_owner(runtime,monkeypatch,tmp_path);new.open()
+                    assert new.owner_lock.held and not owner.owner_lock.held
+                    contender=_RuntimeOwnershipLock(store.path.parent/'runtime.lock')
+                    with pytest.raises(PredictionRuntimeOwnershipError):contender.acquire()
+                else:
+                    assert owner.owner_lock.held and not owner.admitting.is_set() and first.done()
+                resume.set();result=late.result(timeout=5)
+                assert result['state']=='locked' and result['reason']=='mutation_blocked',result
+                assert not store.lp_session_by_idempotency('queued-http-entry')
+                assert account.posts==[]
+            finally:
+                release.set();resume.set();first.result(timeout=5)
+                if late is not None:late.result(timeout=5)
     finally:
-        release.set()
-        resume.set()
-        if new is not None:
-            new.stop()
-        owner.stop()
+        release.set();resume.set()
+        if new is not None:new.close()
+        owner.close()
+    _assert_current_captured_http(tmp_path/'actual-current',boundary)
 
 
 @pytest.mark.parametrize('action_state', ['accepted_without_order_id', 'accepted'])
@@ -582,7 +718,7 @@ def _check_idless_buy_guard(runtime, dead_preparation, monkeypatch, tmp_path, ac
     owner, store, adapter, account, public = _new_owner(runtime, monkeypatch, tmp_path,
         orders=_four_buys()[:3]+(target,))
     public.prices[5] = '.89'
-    owner.start()
+    owner.open()
     try:
         _advance(runtime)
         owner.execution.refresh_lp_dashboard_snapshot()
@@ -615,7 +751,9 @@ def _check_idless_buy_guard(runtime, dead_preparation, monkeypatch, tmp_path, ac
         assert not store.lp_session_by_idempotency('manual-new-token')
         assert store.lp_actions(sid) == audit
     finally:
-        owner.stop()
+        owner.close()
+
+    _assert_current_after_legacy(tmp_path/'actual-current',store,account,public,manual=True)
 
 
 @pytest.mark.parametrize('operation, role', [
