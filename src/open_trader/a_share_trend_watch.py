@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time as time_module
 from collections.abc import Callable, Collection, Mapping
 from contextlib import nullcontext
@@ -43,6 +44,34 @@ class AShareWatchResult:
     exception_count: int
     unknown_quote_count: int
     events_path: Path
+    abnormal_reasons: tuple[dict[str, str], ...] = ()
+
+
+def _protection_detail(value: object, *, limit: int = 500) -> str:
+    """Bound diagnostic text and remove credentials/account identifiers."""
+    text = " ".join(str(value).split())
+    text = re.sub(r"https?://\S+", "[redacted-url]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?i)\b(?:bearer|basic)\s+\S+", "[redacted-auth]", text)
+    text = re.sub(
+        r"(?i)\b(authorization|bearer|password|passwd|token|api[_-]?key|secret|"
+        r"acc[_-]?id|account[_ -]?(?:id|number|no))\b"
+        r"[\s\"']*[:=]?[\s\"']*[^\s,;}]+",
+        r"\1=[redacted]", text,
+    )
+    text = re.sub(
+        r"(?i)\baccount\b[\"']*\s*[:=]\s*[\"']*[^\s,;}]+",
+        "account=[redacted]", text,
+    )
+    text = re.sub(r"(?<!\w)\d{6,}(?!\w)", "[redacted-id]", text)
+    return text[:limit]
+
+
+def _protection_exception_reason(step: str, exc: Exception) -> dict[str, str]:
+    return {
+        "step": step,
+        "exception_type": type(exc).__name__,
+        "message": _protection_detail(exc),
+    }
 
 
 def cn_session(now: datetime) -> str:
