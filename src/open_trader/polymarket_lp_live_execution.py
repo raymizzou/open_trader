@@ -2385,14 +2385,15 @@ class LPD2LiveExecution:
                     snapshot.observation.observation_id, attempt.order_type.value, None, kind == 'passive_exit', ())
                 self.writer.offer(record)
                 handle = self._start_protection_native(identity,
-                    lambda: self._execute_exit(scope, attempt, record, generation, lease, dispatch_origin), lease=lease)
+                    lambda: self._execute_exit(scope, attempt, record, generation, lease, dispatch_origin),
+                    lease=lease, diagnostic_record=record)
                 transferred = True
                 return handle
         finally:
             if not transferred:
                 lease.release()
 
-    def _start_protection_native(self, identity, operation, *, lease):
+    def _start_protection_native(self, identity, operation, *, lease, diagnostic_record=None):
         owned = {h.identity.request_id for h in self._native_jobs.values() if h._thread.is_alive()} | self._active_sends
         if len(owned) >= 2:
             raise RuntimeError('native_capacity')
@@ -2401,7 +2402,15 @@ class LPD2LiveExecution:
         def run():
             try: result = operation()
             except BaseException as exc: future.set_exception(exc)
-            else: future.set_result(result)
+            else:
+                if diagnostic_record is not None:
+                    try:
+                        with self.state._lock:
+                            self._diagnostic_outcomes = append_outcome(self._diagnostic_outcomes, result,
+                                record=diagnostic_record, protection=diagnostic_record.kind == 'CANCEL')
+                    except Exception:
+                        pass
+                future.set_result(result)
             finally: lease.release()
         thread = threading.Thread(target=run, name='lp-d2-protection-send', daemon=False)
         handle = NativeAttempt(identity, future, thread)
@@ -2527,7 +2536,7 @@ class LPD2LiveExecution:
                     self.writer.offer(ReceiptRecord(self.account_id, self.process_epoch, identity.request_id,
                         record.session_id, scope[1], scope[2], attempt.order_key[3], outcome, self._utc_now()))
                     return _ProtectionOutcome(identity.request_id, outcome, attempt.order_key[3])
-                handle = self._start_protection_native(identity, cancel, lease=lease)
+                handle = self._start_protection_native(identity, cancel, lease=lease, diagnostic_record=record)
                 transferred = True
                 return handle
         finally:

@@ -3,6 +3,10 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-18
+
+- D2 diagnostics now count completed protective SELLs and exit cancellations with their original request and observation identity. Offline regressions preserve UNKNOWN outcomes, native completion, no replay and unchanged trading rules.
+
 ## 2026-10-17
 
 - D2 automatic LP status now includes bounded read-only diagnostics for attempts, accepted source age, candidate rejection reasons, Reader role coverage, protection and local action outcomes. Offline bridge and HTTP checks preserve trading/control behavior, distinguish UNKNOWN from empty data, and verify redaction and no extra reads. Rotation policy is unchanged.

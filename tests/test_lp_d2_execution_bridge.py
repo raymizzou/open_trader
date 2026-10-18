@@ -27,6 +27,158 @@ from tests.test_polymarket_lp_risk import _direction
 MIXED_WALLET = '0x' + 'aA' * 20
 
 
+@pytest.mark.parametrize('disposition', ['accepted', 'unknown'])
+def test_d2_diagnostics_record_exit_cancel_outcomes(tmp_path, monkeypatch, disposition):
+    from tests.test_lp_d2_integration import _d2_filled_opening
+    live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch, manual_sale=False)
+    entered, release = Event(), Event()
+    pending = []
+    original_cancel = sdk.cancel_orders
+    def cancel(*, order_ids):
+        assert order_ids == ('passive-exit',)
+        entered.set()
+        assert release.wait(5), 'protective exit-cancel completion watchdog'
+        if disposition == 'unknown':
+            sdk.cancels.append(order_ids)
+            return dict(canceled=[], not_canceled={order_ids[0]: 'offline no confirmation'})
+        return original_cancel(order_ids=order_ids)
+    sdk.cancel_orders = cancel
+    try:
+        producer = PolymarketLPService(live.store, live.trading, clock=live._utc_now)
+        execution = attach(live, producer, tmp_path)
+        for _ in range(2):
+            live.run_once()
+            for handle in live.run_protection_once():
+                actual = handle.result(timeout=3)
+                handle._thread.join(timeout=3)
+                assert handle.done() and actual.status == 'accepted'
+                assert actual.order_id == 'passive-exit'
+        before = execution.lp_auto_state()['diagnostics']['local_outcomes']
+        assert before['by_kind'] == {'BUY': {'accepted': 1}, 'SELL': {'accepted': 1}}
+        assert before['total'] == 2
+        clock[0] = 2
+        public.ask = Decimal('.40')  # real subsequent price change requests exact exit cancellation
+        live.run_once()
+        origin, original_round = live.state.snapshot(), live.rounds.snapshot().round_number
+        pending.extend(live.run_protection_once())
+        handle, = pending
+        assert handle.identity.kind == 'cancel_exit'
+        assert entered.wait(2) and not handle.done()
+        assert execution.lp_auto_state()['diagnostics']['local_outcomes'] == before
+        release.set()
+        actual = handle.result(timeout=3)
+        handle._thread.join(timeout=3)
+        assert handle.done()
+        assert actual.request_id == handle.identity.request_id
+        assert (actual.status, actual.order_id) == (disposition, 'passive-exit')
+        local = execution.lp_auto_state(include_intents=False)['diagnostics']['local_outcomes']
+        assert local['total'] == 3
+        diagnostic_status = 'UNKNOWN' if disposition == 'unknown' else 'accepted'
+        assert local['by_kind'] == {'BUY': {'accepted': 1}, 'SELL': {'accepted': 1}, 'CANCEL': {diagnostic_status: 1}}
+        assert local['unknown_subtypes'] == ({'unavailable': 1} if disposition == 'unknown' else {})
+        detail, = [r for r in local['recent'] if r['request_id'] == actual.request_id]
+        assert detail['kind'] == 'CANCEL' and detail['order_id'] == 'passive-exit'
+        assert detail['disposition'] == diagnostic_status and detail['unknown_subtype'] is None
+        assert detail['generation'] == origin.current.cycle_generation
+        assert detail['observation_id'] == origin.observation.observation_id
+        assert detail['batch_id'] == 'protection:'+actual.request_id and detail['round_number'] == original_round
+        assert detail['local_attempt_finished'] is True and detail['venue_finality'] == 'unavailable'
+        assert execution.lp_auto_state()['diagnostics']['local_outcomes'] == local
+        live.run_once()
+        assert live.run_protection_once() == ()
+        assert execution.lp_auto_state()['diagnostics']['local_outcomes'] == local
+        assert sdk.cancels == [('passive-exit',)]
+        assert len([p for p in sdk.posts if p['side'] == 'SELL']) == 1 and sdk.market_orders == []
+    finally:
+        release.set()
+        for handle in pending:
+            handle._thread.join(timeout=3)
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('disposition', ['accepted', 'rejected', 'unknown', 'not_sent'])
+def test_d2_diagnostics_record_protective_sell_outcomes(tmp_path, monkeypatch, disposition):
+    from tests.test_lp_d2_integration import _d2_filled_opening
+    live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch, manual_sale=False)
+    entered, release = Event(), Event()
+    original_post = sdk.post_order
+    def post(signed):
+        assert signed['side'] == 'SELL'
+        entered.set()
+        assert release.wait(5), 'protective SELL completion watchdog'
+        if disposition == 'rejected':
+            sdk.posts.append(signed)
+            return dict(ok=False, accepted=False, status='REJECTED')
+        if disposition == 'unknown':
+            sdk.posts.append(signed)
+            raise TimeoutError('offline protective SELL uncertainty')
+        return original_post(signed)
+    sdk.post_order = post
+    if disposition == 'not_sent':
+        def failed_sign(**kw):
+            assert kw['side'] == 'SELL'
+            entered.set()
+            assert release.wait(5), 'protective SELL signing watchdog'
+            raise OSError('offline signing failed before POST')
+        sdk.create_limit_order = failed_sign
+    pending = []
+    try:
+        producer = PolymarketLPService(live.store, live.trading, clock=live._utc_now)
+        execution = attach(live, producer, tmp_path)
+        origin = None
+        for _ in range(2):
+            live.run_once()
+            origin = live.state.snapshot()
+            pending.extend(live.run_protection_once())
+        handle, = pending
+        assert handle.identity.kind == 'passive_exit'
+        assert entered.wait(2)
+        assert not handle.done()
+        before = execution.lp_auto_state(include_intents=False)['diagnostics']['local_outcomes']
+        assert before['total'] == 1 and before['by_kind'] == {'BUY': {'accepted': 1}}
+        original_round = live.rounds.snapshot().round_number
+        # Late response crosses a real control generation while its native call is held.
+        live.request_running(False); settle_control(live)
+        live.request_running(True); settle_control(live)
+        live.run_once()
+        newest = execution.lp_auto_state()['diagnostics']['round_start']
+        assert newest['generation'] != origin.current.cycle_generation
+        release.set()
+        actual = handle.result(timeout=3)
+        handle._thread.join(timeout=3)
+        assert handle.done()
+        assert actual.request_id == handle.identity.request_id
+        expected_order = 'passive-exit' if disposition == 'accepted' else None
+        assert (actual.status, actual.order_id) == (disposition, expected_order)
+        diagnostic = execution.lp_auto_state(include_intents=False)['diagnostics']
+        local = diagnostic['local_outcomes']
+        assert local['total'] == 2
+        diagnostic_status = 'UNKNOWN' if disposition == 'unknown' else 'NOT_SENT' if disposition == 'not_sent' else disposition
+        assert local['by_kind'] == {'BUY': {'accepted': 1}, 'SELL': {diagnostic_status: 1}}
+        assert local['unknown_subtypes'] == ({'unavailable': 1} if disposition == 'unknown' else {})
+        detail, = [r for r in local['recent'] if r['request_id'] == actual.request_id]
+        assert (detail['kind'], detail['order_id'], detail['disposition']) == ('SELL', expected_order, diagnostic_status)
+        assert detail['unknown_subtype'] is None
+        assert detail['generation'] == origin.current.cycle_generation
+        assert detail['observation_id'] == origin.observation.observation_id
+        assert detail['batch_id'] == 'protection:'+actual.request_id
+        assert detail['round_number'] == original_round
+        assert detail['local_attempt_finished'] is True and detail['venue_finality'] == 'unavailable'
+        assert diagnostic['round_start'] == newest
+        assert execution.lp_auto_state()['diagnostics']['local_outcomes'] == local
+        live.run_once()
+        assert execution.lp_auto_state()['diagnostics']['local_outcomes'] == local
+        assert len([p for p in sdk.posts if p['side'] == 'SELL']) == int(disposition != 'not_sent')
+        assert sdk.cancels == [] and sdk.market_orders == []
+    finally:
+        release.set()
+        for handle in pending:
+            handle._thread.join(timeout=3)
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
 def test_d2_diagnostics_preserve_distinct_evaluation_and_acceptance_times(tmp_path, monkeypatch):
     from open_trader.polymarket_lp_current_inputs import prepare_current_inputs
     from open_trader.polymarket_lp_diagnostics import summarize_iteration

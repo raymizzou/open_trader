@@ -39,27 +39,39 @@ def bounded_reason_counts(reasons):
     return counts
 
 
-def append_outcome(summary, outcome, *, token, reason=None, protection=False):
+def append_outcome(summary, outcome, *, token=None, record=None, reason=None, protection=False):
     """Called once where an actual local attempt completes, never on projection."""
     by_kind = {kind: dict(counts) for kind, counts in summary.get('by_kind', {}).items()}
     subtypes = dict(summary.get('unknown_subtypes', {}))
-    kind = 'BUY' if outcome.identity.target.kind.value == 'BUY_NEW' else 'CANCEL'
-    raw = outcome.status.value
-    disposition = 'UNKNOWN' if raw.startswith('unknown_') else 'NOT_SENT' if raw == 'not_sent' else raw
-    subtype = raw.removeprefix('unknown_') if disposition == 'UNKNOWN' else None
+    if record is None:
+        kind = 'BUY' if outcome.identity.target.kind.value == 'BUY_NEW' else 'CANCEL'
+        raw = outcome.status.value
+        request_id = outcome.identity.request_id
+        order_id = outcome.venue_order_id or getattr(outcome.identity.target, 'existing_order_id', None)
+        generation = token.cycle_generation if token else None
+        local_finished = outcome.local_attempt_finished
+    else:
+        # Protective results have no ActionIdentity/LocalStatus. Their original
+        # immutable RequestRecord supplies kind and provenance, never fresh state.
+        kind, raw = record.kind, outcome.status
+        request_id, order_id = outcome.request_id, outcome.order_id or record.order_id
+        generation, local_finished = record.cycle_generation, True
+        token = record
+    disposition = 'UNKNOWN' if raw == 'unknown' or raw.startswith('unknown_') else 'NOT_SENT' if raw == 'not_sent' else raw
+    subtype = raw.removeprefix('unknown_') if raw in ('unknown_timeout', 'unknown_error') else None
     counts = by_kind.setdefault(kind, {})
     counts[disposition] = counts.get(disposition, 0)+1
-    if subtype:
-        subtypes[subtype] = subtypes.get(subtype, 0)+1
+    if disposition == 'UNKNOWN':
+        subtype_key = subtype or 'unavailable'
+        subtypes[subtype_key] = subtypes.get(subtype_key, 0)+1
     code = next(iter(bounded_reason_counts((reason,)))) if reason else None
     recent = list(summary.get('recent', ()))
-    recent.append(dict(request_id=outcome.identity.request_id, kind=kind, disposition=disposition,
-        unknown_subtype=subtype, order_id=outcome.venue_order_id or
-            getattr(outcome.identity.target, 'existing_order_id', None),
-        generation=token.cycle_generation if token else None, batch_id=token.batch_id if token else None,
+    recent.append(dict(request_id=request_id, kind=kind, disposition=disposition,
+        unknown_subtype=subtype, order_id=order_id,
+        generation=generation, batch_id=token.batch_id if token else None,
         round_number=token.round_number if token else None,
         observation_id=token.observation_id if token else None, reason=code,
-        local_attempt_finished=outcome.local_attempt_finished, venue_finality='unavailable'))
+        local_attempt_finished=local_finished, venue_finality='unavailable'))
     total = summary.get('total', 0)+1
     cancellations = {key: dict(counts) for key, counts in summary.get('protection_cancel_outcomes', {}).items()}
     if protection:
