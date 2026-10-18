@@ -1202,7 +1202,7 @@ class LPD2LiveExecution:
                 stage = 'round_start'
                 start = self.rounds.begin_round(self._control_view(), orders, fixed_buys=fixed)
             # Observational failures must never replace a control/trading result.
-            self._record_iteration(ticket, prepared, calculation, accepted, start, (), fixed,
+            self._record_iteration(ticket, prepared, selection, accepted, start, (), fixed,
                 captured_candidates, as_of, attempted_at)
             if start.status != StartStatus.BATCH:
                 return RunResult(accepted, start, selection=selection)
@@ -1217,7 +1217,7 @@ class LPD2LiveExecution:
             stage = 'local_attempts'
             outcomes = tuple(self._attempt(start.token, action, observation) for action in start.token.actions)
             finish = self.complete_local_attempts(start.token, outcomes)
-            self._record_iteration(ticket, prepared, calculation, accepted, start, outcomes, fixed,
+            self._record_iteration(ticket, prepared, selection, accepted, start, outcomes, fixed,
                 captured_candidates, as_of, attempted_at)
             self._sealed_candidates.clear()
             self._sealed_candidate_source = None

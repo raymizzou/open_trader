@@ -273,5 +273,5 @@ def summarize_iteration(*, attempted_at, ticket, prepared_frame, calculation,
             observation_id=ticket.observation_id,
             fixed_buy_plan='absent' if fixed_plan is None else 'empty' if not fixed_plan.targets else 'nonempty',
             selected_targets=len(calculation.target_tokens),
-            retained_targets=sum(t in {o['order_id'] for o in prepared_frame.current_buys} for t in calculation.target_tokens),
+            retained_targets=len(calculation.retained_order_ids),
             new_targets=len(fixed_plan.targets) if fixed_plan is not None else None)))

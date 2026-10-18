@@ -1853,6 +1853,88 @@ def test_d2_deferred_target_partial_fill_uses_fresh_attempt_revision(tmp_path, m
         live.trading.close()
 
 
+@pytest.mark.parametrize('case', ['rejected-echo', 'candidate-token-alias'])
+def test_d2_diagnostics_count_accepted_typed_selection(tmp_path, monkeypatch, case):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path, monkeypatch)
+    try:
+        losing_id = ids['F'][1] if case == 'candidate-token-alias' else 'E'
+        incumbent_ids = {'A', 'B', 'C', 'D', losing_id}
+        sdk.orders = tuple(order(k, losing_id if k == 'E' else k) for k in 'ABCDE')
+        initial = execution.lp_auto_scheduled_check()
+        assert set(initial.selection.retained_order_ids) == incumbent_ids
+        assert all(rate is not None for rate in initial.selection.yields.values())
+        if case == 'rejected-echo':
+            canceled = live.cancel_independent((WALLET, *ids['E'], 'E'))
+            assert canceled.result(timeout=3).status.value == 'accepted'
+            wait_rotation_idle(live)
+            assert sdk.cancels == [('E',)]
+            sdk.cancels.clear()
+        sdk.advance(1)
+        pools['F'] = Decimal('200')
+        qualify('F')
+        result = execution.lp_auto_scheduled_check()
+        observation = result.acceptance.observation
+        raw = observation.calculation
+        assert set(raw.yields) == incumbent_ids
+        assert all(rate is not None for rate in raw.yields.values())
+        assert raw.candidate_yields[ids['F'][1]] > max(raw.yields.values())
+        assert set(raw.target_tokens) == {'A', 'B', 'C', 'D', ids['F'][1]}
+        if case == 'rejected-echo':
+            assert result.selection.selection_state == 'NO_DECISION'
+            assert 'orders_not_accepted' in result.selection.selection_reasons
+            assert result.selection.target_tokens == ()
+            assert result.selection.retained_order_ids == ()
+            assert result.selection.new_target_keys == ()
+            assert result.rotation is None or result.rotation.victims == ()
+            assert result.rotation_outcomes == ()
+            assert sdk.posts == [] and sdk.cancels == []
+        else:
+            assert result.selection.selection_state == 'DECISION'
+            assert result.selection.new_target_keys == (ids['F'],)
+            assert result.selection.retained_order_ids == ('A', 'B', 'C', 'D')
+            assert losing_id not in result.selection.retained_order_ids
+            assert len(result.selection.target_tokens) == 5
+            assert set(result.selection.target_tokens) == {'A', 'B', 'C', 'D', ids['F'][1]}
+            attempt, = result.rotation_outcomes
+            assert attempt.order_key == (WALLET, *ids['E'], losing_id)
+            assert attempt.handle.result(timeout=3).status.value == 'accepted'
+            wait_rotation_idle(live)
+            assert sdk.cancels == [(losing_id,)] and sdk.posts == []
+        payload = execution.lp_auto_state(include_intents=False)
+        diagnostic = payload['diagnostics']
+        assert diagnostic['rotation']['selected']['total'] == (0 if case == 'rejected-echo' else 4)
+        assert diagnostic['rotation']['new_targets']['total'] == (0 if case == 'rejected-echo' else 1)
+        round_start = diagnostic['round_start']
+        assert round_start['selected_targets'] == (0 if case == 'rejected-echo' else 5)
+        assert round_start['retained_targets'] == (0 if case == 'rejected-echo' else 4)
+        if case == 'rejected-echo':
+            assert round_start['fixed_buy_plan'] == 'absent'
+            assert round_start['new_targets'] is None
+        assert round_start['observation_id'] == observation.observation_id
+        assert round_start['generation'] == observation.cycle_generation
+        accepted = diagnostic['accepted_observation']
+        assert accepted['observation_id'] == observation.observation_id
+        assert accepted['generation'] == observation.cycle_generation
+        assert accepted['accepted_at'] == observation.accepted_at.isoformat()
+        for name in ('balance', 'open_orders', 'positions'):
+            source = observation.source_frame.sources[name]
+            assert accepted['sources'][name]['source_id'] == source.source_id
+            assert accepted['sources'][name]['checked_at'] == source.checked_at.isoformat()
+        before = (sdk.balance_reads, sdk.order_reads, sdk.position_reads, tuple(sdk.posts), tuple(sdk.cancels))
+        with monkeypatch.context() as no_io:
+            def forbidden(*a, **kw): pytest.fail('diagnostic GET attempted I/O or wake')
+            no_io.setattr(sqlite3, 'connect', forbidden)
+            for name in ('get_balance_allowance', 'list_open_orders', 'list_positions', 'post_order', 'cancel_orders'):
+                no_io.setattr(sdk, name, forbidden)
+            no_io.setattr(execution, '_lp_d2_wake', forbidden)
+            assert execution.lp_auto_state(include_intents=False) == payload
+            assert execution.lp_auto_state(include_intents=False) == payload
+        assert (sdk.balance_reads, sdk.order_reads, sdk.position_reads, tuple(sdk.posts), tuple(sdk.cancels)) == before
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
 def rotation_runtime(tmp_path, monkeypatch, *, budget='100', target=5, wallet='100', startup=True, lower_depth=True):
     """Offline SDK facts with symmetric own depth; no calculator/state stubs."""
     from types import SimpleNamespace
