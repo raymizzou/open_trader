@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-18
 
+- Trend allocation now converts host-local clocks to Shanghai time while preserving the instant, including daylight saving time. Aware clocks use the same conversion. Offline regressions cover allocation dates, the post-close attempt window, and status timestamps on a Los Angeles host.
 - D2 ranks current account BUYs and qualified new choices together, keeps one desired BUY per market, and cancels exact losing IDs after protection runs. Equal yields keep incumbents; existing orders retain real funds and slots until fresh current facts permit refill. Offline bridge checks cover partial fills, final-composition funding, UNKNOWN protection, stale-request refusal, unchanged-book stability and bounded read-only rotation diagnostics.
 
 ## 2026-10-17
