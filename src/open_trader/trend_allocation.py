@@ -277,8 +277,7 @@ def run_trend_allocation_controller(
         failures = 0
         failure_day: str | None = None
         while True:
-            now = now_fn()
-            now = (now.replace(tzinfo=_SHANGHAI) if now.tzinfo is None else now).astimezone(_SHANGHAI)
+            now = now_fn().astimezone(_SHANGHAI)
             day = _date_text(allocation_date or now.date().isoformat(), "allocation_date")
             if day != failure_day:
                 failures = 0
