@@ -573,7 +573,8 @@ def test_all_uncertain_buy_results_invalidate_financial_authority(tmp_path, monk
         adapter.close()
 
 
-def _d2_protection_runtime(tmp_path, monkeypatch, *, quantity='2000', submit=True):
+def _d2_protection_runtime(tmp_path, monkeypatch, *, quantity='2000', submit=True,
+                           budget='10000', bid='.30', ask='.32'):
     """Actual D2 components with only SDK responses and business time controlled."""
     from datetime import timedelta
     from types import SimpleNamespace
@@ -593,8 +594,11 @@ def _d2_protection_runtime(tmp_path, monkeypatch, *, quantity='2000', submit=Tru
             return now if tz is not None else now.replace(tzinfo=None)
     monkeypatch.setattr(polymarket_lp_market_reader, 'datetime', BusinessDateTime)
     monkeypatch.setattr(polymarket_trading, 'datetime', BusinessDateTime)
+    bid_value, ask_value = Decimal(bid), Decimal(ask)
     class Public(_SDKPublicClient):
-        level, bid, ask, reward, failed = Decimal('10000'), Decimal('.30'), Decimal('.32'), Decimal('24'), False
+        level, bid, ask, reward, failed, reward_unknown = (
+            Decimal('10000'), bid_value, ask_value, Decimal('24'), False, False
+        )
         book_reads = 0
         def get_order_book(self, *, token_id):
             self.book_reads += 1
@@ -608,6 +612,9 @@ def _d2_protection_runtime(tmp_path, monkeypatch, *, quantity='2000', submit=Tru
             })
         def list_market_rewards(self, *, condition_id, sponsored):
             assert condition_id == CONDITION_ID
+            if self.reward_unknown:
+                class Unavailable(RuntimeError): retry_after_seconds = 0
+                raise Unavailable('offline current reward unavailable')
             return (CurrentReward(condition_id=condition_id, rewards_max_spread=10,
                 rewards_min_size=Decimal('1'), rewards_config=(CurrentRewardConfig(
                     asset_address='0x2791bca1f2de4661ed88a30c99a7a9449aa84174',
@@ -631,7 +638,7 @@ def _d2_protection_runtime(tmp_path, monkeypatch, *, quantity='2000', submit=Tru
     store = PredictionArbitrageStore(tmp_path)
     seed_running(store)
     live = LPD2LiveExecution(store, adapter, account_id=WALLET, venue='polymarket',
-        process_epoch='protection-epoch', policy=CalculationPolicy(Decimal('10000'), 1),
+        process_epoch='protection-epoch', policy=CalculationPolicy(Decimal(budget), 1),
         clock=lambda: clock[0], utc_now=lambda: BusinessDateTime.now(UTC))
     live.initialize(ValidatedStartAdmission('protection-epoch', 'offline-permit'))
     live.run_once()  # actual round0 empty cleanup, never seed peer internals
@@ -639,7 +646,7 @@ def _d2_protection_runtime(tmp_path, monkeypatch, *, quantity='2000', submit=Tru
         book = adapter.lp_order_books((TOKEN_ID,))[TOKEN_ID]
         captured = polymarket_lp_market_reader.SourceResult('pre-submit-current-book', (
             dict(condition_id=CONDITION_ID, market_id='market-1', token_id=TOKEN_ID,
-                venue='polymarket', price=Decimal('.30'), quantity=Decimal(quantity),
+                venue='polymarket', price=Decimal(bid), quantity=Decimal(quantity),
                 order_type='GTC', expiration=None, post_only=True, send_options=(),
                 direction=dict(market=dict(reward_min_size=Decimal('1'), reward_max_spread=Decimal('.10')),
                     book=book, daily_pool_usd=Decimal('24'))),), checked_at=book['received_at'])
@@ -2428,6 +2435,340 @@ def test_captured_production_candidates_seal_real_gtd_terms_without_legacy_gates
     finally:
         assert live.close(timeout=3)
         adapter.close()
+
+
+def test_sdk_and_plain_cached_accounts_have_identical_end_to_end_targets(tmp_path, monkeypatch):
+    import hashlib
+    from collections.abc import Mapping
+    from dataclasses import replace
+    from types import MappingProxyType
+
+    from open_trader import polymarket_lp_market_reader, polymarket_trading
+    from polymarket.models.clob.account import ClobTrade
+    from polymarket.models.clob.order_response import AcceptedOrder
+    from open_trader.polymarket_lp_current_inputs import prepare_current_inputs
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from open_trader.polymarket_lp_market_calculation import calculate_current
+    from open_trader.polymarket_trading import PolymarketTradingClient, TradingConfig
+    from tests.test_lp_d2_current_inputs import _qualified_service
+    from tests.test_polymarket_lp import _SDKAccountClient
+    from tests.test_lp_order_registration_contract import _SDKPublicClient, CONDITION_ID, TOKEN_ID
+
+    now = datetime(2026, 10, 16, 1, tzinfo=UTC)
+    class FixedClockMeta(type):
+        def __instancecheck__(cls, value):
+            return isinstance(value, datetime)
+
+    class FixedDateTime(datetime, metaclass=FixedClockMeta):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz is not None else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(polymarket_lp_market_reader, 'datetime', FixedDateTime)
+    monkeypatch.setattr(polymarket_trading, 'datetime', FixedDateTime)
+    cache_store = PredictionArbitrageStore(tmp_path / 'cache')
+    cache_store.lp_save_preparation(dict(generation=1, global_recovery_generation=7))
+    account_client = _SDKAccountClient(now)
+    account_client.list_open_orders = lambda **_: []
+    account_client.list_positions = lambda **_: []
+    trade_reads = [0]
+    original_trade_reader = account_client.list_account_trades
+
+    def counted_trade_reader(*args, **kwargs):
+        trade_reads[0] += 1
+        return original_trade_reader(*args, **kwargs)
+
+    account_client.list_account_trades = counted_trade_reader
+    cache_adapter = PolymarketTradingClient(
+        TradingConfig('0x' + '1' * 40, '0x' + '2' * 40), account_client
+    )
+
+    class ControlledTime:
+        def __init__(self, delegate):
+            self._delegate = delegate
+
+        def monotonic(self):
+            return 1000.0
+
+        def __getattr__(self, name):
+            return getattr(self._delegate, name)
+
+    try:
+        with monkeypatch.context() as controlled:
+            controlled.setattr(polymarket_trading, 'time', ControlledTime(polymarket_trading.time))
+            cache_adapter.lp_account_snapshot_shared(
+                trade_generation_provider=cache_store.lp_trade_generation
+            )
+            cached_account = cache_adapter.lp_account_snapshot_shared()
+        assert trade_reads[0] == 1
+        account_model = cached_account['raw_trades'][0]
+    finally:
+        cache_adapter.close()
+    assert isinstance(account_model, ClobTrade)
+    assert cached_account['balance'] > 0
+    assert cached_account['allowance'] > 0
+    assert cached_account['balance_complete'] is True
+    assert cached_account['open_orders'] == ()
+    assert cached_account['positions'] == ()
+    sdk_account = dict(cached_account)
+    plain_account = dict(cached_account)
+    plain_account['raw_trades'] = (
+        account_model.model_dump(mode='python'),
+    )
+
+    class FactsTripwire(Mapping):
+        allowed = frozenset({'directions', 'checked_at', 'global_recovery_generation'})
+
+        def __init__(self, values):
+            self._values = dict(values)
+
+        def _key(self, key):
+            if key not in self.allowed:
+                raise AssertionError(f'removed facts key accessed: {key}')
+            return key
+
+        def __getitem__(self, key):
+            return self._values[self._key(key)]
+
+        def __iter__(self):
+            return iter(self._values)
+
+        def __len__(self):
+            return len(self._values)
+
+        def get(self, key, default=None):
+            key = self._key(key)
+            return self._values.get(key, default)
+
+        def __contains__(self, key):
+            return self._key(key) in self._values
+
+    def run_representation(root, account):
+        producer, _ = _qualified_service(root / 'producer', now,
+                                          condition=CONDITION_ID, token=TOKEN_ID)
+        producer._candidate_qualification_facts[CONDITION_ID]['account'] = account
+        capture = producer.capture_qualified_pool()
+        source = capture.rows[CONDITION_ID]
+        facts = FactsTripwire(source.value['facts'])
+        tripwire_value = MappingProxyType({'row': source.value['row'], 'facts': facts})
+        tripwire_source = replace(source, value=tripwire_value)
+        capture = replace(capture, rows=MappingProxyType({CONDITION_ID: tripwire_source}))
+
+        public = _SDKPublicClient(now)
+        adapter, sdk = _adapter(root / 'runtime', public_client=public)
+        sdk.orders = ()
+        sdk.positions = ()
+        creates = []
+        sdk.create_limit_order = lambda **kwargs: (creates.append(dict(kwargs)) or
+                                                    dict(kwargs, order_type='GTD'))
+
+        def post(signed):
+            sdk.posts.append(signed)
+            return AcceptedOrder(order_id='equivalence-buy', status='live',
+                making_amount=Decimal('0'), taking_amount=Decimal('0'),
+                trade_ids=(), transactions_hashes=())
+
+        sdk.post_order = post
+        store = PredictionArbitrageStore(root / 'runtime')
+        account_id = hashlib.sha256(WALLET.strip().casefold().encode()).hexdigest()
+        store.lp_save_current_settings(account_id, expected_config_version=0,
+            changes=dict(budget_usd='40', target_buy_count=1, buy_price_level=1))
+        seed_running(store)
+        live = LPD2LiveExecution(store, adapter, account_id=WALLET, venue='polymarket',
+            process_epoch='equivalence', policy=CalculationPolicy(None), utc_now=lambda: now)
+        try:
+            live.load_settings()
+            live.initialize(ValidatedStartAdmission('equivalence', 'offline-permit'))
+            first = live.run_once(capture)
+            assert first.outcomes == ()
+            result = live.run_once(capture)
+            assert [outcome.status.value for outcome in result.outcomes] == ['accepted']
+            assert creates == [dict(token_id=TOKEN_ID, price=Decimal('.40'), size=Decimal('20'),
+                                    side='BUY', post_only=True, expiration=1792195260)]
+            assert sdk.posts == [dict(creates[0], order_type='GTD')]
+            observation = result.acceptance.observation
+            assert observation.source_frame.orders == ()
+            assert observation.source_frame.positions == ()
+            assert observation.source_frame.sources['balance'].value == (
+                Decimal('100'), Decimal('100'))
+            public_policy = CalculationPolicy(Decimal('40'), 1)
+            prepared_again = prepare_current_inputs(
+                observation.source_frame, capture, public_policy, now)
+            candidate_rows = prepared_again.sources['candidates'].value
+            assert tuple(row['token_id'] for row in candidate_rows) == (TOKEN_ID,)
+            eligible = prepared_again.sources['candidate_eligibility'].value
+            assert eligible[f'{CONDITION_ID}:{TOKEN_ID}']['state'] == 'eligible'
+            recalculated = calculate_current(prepared_again, public_policy, now)
+            assert (recalculated.buy_reserved, recalculated.inventory_cost,
+                    recalculated.new_capacity) == (
+                        Decimal('0'), Decimal('0'), Decimal('40'))
+            assert recalculated.target_tokens == (TOKEN_ID,)
+            assert observation.calculation.target_tokens == (TOKEN_ID,)
+            assert (observation.calculation.buy_reserved,
+                    observation.calculation.inventory_cost,
+                    observation.calculation.new_capacity) == (
+                        Decimal('0'), Decimal('0'), Decimal('40'))
+            terms = result.outcomes[0].identity.target.terms
+            assert (terms.price, terms.quantity, terms.order_type, terms.post_only,
+                    terms.expiration) == (Decimal('.40'), Decimal('20'), 'GTD', True, 1792195260)
+            baseline = next(b for b in live.state.snapshot().baselines.values()
+                            if b.key.kind == 'queue_bucket')
+            assert baseline.source.source_id == source.source_id
+            assert baseline.source.checked_at == source.checked_at
+            before_posts = len(sdk.posts)
+            sdk.get_balance_allowance = lambda **kwargs: (_ for _ in ()).throw(
+                TimeoutError('current funds unavailable'))
+            unknown_funds = live.run_once(capture)
+            assert unknown_funds.outcomes == () and len(sdk.posts) == before_posts
+            assert live.state.snapshot().new_capacity.state == 'unknown'
+            return (terms, observation.calculation.target_tokens, sdk.posts, baseline.source)
+        finally:
+            assert live.close(timeout=3)
+            adapter.close()
+
+    plain = run_representation(tmp_path / 'plain', plain_account)
+    sdk = run_representation(tmp_path / 'sdk', sdk_account)
+    assert (plain[0].price, plain[0].quantity, plain[0].expiration) == (
+        sdk[0].price, sdk[0].quantity, sdk[0].expiration)
+    assert plain[1:] == sdk[1:]
+
+
+@pytest.mark.parametrize('yield_mode', ['known_current_yield', 'unknown_current_yield'])
+def test_persistently_invalid_incumbent_qualification_preserves_existing_protection(
+    tmp_path, monkeypatch, yield_mode
+):
+    from copy import deepcopy
+    from datetime import timedelta
+    from tests.test_polymarket_lp import _SDKAccountClient
+    from tests.test_lp_d2_current_inputs import _qualified_service
+    from tests.test_lp_order_registration_contract import CONDITION_ID, TOKEN_ID
+
+    live, sdk, public, clock = _d2_protection_runtime(
+        tmp_path / 'runtime', monkeypatch, quantity='10', submit=True,
+        budget='7', bid='.40', ask='.42'
+    )
+    origin = public.now
+    producer, direction = _qualified_service(
+        tmp_path / 'capture', origin, condition=CONDITION_ID, token=TOKEN_ID
+    )
+    producer.clock = lambda: origin + timedelta(seconds=clock[0])
+    sdk_trade = _SDKAccountClient(origin).trade
+    sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID,
+                          size='10', average_price='.30'),)
+    if yield_mode == 'unknown_current_yield':
+        public.reward_unknown = True
+
+        def uncertain_cancel(*, order_ids):
+            sdk.cancels.append(order_ids)
+            raise TimeoutError('offline unknown cancellation')
+
+        sdk.cancel_orders = uncertain_cancel
+    else:
+        public.reward = Decimal('0')
+    try:
+        order_ids = tuple(order.id for order in sdk.orders)
+        assert order_ids == ('entry-A',)
+        baseline_before = next(iter(live.state.snapshot().baselines.values()))
+        template = deepcopy(direction)
+        previous_observation_id = None
+        previous_read_sequence = None
+        for second in (0, 599, 600, 601, 1200):
+            clock[0] = second
+            current = origin + timedelta(seconds=second)
+            fresh = deepcopy(template)
+            fresh['market']['metadata_checked_at'] = current
+            fresh['market']['fees_checked_at'] = current
+            fresh['book']['received_at'] = current
+            fresh['book']['timestamp'] = current
+            fresh['reward_checked_at'] = current
+            fresh['history_summary']['checked_at'] = current
+            fresh['book']['sdk_extra'] = sdk_trade
+            assert producer._candidate_pool_record_success(
+                CONDITION_ID,
+                dict(condition_id=CONDITION_ID, state='eligible',
+                     selected_direction=dict(token_id=TOKEN_ID)),
+                judged_at=current,
+                facts=dict(checked_at=current, directions=[fresh],
+                           account=dict(raw_trades=(fresh['book']['sdk_extra'],)),
+                           reservations=(dict(amount='999999'),)),
+                global_recovery_generation=7)
+            before_pool = deepcopy(producer._candidate_pool)
+            before_rotation = deepcopy(producer._candidate_rotation)
+            invalid_capture = producer.capture_qualified_pool()
+            assert invalid_capture.rows[CONDITION_ID].error == 'qualification_value_invalid'
+            assert invalid_capture.rows[CONDITION_ID].value is None
+            assert invalid_capture.captured_at == current
+            assert invalid_capture.rows[CONDITION_ID].checked_at == current
+            assert producer._candidate_pool == before_pool
+            assert producer._candidate_rotation == before_rotation
+            result = live.run_once(invalid_capture)
+            attempts = live.run_protection_once()
+            for attempt in attempts:
+                attempt.result(timeout=3)
+            assert result.outcomes == ()
+            observation = result.acceptance.observation
+            assert observation is not None
+            assert observation.cycle_generation == live.state.snapshot().current.cycle_generation
+            assert observation.observation_id != previous_observation_id
+            assert (previous_read_sequence is None
+                    or observation.read_ticket.read_sequence > previous_read_sequence)
+            previous_observation_id = observation.observation_id
+            previous_read_sequence = observation.read_ticket.read_sequence
+            for source_name in ('balance', 'open_orders', 'positions',
+                                f'market:{CONDITION_ID}:{TOKEN_ID}'):
+                source = observation.source_frame.sources[source_name]
+                assert source.checked_at == current
+            assert tuple(order.id for order in sdk.orders) == ('entry-A',)
+            assert sdk.posts == [dict(token_id=TOKEN_ID, price=Decimal('.40'),
+                                      size=Decimal('10'), side='BUY', post_only=True,
+                                      expiration=None, order_type='GTC')]
+            assert sdk.market_orders == []
+            assert sdk.positions[0]['size'] == '10'
+            snapshot = live.state.snapshot()
+            assert snapshot.positions and snapshot.positions[0].quantity.value == Decimal('10')
+            assert snapshot.buy_reserved.value == Decimal('4')
+            assert snapshot.inventory_cost.value == Decimal('3')
+            assert snapshot.new_capacity.value == Decimal('0')
+            baseline = next(iter(snapshot.baselines.values()))
+            assert baseline is baseline_before
+            assert snapshot.orders[0].key[3] == 'entry-A'
+            assert snapshot.orders[0].price.value == Decimal('.40')
+            assert snapshot.orders[0].remaining.value == Decimal('10')
+            yield_key = (WALLET, CONDITION_ID, TOKEN_ID, 'entry-A')
+            assert yield_key in snapshot.yields
+            yield_state = snapshot.yields[yield_key]
+            assert all(failure.data_failures == 0
+                       for failure in snapshot.failure_states.values())
+            assert tuple(order for order in snapshot.orders if order.side == 'SELL') == ()
+            assert len(snapshot.sells) == 1
+            sell_state = next(iter(snapshot.sells.values()))
+            assert tuple(sell_state.current_sells) == ()
+            assert sell_state.passive is None and sell_state.protected is None
+            if yield_mode == 'known_current_yield':
+                assert yield_state.yield_pct_per_hour.state == 'known'
+                assert yield_state.yield_pct_per_hour.value == Decimal('0')
+                assert yield_state.unknown_since_monotonic is None
+                assert sdk.cancels == []
+            elif second < 600:
+                assert yield_state.unknown_since_monotonic == 0
+                assert yield_state.unknown_deadline_monotonic == 600
+                assert sdk.cancels == []
+            else:
+                assert yield_state.unknown_since_monotonic == 0
+                assert yield_state.unknown_deadline_monotonic == 600
+                assert sdk.cancels == [('entry-A',)]
+                timeout_reasons = tuple(
+                    target.reason for progress in snapshot.progress.values()
+                    for target in progress.cancel_targets
+                )
+                assert 'buy_yield_unknown_timeout' in timeout_reasons
+        if yield_mode == 'unknown_current_yield':
+            final_yield = live.state.snapshot().yields[(WALLET, CONDITION_ID, TOKEN_ID, 'entry-A')]
+            assert final_yield.unknown_since_monotonic == 0
+            assert final_yield.unknown_deadline_monotonic == 600
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
 
 
 @pytest.mark.parametrize('proof_case', ['final0_complete_absent', 'final0_explicit_zero',
