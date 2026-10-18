@@ -892,6 +892,13 @@ def test_invalid_qualification_capture_warning_is_redacted_bounded_and_rate_limi
     facts = warning_records[0][1][1]
     assert facts['event'] == 'lp_qualified_pool_capture_invalid'
     assert facts['skipped'] == 11 and len(facts['samples']) == 10 and facts['omitted'] == 1
+    expected_market_hashes = (
+        'edebd733a8a1ab76', '0d0772327fb25073', '389b23fb0089af34',
+        'b6874f4d7d1d4a34', '6823869499e3488d', 'a69f7391bf252cac',
+        'd9a4aacc76dcebee', '0330004d47865ffd', 'e2c81eaf680d3676',
+        '828f2c8347b33b4a',
+    )
+    assert tuple(sample['market_hash'] for sample in facts['samples']) == expected_market_hashes
     assert all(len(sample['path']) <= 128 and len(sample['type']) <= 128
                and len(sample['market_hash']) == 16 for sample in facts['samples'])
     rendered = repr(warning_records[0])
