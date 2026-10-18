@@ -3,6 +3,10 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-18
+
+- Trend allocation now converts host-local clocks to Shanghai time while preserving the instant, including daylight saving time. Aware clocks use the same conversion. Offline regressions cover allocation dates, the post-close attempt window, and status timestamps on a Los Angeles host.
+
 ## 2026-10-17
 
 - Trend market controller heartbeat timestamps now convert host-local clocks to the configured timezone while preserving the instant, including daylight saving time. Aware clocks use the same conversion. Focused regressions cover CN/HK timestamps and preserve strict dashboard health thresholds.
