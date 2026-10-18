@@ -966,7 +966,12 @@ def attach(live, producer, tmp_path):
 
 
 def test_d2_execution_scheduler_uses_current_facts_without_legacy_registration(tmp_path, monkeypatch):
+    from polymarket.models.clob.account import ClobTrade
+    from tests.test_polymarket_lp import _SDKAccountClient
     live, producer, sdk, public, now = bridge_runtime(tmp_path, monkeypatch)
+    sdk_trade = _SDKAccountClient(now).trade
+    assert isinstance(sdk_trade, ClobTrade)
+    producer._candidate_qualification_facts[CONDITION_ID]['account']['raw_trades'] = (sdk_trade,)
     release, entered = Event(), Event()
     worker = None
     try:

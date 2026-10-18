@@ -183,6 +183,110 @@ _QUEUE_DATA_FAILURE_REASONS = frozenset(
 logger = logging.getLogger(__name__)
 
 
+class _QualifiedPoolCaptureValueError(TypeError):
+    """Describe one unsupported value in a captured candidate packet."""
+
+    def __init__(self, path: str, value: object) -> None:
+        self.path = _capture_safe_path(path)
+        self.value_type = _capture_safe_type(value)
+        super().__init__("qualification_value_invalid")
+
+
+def _capture_safe_type(value: object) -> str:
+    """Return a bounded type name without retaining an object or repr."""
+
+    name = type(value).__name__
+    safe = "".join(character if character.isalnum() or character in "_.-" else "_"
+                    for character in name)
+    return (safe or "unknown_type")[:128]
+
+
+def _capture_safe_path(value: str) -> str:
+    """Return a bounded path suitable for operator diagnostics."""
+
+    safe = "".join(character if character.isalnum() or character in "_.[]-"
+                    else "_" for character in value)
+    return (safe or "packet")[:128]
+
+
+_CAPTURE_PATH_KEYS = frozenset({
+    "packet", "row", "facts", "directions", "checked_at",
+    "global_recovery_generation", "market", "book", "sdk_extra",
+    "condition_id", "token_id", "market_id", "metadata_checked_at",
+    "fees_checked_at", "received_at", "timestamp", "bids", "asks",
+    "price", "size", "history_summary", "reward_checked_at", "send_options",
+    "payload",
+})
+
+
+def _capture_path_key(value: object) -> str:
+    """Keep known field names and hash arbitrary keys before diagnostics."""
+
+    try:
+        text = str(value)
+    except Exception:
+        return "key_unknown"
+    if text in _CAPTURE_PATH_KEYS:
+        return text
+    return "key_" + hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _capture_market_hash(value: object) -> str:
+    """Hash one market identity without retaining or emitting its text."""
+
+    try:
+        text = str(value)
+    except Exception:
+        text = _capture_safe_type(value)
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _capture_freeze(value: object, *, path: str = "packet") -> object:
+    """Freeze capture values while preserving the shared reader contract.
+
+    Mapping and sequence traversal is local so an unsupported leaf can carry a
+    bounded path. Scalar acceptance and immutable output remain delegated to
+    the shared reader freezer.
+    """
+
+    from .polymarket_lp_market_reader import freeze
+
+    # Keep the reader's scalar-before-container isinstance ordering. A value
+    # can be virtually registered as a Mapping while still being a supported
+    # scalar (for example, a str subclass).
+    if value is None or isinstance(value, (str, int, float, bool, datetime)):
+        return freeze(value)
+    if isinstance(value, Decimal):
+        return freeze(value)
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            str(key): _capture_freeze(value_item,
+                                      path=f"{path}.{_capture_path_key(key)}")
+            for key, value_item in value.items()
+        })
+    if isinstance(value, (list, tuple)):
+        return tuple(
+            _capture_freeze(value_item, path=f"{path}[{index}]")
+            for index, value_item in enumerate(value)
+        )
+    try:
+        return freeze(value)
+    except TypeError as exc:
+        raise _QualifiedPoolCaptureValueError(path, value) from exc
+
+
+def _capture_facts_projection(facts: object) -> object:
+    """Copy only the facts keys consumed by the captured D2 packet."""
+
+    if not isinstance(facts, Mapping):
+        return None
+    return {
+        key: facts[key]
+        for key in ("directions", "checked_at", "global_recovery_generation")
+        if key in facts
+    }
+
+
 class AutoEntryNotSent(ValueError):
     """A pre-POST guard proved that the automatic entry was not sent."""
 
@@ -907,6 +1011,7 @@ class PolymarketLPService:
         self._candidate_scan_lock = threading.Lock()
         self._candidate_maintenance_lock = threading.Lock()
         self._candidate_state_lock = threading.RLock()
+        self._qualified_pool_capture_invalid_last_warn_at: float | None = None
         self._competition_lock = threading.Lock()
         self._competition_refresh_lock = threading.Lock()
         self._competition_version = 0
@@ -2487,6 +2592,7 @@ class PolymarketLPService:
         from uuid import uuid4
         from .polymarket_lp_current_inputs import QualifiedPoolCapture
         from .polymarket_lp_market_reader import SourceResult, freeze
+        warning_facts = None
         with self._candidate_state_lock:
             now = self._now()
             generation = self._qualified_pool_generation
@@ -2495,6 +2601,8 @@ class PolymarketLPService:
                 generation = prepared_fence
             error = "producer_fence_unknown" if generation is None else None
             rows = {}
+            invalid_count = 0
+            invalid_samples = []
             for cid, row in self._candidate_pool.items():
                 facts = self._candidate_qualification_facts.get(cid)
                 reason = error
@@ -2511,11 +2619,56 @@ class PolymarketLPService:
                         checked = _timestamp(facts.get("checked_at"), name="qualification_checked_at")
                     except ValueError:
                         reason = reason or "qualification_time_unknown"
-                rows[cid] = SourceResult(f"qualified:{cid}:{row.get('updated_at')}",
-                    freeze(dict(row=row, facts=facts)), complete=reason is None,
-                    checked_at=checked, error=reason, error_facts=freeze({}))
-            return QualifiedPoolCapture(str(uuid4()), now, True, generation,
+                source_id = f"qualified:{cid}:{row.get('updated_at')}"
+                packet = dict(row=row, facts=_capture_facts_projection(facts))
+                try:
+                    frozen_packet = _capture_freeze(packet)
+                except _QualifiedPoolCaptureValueError as exc:
+                    invalid_count += 1
+                    if len(invalid_samples) < 10:
+                        invalid_samples.append({
+                            "market_hash": _capture_market_hash(cid),
+                            "path": exc.path,
+                            "type": exc.value_type,
+                        })
+                    rows[cid] = SourceResult(
+                        source_id,
+                        None,
+                        complete=False,
+                        checked_at=checked,
+                        error=reason or "qualification_value_invalid",
+                        error_facts=freeze({"path": exc.path, "type": exc.value_type}),
+                    )
+                else:
+                    rows[cid] = SourceResult(
+                        source_id,
+                        frozen_packet,
+                        complete=reason is None,
+                        checked_at=checked,
+                        error=reason,
+                        error_facts=freeze({}),
+                    )
+            if invalid_count:
+                warning_now = monotonic()
+                last_warning = self._qualified_pool_capture_invalid_last_warn_at
+                if last_warning is None or warning_now - last_warning >= 60:
+                    self._qualified_pool_capture_invalid_last_warn_at = warning_now
+                    warning_facts = {
+                        "event": "lp_qualified_pool_capture_invalid",
+                        "skipped": invalid_count,
+                        "samples": invalid_samples,
+                        "omitted": max(0, invalid_count - len(invalid_samples)),
+                    }
+            capture = QualifiedPoolCapture(str(uuid4()), now, True, generation,
                 self._candidate_exclusion_revision, MappingProxyType(rows), error)
+        if warning_facts is not None:
+            try:
+                _lp_capture_read_log(lambda facts=warning_facts: logger.warning(
+                    "lp_qualified_pool_capture_invalid event=%s facts=%s",
+                    "lp_qualified_pool_capture_invalid", facts))
+            except Exception:
+                pass
+        return capture
 
     def candidate_snapshot(self) -> dict[str, object]:
         """Project the rolling candidate pool without external reads.
