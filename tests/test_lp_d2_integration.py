@@ -319,7 +319,8 @@ def test_independent_cancel_preserves_native_inflight_lifetime(tmp_path):
         assert attempt.done() is False
         captured, _ = candidates_for_fixed_send()
         bought = live.run_once(captured)
-        assert [o.status.value for o in bought.outcomes] == ['accepted']*3
+        assert [o.status.value for o in bought.outcomes] == ['accepted']*2
+        assert [post['token_id'] for post in sdk.posts] == ['token-C', 'token-D']
         assert live.rounds.snapshot().round_number == 2
         assert live.status()['native_inflight'] == 1 and not attempt.done()
         old_generation = live.state.snapshot().current.cycle_generation
@@ -341,7 +342,7 @@ def test_independent_cancel_preserves_native_inflight_lifetime(tmp_path):
         assert outcome.identity is attempt.identity and outcome.status.value == 'accepted'
         assert live.close(timeout=3) is True
         assert live.status()['native_inflight'] == 0
-        assert calls == [('ordinary-A',)] and len(sdk.posts) == 3
+        assert calls == [('ordinary-A',)] and len(sdk.posts) == 2
         current = next(o for o in live.state.snapshot().orders if o.key == key)
         assert current.terminal_proof.status == 'CANCELED'
     finally:
@@ -914,7 +915,7 @@ def test_d2_scoring_review_uses_exact_current_order_and_continuous_window(tmp_pa
             assert release.wait(5), 'old scoring native release watchdog'
             return True
         assert order_id == 'entry-B'
-        return clock[0] == 35
+        return clock[0] == 37
     sdk.get_order_scoring = score
     def opening(): return live.state.snapshot().openings[scope]
     pool = ThreadPoolExecutor(max_workers=1)
@@ -923,20 +924,31 @@ def test_d2_scoring_review_uses_exact_current_order_and_continuous_window(tmp_pa
         old = pool.submit(live.run_protection_once)
         assert entered.wait(2), 'actual exact-order scoring read not started'
         # A real later BUY receipt changes the target while A is in native I/O.
+        saved_orders = sdk.orders
         def post(signed):
             sdk.posts.append(signed)
-            sdk.orders += (_open_order('entry-B', 'BUY', price=str(signed['price']), original=str(signed['size'])),)
+            sdk.orders = saved_orders + (_open_order('entry-B', 'BUY', price=str(signed['price']), original=str(signed['size'])),)
             return AcceptedOrder(order_id='entry-B', status='live', making_amount=Decimal('0'),
                 taking_amount=Decimal('0'), trade_ids=(), transactions_hashes=())
         sdk.post_order = post
-        book = live.trading.lp_order_books((TOKEN_ID,))[TOKEN_ID]
-        captured = SourceResult('new-current-entry-book', (dict(condition_id=CONDITION_ID,
-            market_id='market-1', token_id=TOKEN_ID, venue='polymarket', price=Decimal('.30'),
-            quantity=Decimal('2000'), order_type='GTC', expiration=None, post_only=True, send_options=(),
-            direction=dict(market=dict(reward_min_size=Decimal('1'), reward_max_spread=Decimal('.10')),
-                book=book, daily_pool_usd=Decimal('24'))),), checked_at=book['received_at'])
+        def capture():
+            book = live.trading.lp_order_books((TOKEN_ID,))[TOKEN_ID]
+            return SourceResult('new-current-entry-book', (dict(condition_id=CONDITION_ID,
+                market_id='market-1', token_id=TOKEN_ID, venue='polymarket', price=Decimal('.30'),
+                quantity=Decimal('2000'), order_type='GTC', expiration=None, post_only=True, send_options=(),
+                direction=dict(market=dict(reward_min_size=Decimal('1'), reward_max_spread=Decimal('.10')),
+                    book=book, daily_pool_usd=Decimal('24'))),), checked_at=book['received_at'])
+        captured = capture()
+        blocked = live.run_once(captured)
+        assert blocked.outcomes == () and len(sdk.posts) == 1  # visible A occupies the market's only slot
+        assert opening().entry_order_ids == ('entry-A',)
+        clock[0] = 1
+        sdk.orders = ()  # fresh complete listing lag permits the real later receipt
+        captured = capture()
         posted = live.run_once(captured)
         assert [o.venue_order_id for o in posted.outcomes] == ['entry-B']
+        assert posted.outcomes[0].status.value == 'accepted' and len(sdk.posts) == 2
+        assert sdk.orders[:-1] == saved_orders and sdk.orders[-1].id == 'entry-B'
         assert opening().entry_order_ids == ('entry-A', 'entry-B')
         assert opening().scoring.order_key[3] == 'entry-B'
         assert opening().scoring.scoring.state == 'unknown' and opening().scoring.checked_at is None
@@ -944,18 +956,19 @@ def test_d2_scoring_review_uses_exact_current_order_and_continuous_window(tmp_pa
         old.result(timeout=3)
         assert opening().scoring.scoring.state == 'unknown'  # late A=True never attaches to B
         assert opening().scoring.checked_at is None
-        for second in (0, 30, 35, 40, 99):
-            clock[0] = second
+        scoring_start = 2  # first complete A+B observation after B's receipt
+        for offset in (0, 30, 35, 40, 99):
+            clock[0] = scoring_start + offset
             live.run_once()
             live.run_protection_once()
             current = opening()
             assert current.scoring.order_key[3] == 'entry-B' and current.scoring.role == 'entry'
-            assert current.scoring.scoring.value is (second == 35)
-            assert current.scoring.lost_since_monotonic == (None if second == 35 else 40 if second >= 40 else 0)
+            assert current.scoring.scoring.value is (offset == 35)
+            assert current.scoring.lost_since_monotonic == (None if offset == 35 else scoring_start+40 if offset >= 40 else scoring_start)
             assert current.review_status == 'none' and not current.stop_requested
             assert sdk.cancels == [] and sdk.market_orders == []
         checked, source = opening().scoring.checked_at, opening().scoring.source
-        clock[0] = 100
+        clock[0] = scoring_start + 100
         live.run_once()
         attempts = live.run_protection_once()
         for attempt in attempts: attempt.result(timeout=3)
@@ -963,8 +976,8 @@ def test_d2_scoring_review_uses_exact_current_order_and_continuous_window(tmp_pa
         assert current.phase == 'review' and current.review_status == 'scoring_continuously_lost'
         assert current.stop_requested and (current.review_at.value-checked).total_seconds() == 1
         assert current.scoring.checked_at == checked and current.scoring.source == source
-        assert current.scoring.lost_since_monotonic == 40
-        assert calls == [(0, 'entry-A'), (0, 'entry-B'), (30, 'entry-B'), (35, 'entry-B'), (40, 'entry-B'), (99, 'entry-B')]
+        assert current.scoring.lost_since_monotonic == 42
+        assert calls == [(0, 'entry-A'), (2, 'entry-B'), (32, 'entry-B'), (37, 'entry-B'), (42, 'entry-B'), (101, 'entry-B')]
         assert sorted(oid for ids in sdk.cancels for oid in ids) == ['entry-A', 'entry-B']
         assert current.stop_loss_latched.value is False and current.economics.opening_loss_usd.state == 'unknown'
         assert sdk.market_orders == []  # review alone never forces a sale

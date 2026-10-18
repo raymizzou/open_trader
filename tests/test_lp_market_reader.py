@@ -267,6 +267,10 @@ def test_pure_targets_are_fixed_and_deterministically_ordered():
     assert result.targets == ('C', 'D', 'E')
     equal = [dict(candidates[1], condition_id=k, token_id=k, existing=k == 'Z') for k in ['B', 'Z', 'A']]
     source['candidates'] = SourceResult('equal-1', equal, checked_at=now)
+    source['open_orders'] = SourceResult('current-Z', (
+        dict(order('Z'), condition_id='Z', token_id='Z'),), checked_at=now)
+    source['directions'] = SourceResult('current-Z-market', {'Z': dict(direction(), book=dict(
+        bids=[dict(price='.40', size='120')], asks=[dict(price='.42', size='100')]))}, checked_at=now)
     tied = calculate_current(MarketReader.from_captured_sources(CapturedSources(inputs.account, source)),
         CalculationPolicy(Decimal('24'), 3), now)
     assert tied.targets == ('Z', 'A', 'B')
