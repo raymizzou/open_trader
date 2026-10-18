@@ -14,6 +14,7 @@ from types import MappingProxyType
 from .lp_business_writer import LPBusinessWriter, RequestRecord, ReceiptRecord, ProgressRecord
 from .polymarket_lp_control import LPControlOwner
 from .polymarket_lp_current_inputs import prepare_current_inputs
+from .polymarket_lp_diagnostics import summarize_iteration, project_diagnostics, append_outcome
 from .polymarket_lp_current_state import (
     AppliedControl, CommittedControl, CurrentLPState, StoredControl, ValidatedStartAdmission,
     ControlRequestResult,
@@ -282,6 +283,12 @@ class LPD2LiveExecution:
         self._last_current_evidence = None
         self._last_buy_uncertainty = None
         self._mutation_owner = self._mutation_acquire = None
+        self._diagnostics = freeze(dict(version=1, latest_attempt=None, accepted_observation=None,
+            admission=None, reader_coverage=None, round_start=None))
+        self._protection_diagnostics = freeze(dict(entered=False, disposition='unavailable', skip_reason=None,
+            attempt_id=None, attempted_at=None, observation_id=None, generation=None))
+        self._diagnostic_outcomes = freeze(dict(total=0, omitted=0, by_kind={}, unknown_subtypes={}, recent=(),
+            protection_cancel_outcomes={}))
 
     def manual_call(self, operation):
         """Own the whole explicit command, including reliable SQL, until actual end."""
@@ -1099,11 +1106,12 @@ class LPD2LiveExecution:
         self.settings_status()
         return self.control.poll(self._clock())
 
-    def run_once(self, captured_candidates=None, *, timeout=2):
+    def run_once(self, captured_candidates=None, *, timeout=2, attempted_at=None):
         if self._closed:
             raise RuntimeError('d2_closed')
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError('d2_run_in_progress')
+        stage = 'read'
         try:
             with self._settings_lock:
                 self._collect_settings(publish=True)
@@ -1113,10 +1121,15 @@ class LPD2LiveExecution:
             ticket = self.state.begin_observation(current.cycle_generation, ('balance', 'open_orders', 'positions'))
             frame = self.reader.read_current(ReadScope(self.account_id, related_markets=True), time.monotonic()+timeout)
             as_of = self._utc_now()
+            stage = 'preparation'
             prepared = prepare_current_inputs(frame, captured_candidates, policy, as_of)
+            stage = 'calculation'
             calculation = calculate_current(prepared, policy, as_of)
+            stage = 'acceptance'
             accepted = self.state.accept(ticket, frame, calculation, evaluated_at=as_of)
             if accepted.observation is None:
+                self._record_iteration(ticket, prepared, calculation, accepted, None, (), None,
+                    captured_candidates, as_of, attempted_at)
                 return RunResult(accepted)
             observation = accepted.observation
             source = observation.order_view.orders_source
@@ -1138,7 +1151,11 @@ class LPD2LiveExecution:
             # activation callback publishes round then state. No native I/O is
             # performed under it; seal/finish cannot race control application.
             with self.state._lock:
+                stage = 'round_start'
                 start = self.rounds.begin_round(self._control_view(), orders, fixed_buys=fixed)
+            # Observational failures must never replace a control/trading result.
+            self._record_iteration(ticket, prepared, calculation, accepted, start, (), fixed,
+                captured_candidates, as_of, attempted_at)
             if start.status != StartStatus.BATCH:
                 return RunResult(accepted, start)
             self._sealed_candidates = {(start.token.batch_id, a.request_id): row
@@ -1148,14 +1165,90 @@ class LPD2LiveExecution:
             self._sealed_candidate_source = prepared.sources['candidates']
             per_direction = prepared.sources.get('candidate_sources')
             self._sealed_candidate_sources = per_direction.value if per_direction else {}
+            stage = 'local_attempts'
             outcomes = tuple(self._attempt(start.token, action, observation) for action in start.token.actions)
             finish = self.complete_local_attempts(start.token, outcomes)
+            self._record_iteration(ticket, prepared, calculation, accepted, start, outcomes, fixed,
+                captured_candidates, as_of, attempted_at)
             self._sealed_candidates.clear()
             self._sealed_candidate_source = None
             self._sealed_candidate_sources = {}
             return RunResult(accepted, start, finish, outcomes)
+        except BaseException:
+            self.record_attempt_failure(attempted_at=attempted_at, stage=stage)
+            raise
         finally:
             self._run_lock.release()
+
+    def _record_iteration(self, ticket, prepared, calculation, accepted, start, outcomes, fixed,
+                          capture, evaluated_at, attempted_at):
+        try:
+            summary = summarize_iteration(attempted_at=attempted_at or ticket.started_at, ticket=ticket,
+                prepared_frame=prepared, calculation=calculation, acceptance=accepted,
+                round_start=start, outcomes=outcomes, fixed_plan=fixed, capture=capture,
+                evaluated_at=evaluated_at, round_number=self.rounds.snapshot().round_number,
+                accepted_capacity=self.state.snapshot().new_capacity)
+            with self.state._lock:
+                self._diagnostics = freeze({**{k: v for k, v in summary.items() if k != 'local_outcomes'}, 'accepted_observation':
+                    summary['accepted_observation'] or self._diagnostics.get('accepted_observation'),
+                    'round_start': summary['round_start'] if start else self._diagnostics.get('round_start')})
+        except Exception:
+            pass
+
+    def record_attempt_failure(self, *, attempted_at, stage):
+        try:
+            with self.state._lock:
+                self._diagnostics = freeze({**self._diagnostics,
+                    'latest_attempt': dict(attempted_at=attempted_at, stage=stage,
+                        disposition='failed', reason='other', capture=None)})
+        except Exception:
+            pass
+        self._record_protection_status(entered=False, disposition='skipped', skip_reason=stage+'_failed')
+
+    def begin_scheduled_attempt(self):
+        try:
+            attempted_at = self._utc_now()
+        except Exception:
+            attempted_at = None
+        self._record_protection_status(entered=False, disposition='pending',
+            new_attempt=True, attempted_at=attempted_at)
+        return attempted_at
+
+    def _record_protection_status(self, *, entered, disposition, skip_reason=None,
+                                  new_attempt=False, attempted_at=None):
+        try:
+            with self.state._lock:
+                snapshot = self.state.snapshot()
+                values = dict(self._protection_diagnostics)
+                if new_attempt:
+                    values.update(attempt_id=uuid4().hex, attempted_at=attempted_at,
+                        observation_id=None, generation=snapshot.current.cycle_generation)
+                if entered and snapshot.observation is not None:
+                    values.update(observation_id=snapshot.observation.observation_id,
+                        generation=snapshot.observation.cycle_generation)
+                self._protection_diagnostics = freeze(dict(values, entered=entered,
+                    disposition=disposition, skip_reason=skip_reason))
+        except Exception:
+            pass
+
+    def diagnostics(self):
+        try:
+            with self.state._lock:
+                snapshot = self.state.snapshot()
+                result = project_diagnostics(self._diagnostics, as_of=self._utc_now())
+                result['protection'] = {**self._protection_diagnostics,
+                    'cancel_outcomes': self._diagnostic_outcomes['protection_cancel_outcomes']}
+                result['local_outcomes'] = self._diagnostic_outcomes
+                unknown = [y for key, y in snapshot.yields.items() if y.unknown_since_monotonic is not None
+                    and any(o.key == key and o.side == 'BUY' for o in snapshot.active_orders)]
+                now = self._clock()
+                result['unknown_buy_yields'] = dict(total=len(unknown), omitted=max(0, len(unknown)-20),
+                    recent=[dict(order_id=y.order_key[3], unknown_since_at=y.unknown_since_at,
+                        age_seconds=max(0, now-y.unknown_since_monotonic),
+                        due_at_600=now >= y.unknown_deadline_monotonic) for y in unknown[:20]])
+                return result
+        except Exception:
+            return dict(version=1, available=False)
 
     def _offer_progress(self, frame):
         # In-process logging identities only: never restore request history or
@@ -1296,6 +1389,13 @@ class LPD2LiveExecution:
             self._utc_now(), reason))
         if isinstance(token, _IndependentContext) and token.protection_key is not None:
             self._finish_protection_cancel(token.protection_key, outcome)
+        try:
+            with self.state._lock:
+                self._diagnostic_outcomes = append_outcome(self._diagnostic_outcomes, outcome, token=token,
+                    reason=protection_target.reason if protection_target else reason,
+                    protection=isinstance(token, _IndependentContext) and token.protection_key is not None)
+        except Exception:
+            pass
         return outcome
 
     @staticmethod
@@ -2503,6 +2603,17 @@ class LPD2LiveExecution:
                 snapshot = self.state.snapshot()
 
     def run_protection_once(self, *, timeout=2):
+        self._record_protection_status(entered=True, disposition='entered')
+        try:
+            result = self._run_protection_once(timeout=timeout)
+        except BaseException:
+            self._record_protection_status(entered=True, disposition='failed')
+            raise
+        if self._protection_diagnostics['disposition'] == 'entered':
+            self._record_protection_status(entered=True, disposition='completed')
+        return result
+
+    def _run_protection_once(self, *, timeout=2):
         """Evaluate the accepted raw frame; protection never acquires a new book."""
         with self._protection_lock:
             snapshot = self.state.snapshot()
@@ -2511,10 +2622,16 @@ class LPD2LiveExecution:
                     or observation is None or not observation.orders_complete
                     or observation.cycle_generation != snapshot.current.cycle_generation
                     or observation.read_ticket.trade_version_at_start != snapshot.trade_version):
+                reason = ('closed' if self._closed else 'shutdown' if snapshot.current.shutdown_requested else
+                    'fatal' if snapshot.current.fatal_id else 'no_observation' if observation is None else
+                    'orders_incomplete' if not observation.orders_complete else
+                    'generation_changed' if observation.cycle_generation != snapshot.current.cycle_generation else 'stale_observation')
+                self._record_protection_status(entered=True, disposition='skipped', skip_reason=reason)
                 return ()
             self._manual_review_deadlines()
             deadline = time.monotonic()+timeout
             if self._refresh_protection_evidence(deadline):
+                self._record_protection_status(entered=True, disposition='skipped', skip_reason='observation_invalidated')
                 return ()  # receipts invalidate the old observation; ordinary reader supplies the next one
             self._register_first_seen(snapshot)
             snapshot = self.state.snapshot()
