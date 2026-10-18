@@ -393,9 +393,7 @@ def _record_status(
 
 
 def _localized(now: datetime, timezone: str) -> datetime:
-    if now.tzinfo is None or now.utcoffset() is None:
-        return now.replace(tzinfo=ZoneInfo(timezone))
-    return now
+    return now.astimezone(ZoneInfo(timezone))
 
 
 def _retry_at(now: datetime, failures: int) -> datetime:
@@ -482,8 +480,7 @@ def _derive_cycle(
     quote_client: object | None = None,
 ) -> ControllerCycle:
     market = _market(market)
-    if now.tzinfo is None or now.utcoffset() is None:
-        now = now.replace(tzinfo=ZoneInfo(config.timezone))
+    now = _localized(now, config.timezone)
     timezone = TIMEZONES[market]
     local = now.astimezone(timezone)
     today = local.date()
@@ -1468,8 +1465,7 @@ def _allocation_reference_for_cycle(
     """Use the single Shanghai allocation decision; reports never produce one."""
     if not config.trend_animals_api_key:
         return None
-    if now.tzinfo is None or now.utcoffset() is None:
-        now = now.replace(tzinfo=ZoneInfo(config.timezone))
+    now = _localized(now, config.timezone)
     allocation_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
     day = date.fromisoformat(allocation_date)
     a_trading_days = quote_client.get_trading_days(
