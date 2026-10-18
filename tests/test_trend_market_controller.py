@@ -14536,6 +14536,41 @@ def _patch_abnormal_protection(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("market", ["US", "HK"])
+@pytest.mark.parametrize(
+    "calendar_days",
+    [[], ["garbled", "2026-02-30", None, 42], ["2026-09-01", "2026-11-30"]],
+    ids=["empty", "garbled", "outside-window"],
+)
+def test_protection_unknown_calendar_keeps_weekday_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, market: str,
+    calendar_days: list[object],
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    passes: list[str] = []
+    monkeypatch.setattr(
+        controller, "_run_protection_pass",
+        lambda *_args, **_kwargs: passes.append("protection") or _abnormal_protection(),
+    )
+    monkeypatch.setattr(controller, "FutuQuoteClient", lambda **_kwargs: SimpleNamespace(
+        get_trading_days=lambda **_kwargs: calendar_days, close=lambda: None,
+    ))
+    messages: list[str] = []
+    monkeypatch.setattr(
+        controller, "_notify_feishu_once",
+        lambda _title, message, _key: messages.append(message),
+    )
+    now = datetime(2026, 10, 19, 10, 30, tzinfo=controller.TIMEZONES[market])
+
+    run_trend_market_controller(config, market, once=True, now_fn=lambda: now)
+
+    assert passes == ["protection"]
+    assert any("保护检查整体异常，已禁止新买入" in message for message in messages)
+    diagnostic = config.data_dir / f"trend_controller/{market}/protection_diagnostics/2026-10-19.jsonl"
+    assert json.loads(diagnostic.read_text())["status"] == "abnormal"
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
 def test_protection_calendar_holiday_skips(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, market: str,
 ) -> None:
@@ -14546,9 +14581,9 @@ def test_protection_calendar_holiday_skips(
         controller, "_run_protection_pass",
         lambda *_args, **_kwargs: calls.append("protection") or _abnormal_protection(),
     )
-    # An empty same-day Futu calendar is authoritative on this weekday.
+    # A usable window excludes today but includes neighboring trading dates.
     monkeypatch.setattr(controller, "FutuQuoteClient", lambda **_kwargs: SimpleNamespace(
-        get_trading_days=lambda **_kwargs: [], close=lambda: None,
+        get_trading_days=lambda **_kwargs: ["2026-10-16", "2026-10-20"], close=lambda: None,
     ))
     now = datetime(2026, 10, 19, 10, 30, tzinfo=controller.TIMEZONES[market])
     result = run_trend_market_controller(config, market, once=True, now_fn=lambda: now)
@@ -14597,7 +14632,7 @@ def test_protection_trading_weekday_still_blocks_and_alerts(
     assert calls == ["protection"]
     assert len(alerts) == 1
     assert "exceptions=1" in alerts[0]
-    assert queries == [{"market": market, "start": "2026-10-19", "end": "2026-10-19"}]
+    assert queries == [{"market": market, "start": "2026-10-09", "end": "2026-10-29"}]
     diagnostics = config.data_dir / f"trend_controller/{market}/protection_diagnostics/2026-10-19.jsonl"
     assert json.loads(diagnostics.read_text())["status"] == "abnormal"
 
@@ -14617,7 +14652,7 @@ def test_protection_calendar_cached_until_local_date_changes(
         queries.append(kwargs)
         if calendar_error:
             raise RuntimeError("calendar offline")
-        return [str(kwargs["start"])]
+        return [clock["now"].date().isoformat()]
 
     monkeypatch.setattr(controller, "FutuQuoteClient", lambda **_kwargs: SimpleNamespace(
         get_trading_days=calendar, close=lambda: None,
@@ -14649,8 +14684,8 @@ def test_protection_calendar_cached_until_local_date_changes(
 
     assert passes == ["2026-10-19", "2026-10-19", "2026-10-20"]
     assert queries == [
-        {"market": market, "start": "2026-10-19", "end": "2026-10-19"},
-        {"market": market, "start": "2026-10-20", "end": "2026-10-20"},
+        {"market": market, "start": "2026-10-09", "end": "2026-10-29"},
+        {"market": market, "start": "2026-10-10", "end": "2026-10-30"},
     ]
 
 

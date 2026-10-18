@@ -1858,9 +1858,21 @@ def _protection_trading_day(
         # Bound the per-controller cache to the current local day.
         cache.clear()
         try:
-            day = local.date().isoformat()
-            days = quote_factory().get_trading_days(market=market, start=day, end=day)
-            cache[key] = day in days
+            day = local.date()
+            start, end = day - timedelta(days=10), day + timedelta(days=10)
+            days = quote_factory().get_trading_days(
+                market=market, start=start.isoformat(), end=end.isoformat(),
+            )
+            trading_days: set[date] = set()
+            for value in days:
+                try:
+                    parsed = date.fromisoformat(value)
+                except (TypeError, ValueError):
+                    continue
+                if start <= parsed <= end:
+                    trading_days.add(parsed)
+            # An empty/unusable window is unknown, never proof of a holiday.
+            cache[key] = not trading_days or day in trading_days
         except Exception:
             # A calendar failure must never disable protection on a weekday.
             cache[key] = True
