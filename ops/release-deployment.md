@@ -24,7 +24,7 @@ install 脚本为准;任何一步失败即停止,不要临场发明替代做法�
 正式交付先按[验证手册](../docs/operations/agent-verification.md#first-reviewable-implementation)
 建立独立分支/worktree，完成适用开发与安全检查；Main 依据长期授权仅暂存、提交和
 推送任务文件，创建普通（非 Draft）PR，无需再次询问推送或 PR 权限，然后进行独立
-GLM 审查与 CI。范围内修复先更新同一 PR，再刷新审查；最终审查、CI 和反馈门禁
+审查与 CI。范围内修复先更新同一 PR，再刷新审查；最终审查、CI 和反馈门禁
 完成后，由用户明确批准 GitHub 合并。手册中的明确 local-only/no-push/
 do-not-publish/draft 覆盖指令仍适用。本地 `main` 只同步远端，不能通过本地合并或
 直接推送绕过 PR。

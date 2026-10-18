@@ -88,7 +88,7 @@ focused checks honestly; Docker is not a prerequisite to task-branch publication
 
 Follow the [PR-first verification runbook](agent-verification.md#first-reviewable-implementation):
 applicable development/security checks, Main's task-only stage/commit/push and
-normal PR under standing authorization, then independent GLM review and CI.
+normal PR under standing authorization, then independent review and CI.
 No additional push/PR permission question is needed; the runbook's explicit
 local-only/no-push/do-not-publish/draft overrides apply. Publish in-scope repairs
 to the same PR before refreshed review. Final review, feedback and exact-SHA
