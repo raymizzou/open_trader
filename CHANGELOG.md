@@ -5,11 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-18
 
+- D2 diagnostics now count completed protective SELLs and exit cancellations with their original request and observation identity. Selected and retained target counts use the accepted selection and typed order identities. Offline regressions preserve UNKNOWN outcomes, native completion, no replay and unchanged trading rules.
 - Trend allocation now converts host-local clocks to Shanghai time while preserving the instant, including daylight saving time. Aware clocks use the same conversion. Offline regressions cover allocation dates, the post-close attempt window, and status timestamps on a Los Angeles host.
 - D2 ranks current account BUYs and qualified new choices together, keeps one desired BUY per market, and cancels exact losing IDs after protection runs. Equal yields keep incumbents; existing orders retain real funds and slots until fresh current facts permit refill. Funding fallback reconsiders affordable lower-ranked choices after an expensive replacement is ruled out. Offline bridge checks cover partial fills, final-composition funding, UNKNOWN protection, stale-request refusal, unchanged-book stability and bounded read-only rotation diagnostics.
 
 ## 2026-10-17
 
+- D2 automatic LP status now includes bounded read-only diagnostics for attempts, accepted source age, candidate rejection reasons, Reader role coverage, protection and local action outcomes. Offline bridge and HTTP checks preserve trading/control behavior, distinguish UNKNOWN from empty data, and verify redaction and no extra reads. Rotation policy is unchanged.
 - Trend market controller heartbeat timestamps now convert host-local clocks to the configured timezone while preserving the instant, including daylight saving time. Aware clocks use the same conversion. Focused regressions cover CN/HK timestamps and preserve strict dashboard health thresholds.
 - Remove the mandatory reviewer model and profile from the agent delivery workflow and linked guides. Independent review and CI remain required; documentation diff inspection and whitespace checks completed, with no backend tests or reviewer launches for this documentation-only task.
 - D2 accepts case-equivalent valid wallet addresses in current orders, positions and captured BUY candidates. Internal account IDs, stored keys, audit identities and strict receipt checks remain unchanged. Offline contracts cover startup cancellation, a nonempty later-round BUY, wrong-wallet rejection and UNKNOWN capacity blocking. This does not clear preparation pauses or deploy the fix.
