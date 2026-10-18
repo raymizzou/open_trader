@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Generic, Literal, TypeVar
 import threading
 import time
 import math
+import re
 
 if TYPE_CHECKING:
     from .polymarket_lp_market_reader import MarketFrame
@@ -27,6 +28,17 @@ FactState = Literal['known', 'unknown', 'not_read']
 _CURRENT_ORDER_STATES = frozenset({'LIVE', 'OPEN', 'ACCEPTED', 'PARTIALLY_FILLED',
     'CANCELING', 'CANCELLING', 'PENDING_CANCEL'})
 _TERMINAL_ORDER_STATES = frozenset({'CANCELED', 'CANCELLED', 'FILLED', 'MATCHED', 'EXPIRED', 'REJECTED'})
+
+
+def external_account_matches(value: object, owner: object) -> bool:
+    """Compare external wallet rows without changing internal owner identities."""
+    if type(value) is not str or type(owner) is not str:
+        return False
+    if value == owner:
+        return True
+    return (re.fullmatch(r'0[xX][0-9a-fA-F]{40}', value, re.ASCII) is not None
+        and re.fullmatch(r'0[xX][0-9a-fA-F]{40}', owner, re.ASCII) is not None
+        and value.casefold() == owner.casefold())
 
 
 @dataclass(frozen=True)
@@ -721,7 +733,7 @@ class CurrentLPState:
                 key = (self.account_id, row['condition_id'], row['token_id'], row['order_id'])
                 original = _decimal(row.get('original_size', row.get('quantity')))
                 matched, price = _decimal(row.get('size_matched')), _decimal(row.get('price'))
-                if (row.get('account_id', self.account_id) != self.account_id or not all(key)
+                if (not external_account_matches(row.get('account_id', self.account_id), self.account_id) or not all(key)
                         or key in orders or row.get('side') not in ('BUY', 'SELL')
                         or original is None or matched is None or price is None
                         or not 0 <= matched <= original or not 0 < price < 1):
@@ -786,7 +798,7 @@ class CurrentLPState:
                     else:
                         orders[key] = (replace(previous, presence='absent' if orders_complete else 'unknown')
                             if orders_source_current else previous)
-            if any(r.get('account_id', self.account_id) != self.account_id
+            if any(not external_account_matches(r.get('account_id', self.account_id), self.account_id)
                     or not r.get('condition_id') or not r.get('token_id') for r in source_frame.positions):
                 return Acceptance('invalid_identity')
             positions = tuple(CurrentPositionFact(self.account_id, r['condition_id'], r['token_id'],
