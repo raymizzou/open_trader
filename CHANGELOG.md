@@ -6,6 +6,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-10-17
 
 - Remove the mandatory reviewer model and profile from the agent delivery workflow and linked guides. Independent review and CI remain required; documentation diff inspection and whitespace checks completed, with no backend tests or reviewer launches for this documentation-only task.
+- D2 accepts case-equivalent valid wallet addresses in current orders, positions and captured BUY candidates. Internal account IDs, stored keys, audit identities and strict receipt checks remain unchanged. Offline contracts cover startup cancellation, a nonempty later-round BUY, wrong-wallet rejection and UNKNOWN capacity blocking. This does not clear preparation pauses or deploy the fix.
 
 ## 2026-10-16
 

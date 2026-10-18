@@ -25,6 +25,7 @@ from .polymarket_lp_current_state import (
     OpeningProtection, OpeningEconomics, OpeningProtectionUpdate,
     ScoringState, ScoringObservation,
     OwnFillEvidence, SellState, ExitAttempt, ExitEvidenceUpdate,
+    external_account_matches,
 )
 from .polymarket_lp_market_calculation import CalculationPolicy, calculate_current
 from .polymarket_lp_market_reader import MarketReader, ReadScope, freeze
@@ -1216,7 +1217,7 @@ class LPD2LiveExecution:
                 if (any(type(row.get(key)) is not str or not row[key]
                         for key in ('condition_id', 'token_id', 'market_id'))
                         or type(row.get('venue', self.venue)) is not str
-                        or row.get('account_id', self.account_id) != self.account_id):
+                        or not external_account_matches(row.get('account_id', self.account_id), self.account_id)):
                     return None
                 terms = BuyTerms(Decimal(str(row['price'])), Decimal(str(row['quantity'])),
                     row['order_type'], row.get('expiration'), row['post_only'], tuple(row.get('send_options', ())))

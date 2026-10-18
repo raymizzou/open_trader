@@ -1,4 +1,5 @@
 """Inactive Execution attachment at real scheduler, Store, SDK and native boundaries."""
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import hashlib
@@ -22,6 +23,226 @@ from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from tests.test_lp_d2_integration import seed_running, settle_control
 from tests.test_lp_order_registration_contract import _adapter, _SDKPublicClient, _Notifier, WALLET, CONDITION_ID, TOKEN_ID
 from tests.test_polymarket_lp_risk import _direction
+
+MIXED_WALLET = '0x' + 'aA' * 20
+
+
+def wallet_case_runtime(tmp_path, monkeypatch):
+    now = datetime(2026, 10, 17, 1, tzinfo=UTC)
+    class ClockMeta(type):
+        def __instancecheck__(cls, value): return isinstance(value, datetime)
+    class FixedDateTime(datetime, metaclass=ClockMeta):
+        @classmethod
+        def now(cls, tz=None): return now if tz is not None else now.replace(tzinfo=None)
+    monkeypatch.setattr(polymarket_lp_market_reader, 'datetime', FixedDateTime)
+    monkeypatch.setattr(polymarket_trading, 'datetime', FixedDateTime)
+    adapter, sdk = _adapter(tmp_path, public_client=_SDKPublicClient(now))
+    adapter.config = replace(adapter.config, wallet_address=MIXED_WALLET)
+    sdk.positions = (dict(user=WALLET, condition_id=CONDITION_ID, token_id=TOKEN_ID,
+        size='2', average_price='.50', redeemable=False),)
+    sdk.create_limit_order = lambda **kw: dict(kw, order_type='GTD')
+    def post(signed):
+        sdk.posts.append(signed)
+        return dict(order_id='wallet-case-buy', status='LIVE', accepted=True, taking_amount='0')
+    sdk.post_order = post
+    store = PredictionArbitrageStore(tmp_path)
+    seed_running(store)
+    account = '30ffa9b5e1968e54bddadba7ff14c633c7c955a6f41808d9f5633a42c07537dd'
+    store.lp_save_current_settings(account, expected_config_version=0,
+        changes=dict(budget_usd='40', target_buy_count=1, buy_price_level=1))
+    live = LPD2LiveExecution(store, adapter, account_id=MIXED_WALLET, venue='polymarket',
+        process_epoch='wallet-case', policy=CalculationPolicy(None), utc_now=lambda: now)
+    live.load_settings()
+    live.initialize(ValidatedStartAdmission('wallet-case', 'offline-permit'))
+    producer = PolymarketLPService(store, adapter, clock=lambda: now)
+    return live, producer, sdk, now
+
+
+@pytest.mark.parametrize('current_buy', [False, True], ids=['empty-orders', 'exact-buy'])
+def test_mixed_case_wallet_adapter_reaches_startup_round(tmp_path, monkeypatch, current_buy):
+    from tests.test_lp_order_registration_contract import _open_order
+    live, producer, sdk, now = wallet_case_runtime(tmp_path, monkeypatch)
+    if current_buy:
+        sdk.orders = (_open_order('startup-current-buy', 'BUY', price='.40', original='10', matched='3'),)
+        cancel = sdk.cancel_orders
+        def cancel_and_remove(*, order_ids):
+            receipt = cancel(order_ids=order_ids)
+            sdk.orders = tuple(o for o in sdk.orders if o.id not in receipt['canceled'])
+            return receipt
+        sdk.cancel_orders = cancel_and_remove
+    try:
+        execution = attach(live, producer, tmp_path)
+        scheduler = LPAutoScheduler(execution, clock=lambda: now)
+        execution.set_lp_auto_scheduler(scheduler)
+        assert scheduler.run_due()
+        snapshot = live.state.snapshot()
+        assert snapshot.observation is not None
+        assert snapshot.observation.account_id == MIXED_WALLET
+        assert snapshot.observation.source_frame.positions[0]['account_id'] == WALLET
+        assert snapshot.positions[0].account_id == MIXED_WALLET
+        assert snapshot.positions[0].quantity.value == Decimal('2')
+        assert snapshot.observation.calculation.inventory_cost == Decimal('1.00')
+        assert snapshot.observation.calculation.buy_reserved == (Decimal('2.80') if current_buy else Decimal('0'))
+        assert live.rounds.snapshot().round_number == 1
+        assert sdk.posts == []
+        assert sdk.cancels == ([('startup-current-buy',)] if current_buy else [])
+        assert scheduler.run_due()
+        assert sdk.cancels == ([('startup-current-buy',)] if current_buy else [])
+        assert sdk.posts == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('unknown', ['balance', 'inventory', 'wrong-wallet'])
+def test_case_fix_preserves_persisted_identity_and_unknown_gate(tmp_path, monkeypatch, unknown):
+    from tests.test_lp_business_writer_contract import request
+    from tests.test_lp_d2_integration import candidates_for_fixed_send
+    live, producer, sdk, now = wallet_case_runtime(tmp_path, monkeypatch)
+    account = '30ffa9b5e1968e54bddadba7ff14c633c7c955a6f41808d9f5633a42c07537dd'
+    audit = request('old-wallet-request', account_id=MIXED_WALLET, process_epoch='old-epoch',
+        session_id='old-wallet-audit', condition_id=CONDITION_ID, token_id=TOKEN_ID,
+        order_id='historical-buy', requested_at=now)
+    try:
+        assert live.store.lp_log_business_record(audit)
+        def documents():
+            with sqlite3.connect(live.store.path) as connection:
+                return tuple(connection.execute(sql).fetchall() for sql in (
+                    'SELECT payload FROM lp_auto_pool',
+                    "SELECT payload FROM lp_sessions WHERE session_id='old-wallet-audit'",
+                    "SELECT payload FROM lp_actions WHERE action_key='old-wallet-request'"))
+        before = documents()
+        control = live.store.lp_load_current_control(account)
+        settings = live.store.lp_load_current_settings(account)
+        healthy = live.run_once()
+        assert healthy.acceptance.status == 'accepted'
+        assert live.state.snapshot().new_capacity.value == Decimal('39')
+        assert live.state.snapshot().current.account_id == MIXED_WALLET
+        assert live.rounds.snapshot().account_id == MIXED_WALLET
+        assert live.rounds.snapshot().round_number == 1
+        assert live.state.snapshot().orders == ()  # An audit cannot restore a BUY.
+        assert live.store.lp_load_current_control(account) == control
+        assert live.store.lp_load_current_settings(account) == settings
+        assert settings['account_id'] == account
+        assert settings['budget_usd'] == '40'
+        assert documents() == before
+        assert not live.store.lp_log_business_record(replace(audit,
+            request_id='wrong-parent-case', account_id=WALLET))
+        assert documents() == before
+        candidates, rows = candidates_for_fixed_send()
+        for row in rows:
+            row['account_id'] = WALLET
+        if unknown == 'balance':
+            def unavailable(**kw): raise OSError('offline balance unavailable')
+            sdk.get_balance_allowance = unavailable
+        elif unknown == 'inventory':
+            sdk.positions = (dict(user=WALLET, condition_id=CONDITION_ID, token_id=TOKEN_ID, size='2'),)
+        else:
+            sdk.positions = (dict(user='0x'+'b'*40, condition_id=CONDITION_ID,
+                token_id=TOKEN_ID, size='2', average_price='.50'),)
+        rejected = live.run_once(candidates)
+        # Complete position provenance can still carry an unknown cost.
+        assert rejected.acceptance.status == ('accepted' if unknown == 'inventory' else 'partial')
+        assert live.state.snapshot().new_capacity.state == 'unknown'
+        assert live.state.snapshot().new_capacity.value is None
+        assert sdk.posts == [] and sdk.cancels == []
+        assert live.rounds.snapshot().round_number == 1
+        assert live.store.lp_load_current_control(account) == control
+        assert live.store.lp_load_current_settings(account) == settings
+        assert documents() == before
+        with pytest.raises(ValueError, match='lp_control_identity_or_value_invalid'):
+            live.store.lp_load_current_control(MIXED_WALLET)
+        with pytest.raises(ValueError, match='lp_settings_account_identity'):
+            live.store.lp_load_current_settings(MIXED_WALLET)
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def wallet_case_candidates():
+    from tests.test_lp_d2_integration import candidates_for_fixed_send
+    captured, rows = candidates_for_fixed_send()
+    return replace(captured, value=[dict(rows[0], account_id=WALLET)])
+
+
+def test_case_variant_candidate_builds_nonempty_round_one_plan(tmp_path, monkeypatch):
+    live, producer, sdk, now = wallet_case_runtime(tmp_path, monkeypatch)
+    try:
+        live.run_once()
+        assert live.rounds.snapshot().round_number == 1
+        captured = wallet_case_candidates()
+        result = live.run_once(captured)
+        assert result.acceptance.status == 'accepted'
+        assert result.start.status.value == 'batch'
+        assert len(result.start.token.actions) == 1
+        action = result.start.token.actions[0]
+        assert action.account_id == MIXED_WALLET
+        assert action.target.token_id == 'token-F'
+        assert action.target.terms.price == Decimal('.40')
+        assert action.target.terms.quantity == Decimal('20')
+        assert len(sdk.posts) == 1
+        assert result.outcomes[0].status.value == 'accepted'
+        assert live.rounds.snapshot().round_number == 2
+        snapshot = live.state.snapshot()
+        assert snapshot.orders[0].key == (MIXED_WALLET, 'condition-F', 'token-F', 'wallet-case-buy')
+        assert snapshot.positions[0].account_id == MIXED_WALLET
+        assert snapshot.observation.account_id == MIXED_WALLET
+        assert captured.value[0]['account_id'] == WALLET
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('receipt_account', ['absent', 'lowercase', 'different'])
+def test_wallet_case_fix_keeps_buy_receipt_identity_strict(tmp_path, monkeypatch, receipt_account):
+    live, producer, sdk, now = wallet_case_runtime(tmp_path, monkeypatch)
+    def post(signed):
+        sdk.posts.append(signed)
+        response = dict(order_id='wallet-case-receipt', status='LIVE', accepted=True, taking_amount='0')
+        if receipt_account != 'absent':
+            response['account_id'] = WALLET if receipt_account == 'lowercase' else '0x'+'b'*40
+        return response
+    sdk.post_order = post
+    try:
+        live.run_once()
+        result = live.run_once(wallet_case_candidates())
+        assert len(result.outcomes) == 1 and len(sdk.posts) == 1
+        assert result.outcomes[0].identity.account_id == MIXED_WALLET
+        snapshot = live.state.snapshot()
+        if receipt_account == 'absent':
+            assert result.outcomes[0].status.value == 'accepted'
+            assert snapshot.orders[0].key == (MIXED_WALLET, 'condition-F', 'token-F', 'wallet-case-receipt')
+            assert live.status()['last_buy_uncertainty'] is None
+        else:
+            assert result.outcomes[0].status.value == 'unknown_error'
+            assert snapshot.orders == ()
+            assert all(f.state == 'unknown' and f.value is None for f in (
+                snapshot.buy_reserved, snapshot.inventory_cost, snapshot.current_exposure, snapshot.new_capacity))
+            uncertainty = live.status()['last_buy_uncertainty']
+            assert uncertainty.reason == 'invalid_receipt'
+            assert uncertainty.account_id == MIXED_WALLET
+            assert uncertainty.request_id == result.outcomes[0].identity.request_id
+        assert live.complete_local_attempts(result.start.token, result.outcomes).status.value == 'duplicate'
+        assert len(sdk.posts) == 1
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_fixed_plan_still_rejects_wrong_wallet_candidate(tmp_path, monkeypatch):
+    live, producer, sdk, now = wallet_case_runtime(tmp_path, monkeypatch)
+    try:
+        live.run_once()
+        captured = wallet_case_candidates()
+        captured.value[0]['account_id'] = '0x'+'b'*40
+        result = live.run_once(captured)
+        assert result.acceptance.status == 'accepted'
+        assert result.start.status.value == 'needs_fixed_plan'
+        assert live.rounds.snapshot().round_number == 1
+        assert sdk.posts == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
 
 
 def bridge_runtime(tmp_path, monkeypatch, *, target_count=1, candidate_count=1):
