@@ -133,6 +133,7 @@ def select_current_composition(frame, policy, calculation, *, orders_accepted=Tr
         if not budget_reduction:
             capacity = reserved
     rejected = set()
+    unfundable = set()
     protected = [({**row, 'existing': True}, None, row['remaining'] * row['price'])
         for row in frame.current_buys if estimates[row['order_id']] is None]
     protected_cost = sum((item[2] for item in protected), Decimal(0))
@@ -144,7 +145,7 @@ def select_current_composition(frame, policy, calculation, *, orders_accepted=Tr
         for item in ranked:
             row, rate, cost = item
             identity = (row['condition_id'], row['token_id'])
-            if (not row.get('existing') and identity in rejected
+            if (not row.get('existing') and identity in rejected | unfundable
                     or row['condition_id'] in markets):
                 continue
             if len(selected) >= policy.target_count:
@@ -157,10 +158,17 @@ def select_current_composition(frame, policy, calculation, *, orders_accepted=Tr
         new = [item for item in selected if not item[0].get('existing')]
         if sum((item[2] for item in new), Decimal(0)) <= max(Decimal(0), remaining - retained):
             break
-        # Remove the lowest ranked new choice permanently for this decision,
-        # then let the ranked incumbent alternatives compete again.
+        # Lower choices are only tentatively removed while a higher choice
+        # remains. If even the lone new choice cannot fund its incumbent
+        # backfill, exclude it and reconsider those lower choices. Each restart
+        # excludes one new identity, bounding these ranked passes quadratically.
         row = new[-1][0]
-        rejected.add((row['condition_id'], row['token_id']))
+        identity = (row['condition_id'], row['token_id'])
+        if len(new) == 1:
+            unfundable.add(identity)
+            rejected.clear()
+        else:
+            rejected.add(identity)
     targets = [row['condition_id'] for row, _, _ in selected]
     tokens = [row['order_id'] if row.get('existing') else row['token_id'] for row, _, _ in selected]
     retained_ids = tuple(row['order_id'] for row, _, _ in selected if row.get('existing'))

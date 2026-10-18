@@ -2005,3 +2005,52 @@ def test_d2_fixed_plan_distinguishes_order_ids_from_candidate_tokens(tmp_path, m
     finally:
         assert live.close(timeout=3)
         live.trading.close()
+
+
+def test_d2_funding_reconsiders_affordable_candidate_after_expensive_choice_fails(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch,wallet='50')
+    entered, release = Event(), Event()
+    try:
+        sdk.orders = tuple(order(k) for k in 'ABCDE')
+        pools['F'], pools['G'] = Decimal('10000'), Decimal('1000')
+        qualify('F',quantity='90'); qualify('G')
+        cancel = sdk.cancel_orders
+        def held_cancel(*,order_ids):
+            assert order_ids == ('E',)
+            entered.set(); assert release.wait(5), 'funding fallback native watchdog'
+            return cancel(order_ids=order_ids)
+        sdk.cancel_orders = held_cancel
+        result = execution.lp_auto_scheduled_check()
+        calculation = result.acceptance.observation.calculation
+        rates = (calculation.candidate_yields[ids['F'][1]],
+            calculation.candidate_yields[ids['G'][1]],calculation.yields['A'])
+        assert rates[0] > rates[1] > rates[2]
+        expected_rates = (Decimal(675000)/3799,Decimal(16875)/808,Decimal(3375)/1616)
+        assert all(abs(actual-expected) <= Decimal('1e-10')
+            for actual,expected in zip(rates,expected_rates)), rates
+        assert calculation.buy_reserved == Decimal('50') and calculation.new_capacity == Decimal('0')
+        assert result.selection.retained_order_ids == ('A','B','C','D')
+        assert result.selection.new_target_keys == (ids['G'],)
+        assert len(result.selection.target_tokens) == 5
+        assert {victim.key[3] for victim in result.rotation.victims} == {'E'}
+        assert entered.wait(2)
+        action, = result.rotation_outcomes
+        assert action.order_key == (WALLET,*ids['E'],'E')
+        assert action.handle.identity.target.existing_order_id == 'E'
+        assert sdk.posts == [] and sdk.cancels == []
+        release.set()
+        assert action.handle.result(timeout=3).status.value == 'accepted'
+        wait_rotation_idle(live)
+        assert sdk.cancels == [('E',)] and sdk.posts == []
+        sdk.advance(1)
+        sdk.orders = tuple(order(k) for k in 'ABCD')
+        refill = execution.lp_auto_scheduled_check()
+        assert set(refill.selection.candidate_yields) == {ids['F'][1],ids['G'][1]}
+        assert refill.selection.new_target_keys == (ids['G'],)
+        assert [post['token_id'] for post in sdk.posts] == [ids['G'][1]]
+        assert refill.outcomes[0].status.value == 'accepted'
+        assert sdk.cancels == [('E',)] and refill.rotation.victims == ()
+    finally:
+        release.set()
+        assert live.close(timeout=3)
+        live.trading.close()
