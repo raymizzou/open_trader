@@ -173,7 +173,7 @@ Run one real daily check for a market:
 Delivery is PR-first: start an isolated branch/worktree from freshly fetched
 `origin/main`, complete applicable development/security checks, then Main stages,
 commits and pushes only task files and opens a normal PR under standing
-authorization, without another push/PR question. Independent GLM review and CI
+authorization, without another push/PR question. Independent review and CI
 follow publication; in-scope repairs update the same PR before refreshed review.
 Final review, CI and feedback gates precede explicit user approval to merge
 on GitHub. The runbook's explicit local-only/no-push/do-not-publish/draft overrides

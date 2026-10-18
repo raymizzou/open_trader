@@ -178,6 +178,6 @@ replace a digest with an unverified guess. Add the dated CHANGELOG, then follow
 the [PR-first delivery loop](agent-verification.md#first-reviewable-implementation):
 Main stages/commits/pushes only task files and opens a normal PR under standing
 authorization without another push/PR question, subject to its explicit
-local-only/no-push/do-not-publish/draft overrides. Independent GLM review and CI
+local-only/no-push/do-not-publish/draft overrides. Independent review and CI
 follow publication; in-scope repairs update the same PR before refreshed review.
 Final review, CI and feedback gates precede explicit user approval for GitHub merge.

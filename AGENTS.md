@@ -81,7 +81,7 @@ On interruption, verify actual worktree, edits, active commands and live session
 ownership before resuming the original session/model. Actual reads, edits or tool
 execution establish progress; a `working` badge alone does not. After 10 continuous
 minutes without actual progress, Main reports the blocker and waiting/model-change
-options. The user decides model changes; this does not change the reviewer model,
+options. The user decides model changes; this does not authorize model changes for other roles,
 set a test/CI timeout or authorize stopping active commands.
 
 For review and delivery, lead with what behavior changed and why. Tie claims to
@@ -201,7 +201,7 @@ closure, final acceptance or merge; an unavailable reviewer does not delay it.
 Report actual publication/access failures. Verify the remote PR URL and exact
 head/base, and record checks and pending review status. Publication is a review
 handoff, not approval or readiness; claim dots has started only with observed evidence.
-Immediately start a separate Herdr GLM-5.3/max reviewer pane alongside
+Immediately start a separate Herdr independent reviewer pane alongside
 CI; verify actual startup and keep review and CI status separate. Pin issue scope, PR
 URL, head/base SHAs and verification; unavailable prerequisites are blockers,
 not completed reviews. Follow the
