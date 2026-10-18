@@ -534,9 +534,15 @@ def test_d2_diagnostics_keep_last_accepted_source_time_after_failed_attempt(tmp_
         assert previous_protection['entered'] is True
         clock[0] += timedelta(seconds=61)
         if failure == 'capture-failure':
-            # The real producer fails while freezing an unsupported source value.
-            producer._candidate_qualification_facts[CONDITION_ID]['bad_packet'] = object()
-            with pytest.raises(TypeError, match='reader_requires_values'):
+            # Unsupported leaves are isolated; a source traversal error still
+            # fails the real capture and must preserve the accepted observation.
+            class UnreadableSource(dict):
+                def items(self):
+                    raise TypeError('source_traversal_failed')
+
+            direction = producer._candidate_qualification_facts[CONDITION_ID]['directions'][0]
+            direction['book'] = UnreadableSource(direction['book'])
+            with pytest.raises(TypeError, match='source_traversal_failed'):
                 execution.lp_auto_scheduled_check()
         else:
             from open_trader.polymarket_lp_current_inputs import prepare_current_inputs
