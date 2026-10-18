@@ -62,7 +62,7 @@ def test_market_frame_adaptation_has_no_reads_and_preserves_source_identity(monk
                 assert actual == Decimal(0)
             else:
                 assert actual.quantize(Decimal('.000000000001')) == Decimal(rate)
-            assert result.target_tokens == ('candidate-t',)
+            assert result.target_tokens == (('candidate-t',) if pool == '0' else ('o1',))
             for missing in (None, SourceResult('missing', complete=False, error='network', checked_at=checked)):
                 sources = dict(raw.sources)
                 sources.pop('market:c1:t1')
@@ -199,7 +199,7 @@ def test_qualified_candidates_use_same_frame_and_independent_source_coverage(tmp
         prepared = prepare_current_inputs(raw,pool,policy,now)
         result = calculate_current(prepared,policy,now)
         assert (result.buy_reserved,result.inventory_cost,result.new_capacity)==(Decimal('4'),Decimal('3'),Decimal('33'))
-        assert result.target_tokens == ('candidate-t',)
+        assert result.target_tokens == ('other-buy', 'candidate-t')
         row, = prepared.sources['candidates'].value
         assert row['price']==price and row['quantity']==Decimal('20')
         assert row['policy_version']==policy.config_version

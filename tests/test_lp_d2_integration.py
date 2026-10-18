@@ -319,7 +319,8 @@ def test_independent_cancel_preserves_native_inflight_lifetime(tmp_path):
         assert attempt.done() is False
         captured, _ = candidates_for_fixed_send()
         bought = live.run_once(captured)
-        assert [o.status.value for o in bought.outcomes] == ['accepted']*3
+        assert [o.status.value for o in bought.outcomes] == ['accepted']*2
+        assert [post['token_id'] for post in sdk.posts] == ['token-C', 'token-D']
         assert live.rounds.snapshot().round_number == 2
         assert live.status()['native_inflight'] == 1 and not attempt.done()
         old_generation = live.state.snapshot().current.cycle_generation
@@ -341,7 +342,7 @@ def test_independent_cancel_preserves_native_inflight_lifetime(tmp_path):
         assert outcome.identity is attempt.identity and outcome.status.value == 'accepted'
         assert live.close(timeout=3) is True
         assert live.status()['native_inflight'] == 0
-        assert calls == [('ordinary-A',)] and len(sdk.posts) == 3
+        assert calls == [('ordinary-A',)] and len(sdk.posts) == 2
         current = next(o for o in live.state.snapshot().orders if o.key == key)
         assert current.terminal_proof.status == 'CANCELED'
     finally:

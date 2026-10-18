@@ -3,6 +3,10 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-18
+
+- D2 ranks current account BUYs and qualified new choices together, keeps one desired BUY per market, and cancels exact losing IDs after protection runs. Equal yields keep incumbents; existing orders retain real funds and slots until fresh current facts permit refill. Offline bridge checks cover partial fills, final-composition funding, UNKNOWN protection, stale-request refusal, unchanged-book stability and bounded read-only rotation diagnostics.
+
 ## 2026-10-17
 
 - Trend market controller heartbeat timestamps now convert host-local clocks to the configured timezone while preserving the instant, including daylight saving time. Aware clocks use the same conversion. Focused regressions cover CN/HK timestamps and preserve strict dashboard health thresholds.
