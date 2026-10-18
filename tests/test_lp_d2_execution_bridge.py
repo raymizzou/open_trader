@@ -94,6 +94,49 @@ def test_mixed_case_wallet_adapter_reaches_startup_round(tmp_path, monkeypatch, 
         live.trading.close()
 
 
+def test_d2_funding_reconsiders_lower_choice_after_middle_choice_fails(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch,wallet='50')
+    try:
+        sdk.orders = tuple(order(k) for k in 'ABCDE')
+        pools['H'], pools['F'], pools['G'] = Decimal('20000'), Decimal('10000'), Decimal('1000')
+        qualify('H'); qualify('F',quantity='90'); qualify('G')
+        result = execution.lp_auto_scheduled_check()
+        calculation = result.acceptance.observation.calculation
+        rates = tuple(calculation.candidate_yields[ids[k][1]] for k in 'HFG')
+        assert rates[0] > rates[1] > rates[2] > calculation.yields['A']
+        expected_rates = (Decimal(337500)/808,Decimal(675000)/3799,Decimal(16875)/808)
+        assert all(abs(actual-expected) <= Decimal('1e-10')
+            for actual,expected in zip(rates,expected_rates)), rates
+        assert calculation.buy_reserved == Decimal('50') and calculation.new_capacity == Decimal('0')
+        assert result.selection.retained_order_ids == ('A','B','C')
+        assert result.selection.new_target_keys == (ids['H'],ids['G'])
+        assert len(result.selection.target_tokens) == 5
+        assert {victim.key[3] for victim in result.rotation.victims} == {'D','E'}
+        actions = {action.order_key[3]:action for action in result.rotation_outcomes}
+        assert set(actions) == {'D','E'}
+        assert sdk.posts == []
+        for key, action in actions.items():
+            assert action.order_key == (WALLET,*ids[key],key)
+            assert action.handle.identity.target.existing_order_id == key
+            assert action.handle.result(timeout=3).status.value == 'accepted'
+        wait_rotation_idle(live)
+        assert len(sdk.cancels) == 2 and {batch for batch in sdk.cancels} == {('D',),('E',)}
+        assert sdk.posts == []
+        sdk.advance(1)
+        sdk.orders = tuple(order(k) for k in 'ABC')
+        refill = execution.lp_auto_scheduled_check()
+        assert set(refill.selection.candidate_yields) == {ids[k][1] for k in 'HFG'}
+        assert refill.selection.retained_order_ids == ('A','B','C')
+        assert refill.selection.new_target_keys == (ids['H'],ids['G'])
+        assert len(sdk.posts) == 2 and {post['token_id'] for post in sdk.posts} == {ids[k][1] for k in 'HG'}
+        assert len(refill.outcomes) == 2 and all(outcome.status.value == 'accepted' for outcome in refill.outcomes)
+        assert len(sdk.cancels) == 2 and {batch for batch in sdk.cancels} == {('D',),('E',)}
+        assert refill.rotation.victims == ()
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
 @pytest.mark.parametrize('unknown', ['balance', 'inventory', 'wrong-wallet'])
 def test_case_fix_preserves_persisted_identity_and_unknown_gate(tmp_path, monkeypatch, unknown):
     from tests.test_lp_business_writer_contract import request

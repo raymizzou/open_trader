@@ -132,43 +132,62 @@ def select_current_composition(frame, policy, calculation, *, orders_accepted=Tr
         remaining = reserved
         if not budget_reduction:
             capacity = reserved
-    rejected = set()
-    unfundable = set()
     protected = [({**row, 'existing': True}, None, row['remaining'] * row['price'])
         for row in frame.current_buys if estimates[row['order_id']] is None]
     protected_cost = sum((item[2] for item in protected), Decimal(0))
     selected = protected[:]
-    while selection_valid and remaining is not None and capacity is not None:
-        selected = protected[:]
-        markets = {row['condition_id'] for row, _, _ in protected}
-        used = protected_cost
-        for item in ranked:
-            row, rate, cost = item
-            identity = (row['condition_id'], row['token_id'])
-            if (not row.get('existing') and identity in rejected | unfundable
-                    or row['condition_id'] in markets):
-                continue
-            if len(selected) >= policy.target_count:
-                break
-            if used + cost <= capacity:
-                selected.append(item)
-                markets.add(row['condition_id'])
-                used += cost
-        retained = sum((cost for row, _, cost in selected if row.get('existing')), Decimal(0))
-        new = [item for item in selected if not item[0].get('existing')]
-        if sum((item[2] for item in new), Decimal(0)) <= max(Decimal(0), remaining - retained):
-            break
-        # Lower choices are only tentatively removed while a higher choice
-        # remains. If even the lone new choice cannot fund its incumbent
-        # backfill, exclude it and reconsider those lower choices. Each restart
-        # excludes one new identity, bounding these ranked passes quadratically.
-        row = new[-1][0]
-        identity = (row['condition_id'], row['token_id'])
-        if len(new) == 1:
-            unfundable.add(identity)
-            rejected.clear()
-        else:
-            rejected.add(identity)
+    if selection_valid and remaining is not None and capacity is not None:
+        rejected = set()
+        failed = set()
+
+        def composition():
+            chosen = protected[:]
+            markets = {row['condition_id'] for row, _, _ in protected}
+            used = protected_cost
+            for item in ranked:
+                row, rate, cost = item
+                identity = (row['condition_id'], row['token_id'])
+                if (not row.get('existing') and identity in rejected
+                        or row['condition_id'] in markets):
+                    continue
+                if len(chosen) >= policy.target_count:
+                    break
+                if used + cost <= capacity:
+                    chosen.append(item)
+                    markets.add(row['condition_id'])
+                    used += cost
+            return chosen
+
+        def funded(chosen):
+            identity = tuple((bool(row.get('existing')), row.get('order_id'),
+                row['condition_id'], row['token_id']) for row, _, _ in chosen)
+            if identity in failed:
+                return False  # Do not re-evaluate a rejected composition.
+            retained = sum((cost for row, _, cost in chosen if row.get('existing')), Decimal(0))
+            new_cost = sum((cost for row, _, cost in chosen if not row.get('existing')), Decimal(0))
+            if new_cost <= max(Decimal(0), remaining - retained):
+                return True
+            failed.add(identity)
+            return False
+
+        selected = composition()
+        while not funded(selected):
+            row = next(row for row, _, _ in reversed(selected) if not row.get('existing'))
+            rejected.add((row['condition_id'], row['token_id']))
+            selected = composition()
+        # Reconsider each temporary removal once, in rank order, against the
+        # surviving funded choices and their incumbent backfill. The descent
+        # and this pass each visit at most every new identity: no subset search.
+        reconsider = dict.fromkeys((row['condition_id'], row['token_id'])
+            for row, _, _ in ranked if not row.get('existing')
+            and (row['condition_id'], row['token_id']) in rejected)
+        for identity in reconsider:
+            rejected.remove(identity)
+            proposed = composition()
+            if funded(proposed):
+                selected = proposed
+            else:
+                rejected.add(identity)
     targets = [row['condition_id'] for row, _, _ in selected]
     tokens = [row['order_id'] if row.get('existing') else row['token_id'] for row, _, _ in selected]
     retained_ids = tuple(row['order_id'] for row, _, _ in selected if row.get('existing'))
