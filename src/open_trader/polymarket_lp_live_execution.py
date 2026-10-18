@@ -5,6 +5,7 @@ from decimal import Decimal
 from collections.abc import Mapping
 import json
 import hashlib
+import logging
 import threading
 import time
 from concurrent.futures import Future
@@ -14,7 +15,7 @@ from types import MappingProxyType
 from .lp_business_writer import LPBusinessWriter, RequestRecord, ReceiptRecord, ProgressRecord
 from .polymarket_lp_control import LPControlOwner
 from .polymarket_lp_current_inputs import prepare_current_inputs
-from .polymarket_lp_diagnostics import summarize_iteration, project_diagnostics, append_outcome
+from .polymarket_lp_diagnostics import summarize_iteration, project_diagnostics, append_outcome, diagnostic_json_copy
 from .polymarket_lp_current_state import (
     AppliedControl, CommittedControl, CurrentLPState, StoredControl, ValidatedStartAdmission,
     ControlRequestResult,
@@ -37,6 +38,9 @@ from .polymarket_lp_round import (
     LPRoundCoordinator, CycleStatus, FixedBuyPlan, StartStatus, CancelTarget,
     LocalOutcome, LocalStatus, BuyTarget, BuyTerms, ActionIdentity, BatchKind,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -1308,6 +1312,7 @@ class LPD2LiveExecution:
                         due_at_600=now >= y.unknown_deadline_monotonic) for y in unknown[:20]])
                 return result
         except Exception:
+            logger.exception('prediction_lp_diagnostics_failed')
             return dict(version=1, available=False)
 
     def _offer_progress(self, frame):
@@ -1495,14 +1500,23 @@ class LPD2LiveExecution:
                 self._rotation_summary, self._rotation_pending = summary, tuple(pending)
         except Exception:
             # Diagnostics cannot replace or suppress the trading result.
+            logger.exception('prediction_lp_rotation_diagnostics_failed')
             with self.state._lock:
-                self._rotation_summary = dict(selection_state='UNKNOWN', reason_counts={'other':1})
+                self._rotation_summary = dict(selection_state='UNKNOWN', reason_counts={'other':1},
+                    available=False, error='diagnostics_unavailable')
                 self._rotation_pending = ()
 
     def rotation_diagnostics(self):
         """Memory-only GET. Read completed Futures without waiting or replaying."""
+        try:
+            return self._rotation_diagnostics()
+        except Exception:
+            logger.exception('prediction_lp_rotation_diagnostics_failed')
+            return dict(selection_state='UNKNOWN', available=False, error='diagnostics_unavailable')
+
+    def _rotation_diagnostics(self):
         with self.state._lock:
-            summary = json.loads(json.dumps(self._rotation_summary))
+            summary = diagnostic_json_copy(self._rotation_summary)
             pending = self._rotation_pending
         if summary is None or not pending:
             return summary

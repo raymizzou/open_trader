@@ -29,6 +29,7 @@ from .notifications import (
     render_yes_no_signal_notification,
 )
 from .polymarket_lp import SCORING_STALE_SECONDS, queue_protection_status_view
+from .polymarket_lp_diagnostics import diagnostic_json_copy
 from .polymarket_trading import (
     LpAccountRoundInvalid,
     LegResult,
@@ -1007,6 +1008,16 @@ class PredictionExecutionService:
             if isinstance(value, Mapping): return {str(k): json_value(v) for k, v in value.items()}
             if isinstance(value, (tuple, list)): return [json_value(v) for v in value]
             return value
+        def diagnostic_view(name, read):
+            try:
+                value = diagnostic_json_copy(read())
+                if not isinstance(value, dict) and not (name == 'rotation' and value is None):
+                    raise TypeError('diagnostic_shape')
+                return value
+            except Exception:
+                logger.exception('prediction_lp_diagnostics_failed component=%s', name)
+                return dict(available=False, error='diagnostics_unavailable',
+                    **{'selection_state' if name == 'rotation' else 'state': 'UNKNOWN'})
         with live.state._lock:
             status = live.control.status()
             snapshot = live.state.snapshot()
@@ -1028,8 +1039,8 @@ class PredictionExecutionService:
                 settings_pending=settings['pending'], settings_native_inflight=settings['native_inflight'],
                 settings_error=settings['error'], effective_round_interval_seconds=None,
                 check_interval_seconds=None, cycle_mode='continuous')
-            result['diagnostics'] = json_value(live.diagnostics())
-            result['diagnostics']['rotation'] = live.rotation_diagnostics()
+            result['diagnostics'] = diagnostic_view('iteration', live.diagnostics)
+            result['diagnostics']['rotation'] = diagnostic_view('rotation', live.rotation_diagnostics)
             for name, fact in (('buy_reserved_usd', snapshot.buy_reserved),
                     ('inventory_cost_usd', snapshot.inventory_cost), ('current_exposure_usd', snapshot.current_exposure),
                     ('new_capacity_usd', snapshot.new_capacity)):

@@ -3,6 +3,10 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-19
+
+- LP rotation diagnostics serialize date/time values as ISO strings. Unavailable diagnostics return an UNKNOWN marker without breaking automatic status or dashboard responses. State-read and monitor failures are logged and retried after the API retry interval; unreadable state cannot start a new execution cycle. Offline regressions cover SDK expiration values, HTTP isolation and scheduler recovery while preserving trading and risk guards.
+
 ## 2026-10-18
 
 - D2 diagnostics now count completed protective SELLs and exit cancellations with their original request and observation identity. Selected and retained target counts use the accepted selection and typed order identities. Offline regressions preserve UNKNOWN outcomes, native completion, no replay and unchanged trading rules.

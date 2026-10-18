@@ -1,7 +1,28 @@
 """Bounded value-only D2 observations. These values grant no trading authority."""
 from collections.abc import Mapping
-from datetime import datetime
+from dataclasses import fields, is_dataclass
+from datetime import date, datetime
+from decimal import Decimal
+from enum import Enum
+import json
 from .polymarket_lp_market_reader import CURRENT_ORDER_STATES, SourceResult, freeze
+
+
+def diagnostic_json_copy(value):
+    """Detach diagnostic values and reject unsupported data at this boundary."""
+    def encode(item):
+        if isinstance(item, (datetime, date)):
+            return item.isoformat()
+        if isinstance(item, Decimal):
+            return str(item)
+        if isinstance(item, Enum):
+            return item.value
+        if is_dataclass(item) and not isinstance(item, type):
+            return {f.name: getattr(item, f.name) for f in fields(item)}
+        if isinstance(item, Mapping):
+            return dict(item)
+        raise TypeError(type(item).__name__)
+    return json.loads(json.dumps(value, default=encode, allow_nan=False))
 
 
 _REASONS = frozenset({'producer_fence_changed', 'producer_fence_unknown',
