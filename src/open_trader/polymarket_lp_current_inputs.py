@@ -47,6 +47,13 @@ def _prepare_qualified(frame, capture, policy, as_of):
     from .polymarket_lp_views import lp_history_eligibility, _next_review_at
     from .polymarket_lp import expiration_for_review
     account = _current_account(frame, as_of)
+    # Qualification considers a possible final composition. The calculator
+    # reserves its retained orders, and the sender separately requires actual
+    # free funds. Keep all order facts for participation/depth gates here.
+    selection_account = ({**account.value,
+        'balance': account.value['balance'] + frame.buy_reserved,
+        'allowance': account.value['allowance'] + frame.buy_reserved}
+        if account.complete else None)
     rows, sources, eligibility = [], {}, {}
     for cid, source in capture.rows.items():
         if not source.complete or source.error:
@@ -71,7 +78,7 @@ def _prepare_qualified(frame, capture, policy, as_of):
                 reason = lp_history_eligibility(direction.get('history_summary'), now=as_of,
                     condition_id=cid, token_id=token)
             evaluated = (dict(state='unknown', reason_codes=(reason,), guidance=None) if reason else
-                evaluate_lp_entry(direction, account=account.value, now=as_of, reservations=(),
+                evaluate_lp_entry(direction, account=selection_account, now=as_of, reservations=(),
                     candidate=True, bid_level=policy.buy_price_level))
             eligibility[key] = evaluated
             guide = evaluated.get('guidance')

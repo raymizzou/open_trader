@@ -316,7 +316,8 @@ def test_d2_diagnostics_are_bounded_redacted_and_read_only(tmp_path, monkeypatch
             assert live.run_once(capture).acceptance.observation is not None
             broken.setattr(live_module, 'project_diagnostics', broken_diagnostic)
             fallback = execution.lp_auto_state(include_intents=False)
-            assert fallback['diagnostics'] == dict(version=1, available=False)
+            assert fallback['diagnostics'] == dict(version=1, available=False,
+                rotation=live.rotation_diagnostics())
             assert fallback['desired_running'] is True
 
         def broken_clock(): raise RuntimeError(sentinel)
@@ -703,6 +704,49 @@ def test_mixed_case_wallet_adapter_reaches_startup_round(tmp_path, monkeypatch, 
         assert scheduler.run_due()
         assert sdk.cancels == ([('startup-current-buy',)] if current_buy else [])
         assert sdk.posts == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_funding_reconsiders_lower_choice_after_middle_choice_fails(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch,wallet='50')
+    try:
+        sdk.orders = tuple(order(k) for k in 'ABCDE')
+        pools['H'], pools['F'], pools['G'] = Decimal('20000'), Decimal('10000'), Decimal('1000')
+        qualify('H'); qualify('F',quantity='90'); qualify('G')
+        result = execution.lp_auto_scheduled_check()
+        calculation = result.acceptance.observation.calculation
+        rates = tuple(calculation.candidate_yields[ids[k][1]] for k in 'HFG')
+        assert rates[0] > rates[1] > rates[2] > calculation.yields['A']
+        expected_rates = (Decimal(337500)/808,Decimal(675000)/3799,Decimal(16875)/808)
+        assert all(abs(actual-expected) <= Decimal('1e-10')
+            for actual,expected in zip(rates,expected_rates)), rates
+        assert calculation.buy_reserved == Decimal('50') and calculation.new_capacity == Decimal('0')
+        assert result.selection.retained_order_ids == ('A','B','C')
+        assert result.selection.new_target_keys == (ids['H'],ids['G'])
+        assert len(result.selection.target_tokens) == 5
+        assert {victim.key[3] for victim in result.rotation.victims} == {'D','E'}
+        actions = {action.order_key[3]:action for action in result.rotation_outcomes}
+        assert set(actions) == {'D','E'}
+        assert sdk.posts == []
+        for key, action in actions.items():
+            assert action.order_key == (WALLET,*ids[key],key)
+            assert action.handle.identity.target.existing_order_id == key
+            assert action.handle.result(timeout=3).status.value == 'accepted'
+        wait_rotation_idle(live)
+        assert len(sdk.cancels) == 2 and {batch for batch in sdk.cancels} == {('D',),('E',)}
+        assert sdk.posts == []
+        sdk.advance(1)
+        sdk.orders = tuple(order(k) for k in 'ABC')
+        refill = execution.lp_auto_scheduled_check()
+        assert set(refill.selection.candidate_yields) == {ids[k][1] for k in 'HFG'}
+        assert refill.selection.retained_order_ids == ('A','B','C')
+        assert refill.selection.new_target_keys == (ids['H'],ids['G'])
+        assert len(sdk.posts) == 2 and {post['token_id'] for post in sdk.posts} == {ids[k][1] for k in 'HG'}
+        assert len(refill.outcomes) == 2 and all(outcome.status.value == 'accepted' for outcome in refill.outcomes)
+        assert len(sdk.cancels) == 2 and {batch for batch in sdk.cancels} == {('D',),('E',)}
+        assert refill.rotation.victims == ()
     finally:
         assert live.close(timeout=3)
         live.trading.close()
@@ -1805,5 +1849,866 @@ def test_d2_deferred_target_partial_fill_uses_fresh_attempt_revision(tmp_path, m
         for event in releases.values(): event.set()
         if worker: worker.join(3)
         for handle in (*handles.values(), *old_attempts): handle._thread.join(3)
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def rotation_runtime(tmp_path, monkeypatch, *, budget='100', target=5, wallet='100', startup=True, lower_depth=True):
+    """Offline SDK facts with symmetric own depth; no calculator/state stubs."""
+    from types import SimpleNamespace
+    from tests.test_lp_order_registration_contract import _open_order
+    from polymarket.models.clob.order_book import OrderBook, OrderBookLevel
+    now = datetime(2026, 10, 17, 1, tzinfo=UTC)
+    business_time = [0.]
+    source_time = threading.local()
+    class ClockMeta(type):
+        def __instancecheck__(cls, value): return isinstance(value, datetime)
+    class FixedDateTime(datetime, metaclass=ClockMeta):
+        @classmethod
+        def now(cls, tz=None):
+            value = getattr(source_time,'value',now)
+            return value if tz is not None else value.replace(tzinfo=None)
+    monkeypatch.setattr(polymarket_lp_market_reader, 'datetime', FixedDateTime)
+    monkeypatch.setattr(polymarket_trading, 'datetime', FixedDateTime)
+    ids = {letter: ('0x'+format(i, '064x'), '0x'+format(i+100, '064x'))
+        for i, letter in enumerate('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 1)}
+    pools = {letter: Decimal(100-i) for i, letter in enumerate(ids)}
+    pools['F'] = Decimal('1')
+    base = _SDKPublicClient(now).get_market(id='market-1')
+    class Public:
+        def list_markets(self, *, condition_ids, **kw):
+            markets = [base.model_copy(update=dict(id='market-'+letter, condition_id=cid,
+                outcomes=base.outcomes.model_copy(update=dict(yes=base.outcomes.yes.model_copy(
+                    update=dict(token_id=token))))))
+                for letter, (cid, token) in ids.items() if cid in condition_ids]
+            return list({m.condition_id:m for m in reversed(markets)}.values())
+        def list_market_rewards(self, *, condition_id, sponsored):
+            letter = next(k for k, pair in ids.items() if pair[0] == condition_id)
+            return [dict(condition_id=condition_id, rewards_config=[dict(
+                asset_address='0x2791bca1f2de4661ed88a30c99a7a9449aa84174', rate_per_day=str(pools[letter]), start_date='2026-01-01', end_date='2027-01-01')])]
+        def get_order_books(self, *, token_ids):
+            return tuple(self.get_order_book(token_id=t) for t in token_ids)
+        def get_order_book(self, *, token_id):
+            cid = next(pair[0] for pair in ids.values() if pair[1] == token_id)
+            own = sum((o.original_size-o.size_matched for o in sdk.orders
+                if o.token_id == token_id and o.side == 'BUY'), Decimal(0))
+            return OrderBook(market=cid, asset_id=token_id, timestamp=now,
+                bids=(OrderBookLevel(price=Decimal('.50'),size=Decimal('100')+own),
+                    *( (OrderBookLevel(price=Decimal('.49'),size=Decimal('100')),) if lower_depth else () )),
+                asks=(OrderBookLevel(price=Decimal('.52'),size=Decimal('100')),),
+                min_order_size=Decimal('20'),tick_size=Decimal('.01'),neg_risk=False,hash='rotation-book')
+    adapter, sdk = _adapter(tmp_path, public_client=Public())
+    def advance(seconds):
+        nonlocal now
+        now += timedelta(seconds=seconds)
+        business_time[0] += seconds
+    sdk.advance = advance
+    sdk.position_timestamp = None
+    read_positions = sdk.list_positions
+    def positions_with_source_time(**kw):
+        rows = read_positions(**kw)
+        if sdk.position_timestamp is not None: source_time.value = sdk.position_timestamp
+        return rows
+    sdk.list_positions = positions_with_source_time
+    sdk.get_balance_allowance = lambda **kw: SimpleNamespace(balance=str(Decimal(wallet)*1000000),
+        allowances={sdk.environment.standard_exchange:str(Decimal(wallet)*1000000)})
+    sdk.create_limit_order = lambda **kw: dict(kw, order_type='GTD')
+    def post(signed):
+        sdk.posts.append(signed)
+        return dict(order_id='O'+str(len(sdk.posts)),status='LIVE',accepted=True,taking_amount='0')
+    sdk.post_order = post
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_save_preparation(dict(generation=1,global_recovery_generation=7))
+    seed_running(store)
+    account = hashlib.sha256(WALLET.encode()).hexdigest()
+    store.lp_save_current_settings(account,expected_config_version=0,
+        changes=dict(target_buy_count=target,buy_price_level=1,**({} if budget is None else dict(budget_usd=budget))))
+    live = LPD2LiveExecution(store,adapter,account_id=WALLET,venue='polymarket',
+        process_epoch='rotation',policy=CalculationPolicy(None),utc_now=lambda:now,
+        clock=lambda:business_time[0],reader=polymarket_lp_market_reader.MarketReader(adapter.lp_reader_source_port()))
+    live.load_settings(); live.initialize(ValidatedStartAdmission('rotation','offline-permit'))
+    producer = PolymarketLPService(store,adapter,clock=lambda:now)
+    execution = attach(live,producer,tmp_path)
+    if startup:
+        execution.lp_auto_scheduled_check()  # real empty startup cleanup
+        assert live.rounds.snapshot().round_number == 1 and sdk.cancels == []
+    def order(letter, order_id=None, *, original='20', matched='0', price='.50'):
+        cid, token = ids[letter]
+        return _open_order(order_id or letter,'BUY',price=price,original=original,matched=matched,
+            token_id=token).model_copy(update=dict(market=cid,condition_id=cid))
+    def qualify(letter, *, quantity='20', history_complete=True):
+        cid, token = ids[letter]
+        direction = _direction(reward_min_size=quantity,minimum_order_size=quantity)
+        direction['market'].update(condition_id=cid,token_id=token,market_id='market-'+letter,
+            metadata_checked_at=now,fees_checked_at=now)
+        direction['book'].update(condition_id=cid,token_id=token,received_at=now,timestamp=now,
+            bids=[dict(price=Decimal('.50'),size=Decimal('100')),dict(price=Decimal('.49'),size=Decimal('100'))],
+            asks=[dict(price=Decimal('.52'),size=Decimal('100'))])
+        direction.update(daily_pool_usd=pools[letter],reward_checked_at=now,
+            history_summary=dict(condition_id=cid,token_id=token,state='known',checked_at=now,amplitude=Decimal('.01')))
+        if not history_complete: direction['history_summary'] = None
+        assert producer._candidate_pool_record_success(cid,dict(condition_id=cid,state='eligible'),
+            judged_at=now,facts=dict(checked_at=now,directions=[direction]),global_recovery_generation=7)
+    return live, execution, sdk, ids, pools, order, qualify
+
+
+@pytest.mark.parametrize('case', ['distinct-markets', 'same-token-ids', 'same-market-opposite-tokens', 'same-market-opposite-token-tie'])
+def test_d2_current_target_counts_existing_manual_and_partial_buys(tmp_path, monkeypatch, case):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch)
+    try:
+        sdk.orders = tuple(order(k,original='30' if k=='A' else '20',matched='10' if k=='A' else '0')
+            for k in 'ABCDE')
+        if case == 'same-token-ids':
+            sdk.orders = (order('A','A1'),order('A','A2'),order('B'),order('C'),order('D'))
+        if case == 'same-market-opposite-tokens':
+            ids['Z'] = (ids['A'][0],ids['Z'][1])
+            sdk.orders = (order('A','A-YES'),order('Z','A-NO',price='.49'),order('B'),order('C'),order('D'))
+        if case == 'same-market-opposite-token-tie':
+            ids['Z'] = (ids['A'][0],ids['Z'][1])
+            sdk.orders = (order('A','z-order'),order('Z','a-order'),order('B'),order('C'),order('D'))
+        sdk.positions = (dict(user=WALLET,condition_id=ids['A'][0],token_id=ids['A'][1],
+            size='10',average_price='.50',redeemable=False),)
+        qualify('F')
+        result = execution.lp_auto_scheduled_check()
+        current = live.state.snapshot()
+        assert current.buy_reserved.value == (Decimal('49.8') if case=='same-market-opposite-tokens' else Decimal('50'))
+        assert current.inventory_cost.value == Decimal('5')
+        assert set(current.observation.calculation.yields) == (set('ABCDE') if case=='distinct-markets' else {'A1','A2','B','C','D'} if case=='same-token-ids' else {'A-YES','A-NO','B','C','D'} if case=='same-market-opposite-tokens' else {'a-order','z-order','B','C','D'})
+        assert all(v is not None for v in current.observation.calculation.yields.values()), current.observation.source_frame.sources
+        assert ids['F'][1] in current.observation.calculation.candidate_yields
+        if case == 'distinct-markets':
+            assert set(current.observation.calculation.target_tokens) == set('ABCDE')
+            assert sdk.posts == [] and sdk.cancels == []
+        elif case == 'same-token-ids':
+            assert current.observation.calculation.yields['A1'] == current.observation.calculation.yields['A2']
+            assert 'A1' in current.observation.calculation.target_tokens
+            assert 'A2' not in current.observation.calculation.target_tokens
+            attempt, = result.rotation_outcomes
+            assert attempt.handle.result(timeout=3).status.value == 'accepted'
+            assert sdk.cancels == [('A2',)] and sdk.posts == []
+        elif case=='same-market-opposite-tokens':
+            assert current.observation.calculation.yields['A-YES'] > current.observation.calculation.yields['A-NO']
+            assert 'A-YES' in current.observation.calculation.target_tokens
+            assert 'A-NO' not in current.observation.calculation.target_tokens
+            attempt, = result.rotation_outcomes
+            assert attempt.handle.result(timeout=3).status.value == 'accepted'
+            assert sdk.cancels == [('A-NO',)] and sdk.posts == []
+        else:
+            assert current.observation.calculation.yields['a-order'] == current.observation.calculation.yields['z-order']
+            assert set(current.observation.calculation.target_tokens).intersection({'a-order','z-order'}) == {'a-order'}
+            attempt, = result.rotation_outcomes
+            assert attempt.handle.result(timeout=3).status.value == 'accepted'
+            assert sdk.cancels == [('z-order',)] and sdk.posts == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('case', ['five-retained', 'partial-fill', 'low-wallet-defensive', 'wallet55', 'fundable-replacement', 'unfundable-replacement'])
+def test_d2_existing_selection_counts_reserved_money_once(tmp_path, monkeypatch, case):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch, wallet='20' if case=='low-wallet-defensive' else '55' if case=='wallet55' else '50' if case in ('fundable-replacement','unfundable-replacement') else '100')
+    try:
+        sdk.orders = tuple(order(k,matched='10' if case=='partial-fill' and k=='A' else '0') for k in 'ABCDE')
+        sdk.positions = (dict(user=WALLET,condition_id=ids['Z'][0],token_id=ids['Z'][1],
+            size='40',average_price='.50',redeemable=False),)
+        if case in ('fundable-replacement','unfundable-replacement'): pools['F'] = Decimal('200')
+        qualify('F',quantity='60' if case=='unfundable-replacement' else '20')
+        result = execution.lp_auto_scheduled_check()
+        calculation = result.acceptance.observation.calculation
+        assert calculation.buy_reserved == (Decimal('45') if case=='partial-fill' else Decimal('50'))
+        assert calculation.inventory_cost == Decimal('20')
+        assert calculation.new_capacity == (Decimal('35') if case=='partial-fill' else Decimal('0') if case=='low-wallet-defensive' else Decimal('5') if case=='wallet55' else Decimal('0') if case in ('fundable-replacement','unfundable-replacement') else Decimal('30'))
+        if case=='fundable-replacement':
+            assert set(calculation.target_tokens) == {'A','B','C','D',ids['F'][1]}
+            attempt, = result.rotation_outcomes
+            assert attempt.handle.result(timeout=3).status.value == 'accepted'
+            assert sdk.cancels == [('E',)] and sdk.posts == []
+            sdk.orders = tuple(order(k) for k in 'ABCD')
+            refill = execution.lp_auto_scheduled_check()
+            assert len(sdk.posts) == 1 and sdk.posts[0]['token_id'] == ids['F'][1]
+            assert refill.outcomes[0].status.value == 'accepted'
+        else:
+            assert set(calculation.target_tokens) == set('ABCDE')
+            assert sdk.posts == [] and sdk.cancels == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('case', ['better', 'equal', 'small-improvement'])
+def test_d2_yield_replacement_cancels_exact_victim_before_refill(tmp_path, monkeypatch, case):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch)
+    entered, release = Event(), Event()
+    try:
+        sdk.orders = tuple(order(k) for k in 'ABCDE')
+        pools['F'] = pools['E'] if case=='equal' else Decimal('96.0000000001') if case=='small-improvement' else Decimal('200')
+        qualify('F')
+        cancel = sdk.cancel_orders
+        def held_cancel(*, order_ids):
+            assert order_ids == ('E',)
+            entered.set()
+            assert release.wait(5), 'external cancel watchdog'
+            return cancel(order_ids=order_ids)
+        sdk.cancel_orders = held_cancel
+        result = execution.lp_auto_scheduled_check()
+        calculation = result.acceptance.observation.calculation
+        if case=='equal':
+            assert calculation.candidate_yields[ids['F'][1]] == calculation.yields['E']
+            assert set(calculation.target_tokens) == set('ABCDE')
+            assert sdk.cancels == [] and sdk.posts == [] and result.rotation_outcomes == ()
+            return
+        assert calculation.candidate_yields[ids['F'][1]] > calculation.yields['E']
+        assert entered.wait(2)
+        assert result.finish is not None and live.rounds.snapshot().round_number == 2
+        assert sdk.posts == [] and sdk.cancels == []
+        assert set(result.acceptance.observation.calculation.target_tokens) == {'A','B','C','D',ids['F'][1]}
+        attempt, = result.rotation_outcomes
+        assert attempt.order_key == (WALLET,*ids['E'],'E')
+        release.set()
+        assert attempt.handle.result(timeout=3).status.value == 'accepted'
+        assert sdk.cancels == [('E',)] and sdk.posts == []
+        reads = sdk.order_reads
+        sdk.orders = tuple(order(k) for k in 'ABCD')
+        next_result = execution.lp_auto_scheduled_check()
+        assert sdk.order_reads == reads+1
+        assert len(sdk.posts) == 1 and sdk.posts[0]['token_id'] == ids['F'][1]
+        assert next_result.outcomes[0].status.value == 'accepted'
+    finally:
+        release.set()
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('case', ['over-target', 'over-budget'])
+def test_d2_over_target_current_buys_converge_without_selling_inventory(tmp_path, monkeypatch, case):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch,budget='60' if case=='over-budget' else '100')
+    try:
+        sdk.orders = tuple(order(k) for k in ('ABCDE' if case=='over-budget' else 'ABCDEF'))
+        sdk.positions = (dict(user=WALLET,condition_id=ids['Z'][0],token_id=ids['Z'][1],
+            size='40',average_price='.50',redeemable=False),)
+        result = execution.lp_auto_scheduled_check()
+        assert set(result.acceptance.observation.calculation.target_tokens) == set('ABCD' if case=='over-budget' else 'ABCDE')
+        attempt, = result.rotation_outcomes
+        assert attempt.handle.result(timeout=3).status.value == 'accepted'
+        assert sdk.cancels == [('E' if case=='over-budget' else 'F',)] and sdk.posts == [] and sdk.market_orders == []
+        assert result.acceptance.observation.calculation.inventory_cost == Decimal('20')
+        if case=='over-budget':
+            sdk.orders = tuple(order(k) for k in 'ABCD')
+            next_result = execution.lp_auto_scheduled_check()
+            assert next_result.acceptance.observation.calculation.new_capacity == Decimal('0')
+            assert next_result.rotation_outcomes == ()
+            assert sdk.cancels == [('E',)] and sdk.posts == [] and sdk.market_orders == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def wait_rotation_idle(live):
+    deadline = time.monotonic()+3
+    while live.status()['native_inflight'] and time.monotonic() < deadline:
+        time.sleep(.001)
+    assert live.status()['native_inflight'] == 0, 'native lifetime watchdog'
+
+
+def test_d2_unknown_incumbent_reserves_slot_until_existing_protection_deadline(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch)
+    try:
+        sdk.orders = tuple(order(k) for k in 'ABCDU')
+        pools['U'] = None
+        qualify('F')
+        first = execution.lp_auto_scheduled_check()
+        calculation = first.acceptance.observation.calculation
+        assert calculation.yields['U'] is None
+        assert set(calculation.target_tokens) == set('ABCDU')
+        assert calculation.buy_reserved == Decimal('50')
+        assert sdk.posts == [] and sdk.cancels == []
+        sdk.advance(599); qualify('F')
+        before = execution.lp_auto_scheduled_check()
+        assert before.acceptance.observation.calculation.yields['U'] is None
+        assert sdk.posts == [] and sdk.cancels == []
+        sdk.advance(1); qualify('F')
+        due = execution.lp_auto_scheduled_check()
+        wait_rotation_idle(live)
+        assert sdk.cancels == [('U',)] and sdk.posts == []
+        assert due.rotation_outcomes == ()
+        assert due.acceptance.observation.calculation.buy_reserved == Decimal('50')
+        sdk.orders = tuple(order(k) for k in 'ABCD')
+        refill = execution.lp_auto_scheduled_check()
+        assert len(sdk.posts) == 1 and sdk.posts[0]['token_id'] == ids['F'][1]
+        assert refill.outcomes[0].status.value == 'accepted'
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('case', ['rejected', 'unknown', 'changed-admission'])
+def test_d2_rotation_requires_new_current_evidence_for_new_cancel_decision(tmp_path, monkeypatch, case):
+    if case=='changed-admission':
+        return rotation_changed_admission_cases(tmp_path,monkeypatch)
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch)
+    try:
+        sdk.orders = tuple(order(k) for k in 'ABCDE')
+        pools['F'] = Decimal('200'); qualify('F')
+        def refused(*, order_ids):
+            sdk.cancels.append(order_ids)
+            if case=='unknown': raise OSError('offline uncertain cancel')
+            return dict(canceled=(),not_canceled={order_ids[0]:'venue refusal'})
+        sdk.cancel_orders = refused
+        first = execution.lp_auto_scheduled_check()
+        old, = first.rotation_outcomes
+        assert old.handle.result(timeout=3).status.value == ('unknown_error' if case=='unknown' else 'rejected')
+        wait_rotation_idle(live)
+        assert sdk.cancels == [('E',)] and sdk.posts == []
+        live.dispatch_rotation(first)
+        assert sdk.cancels == [('E',)]
+        sdk.orders = None
+        incomplete = execution.lp_auto_scheduled_check()
+        assert incomplete.rotation is None and sdk.cancels == [('E',)] and sdk.posts == []
+        sdk.orders = tuple(order(k) for k in 'ABCDE')
+        sdk.advance(1); qualify('F')
+        fresh = execution.lp_auto_scheduled_check()
+        new, = fresh.rotation_outcomes
+        assert new.handle.result(timeout=3).status.value == ('unknown_error' if case=='unknown' else 'rejected')
+        wait_rotation_idle(live)
+        assert old.handle.identity.request_id != new.handle.identity.request_id
+        assert sdk.cancels == [('E',),('E',)]
+        live.dispatch_rotation(first)
+        live.dispatch_rotation(fresh)
+        wait_rotation_idle(live)
+        assert sdk.cancels == [('E',),('E',)]
+        sdk.orders = tuple(order(k,'E2' if k=='E' else k) for k in 'ABCDE')
+        sdk.advance(1)
+        latest = live.run_once(execution._lp.capture_qualified_pool())
+        live.dispatch_rotation(fresh)
+        assert latest.acceptance.observation.observation_id != fresh.acceptance.observation.observation_id
+        assert sdk.cancels == [('E',),('E',)] and sdk.posts == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def rotation_changed_admission_cases(tmp_path, monkeypatch):
+    for window in ('admission','send'):
+        for change in ('pause','resume','terms','identity'):
+            with monkeypatch.context() as isolated:
+                path = tmp_path/(window+'-'+change); path.mkdir()
+                live, execution, sdk, ids, pools, order, qualify = rotation_runtime(path,isolated)
+                entered, release = Event(), Event()
+                results, errors = [], []
+                worker = None
+                real_connect = sqlite3.connect
+                class HeldSafety(sqlite3.Connection):
+                    def execute(self, sql, *a, **kw):
+                        cursor = super().execute(sql,*a,**kw)
+                        thread = threading.current_thread().name
+                        selected = thread == ('rotation-admission' if window=='admission' else 'lp-d2-independent-cancel')
+                        if selected and sql.startswith('SELECT * FROM executions WHERE state NOT IN') and not entered.is_set():
+                            entered.set(); assert release.wait(8), 'rotation safety watchdog'
+                        return cursor
+                def tick():
+                    try: results.append(execution.lp_auto_scheduled_check())
+                    except BaseException as exc: errors.append(exc)
+                try:
+                    sdk.orders = tuple(order(k) for k in 'ABCDE')
+                    pools['F'] = Decimal('200'); qualify('F')
+                    isolated.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=HeldSafety))))
+                    worker = threading.Thread(target=tick,name='rotation-admission')
+                    worker.start(); assert entered.wait(3)
+                    assert sdk.cancels == [] and sdk.posts == []
+                    generation = live.state.snapshot().current.cycle_generation
+                    if change in ('pause','resume'):
+                        assert live.request_running(False).status == 'accepted'; settle_control(live)
+                        if change=='resume':
+                            assert live.request_running(True).status == 'accepted'; settle_control(live)
+                            assert live.state.snapshot().current.cycle_generation != generation
+                    else:
+                        sdk.orders = tuple(order(k,'E2' if k=='E' and change=='identity' else k,
+                            original='21' if k=='E' and change=='terms' else '20') for k in 'ABCDE')
+                        sdk.advance(1)
+                        updated = live.run_once(execution._lp.capture_qualified_pool())
+                        assert updated.acceptance.observation.orders_complete
+                    release.set(); worker.join(3)
+                    assert not worker.is_alive() and errors == []
+                    result, = results
+                    for outcome in result.rotation_outcomes:
+                        if outcome.handle: assert outcome.handle.result(timeout=3).status.value == 'not_sent'
+                        else: assert outcome.status == 'not_sent'
+                    wait_rotation_idle(live)
+                    assert sdk.cancels == [] and sdk.posts == []
+                finally:
+                    release.set()
+                    if worker: worker.join(3)
+                    assert live.close(timeout=3)
+                    live.trading.close()
+
+
+def test_d2_receipt_listing_lag_preserves_agreed_current_authority(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch,target=1)
+    try:
+        qualify('A')
+        first = execution.lp_auto_scheduled_check()
+        assert len(sdk.posts) == 1 and first.outcomes[0].venue_order_id == 'O1'
+        sdk.advance(-1)
+        older = execution.lp_auto_scheduled_check()
+        assert len(sdk.posts) == 1 and sdk.cancels == []
+        sdk.orders = None
+        sdk.advance(1)
+        incomplete = execution.lp_auto_scheduled_check()
+        assert len(sdk.posts) == 1 and sdk.cancels == []
+        assert incomplete.rotation is None
+        sdk.orders = ()
+        sdk.advance(1); qualify('A')
+        lag = execution.lp_auto_scheduled_check()
+        assert len(sdk.posts) == 2 and lag.outcomes[0].venue_order_id == 'O2'
+        sdk.orders = (order('A','O1'),order('A','O2'))
+        sdk.advance(1); qualify('A')
+        convergence = execution.lp_auto_scheduled_check()
+        calculation = convergence.acceptance.observation.calculation
+        assert calculation.yields['O1'] == calculation.yields['O2'] is not None
+        assert calculation.target_tokens == ('O1',)
+        attempt, = convergence.rotation_outcomes
+        assert attempt.handle.result(timeout=3).status.value == 'accepted'
+        assert sdk.cancels == [('O2',)] and len(sdk.posts) == 2
+        assert calculation.buy_reserved == Decimal('20')
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('case', ['unknown-balance', 'incomplete-candidates', 'orders-rejected-after-cancel-ack', 'budget-none'])
+def test_d2_unknown_inputs_produce_no_rotation_decision(tmp_path, monkeypatch, case):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch,budget=None if case=='budget-none' else '100')
+    try:
+        sdk.orders = tuple(order(k) for k in 'ABCDE')
+        if case=='orders-rejected-after-cancel-ack':
+            execution.lp_auto_scheduled_check()
+            canceled = live.cancel_independent((WALLET,*ids['E'],'E'))
+            assert canceled.result(timeout=3).status.value == 'accepted'
+            wait_rotation_idle(live)
+            sdk.cancels.clear()
+            sdk.advance(1)
+        pools['F'] = Decimal('200'); qualify('F')
+        def missing(**kw): raise OSError('offline missing balance')
+        if case=='unknown-balance': sdk.get_balance_allowance = missing
+        if case=='incomplete-candidates':
+            result = live.run_once(polymarket_lp_market_reader.SourceResult('incomplete-inventory',complete=False))
+            live.run_protection_once()
+            result = live.dispatch_rotation(result)
+        else:
+            result = execution.lp_auto_scheduled_check()
+        assert sdk.cancels == [] and sdk.posts == []
+        calculation = result.selection
+        assert calculation.selection_state == 'NO_DECISION'
+        assert ('balance_unknown' if case=='unknown-balance' else 'orders_not_accepted' if case=='orders-rejected-after-cancel-ack' else 'budget_unknown' if case=='budget-none' else 'candidates_incomplete') in calculation.selection_reasons
+        assert result.rotation is None or result.rotation.victims == ()
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('case', ['pending-sell', 'unknown-due'])
+def test_d2_protection_precedes_rotation_native_slots(tmp_path, monkeypatch, case):
+    if case=='unknown-due':
+        return rotation_unknown_due_capacity(tmp_path,monkeypatch)
+    from tests.test_lp_d2_integration import _d2_filled_opening
+    from tests.test_lp_order_registration_contract import _open_order
+    live, sdk, public, clock = _d2_filled_opening(tmp_path,monkeypatch,manual_sale=False)
+    sell_entered, cancel_entered, release = Event(), Event(), Event()
+    try:
+        producer = PolymarketLPService(live.store,live.trading,clock=live._utc_now)
+        execution = attach(live,producer,tmp_path)
+        rewards = public.list_market_rewards
+        public.list_market_rewards = lambda **kw: rewards(condition_id=kw['condition_id'],sponsored=False)
+        execution.lp_auto_scheduled_check()  # real own-fill evidence receipt
+        sdk.orders += tuple(_open_order(oid,'BUY',price='.30',original='20') for oid in ('B','C','D'))
+        post, cancel = sdk.post_order, sdk.cancel_orders
+        def held_post(signed):
+            assert signed['side'] == 'SELL'
+            sell_entered.set(); assert release.wait(5), 'protective SELL watchdog'
+            return post(signed)
+        def held_cancel(*, order_ids):
+            assert order_ids[0] in {'C','D'}
+            cancel_entered.set(); assert release.wait(5), 'rotation native watchdog'
+            return cancel(order_ids=order_ids)
+        sdk.post_order, sdk.cancel_orders = held_post, held_cancel
+        clock[0] += 1
+        result = execution.lp_auto_scheduled_check()
+        assert sell_entered.wait(2) and cancel_entered.wait(2)
+        assert live.status()['native_inflight'] == 2
+        assert {o.order_key[3] for o in result.rotation_outcomes} == {'C','D'}
+        pending = [o for o in result.rotation_outcomes if o.handle]
+        refused = [o for o in result.rotation_outcomes if not o.handle]
+        assert len(pending) == len(refused) == 1
+        assert refused[0].status == 'not_sent' and refused[0].reason == 'native_capacity'
+        assert sdk.posts == [sdk.posts[0]] and sdk.cancels == []
+        release.set()
+        assert pending[0].handle.result(timeout=3).status.value == 'accepted'
+        wait_rotation_idle(live)
+        assert len(sdk.posts) == 2 and sdk.posts[-1]['side'] == 'SELL'
+        assert len(sdk.cancels) == 1
+    finally:
+        release.set()
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def rotation_unknown_due_capacity(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch)
+    entered = {key:Event() for key in ('protection','rotation')}
+    release = Event()
+    try:
+        pools['U'] = None
+        sdk.orders = tuple(order(k) for k in 'ABCDU')
+        execution.lp_auto_scheduled_check()
+        sdk.orders = tuple(order(k) for k in 'ABCDEFU')
+        sdk.advance(600)
+        cancel = sdk.cancel_orders
+        def held(*,order_ids):
+            entered['protection' if order_ids==('U',) else 'rotation'].set()
+            assert release.wait(5), 'protection-first native watchdog'
+            return cancel(order_ids=order_ids)
+        sdk.cancel_orders = held
+        result = execution.lp_auto_scheduled_check()
+        assert entered['protection'].wait(2) and entered['rotation'].wait(2)
+        assert live.status()['native_inflight'] == 2
+        assert {o.order_key[3] for o in result.rotation_outcomes} == {'E','F'}
+        assert sum(o.handle is not None for o in result.rotation_outcomes) == 1
+        refusal, = (o for o in result.rotation_outcomes if o.handle is None)
+        assert refusal.reason == 'native_capacity' and refusal.status == 'not_sent'
+        assert sdk.cancels == [] and sdk.posts == []
+        release.set(); wait_rotation_idle(live)
+        assert ('U',) in sdk.cancels and len(sdk.cancels) == 2 and sdk.posts == []
+    finally:
+        release.set()
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_rotation_refusal_does_not_skip_protection(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch)
+    try:
+        pools['U'] = None
+        sdk.orders = tuple(order(k) for k in 'ABCDU')
+        execution.lp_auto_scheduled_check()
+        old_progress = next(p for k,p in live.state.snapshot().progress.items() if k.scope[1:3]==ids['U'])
+        sdk.advance(600)
+        sdk.orders = tuple(order(k) for k in 'ABCDEU')
+        execution._breaker_open = True  # existing external incident admission fixture
+        refused = execution.lp_auto_scheduled_check()
+        outcome, = refused.rotation_outcomes
+        assert outcome.order_key == (WALLET,*ids['E'],'E')
+        assert outcome.status == 'not_sent' and outcome.reason == 'mutation_not_admitted'
+        assert outcome.handle is None and live.status()['native_inflight'] == 0
+        snapshot = live.state.snapshot()
+        assert (WALLET,*ids['U'],'U') in snapshot.unknown_yield_due
+        progress = next(p for k,p in snapshot.progress.items() if k.scope[1:3]==ids['U'])
+        assert progress.scope_version > old_progress.scope_version and progress.cancel_targets == ()
+        assert sdk.cancels == [] and sdk.posts == []
+        execution._breaker_open = False
+        sdk.advance(1)
+        resumed = execution.lp_auto_scheduled_check()
+        for action in resumed.rotation_outcomes:
+            if action.handle: action.handle.result(timeout=3)
+        wait_rotation_idle(live)
+        assert {ids[0] for ids in sdk.cancels} == {'U','E'} and sdk.posts == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('case', ['paused', 'round-zero', 'busy', 'blocked'])
+def test_d2_rotation_dispatch_requires_normal_buy_batch(tmp_path, monkeypatch, case):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch,startup=case!='round-zero')
+    try:
+        busy = None
+        if case=='busy':
+            from open_trader.polymarket_lp_live_execution import _Orders
+            from open_trader.polymarket_lp_round import FixedBuyPlan
+            observed = live.run_once(execution._lp.capture_qualified_pool()).acceptance.observation
+            orders = _Orders(WALLET,observed.cycle_generation,observed.observation_id,True,True,True,None,())
+            fixed = FixedBuyPlan(WALLET,observed.cycle_generation,observed.observation_id,'held-empty',())
+            busy = live.rounds.begin_round(live._control_view(),orders,fixed_buys=fixed)
+            assert busy.status.value == 'batch'
+        sdk.orders = tuple(order(k) for k in 'ABCDE')
+        if case=='blocked':
+            sdk.orders = (*sdk.orders[:-1],order('E',matched='21'))
+        pools['F'] = Decimal('200'); qualify('F')
+        if case=='paused':
+            assert live.request_running(False).status == 'accepted'; settle_control(live)
+        result = execution.lp_auto_scheduled_check()
+        if case=='paused':
+            assert result.start.status.value == 'observe_only'
+        elif case in ('busy','blocked'):
+            assert result.start.status.value == case
+        else:
+            assert result.start.token.kind.value == 'STARTUP_CANCEL'
+            assert {a.target.existing_order_id for a in result.start.token.actions} == set('ABCDE')
+            assert sorted(sdk.cancels) == [(k,) for k in 'ABCDE']
+            assert live.rounds.snapshot().round_number == 1
+        assert result.rotation is None and result.rotation_outcomes == ()
+        assert sdk.posts == []
+        if case in ('paused','busy','blocked'): assert sdk.cancels == []
+        else:
+            execution.lp_auto_scheduled_check()
+            assert sorted(sdk.cancels) == [(k,) for k in 'ABCDE']
+        if case=='blocked':
+            sdk.orders = tuple(order(k) for k in 'ABCDE')
+            absent_plan = live.run_once()
+            assert absent_plan.start.status.value == 'needs_fixed_plan'
+            assert absent_plan.rotation is None and sdk.cancels == [] and sdk.posts == []
+    finally:
+        if case=='busy' and busy is not None:
+            assert live.complete_local_attempts(busy.token,()).status.value == 'completed'
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_rotation_is_stable_after_refill_on_unchanged_books(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch)
+    try:
+        sdk.orders = tuple(order(k) for k in 'ABCDE')
+        pools['F'] = Decimal('96.0000000001'); qualify('F')
+        selected = execution.lp_auto_scheduled_check()
+        before = selected.acceptance.observation.calculation
+        assert before.candidate_yields[ids['F'][1]] > before.yields['E']
+        action, = selected.rotation_outcomes
+        assert action.handle.result(timeout=3).status.value == 'accepted'
+        wait_rotation_idle(live)
+        sdk.advance(1)
+        sdk.orders = tuple(order(k) for k in 'ABCD'); qualify('F')
+        refill = execution.lp_auto_scheduled_check()
+        assert len(sdk.posts) == 1 and refill.outcomes[0].venue_order_id == 'O1'
+        sdk.orders += (order('F','O1'),)
+        sdk.advance(1); qualify('E'); qualify('F')
+        stable = execution.lp_auto_scheduled_check()
+        after = stable.acceptance.observation.calculation
+        assert after.yields['O1'] == before.candidate_yields[ids['F'][1]]
+        assert after.candidate_yields[ids['E'][1]] == before.yields['E']
+        assert set(after.target_tokens) == {'A','B','C','D','O1'}
+        assert stable.rotation_outcomes == () and stable.outcomes == ()
+        assert sdk.cancels == [('E',)] and len(sdk.posts) == 1
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('case', ['participating', 'history-incomplete'])
+def test_d2_incumbent_new_entry_gate_does_not_evict_current_buy(tmp_path, monkeypatch, case):
+    from open_trader.polymarket_lp_current_inputs import prepare_current_inputs
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch)
+    try:
+        sdk.orders = tuple(order(k) for k in 'ABCDE')
+        qualify('A',history_complete=case!='history-incomplete'); qualify('F')
+        result = execution.lp_auto_scheduled_check()
+        calculation = result.acceptance.observation.calculation
+        prepared = prepare_current_inputs(result.acceptance.observation.source_frame,
+            execution._lp.capture_qualified_pool(),live.policy,live._utc_now())
+        gate = prepared.sources['candidate_eligibility'].value[':'.join(ids['A'])]
+        if case=='participating':
+            assert gate['state'] == 'rejected' and 'market_already_participating' in gate['reason_codes']
+        else:
+            assert gate['state'] == 'unknown' and gate['reason_codes']
+        assert all(value is not None for value in calculation.yields.values())
+        assert set(calculation.target_tokens) == set('ABCDE')
+        assert result.rotation_outcomes == () and sdk.cancels == [] and sdk.posts == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_source_result_incumbent_reuses_current_order_yield(tmp_path, monkeypatch):
+    from open_trader.polymarket_lp_market_reader import SourceResult
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch,lower_depth=False)
+    try:
+        sdk.orders = tuple(order(k) for k in 'ABCDE')
+        def captured_row(letter,quantity,pool,bid_size,**extra):
+            cid,token = ids[letter]
+            return dict(account_id=WALLET,venue='polymarket',condition_id=cid,token_id=token,
+                market_id='market-'+letter,price=Decimal('.50'),quantity=Decimal(quantity),
+                order_type='GTD',expiration=1792281660,post_only=True,send_options=(),
+                direction=dict(market=dict(reward_min_size=Decimal('1'),reward_max_spread=Decimal('.10')),
+                    book=dict(bids=[dict(price=Decimal('.50'),size=Decimal(bid_size))],
+                        asks=[dict(price=Decimal('.52'),size=Decimal('100'))]),daily_pool_usd=Decimal(pool)),**extra)
+        captured = SourceResult('separate-candidate-facts',(
+            captured_row('A','140','100000','240',existing=True,order_id='A'),
+            captured_row('F','20','1','100')),checked_at=live._utc_now())
+        result = live.run_once(captured_candidates=captured)
+        live.run_protection_once()
+        result = live.dispatch_rotation(result)
+        calculation = result.acceptance.observation.calculation
+        assert calculation.buy_reserved == Decimal('50') and calculation.new_capacity == Decimal('50')
+        assert set(calculation.yields) == set('ABCDE')
+        assert calculation.yields['A'].quantize(Decimal('.000000000001')) == Decimal('2.604166666667')
+        assert set(calculation.target_tokens) == set('ABCDE') and len(calculation.target_tokens) == 5
+        assert set(calculation.candidate_yields) == {ids['F'][1]}
+        assert live.state.snapshot().yields[(WALLET,*ids['A'],'A')].yield_pct_per_hour.value == calculation.yields['A']
+        assert result.rotation.victims == () and result.rotation_outcomes == ()
+        assert sdk.posts == [] and sdk.cancels == []
+        assert captured.value[0]['quantity'] == Decimal('140')
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_rotation_diagnostics_are_bounded_and_read_only(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch,budget='1000')
+    release, entered = Event(), Event()
+    calls, calls_lock = [], threading.Lock()
+    try:
+        sdk.orders = tuple(order(k) for k in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+        def held(*,order_ids):
+            with calls_lock:
+                calls.append(order_ids)
+                if len(calls)==2: entered.set()
+            assert release.wait(5), 'diagnostic native watchdog'
+            return dict(canceled=(),not_canceled={order_ids[0]:'ERROR_SENTINEL_TOKEN_secret'})
+        sdk.cancel_orders = held
+        result = execution.lp_auto_scheduled_check()
+        assert entered.wait(2)
+        assert len(result.rotation.victims) == 21
+        payload = execution.lp_auto_state(include_intents=False)
+        rotation = payload['diagnostics']['rotation']
+        assert rotation['selection_state'] == 'DECISION'
+        assert rotation['identity']['observation_id'] == result.acceptance.observation.observation_id
+        assert rotation['incumbent_yields']['total'] == 26
+        assert len(rotation['incumbent_yields']['samples']) == 20
+        assert rotation['incumbent_yields']['omitted'] == 6
+        assert all(row['kind']=='incumbent' and row['state']=='known' for row in rotation['incumbent_yields']['samples'])
+        assert rotation['victims']['total'] == 21 and rotation['victims']['omitted'] == 1
+        assert len(rotation['victims']['samples']) == 20
+        assert all(row['terms_version'] for row in rotation['victims']['samples'])
+        outcomes = rotation['outcomes']
+        assert outcomes['total'] == 21 and len(outcomes['samples']) == 20 and outcomes['omitted'] == 1
+        assert outcomes['counts'] == {'pending':2,'not_sent':19}
+        assert outcomes['reason_counts'] == {'native_capacity':19}
+        assert len(outcomes['reason_counts']) <= 21
+        assert 'ERROR_SENTINEL' not in json.dumps(payload)
+        before = (sdk.balance_reads,sdk.order_reads,sdk.position_reads,len(sdk.posts),tuple(calls))
+        with monkeypatch.context() as no_io:
+            def forbidden(*a,**kw): pytest.fail('rotation GET attempted I/O or wake')
+            no_io.setattr(sqlite3,'connect',forbidden)
+            for name in ('get_balance_allowance','list_open_orders','list_positions','post_order','cancel_orders'):
+                no_io.setattr(sdk,name,forbidden)
+            no_io.setattr(execution,'_lp_d2_wake',forbidden)
+            assert execution.lp_auto_state(include_intents=False) == payload
+            assert execution.lp_auto_state(include_intents=False) == payload
+        assert (sdk.balance_reads,sdk.order_reads,sdk.position_reads,len(sdk.posts),tuple(calls)) == before
+        release.set()
+        for action in result.rotation_outcomes:
+            if action.handle: assert action.handle.result(timeout=3).status.value == 'rejected'
+        wait_rotation_idle(live)
+        current = execution.lp_auto_state(include_intents=False)['diagnostics']['rotation']
+        assert current['outcomes']['counts'] == {'rejected':2,'not_sent':19}
+        assert 'ERROR_SENTINEL' not in json.dumps(current)
+        assert payload['effective_settings']['target_buy_count'] == 5
+        assert payload['effective_running'] is True
+    finally:
+        release.set()
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_count_reduction_does_not_use_rejected_financial_replacement(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch)
+    try:
+        sdk.orders = tuple(order(k,'F-current' if k=='F' else k) for k in 'ABCDEF')
+        # First establish real accepted source watermarks without dispatching rotation.
+        initial = live.run_once(execution._lp.capture_qualified_pool())
+        live.run_protection_once()
+        assert initial.acceptance.observation.positions_complete
+        prior_position_time = initial.acceptance.observation.source_frame.sources['positions'].checked_at
+        sdk.advance(2)
+        sdk.position_timestamp = prior_position_time-timedelta(seconds=1)
+        pools['G'] = Decimal('200'); qualify('G')
+        result = execution.lp_auto_scheduled_check()
+        observation = result.acceptance.observation
+        raw = observation.calculation
+        assert ids['G'][1] in raw.target_tokens
+        assert raw.candidate_yields[ids['G'][1]] > max(raw.yields.values())
+        assert raw.new_capacity == Decimal('40')
+        assert observation.orders_complete and not observation.positions_complete
+        snapshot = live.state.snapshot()
+        assert snapshot.inventory_cost.state == snapshot.new_capacity.state == 'unknown'
+        assert snapshot.buy_reserved.value == Decimal('60')
+        assert set(result.selection.target_tokens) == set('ABCDE')
+        assert 'financial_authority_unknown' in result.selection.selection_reasons
+        assert result.selection.decision_states['replacement'] == 'NO_DECISION'
+        assert result.selection.decision_states['over_target'] == 'DECISION'
+        assert {victim.key[3] for victim in result.rotation.victims} == {'F-current'}
+        action, = result.rotation_outcomes
+        assert action.handle.result(timeout=3).status.value == 'accepted'
+        wait_rotation_idle(live)
+        assert sdk.cancels == [('F-current',)] and sdk.posts == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_fixed_plan_distinguishes_order_ids_from_candidate_tokens(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch)
+    try:
+        sdk.orders = tuple(order(k,ids['G'][1] if k=='A' else k) for k in 'ABCD')
+        pools['H'],pools['G'] = Decimal('50'),Decimal('1')
+        qualify('H'); qualify('G')
+        result = execution.lp_auto_scheduled_check()
+        calculation = result.acceptance.observation.calculation
+        assert calculation.buy_reserved == Decimal('40') and calculation.new_capacity == Decimal('60')
+        assert set(calculation.candidate_yields) == {ids['H'][1],ids['G'][1]}
+        assert set(calculation.target_tokens) == {ids['G'][1],'B','C','D',ids['H'][1]}
+        assert len(sdk.posts) == 1 and sdk.posts[0]['token_id'] == ids['H'][1]
+        assert result.outcomes[0].identity.target.token_id == ids['H'][1]
+        assert result.outcomes[0].identity.target.market_id == 'market-H'
+        assert result.outcomes[0].status.value == 'accepted'
+        assert result.rotation.victims == () and sdk.cancels == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_d2_funding_reconsiders_affordable_candidate_after_expensive_choice_fails(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch,wallet='50')
+    entered, release = Event(), Event()
+    try:
+        sdk.orders = tuple(order(k) for k in 'ABCDE')
+        pools['F'], pools['G'] = Decimal('10000'), Decimal('1000')
+        qualify('F',quantity='90'); qualify('G')
+        cancel = sdk.cancel_orders
+        def held_cancel(*,order_ids):
+            assert order_ids == ('E',)
+            entered.set(); assert release.wait(5), 'funding fallback native watchdog'
+            return cancel(order_ids=order_ids)
+        sdk.cancel_orders = held_cancel
+        result = execution.lp_auto_scheduled_check()
+        calculation = result.acceptance.observation.calculation
+        rates = (calculation.candidate_yields[ids['F'][1]],
+            calculation.candidate_yields[ids['G'][1]],calculation.yields['A'])
+        assert rates[0] > rates[1] > rates[2]
+        expected_rates = (Decimal(675000)/3799,Decimal(16875)/808,Decimal(3375)/1616)
+        assert all(abs(actual-expected) <= Decimal('1e-10')
+            for actual,expected in zip(rates,expected_rates)), rates
+        assert calculation.buy_reserved == Decimal('50') and calculation.new_capacity == Decimal('0')
+        assert result.selection.retained_order_ids == ('A','B','C','D')
+        assert result.selection.new_target_keys == (ids['G'],)
+        assert len(result.selection.target_tokens) == 5
+        assert {victim.key[3] for victim in result.rotation.victims} == {'E'}
+        assert entered.wait(2)
+        action, = result.rotation_outcomes
+        assert action.order_key == (WALLET,*ids['E'],'E')
+        assert action.handle.identity.target.existing_order_id == 'E'
+        assert sdk.posts == [] and sdk.cancels == []
+        release.set()
+        assert action.handle.result(timeout=3).status.value == 'accepted'
+        wait_rotation_idle(live)
+        assert sdk.cancels == [('E',)] and sdk.posts == []
+        sdk.advance(1)
+        sdk.orders = tuple(order(k) for k in 'ABCD')
+        refill = execution.lp_auto_scheduled_check()
+        assert set(refill.selection.candidate_yields) == {ids['F'][1],ids['G'][1]}
+        assert refill.selection.new_target_keys == (ids['G'],)
+        assert [post['token_id'] for post in sdk.posts] == [ids['G'][1]]
+        assert refill.outcomes[0].status.value == 'accepted'
+        assert sdk.cancels == [('E',)] and refill.rotation.victims == ()
+    finally:
+        release.set()
         assert live.close(timeout=3)
         live.trading.close()

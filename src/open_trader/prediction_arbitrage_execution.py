@@ -1029,6 +1029,7 @@ class PredictionExecutionService:
                 settings_error=settings['error'], effective_round_interval_seconds=None,
                 check_interval_seconds=None, cycle_mode='continuous')
             result['diagnostics'] = json_value(live.diagnostics())
+            result['diagnostics']['rotation'] = live.rotation_diagnostics()
             for name, fact in (('buy_reserved_usd', snapshot.buy_reserved),
                     ('inventory_cost_usd', snapshot.inventory_cost), ('current_exposure_usd', snapshot.current_exposure),
                     ('new_capacity_usd', snapshot.new_capacity)):
@@ -1133,7 +1134,7 @@ class PredictionExecutionService:
                 raise
             result = self._lp_d2.run_once(capture, attempted_at=attempted_at)
             self._lp_d2.run_protection_once()
-            return result
+            return self._lp_d2.dispatch_rotation(result)
         return self._lp_auto_pool().run_once(reuse_facts=True)
 
     def lp_auto_run_once(self, *, round_id=None):
