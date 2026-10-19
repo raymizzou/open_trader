@@ -29,6 +29,8 @@ from .a_share_trend import (
 )
 from .a_share_trend_watch import (
     AShareWatchResult,
+    _protection_detail,
+    _protection_exception_reason,
     cn_session,
     watch_a_share_protection,
 )
@@ -1638,16 +1640,20 @@ def _run_protection_pass(
         return simulated_result
 
     real_events_path = paths.root / "real_watch_events.jsonl"
+    step = "fetch_account_snapshot"
     try:
         account_snapshot = fetch_account_snapshot()
+        step = "load_real_holding_input"
         real_account = load_real_holding_input(
             account_snapshot,
             market,
             state_path=paths.real_state,
         )
-    except Exception:
+    except Exception as exc:
         return _combine_protection_results(
-            (simulated_result, _abnormal_protection_result(real_events_path)),
+            (simulated_result, _abnormal_protection_result(
+                real_events_path, reasons=(_protection_exception_reason(step, exc),),
+            )),
             events_path=paths.events,
         )
     account_sources = account_snapshot.get("sources")
@@ -1684,8 +1690,9 @@ def _run_protection_pass(
         and real_source.get("source_kind") in {"live", "live_account"}
         and not getattr(real_account, "blocked_instrument_ids", {})
     ):
+        reasons = _real_protection_gate_reasons(futu_source, quote_source, real_account)
         return _combine_protection_results(
-            (simulated_result, _abnormal_protection_result(real_events_path)),
+            (simulated_result, _abnormal_protection_result(real_events_path, reasons=reasons)),
             events_path=paths.events,
         )
 
@@ -1713,7 +1720,39 @@ def _run_protection_pass(
     )
 
 
-def _abnormal_protection_result(events_path: Path) -> AShareWatchResult:
+def _real_protection_gate_reasons(
+    futu_source: object, quote_source: object, real_account: object,
+) -> tuple[dict[str, str], ...]:
+    futu = futu_source if isinstance(futu_source, Mapping) else {}
+    quotes = quote_source if isinstance(quote_source, Mapping) else {}
+    real_source = getattr(real_account, "source", {})
+    real_source = real_source if isinstance(real_source, Mapping) else {}
+    checks = (
+        ("futu.source_kind", futu.get("source_kind"), ("live", "live_account")),
+        ("futu.status", futu.get("status"), ("healthy",)),
+        ("quotes.status", quotes.get("status"), ("healthy",)),
+        ("real_account.status", getattr(real_account, "status", None), ("available",)),
+        ("real_source.broker", real_source.get("broker"), ("futu",)),
+        ("real_source.source_kind", real_source.get("source_kind"), ("live", "live_account")),
+    )
+    failures = [(field, value) for field, value, allowed in checks if value not in allowed]
+    reason = getattr(real_account, "reason", "")
+    if reason:
+        failures.append(("real_account.reason", reason))
+    blocked = getattr(real_account, "blocked_instrument_ids", {})
+    if blocked:
+        # Only instrument keys, never the account payload or position details.
+        keys = list(blocked)[:20] if isinstance(blocked, Mapping) else "unavailable"
+        failures.append(("blocked_instrument_ids", keys))
+    return tuple({
+        "step": "real_account_gate", "condition": field,
+        "message": _protection_detail(f"{field}={value}"),
+    } for field, value in failures)
+
+
+def _abnormal_protection_result(
+    events_path: Path, *, reasons: tuple[dict[str, str], ...] = (),
+) -> AShareWatchResult:
     return AShareWatchResult(
         status="abnormal",
         watched_symbol_count=0,
@@ -1721,6 +1760,7 @@ def _abnormal_protection_result(events_path: Path) -> AShareWatchResult:
         exception_count=1,
         unknown_quote_count=0,
         events_path=events_path,
+        abnormal_reasons=reasons,
     )
 
 
@@ -1754,6 +1794,11 @@ def _combine_protection_results(
             for result in results
         ),
         events_path=events_path,
+        abnormal_reasons=tuple(
+            reason
+            for result in results
+            for reason in getattr(result, "abnormal_reasons", ())
+        ),
     )
 
 
@@ -1770,11 +1815,19 @@ def _protection_blocker(result: object) -> str | None:
         or isinstance(unknown_quotes, bool)
         or unknown_quotes
     ):
-        return (
+        summary = (
             "protection pass abnormal: "
             f"status={status or 'missing'}, exceptions={exceptions}, "
             f"unknown_quotes={unknown_quotes}"
         )
+        reasons = getattr(result, "abnormal_reasons", ())
+        if reasons:
+            detail = "; ".join(
+                f"{reason.get('step', '')}: {reason.get('exception_type', '')} "
+                f"{reason.get('message', '')}" for reason in reasons
+            )
+            summary += f"; reasons: {_protection_detail(detail)}"
+        return summary
     return None
 
 
@@ -1786,6 +1839,44 @@ _PROTECTION_SESSION_STARTS = {
     "afternoon": time(13, 0),
     "open": time(9, 30),
 }
+
+
+def _protection_trading_day(
+    local: datetime,
+    market: str,
+    *,
+    quote_factory: Callable[[], object],
+    cache: dict[tuple[str, date], bool],
+) -> bool:
+    # CN retains its existing session/calendar policy.
+    if market == "CN":
+        return True
+    if local.weekday() >= 5:
+        return False
+    key = (market, local.date())
+    if key not in cache:
+        # Bound the per-controller cache to the current local day.
+        cache.clear()
+        try:
+            day = local.date()
+            start, end = day - timedelta(days=10), day + timedelta(days=10)
+            days = quote_factory().get_trading_days(
+                market=market, start=start.isoformat(), end=end.isoformat(),
+            )
+            trading_days: set[date] = set()
+            for value in days:
+                try:
+                    parsed = date.fromisoformat(value)
+                except (TypeError, ValueError):
+                    continue
+                if start <= parsed <= end:
+                    trading_days.add(parsed)
+            # An empty/unusable window is unknown, never proof of a holiday.
+            cache[key] = not trading_days or day in trading_days
+        except Exception:
+            # A calendar failure must never disable protection on a weekday.
+            cache[key] = True
+    return cache[key]
 
 
 def _protection_buffer_active(local: datetime, market: str) -> bool:
@@ -1810,6 +1901,8 @@ def _record_protection_diagnostics(
     result: object,
     blocker: str,
     occurred_at: datetime,
+    *,
+    reasons: tuple[dict[str, str], ...] = (),
 ) -> None:
     path = (
         config.data_dir
@@ -1824,6 +1917,7 @@ def _record_protection_diagnostics(
         "exception_count": getattr(result, "exception_count", None),
         "unknown_quote_count": getattr(result, "unknown_quote_count", None),
         "blocker": blocker,
+        "reasons": list(getattr(result, "abnormal_reasons", ())) + list(reasons),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3650,8 +3744,8 @@ def _notify_protection_blocker(
         happened="保护检查整体异常，已禁止新买入",
         impact=f"{MARKET_LABELS[market]}活动保护线无法完整检查",
         action="查看 Dashboard 风险状态并人工核价",
-        detail=protection_error,
     )
+    message += f"\n原因：{_protection_detail(protection_error)}"
     return _notify_feishu_once(
         title,
         message,
@@ -4970,6 +5064,7 @@ def run_trend_market_controller(
     last_success: object = None
     quote_client: object | None = None
     account_client: object | None = None
+    protection_calendar: dict[tuple[str, date], bool] = {}
 
     def close_client(client: object | None) -> None:
         close = getattr(client, "close", None)
@@ -5113,7 +5208,13 @@ def run_trend_market_controller(
             )
             protection_error: str | None = None
             protection_result: object | None = None
-            if local_session in {"morning", "afternoon", "open"}:
+            protection_reasons: tuple[dict[str, str], ...] = ()
+            if (
+                local_session in {"morning", "afternoon", "open"}
+                and _protection_trading_day(
+                    local, market, quote_factory=shared_quote, cache=protection_calendar,
+                )
+            ):
                 try:
                     protection_result = _run_protection_pass(
                         config,
@@ -5126,7 +5227,11 @@ def run_trend_market_controller(
                 except Exception as exc:
                     if isinstance(exc, FutuQuoteError):
                         reset_quote()
-                    protection_error = f"protection pass failed: {exc}"
+                    reason = _protection_exception_reason("run_protection_pass", exc)
+                    protection_reasons = (reason,)
+                    protection_error = (
+                        f"protection pass failed: {reason['exception_type']}: {reason['message']}"
+                    )
             if protection_error is not None:
                 _record_protection_diagnostics(
                     config,
@@ -5135,6 +5240,7 @@ def run_trend_market_controller(
                     protection_result,
                     protection_error,
                     now,
+                    reasons=protection_reasons,
                 )
                 if not _protection_buffer_active(local, market):
                     _notify_protection_blocker(
