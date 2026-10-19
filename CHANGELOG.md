@@ -3,6 +3,11 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-19
+
+- BUY cancellations that stop before SDK dispatch now retain the exact local refusal reason in audit receipts and bounded diagnostics. Unchanged normal rotation targets wait 10 seconds after a never-sent attempt before a fresh decision may retry, reducing repeated audit writes. Queue, scoring and 600-second unknown-yield protection keep their existing admission and currentness checks without this delay; UNKNOWN native outcomes retain their no-replay rules. Offline regressions cover reason persistence, request-free deferrals, retry boundaries and identity changes. SQLite/D3 lock work is tracked separately; historical refusal gates remain unknown.
+- LP rotation diagnostics serialize date/time values as ISO strings. Unavailable diagnostics return an UNKNOWN marker without breaking automatic status or dashboard responses. State-read and monitor failures are logged and retried after the API retry interval; unreadable state cannot start a new execution cycle. Offline regressions cover SDK expiration values, HTTP isolation and scheduler recovery while preserving trading and risk guards.
+
 ## 2026-10-18
 
 - US/HK trend protection now skips weekends and Futu calendar holidays. Calendar failures or empty/unusable 21-day calendar windows keep weekday protection active; only a usable window excluding today establishes a holiday. Abnormal diagnostics and blocker alerts include bounded, redacted exception or health-gate reasons. Offline controller/watcher regressions preserve trading-day guards and the opening alert buffer; not deployed.

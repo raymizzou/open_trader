@@ -198,6 +198,7 @@ class LocalOutcome:
     local_attempt_finished: bool
     venue_order_id: str | None = None
     receipt_status: str | None = None
+    reason_code: str | None = None
 
 
 class CycleStatus(StrEnum):
