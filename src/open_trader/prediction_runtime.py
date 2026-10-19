@@ -944,6 +944,10 @@ class PredictionRuntime:
                 set_cross_venue_monitor(
                     self._cross_runtime or self.cross_venue_monitor
                 )
+            if self._n_leg_paused and self.lp_d2 is not None:
+                # Claim, transport identity, control and settings have been
+                # validated locally. The sole Scheduler owns the first API read.
+                self.execution.admit_d2_paused_startup()
         except Exception as exc:
             if isinstance(exc,(PredictionStartDenied,PredictionRuntimeFatal)):
                 self._fatal=self._fatal or exc
@@ -954,7 +958,10 @@ class PredictionRuntime:
             raise
 
         try:
-            reconcile = self.execution.reconcile_startup()
+            reconcile = (
+                None if self._n_leg_paused and self.lp_d2 is not None
+                else self.execution.reconcile_startup()
+            )
             if isinstance(reconcile, Mapping) and reconcile.get("state") == "locked":
                 self._record_claimed_startup_failure(RuntimeError(
                     str(reconcile.get("reason", "reconcile_locked"))))

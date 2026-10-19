@@ -4573,7 +4573,8 @@ def test_d2_account_unknown_stays_online_without_buy_until_fresh_complete_facts(
         assert unknown['scheduler_starts']==1 and unknown['permit']['state']=='CLAIMED'
         assert unknown['reconcile_calls']==unknown['legacy_ticks']==0
         child.assert_owned()
-        child.release('fresh-facts')  # Only the external list availability changes.
+        child.release('fresh-facts')  # Recover the external list availability.
+        child.advance(60)  # Then reach the Reader retry deadline; no failed-read race.
         known=_nr_cycle(child)
         assert known['orders_complete'] is True and known['reserved_state']=='known'
         assert known['cancels']==[['A']]

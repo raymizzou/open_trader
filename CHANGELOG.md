@@ -3,6 +3,10 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-20
+
+- With N-leg paused, D2 startup uses reliable local admission and leaves the first account read to its sole Scheduler. API timeouts keep the runtime online with UNKNOWN LP facts and no new BUYs until complete facts arrive. Admission preserves historical execution/incident states; round0 BUY cleanup and SELL protections remain in place. Offline startup checks cover admission, retry and fatal control/settings/identity failures.
+
 ## 2026-10-19
 
 - With N-leg paused, D2 LP actions no longer stop on unfinished historical executions. Unacknowledged incidents still block BUY/SELL posts and rotation cancellations but allow exact protective BUY cancellations. Failed candidate capture keeps account reads and protection running without new BUYs, with bounded failure diagnostics and throttled exception logs. Offline checks cover these permissions and current-state safeguards; startup reconciliation is unchanged.

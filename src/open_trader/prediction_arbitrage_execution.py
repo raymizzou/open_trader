@@ -869,8 +869,8 @@ class PredictionExecutionService:
         self._legacy_strategy_retired = bool(legacy_retired)
         self._n_leg_paused = False
         self._process_lock = _PROCESS_LOCK
-        # A newly constructed process has not reconciled its dedicated wallet;
-        # only a clean startup/reset path may clear this lock.
+        # Startup admission (local for paused D2, reconciliation otherwise)
+        # must release this latch before mutations can be considered.
         self._breaker_open = True
         self._cross_breaker_open = False
         self._first_live_order_verified = False
@@ -900,6 +900,25 @@ class PredictionExecutionService:
         self._lp_manual_audit_ready = False
         if lp_d2 is not None:
             lp_d2.bind_mutation_admission(self, self._lp_d2_acquire)
+
+    def admit_d2_paused_startup(self) -> None:
+        """Release the startup latch after reliable local D2 initialization.
+
+        Runtime initializes control with its validated claim and loads settings
+        first. Current account facts belong to the Scheduler; historical rows
+        are left intact and incident permissions still apply to each mutation.
+        """
+        live = self._lp_d2
+        if live is None or not self._n_leg_paused:
+            raise ValueError('d2_paused_startup_required')
+        status = live.control.status()
+        current = status.current
+        if (live._closed or status.fatal is not None or current.fatal_id is not None
+                or current.shutdown_requested or current.control_version is None
+                or current.account_id != live.account_id
+                or current.process_epoch != live.process_epoch):
+            raise ValueError('d2_local_startup_not_ready')
+        self._breaker_open = False
 
     def _lp_d2_permission(self, action):
         live = self._lp_d2

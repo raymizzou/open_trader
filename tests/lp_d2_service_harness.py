@@ -1440,7 +1440,8 @@ def child(runtime_root,port,scenario,config_path):
                 '--release-manifest',str(release_root/'ops/prediction-service-release.json')]))
         if runtime_only:
             seed_no_reconcile_permit(root,release_root,config_path,port)
-            return run_no_reconcile_runtime(root,config_path,scenario,sdk,publish_snapshot,mark)
+            return run_no_reconcile_runtime(root,config_path,scenario,sdk,publish_snapshot,mark,
+                business_clock,utc_clock)
         if not scenario.startswith('automatic'):
             from contextlib import ExitStack
             with ExitStack() as operation:
@@ -1599,9 +1600,13 @@ def seed_no_reconcile_history(store, *, unfinished_execution=False):
     from open_trader.lp_business_writer import RequestRecord
     from tests.test_lp_order_registration_contract import WALLET, CONDITION_ID, TOKEN_ID
     stamp=datetime(2026,10,1,tzinfo=UTC)
+    # The unrelated earnings monitor also starts with the runtime. This old
+    # session already had its post-review reward attempt; preserve the strict
+    # whole-row history oracle without racing an advisory reward refresh.
     store.lp_create_session('old-session','old-session-key',state='entry_open',payload=dict(
         market_id='market-1',condition_id=CONDITION_ID,token_id=TOKEN_ID,outcome='YES',
-        price='.40',quantity='10',entry_order_id='missing-old-buy',owned_order_ids=['missing-old-buy']))
+        price='.40',quantity='10',entry_order_id='missing-old-buy',owned_order_ids=['missing-old-buy'],
+        review_at=stamp.isoformat(),reward_observation=dict(status='unknown',last_attempt_at=stamp.isoformat())))
     store.lp_log_business_record(RequestRecord(account_id=WALLET,process_epoch='old-process',
         request_id='old-request',session_id='old-audit',condition_id=CONDITION_ID,token_id=TOKEN_ID,
         kind='BUY',price=Decimal('.40'),quantity=Decimal('10'),requested_at=stamp,order_id='missing-old-buy'))
@@ -1649,7 +1654,8 @@ def seed_no_reconcile_permit(root,release,config,port):
             artifacts=[dict(scope=scope,id=i,digest='sha256:'+'0'*64)
                 for i,scope in enumerate(('gateway','legacy','account','prediction','portable'),1)]))
     write_prediction_runtime_record(root/'prediction-service-runtime.json',dict(state='stopped',
-        manager='foreground',candidate=dict(source,lp_validation=binding)))
+        manager='foreground',manager_identity=f'foreground:{os.getuid()}',
+        candidate=dict(source,lp_validation=binding)))
     identity=identity_for_runtime(data_dir=root/'data',prediction_config_path=config,host='127.0.0.1',port=port)
     directory=root/'lp-start-guard';directory.mkdir(mode=0o700)
     permit=directory/'permit.json'
@@ -1658,7 +1664,7 @@ def seed_no_reconcile_permit(root,release,config,port):
     permit.chmod(0o600)
 
 
-def run_no_reconcile_runtime(root,config_path,scenario,sdk,publish,mark):
+def run_no_reconcile_runtime(root,config_path,scenario,sdk,publish,mark,clock,utc_now):
     """Observe real owners with a profiler; never replace their return values."""
     import signal
     from open_trader.prediction_runtime import PredictionRuntime
@@ -1669,11 +1675,9 @@ def run_no_reconcile_runtime(root,config_path,scenario,sdk,publish,mark):
     counters=dict(reconcile_calls=0,legacy_ticks=0,scheduler_starts=0)
     codes={PredictionExecutionService.reconcile_startup.__code__:'reconcile_calls',
         PolymarketLPService.tick.__code__:'legacy_ticks',LPAutoScheduler.start.__code__:'scheduler_starts'}
-    start_time=datetime.now(UTC)
     runtime=PredictionRuntime(data_dir=root/'data',prediction_config_path=config_path,
         dashboard_url='http://127.0.0.1:8769/',n_leg_paused=True,enable_n_leg_background=False,
-        lp_clock=lambda:float((events/'clock').read_text()),
-        history_clock=lambda:start_time+timedelta(seconds=float((events/'clock').read_text())))
+        lp_clock=clock,history_clock=utc_now)
     def snapshot():
         observation=runtime.lp_d2.state.snapshot().observation if runtime.lp_d2 else None
         status=runtime.lp_d2.status() if runtime.lp_d2 else None
