@@ -277,7 +277,8 @@ def _transition_id(value):
 
 
 class _StandaloneMutationLease:
-    def allowed(self): return True
+    def __init__(self, action): self.action = action
+    def allowed(self, action=None): return action is None or action == self.action
     def release(self): pass
 
 
@@ -919,7 +920,7 @@ class LPD2LiveExecution:
             self._mutation_owner, self._mutation_acquire = owner, acquire
 
     def _acquire_mutation(self, action):
-        return self._mutation_acquire(action) if self._mutation_acquire else _StandaloneMutationLease()
+        return self._mutation_acquire(action) if self._mutation_acquire else _StandaloneMutationLease(action)
 
     def initialize(self, admission):
         self._admission = admission
@@ -1792,9 +1793,10 @@ class LPD2LiveExecution:
 
     def _buy_admitted(self, token, action, record, lease, *, manual_origin=None, manual_command=None, submit_source=None):
         terms = action.target.terms
+        mutation = 'MANUAL_BUY' if manual_origin is not None else 'BUY'
         def current():
             return self._manual_origin_current(manual_origin) if manual_origin is not None else self._dispatch_current(token.cycle_generation, running=True)
-        if not lease.allowed() or not current():
+        if not lease.allowed(mutation) or not current():
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         try:
             signed = self.trading.lp_create_limit_order(token_id=record.token_id, price=terms.price,
@@ -1802,7 +1804,7 @@ class LPD2LiveExecution:
                 **dict(terms.send_options))
         except Exception:
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
-        if not lease.allowed() or not current():
+        if not lease.allowed(mutation) or not current():
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         native_started_at = self._utc_now()
         try:
@@ -1884,7 +1886,7 @@ class LPD2LiveExecution:
         if (order.key[0] != self.account_id or order.key[2:] != (target.token_id, target.existing_order_id)
                 or order.side != 'BUY'):
             return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='independent_cancel_identity')
-        if not lease.allowed():
+        if not lease.allowed('CANCEL'):
             return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='mutation_lease_not_current')
         with self.state._lock:
             if not self._dispatch_current(observation.cycle_generation, running=not protection):
@@ -2829,14 +2831,14 @@ class LPD2LiveExecution:
     def _execute_exit(self, scope, attempt, record, generation, lease, origin):
         outcome, venue_id, signed = 'not_sent', None, None
         try:
-            if not lease.allowed() or not self._sell_dispatch_current(scope, attempt, generation, origin):
+            if not lease.allowed('SELL') or not self._sell_dispatch_current(scope, attempt, generation, origin):
                 with self.state._lock:
                     self._publish_sell_attempt(scope, replace(attempt, state='rejected', native_state='ended'))
                 return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
             signed = (self.trading.lp_create_limit_order(token_id=scope[2], side='SELL', price=attempt.price.value,
                 quantity=attempt.submit_quantity.value, expiration=None, post_only=True)
                 if attempt.kind == 'passive_exit' else None)
-            if not lease.allowed() or not self._sell_dispatch_current(scope, attempt, generation, origin):
+            if not lease.allowed('SELL') or not self._sell_dispatch_current(scope, attempt, generation, origin):
                 with self.state._lock:
                     self._publish_sell_attempt(scope, replace(attempt, state='rejected', native_state='ended'))
                 return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
@@ -2893,7 +2895,7 @@ class LPD2LiveExecution:
         return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
 
     def _cancel_exit(self, scope, attempt, origin):
-        lease = self._acquire_mutation('CANCEL')
+        lease = self._acquire_mutation('SELL_CANCEL')
         if lease is None:
             return None
         transferred = False
@@ -2919,7 +2921,7 @@ class LPD2LiveExecution:
                 def cancel():
                     outcome = 'unknown'
                     try:
-                        if not lease.allowed():
+                        if not lease.allowed('SELL_CANCEL'):
                             outcome = 'not_sent'
                         else:
                             with self.state._lock:

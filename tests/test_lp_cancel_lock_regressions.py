@@ -93,8 +93,8 @@ class PermissionPort:
         class Lease:
             released = False
 
-            def allowed(self):
-                return not self.released and port.allowed
+            def allowed(self, action=None):
+                return not self.released and port.allowed and (action is None or action == kind)
 
             def release(self):
                 self.released = True

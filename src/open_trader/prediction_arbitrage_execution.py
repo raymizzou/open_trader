@@ -769,11 +769,12 @@ def _call(method: object, *args: object, **kwargs: object) -> object:
 
 class _D2MutationLease:
     """One actual call's share of this D2 owner's process/file exclusion."""
-    def __init__(self, execution):
-        self.execution, self.released = execution, False
+    def __init__(self, execution, action):
+        self.execution, self.action, self.released = execution, action, False
 
-    def allowed(self):
-        return not self.released and self.execution._lp_d2_permission()
+    def allowed(self, action=None):
+        return (not self.released and (action is None or action == self.action)
+            and self.execution._lp_d2_permission(self.action))
 
     def release(self):
         if self.released:
@@ -899,13 +900,17 @@ class PredictionExecutionService:
         if lp_d2 is not None:
             lp_d2.bind_mutation_admission(self, self._lp_d2_acquire)
 
-    def _lp_d2_permission(self):
+    def _lp_d2_permission(self, action):
         live = self._lp_d2
         current = live.state.snapshot().current
         if live._closed or current.shutdown_requested or current.fatal_id is not None:
             return False
         try:
-            return not self._breaker_is_open() and self._store.active_execution() is None
+            if self._breaker_open or action not in ('BUY', 'MANUAL_BUY', 'SELL', 'CANCEL', 'SELL_CANCEL'):
+                return False
+            if action != 'CANCEL' and self._store.unacknowledged_incident() is not None:
+                return False
+            return self._n_leg_paused or self._store.active_execution() is None
         except Exception:
             return False  # unavailable mutation safety is never an SDK permission
 
@@ -916,19 +921,19 @@ class PredictionExecutionService:
         with self._lp_d2_lease_lock:
             if self._lp_d2_manual_lease or manual and self._lp_d2_lease_users:
                 return None
-            if not self._lp_d2_permission():
+            if not self._lp_d2_permission(action):
                 return None
             if self._lp_d2_lease is None:
                 lock = self._acquire_global_lock(wait_seconds=_LP_SUBMIT_LOCK_WAIT_SECONDS if manual else 0)
                 if lock is None:
                     return None
-                if not self._lp_d2_permission():
+                if not self._lp_d2_permission(action):
                     self._release_global_lock(lock)
                     return None
                 self._lp_d2_lease = lock
             self._lp_d2_lease_users += 1
             self._lp_d2_manual_lease = manual
-            return _D2MutationLease(self)
+            return _D2MutationLease(self, action)
 
     def _lp_d2_submit_entry(self, payload, *, preview_id=None):
         key = str(payload.get('idempotency_key') or '').strip()
@@ -942,7 +947,7 @@ class PredictionExecutionService:
             return previous['response']
         if self._breaker_is_open():
             return dict(state='locked',reason='circuit_breaker_open')
-        active = self._store.active_execution()
+        active = None if self._n_leg_paused else self._store.active_execution()
         if active is not None:
             return dict(state='busy',reason='active_execution',execution_id=active.get('execution_id'))
         lease = self._lp_d2_acquire('MANUAL_BUY')
@@ -963,7 +968,7 @@ class PredictionExecutionService:
             return dict(state='rejected',reason='idempotency_key_required' if not key else 'session_id_invalid')
         if self._breaker_is_open():
             return dict(state='locked',reason='circuit_breaker_open')
-        active = self._store.active_execution()
+        active = None if self._n_leg_paused else self._store.active_execution()
         if active is not None:
             return dict(state='busy',reason='active_execution',execution_id=active.get('execution_id'))
         lease = self._lp_d2_acquire('MANUAL_BUY')
@@ -1141,9 +1146,9 @@ class PredictionExecutionService:
             attempted_at = self._lp_d2.begin_scheduled_attempt()
             try:
                 capture = self._lp.capture_qualified_pool()
-            except BaseException:
+            except Exception:
                 self._lp_d2.record_attempt_failure(attempted_at=attempted_at, stage='capture')
-                raise
+                capture = None  # Unavailable candidates forbid BUY, not account protection.
             result = self._lp_d2.run_once(capture, attempted_at=attempted_at)
             self._lp_d2.run_protection_once()
             return self._lp_d2.dispatch_rotation(result)

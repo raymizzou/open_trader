@@ -322,8 +322,10 @@ def test_d2_diagnostics_are_bounded_redacted_and_read_only(tmp_path, monkeypatch
 
         def broken_clock(): raise RuntimeError(sentinel)
         producer.clock = broken_clock
-        with pytest.raises(RuntimeError, match=sentinel):
-            execution.lp_auto_scheduled_check()
+        protected = execution.lp_auto_scheduled_check()
+        assert protected.acceptance.observation is not None
+        admission = execution.lp_auto_state()['diagnostics']['admission']
+        assert admission['inventory'] == dict(total=None, valid=None, invalid=None, complete=False)
         runtime = _Runtime()
         runtime.execution, runtime._lp_auto_scheduler = execution, None
         runtime.lp_auto_state = lambda **kw: PredictionRuntime.lp_auto_state(runtime, **kw)
@@ -339,7 +341,7 @@ def test_d2_diagnostics_are_bounded_redacted_and_read_only(tmp_path, monkeypatch
             status, payload = _response(base+'/api/prediction-arbitrage/lp/auto/state', timeout=3)
             assert status == 200
             assert payload['diagnostics']['admission'] == admission
-            assert payload['diagnostics']['latest_attempt']['reason'] == 'other'
+            assert payload['diagnostics']['latest_attempt']['capture'] is None
             assert sentinel not in json.dumps(payload)
             compact = execution.lp_auto_state(include_intents=False)
             assert compact['diagnostics'] == payload['diagnostics'] and 'intents' not in compact
@@ -535,15 +537,16 @@ def test_d2_diagnostics_keep_last_accepted_source_time_after_failed_attempt(tmp_
         clock[0] += timedelta(seconds=61)
         if failure == 'capture-failure':
             # Unsupported leaves are isolated; a source traversal error still
-            # fails the real capture and must preserve the accepted observation.
+            # fails capture but must allow fresh account observation/protection.
             class UnreadableSource(dict):
                 def items(self):
                     raise TypeError('source_traversal_failed')
 
             direction = producer._candidate_qualification_facts[CONDITION_ID]['directions'][0]
             direction['book'] = UnreadableSource(direction['book'])
-            with pytest.raises(TypeError, match='source_traversal_failed'):
-                execution.lp_auto_scheduled_check()
+            result = execution.lp_auto_scheduled_check()
+            current = result.acceptance.observation
+            assert current is not None and current.observation_id != accepted.observation_id
         else:
             from open_trader.polymarket_lp_current_inputs import prepare_current_inputs
             from open_trader.polymarket_lp_market_calculation import calculate_current
@@ -565,27 +568,35 @@ def test_d2_diagnostics_keep_last_accepted_source_time_after_failed_attempt(tmp_
             assert summary['accepted_observation'] is None
         diagnostic = execution.lp_auto_state(include_intents=False)['diagnostics']
         if failure == 'capture-failure':
-            assert diagnostic['latest_attempt'] == dict(attempted_at=clock[0].isoformat(),
-                stage='capture', disposition='failed', reason='other', capture=None)
-            assert diagnostic['protection']['entered'] is False
-            assert diagnostic['protection']['disposition'] == 'skipped'
-            assert diagnostic['protection']['skip_reason'] == 'capture_failed'
+            assert diagnostic['latest_attempt']['attempted_at'] == clock[0].isoformat()
+            assert diagnostic['latest_attempt']['capture'] is None
+            assert diagnostic['protection']['entered'] is True
+            assert diagnostic['protection']['disposition'] == 'completed'
+            assert diagnostic['protection']['skip_reason'] is None
             assert diagnostic['protection']['attempt_id'] != previous_protection['attempt_id']
             assert diagnostic['protection']['attempted_at'] == clock[0].isoformat()
-            assert diagnostic['protection']['observation_id'] is None
+            assert diagnostic['protection']['observation_id'] == current.observation_id
             assert previous_protection['observation_id'] == accepted.observation_id
         source = diagnostic['accepted_observation']
-        assert source['observation_id'] == accepted.observation_id
+        expected = current if failure == 'capture-failure' else accepted
+        assert source['observation_id'] == expected.observation_id
         assert source['generation'] == accepted.cycle_generation
-        assert source['accepted_at'] == now.isoformat() and source['evaluated_at'] == now.isoformat()
+        evaluated_at = clock[0] if failure == 'capture-failure' else now
+        # The fixture's state clock and SDK source timestamps remain at now;
+        # only the execution evaluation clock advanced for this attempt.
+        assert source['accepted_at'] == now.isoformat() and source['evaluated_at'] == evaluated_at.isoformat()
         assert source['age_seconds'] == 61
-        assert source['read_ticket']['observation_id'] == accepted.read_ticket.observation_id
+        assert source['read_ticket']['observation_id'] == expected.read_ticket.observation_id
         assert source['sources']['balance']['checked_at'] == now.isoformat()
         assert source['sources']['balance']['age_seconds'] == 61
         assert source['sources']['balance']['complete'] is True
-        assert source['sources']['qualification']['checked_at'] == (now-timedelta(seconds=4)).isoformat()
-        assert source['sources']['qualification']['age_seconds'] == 65
-        assert live.state.snapshot().observation == accepted
+        if failure == 'capture-failure':
+            assert source['sources']['qualification']['checked_at'] is None
+            assert source['sources']['qualification']['age_seconds'] is None
+        else:
+            assert source['sources']['qualification']['checked_at'] == (now-timedelta(seconds=4)).isoformat()
+            assert source['sources']['qualification']['age_seconds'] == 65
+        assert live.state.snapshot().observation == expected
         assert sdk.posts == sdk.cancels == []
     finally:
         assert live.close(timeout=3)
