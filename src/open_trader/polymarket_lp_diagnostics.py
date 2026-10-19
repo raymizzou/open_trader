@@ -49,7 +49,10 @@ _REASONS = frozenset({'producer_fence_changed', 'producer_fence_unknown',
     'book_freshness_unknown', 'book_freshness_invalid', 'account_freshness_invalid', 'bid_level_invalid',
     'second_bid_insufficient', 'event_in_progress', 'event_recovery_pending', 'event_start_time_unknown',
     'event_end_time_unknown', 'event_end_time_in_future', 'post_event_screening_unknown',
-    'event_timing_unknown', 'event_starting_soon', 'event_status_unknown', 'scoring_continuously_lost'})
+    'event_timing_unknown', 'event_starting_soon', 'event_status_unknown', 'scoring_continuously_lost',
+    'mutation_not_admitted', 'mutation_lease_not_current', 'independent_cancel_identity',
+    'independent_cancel_not_current', 'independent_cancel_inflight', 'rotation_not_current',
+    'protection_cancel_owned', 'protection_cancel_not_current', 'protection_evidence_not_current', 'native_capacity'})
 
 
 def bounded_reason_counts(reasons):
@@ -85,7 +88,9 @@ def append_outcome(summary, outcome, *, token=None, record=None, reason=None, pr
     if disposition == 'UNKNOWN':
         subtype_key = subtype or 'unavailable'
         subtypes[subtype_key] = subtypes.get(subtype_key, 0)+1
-    code = next(iter(bounded_reason_counts((reason,)))) if reason else None
+    trigger_code = next(iter(bounded_reason_counts((reason,)))) if reason else None
+    actual_reason = getattr(outcome, 'reason_code', None) if disposition == 'NOT_SENT' else None
+    code = next(iter(bounded_reason_counts((actual_reason,)))) if actual_reason else trigger_code
     recent = list(summary.get('recent', ()))
     recent.append(dict(request_id=request_id, kind=kind, disposition=disposition,
         unknown_subtype=subtype, order_id=order_id,
@@ -93,10 +98,12 @@ def append_outcome(summary, outcome, *, token=None, record=None, reason=None, pr
         round_number=token.round_number if token else None,
         observation_id=token.observation_id if token else None, reason=code,
         local_attempt_finished=local_finished, venue_finality='unavailable'))
+    if protection and actual_reason and trigger_code:
+        recent[-1]['trigger_reason'] = trigger_code
     total = summary.get('total', 0)+1
     cancellations = {key: dict(counts) for key, counts in summary.get('protection_cancel_outcomes', {}).items()}
     if protection:
-        key = code if code and (code in cancellations or len(cancellations.keys()-{'other'}) < 20) else 'other'
+        key = trigger_code if trigger_code and (trigger_code in cancellations or len(cancellations.keys()-{'other'}) < 20) else 'other'
         counts = cancellations.setdefault(key, {})
         counts[raw] = counts.get(raw, 0)+1
     return freeze(dict(total=total, omitted=max(0, total-20), by_kind=by_kind,

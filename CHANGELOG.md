@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-19
 
+- BUY cancellations that stop before SDK dispatch now retain the exact local refusal reason in audit receipts and bounded diagnostics. Unchanged normal rotation targets wait 10 seconds after a never-sent attempt before a fresh decision may retry, reducing repeated audit writes. Queue, scoring and 600-second unknown-yield protection keep their existing admission and currentness checks without this delay; UNKNOWN native outcomes retain their no-replay rules. Offline regressions cover reason persistence, request-free deferrals, retry boundaries and identity changes. SQLite/D3 lock work is tracked separately; historical refusal gates remain unknown.
 - LP rotation diagnostics serialize date/time values as ISO strings. Unavailable diagnostics return an UNKNOWN marker without breaking automatic status or dashboard responses. State-read and monitor failures are logged and retried after the API retry interval; unreadable state cannot start a new execution cycle. Offline regressions cover SDK expiration values, HTTP isolation and scheduler recovery while preserving trading and risk guards.
 
 ## 2026-10-18
