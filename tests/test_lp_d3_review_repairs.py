@@ -1,4 +1,4 @@
-"""Approved F2 review regressions at the real Store/public service seams."""
+"""Approved F-core review regressions at real Store/public service seams."""
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
 import threading
@@ -164,6 +164,114 @@ def test_retry_after_requeue_requires_full_five_second_budget(tmp_path, monkeypa
     finally:
         blocker.execute('ROLLBACK')
         blocker.close()
+
+
+def test_first_begin_after_guard_wait_respects_inherited_deadline(tmp_path, monkeypatch):
+    """R3-1: the first grant cannot authorize a BEGIN after its chain expires."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from open_trader import lp_persistence, prediction_arbitrage_store
+    from open_trader.polymarket_lp import PolymarketLPService
+    from tests.test_lp_d3_persistence import wait_for
+    from tests.test_polymarket_lp import _LPCandidateQueryExchange
+
+    stamp = datetime(2026, 10, 19, tzinfo=UTC)
+    store = PredictionArbitrageStore(tmp_path)
+    original = dict(generation=1, global_recovery_generation=1, state='paused',
+        paused=True, durable_marker='preserve')
+    store.lp_save_preparation(original)
+    service = PolymarketLPService(store, _LPCandidateQueryExchange(stamp, {}), clock=lambda: stamp)
+    owner = LPWriteCoordinator(store.path)
+    guard = service._candidate_state_lock
+    held, release = threading.Event(), threading.Event()
+    clock_lock = threading.Lock()
+    now = 1000.0
+
+    def clock():
+        with clock_lock:
+            return now
+
+    # Override only the two business-deadline lookup sites. Event waits and
+    # wait_for's independent monotonic watchdog retain the real system clock.
+    monkeypatch.setattr(lp_persistence, 'time', SimpleNamespace(monotonic=clock))
+    monkeypatch.setattr(prediction_arbitrage_store, 'monotonic', clock)
+    connect = sqlite3.connect
+    connections, begins, writes = [], [], []
+
+    class Boundary(sqlite3.Connection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.observed = threading.current_thread().name.startswith('first-begin-target')
+            self.closed = False
+            if self.observed:
+                connections.append(self)
+
+        def execute(self, sql, *args, **kwargs):
+            if self.observed:
+                verb = sql.strip().split()[0].upper()
+                if verb == 'BEGIN':
+                    begins.append(sql)
+                if verb in {'INSERT', 'UPDATE', 'DELETE', 'REPLACE'}:
+                    writes.append(sql)
+            return super().execute(sql, *args, **kwargs)
+
+        def executemany(self, sql, *args, **kwargs):
+            if self.observed:
+                writes.append(sql)
+            return super().executemany(sql, *args, **kwargs)
+
+        def close(self):
+            super().close()
+            self.closed = True
+
+    monkeypatch.setattr(sqlite3, 'connect', lambda *a, **k: connect(*a, **(k | dict(factory=Boundary))))
+
+    def hold_guard():
+        with guard:
+            held.set()
+            assert release.wait(5), 'independent guard-holder watchdog'
+
+    with ThreadPoolExecutor(max_workers=1) as holders, ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='first-begin-target') as targets:
+        holding = holders.submit(hold_guard)
+        try:
+            assert held.wait(5)
+            with owner.enforce_lock_order(), owner.acquire('control'):
+                target = targets.submit(service.recover_preparation, scope='global', expected_generation=1)
+                wait_for(owner.status, lambda s: s['waiting'] == 1)
+                with clock_lock:
+                    now = 1014.5  # The first permit has only 0.5s left.
+            wait_for(owner.status, lambda s: s['holder'])
+            assert not target.done()  # Granted, but blocked on the independent guard.
+            with clock_lock:
+                now = 1016.0
+            release.set()
+            with pytest.raises(AdmissionTimeout) as failure:
+                target.result(timeout=5)
+            holding.result(timeout=5)
+        finally:
+            release.set()
+            holding.result(timeout=5)
+
+    assert failure.value.known_not_written is True
+    assert begins == writes == []
+    assert connections and all(connection.closed for connection in connections)
+    assert guard.acquire(timeout=2)
+    guard.release()
+    status = owner.status()
+    assert not status['holder'] and status['waiting'] == 0
+    assert status['lock_order_violations'] == status['begin_retries'] == 0
+    assert status['admission_timeouts'] == 1
+    terminal = next(row for row in status['admissions'] if row['event'] == 'timeout')
+    native = next(row for row in status['transactions']
+        if row['operation'].endswith('.lp_recover_preparation_items'))
+    assert native['failed'] is True and native['phase'] == 'begin'
+    assert native['chain_id'] == terminal['chain_id']
+    assert native['begin_attempts'] == terminal['begin_attempts'] == 0
+    assert native['retry_wait_seconds'] == terminal['retry_wait_seconds'] == 0.0
+    assert store.lp_preparation() == original
+    # A new independent operation can reuse the released permit and connection.
+    assert service.recover_preparation(scope='global', expected_generation=1)['generation'] == 2
 
 
 def test_bounded_admission_and_retry_telemetry_is_visible_without_payload(tmp_path, caplog):
