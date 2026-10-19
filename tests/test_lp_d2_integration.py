@@ -2302,11 +2302,57 @@ def test_settings_publish_after_commit_without_blocking_current_facts(tmp_path, 
         live.configure(dict(api_retry_interval_seconds=66,expected_config_version=3))
         assert entered.wait(2)
         control_entered.clear()
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+        from tests.test_lp_d3_persistence import wait_for
+        owner=live.store._lp_write_coordinator
+        acquire=owner.acquire
+        control_queued=(Event(),Event())
+        control_admissions=[]
+        @contextmanager
+        def observe_control_admission(priority='background',**kwargs):
+            if priority=='control' and threading.current_thread().name=='lp-control-save':
+                admission=kwargs['cancellation']
+                observed=False
+                def is_cancelled():
+                    nonlocal observed
+                    if not observed:
+                        observed=True
+                        control_admissions.append(admission)
+                        control_queued[len(control_admissions)-1].set()
+                    return admission.is_set()
+                # acquire checks cancellation only after appending this ticket.
+                # Delegate every decision to the real attempt's admission.
+                kwargs=kwargs|dict(cancellation=SimpleNamespace(is_set=is_cancelled))
+            with acquire(priority,**kwargs) as permit:
+                yield permit
+        monkeypatch.setattr(owner,'acquire',observe_control_admission)
         assert live.request_running(False).status=='accepted'
-        assert control_entered.wait(2)
+        # Settings retains its real native COMMIT hold and the sole permit.
+        # Match the exact control attempt; business may legitimately queue too.
+        assert control_queued[0].wait(5), 'first control admission watchdog'
+        assert owner.status()['holder'] and live.settings_status()['native_inflight']
+        assert live.control.status().attempt_number==1
+        assert not control_entered.is_set()
         clock[0]+=11
-        fatal=live.poll().fatal
-        assert fatal is not None and live.state.snapshot().current.shutdown_requested
+        # A queued control is known-not-written, so one cancellation is safe.
+        # Exhaust its actual second attempt while settings still holds COMMIT;
+        # the late settings result must preserve this peer fatal and shutdown.
+        cancelled=wait_for(live.poll, lambda s:s.save_state=='retry_wait')
+        assert cancelled.fatal is None and cancelled.error_code=='AdmissionCancelled'
+        assert len(control_admissions)==1 and control_admissions[0].is_set()
+        clock[0]=cancelled.retry_at_monotonic
+        live.poll()
+        assert control_queued[1].wait(5), 'second control admission watchdog'
+        assert control_admissions[1] is not control_admissions[0]
+        assert owner.status()['holder'] and live.settings_status()['native_inflight']
+        assert live.control.status().attempt_number==2 and not control_entered.is_set()
+        clock[0]+=11
+        fatal=wait_for(live.poll, lambda s:s.fatal is not None).fatal
+        assert fatal.origin=='save_retry_exhausted' and fatal.outcome=='failed'
+        assert len(control_admissions)==2 and all(a.is_set() for a in control_admissions)
+        assert live.control.status().error_code=='AdmissionCancelled' and not control_entered.is_set()
+        assert live.state.snapshot().current.shutdown_requested
         assert live.close(timeout=.01) is False and live.settings_status()['native_inflight']
         release.set();wait_settings(lambda s:not s['pending'])
         assert live.close(timeout=3) and live.settings_status()['effective'].config_version==4
