@@ -48,6 +48,7 @@ class LPControlOwner:
         self._closing = False
         self._episode_attempts = 0
         self._completed_monotonic = None
+        self._attempt_admission = None
 
     def _set_status(self, **changes):
         self._state._control_status = replace(self._state._control_status, **changes)
@@ -152,8 +153,15 @@ class LPControlOwner:
                 self._set_status(save_state='saving' if self._episode_attempts == 1 else 'retrying',
                     attempt_number=self._episode_attempts, retry_at_monotonic=None,
                     attempt_started_monotonic=started, attempt_deadline_monotonic=started + 10)
+                admitted_save = getattr(self._store, 'save_with_admission', None)
+                if callable(admitted_save):
+                    from .lp_persistence import WriteAdmission
+                    self._attempt_admission = WriteAdmission(started + 10, self._clock)
+                else:
+                    self._attempt_admission = None
             try:
-                result = self._store.save(write)
+                result = (admitted_save(write, self._attempt_admission) if callable(admitted_save)
+                          else self._store.save(write))
             except BaseException as exc:
                 self._completed_monotonic = self._clock()
                 future.set_exception(exc)
@@ -170,9 +178,12 @@ class LPControlOwner:
                     and now_monotonic > status.attempt_deadline_monotonic
                     and (not self._future.done() or self._completed_monotonic > status.attempt_deadline_monotonic)
                     and status.fatal is None):
-                self._set_status(save_state='unknown', error_code='save_unreturned')
-                self._trip('save_timeout', 'unknown', 'save_unreturned',
-                    write=self._inflight, attempt=status.attempt_number)
+                known_not_written = (self._attempt_admission is not None
+                    and self._attempt_admission.cancel_before_begin())
+                if not known_not_written:
+                    self._set_status(save_state='unknown', error_code='save_unreturned')
+                    self._trip('save_timeout', 'unknown', 'save_unreturned',
+                        write=self._inflight, attempt=status.attempt_number)
             if self._future is not None and self._future.done() and not self._thread.is_alive():
                 future, write = self._future, self._inflight
                 self._future, self._inflight = None, None

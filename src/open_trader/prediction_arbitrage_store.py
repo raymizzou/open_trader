@@ -18,7 +18,7 @@ from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from itertools import chain
 from pathlib import Path
-from time import monotonic
+from time import monotonic, thread_time
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping
 from zoneinfo import ZoneInfo
 
@@ -390,6 +390,8 @@ class PredictionArbitrageStore:
     def __init__(self, data_dir: Path, *, initialize: bool = True) -> None:
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+        from .lp_persistence import LPWriteCoordinator
+        self._lp_write_coordinator = LPWriteCoordinator(self.path)
         if type(initialize) is not bool:
             raise ValueError("initialize must be a boolean")
         if initialize:
@@ -421,7 +423,11 @@ class PredictionArbitrageStore:
 
         try:
             with self._read_connection() as connection:
-                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                checkpoint_started = monotonic()
+                result = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                self._lp_write_coordinator.record_checkpoint(result, seconds=monotonic()-checkpoint_started,
+                    page_size=connection.execute("PRAGMA page_size").fetchone()[0],
+                    autocheckpoint=connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0])
         except Exception:
             logger.warning("prediction_arbitrage_wal_checkpoint_failed", exc_info=True)
 
@@ -448,12 +454,54 @@ class PredictionArbitrageStore:
     @contextmanager
     def _transaction(self, *, immediate: bool = True, prepared_at: float | None = None,
                      diagnostics: dict | None = None, prepare_seconds: float = 0.0,
-                     commit_guard=None, after_commit: Callable[[], None] | None = None) -> Iterator[sqlite3.Connection]:
+                     commit_guard=None, after_commit: Callable[[], None] | None = None,
+                     lp_priority: str | None = None, admission=None) -> Iterator[sqlite3.Connection]:
+        from .lp_persistence import LP_WRITE_OPERATIONS, write_priority
+        operation = sys._getframe(2).f_code.co_qualname
+        name = operation.rsplit('.', 1)[-1]
+        is_lp = lp_priority is not None or name in LP_WRITE_OPERATIONS
+        deadline = min(monotonic() + 15, admission.real_deadline) if admission is not None else monotonic() + 15
+        priority = lp_priority or write_priority(name)
+        borrowed = is_lp and self._lp_write_coordinator.in_scope
+        for attempt in range(3 if is_lp and immediate and not borrowed else 1):
+            permit = (self._lp_write_coordinator.acquire(priority, deadline=deadline, cancellation=admission)
+                      if is_lp and not borrowed else nullcontext())
+            body_started = False
+            try:
+                with permit:
+                    native = self._lp_write_coordinator.native_transaction() if is_lp else nullcontext()
+                    with native, self._native_transaction(immediate=immediate, prepared_at=prepared_at,
+                            diagnostics=diagnostics, prepare_seconds=prepare_seconds,
+                            commit_guard=commit_guard, after_commit=after_commit, operation=operation,
+                            admission=admission, telemetry=is_lp) as connection:
+                        body_started = True
+                        yield connection
+                return
+            except sqlite3.Error as error:
+                if (body_started or borrowed or not getattr(error, '_lp_begin_not_started', False)
+                        or attempt >= 2 or not is_lp or not immediate
+                        or getattr(error, 'sqlite_errorcode', None) != sqlite3.SQLITE_BUSY
+                        or deadline - monotonic() < _BUSY_TIMEOUT_MS / 1000):
+                    raise
+                self._lp_write_coordinator.record_begin_retry()
+                if admission is not None:
+                    admission.begin_failed()
+                # Close and release a failed pre-body BEGIN before a new ticket.
+
+    def lp_write_scope(self, priority='reliable'):
+        """Admission before a caller-owned memory lock; commits stay separate."""
+        return self._lp_write_coordinator.scope(priority)
+
+    @contextmanager
+    def _native_transaction(self, *, immediate, prepared_at, diagnostics, prepare_seconds,
+                            commit_guard, after_commit, operation, admission=None, telemetry=False):
         started = monotonic()
         connection = self._connection()
-        operation = sys._getframe(2).f_code.co_qualname
         begin_at = monotonic()
         acquired = body_end = commit_end = None
+        cpu_started = thread_time()
+        guard_wait_seconds = after_commit_seconds = 0.0
+        commit_started = None
         try:
             changes_before = connection.total_changes
         except Exception:
@@ -462,19 +510,30 @@ class PredictionArbitrageStore:
         failed = False
         wait_failure = False
         try:
+            if admission is not None:
+                admission.start_begin()
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             acquired = monotonic()
             phase = "body"
             yield connection
             body_end = monotonic()
             phase = "commit"
+            guard_started = monotonic()
             with commit_guard if commit_guard is not None else nullcontext():
+                commit_started = monotonic()
+                guard_wait_seconds = commit_started - guard_started
                 connection.execute("COMMIT")
                 commit_end = monotonic()
                 phase = "complete"
                 if after_commit is not None:
-                    after_commit()
+                    after_started = monotonic()
+                    try:
+                        after_commit()
+                    finally:
+                        after_commit_seconds = monotonic() - after_started
         except BaseException as error:
+            if phase == 'begin' and isinstance(error, sqlite3.Error):
+                error._lp_begin_not_started = not connection.in_transaction
             failed = True
             wait_failure = isinstance(error, LpObservationWait) and str(error) in {
                 'session_changed', 'account_round_invalid', 'account_snapshot_superseded', 'account_snapshot_conflict',
@@ -513,6 +572,18 @@ class PredictionArbitrageStore:
             except Exception:
                 changes = 'unknown'
             connection.close()
+            if telemetry:
+                stages = {key: value for key, value in (diagnostics or {}).items()
+                    if key in {'input_rows', 'encode_seconds', 'executemany_seconds', 'bookmark_seconds',
+                        'scan_seconds', 'udf_seconds', 'pk_recheck_seconds', 'update_seconds', 'hydrate_seconds'}
+                    and type(value) in (int, float) and math.isfinite(value) and value >= 0}
+                self._lp_write_coordinator.record_transaction(operation, phase=phase, failed=failed,
+                    wall_seconds=finished-started, thread_cpu_seconds=thread_time()-cpu_started,
+                    begin_seconds=(acquired if acquired is not None else finished)-begin_at,
+                    body_seconds=body_end-acquired if acquired is not None and body_end is not None else 0.0,
+                    guard_wait_seconds=guard_wait_seconds,
+                    commit_seconds=commit_end-commit_started if commit_end is not None and commit_started is not None else 0.0,
+                    after_commit_seconds=after_commit_seconds, stages=stages)
             try:
                 if finished - begin_at >= _SLOW_TRANSACTION_SECONDS:
                     logger.warning(
@@ -2773,6 +2844,7 @@ class PredictionArbitrageStore:
         *,
         expires_at: str,
         created_at: str | None = None,
+        lp_priority: str | None = None,
     ) -> str:
         encoded = _dump_execution_payload(payload)
         created = _parse_timestamp(created_at or _utc_now())
@@ -2781,7 +2853,7 @@ class PredictionArbitrageStore:
         # lifetimes so every preview is at most the fixed ten-second window.
         expiry = min(requested_expiry, created + _PREVIEW_TTL)
         preview_id = _new_id()
-        with self._transaction() as connection:
+        with self._transaction(lp_priority=lp_priority) as connection:
             connection.execute(
                 "INSERT INTO previews(preview_id, payload, created_at, expires_at, consumed_at) VALUES (?, ?, ?, ?, NULL)",
                 (preview_id, encoded, _canonical_timestamp(created), _canonical_timestamp(expiry)),
@@ -3891,7 +3963,7 @@ class PredictionArbitrageStore:
 
         if self._lp_metadata_cache_ready:
             return
-        with self._lp_metadata_cache_schema_lock:
+        with self.lp_write_scope(), self._lp_metadata_cache_schema_lock:
             if self._lp_metadata_cache_ready:
                 return
             with self._transaction() as connection:
@@ -3976,6 +4048,7 @@ class PredictionArbitrageStore:
     ) -> None:
         """Upsert LP market metadata rows in bounded ~400-row transactions."""
 
+        prepared_at = monotonic()
         encoded: list[tuple[str, str, float, int]] = []
         for raw_condition, raw_entry in entries.items():
             condition = str(raw_condition or "").strip()
@@ -4000,9 +4073,12 @@ class PredictionArbitrageStore:
                     1,
                 )
             )
+        encode_seconds = monotonic() - prepared_at
         for offset in range(0, len(encoded), 400):
             chunk = encoded[offset : offset + 400]
-            with self._transaction() as connection:
+            diagnostics = dict(input_rows=len(chunk), encode_seconds=encode_seconds)
+            with self._transaction(prepared_at=prepared_at, diagnostics=diagnostics) as connection:
+                execute_started = monotonic()
                 connection.executemany(
                     """
                     INSERT INTO
@@ -4015,6 +4091,7 @@ class PredictionArbitrageStore:
                     """,
                     chunk,
                 )
+                diagnostics["executemany_seconds"] = monotonic() - execute_started
 
     def lp_metadata_cache_prune(self, *, now: datetime | None = None, limit: int = 400) -> tuple[int, bool]:
         """Delete one bounded expiry chunk; return count and same-cutoff remainder."""
@@ -4735,6 +4812,9 @@ class PredictionArbitrageStore:
         current = _canonical_timestamp(now)
         now_moment = _parse_timestamp(current)
         claimed: list[dict[str, object]] = []
+        diagnostics = dict(udf_seconds=0.0, pk_recheck_seconds=0.0, update_seconds=0.0)
+        scan_started = monotonic()
+        scan_cpu_started = thread_time()
         identities = None if condition_ids is None else tuple(
             dict.fromkeys(
                 str(value).strip() for value in condition_ids if str(value).strip()
@@ -4758,7 +4838,8 @@ class PredictionArbitrageStore:
         if not entered_here and self._lp_preparation_owner_handle is None:
             return claimed
         try:
-            with self._transaction() as connection:
+            with self._read_connection() as connection:
+                connection.execute("BEGIN")
                 if stage_scoped:
                     # Match the history caller's timestamp parser, including
                     # aware offset forms and its malformed-deadline failure.
@@ -4767,6 +4848,7 @@ class PredictionArbitrageStore:
                     deadline_errors: list[ValueError] = []
 
                     def dispatch_due(deadline: object, paused: int, retry_used: int) -> bool:
+                        udf_started = monotonic()
                         try:
                             if not isinstance(deadline, str):
                                 raise ValueError("next_retry_at_invalid")
@@ -4781,6 +4863,8 @@ class PredictionArbitrageStore:
                             if not deadline_errors:
                                 deadline_errors.append(ValueError("next_retry_at_invalid"))
                             return False
+                        finally:
+                            diagnostics['udf_seconds'] += monotonic() - udf_started
                         return due and paused == 0 and retry_used == 0
 
                     connection.create_function("lp_dispatch_retry_due", 3, dispatch_due)
@@ -4816,7 +4900,7 @@ class PredictionArbitrageStore:
                     ).fetchall()
                 else:
                     # Older deployed SQLite builds allow only 999 parameters.
-                    # Keep every batch and retry spend in this one transaction.
+                    # Keep the complete candidate scan in this one read snapshot.
                     batch_size = max(1, connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
                     rows = []
                     for offset in range(0, len(identities), batch_size):
@@ -4832,29 +4916,62 @@ class PredictionArbitrageStore:
                             batch,
                         ).fetchall())
                     rows.sort(key=lambda row: (row["next_retry_at"], row["condition_id"]))
+                candidates = []
                 for row in rows:
                     try:
                         due = _parse_timestamp(row["next_retry_at"])
                     except ValueError:
                         continue
-                    if due > now_moment:
+                    if due <= now_moment:
+                        candidates.append(row)
+                # End the read snapshot before competing for write admission.
+            diagnostics["scan_seconds"] = monotonic() - scan_started
+            diagnostics["input_rows"] = len(candidates)
+            if not candidates:
+                self._lp_write_coordinator.record_read_stage('PredictionArbitrageStore.lp_claim_preparation_retries',
+                    phase='scan_only', seconds=diagnostics['scan_seconds'],
+                    cpu_seconds=thread_time()-scan_cpu_started, stages=diagnostics)
+                return claimed
+            updated_rows = []
+            with self._transaction(diagnostics=diagnostics) as connection:
+                for snapshot in candidates:
+                    condition = str(snapshot["condition_id"])
+                    recheck_started = monotonic()
+                    row = connection.execute(
+                        "SELECT * FROM lp_preparation_items WHERE condition_id=?", (condition,),
+                    ).fetchone()
+                    diagnostics['pk_recheck_seconds'] += monotonic() - recheck_started
+                    # IMMEDIATE excludes concurrent writers. Full raw version
+                    # comparison also preserves stage, deadline and recovery
+                    # changes between the read snapshot and this short CAS.
+                    if row is None or tuple(row) != tuple(snapshot):
                         continue
-                    condition = str(row["condition_id"])
-                    connection.execute(
+                    update_started = monotonic()
+                    changed = connection.execute(
                         """
                         UPDATE lp_preparation_items
                         SET retry_used=1,state='retrying',retry_started_at=?,
                             next_retry_at=NULL,updated_at=?
-                        WHERE condition_id=? AND paused=0 AND retry_used=0
+                        WHERE condition_id=? AND generation=? AND state=?
+                          AND paused=0 AND retry_used=0 AND next_retry_at=? AND updated_at=?
                         """,
-                        (current, _utc_now(), condition),
+                        (current, _utc_now(), condition, row["generation"], row["state"],
+                         row["next_retry_at"], row["updated_at"]),
                     )
+                    diagnostics["update_seconds"] += monotonic() - update_started
+                    if changed.rowcount != 1:
+                        continue
                     updated = connection.execute(
-                        "SELECT * FROM lp_preparation_items WHERE condition_id=?",
-                        (condition,),
+                        "SELECT * FROM lp_preparation_items WHERE condition_id=?", (condition,),
                     ).fetchone()
                     if updated is not None:
-                        claimed.append(self._lp_preparation_item(updated))
+                        updated_rows.append(updated)
+            hydrate_started, hydrate_cpu = monotonic(), thread_time()
+            claimed = [self._lp_preparation_item(row) for row in updated_rows]
+            self._lp_write_coordinator.record_read_stage('PredictionArbitrageStore.lp_claim_preparation_retries',
+                phase='hydrated_after_commit', seconds=monotonic()-hydrate_started,
+                cpu_seconds=thread_time()-hydrate_cpu,
+                stages={'hydrate_seconds': monotonic()-hydrate_started, 'input_rows': len(updated_rows)})
         finally:
             if entered_here:
                 self.lp_release_preparation_owner()
@@ -5251,6 +5368,7 @@ class PredictionArbitrageStore:
         account_id: str,
         condition_id: str,
         updates: Mapping[str, object],
+        *, expected_share_alert: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         """Atomically merge selected fields into one LP observation."""
 
@@ -5260,12 +5378,21 @@ class PredictionArbitrageStore:
             raise ValueError("LP observation identity is required")
         if not isinstance(updates, Mapping):
             raise ValueError("LP observation updates must be an object")
+        if expected_share_alert is not None and (
+                not isinstance(expected_share_alert, Mapping) or set(expected_share_alert) != {
+                    'last_share_checked_at', 'breach_started_at', 'notification_pending'}):
+            raise ValueError('lp_share_alert_fence_invalid')
         with self._transaction() as connection:
             current = connection.execute(
-                "SELECT payload FROM lp_market_observations WHERE account_id=? AND condition_id=?",
+                "SELECT payload,updated_at FROM lp_market_observations WHERE account_id=? AND condition_id=?",
                 (account_key, market_key),
             ).fetchone()
             previous = _load_payload(str(current["payload"])) if current is not None else {}
+            if expected_share_alert is not None:
+                alert = previous.get('share_alert')
+                if not isinstance(alert, Mapping) or any(alert.get(k) != v for k, v in expected_share_alert.items()):
+                    return {**previous, 'condition_id': market_key,
+                            'updated_at': current['updated_at'] if current is not None else None}
             merged = dict(previous)
             for key, value in updates.items():
                 old_value = merged.get(str(key))
@@ -5353,10 +5480,12 @@ class PredictionArbitrageStore:
         if first is None and progress is None:
             return 0
         progress_payload = _dump_relation_payload(dict(progress)) if progress is not None else None
+        diagnostics["encode_seconds"] = monotonic() - prepared_at
         if stop_event is not None and stop_event.is_set():
             raise RuntimeError("competition_cancelled")
         with self._transaction(prepared_at=prepared_at, diagnostics=diagnostics,
                                commit_guard=commit_guard, after_commit=after_commit) as connection:
+            execute_started = monotonic()
             connection.executemany(
                 """
                 INSERT OR REPLACE INTO lp_market_competitiveness
@@ -5365,9 +5494,12 @@ class PredictionArbitrageStore:
                 """,
                 chain((first,), encoded) if first is not None else (),
             )
+            diagnostics["executemany_seconds"] = monotonic() - execute_started
+            bookmark_started = monotonic()
             if progress_payload is not None:
                 connection.execute("INSERT OR REPLACE INTO lp_competition_progress(singleton,payload) VALUES (1,?)",
                                    (progress_payload,))
+            diagnostics["bookmark_seconds"] = monotonic() - bookmark_started
             if stop_event is not None and stop_event.is_set():
                 raise RuntimeError("competition_cancelled")
         return diagnostics["input_rows"]
@@ -8060,7 +8192,7 @@ class PredictionArbitrageStore:
             document = json.loads(row['payload'])
         return self._lp_current_control_values(document, account_id)
 
-    def lp_save_current_control(self, write: Mapping[str, object]):
+    def lp_save_current_control(self, write: Mapping[str, object], *, admission=None):
         """Merge narrow reliable control in the actual transaction, then receipt.
 
         This port is synchronous and independent of disposable business logging.
@@ -8083,7 +8215,7 @@ class PredictionArbitrageStore:
                 or requested_at.utcoffset().total_seconds() != 0
                 or values['actor'] is not None and type(values['actor']) is not str):
             raise ValueError('lp_control_write_invalid')
-        with self._transaction() as connection:
+        with self._transaction(admission=admission) as connection:
             row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
             document = (json.loads(row['payload']) if row is not None else
                         default_account_pool_document(self.path, values['account_id'], datetime.now(timezone.utc)))

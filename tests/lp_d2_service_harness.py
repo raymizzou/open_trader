@@ -740,7 +740,6 @@ def child(runtime_root,port,scenario,config_path):
             if name=='lp-business-writer' and sql=='BEGIN IMMEDIATE':
                 # This optional audit write never acquires SQLite's write lock
                 # or succeeds. Its actual external I/O lifetime still drains.
-                if not (events/'business-entered').exists():hold('business')
                 mark('business-record-unavailable')
                 raise sqlite3.OperationalError('disposable business records unavailable')
             if name=='lp-d2-manual-command' and sql=='BEGIN' and scenario=='reader':
@@ -748,11 +747,9 @@ def child(runtime_root,port,scenario,config_path):
             result=super().execute(sql,*a,**kw)
             if name=='lp-settings-save' and sql=='COMMIT' and 'repair-lock-order' in scenario:
                 mark('repair-settings-commit-'+str(len(list(events.glob('repair-settings-commit-*')))+1))
-            if name=='lp-settings-save' and sql=='COMMIT' and scenario=='reader':hold('settings')
             if name=='lp-control-save' and sql=='COMMIT' and scenario=='late_control':
                 control_native.append(threading.current_thread())
                 hold('control')
-            if sql=='COMMIT' and name=='lp-metadata-writer' and not (events/'metadata-entered').exists():hold('metadata')
             return result
     real_from_keychain=PolymarketTradingClient.from_keychain
     def runtime_sdk(cls,config):
@@ -774,6 +771,24 @@ def child(runtime_root,port,scenario,config_path):
         return adapter
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=NativeSQL))))
+        from open_trader.lp_persistence import LPWriteCoordinator
+        native_admission = LPWriteCoordinator.acquire
+        @contextmanager
+        def staged_admission(owner, *args, **kwargs):
+            # Disposable/settings jobs remain actually in flight, before
+            # admission. Multiple native LP transactions cannot be parked
+            # together now. Native control COMMIT is still held below for
+            # UNKNOWN/late-success coverage; S01/F06 separately hold real SQL.
+            name = threading.current_thread().name
+            resource = {'lp-business-writer': 'business',
+                        'lp-metadata-writer': 'metadata'}.get(name)
+            if name == 'lp-settings-save' and scenario == 'reader':
+                resource = 'settings'
+            if resource and not (events/(resource+'-entered')).exists():
+                hold(resource)
+            with native_admission(owner, *args, **kwargs) as admitted:
+                yield admitted
+        patch.setattr(LPWriteCoordinator, 'acquire', staged_admission)
         if scenario=='rollback-current-repair-lock-order':
             native_thread_join=threading.Thread.join
             def observed_settings_join(thread,*args,**kwargs):

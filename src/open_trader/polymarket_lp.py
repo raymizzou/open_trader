@@ -963,14 +963,15 @@ class PolymarketLPService:
         if callable(listener):
             listener(self._invalidate_lp_account_round)
         self._protection_notifier: Callable[..., object] | None = None
-        self._mutex = threading.RLock()
+        from .lp_persistence import MemoryLock, SerializedCalls
+        self._mutex = MemoryLock('_mutex', reentrant=True)
         self._entry_sends: set[str] = set()
         self._cancel_sends: set[str] = set()
         self._entry_sends_lock = threading.Lock()
         self._facts_owner = threading.local()
         self._facts_lock = threading.Lock()
         self._facts_apply_lock = threading.Lock()
-        self._first_seen_apply_lock = threading.Lock()
+        self._first_seen_apply_lock = MemoryLock('_first_seen_apply_lock', reentrant=False)
         self._account_registration_attempt = 0
         self._account_order_sync_error: str | None = None
         self._deferred_protection_notices = threading.local()
@@ -988,7 +989,7 @@ class PolymarketLPService:
         self._facts_attention_summary = None
         self._facts_attention_verifier = None
         self._attention_queue_lock = threading.Lock()
-        self._attention_delivery_lock = threading.Lock()
+        self._attention_delivery_lock = SerializedCalls()
         self._attention_delivery_results: dict[tuple[str, bool, str], dict[str, bool]] = {}
         self._attention_pending: dict[str, object] = {}
         self._attention_thread: threading.Thread | None = None
@@ -1001,23 +1002,23 @@ class PolymarketLPService:
         self._facts_publisher = None
         self._facts_validator = None
         self._facts_wakeup = None
-        self._reward_refresh_lock = threading.Lock()
-        self._price_history_refresh_lock = threading.Lock()
-        self._report_lock = threading.Lock()
+        self._reward_refresh_lock = SerializedCalls()
+        self._price_history_refresh_lock = SerializedCalls()
+        self._report_lock = SerializedCalls()
         # Issue #146: the full scan and the head maintenance run on
         # independent threads; separate locks let a long scan proceed while
         # maintenance refreshes the published head (and vice versa) without
         # either kind overlapping itself.
-        self._candidate_scan_lock = threading.Lock()
-        self._candidate_maintenance_lock = threading.Lock()
-        self._candidate_state_lock = threading.RLock()
+        self._candidate_scan_lock = SerializedCalls()
+        self._candidate_maintenance_lock = SerializedCalls()
+        self._candidate_state_lock = MemoryLock('_candidate_state_lock', reentrant=True)
         self._qualified_pool_capture_invalid_last_warn_at: float | None = None
-        self._competition_lock = threading.Lock()
-        self._competition_refresh_lock = threading.Lock()
+        self._competition_lock = MemoryLock('_competition_lock', reentrant=False)
+        self._competition_refresh_lock = SerializedCalls()
         self._competition_version = 0
         self._candidate_queue_build_sequence = 0
         self._competition_state: dict[str, object] = {}
-        self._preparation_lock = threading.RLock()
+        self._preparation_lock = MemoryLock('_preparation_lock', reentrant=True)
         self._sample_target_lock = threading.Lock()
         self._sample_targets: tuple[tuple[str, str], ...] = ()
         self._sample_target_version = 0
@@ -1168,7 +1169,7 @@ class PolymarketLPService:
             until = checked_at + timedelta(seconds=seconds)
         else:
             return False
-        with self._candidate_state_lock:
+        with self._lp_write_scope(), self._candidate_state_lock:
             if not self._candidate_generation_allowed(global_recovery_generation):
                 return False
             if exclusion_revision is not None and exclusion_revision != self._candidate_exclusion_revision:
@@ -1232,7 +1233,7 @@ class PolymarketLPService:
         if not self._candidate_generation_allowed(global_recovery_generation):
             return False
         if self.exclusions_enabled and (market.get("closed") is True or market.get("resolved") is True):
-            with self._candidate_state_lock:
+            with self._lp_write_scope(), self._candidate_state_lock:
                 if not self._candidate_generation_allowed(global_recovery_generation):
                     return False
                 if self.store.lp_clear_ended_market_exclusions(
@@ -1607,13 +1608,17 @@ class PolymarketLPService:
                 result.update(deepcopy(dict(summary)))
         return result
 
+    def _lp_write_scope(self):
+        scope = getattr(self.store, 'lp_write_scope', None)
+        return scope() if callable(scope) else nullcontext()
+
     def _save_preparation(
         self,
         updates: Mapping[str, object],
         *,
         expected_generation: int | None = None,
     ) -> dict[str, object]:
-        with self._preparation_lock:
+        with self._lp_write_scope(), self._preparation_lock:
             current = self.preparation_snapshot()
             merged = {**current, **dict(updates)}
             if expected_generation is not None and "generation" not in updates:
@@ -2349,7 +2354,7 @@ class PolymarketLPService:
         if scope == "global":
             if not callable(item_recoverer):
                 raise RuntimeError("durable preparation recovery is unavailable")
-            with self._candidate_state_lock:
+            with self._lp_write_scope(), self._candidate_state_lock:
                 item_recoverer((), expected_generation=expected_generation)
                 self._prepared_inputs = None
                 self._prepared_inputs_version += 1
@@ -9727,9 +9732,9 @@ class PolymarketLPService:
             prepare_seconds = monotonic() - prepared_at
             _lp_causal_event("account_publish_ready", account=snapshot, prepare_seconds=prepare_seconds)
             lock_started = monotonic()
-            with _lp_read_lock(self._first_seen_apply_lock, "account_registration_apply_lock_wait"):
+            with self._lp_write_scope(), _lp_read_lock(self._first_seen_apply_lock, "account_registration_apply_lock_wait"):
                 diagnostics["apply_lock_wait_seconds"] = round(monotonic() - lock_started, 3)
-                with self.store._transaction(prepare_seconds=prepare_seconds, diagnostics=diagnostics) as connection:
+                with self.store._transaction(prepare_seconds=prepare_seconds, diagnostics=diagnostics, lp_priority="reliable") as connection:
                     _lp_causal_event("account_publish_begin", account=snapshot, prepare_seconds=prepare_seconds)
                     observed = connection.execute(
                         "SELECT generation FROM lp_trade_generation WHERE singleton=1"
@@ -11042,14 +11047,18 @@ class PolymarketLPService:
                     attempted_at=now,
                     reason=type(exc).__name__,
                 )
-            with self._mutex:
-                current = self.store.lp_session(str(session["session_id"]))
-                if current is None:
-                    return {"state": "none", "session_id": session.get("session_id")}
+            try:
+                # The Store merges this narrow observation into the current
+                # row atomically. Do not wait for the service mutex while
+                # owning write admission: legacy reconciliation holds it.
                 updated = self.store.lp_update_session(
                     str(session["session_id"]),
                     patch={"reward_observation": observation},
                 )
+            except ValueError as exc:
+                if str(exc) != "lp_session_not_found":
+                    raise
+                return {"state": "none", "session_id": session.get("session_id")}
             return self._status_payload(updated)
 
     @staticmethod

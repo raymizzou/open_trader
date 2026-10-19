@@ -537,6 +537,21 @@ def test_begin_preparation_write_failure_cannot_pause_recovered_generation(tmp_p
             fail_after_release()
         return writer(payload, expected_generation=expected_generation, initialize_global_fence=initialize_global_fence)
     if boundary == 'begin-write':
+        from contextlib import contextmanager
+        original_scope = service._lp_write_scope
+        first = [True]
+        @contextmanager
+        def delayed_admission():
+            # Recovery wins before this old attempt owns admission. Holding
+            # the permit while asking recovery to write is no longer a valid
+            # scheduling fixture. The real SQL failure still happens below.
+            if first[0]:
+                first[0] = False
+                entered.set()
+                assert release.wait(5), 'Independent initial admission watchdog'
+            with original_scope():
+                yield
+        monkeypatch.setattr(service, '_lp_write_scope', delayed_admission)
         monkeypatch.setattr(store, 'lp_save_preparation', delayed_writer)
     else:
         monkeypatch.setattr(store, 'lp_preparation_items', fail_after_release)

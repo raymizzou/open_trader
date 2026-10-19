@@ -825,7 +825,8 @@ class PredictionExecutionService:
         self._lp_d2_manual_lease = False
         self._lp_dashboard_lock = threading.RLock()
         self._lp_reward_percentage_lock = threading.Lock()
-        self._lp_share_watch_notification_lock = threading.Lock()
+        from .lp_persistence import SerializedCalls
+        self._lp_share_watch_notification_lock = SerializedCalls()
         self._lp_share_watch_seen: set[str] = set()
         self._lp_dashboard_cache: dict[str, object] | None = None
         self._lp_account_trades_cache: dict[str, object] | None = None
@@ -1382,13 +1383,11 @@ class PredictionExecutionService:
             return dict(current) if isinstance(current, Mapping) else {}
 
         def save_watch_fields(
-            condition_id: str, fields: Mapping[str, object]
+            condition_id: str, fields: Mapping[str, object], *, expected_share_alert=None
         ) -> dict[str, object] | None:
-            return update_observation(
-                account_id,
-                condition_id,
-                {"share_alert": dict(fields)},
-            )
+            return _call(update_observation, account_id, condition_id,
+                {"share_alert": dict(fields)}, **({'expected_share_alert': expected_share_alert}
+                    if expected_share_alert is not None else {}))
 
         snapshot = self._lp_open_orders_snapshot(stop_event=stop_event)
         # The authenticated reader stamps its result after the network call;
@@ -1620,6 +1619,8 @@ class PredictionExecutionService:
                             "notification_pending": False,
                             "last_attempt_at": _timestamp(send_now),
                         },
+                        expected_share_alert={key: latest.get(key) for key in (
+                            'last_share_checked_at', 'breach_started_at', 'notification_pending')},
                     )
                     continue
                 if stop_event is not None and stop_event.is_set():

@@ -260,10 +260,13 @@ class _ControlStore:
         return StoredControl(**{**saved, 'account_id': self.account_id})
 
     def save(self, write):
+        return self.save_with_admission(write, None)
+
+    def save_with_admission(self, write, attempt):
         if write.account_id != self.account_id:
             raise ValueError('d2_control_account_identity')
         return CommittedControl(**self.store.lp_save_current_control({
-            **asdict(write), 'account_id': self.pool_account_id}))
+            **asdict(write), 'account_id': self.pool_account_id}, admission=attempt))
 
 
 def _transition_id(value):
@@ -696,7 +699,7 @@ class LPD2LiveExecution:
         expires = as_of+timedelta(seconds=10)
         preview_id = self.store.create_preview(self._manual_json(dict(request,
             session_id=group['identity']['session_id'],preflight=facts)),
-            expires_at=expires.isoformat(),created_at=as_of.isoformat())
+            expires_at=expires.isoformat(),created_at=as_of.isoformat(), lp_priority="reliable")
         return dict(state='previewed',preview_id=preview_id,expires_at=expires.isoformat(),
             request=dict(session_id=group['identity']['session_id'],quantity=request['quantity']),
             price=request['price'],preflight=facts,
@@ -749,7 +752,7 @@ class LPD2LiveExecution:
             return dict(state='rejected', reason=str(exc))
         expires = as_of + timedelta(seconds=10)
         preview_id = self.store.create_preview(self._manual_json(dict(request, preflight=facts)),
-            expires_at=expires.isoformat(), created_at=as_of.isoformat())
+            expires_at=expires.isoformat(), created_at=as_of.isoformat(), lp_priority="reliable")
         return dict(state='previewed', preview_id=preview_id, expires_at=expires.isoformat(),
             request=request, preflight=facts,
             queue_protection_estimate=service._queue_protection_preview_estimate(request, values))
