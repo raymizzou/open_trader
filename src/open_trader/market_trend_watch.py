@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from .a_share_trend_watch import (
     AShareWatchResult,
+    _protection_exception_reason,
     _close,
     _load_active_lines,
     _monitor_interrupted,
@@ -29,7 +30,9 @@ MARKET_LABELS = {"HK": "港股", "US": "美股"}
 BROKER_LABELS = {"HK": "辉立", "US": "富途"}
 
 
-def _abnormal_result(events_path: Path) -> AShareWatchResult:
+def _abnormal_result(
+    events_path: Path, *, step: str, exc: Exception,
+) -> AShareWatchResult:
     return AShareWatchResult(
         status="abnormal",
         watched_symbol_count=0,
@@ -37,6 +40,7 @@ def _abnormal_result(events_path: Path) -> AShareWatchResult:
         exception_count=1,
         unknown_quote_count=0,
         events_path=events_path,
+        abnormal_reasons=(_protection_exception_reason(step, exc),),
     )
 
 
@@ -126,7 +130,7 @@ def watch_market_protection(
                     )
                     interrupted = True
                 if once:
-                    return _abnormal_result(events_path)
+                    return _abnormal_result(events_path, step="quote_client_factory", exc=exc)
                 sleep_fn(reconnect_seconds)
                 now = now_fn()
                 continue
@@ -181,7 +185,7 @@ def watch_market_protection(
                 if not once:
                     raise
             if once:
-                return _abnormal_result(events_path)
+                return _abnormal_result(events_path, step="trading_calendar", exc=exc)
             sleep_fn(reconnect_seconds)
             now = now_fn()
             continue
@@ -205,7 +209,7 @@ def watch_market_protection(
             expected_date=opening.date().isoformat(),
             timezone=timezone,
         )
-    except Exception:
+    except Exception as exc:
         if not once:
             raise
         if close_quote_client:
@@ -213,7 +217,7 @@ def watch_market_protection(
                 _close(client)
             except Exception:
                 pass
-        return _abnormal_result(events_path)
+        return _abnormal_result(events_path, step="account_loader", exc=exc)
     if opening > local_now:
         sleep_fn((opening - local_now).total_seconds())
 

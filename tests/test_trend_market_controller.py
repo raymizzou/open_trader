@@ -4313,7 +4313,9 @@ def patch_controller_quote(monkeypatch: pytest.MonkeyPatch) -> None:
         controller,
         "FutuQuoteClient",
         lambda **_kwargs: SimpleNamespace(
-            get_trading_days=lambda **_query: [], close=lambda: None
+            get_trading_days=lambda **query: (
+                [query["start"]] if query["start"] == query["end"] else []
+            ), close=lambda: None
         ),
     )
 
@@ -14494,10 +14496,349 @@ def _abnormal_protection() -> SimpleNamespace:
     )
 
 
+@pytest.mark.parametrize("market", ["US", "HK"])
+@pytest.mark.parametrize("day", ["2026-10-17", "2026-10-18"])
+def test_protection_skips_weekends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, market: str, day: str,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    calls: list[str] = []
+    monkeypatch.setattr(
+        controller, "_run_protection_pass",
+        lambda *_args, **_kwargs: calls.append("protection") or _abnormal_protection(),
+    )
+    alerts: list[str] = []
+    monkeypatch.setattr(
+        controller, "_notify_protection_blocker",
+        lambda *_args: alerts.append("alert"),
+    )
+    now = datetime.fromisoformat(f"{day}T10:30:00").replace(
+        tzinfo=controller.TIMEZONES[market]
+    )
+
+    result = run_trend_market_controller(
+        config, market, once=True, now_fn=lambda: now,
+    )
+
+    assert calls == []
+    assert alerts == []
+    assert "protection" not in str(result.get("blocker"))
+    assert not list((config.data_dir / "trend_controller").glob(
+        "*/protection_diagnostics/*.jsonl"
+    ))
+
+
 def _patch_abnormal_protection(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         controller, "_run_protection_pass", lambda *_args, **_kwargs: _abnormal_protection()
     )
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
+@pytest.mark.parametrize(
+    "calendar_days",
+    [[], ["garbled", "2026-02-30", None, 42], ["2026-09-01", "2026-11-30"]],
+    ids=["empty", "garbled", "outside-window"],
+)
+def test_protection_unknown_calendar_keeps_weekday_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, market: str,
+    calendar_days: list[object],
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    passes: list[str] = []
+    monkeypatch.setattr(
+        controller, "_run_protection_pass",
+        lambda *_args, **_kwargs: passes.append("protection") or _abnormal_protection(),
+    )
+    monkeypatch.setattr(controller, "FutuQuoteClient", lambda **_kwargs: SimpleNamespace(
+        get_trading_days=lambda **_kwargs: calendar_days, close=lambda: None,
+    ))
+    messages: list[str] = []
+    monkeypatch.setattr(
+        controller, "_notify_feishu_once",
+        lambda _title, message, _key: messages.append(message),
+    )
+    now = datetime(2026, 10, 19, 10, 30, tzinfo=controller.TIMEZONES[market])
+
+    run_trend_market_controller(config, market, once=True, now_fn=lambda: now)
+
+    assert passes == ["protection"]
+    assert any("保护检查整体异常，已禁止新买入" in message for message in messages)
+    diagnostic = config.data_dir / f"trend_controller/{market}/protection_diagnostics/2026-10-19.jsonl"
+    assert json.loads(diagnostic.read_text())["status"] == "abnormal"
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
+def test_protection_calendar_holiday_skips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, market: str,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    calls: list[str] = []
+    monkeypatch.setattr(
+        controller, "_run_protection_pass",
+        lambda *_args, **_kwargs: calls.append("protection") or _abnormal_protection(),
+    )
+    # A usable window excludes today but includes neighboring trading dates.
+    monkeypatch.setattr(controller, "FutuQuoteClient", lambda **_kwargs: SimpleNamespace(
+        get_trading_days=lambda **_kwargs: ["2026-10-16", "2026-10-20"], close=lambda: None,
+    ))
+    now = datetime(2026, 10, 19, 10, 30, tzinfo=controller.TIMEZONES[market])
+    result = run_trend_market_controller(config, market, once=True, now_fn=lambda: now)
+
+    assert calls == []
+    assert "protection" not in str(result.get("blocker"))
+    assert not list((config.data_dir / "trend_controller").glob(
+        "*/protection_diagnostics/*.jsonl"
+    ))
+    assert not list((config.data_dir / "trend_controller").glob(
+        "*/notifications/*/*.json"
+    ))
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
+@pytest.mark.parametrize("calendar_error", [False, True], ids=["trading-day", "calendar-error"])
+def test_protection_trading_weekday_still_blocks_and_alerts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, market: str, calendar_error: bool,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    calls: list[str] = []
+    monkeypatch.setattr(
+        controller, "_run_protection_pass",
+        lambda *_args, **_kwargs: calls.append("protection") or _abnormal_protection(),
+    )
+    queries: list[dict[str, object]] = []
+
+    def calendar(**kwargs: object) -> list[str]:
+        queries.append(kwargs)
+        if calendar_error:
+            raise controller.FutuQuoteError("calendar offline", error_type="snapshot_failed")
+        return ["2026-10-19"]
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", lambda **_kwargs: SimpleNamespace(
+        get_trading_days=calendar, close=lambda: None,
+    ))
+    alerts: list[str] = []
+    monkeypatch.setattr(
+        controller, "_notify_protection_blocker",
+        lambda _config, _market, _day, error, _at: alerts.append(error),
+    )
+    now = datetime(2026, 10, 19, 10, 30, tzinfo=controller.TIMEZONES[market])
+    run_trend_market_controller(config, market, once=True, now_fn=lambda: now)
+
+    assert calls == ["protection"]
+    assert len(alerts) == 1
+    assert "exceptions=1" in alerts[0]
+    assert queries == [{"market": market, "start": "2026-10-09", "end": "2026-10-29"}]
+    diagnostics = config.data_dir / f"trend_controller/{market}/protection_diagnostics/2026-10-19.jsonl"
+    assert json.loads(diagnostics.read_text())["status"] == "abnormal"
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
+@pytest.mark.parametrize("calendar_error", [False, True])
+def test_protection_calendar_cached_until_local_date_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, market: str, calendar_error: bool,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    clock = {"now": datetime(2026, 10, 19, 10, 30, tzinfo=controller.TIMEZONES[market])}
+    queries: list[dict[str, object]] = []
+    passes: list[str] = []
+
+    def calendar(**kwargs: object) -> list[str]:
+        queries.append(kwargs)
+        if calendar_error:
+            raise RuntimeError("calendar offline")
+        return [clock["now"].date().isoformat()]
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", lambda **_kwargs: SimpleNamespace(
+        get_trading_days=calendar, close=lambda: None,
+    ))
+    monkeypatch.setattr(
+        controller, "_run_protection_pass",
+        lambda _config, _market, day, **_kwargs: passes.append(day) or protection_success(),
+    )
+
+    class StopLoop(Exception):
+        pass
+
+    sleeps = 0
+
+    def advance(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 1:
+            clock["now"] += timedelta(seconds=5)
+        elif sleeps == 2:
+            clock["now"] += timedelta(days=1)
+        else:
+            raise StopLoop
+
+    with pytest.raises(StopLoop):
+        run_trend_market_controller(
+            config, market, now_fn=lambda: clock["now"], sleep_fn=advance,
+        )
+
+    assert passes == ["2026-10-19", "2026-10-19", "2026-10-20"]
+    assert queries == [
+        {"market": market, "start": "2026-10-09", "end": "2026-10-29"},
+        {"market": market, "start": "2026-10-10", "end": "2026-10-30"},
+    ]
+
+
+@pytest.mark.parametrize("step", ["fetch_account_snapshot", "load_real_holding_input"])
+def test_real_protection_exception_reason_reaches_diagnostics_and_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: str,
+) -> None:
+    config = controller_config(tmp_path)
+    monkeypatch.setattr(controller, "require_trend_executor", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(controller, "watch_market_protection", lambda **_kwargs: protection_success())
+    monkeypatch.setattr(controller, "fetch_account_snapshot", lambda: {})
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError(
+            "snapshot offline acc_id=123456789 token=private-token "
+            "Authorization: Bearer private-auth account_no=A12345 api_key=private-key "
+            "https://api.test/?token=private-url " + "x" * 600
+        )
+
+    monkeypatch.setattr(controller, step, fail)
+    result = controller._run_protection_pass(
+        config, "US", "2026-10-19", quote_client=object(),
+        account_loader=lambda *_args, **_kwargs: object(),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+    assert len(result.abnormal_reasons) == 1
+    reason = result.abnormal_reasons[0]
+    assert reason["step"] == step
+    assert reason["exception_type"] == "RuntimeError"
+    assert "snapshot offline" in reason["message"]
+    assert len(reason["message"]) <= 500
+    now = datetime(2026, 10, 19, 10, 30, tzinfo=controller.TIMEZONES["US"])
+    blocker = controller._protection_blocker(result)
+    assert blocker is not None
+    controller._record_protection_diagnostics(config, "US", "2026-10-19", result, blocker, now)
+    messages: list[str] = []
+    monkeypatch.setattr(controller, "_notify_feishu_once", lambda _title, message, _key: messages.append(message))
+    controller._notify_protection_blocker(config, "US", "2026-10-19", blocker, now.isoformat())
+    diagnostic = config.data_dir / "trend_controller/US/protection_diagnostics/2026-10-19.jsonl"
+    row = json.loads(diagnostic.read_text())
+    assert row["reasons"] == list(result.abnormal_reasons)
+    assert step in blocker
+    assert "snapshot offline" in messages[0]
+    assert "RuntimeError" in messages[0]
+    for text in (diagnostic.read_text(), messages[0], blocker):
+        assert "123456789" not in text
+        assert "private-token" not in text
+        assert "private-auth" not in text
+        assert "A12345" not in text
+        assert "private-key" not in text
+        assert "private-url" not in text
+
+
+def test_protection_combines_simulated_and_real_abnormal_reasons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    monkeypatch.setattr(controller, "require_trend_executor", lambda *_args, **_kwargs: None)
+    simulated_reason = {
+        "step": "account_loader", "exception_type": "ValueError", "message": "simulated offline",
+    }
+    monkeypatch.setattr(controller, "watch_market_protection", lambda **_kwargs: share_watch.AShareWatchResult(
+        "abnormal", 2, 1, 1, 3, tmp_path / "events.jsonl", (simulated_reason,),
+    ))
+
+    def fail() -> object:
+        raise RuntimeError("real snapshot offline")
+
+    monkeypatch.setattr(controller, "fetch_account_snapshot", fail)
+    result = controller._run_protection_pass(
+        config, "US", "2026-10-19", quote_client=object(),
+        account_loader=lambda *_args, **_kwargs: object(),
+    )
+    assert (result.status, result.watched_symbol_count, result.trigger_count,
+            result.exception_count, result.unknown_quote_count) == ("abnormal", 2, 1, 2, 3)
+    assert result.abnormal_reasons == (simulated_reason, {
+        "step": "fetch_account_snapshot", "exception_type": "RuntimeError",
+        "message": "real snapshot offline",
+    })
+
+
+def test_real_protection_gate_failure_reasons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    monkeypatch.setattr(controller, "require_trend_executor", lambda *_args, **_kwargs: None)
+    watchers: list[str] = []
+    monkeypatch.setattr(controller, "watch_market_protection", lambda **kwargs: (
+        watchers.append(kwargs["events_path"].name) or protection_success()
+    ))
+    monkeypatch.setattr(controller, "fetch_account_snapshot", lambda: {
+        "sources": {
+            "account": {"brokers": {"futu": {"source_kind": "cached", "status": "stale"}}},
+            "quotes": {"status": "stale"},
+        },
+    })
+    monkeypatch.setattr(controller, "load_real_holding_input", lambda *_args, **_kwargs: SimpleNamespace(
+        status="unavailable", reason="account_quotes_stale",
+        source={"broker": "other", "source_kind": "statement"},
+        blocked_instrument_ids={"instrument-nvda": "account_quotes_stale"},
+    ))
+    result = controller._run_protection_pass(
+        config, "US", "2026-10-19", quote_client=object(),
+        account_loader=lambda *_args, **_kwargs: object(),
+    )
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+    assert watchers == ["watch_events.jsonl"]
+    reasons = {reason["condition"]: reason for reason in result.abnormal_reasons}
+    expected = {
+        "futu.source_kind": "cached", "futu.status": "stale",
+        "quotes.status": "stale", "real_account.status": "unavailable",
+        "real_account.reason": "account_quotes_stale", "real_source.broker": "other",
+        "real_source.source_kind": "statement", "blocked_instrument_ids": "instrument-nvda",
+    }
+    assert reasons.keys() == expected.keys()
+    for condition, value in expected.items():
+        assert reasons[condition]["step"] == "real_account_gate"
+        assert value in reasons[condition]["message"]
+    blocker = controller._protection_blocker(result)
+    now = datetime(2026, 10, 19, 10, 30, tzinfo=controller.TIMEZONES["US"])
+    controller._record_protection_diagnostics(config, "US", "2026-10-19", result, blocker, now)
+    diagnostic = config.data_dir / "trend_controller/US/protection_diagnostics/2026-10-19.jsonl"
+    assert json.loads(diagnostic.read_text())["reasons"] == list(result.abnormal_reasons)
+
+
+def test_outer_protection_exception_reason_reaches_diagnostics_and_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("outer quote offline acc_id=123456789")
+
+    monkeypatch.setattr(controller, "_run_protection_pass", fail)
+    messages: list[str] = []
+    monkeypatch.setattr(controller, "_notify_feishu_once", lambda _title, message, _key: messages.append(message))
+    now = datetime.fromisoformat("2026-07-20T10:30:00+08:00")
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: now)
+    diagnostic = config.data_dir / "trend_controller/CN/protection_diagnostics/2026-07-20.jsonl"
+    row = json.loads(diagnostic.read_text())
+    assert row["status"] == "error"
+    assert row["reasons"] == [{
+        "step": "run_protection_pass", "exception_type": "ValueError",
+        "message": "outer quote offline acc_id=[redacted]",
+    }]
+    assert "ValueError" in row["blocker"]
+    assert any("outer quote offline" in message and "ValueError" in message for message in messages)
+    assert "123456789" not in diagnostic.read_text()
+    assert "123456789" not in " ".join(messages)
 
 
 @pytest.mark.parametrize(

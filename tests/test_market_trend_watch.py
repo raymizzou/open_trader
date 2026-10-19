@@ -140,6 +140,11 @@ def test_once_market_watcher_returns_abnormal_when_reconnect_client_fails(
     assert result.status == "abnormal"
     assert result.exception_count == 1
 
+    assert result.abnormal_reasons == ({
+        "step": "quote_client_factory", "exception_type": "FutuQuoteError",
+        "message": "reconnect offline",
+    },)
+
 
 def test_market_watcher_default_clock_records_aware_timestamps(
     tmp_path: Path,
@@ -522,6 +527,10 @@ def test_once_market_watcher_returns_abnormal_when_account_snapshot_fails(
 
     assert result.status == "abnormal"
     assert result.exception_count == 1
+    assert result.abnormal_reasons == ({
+        "step": "account_loader", "exception_type": "RuntimeError",
+        "message": "account snapshot offline",
+    },)
 
 
 def test_once_market_watcher_returns_abnormal_when_failed_client_cannot_close(
