@@ -75,6 +75,18 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
     books = exchange.lp_order_books
     account = exchange.lp_account_snapshot_shared
     sign = exchange.lp_create_limit_order
+    acquire = store._lp_write_coordinator.acquire
+
+    @contextmanager
+    def observed_admission(*args, **kwargs):
+        if (registration_caller and get_ident() == registration_caller[0]
+                and registration_armed[0]):
+            registration_armed[0] = False
+            registration_entered.set()
+            if not registration_release.wait(5):
+                barrier_errors.append('Independent registration watchdog expired')
+        with acquire(*args, **kwargs) as permit:
+            yield permit
 
     def observed_connect(database, *args, **kwargs):
         connection = connect(database, *args, **kwargs)
@@ -91,15 +103,8 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
                     except BaseException as exc:
                         barrier_errors.append(type(exc).__name__)
                 elif (registration_caller and get_ident() == registration_caller[0]
-                        and registration_armed[0] and statement.strip().upper() == 'BEGIN IMMEDIATE'):
-                    registration_armed[0] = False
+                        and statement.strip().upper() == 'BEGIN IMMEDIATE' and not registration_intercepted):
                     registration_intercepted.append(dict(thread=get_ident(), statement=statement))
-                    registration_entered.set()
-                    try:
-                        if not registration_release.wait(5):
-                            barrier_errors.append('Independent registration watchdog expired')
-                    except BaseException as exc:
-                        barrier_errors.append(type(exc).__name__)
             connection.set_trace_callback(trace)
         return connection
 
@@ -124,6 +129,7 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
         return sign(**kwargs)
 
     monkeypatch.setattr(sqlite3, 'connect', observed_connect)
+    monkeypatch.setattr(store._lp_write_coordinator, 'acquire', observed_admission)
     monkeypatch.setattr(exchange, 'lp_order_books', observed_books)
     monkeypatch.setattr(exchange, 'lp_account_snapshot_shared', observed_account)
     monkeypatch.setattr(exchange, 'lp_create_limit_order', observed_sign)
@@ -184,7 +190,7 @@ def test_first_plan_approval_is_atomic_with_account_facts(tmp_path, monkeypatch,
                     return engine.refresh_lp_dashboard_snapshot()
                 publishing = workers.submit(publish)
                 try:
-                    assert registration_entered.wait(5), 'Real registration reaches its own writer in its apply lane'
+                    assert registration_entered.wait(5), 'Real registration reaches admission before taking its writer permit'
                     assert registration_caller[0] != caller[0]
                     release.set()
                     assert pending.result(timeout=5), 'Original plan progresses without the background apply lane'

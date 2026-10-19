@@ -22,6 +22,7 @@ from time import monotonic, thread_time
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping
 from zoneinfo import ZoneInfo
 
+from .lp_persistence import AdmissionCancelled, AdmissionTimeout, MemoryLock, SLOW_WRITE_SECONDS
 from .polymarket_lp_errors import LpObservationWait
 from .polymarket_lp_notification_batches import matching_batch_channels
 from open_trader.llm_providers import DEFAULT_PROVIDER, PROVIDER_IDS
@@ -41,7 +42,7 @@ SignalHistoryWindow = Literal["24h", "7d", "30d", "all"]
 logger = logging.getLogger(__name__)
 
 _BUSY_TIMEOUT_MS = 5_000
-_SLOW_TRANSACTION_SECONDS = 1.0
+_SLOW_TRANSACTION_SECONDS = SLOW_WRITE_SECONDS
 # Reserved lp_sessions.session_id holding manual-cancel audit anchor rows.
 # Never returned as a "latest" session and skipped by daily-report assembly;
 # direct reads (lp_session) still work.
@@ -406,7 +407,7 @@ class PredictionArbitrageStore:
         self._lp_preparation_owner_handle: Any | None = None
         self._lp_preparation_owner_mutex = threading.Lock()
         self._lp_metadata_cache_ready = False
-        self._lp_metadata_cache_schema_lock = threading.Lock()
+        self._lp_metadata_cache_schema_lock = MemoryLock('_lp_metadata_cache_schema_lock')
         self._lp_trade_change_listener: Callable[[str], None] | None = None
         self._lp_trade_change_listener_lock = threading.Lock()
         if initialize:
@@ -423,11 +424,13 @@ class PredictionArbitrageStore:
 
         try:
             with self._read_connection() as connection:
+                wal_bytes_before = self._lp_write_coordinator.wal_bytes()
                 checkpoint_started = monotonic()
                 result = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
                 self._lp_write_coordinator.record_checkpoint(result, seconds=monotonic()-checkpoint_started,
                     page_size=connection.execute("PRAGMA page_size").fetchone()[0],
-                    autocheckpoint=connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0])
+                    autocheckpoint=connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0],
+                    wal_bytes_before=wal_bytes_before, wal_bytes_after=self._lp_write_coordinator.wal_bytes())
         except Exception:
             logger.warning("prediction_arbitrage_wal_checkpoint_failed", exc_info=True)
 
@@ -460,23 +463,39 @@ class PredictionArbitrageStore:
         operation = sys._getframe(2).f_code.co_qualname
         name = operation.rsplit('.', 1)[-1]
         is_lp = lp_priority is not None or name in LP_WRITE_OPERATIONS
-        deadline = min(monotonic() + 15, admission.real_deadline) if admission is not None else monotonic() + 15
+        chain_started = monotonic()
+        deadline = min(chain_started + 15, admission.real_deadline) if admission is not None else chain_started + 15
         priority = lp_priority or write_priority(name)
         borrowed = is_lp and self._lp_write_coordinator.in_scope
+        outer_attempt = self._lp_write_coordinator.write_attempt if self._lp_write_coordinator.in_scope else None
+        if outer_attempt is not None:
+            deadline = min(deadline, outer_attempt['deadline'])
+        retry_chain = outer_attempt if outer_attempt is not None else self._lp_write_coordinator.new_retry_chain(deadline) if is_lp else None
         for attempt in range(3 if is_lp and immediate and not borrowed else 1):
-            permit = (self._lp_write_coordinator.acquire(priority, deadline=deadline, cancellation=admission)
+            if retry_chain is not None and outer_attempt is None:
+                retry_chain['attempt'] = attempt
+            permit = (self._lp_write_coordinator.acquire(priority, deadline=deadline, cancellation=admission, retry_chain=retry_chain)
                       if is_lp and not borrowed else nullcontext())
             body_started = False
             try:
                 with permit:
+                    # Requeueing consumed the same absolute retry budget. A
+                    # new grant alone does not authorize another full busy wait.
+                    if (attempt or outer_attempt is not None and outer_attempt['attempt']) and deadline - monotonic() < _BUSY_TIMEOUT_MS / 1000:
+                        raise AdmissionTimeout('lp_write_retry_budget_exhausted')
                     native = self._lp_write_coordinator.native_transaction() if is_lp else nullcontext()
                     with native, self._native_transaction(immediate=immediate, prepared_at=prepared_at,
                             diagnostics=diagnostics, prepare_seconds=prepare_seconds,
                             commit_guard=commit_guard, after_commit=after_commit, operation=operation,
-                            admission=admission, telemetry=is_lp) as connection:
+                            admission=admission, telemetry=is_lp, retry_chain=retry_chain) as connection:
                         body_started = True
+                        if outer_attempt is not None:
+                            outer_attempt['body_entered'] = True
                         yield connection
                 return
+            except (AdmissionTimeout, AdmissionCancelled) as error:
+                self._lp_write_coordinator.admission_failed(error, priority=priority, started=chain_started, retry_chain=retry_chain)
+                raise
             except sqlite3.Error as error:
                 if (body_started or borrowed or not getattr(error, '_lp_begin_not_started', False)
                         or attempt >= 2 or not is_lp or not immediate
@@ -488,13 +507,17 @@ class PredictionArbitrageStore:
                     admission.begin_failed()
                 # Close and release a failed pre-body BEGIN before a new ticket.
 
-    def lp_write_scope(self, priority='reliable'):
+    def lp_write_scope(self, priority='background'):
         """Admission before a caller-owned memory lock; commits stay separate."""
         return self._lp_write_coordinator.scope(priority)
 
+    def lp_write_operation(self, operation, *, priority='background'):
+        """Run a guard-owning publication phase with safe pre-body requeue."""
+        return self._lp_write_coordinator.run_write(operation, priority)
+
     @contextmanager
     def _native_transaction(self, *, immediate, prepared_at, diagnostics, prepare_seconds,
-                            commit_guard, after_commit, operation, admission=None, telemetry=False):
+                            commit_guard, after_commit, operation, admission=None, telemetry=False, retry_chain=None):
         started = monotonic()
         connection = self._connection()
         begin_at = monotonic()
@@ -512,6 +535,8 @@ class PredictionArbitrageStore:
         try:
             if admission is not None:
                 admission.start_begin()
+            if retry_chain is not None:
+                retry_chain['begin_attempts'] += 1
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             acquired = monotonic()
             phase = "body"
@@ -577,7 +602,7 @@ class PredictionArbitrageStore:
                     if key in {'input_rows', 'encode_seconds', 'executemany_seconds', 'bookmark_seconds',
                         'scan_seconds', 'udf_seconds', 'pk_recheck_seconds', 'update_seconds', 'hydrate_seconds'}
                     and type(value) in (int, float) and math.isfinite(value) and value >= 0}
-                self._lp_write_coordinator.record_transaction(operation, phase=phase, failed=failed,
+                self._lp_write_coordinator.record_transaction(operation, retry_chain=retry_chain, phase=phase, failed=failed,
                     wall_seconds=finished-started, thread_cpu_seconds=thread_time()-cpu_started,
                     begin_seconds=(acquired if acquired is not None else finished)-begin_at,
                     body_seconds=body_end-acquired if acquired is not None and body_end is not None else 0.0,
@@ -3963,21 +3988,24 @@ class PredictionArbitrageStore:
 
         if self._lp_metadata_cache_ready:
             return
-        with self.lp_write_scope(), self._lp_metadata_cache_schema_lock:
-            if self._lp_metadata_cache_ready:
-                return
-            with self._transaction() as connection:
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS lp_market_metadata_cache(
-                        condition_id TEXT PRIMARY KEY,
-                        payload TEXT NOT NULL,
-                        expires_at REAL NOT NULL,
-                        present INTEGER NOT NULL
+        def initialize():
+            with self._lp_metadata_cache_schema_lock:
+                if self._lp_metadata_cache_ready:
+                    return
+                with self._transaction(lp_priority='background') as connection:
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS lp_market_metadata_cache(
+                            condition_id TEXT PRIMARY KEY,
+                            payload TEXT NOT NULL,
+                            expires_at REAL NOT NULL,
+                            present INTEGER NOT NULL
+                        )
+                        """
                     )
-                    """
-                )
-            self._lp_metadata_cache_ready = True
+                self._lp_metadata_cache_ready = True
+
+        self.lp_write_operation(initialize, priority='background')
 
     @staticmethod
     def _lp_metadata_cache_horizon(now: datetime | None) -> float:

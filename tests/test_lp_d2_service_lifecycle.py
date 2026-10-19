@@ -19,6 +19,7 @@ def test_control_save_retry_failure_stops_program_after_real_io_drains(tmp_path)
 
 def _assert_retry_failure_drains(root,scenario):
     with ServiceChild(root,scenario=scenario) as child:
+        child.marker('native-publication-holds').touch()
         child.start()
         resources=('reader','metadata') if scenario=='reader' else ('business','metadata','post')
         for resource in resources:child.wait(resource+'-entered')
@@ -51,6 +52,16 @@ def _assert_retry_failure_drains(root,scenario):
         for resource in resources:
             child.release(resource)
             child.wait(resource+'-ended')
+            if resource in {'metadata','settings','business'}:
+                child.wait(resource+'-native-entered')
+                native = json.loads(child.marker(resource+'-native-state.json').read_text())
+                assert native['connection_is_active'] is True and native['in_transaction'] is False
+                assert native['phase'] == ('begin' if resource=='business' else 'committed')
+                child.assert_owned()
+                assert not child.marker('public-client-closed').exists()
+                assert not child.marker('process-finalizing').exists()
+                child.release(resource+'-native')
+                child.wait(resource+'-native-ended')
             if resource=='manual':child.wait_manual()
             child.assert_owned()
             assert not child.marker('public-client-closed').exists()

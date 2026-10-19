@@ -229,7 +229,8 @@ if port:
     def actual_posts(self):return len(list(self.events.glob('post-call-*')))
     def __enter__(self):return self
     def __exit__(self,*args):
-        for resource in ('post','reader','reader-shutdown','notready','business','metadata','http','control','settings','manual','optional'):self.release(resource)
+        for resource in ('post','reader','reader-shutdown','notready','business','metadata','http','control','settings','manual','optional',
+                         'business-native','metadata-native','settings-native'):self.release(resource)
         for name in self.http_handles:self.release(name)
         if self.process and self.process.poll() is None:
             self.process.terminate()
@@ -741,10 +742,26 @@ def child(runtime_root,port,scenario,config_path):
                 # This optional audit write never acquires SQLite's write lock
                 # or succeeds. Its actual external I/O lifetime still drains.
                 mark('business-record-unavailable')
+                if (events/'native-publication-holds').exists() and not (events/'business-native-entered').exists():
+                    (events/'business-native-state.json').write_text(json.dumps(dict(
+                        phase='begin', in_transaction=self.in_transaction,
+                        connection_is_active=self.fixture_connection_id in sql_active)))
+                    hold('business-native')
                 raise sqlite3.OperationalError('disposable business records unavailable')
             if name=='lp-d2-manual-command' and sql=='BEGIN' and scenario=='reader':
                 hold('manual')
             result=super().execute(sql,*a,**kw)
+            resource = {'lp-metadata-writer':'metadata', 'lp-settings-save':'settings'}.get(name)
+            if (resource and sql=='COMMIT' and (events/'native-publication-holds').exists()
+                    and not (events/(resource+'-native-entered')).exists()):
+                # Real COMMIT has returned, but this Connection/Store call and
+                # its permit have not returned or closed. Park one native
+                # owner at a time, after the fatal-control test has drained its
+                # separate admission parking; no concurrent SQLite writers.
+                (events/(resource+'-native-state.json')).write_text(json.dumps(dict(
+                    phase='committed', in_transaction=self.in_transaction,
+                    connection_is_active=self.fixture_connection_id in sql_active)))
+                hold(resource+'-native')
             if name=='lp-settings-save' and sql=='COMMIT' and 'repair-lock-order' in scenario:
                 mark('repair-settings-commit-'+str(len(list(events.glob('repair-settings-commit-*')))+1))
             if name=='lp-control-save' and sql=='COMMIT' and scenario=='late_control':
@@ -775,10 +792,11 @@ def child(runtime_root,port,scenario,config_path):
         native_admission = LPWriteCoordinator.acquire
         @contextmanager
         def staged_admission(owner, *args, **kwargs):
-            # Disposable/settings jobs remain actually in flight, before
-            # admission. Multiple native LP transactions cannot be parked
-            # together now. Native control COMMIT is still held below for
-            # UNKNOWN/late-success coverage; S01/F06 separately hold real SQL.
+            # Queue ownership and native ownership are separate stages. This
+            # first parking lets control reach its real failure while optional
+            # jobs remain in flight. Opt-in native-publication-holds above
+            # restores each committed-but-unreturned/native-BEGIN boundary,
+            # released serially by the lifecycle regression.
             name = threading.current_thread().name
             resource = {'lp-business-writer': 'business',
                         'lp-metadata-writer': 'metadata'}.get(name)

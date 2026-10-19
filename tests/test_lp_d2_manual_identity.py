@@ -39,15 +39,12 @@ def test_manual_entry_identity_claim_replays_across_owners(tmp_path, monkeypatch
     first, second = PredictionArbitrageStore(tmp_path), PredictionArbitrageStore(tmp_path)
     assert first.lp_manual_command(ACCOUNT, 'raw-key') is None
     gate, results, errors = Barrier(2), [], []
-    real_connect = sqlite3.connect
-    class SimultaneousClaims(sqlite3.Connection):
-        def execute(self, sql, *a, **kw):
-            if sql == 'BEGIN IMMEDIATE' and current_thread().name.startswith('manual-claim-'):
-                gate.wait(timeout=3)
-            return super().execute(sql,*a,**kw)
-    monkeypatch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=SimultaneousClaims))))
+    # Race public claims before single-writer admission, as with preview claims.
+    # Native BEGINs cannot rendezvous while one owns the shared permit.
     def claim(store):
-        try: results.append(store.lp_claim_manual_command(command()))
+        try:
+            gate.wait(timeout=3)
+            results.append(store.lp_claim_manual_command(command()))
         except BaseException as exc: errors.append(exc)
     threads=[Thread(target=claim,args=(store,),name='manual-claim-'+str(i)) for i,store in enumerate((first,second))]
     for t in threads: t.start()

@@ -2303,10 +2303,25 @@ def test_settings_publish_after_commit_without_blocking_current_facts(tmp_path, 
         assert entered.wait(2)
         control_entered.clear()
         assert live.request_running(False).status=='accepted'
-        assert control_entered.wait(2)
+        # Settings retains its real native COMMIT hold and the sole permit.
+        # Observe control waiting for admission, before a second native BEGIN.
+        from tests.test_lp_d3_persistence import wait_for
+        wait_for(live.store._lp_write_coordinator.status, lambda s:s['waiting']==1)
+        assert not control_entered.is_set()
         clock[0]+=11
-        fatal=live.poll().fatal
-        assert fatal is not None and live.state.snapshot().current.shutdown_requested
+        # A queued control is known-not-written, so one cancellation is safe.
+        # Exhaust its actual second attempt while settings still holds COMMIT;
+        # the late settings result must preserve this peer fatal and shutdown.
+        cancelled=wait_for(live.poll, lambda s:s.save_state=='retry_wait')
+        assert cancelled.fatal is None and cancelled.error_code=='AdmissionCancelled'
+        clock[0]=cancelled.retry_at_monotonic
+        live.poll()
+        wait_for(live.store._lp_write_coordinator.status, lambda s:s['waiting']==1)
+        assert live.control.status().attempt_number==2 and not control_entered.is_set()
+        clock[0]+=11
+        fatal=wait_for(live.poll, lambda s:s.fatal is not None).fatal
+        assert fatal.origin=='save_retry_exhausted' and fatal.outcome=='failed'
+        assert live.state.snapshot().current.shutdown_requested
         assert live.close(timeout=.01) is False and live.settings_status()['native_inflight']
         release.set();wait_settings(lambda s:not s['pending'])
         assert live.close(timeout=3) and live.settings_status()['effective'].config_version==4

@@ -1169,22 +1169,24 @@ class PolymarketLPService:
             until = checked_at + timedelta(seconds=seconds)
         else:
             return False
-        with self._lp_write_scope(), self._candidate_state_lock:
-            if not self._candidate_generation_allowed(global_recovery_generation):
-                return False
-            if exclusion_revision is not None and exclusion_revision != self._candidate_exclusion_revision:
-                return False
-            inserted = self.store.lp_record_market_exclusion(
-                condition_id, token_id, reason, checked_at=checked_at,
-                cooldown_until=until, now=self._now(),
-                global_recovery_generation=global_recovery_generation,
-            )
-            if inserted:
-                self._candidate_exclusion_revision += 1
-                self._evict_excluded_candidates(condition_id)
-                if callable(self._candidate_preparation_wakeup):
-                    self._candidate_preparation_wakeup()
-            return inserted
+        def publish_exclusion():
+            with self._candidate_state_lock:
+                if not self._candidate_generation_allowed(global_recovery_generation):
+                    return False
+                if exclusion_revision is not None and exclusion_revision != self._candidate_exclusion_revision:
+                    return False
+                inserted = self.store.lp_record_market_exclusion(
+                    condition_id, token_id, reason, checked_at=checked_at,
+                    cooldown_until=until, now=self._now(),
+                    global_recovery_generation=global_recovery_generation,
+                )
+                if inserted:
+                    self._candidate_exclusion_revision += 1
+                    self._evict_excluded_candidates(condition_id)
+                    if callable(self._candidate_preparation_wakeup):
+                        self._candidate_preparation_wakeup()
+                return inserted
+        return self._lp_write_operation(publish_exclusion, priority='background')
 
     def _candidate_market_rejection(self, reward, market, *, now, competition=None):
         """Reuse existing thresholds, cheap public facts before history/books."""
@@ -1233,15 +1235,17 @@ class PolymarketLPService:
         if not self._candidate_generation_allowed(global_recovery_generation):
             return False
         if self.exclusions_enabled and (market.get("closed") is True or market.get("resolved") is True):
-            with self._lp_write_scope(), self._candidate_state_lock:
-                if not self._candidate_generation_allowed(global_recovery_generation):
-                    return False
-                if self.store.lp_clear_ended_market_exclusions(
-                    condition_id,
-                    checked_at=checked_at,
-                    global_recovery_generation=global_recovery_generation,
-                ):
-                    self._candidate_exclusion_revision += 1
+            def publish_ended():
+                with self._candidate_state_lock:
+                    if not self._candidate_generation_allowed(global_recovery_generation):
+                        return False
+                    if self.store.lp_clear_ended_market_exclusions(
+                        condition_id,
+                        checked_at=checked_at,
+                        global_recovery_generation=global_recovery_generation,
+                    ):
+                        self._candidate_exclusion_revision += 1
+            self._lp_write_operation(publish_ended, priority='background')
             return True
         return False
 
@@ -1612,34 +1616,40 @@ class PolymarketLPService:
         scope = getattr(self.store, 'lp_write_scope', None)
         return scope() if callable(scope) else nullcontext()
 
+    def _lp_write_operation(self, operation, *, priority='background'):
+        run = getattr(self.store, 'lp_write_operation', None)
+        return run(operation, priority=priority) if callable(run) else operation()
+
     def _save_preparation(
         self,
         updates: Mapping[str, object],
         *,
         expected_generation: int | None = None,
     ) -> dict[str, object]:
-        with self._lp_write_scope(), self._preparation_lock:
-            current = self.preparation_snapshot()
-            merged = {**current, **dict(updates)}
-            if expected_generation is not None and "generation" not in updates:
-                merged["generation"] = expected_generation
-            writer = getattr(self.store, "lp_save_preparation", None)
-            reader = getattr(self.store, "lp_preparation", None)
-            existing = reader() if callable(reader) else None
-            store_expected = (
-                expected_generation if isinstance(existing, Mapping) else None
-            )
-            saved = (
-                writer(merged, expected_generation=store_expected, initialize_global_fence=True)
-                if callable(writer)
-                else merged
-            )
-            if isinstance(saved, Mapping):
-                self._preparation = deepcopy(dict(saved))
-                return deepcopy(dict(saved))
-            latest = self.preparation_snapshot()
-            self._preparation = latest
-            return latest
+        def save():
+            with self._preparation_lock:
+                current = self.preparation_snapshot()
+                merged = {**current, **dict(updates)}
+                if expected_generation is not None and "generation" not in updates:
+                    merged["generation"] = expected_generation
+                writer = getattr(self.store, "lp_save_preparation", None)
+                reader = getattr(self.store, "lp_preparation", None)
+                existing = reader() if callable(reader) else None
+                store_expected = (
+                    expected_generation if isinstance(existing, Mapping) else None
+                )
+                saved = (
+                    writer(merged, expected_generation=store_expected, initialize_global_fence=True)
+                    if callable(writer)
+                    else merged
+                )
+                if isinstance(saved, Mapping):
+                    self._preparation = deepcopy(dict(saved))
+                    return deepcopy(dict(saved))
+                latest = self.preparation_snapshot()
+                self._preparation = latest
+                return latest
+        return self._lp_write_operation(save, priority='reliable')
 
     def _claim_fault_alert_if_due(
         self, state: Mapping[str, object]
@@ -2354,11 +2364,13 @@ class PolymarketLPService:
         if scope == "global":
             if not callable(item_recoverer):
                 raise RuntimeError("durable preparation recovery is unavailable")
-            with self._lp_write_scope(), self._candidate_state_lock:
-                item_recoverer((), expected_generation=expected_generation)
-                self._prepared_inputs = None
-                self._prepared_inputs_version += 1
-                self._candidate_queue_state = None
+            def publish_recovery():
+                with self._candidate_state_lock:
+                    item_recoverer((), expected_generation=expected_generation)
+                    self._prepared_inputs = None
+                    self._prepared_inputs_version += 1
+                    self._candidate_queue_state = None
+            self._lp_write_operation(publish_recovery, priority='reliable')
             return {**self.preparation_snapshot(), "recovered_condition_ids": []}
         recovered_items = item_recoverer() if callable(item_recoverer) else ()
         recovered_condition_ids = [
@@ -9726,148 +9738,150 @@ class PolymarketLPService:
             financial_facts = builder(
                 snapshot, now=self._now(), expected_account_id=account_id,
             )
-            token_results = []
-            registered_sessions = {}
-            created = joined = 0
-            prepare_seconds = monotonic() - prepared_at
-            _lp_causal_event("account_publish_ready", account=snapshot, prepare_seconds=prepare_seconds)
-            lock_started = monotonic()
-            with self._lp_write_scope(), _lp_read_lock(self._first_seen_apply_lock, "account_registration_apply_lock_wait"):
-                diagnostics["apply_lock_wait_seconds"] = round(monotonic() - lock_started, 3)
-                with self.store._transaction(prepare_seconds=prepare_seconds, diagnostics=diagnostics, lp_priority="reliable") as connection:
-                    _lp_causal_event("account_publish_begin", account=snapshot, prepare_seconds=prepare_seconds)
-                    observed = connection.execute(
-                        "SELECT generation FROM lp_trade_generation WHERE singleton=1"
-                    ).fetchone()
-                    current_revisions = revisions(connection)
-                    if observed is None:
-                        raise LpObservationWait("account_round_invalid")
-                    current_generation = int(observed['generation'])
-                    if current_generation != generation or current_revisions != expected_revisions:
-                        if not _automatic_observation or current_generation != generation:
+            def publish_account():
+                token_results = []
+                registered_sessions = {}
+                created = joined = 0
+                prepare_seconds = monotonic() - prepared_at
+                _lp_causal_event("account_publish_ready", account=snapshot, prepare_seconds=prepare_seconds)
+                lock_started = monotonic()
+                with _lp_read_lock(self._first_seen_apply_lock, "account_registration_apply_lock_wait"):
+                    diagnostics["apply_lock_wait_seconds"] = round(monotonic() - lock_started, 3)
+                    with self.store._transaction(prepare_seconds=prepare_seconds, diagnostics=diagnostics, lp_priority="reliable") as connection:
+                        _lp_causal_event("account_publish_begin", account=snapshot, prepare_seconds=prepare_seconds)
+                        observed = connection.execute(
+                            "SELECT generation FROM lp_trade_generation WHERE singleton=1"
+                        ).fetchone()
+                        current_revisions = revisions(connection)
+                        if observed is None:
                             raise LpObservationWait("account_round_invalid")
-                        # Monitoring may publish the very IDs in this read.
-                        # Accept that narrow change only after checking every
-                        # changed owner and actual new BUY request/exposure.
-                        buys = {buy['order_id']: buy for buy in financial_facts['buys']}
-                        positions = {position['token_id']: position for position in financial_facts['positions']}
-                        fills = financial_facts.get('order_fills') or {}
-                        owned_fill_rows = {str(fill['order_id']): fill for fill in owned_fills}
-                        for sid in expected_revisions.keys() | current_revisions.keys():
-                            if expected_revisions.get(sid) == current_revisions.get(sid):
-                                continue
-                            row = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?', (sid,)).fetchone()
-                            session = self.store._lp_row_result(row) if row else None
-                            if not session or session.get('order_identity_conflict'):
-                                raise LpObservationWait('account_round_invalid')
-                            for audit in self.store.lp_actions(sid, connection=connection):
-                                stamp = audit.get('submit_requested_at') or audit.get('submit_post_started_at')
-                                if (submission_action_kind(audit) in ('entry', 'augment')
-                                        and audit.get('side') == 'BUY' and stamp
-                                        and _timestamp(stamp, name='submit_requested_at') >= read_started
-                                        and audit.get('state') in ('pending', 'accepted', 'unknown')):
-                                    raise LpObservationWait('account_round_invalid')
-                            for oid, fact in self._order_history(session).items():
-                                if fact.get('side') != 'BUY':
+                        current_generation = int(observed['generation'])
+                        if current_generation != generation or current_revisions != expected_revisions:
+                            if not _automatic_observation or current_generation != generation:
+                                raise LpObservationWait("account_round_invalid")
+                            # Monitoring may publish the very IDs in this read.
+                            # Accept that narrow change only after checking every
+                            # changed owner and actual new BUY request/exposure.
+                            buys = {buy['order_id']: buy for buy in financial_facts['buys']}
+                            positions = {position['token_id']: position for position in financial_facts['positions']}
+                            fills = financial_facts.get('order_fills') or {}
+                            owned_fill_rows = {str(fill['order_id']): fill for fill in owned_fills}
+                            for sid in expected_revisions.keys() | current_revisions.keys():
+                                if expected_revisions.get(sid) == current_revisions.get(sid):
                                     continue
-                                buy = buys.get(oid)
-                                matched = _maybe_decimal(fact.get('size_matched'))
-                                if (fact.get('status') == 'LIVE' or buy is not None) and (
-                                        not buy or fact.get('status') != 'LIVE'
-                                        or str(buy['token_id']) != str(session['token_id'])
-                                        or str(fact.get('token_id')) != str(buy['token_id'])
-                                        or _maybe_decimal(fact.get('price')) != _maybe_decimal(buy['price'])
-                                        or _maybe_decimal(fact.get('original_size', fact.get('quantity'))) != _maybe_decimal(buy['original_quantity'])
-                                        or matched != _maybe_decimal(buy['filled_quantity'])
-                                        or _maybe_decimal(fact.get('remaining_size')) != _maybe_decimal(buy['quantity'])):
+                                row = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?', (sid,)).fetchone()
+                                session = self.store._lp_row_result(row) if row else None
+                                if not session or session.get('order_identity_conflict'):
                                     raise LpObservationWait('account_round_invalid')
-                                if matched is None or matched < Decimal('0'):
-                                    raise LpObservationWait('account_round_invalid')
-                                if matched > Decimal('0'):
-                                    fill = owned_fill_rows.get(oid, {})
-                                    position = positions.get(str(session['token_id']), {})
-                                    quantity = _maybe_decimal(fact.get('original_size', fact.get('quantity')))
-                                    remaining = _maybe_decimal(fact.get('remaining_size'))
-                                    average = _maybe_decimal(fact.get('average_price'))
-                                    if (fill.get('side') != 'BUY'
-                                            or str(fill.get('token_id')) != str(session['token_id'])
-                                            or str(fill.get('condition_id')) != str(session.get('condition_id'))
-                                            or _maybe_decimal(fills.get(oid)) != matched
-                                            or _maybe_decimal(fill.get('size_matched')) != matched
-                                            or average is None or average <= Decimal('0')
-                                            or _maybe_decimal(fill.get('average_price')) != average
-                                            or quantity is None or quantity < matched
-                                            or remaining is None or remaining != quantity - matched
-                                            or str(fact.get('token_id')) != str(session['token_id'])
-                                            or (_maybe_decimal(fact.get('price')) or Decimal('0')) <= Decimal('0')
-                                            or _maybe_decimal(position.get('quantity')) != _maybe_decimal(session.get('residual_quantity'))
-                                            or _maybe_decimal(position.get('inventory_cost_usd')) is None
-                                            or _maybe_decimal(position['inventory_cost_usd']) != _maybe_decimal(session.get('buy_cost'))):
+                                for audit in self.store.lp_actions(sid, connection=connection):
+                                    stamp = audit.get('submit_requested_at') or audit.get('submit_post_started_at')
+                                    if (submission_action_kind(audit) in ('entry', 'augment')
+                                            and audit.get('side') == 'BUY' and stamp
+                                            and _timestamp(stamp, name='submit_requested_at') >= read_started
+                                            and audit.get('state') in ('pending', 'accepted', 'unknown')):
                                         raise LpObservationWait('account_round_invalid')
-                    _freshness(read_ended, self._now(), "account_freshness")
-                    pool_row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
-                    published = (json.loads(pool_row['payload']).get('account_financial_facts') or {}) if pool_row else {}
-                    capture_only = _automatic_observation and any(
-                        published.get(key) and _timestamp(published[key], name=key) > _timestamp(financial_facts[key], name=key)
-                        for key in ('read_started_at', 'read_ended_at', 'checked_at'))
-                    session_cache = {}
-                    for token, token_rows, candidate in prepared:
-                        result = self.store.lp_register_exchange_orders(
-                            account_id, token, token_rows, session=candidate,
-                            expected_generation=generation, connection=connection, diagnostics=diagnostics,
-                            _session_cache=session_cache,
-                        )
-                        state = "created" if result["created"] else "joined"
-                        created += int(result["created"])
-                        joined += int(not result["created"])
-                        token_results.append({"token_id": token, "state": state,
-                                              "session_id": result["session"]["session_id"]})
-                        registered_sessions[token] = result['session']
-                    # The empty-account case uses the same fenced transaction:
-                    # it is evidence of zero occupancy, not an early return.
-                    if _planning_only or capture_only:
-                        # Register proven current IDs, without account-wide
-                        # coverage, historical conclusions or full publication.
-                        for buy in financial_facts['buys']:
-                            session = registered_sessions[buy['token_id']]
-                            buy['session_id'] = session['session_id']
-                            for key in ('condition_id', 'market_id', 'outcome'):
-                                if not buy.get(key):
-                                    buy[key] = session.get(key)
-                    else:
-                        self.store.lp_publish_account_financial_facts(
-                            financial_facts, connection=connection,
-                            expected_generation=generation, diagnostics=diagnostics,
-                        )
-                    # Carry this transaction's exact source through the public
-                    # registration return. A later publisher is not its owner.
-                    row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
-                    planning_document = json.loads(row['payload']) if row else {}
-                    if _planning_only or capture_only:
-                        sessions = [self.store._lp_row_result(row) for row in
-                            connection.execute('SELECT * FROM lp_sessions ORDER BY session_id').fetchall()]
-                        holds = project_planning_buy_holds(sessions,
-                            {s['session_id']: self.store.lp_actions(s['session_id'], connection=connection)
-                             for s in sessions}, planning_document.get('intents') or {}, financial_facts['buys'],
-                            account_id=financial_facts['account_id'], checked_at=financial_facts['checked_at'],
-                            read_started_at=_timestamp(financial_facts['read_started_at'], name='read_started_at'))
-                        financial_facts.update({key: holds[key] for key in
-                            ('pending_buy_actions', 'independent_sell_unknown')})
-                        if holds['account_send_inflight']:
-                            financial_facts['financial_status'] = 'unknown'
-                            financial_facts['reason_codes'] = sorted(set(financial_facts.get('reason_codes') or ())
-                                | {'account_send_inflight'})
-                        planning_document['_planning_buy_isolation'] = holds['isolation']
-                        planning_document['account_financial_facts'] = deepcopy(financial_facts)
-                        if _planning_only and not capture_only:
-                            self.store.lp_publish_planning_account_facts(financial_facts,
-                                holds['isolation'], connection=connection)
-                    planning_capture = dict(document=planning_document, validated_at=self._now(),
-                        validated_generation=generation)
-            return {"state": "registered", "tokens": token_results,
-                    "created": created, "joined": joined,
-                    '_planning_capture': planning_capture,
-                    **({'planning_facts': financial_facts} if _planning_only else {})}
+                                for oid, fact in self._order_history(session).items():
+                                    if fact.get('side') != 'BUY':
+                                        continue
+                                    buy = buys.get(oid)
+                                    matched = _maybe_decimal(fact.get('size_matched'))
+                                    if (fact.get('status') == 'LIVE' or buy is not None) and (
+                                            not buy or fact.get('status') != 'LIVE'
+                                            or str(buy['token_id']) != str(session['token_id'])
+                                            or str(fact.get('token_id')) != str(buy['token_id'])
+                                            or _maybe_decimal(fact.get('price')) != _maybe_decimal(buy['price'])
+                                            or _maybe_decimal(fact.get('original_size', fact.get('quantity'))) != _maybe_decimal(buy['original_quantity'])
+                                            or matched != _maybe_decimal(buy['filled_quantity'])
+                                            or _maybe_decimal(fact.get('remaining_size')) != _maybe_decimal(buy['quantity'])):
+                                        raise LpObservationWait('account_round_invalid')
+                                    if matched is None or matched < Decimal('0'):
+                                        raise LpObservationWait('account_round_invalid')
+                                    if matched > Decimal('0'):
+                                        fill = owned_fill_rows.get(oid, {})
+                                        position = positions.get(str(session['token_id']), {})
+                                        quantity = _maybe_decimal(fact.get('original_size', fact.get('quantity')))
+                                        remaining = _maybe_decimal(fact.get('remaining_size'))
+                                        average = _maybe_decimal(fact.get('average_price'))
+                                        if (fill.get('side') != 'BUY'
+                                                or str(fill.get('token_id')) != str(session['token_id'])
+                                                or str(fill.get('condition_id')) != str(session.get('condition_id'))
+                                                or _maybe_decimal(fills.get(oid)) != matched
+                                                or _maybe_decimal(fill.get('size_matched')) != matched
+                                                or average is None or average <= Decimal('0')
+                                                or _maybe_decimal(fill.get('average_price')) != average
+                                                or quantity is None or quantity < matched
+                                                or remaining is None or remaining != quantity - matched
+                                                or str(fact.get('token_id')) != str(session['token_id'])
+                                                or (_maybe_decimal(fact.get('price')) or Decimal('0')) <= Decimal('0')
+                                                or _maybe_decimal(position.get('quantity')) != _maybe_decimal(session.get('residual_quantity'))
+                                                or _maybe_decimal(position.get('inventory_cost_usd')) is None
+                                                or _maybe_decimal(position['inventory_cost_usd']) != _maybe_decimal(session.get('buy_cost'))):
+                                            raise LpObservationWait('account_round_invalid')
+                        _freshness(read_ended, self._now(), "account_freshness")
+                        pool_row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+                        published = (json.loads(pool_row['payload']).get('account_financial_facts') or {}) if pool_row else {}
+                        capture_only = _automatic_observation and any(
+                            published.get(key) and _timestamp(published[key], name=key) > _timestamp(financial_facts[key], name=key)
+                            for key in ('read_started_at', 'read_ended_at', 'checked_at'))
+                        session_cache = {}
+                        for token, token_rows, candidate in prepared:
+                            result = self.store.lp_register_exchange_orders(
+                                account_id, token, token_rows, session=candidate,
+                                expected_generation=generation, connection=connection, diagnostics=diagnostics,
+                                _session_cache=session_cache,
+                            )
+                            state = "created" if result["created"] else "joined"
+                            created += int(result["created"])
+                            joined += int(not result["created"])
+                            token_results.append({"token_id": token, "state": state,
+                                                  "session_id": result["session"]["session_id"]})
+                            registered_sessions[token] = result['session']
+                        # The empty-account case uses the same fenced transaction:
+                        # it is evidence of zero occupancy, not an early return.
+                        if _planning_only or capture_only:
+                            # Register proven current IDs, without account-wide
+                            # coverage, historical conclusions or full publication.
+                            for buy in financial_facts['buys']:
+                                session = registered_sessions[buy['token_id']]
+                                buy['session_id'] = session['session_id']
+                                for key in ('condition_id', 'market_id', 'outcome'):
+                                    if not buy.get(key):
+                                        buy[key] = session.get(key)
+                        else:
+                            self.store.lp_publish_account_financial_facts(
+                                financial_facts, connection=connection,
+                                expected_generation=generation, diagnostics=diagnostics,
+                            )
+                        # Carry this transaction's exact source through the public
+                        # registration return. A later publisher is not its owner.
+                        row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+                        planning_document = json.loads(row['payload']) if row else {}
+                        if _planning_only or capture_only:
+                            sessions = [self.store._lp_row_result(row) for row in
+                                connection.execute('SELECT * FROM lp_sessions ORDER BY session_id').fetchall()]
+                            holds = project_planning_buy_holds(sessions,
+                                {s['session_id']: self.store.lp_actions(s['session_id'], connection=connection)
+                                 for s in sessions}, planning_document.get('intents') or {}, financial_facts['buys'],
+                                account_id=financial_facts['account_id'], checked_at=financial_facts['checked_at'],
+                                read_started_at=_timestamp(financial_facts['read_started_at'], name='read_started_at'))
+                            financial_facts.update({key: holds[key] for key in
+                                ('pending_buy_actions', 'independent_sell_unknown')})
+                            if holds['account_send_inflight']:
+                                financial_facts['financial_status'] = 'unknown'
+                                financial_facts['reason_codes'] = sorted(set(financial_facts.get('reason_codes') or ())
+                                    | {'account_send_inflight'})
+                            planning_document['_planning_buy_isolation'] = holds['isolation']
+                            planning_document['account_financial_facts'] = deepcopy(financial_facts)
+                            if _planning_only and not capture_only:
+                                self.store.lp_publish_planning_account_facts(financial_facts,
+                                    holds['isolation'], connection=connection)
+                        planning_capture = dict(document=planning_document, validated_at=self._now(),
+                            validated_generation=generation)
+                return {"state": "registered", "tokens": token_results,
+                        "created": created, "joined": joined,
+                        '_planning_capture': planning_capture,
+                        **({'planning_facts': financial_facts} if _planning_only else {})}
+            return self._lp_write_operation(publish_account, priority='reliable')
         except ValueError as exc:
             if isinstance(exc, LpObservationWait):
                 return {"state": "skipped", "reason": "account_round_invalid",
@@ -10153,146 +10167,157 @@ class PolymarketLPService:
             for episode in self.store.lp_active_first_seen_episodes():
                 if str(episode.get("token_id") or "") == token_id:
                     return {"state": "skipped", "reason": "episode_exists"}
-            ordered = sorted(
-                candidates,
-                key=lambda row: (
-                    _first_seen_stamp_key(row.get("first_seen_at")),
-                    _first_seen_stamp_key(row.get("created_at")),
-                    str(row.get("order_id") or ""),
-                ),
-            )
-            anchor = ordered[0]
-            anchor_price = _maybe_decimal(anchor.get("price"))
-            if anchor_price is None:
-                return {
-                    "state": "registration_failed",
-                    "reason_codes": ["price_unknown"],
-                    "token_id": token_id,
-                }
-            level_rows = [
-                row
-                for row in ordered
-                if _maybe_decimal(row.get("price")) == anchor_price
-            ]
-            own_remaining = Decimal("0")
-            for row in level_rows:
-                remaining = _maybe_decimal(row.get("remaining"))
-                if remaining is None:
-                    own_remaining = None
-                    break
-                own_remaining += remaining
-            book = self._read_first_seen_book(token_id)
-            baseline = first_observation_baseline(
-                book,
-                price=anchor_price,
-                own_remaining=own_remaining,
-            )
-            if baseline["state"] != "known":
-                return {
-                    "state": "registration_failed",
-                    "reason_codes": list(baseline["reason_codes"]),
-                    "token_id": token_id,
-                }
-            anchor_order_ids = [
-                str(row.get("order_id") or "") for row in level_rows
-            ]
-            anchor_order_ids = [order_id for order_id in anchor_order_ids if order_id]
-            first_seen_at = _first_seen_stamp_value(
-                anchor.get("first_seen_at"), default=now
-            )
-            order_placement_times: dict[str, object] = {}
-            placement_datetimes: list[datetime] = []
-            for row in level_rows:
-                order_id = str(row.get("order_id") or "")
-                if not order_id:
-                    continue
-                try:
-                    placement = _timestamp(
-                        row.get("created_at"), name="venue_created_at"
-                    )
-                except ValueError:
-                    order_placement_times[order_id] = None
-                else:
-                    order_placement_times[order_id] = _iso(placement)
-                    placement_datetimes.append(placement)
-
-            def first_text(key: str) -> str | None:
-                for row in ordered:
-                    value = _text(row.get(key))
-                    if value is not None:
-                        return value
-                return None
-
-            market_id = first_text("market_id")
-            market_title = first_text("market_title")
-            market_url = first_text("market_url")
-            outcome = first_text("outcome")
-            received_at = _timestamp(
-                baseline["baseline_book_received_at"], name="book_received_at"
-            )
-            registration_delay = (received_at - first_seen_at).total_seconds()
-            episode_id = uuid.uuid4().hex
-            payload: dict[str, object] = {
-                "token_id": token_id,
-                "condition_id": condition_id,
-                "anchor_order_ids": anchor_order_ids,
-                "anchor_price": str(anchor_price),
-                "baseline_front": baseline["baseline_front"],
-                "baseline_price": baseline["baseline_price"],
-                "baseline_book_received_at": baseline["baseline_book_received_at"],
-                "baseline_book_hash": baseline["baseline_book_hash"],
-                "baseline_source": "first_observation",
-                "baseline_version": 1,
-                "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
-                "first_seen_at": _iso(first_seen_at),
-                "venue_created_at": (
-                    _iso(min(placement_datetimes)) if placement_datetimes else None
-                ),
-                "order_placement_times": order_placement_times,
-                "market_id": market_id,
-                "market_title": market_title,
-                "market_url": market_url,
-                "outcome": outcome,
-                "registration_delay": registration_delay,
-                "data_failures": 0,
-                "state": "monitoring",
-                "notification_sent": False,
-                "blocked_notified": False,
-                "cancel_scope": "own_buys_at_level",
-                "cancel_targets": [],
-                "canceled_order_ids": [],
-                "cancel_target_remaining": {},
-                "canceled_remaining": None,
-                "partially_filled_quantity": None,
-                "cancel_requested_at": None,
-                "cancel_reason": None,
-                "reason_codes": [],
-            }
-            episode = self.store.lp_create_first_seen_episode(
-                episode_id,
-                token_id=token_id,
-                condition_id=condition_id,
-                state="monitoring",
-                payload=payload,
-            )
-            recorder = getattr(self.store, "lp_record_book_samples", None)
-            if callable(recorder):
-                sample = self._first_seen_book_sample(
-                    condition_id=condition_id, token_id=token_id, book=book
-                )
-                if sample is not None:
-                    try:
-                        recorder([sample], now=now)
-                    except Exception:
-                        pass
+        # Resolve the external book before admission or any publication mutex.
+        ordered = sorted(
+            candidates,
+            key=lambda row: (
+                _first_seen_stamp_key(row.get("first_seen_at")),
+                _first_seen_stamp_key(row.get("created_at")),
+                str(row.get("order_id") or ""),
+            ),
+        )
+        anchor = ordered[0]
+        anchor_price = _maybe_decimal(anchor.get("price"))
+        if anchor_price is None:
             return {
-                "state": "registered",
-                "episode_id": episode_id,
-                "episode": episode,
+                "state": "registration_failed",
+                "reason_codes": ["price_unknown"],
                 "token_id": token_id,
-                "anchor_price": str(anchor_price),
-                "baseline_front": baseline["baseline_front"],
             }
+        level_rows = [
+            row
+            for row in ordered
+            if _maybe_decimal(row.get("price")) == anchor_price
+        ]
+        own_remaining = Decimal("0")
+        for row in level_rows:
+            remaining = _maybe_decimal(row.get("remaining"))
+            if remaining is None:
+                own_remaining = None
+                break
+            own_remaining += remaining
+        book = self._read_first_seen_book(token_id)
+        baseline = first_observation_baseline(
+            book,
+            price=anchor_price,
+            own_remaining=own_remaining,
+        )
+        if baseline["state"] != "known":
+            return {
+                "state": "registration_failed",
+                "reason_codes": list(baseline["reason_codes"]),
+                "token_id": token_id,
+            }
+        anchor_order_ids = [
+            str(row.get("order_id") or "") for row in level_rows
+        ]
+        anchor_order_ids = [order_id for order_id in anchor_order_ids if order_id]
+        first_seen_at = _first_seen_stamp_value(
+            anchor.get("first_seen_at"), default=now
+        )
+        order_placement_times: dict[str, object] = {}
+        placement_datetimes: list[datetime] = []
+        for row in level_rows:
+            order_id = str(row.get("order_id") or "")
+            if not order_id:
+                continue
+            try:
+                placement = _timestamp(
+                    row.get("created_at"), name="venue_created_at"
+                )
+            except ValueError:
+                order_placement_times[order_id] = None
+            else:
+                order_placement_times[order_id] = _iso(placement)
+                placement_datetimes.append(placement)
+
+        def first_text(key: str) -> str | None:
+            for row in ordered:
+                value = _text(row.get(key))
+                if value is not None:
+                    return value
+            return None
+
+        market_id = first_text("market_id")
+        market_title = first_text("market_title")
+        market_url = first_text("market_url")
+        outcome = first_text("outcome")
+        received_at = _timestamp(
+            baseline["baseline_book_received_at"], name="book_received_at"
+        )
+        registration_delay = (received_at - first_seen_at).total_seconds()
+        episode_id = uuid.uuid4().hex
+        payload: dict[str, object] = {
+            "token_id": token_id,
+            "condition_id": condition_id,
+            "anchor_order_ids": anchor_order_ids,
+            "anchor_price": str(anchor_price),
+            "baseline_front": baseline["baseline_front"],
+            "baseline_price": baseline["baseline_price"],
+            "baseline_book_received_at": baseline["baseline_book_received_at"],
+            "baseline_book_hash": baseline["baseline_book_hash"],
+            "baseline_source": "first_observation",
+            "baseline_version": 1,
+            "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
+            "first_seen_at": _iso(first_seen_at),
+            "venue_created_at": (
+                _iso(min(placement_datetimes)) if placement_datetimes else None
+            ),
+            "order_placement_times": order_placement_times,
+            "market_id": market_id,
+            "market_title": market_title,
+            "market_url": market_url,
+            "outcome": outcome,
+            "registration_delay": registration_delay,
+            "data_failures": 0,
+            "state": "monitoring",
+            "notification_sent": False,
+            "blocked_notified": False,
+            "cancel_scope": "own_buys_at_level",
+            "cancel_targets": [],
+            "canceled_order_ids": [],
+            "cancel_target_remaining": {},
+            "canceled_remaining": None,
+            "partially_filled_quantity": None,
+            "cancel_requested_at": None,
+            "cancel_reason": None,
+            "reason_codes": [],
+        }
+        def publish_first_seen():
+            with self._mutex:
+                for episode in self.store.lp_active_first_seen_episodes():
+                    if str(episode.get("token_id") or "") == token_id:
+                        return {"state": "skipped", "reason": "episode_exists"}
+                episode = self.store.lp_create_first_seen_episode(
+                    episode_id,
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    state="monitoring",
+                    payload=payload,
+                )
+                return {
+                    "state": "registered",
+                    "episode_id": episode_id,
+                    "episode": episode,
+                    "token_id": token_id,
+                    "anchor_price": str(anchor_price),
+                    "baseline_front": baseline["baseline_front"],
+                }
+        result = self._lp_write_operation(publish_first_seen, priority='background')
+        if result['state'] != 'registered':
+            return result
+        # Optional history keeps its independent transaction/retry boundary.
+        recorder = getattr(self.store, "lp_record_book_samples", None)
+        if callable(recorder):
+            sample = self._first_seen_book_sample(
+                condition_id=condition_id, token_id=token_id, book=book
+            )
+            if sample is not None:
+                try:
+                    recorder([sample], now=now)
+                except Exception:
+                    pass
+        return result
 
     def _read_first_seen_book(self, token_id: str) -> Mapping[str, object] | None:
         """Read one token's book through the bounded SDK batch adapter."""

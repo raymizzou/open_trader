@@ -437,9 +437,9 @@ def test_control_deadline_includes_admission_and_distinguishes_native_unknown(tm
 def test_d2_routes_never_construct_or_call_legacy_mutations(tmp_path, monkeypatch, d2_enabled):
     """F13 characterization, F1d option B: test routing, not financial startup.
 
-    The legacy control retains its real startup breaker. Constructed legacy
-    pool/hooks and four legacy gate responses prove branch selection without
-    fabricating a ready account or changing financial preconditions. The D2
+    The legacy control first proves its startup breaker, then opens only the
+    fixture breaker so all four installed legacy spies are positive controls.
+    No real legacy mutation is executed by those spies. The D2
     arm executes manual_call closures and keeps the zero-legacy-call assertion.
     """
     from types import SimpleNamespace
@@ -491,6 +491,9 @@ def test_d2_routes_never_construct_or_call_legacy_mutations(tmp_path, monkeypatc
         from open_trader.polymarket_lp_auto import LPAutoPool
         assert isinstance(execution._auto_pool, LPAutoPool)
         assert lp._facts_publisher is not None
+        # Fixture-only positive control: the public gate has already been
+        # characterized as locked; spies, not a real trader, receive calls.
+        execution._breaker_open = False
     results = [execution.lp_start('missing-preview', 'start-key'),
         execution.lp_augment('missing-group', 'missing-preview', 'augment-key'),
         execution.lp_submit_entry({'idempotency_key': 'entry-key'}),
@@ -501,8 +504,9 @@ def test_d2_routes_never_construct_or_call_legacy_mutations(tmp_path, monkeypatc
         assert legacy_calls == []
     else:
         assert manual_calls == entries == []
-        assert legacy_calls == []  # genuine legacy safety gates run first
-        assert results == [{'state': 'locked', 'reason': 'circuit_breaker_open'}] * 4
+        assert legacy_calls == ['start', 'augment', 'submit_entry', 'submit_augment']
+        assert results == [{'routed': 'legacy'}] * 4
+        legacy_calls.clear()
 
     wakes = []
     execution.set_lp_auto_scheduler(SimpleNamespace(request_check=lambda: wakes.append('requested')))
@@ -542,14 +546,19 @@ def test_global_lock_order_has_no_memory_lock_to_permit_inversion(tmp_path, port
         store.update_lp_observation('A', 'C', {'share_alert': {'notification_pending': False,
             'breach_started_at': None}}, expected_share_alert=old)
         assert store.lp_observations('A')['C']['share_alert'] == new
-        return
     store.lp_create_session('reward', 'reward-key', state='entry_open', payload=dict(
         condition_id='condition-M0', reward_date=STAMP.date().isoformat(), paid_rewards='0', trade_pnl='0'))
     service = PolymarketLPService(store, Exchange(STAMP, {'M0': Decimal('100')}), clock=lambda: STAMP)
     owner = LPWriteCoordinator(store.path)
     refresh = (lambda: service.refresh_rewards('reward')) if port == 'reward' else service.refresh_price_history
     read = (lambda: service.status('reward')) if port == 'reward' else service.preparation_snapshot
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    if port == 'share':
+        from tests.test_lp_sqlite_contention_core import _Account, _Notifier
+        from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+        execution = PredictionExecutionService(store=store, monitor=object(), trading=_Account(),
+            notifier=_Notifier(), lock_path=tmp_path/'share.lock')
+        refresh, read = execution.refresh_lp_share_watch, execution.lp_share_watch_state
+    with owner.enforce_lock_order(), ThreadPoolExecutor(max_workers=2) as pool:
         with owner.acquire():
             pending = pool.submit(refresh)
             wait_for(owner.status, lambda s: s['waiting'] == 1)
@@ -611,16 +620,60 @@ def test_all_lp_write_ports_use_one_resolved_database_coordinator(tmp_path):
     # transaction. The generic preview table also needs explicit LP tagging.
     module = ast.parse(inspect.getsource(__import__('open_trader.prediction_arbitrage_store', fromlist=['x'])))
     cls = next(n for n in module.body if isinstance(n, ast.ClassDef) and n.name == 'PredictionArbitrageStore')
+    # Every nonconstant SQL owner is classified, including readers/PRAGMA and
+    # startup DDL. A new unresolved execute cannot disappear merely because
+    # its method contains no literal lp_ table name (X-lite remains separate).
+    dynamic_sql_roles = {
+        'native_control': {'_connection', '_native_transaction'},
+        'bootstrap': {'_create_schema'},
+        'non_lp_writer': {'save_observation_pool_members'},
+        'lp_writer': {'lp_claim_preparation_item_alerts', 'lp_finish_preparation_item_alerts',
+            'lp_claim_preparation_retries', 'lp_recover_preparation_items',
+            'lp_publish_account_financial_facts', 'lp_register_fenced_actions'},
+        'read_only': {'relation_scan_history', 'cross_auto_attempts', 'load_llm_cache_entries',
+            'lp_price_history_summary_batches', 'lp_price_history_samples_batch', 'lp_candidate_allowed',
+            'lp_metadata_cache_items', 'lp_competitiveness_map', 'lp_auto_daily_reports',
+            '_n_leg_lineage_ancestors', '_n_leg_lineage_lock_decision', 'active_execution'},
+    }
+    all_dynamic = set()
+    supplied_connection_helpers = {'_lp_register_trade_change', 'lp_publish_planning_account_facts'}
+    observed_helpers = set()
+    observed_dynamic = set()
     for method in cls.body:
         if not isinstance(method, ast.FunctionDef):
             continue
-        writes_lp = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-            and n.func.attr == 'execute' and n.args and isinstance(n.args[0], ast.Constant)
-            and isinstance(n.args[0].value, str)
-            and re.search(r'\b(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM)\s+lp_', n.args[0].value, re.I)
-            for n in ast.walk(method))
-        if writes_lp and 'connection' not in [a.arg for a in (*method.args.args, *method.args.kwonlyargs)]:
+        calls = [node for node in ast.walk(method) if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute) and node.func.attr in {'execute', 'executemany', 'executescript'}
+            and node.args]
+        if any(not isinstance(node.args[0], ast.Constant) for node in calls):
+            all_dynamic.add(method.name)
+        # Includes f-string fragments, SQL assigned to a variable, executemany
+        # and supplied-connection helpers. Never skip a method by signature.
+        sql_literals = ' '.join(node.value for node in ast.walk(method)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str))
+        writes_lp = bool(calls) and bool(re.search(
+            r'\b(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM)\s+lp_', sql_literals, re.I))
+        if not writes_lp:
+            continue
+        if any(not isinstance(node.args[0], ast.Constant) for node in calls):
+            observed_dynamic.add(method.name)
+        if method.name == '_create_schema':
+            # Explicit startup DDL/bootstrap inventory, not a runtime port.
+            assert any(node.func.attr == 'executescript' for node in calls)
+            continue
+        if method.name in supplied_connection_helpers:
+            assert 'connection' in [a.arg for a in (*method.args.args, *method.args.kwonlyargs)]
+            assert not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr in {'_connection', '_read_connection', '_transaction'} for n in ast.walk(method))
+            observed_helpers.add(method.name)
+        else:
             assert method.name in LP_WRITE_OPERATIONS, method.name
+    assert all_dynamic <= set().union(*dynamic_sql_roles.values())
+    assert dynamic_sql_roles['lp_writer'] <= LP_WRITE_OPERATIONS
+    assert observed_helpers == supplied_connection_helpers
+    assert {'lp_claim_preparation_item_alerts', 'lp_finish_preparation_item_alerts',
+        'lp_claim_preparation_retries', 'lp_recover_preparation_items',
+        'lp_publish_account_financial_facts', 'lp_register_fenced_actions'} <= observed_dynamic
     writes = [lambda: peer.create_preview({'kind': 'LP'}, expires_at='2026-10-19T00:00:10Z',
                     created_at='2026-10-19T00:00:00Z', lp_priority='reliable'),
               lambda: peer.save_lp_observation('A', 'C', {'state': 'known'}),

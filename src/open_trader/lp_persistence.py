@@ -10,6 +10,12 @@ import threading
 import time
 import weakref
 import math
+import sqlite3
+import logging
+
+
+logger = logging.getLogger(__name__)
+SLOW_WRITE_SECONDS = 1.0
 
 
 _memory = threading.local()
@@ -204,11 +210,14 @@ class LPWriteCoordinator:
                 owner._transactions = deque(maxlen=64)
                 owner._checkpoint = None
                 owner._begin_retries = 0
+                owner._next_chain = 0
+                owner._admissions = deque(maxlen=64)
+                owner._strict_lock_order = False
                 cls._registry[identity] = owner
             return owner
 
     @contextmanager
-    def acquire(self, priority='background', *, deadline=None, cancellation=None):
+    def acquire(self, priority='background', *, deadline=None, cancellation=None, retry_chain=None):
         ranks = {'control': 0, 'safety': 0, 'reliable': 1, 'background': 2}
         if priority not in ranks:
             raise ValueError('lp_write_priority_invalid')
@@ -216,53 +225,122 @@ class LPWriteCoordinator:
         deadline = started + 15 if deadline is None else deadline
         if not math.isfinite(deadline):
             raise ValueError('lp_write_deadline_invalid')
+        wal_bytes = self.wal_bytes()
         try:
-            wal_bytes = self.path.with_name(self.path.name + '-wal').stat().st_size
-        except FileNotFoundError:
-            wal_bytes = 0
-        except OSError:
-            wal_bytes = None
-        with self._condition:
-            if getattr(_memory, 'held', ()):
-                self._lock_order_violations += 1
-            if self._holder_thread == threading.get_ident():
-                raise RuntimeError('nested_lp_write_connection')
-            ticket = (ranks[priority], self._next_ticket)
-            self._next_ticket += 1
-            self._pending.append(ticket)
-            try:
-                while True:
-                    if cancellation is not None and cancellation.is_set():
-                        self._cancelled += 1
-                        raise AdmissionCancelled('lp_write_cancelled_before_begin')
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        self._timed_out += 1
-                        raise AdmissionTimeout('lp_write_admission_deadline')
-                    if self._holder is None and min(self._pending) == ticket:
-                        break
-                    self._condition.wait(min(remaining, .025) if cancellation is not None else remaining)
-            finally:
-                self._pending.remove(ticket)
-                self._condition.notify_all()
-            self._holder = ticket
-            self._holder_thread = threading.get_ident()
-            acquired = time.monotonic()
-            self._wait_seconds += acquired - started
-            self._local.wait_seconds = acquired - started
-            self._local.wal_bytes = wal_bytes
-            self._local.priority = priority
+            with self._condition:
+                if getattr(_memory, 'held', ()):
+                    self._lock_order_violations += 1
+                    if self._strict_lock_order:
+                        raise RuntimeError('lp_write_lock_order_violation')
+                if self._holder_thread == threading.get_ident():
+                    raise RuntimeError('nested_lp_write_connection')
+                enqueued_at = time.monotonic()
+                ticket = (ranks[priority], self._next_ticket, enqueued_at)
+                self._next_ticket += 1
+                self._pending.append(ticket)
+                try:
+                    while True:
+                        if cancellation is not None and cancellation.is_set():
+                            raise AdmissionCancelled('lp_write_cancelled_before_begin')
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise AdmissionTimeout('lp_write_admission_deadline')
+                        if self._holder is None and min(self._pending) == ticket:
+                            break
+                        self._condition.wait(min(remaining, .025) if cancellation is not None else remaining)
+                finally:
+                    self._pending.remove(ticket)
+                    self._condition.notify_all()
+                self._holder = ticket
+                self._holder_thread = threading.get_ident()
+                acquired = time.monotonic()
+                self._wait_seconds += acquired - started
+                self._local.wait_seconds = acquired - started
+                self._local.ticket_enqueued_at = enqueued_at
+                self._local.wal_bytes = wal_bytes
+                self._local.priority = priority
+                if retry_chain is not None and retry_chain['attempt']:
+                    retry_chain['retry_wait_seconds'] += acquired - started
+        except (AdmissionTimeout, AdmissionCancelled) as error:
+            if retry_chain is not None and retry_chain['attempt']:
+                retry_chain['retry_wait_seconds'] += time.monotonic() - started
+            self.admission_failed(error, priority=priority, started=started,
+                enqueued_at=enqueued_at, retry_chain=retry_chain)
+            raise
         try:
+            if acquired - started >= SLOW_WRITE_SECONDS:
+                self._record_admission('slow_wait', priority, enqueued_at, acquired-started, 0.0, retry_chain=retry_chain)
             yield self
         finally:
+            held = time.monotonic() - acquired
             with self._condition:
-                self._hold_seconds += time.monotonic() - acquired
+                self._hold_seconds += held
                 self._completed += 1
                 self._holder = self._holder_thread = None
                 self._condition.notify_all()
+            self._record_admission('slow_hold' if held >= SLOW_WRITE_SECONDS else 'complete',
+                priority, enqueued_at, acquired-started, held, retry_chain=retry_chain)
+
+    def wal_bytes(self):
+        # File sampling is always outside admission and its queue mutex.
+        try:
+            return self.path.with_name(self.path.name + '-wal').stat().st_size
+        except FileNotFoundError:
+            return 0
+        except OSError:
+            return None
+
+    def _record_admission(self, event, priority, started, wait_seconds, hold_seconds, *, retry_chain=None):
+        row = dict(event=event, priority=priority, ticket_enqueued_at=started,
+            wait_seconds=wait_seconds, hold_seconds=hold_seconds, thread=threading.get_ident(),
+            chain_id=retry_chain['chain_id'] if retry_chain is not None else None,
+            begin_attempts=retry_chain['begin_attempts'] if retry_chain is not None else 0,
+            retry_wait_seconds=retry_chain['retry_wait_seconds'] if retry_chain is not None else 0.0)
+        with self._condition:
+            self._admissions.append(row)
+        if event != 'complete':
+            try:
+                logger.warning('lp_write_admission event=%s priority=%s ticket_enqueued_at=%.6f wait_seconds=%.3f hold_seconds=%.3f thread=%s chain_id=%s begin_attempts=%d retry_wait_seconds=%.3f',
+                    event, priority, started, wait_seconds, hold_seconds, row['thread'],
+                    row['chain_id'], row['begin_attempts'], row['retry_wait_seconds'])
+            except Exception:
+                pass  # Observability cannot change a storage outcome.
+
+    def admission_failed(self, error, *, priority, started, enqueued_at=None, retry_chain=None):
+        if getattr(error, '_lp_admission_logged', False):
+            return
+        error._lp_admission_logged = True
+        cancelled = isinstance(error, AdmissionCancelled)
+        with self._condition:
+            if cancelled:
+                self._cancelled += 1
+            else:
+                self._timed_out += 1
+        self._record_admission('cancelled' if cancelled else 'timeout', priority,
+            enqueued_at if enqueued_at is not None else getattr(self._local, 'ticket_enqueued_at', started),
+            max(0.0, time.monotonic()-started), 0.0, retry_chain=retry_chain)
+
+    def new_retry_chain(self, deadline):
+        with self._condition:
+            identity = self._next_chain
+            self._next_chain += 1
+        return dict(chain_id=identity, deadline=deadline, attempt=0, body_entered=False,
+            begin_attempts=0, retry_wait_seconds=0.0)
 
     @contextmanager
-    def scope(self, priority='reliable'):
+    def enforce_lock_order(self):
+        """Test opt-in: production counts violations without changing outcomes."""
+        with self._condition:
+            previous = self._strict_lock_order
+            self._strict_lock_order = True
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._strict_lock_order = previous
+
+    @contextmanager
+    def scope(self, priority='background', *, deadline=None):
         """Reserve admission before a caller's short memory publication lock.
 
         Each actual Store action retains its own commit/rollback boundary.
@@ -271,12 +349,51 @@ class LPWriteCoordinator:
         if self.in_scope:
             yield self
             return
-        with self.acquire(priority):
+        with self.acquire(priority, deadline=deadline, retry_chain=self.write_attempt):
             self._local.scope = True
             try:
                 yield self
             finally:
                 self._local.scope = False
+
+    def run_write(self, operation, priority='background'):
+        """Re-enter a short publication closure only before any native body.
+
+        The closure owns its guards. Unwinding it closes a failed BEGIN's
+        connection and exits every guard before releasing admission and taking
+        a new ticket. An entered body, including a committed prefix, forbids
+        replay of the closure.
+        """
+        if self.in_scope:
+            return operation()
+        deadline = time.monotonic() + 15
+        previous = getattr(self._local, 'write_attempt', None)
+        state = self.new_retry_chain(deadline)
+        self._local.write_attempt = state
+        try:
+            for attempt in range(3):
+                state['attempt'] = attempt
+                try:
+                    with self.scope(priority, deadline=deadline):
+                        if attempt and deadline - time.monotonic() < 5:
+                            raise AdmissionTimeout('lp_write_retry_budget_exhausted')
+                        return operation()
+                except (AdmissionTimeout, AdmissionCancelled) as error:
+                    self.admission_failed(error, priority=priority, started=deadline-15, retry_chain=state)
+                    raise
+                except sqlite3.Error as error:
+                    if (state['body_entered'] or attempt >= 2
+                            or not getattr(error, '_lp_begin_not_started', False)
+                            or getattr(error, 'sqlite_errorcode', None) != sqlite3.SQLITE_BUSY
+                            or deadline - time.monotonic() < 5):
+                        raise
+                    self.record_begin_retry()
+        finally:
+            self._local.write_attempt = previous
+
+    @property
+    def write_attempt(self):
+        return getattr(self._local, 'write_attempt', None)
 
     @property
     def in_scope(self):
@@ -292,10 +409,14 @@ class LPWriteCoordinator:
         finally:
             self._local.native = False
 
-    def record_transaction(self, operation, **metrics):
+    def record_transaction(self, operation, *, retry_chain=None, **metrics):
         metrics.update(operation=operation, permit_wait_seconds=float(getattr(self._local, 'wait_seconds', 0)),
             wal_bytes_before=getattr(self._local, 'wal_bytes', None),
-            priority=getattr(self._local, 'priority', 'unknown'))
+            priority=getattr(self._local, 'priority', 'unknown'), thread=threading.get_ident(),
+            ticket_enqueued_at=getattr(self._local, 'ticket_enqueued_at', None),
+            chain_id=retry_chain['chain_id'] if retry_chain is not None else None,
+            begin_attempts=retry_chain['begin_attempts'] if retry_chain is not None else 0,
+            retry_wait_seconds=retry_chain['retry_wait_seconds'] if retry_chain is not None else 0.0)
         with self._condition:
             self._transactions.append(metrics)
 
@@ -305,22 +426,26 @@ class LPWriteCoordinator:
 
     def record_read_stage(self, operation, *, phase, seconds, cpu_seconds, stages):
         """Scans/hydration outside admission must not disappear from telemetry."""
-        row = dict(operation=operation, phase=phase, failed=False, wall_seconds=seconds,
+        row = dict(operation=operation, phase=phase, failed=False, wall_seconds=seconds, thread=threading.get_ident(),
             thread_cpu_seconds=cpu_seconds, begin_seconds=0.0, body_seconds=0.0,
             guard_wait_seconds=0.0, commit_seconds=0.0, after_commit_seconds=0.0,
             permit_wait_seconds=0.0, wal_bytes_before=None, priority='read_only', stages=dict(stages))
         with self._condition:
             self._transactions.append(row)
 
-    def record_checkpoint(self, result, *, seconds, page_size, autocheckpoint):
+    def record_checkpoint(self, result, *, seconds, page_size, autocheckpoint, wal_bytes_before=None, wal_bytes_after=None):
         with self._condition:
             self._checkpoint = dict(busy=result[0], log_frames=result[1], checkpointed_frames=result[2],
                 seconds=seconds, page_size=page_size, wal_autocheckpoint_pages=autocheckpoint,
-                source='existing_startup_truncate')
+                source='existing_startup_truncate', wal_bytes_before=wal_bytes_before, wal_bytes_after=wal_bytes_after,
+                wal_bytes_delta=wal_bytes_after-wal_bytes_before if wal_bytes_before is not None and wal_bytes_after is not None else None)
 
     def status(self):
         with self._condition:
-            return dict(waiting=len(self._pending), holder=self._holder is not None,
+            oldest = min((ticket[2] for ticket in self._pending), default=None)
+            return dict(oldest_ticket_enqueued_at=oldest,
+                        oldest_ticket_age_seconds=max(0.0, time.monotonic()-oldest) if oldest is not None else 0.0,
+                        admissions=[dict(row) for row in self._admissions], waiting=len(self._pending), holder=self._holder is not None,
                         completed=self._completed, permit_wait_seconds=self._wait_seconds,
                         permit_hold_seconds=self._hold_seconds,
                         cancelled_before_begin=self._cancelled, admission_timeouts=self._timed_out,

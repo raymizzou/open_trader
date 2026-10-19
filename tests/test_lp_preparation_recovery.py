@@ -537,22 +537,29 @@ def test_begin_preparation_write_failure_cannot_pause_recovered_generation(tmp_p
             fail_after_release()
         return writer(payload, expected_generation=expected_generation, initialize_global_fence=initialize_global_fence)
     if boundary == 'begin-write':
-        from contextlib import contextmanager
-        original_scope = service._lp_write_scope
+        original_operation = store.lp_write_operation
         first = [True]
-        @contextmanager
-        def delayed_admission():
-            # Recovery wins before this old attempt owns admission. Holding
-            # the permit while asking recovery to write is no longer a valid
-            # scheduling fixture. The real SQL failure still happens below.
-            if first[0]:
-                first[0] = False
-                entered.set()
-                assert release.wait(5), 'Independent initial admission watchdog'
-            with original_scope():
-                yield
-        monkeypatch.setattr(service, '_lp_write_scope', delayed_admission)
-        monkeypatch.setattr(store, 'lp_save_preparation', delayed_writer)
+        def fail_from_old_snapshot(payload, *, expected_generation=None, initialize_global_fence=False):
+            if payload.get('state') == 'preparing':
+                assert expected_generation == 1
+                # The old generation has really been read/merged after
+                # admission. Fail real SQL, then let every native resource and
+                # publication guard unwind before the independent recovery.
+                with store._transaction(lp_priority='reliable') as connection:
+                    connection.execute('SELECT * FROM missing_private_fixture_table')
+            return writer(payload, expected_generation=expected_generation,
+                initialize_global_fence=initialize_global_fence)
+        def after_failed_admission(operation, **kwargs):
+            try:
+                return original_operation(operation, **kwargs)
+            except sqlite3.Error:
+                if first[0]:
+                    first[0] = False
+                    entered.set()
+                    assert release.wait(5), 'Independent stale-snapshot failure watchdog'
+                raise
+        monkeypatch.setattr(store, 'lp_write_operation', after_failed_admission)
+        monkeypatch.setattr(store, 'lp_save_preparation', fail_from_old_snapshot)
     else:
         monkeypatch.setattr(store, 'lp_preparation_items', fail_after_release)
     results, errors = [], []
