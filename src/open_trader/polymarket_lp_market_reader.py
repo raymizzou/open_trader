@@ -35,6 +35,24 @@ def decimal(value):
         return None
 
 
+def observed_source_error(source):
+    """Only native error codes and captured exception types are publishable."""
+    if source is None or not source.error:
+        return None
+    if source.error in ('capacity', 'timeout', 'in_progress', 'closed', 'provider_error'):
+        return source.error
+    exception_type = source.diagnostics.get('exception_type') if isinstance(source.diagnostics, Mapping) else None
+    return exception_type[:64] if isinstance(exception_type, str) else 'provider_error'
+
+
+def _freeze_source_diagnostics(value):
+    """Diagnostic metadata must not invalidate captured trading facts."""
+    try:
+        return freeze(value) if isinstance(value, Mapping) else MappingProxyType({})
+    except Exception:
+        return MappingProxyType({})
+
+
 @dataclass(frozen=True)
 class ReadScope:
     account: str
@@ -52,6 +70,7 @@ class SourceResult:
     retry_at: float | None = None
     failed_at: datetime | None = None
     error_facts: Mapping = field(default_factory=dict)
+    diagnostics: Mapping = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -72,6 +91,7 @@ class MarketFrame:
     inventory_cost: Decimal | None = None
     history_fees: Decimal | None = None
     errors: tuple[str, ...] = ()
+    reader_diagnostics: Mapping = field(default_factory=dict)
 
     @property
     def current_buys(self):
@@ -84,13 +104,15 @@ class MarketReader:
         self._clock = clock
         self._lock = threading.Lock()
         self._jobs = {}
+        self._job_started_at = {}
         self._retry = {}
         self._wait_epoch = 0
         self._closed = False
 
     @staticmethod
     def from_captured_sources(captured: CapturedSources) -> MarketFrame:
-        sources = {name: replace(s, value=freeze(s.value), error_facts=freeze(s.error_facts)) for name, s in captured.sources.items()}
+        sources = {name: replace(s, value=freeze(s.value), error_facts=freeze(s.error_facts),
+            diagnostics=_freeze_source_diagnostics(s.diagnostics)) for name, s in captured.sources.items()}
         errors, orders, positions = [], [], []
         order_source = sources.get('open_orders')
         position_source = sources.get('positions')
@@ -142,6 +164,14 @@ class MarketReader:
     def _start(self, key, scope):
         future = Future()
         self._jobs[key] = future
+        try:
+            for previous in tuple(self._job_started_at):
+                job = self._jobs.get(previous)
+                if job is None or job.done():
+                    self._job_started_at.pop(previous, None)
+            self._job_started_at[key] = self._clock()
+        except Exception:
+            pass
         def run():
             source_id = uuid.uuid4().hex
             try:
@@ -166,7 +196,8 @@ class MarketReader:
                 if not isinstance(seconds, (int, float)) or not 0 <= seconds < float('inf'):
                     seconds = 60
                 result = SourceResult(source_id, complete=False, error=type(exc).__name__,
-                    retry_at=response_at + seconds, failed_at=failed_at, error_facts=freeze(facts))
+                    retry_at=response_at + seconds, failed_at=failed_at, error_facts=freeze(facts),
+                    diagnostics=freeze(dict(exception_type=type(exc).__name__[:64])))
                 with self._lock:
                     if response_epoch == self._wait_epoch:
                         self._retry[key] = result
@@ -184,6 +215,7 @@ class MarketReader:
                     existing = self._jobs.get(key)
                     if existing is not None and existing.done():
                         self._jobs.pop(key)
+                        self._job_started_at.pop(key, None)
                         existing = None
                     retry = self._retry.get(key)
                     if self._closed:
@@ -192,6 +224,12 @@ class MarketReader:
                         sources[name] = SourceResult('', complete=False, error='in_progress')
                     elif retry and self._clock() < retry.retry_at:
                         sources[name] = retry
+                        try:
+                            sources[name] = replace(retry, diagnostics=freeze(dict(retry.diagnostics,
+                                retry_cache_hit=True,
+                                remaining_retry_seconds=max(0, retry.retry_at-self._clock()))))
+                        except Exception:
+                            pass
                     elif time.monotonic() >= deadline:
                         sources[name] = SourceResult('', complete=False, error='timeout')
                     elif sum(not f.done() for f in self._jobs.values()) < 2:
@@ -211,6 +249,16 @@ class MarketReader:
                     sources[name] = SourceResult('', complete=False, error='timeout' if name in own else 'capacity')
                 break
             wait(tuple(own.values()), timeout=remaining, return_when=FIRST_COMPLETED)
+        # Observation cannot change an acquired result or native ownership.
+        try:
+            sources = {name: replace(s, diagnostics=freeze(dict(
+                {'retry_cache_hit': False, 'remaining_retry_seconds': None}, **s.diagnostics,
+                source_error=s.error, error_class=(s.error if s.error in
+                    ('capacity', 'timeout', 'in_progress', 'closed') else 'exception' if s.error else None),
+                http_status=s.error_facts.get('status') if type(s.error_facts.get('status')) is int else None)))
+                for name, s in sources.items()}
+        except Exception:
+            pass
         frame = self.from_captured_sources(CapturedSources(scope.account, sources))
         if scope.related_markets:
             identities = sorted({(r['condition_id'], r['token_id']) for r in (*frame.orders, *frame.positions)})
@@ -218,6 +266,23 @@ class MarketReader:
                 market_scope = ReadScope(scope.account, tuple('market:' + c + ':' + t for c, t in identities))
                 markets = self.read_current(market_scope, deadline)
                 frame = self.from_captured_sources(CapturedSources(scope.account, {**sources, **markets.sources}))
+        try:
+            with self._lock:
+                observed = self._clock()
+                jobs = tuple(dict(key=key, scope=dict(account=key[0], component=key[1],
+                    condition_id=key[1].split(':',2)[1] if key[1].startswith('market:') and key[1].count(':')>=2 else None,
+                    token_id=key[1].split(':',2)[2] if key[1].startswith('market:') and key[1].count(':')>=2 else None),
+                    age_seconds=max(0, observed-self._job_started_at[key])
+                        if key in self._job_started_at else None)
+                    for key, future in self._jobs.items() if not future.done())
+            ages = {tuple(job['key']): job['age_seconds'] for job in jobs}
+            frame = replace(frame, reader_diagnostics=freeze(dict(inflight_count=len(jobs),
+                jobs=jobs[:2], observed_monotonic=observed)),
+                sources=MappingProxyType({name: replace(s, diagnostics=freeze(dict(s.diagnostics,
+                    inflight_age_seconds=ages.get((scope.account, name)))))
+                    for name, s in frame.sources.items()}))
+        except Exception:
+            pass
         return frame
 
     def reset_provider_wait(self):

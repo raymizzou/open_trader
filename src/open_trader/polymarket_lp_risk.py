@@ -1334,15 +1334,19 @@ def minimum_order_estimate(direction, guidance, now, *, resting_quantity=Decimal
             or set(estimate.get('reason_codes', [])) in ({'reward_distance_invalid'}, {'reward_score_zero'})):
         return dict(state='known', basis='resting_non_scoring_order', quantity=quantity,
                     price=price, capital_usd=price*quantity, hourly_reward_usd=ZERO,
-                    yield_pct_per_hour=ZERO, checked_at=now)
+                    yield_pct_per_hour=ZERO, checked_at=now,
+                    estimated_share=None, competition_upper_bound=None, daily_pool_usd=direction.get('daily_pool_usd'))
     if estimate['state'] != 'known':
         return estimate
     weight = (1 - abs(price - estimate['midpoint']) / _decimal(market['reward_max_spread'], 'money')) ** 2
     competition = estimate['competition_upper_bound']
+    scores = None
     if resting_quantity:
         bids = _levels(direction['book'].get('bids'), 'bids')
-        if sum((size for p, size in bids if p == price), ZERO) < resting_quantity:
-            return dict(state='unknown', reason_codes=['own_order_depth_unknown'])
+        public_depth = sum((size for p, size in bids if p == price), ZERO)
+        if public_depth < resting_quantity:
+            return dict(state='unknown', reason_codes=['own_order_depth_unknown'],
+                public_depth_at_price=public_depth, resting_quantity=resting_quantity)
         # Keep the observed reward midpoint; remove our score from competition,
         # since public depth already contains this resting order.
         scores = []
@@ -1355,10 +1359,15 @@ def minimum_order_estimate(direction, guidance, now, *, resting_quantity=Decimal
         competition = min(scores) + abs(scores[0] - scores[1]) / 3
     own_score = quantity * weight / 3
     share = own_score / (competition + own_score)
-    reward = _decimal(direction['daily_pool_usd'], 'money') * share / 24
+    pool = _decimal(direction['daily_pool_usd'], 'money')
+    reward = pool * share / 24
     return dict(state='known', basis='resting_scoring_order' if resting_quantity else 'minimum_scoring_order', quantity=quantity,
                 price=price, capital_usd=price*quantity, hourly_reward_usd=reward,
-                yield_pct_per_hour=reward/(price*quantity)*100, checked_at=now)
+                yield_pct_per_hour=reward/(price*quantity)*100, checked_at=now,
+                estimated_share=share, competition_upper_bound=competition,
+                daily_pool_usd=pool,
+                weighted_bid_score=scores[0] if scores is not None else None,
+                weighted_ask_score=scores[1] if scores is not None else None)
 
 
 def estimate_lp_queue_position(
