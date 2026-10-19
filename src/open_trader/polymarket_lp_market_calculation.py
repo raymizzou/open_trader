@@ -58,7 +58,8 @@ def calculate_current(frame, policy, as_of) -> CalculationResult:
         if direction:
             try:
                 estimate = minimum_order_estimate(direction, {'price': row['price'],
-                    'quantity': row['remaining']}, as_of, resting_quantity=row['remaining'])
+                    'quantity': row['remaining']}, as_of, resting_quantity=row['remaining'],
+                    include_observation=True)
             except (ValueError, TypeError, KeyError) as exc:
                 exception_type = type(exc).__name__
         estimates[row['order_id']] = (estimate.get('yield_pct_per_hour')
@@ -101,7 +102,7 @@ def calculate_current(frame, policy, as_of) -> CalculationResult:
             try:
                 quantity, price = decimal(row['quantity']), decimal(row['price'])
                 estimate = minimum_order_estimate(row['direction'], {'price': price, 'quantity': quantity},
-                    row.get('evaluation_at', as_of))
+                    row.get('evaluation_at', as_of), include_observation=True)
                 rate = estimate.get('yield_pct_per_hour')
                 candidate_yields[row['token_id']] = rate if estimate.get('state') == 'known' else None
                 try:

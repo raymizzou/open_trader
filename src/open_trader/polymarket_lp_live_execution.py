@@ -1276,24 +1276,33 @@ class LPD2LiveExecution:
             except Exception:
                 summary = dict(summary, yield_observation=dict(available=False))
             with self.state._lock:
-                observed = summary.get('yield_observation', {})
-                if observed.get('available'):
-                    observed = dict(observed)
-                    self._yield_unknown_observations = freeze(observed.pop('unknown_incumbents')['samples'])
-                    summary['yield_observation'] = observed
-                    try:
-                        history = yield_diagnostic_value(self._yield_rounds)
-                    except Exception:
-                        history = []
-                        self._yield_diagnostic_instance = uuid4().hex
-                    identity = observed['identity']['observation_id']
-                    duplicate = any(r['identity']['observation_id'] == identity for r in history)
-                    self._yield_rounds_total += not duplicate
-                    self._yield_rounds = freeze([r for r in history
-                        if r['identity']['observation_id'] != identity] + [observed])[-YIELD_ROUND_LIMIT:]
-                summary['yield_rounds'] = dict(instance_id=self._yield_diagnostic_instance,
-                    total_observations=self._yield_rounds_total, round_limit=YIELD_ROUND_LIMIT,
-                    row_limit=YIELD_ROW_LIMIT, recent=self._yield_rounds)
+                try:
+                    observed = summary.get('yield_observation', {})
+                    if observed.get('available'):
+                        observed = dict(observed)
+                        unknown_observations = freeze(observed.pop('unknown_incumbents')['samples'])
+                        summary['yield_observation'] = observed
+                        try:
+                            history = yield_diagnostic_value(self._yield_rounds)
+                        except Exception:
+                            history = []
+                            self._yield_diagnostic_instance = uuid4().hex
+                        identity = observed['identity']['observation_id']
+                        duplicate = any(r['identity']['observation_id'] == identity for r in history)
+                        rounds = freeze([r for r in history
+                            if r['identity']['observation_id'] != identity] + [observed])[-YIELD_ROUND_LIMIT:]
+                        self._yield_unknown_observations = unknown_observations
+                        self._yield_rounds_total += not duplicate
+                        self._yield_rounds = rounds
+                    summary['yield_rounds'] = dict(instance_id=self._yield_diagnostic_instance,
+                        total_observations=self._yield_rounds_total, round_limit=YIELD_ROUND_LIMIT,
+                        row_limit=YIELD_ROW_LIMIT, recent=self._yield_rounds)
+                except Exception:
+                    self._yield_rounds, self._yield_unknown_observations = (), ()
+                    self._yield_rounds_total = 0
+                    self._yield_diagnostic_instance = uuid4().hex
+                    summary['yield_observation'] = dict(available=False)
+                    summary['yield_rounds'] = dict(available=False)
                 self._diagnostics = freeze({**{k: v for k, v in summary.items() if k != 'local_outcomes'}, 'accepted_observation':
                     summary['accepted_observation'] or self._diagnostics.get('accepted_observation'),
                     'round_start': summary['round_start'] if start else self._diagnostics.get('round_start')})
@@ -1352,28 +1361,34 @@ class LPD2LiveExecution:
                     recent=[dict(order_id=y.order_key[3], unknown_since_at=y.unknown_since_at,
                         age_seconds=max(0, now-y.unknown_since_monotonic),
                         due_at_600=now >= y.unknown_deadline_monotonic) for y in unknown[:20]])
-                details = {r.get('order_id'): r for r in self._yield_unknown_observations}
+                try:
+                    details = {r.get('order_id'): r for r in self._yield_unknown_observations}
+                except Exception:
+                    details = {}
                 for row, state in zip(result['unknown_buy_yields']['recent'], unknown[:20]):
-                    detail = details.get(row['order_id'], {})
-                    current = bool(detail.get('accepted_input') and any(
-                        s.source_id == detail.get('order_source_id') for s in state.input_sources))
-                    row.update(yield_diagnostic_value(detail))
-                    row.update(reason_is_current=current,
-                        reason_codes=detail.get('reason_codes', ()) if current else ('reason_unavailable',),
-                        attempted_reason_codes=detail.get('reason_codes', ()))
-                    if not current:
-                        latest = result.get('yield_observation', {})
-                        relevant = ('open_orders', 'market:'+state.order_key[1]+':'+state.order_key[2])
-                        failures = [error for error in latest.get('source_errors', {}).get('samples', ())
-                            if error.get('source') in relevant or
-                            (error.get('condition_id'),error.get('token_id')) == state.order_key[1:3]]
-                        row['attempted_source_failures'] = [{k: error.get(k) for k in
-                            ('source', 'source_error', 'error_class', 'retry_cache_hit',
-                             'remaining_retry_seconds', 'inflight_age_seconds', 'http_status')}
-                            for error in failures[:2]]
-                        if failures and not detail:
-                            row['attempted_reason_codes'] = ('order_inputs_not_current',)
-                            row['reason_observation_id'] = latest.get('identity', {}).get('observation_id')
+                    try:
+                        detail = details.get(row['order_id'], {})
+                        current = bool(detail.get('accepted_input') and any(
+                            s.source_id == detail.get('order_source_id') for s in state.input_sources))
+                        enrichment = dict(yield_diagnostic_value(detail), reason_is_current=current,
+                            reason_codes=detail.get('reason_codes', ()) if current else ('reason_unavailable',),
+                            attempted_reason_codes=detail.get('reason_codes', ()))
+                        if not current:
+                            latest = result.get('yield_observation', {})
+                            relevant = ('open_orders', 'market:'+state.order_key[1]+':'+state.order_key[2])
+                            failures = [error for error in latest.get('source_errors', {}).get('samples', ())
+                                if error.get('source') in relevant or
+                                (error.get('condition_id'),error.get('token_id')) == state.order_key[1:3]]
+                            enrichment['attempted_source_failures'] = [{k: error.get(k) for k in
+                                ('source', 'source_error', 'error_class', 'retry_cache_hit',
+                                 'remaining_retry_seconds', 'inflight_age_seconds', 'http_status')}
+                                for error in failures[:2]]
+                            if failures and not detail:
+                                enrichment['attempted_reason_codes'] = ('order_inputs_not_current',)
+                                enrichment['reason_observation_id'] = latest.get('identity', {}).get('observation_id')
+                        row.update(enrichment)
+                    except Exception:
+                        row.update(reason_is_current=False, reason_codes=('reason_unavailable',))
                 return result
         except Exception:
             logger.exception('prediction_lp_diagnostics_failed')
@@ -1530,9 +1545,12 @@ class LPD2LiveExecution:
                 value = dict(kind=row.kind, identity=list(row.identity), state=row.state,
                     yield_pct_per_hour=None if row.yield_pct_per_hour is None else str(row.yield_pct_per_hour))
                 if row.kind == 'incumbent' and selection:
-                    value['observation'] = yield_diagnostic_value({k: v for k, v in
-                        selection.incumbent_observations.get(row.identity[3], {}).items()
-                        if k not in ('account_id', 'condition_id', 'token_id', 'order_id', 'state', 'yield_pct_per_hour')})
+                    try:
+                        value['observation'] = yield_diagnostic_value({k: v for k, v in
+                            selection.incumbent_observations.get(row.identity[3], {}).items()
+                            if k not in ('account_id', 'condition_id', 'token_id', 'order_id', 'state', 'yield_pct_per_hour')})
+                    except Exception:
+                        value['observation'] = None
                 return value
             known_reasons = {'balance_unknown', 'budget_unknown', 'orders_unknown', 'positions_unknown',
                 'financial_authority_unknown', 'candidates_incomplete', 'orders_not_accepted',
@@ -1571,9 +1589,12 @@ class LPD2LiveExecution:
                     expiration=order.expiration.value)
                     for order in decision.victims) if decision else bounded(()), outcomes=outcomes)
             with self.state._lock:
-                observation = self._diagnostics.get('yield_observation', {})
-                summary['source_errors'] = observation.get('source_errors')
-                summary['read_ticket'] = observation.get('read_ticket')
+                try:
+                    observation = self._diagnostics.get('yield_observation', {})
+                    summary['source_errors'] = observation.get('source_errors')
+                    summary['read_ticket'] = observation.get('read_ticket')
+                except Exception:
+                    summary['source_errors'], summary['read_ticket'] = None, None
                 self._rotation_summary, self._rotation_pending = summary, tuple(pending)
         except Exception:
             # Diagnostics cannot replace or suppress the trading result.

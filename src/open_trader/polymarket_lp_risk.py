@@ -1317,8 +1317,8 @@ def estimate_lp_target_share_yield(
 LP_QUEUE_PROTECTION_THRESHOLD = Decimal("0.5")
 
 
-def minimum_order_estimate(direction, guidance, now, *, resting_quantity=Decimal(0)):
-    """Reuse reward weights, recompute the share at the actual legal quantity."""
+def minimum_order_estimate(direction, guidance, now, *, resting_quantity=Decimal(0), include_observation=False):
+    """Keep the persisted estimate stable; extra observation fields are opt-in."""
     ZERO = Decimal(0)
     market = direction['market']
     estimate = estimate_lp_target_share_yield(
@@ -1332,10 +1332,13 @@ def minimum_order_estimate(direction, guidance, now, *, resting_quantity=Decimal
     # conclusive failures of the actual resting quote mean zero, not unknown.
     if resting_quantity and ((estimate['state'] == 'known' and quantity < _decimal(market['reward_min_size'], 'money'))
             or set(estimate.get('reason_codes', [])) in ({'reward_distance_invalid'}, {'reward_score_zero'})):
-        return dict(state='known', basis='resting_non_scoring_order', quantity=quantity,
+        result = dict(state='known', basis='resting_non_scoring_order', quantity=quantity,
                     price=price, capital_usd=price*quantity, hourly_reward_usd=ZERO,
-                    yield_pct_per_hour=ZERO, checked_at=now,
-                    estimated_share=None, competition_upper_bound=None, daily_pool_usd=direction.get('daily_pool_usd'))
+                    yield_pct_per_hour=ZERO, checked_at=now)
+        if include_observation:
+            result.update(estimated_share=None, competition_upper_bound=None,
+                daily_pool_usd=direction.get('daily_pool_usd'))
+        return result
     if estimate['state'] != 'known':
         return estimate
     weight = (1 - abs(price - estimate['midpoint']) / _decimal(market['reward_max_spread'], 'money')) ** 2
@@ -1345,8 +1348,10 @@ def minimum_order_estimate(direction, guidance, now, *, resting_quantity=Decimal
         bids = _levels(direction['book'].get('bids'), 'bids')
         public_depth = sum((size for p, size in bids if p == price), ZERO)
         if public_depth < resting_quantity:
-            return dict(state='unknown', reason_codes=['own_order_depth_unknown'],
-                public_depth_at_price=public_depth, resting_quantity=resting_quantity)
+            result = dict(state='unknown', reason_codes=['own_order_depth_unknown'])
+            if include_observation:
+                result.update(public_depth_at_price=public_depth, resting_quantity=resting_quantity)
+            return result
         # Keep the observed reward midpoint; remove our score from competition,
         # since public depth already contains this resting order.
         scores = []
@@ -1361,13 +1366,15 @@ def minimum_order_estimate(direction, guidance, now, *, resting_quantity=Decimal
     share = own_score / (competition + own_score)
     pool = _decimal(direction['daily_pool_usd'], 'money')
     reward = pool * share / 24
-    return dict(state='known', basis='resting_scoring_order' if resting_quantity else 'minimum_scoring_order', quantity=quantity,
+    result = dict(state='known', basis='resting_scoring_order' if resting_quantity else 'minimum_scoring_order', quantity=quantity,
                 price=price, capital_usd=price*quantity, hourly_reward_usd=reward,
-                yield_pct_per_hour=reward/(price*quantity)*100, checked_at=now,
-                estimated_share=share, competition_upper_bound=competition,
-                daily_pool_usd=pool,
-                weighted_bid_score=scores[0] if scores is not None else None,
-                weighted_ask_score=scores[1] if scores is not None else None)
+                yield_pct_per_hour=reward/(price*quantity)*100, checked_at=now)
+    if include_observation:
+        result.update(estimated_share=share, competition_upper_bound=competition,
+            daily_pool_usd=pool,
+            weighted_bid_score=scores[0] if scores is not None else None,
+            weighted_ask_score=scores[1] if scores is not None else None)
+    return result
 
 
 def estimate_lp_queue_position(

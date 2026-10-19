@@ -302,7 +302,8 @@ def test_estimate_details_preserve_known_zero_and_literal_values(case):
     d=candidate(pool='0' if case=='pool-zero' else '24')['direction']
     row=dict(base.orders[0])
     if case=='resting-nonscoring': row['price']=Decimal('.10')
-    result=minimum_order_estimate(d,dict(price=row['price'],quantity=20),NOW,resting_quantity=Decimal('20'))
+    result=minimum_order_estimate(d,dict(price=row['price'],quantity=20),NOW,
+        resting_quantity=Decimal('20'),include_observation=True)
     assert result['state']=='known'
     if case=='resting-nonscoring':
         assert result['basis']=='resting_non_scoring_order' and result['yield_pct_per_hour']==0
@@ -313,7 +314,7 @@ def test_estimate_details_preserve_known_zero_and_literal_values(case):
         assert result['daily_pool_usd']==Decimal('0' if case=='pool-zero' else '24')
         assert result['capital_usd']==8
         assert result['yield_pct_per_hour'].quantize(Decimal('.000000000001'))==Decimal('0' if case=='pool-zero' else '.892857142857')
-        fresh=minimum_order_estimate(d,dict(price='.40',quantity=20),NOW)
+        fresh=minimum_order_estimate(d,dict(price='.40',quantity=20),NOW,include_observation=True)
         assert fresh['competition_upper_bound']==81 and fresh['estimated_share']==Decimal('.0625')
         assert fresh['yield_pct_per_hour']==Decimal('0' if case=='pool-zero' else '.78125')
         calculated=calculate_current(replace(base,sources=MappingProxyType({**base.sources,'directions':SourceResult('d',{'o1':d})})),POLICY,NOW)
@@ -621,3 +622,118 @@ def test_yield_payload_budget_at_full_caps(current):
     assert len(observation['incumbents']['samples'])==YIELD_ROW_LIMIT
     assert len(addition['yield_rounds']['recent'])==YIELD_ROUND_LIMIT
     assert observation['incumbents']['samples'][0]['public_depth_at_price']=='1.2300'
+
+
+@pytest.mark.parametrize('case',['candidate','incumbent','pool-zero','non-scoring','own-depth','pool-unknown'])
+def test_default_minimum_estimate_preserves_legacy_output(case):
+    direction=candidate(pool='0' if case=='pool-zero' else '24')['direction']
+    price=Decimal('.10') if case=='non-scoring' else Decimal('.40')
+    resting=Decimal(0) if case=='candidate' else Decimal(20)
+    if case=='own-depth': direction['book']['bids']=[dict(price='.40',size='7')]
+    if case=='pool-unknown': direction['daily_pool_usd']=None
+    result=minimum_order_estimate(direction,dict(price=price,quantity=20),NOW,resting_quantity=resting)
+    if case=='pool-unknown':
+        assert result==dict(state='unknown',reason_codes=['reward_pool_unknown'],
+            **{key:None for key in ('yield_pct_per_hour','yield_pct_per_hour_display',
+                'target_quantity','target_capital_usd','hourly_reward_usd','midpoint',
+                'competition_upper_bound','checked_at')})
+    elif case=='own-depth':
+        assert result==dict(state='unknown',reason_codes=['own_order_depth_unknown'])
+    else:
+        assert set(result)=={'state','basis','quantity','price','capital_usd',
+            'hourly_reward_usd','yield_pct_per_hour','checked_at'}
+        assert result['state']=='known' and result['checked_at']==NOW
+        assert result['price']==price and result['quantity']==20 and result['capital_usd']==price*20
+        if case in ('pool-zero','non-scoring'):
+            assert result['hourly_reward_usd']==result['yield_pct_per_hour']==0
+        elif case=='candidate':
+            assert result['hourly_reward_usd']==Decimal('.0625') and result['yield_pct_per_hour']==Decimal('.78125')
+        else:
+            assert result['yield_pct_per_hour'].quantize(Decimal('.000000000001'))==Decimal('.892857142857')
+
+
+def test_rotation_observation_fault_preserves_legacy_summary_and_pending(tmp_path,monkeypatch):
+    from tests.test_lp_d2_execution_bridge import rotation_runtime,wait_rotation_idle
+    live,execution,sdk,ids,pools,order,qualify=rotation_runtime(tmp_path,monkeypatch)
+    try:
+        sdk.orders=tuple(order(k) for k in 'ABCDEF')
+        result=execution.lp_auto_scheduled_check()
+        assert result.rotation_outcomes and all(o.handle for o in result.rotation_outcomes)
+        for outcome in result.rotation_outcomes: outcome.handle.result(timeout=3)
+        wait_rotation_idle(live)
+        pending=live._rotation_pending
+        assert pending
+        before=live.rotation_diagnostics()
+        calls=(sdk.order_reads,sdk.position_reads,tuple(sdk.posts),tuple(sdk.cancels))
+        observations={key:dict(value,unsupported=object()) for key,value in result.selection.incumbent_observations.items()}
+        live._remember_rotation(replace(result,selection=replace(result.selection,incumbent_observations=observations)))
+        assert live._rotation_pending==pending
+        after=live.rotation_diagnostics()
+        assert after['selection_state']==before['selection_state']
+        assert after['identity']==before['identity'] and after['victims']==before['victims']
+        assert after['outcomes']==before['outcomes']
+        for old,new in zip(before['incumbent_yields']['samples'],after['incumbent_yields']['samples'],strict=True):
+            assert {k:v for k,v in new.items() if k!='observation'}=={k:v for k,v in old.items() if k!='observation'}
+            assert new['observation'] is None
+        assert (sdk.order_reads,sdk.position_reads,tuple(sdk.posts),tuple(sdk.cancels))==calls
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_unknown_observation_fault_preserves_legacy_rows(tmp_path,monkeypatch):
+    from tests.test_lp_d2_execution_bridge import rotation_runtime
+    live,execution,sdk,ids,pools,order,qualify=rotation_runtime(tmp_path,monkeypatch)
+    port=live.reader._port
+    class Port:
+        def read(self,name,scope):
+            if name.startswith('market:'): raise ValueError('provider failure')
+            return port.read(name,scope)
+    live.reader._port=Port()
+    sdk.orders=(order('A'),)
+    try:
+        execution.lp_auto_scheduled_check()
+        baseline=execution.lp_auto_state(include_intents=False)['diagnostics']
+        old,=baseline['unknown_buy_yields']['recent']
+        live._yield_unknown_observations=tuple(dict(row,unsupported=object()) for row in live._yield_unknown_observations)
+        calls=(sdk.order_reads,sdk.position_reads,tuple(sdk.posts),tuple(sdk.cancels))
+        result=execution.lp_auto_state(include_intents=False)['diagnostics']
+        row,=result['unknown_buy_yields']['recent']
+        for key in ('order_id','unknown_since_at','age_seconds','due_at_600'): assert row[key]==old[key]
+        assert result['accepted_observation']==baseline['accepted_observation']
+        assert result['admission']==baseline['admission'] and result['round_start']==baseline['round_start']
+        assert row['reason_codes']==['reason_unavailable'] and row['reason_is_current'] is False
+        assert (sdk.order_reads,sdk.position_reads,tuple(sdk.posts),tuple(sdk.cancels))==calls
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_ring_update_fault_preserves_existing_iteration_refresh(tmp_path,monkeypatch):
+    from tests.test_lp_d2_execution_bridge import rotation_runtime
+    live,execution,sdk,ids,pools,order,qualify=rotation_runtime(tmp_path,monkeypatch)
+    try:
+        before=execution.lp_auto_state(include_intents=False)['diagnostics']
+        live._yield_rounds=({'identity':{}},)
+        sdk.advance(1)
+        # An incomplete candidate source has one diagnostic capture. A normal
+        # batch captures twice and can recover the ring before the GET below.
+        result=live.run_once(SourceResult('incomplete-candidates',complete=False))
+        assert result.finish is None and result.selection.selection_state=='NO_DECISION'
+        after=execution.lp_auto_state(include_intents=False)['diagnostics']
+        observation=result.acceptance.observation.observation_id
+        assert observation!=before['accepted_observation']['observation_id']
+        assert after['accepted_observation']['observation_id']==observation
+        assert after['round_start']['observation_id']==observation
+        assert after['admission']['observation_id']==observation
+        assert after['reader_coverage']['observation_id']==observation
+        assert after['yield_rounds']['available'] is False
+        sdk.advance(1)
+        recovered=execution.lp_auto_scheduled_check()
+        history=execution.lp_auto_state(include_intents=False)['diagnostics']['yield_rounds']
+        assert history['instance_id']!=before['yield_rounds']['instance_id']
+        assert history['recent'][-1]['identity']['observation_id']==recovered.acceptance.observation.observation_id
+        assert sdk.posts==sdk.cancels==[]
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
