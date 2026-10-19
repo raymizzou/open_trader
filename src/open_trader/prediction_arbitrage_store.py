@@ -533,8 +533,6 @@ class PredictionArbitrageStore:
         failed = False
         wait_failure = False
         try:
-            if admission is not None:
-                admission.start_begin()
             if retry_chain is not None:
                 # Guards and connection setup consume the inherited budget too.
                 # An entered body/COMMIT may finish late; a new BEGIN may not.
@@ -543,6 +541,10 @@ class PredictionArbitrageStore:
                     raise AdmissionTimeout('lp_write_admission_deadline')
                 if retry_chain['attempt'] and remaining < _BUSY_TIMEOUT_MS / 1000:
                     raise AdmissionTimeout('lp_write_retry_budget_exhausted')
+            # Local refusals must leave control admission cancellable.
+            if admission is not None:
+                admission.start_begin()
+            if retry_chain is not None:
                 retry_chain['begin_attempts'] += 1
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             acquired = monotonic()

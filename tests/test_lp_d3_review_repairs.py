@@ -274,6 +274,133 @@ def test_first_begin_after_guard_wait_respects_inherited_deadline(tmp_path, monk
     assert service.recover_preparation(scope='global', expected_generation=1)['generation'] == 2
 
 
+def test_control_expiry_before_sql_begin_remains_known_not_written(tmp_path, monkeypatch):
+    """R4-1: a local refusal must not mark the real control attempt native-started."""
+    from dataclasses import asdict
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from open_trader import lp_persistence, prediction_arbitrage_store
+    from open_trader.polymarket_lp_control import LPControlOwner
+    from open_trader.polymarket_lp_current_state import (
+        CurrentLPState, StoredControl, CommittedControl, ValidatedStartAdmission,
+    )
+    from tests.test_lp_control_contract import ActivationPort, FatalPort, Clock, poll_until
+
+    store = PredictionArbitrageStore(tmp_path)
+    native_now = [1000.0]
+    business = Clock()
+    stamp = datetime(2026, 10, 19, tzinfo=UTC)
+    closed, release = threading.Event(), threading.Event()
+    begins, errors, attempts = [], [], []
+    connect = sqlite3.connect
+
+    class Boundary(sqlite3.Connection):
+        boundary = False
+
+        def execute(self, sql, *args, **kwargs):
+            result = super().execute(sql, *args, **kwargs)
+            if threading.current_thread().name == 'lp-control-save':
+                if sql == 'PRAGMA foreign_keys=ON' and not attempts[0].is_set():
+                    # Native admission time expires during connection setup;
+                    # the independent control business clock has not expired.
+                    self.boundary = True
+                    native_now[0] = 1011.0
+                if sql == 'BEGIN IMMEDIATE':
+                    begins.append(sql)
+            return result
+
+        def close(self):
+            super().close()
+            if self.boundary:
+                closed.set()
+                assert release.wait(5), 'independent cleanup-boundary watchdog'
+
+    class Port:
+        def load(self, account):
+            return StoredControl(account, True, True, stamp, stamp)
+
+        def save(self, write):
+            return self.save_with_admission(write, None)
+
+        def save_with_admission(self, write, attempt):
+            attempts.append(attempt)
+            try:
+                return CommittedControl(**store.lp_save_current_control(asdict(write), admission=attempt))
+            except BaseException as error:
+                errors.append(error)
+                raise
+
+    monkeypatch.setattr(lp_persistence, 'time', SimpleNamespace(monotonic=lambda: native_now[0]))
+    monkeypatch.setattr(prediction_arbitrage_store, 'monotonic', lambda: native_now[0])
+    monkeypatch.setattr(sqlite3, 'connect', lambda *a, **k: connect(*a, **(k | dict(factory=Boundary))))
+    state = CurrentLPState('A', 'review-process', clock=business, utc_now=lambda: stamp)
+    fatal = FatalPort()
+    owner = LPControlOwner(state, Port(), ActivationPort(state), fatal,
+        clock=business, utc_now=lambda: stamp)
+    owner.initialize(ValidatedStartAdmission('review-process', 'review-start'))
+    try:
+        assert owner.request_running(False).status == 'accepted'
+        assert closed.wait(5)
+        assert begins == []
+        assert len(attempts) == 1 and attempts[0].real_deadline == 1010.0
+        business.value = 111.0
+        observed = owner.poll(business())
+        assert owner.close(0).writer_drained is False
+        assert observed.native_save_in_flight is True
+        assert observed.fatal is None, 'pre-BEGIN known-not-written was classified as native UNKNOWN'
+        assert fatal.signals == []
+    finally:
+        release.set()
+        # Let the actual failed writer return before advancing to the permitted
+        # retry. Keep cleanup ownership until that retry really commits.
+        completed = poll_until(owner, business, lambda s: not s.native_save_in_flight)
+        if completed.fatal is None and completed.save_state == 'retry_wait':
+            assert completed.retry_at_monotonic == 112.0
+            assert begins == []
+            assert errors and isinstance(errors[0], AdmissionTimeout)
+            assert errors[0].known_not_written is True
+            row = next(r for r in LPWriteCoordinator(store.path).status()['transactions']
+                if r['operation'].endswith('.lp_save_current_control'))
+            assert row['phase'] == 'begin' and row['failed'] is True and row['begin_attempts'] == 0
+            business.value = 112.0
+        report = owner.close(3)
+    assert report.writer_drained is True
+    assert len(attempts) == 2 and attempts[0] is not attempts[1]
+    assert begins == ['BEGIN IMMEDIATE']  # Only the later known-failure retry.
+    assert owner.status().save_state == 'saved' and owner.status().saved_version == 1
+    assert owner.status().fatal is None and fatal.signals == []
+
+
+def test_first_attempt_with_positive_subfive_budget_may_begin(tmp_path, monkeypatch):
+    """R4 positive control: attempt0 needs positive time, not a full five seconds."""
+    from types import SimpleNamespace
+    from open_trader import lp_persistence, prediction_arbitrage_store
+
+    store = PredictionArbitrageStore(tmp_path)
+    now = [1000.0]
+    begins = []
+    connect = sqlite3.connect
+
+    class Boundary(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            result = super().execute(sql, *args, **kwargs)
+            if sql == 'PRAGMA foreign_keys=ON':
+                now[0] = 1014.5
+            if sql == 'BEGIN IMMEDIATE':
+                begins.append(sql)
+            return result
+
+    monkeypatch.setattr(lp_persistence, 'time', SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(prediction_arbitrage_store, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(sqlite3, 'connect', lambda *a, **k: connect(*a, **(k | dict(factory=Boundary))))
+    result = store.lp_write_operation(lambda: store.update_lp_observation('A', 'C', {'positive_remaining': True}))
+    assert result['positive_remaining'] is True
+    assert begins == ['BEGIN IMMEDIATE']
+    row = next(r for r in LPWriteCoordinator(store.path).status()['transactions']
+        if r['operation'].endswith('.update_lp_observation'))
+    assert row['begin_attempts'] == 1 and row['phase'] == 'complete' and not row['failed']
+
+
 def test_bounded_admission_and_retry_telemetry_is_visible_without_payload(tmp_path, caplog):
     """R2-4/M3: queue ages, chain identity, checkpoint deltas and outcomes."""
     store = PredictionArbitrageStore(tmp_path)
