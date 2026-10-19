@@ -1117,6 +1117,156 @@ def test_d2_execution_control_projection_keeps_requested_effective_saved_distinc
         live.trading.close()
 
 
+def test_paused_nleg_stale_execution_does_not_block_current_buy_cleanup(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(
+        tmp_path, monkeypatch, startup=False)
+    try:
+        execution._n_leg_paused = True  # runtime's NLEG_PAUSED configuration boundary
+        row = live.store.create_recovery_execution(
+            dict(reason='historical unfinished execution'), idempotency_key='stale-execution')
+        live.store.transition_execution(row['execution_id'], state='submitting', evidence={})
+        historical = live.store.active_execution()
+        assert historical['state'] == 'submitting'
+        manual_sell = order('S').model_copy(update=dict(side='SELL'))
+        sdk.orders = (order('A'), manual_sell)
+        assert live.store.lp_active_sessions() == []  # A has no local registration.
+
+        result = execution.lp_auto_scheduled_check()
+
+        observation = result.acceptance.observation
+        assert observation.orders_complete and sdk.order_reads == 1
+        assert {(o.key[3], o.side) for o in observation.order_view.open_orders} == {
+            ('A', 'BUY'), ('S', 'SELL')}
+        assert result.start.token.kind.value == 'STARTUP_CANCEL'
+        assert {a.target.existing_order_id for a in result.start.token.actions} == {'A'}
+        assert sdk.posts == [] and sdk.market_orders == []
+        assert live.store.active_execution() == historical
+        sell, = (o for o in live.state.snapshot().active_orders if o.key[3] == 'S')
+        assert sell.side == 'SELL' and sell.venue_status == 'LIVE'
+        assert sdk.orders[1] == manual_sell
+        assert sdk.cancels == [('A',)], 'stale execution must not block exact round0 BUY cleanup'
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_candidate_capture_failure_keeps_current_order_protection(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(
+        tmp_path, monkeypatch, target=1)
+    try:
+        execution._n_leg_paused = True
+        pools['A'] = None  # Current BUY yield is unknown; existing protection expires at 600s.
+        manual_sell = order('S').model_copy(update=dict(side='SELL'))
+        sdk.orders = (order('A'), manual_sell)
+        first = execution.lp_auto_scheduled_check()
+        assert first.acceptance.observation.calculation.yields['A'] is None
+        assert sdk.cancels == [] and sdk.posts == []
+        before_reads = sdk.order_reads
+        before_observation = first.acceptance.observation.observation_id
+        sdk.advance(600)
+
+        capture_attempts = []
+        def unavailable_candidate_clock():
+            capture_attempts.append(True)
+            raise RuntimeError('candidate capture clock unavailable')
+        # Fail the real capture at its injected clock boundary, not an owner stub.
+        monkeypatch.setattr(execution._lp, 'clock', unavailable_candidate_clock)
+        scheduler = LPAutoScheduler(execution, clock=live._utc_now)
+        scheduler.request_check()
+        assert scheduler.run_due()
+        wait_rotation_idle(live)
+
+        assert capture_attempts
+        assert sdk.posts == [] and sdk.market_orders == []
+        assert sdk.orders[1] == manual_sell
+        assert sdk.order_reads == before_reads + 1, 'capture failure must not skip current account reads'
+        snapshot = live.state.snapshot()
+        assert snapshot.observation.observation_id != before_observation
+        assert snapshot.observation.orders_complete
+        assert {(o.key[3], o.side) for o in snapshot.observation.order_view.open_orders} == {
+            ('A', 'BUY'), ('S', 'SELL')}
+        assert sdk.cancels == [('A',)], 'unknown-yield protection must survive candidate capture failure'
+        sell, = (o for o in snapshot.active_orders if o.key[3] == 'S')
+        assert sell.side == 'SELL' and sell.venue_status == 'LIVE'
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('check', ['scheduled-protection', 'lease-final-recheck'])
+def test_historical_incident_blocks_new_buy_but_allows_exact_protection_cancel(tmp_path, monkeypatch, check):
+    from open_trader.lp_business_writer import RequestRecord
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(
+        tmp_path, monkeypatch, target=2)
+    cancel_lease = None
+    try:
+        execution._n_leg_paused = True
+        pools['A'] = None
+        manual_sell = order('S').model_copy(update=dict(side='SELL'))
+        sdk.orders = (order('A'), manual_sell)
+        first = execution.lp_auto_scheduled_check()
+        assert first.acceptance.observation.calculation.yields['A'] is None
+        assert sdk.posts == [] and sdk.cancels == []
+        sdk.advance(600)
+        qualify('F')  # One vacant slot and a fresh eligible BUY, independent of A's protection.
+        # Acquire while permitted, then change the persisted incident truth before dispatch.
+        # This exercises the real lease's final recheck, independently of initial admission.
+        if check == 'lease-final-recheck':
+            cancel_lease = execution._lp_d2_acquire('CANCEL')
+            assert cancel_lease is not None and cancel_lease.allowed()
+        historical = live.store.create_recovery_execution(
+            dict(reason='historical incident'), idempotency_key='historical-incident')
+        incident_id = live.store.open_incident(historical['execution_id'], dict(reason='not acknowledged'))
+        incident = live.store.unacknowledged_incident()
+        assert incident['incident_id'] == incident_id and live.store.active_execution() is None
+
+        result = execution.lp_auto_scheduled_check()
+        wait_rotation_idle(live)
+
+        observation = result.acceptance.observation
+        assert observation.orders_complete
+        assert {(o.key[3], o.side) for o in observation.order_view.open_orders} == {
+            ('A', 'BUY'), ('S', 'SELL')}
+        assert result.selection.new_target_keys == (ids['F'],)
+        buy, = result.outcomes
+        assert buy.identity.target.token_id == ids['F'][1] and buy.status.value == 'not_sent'
+        assert live.store.unacknowledged_incident() == incident
+        assert live.store.histories('executions') == [historical]
+        assert sdk.posts == [] and sdk.market_orders == []
+        assert sdk.orders[1] == manual_sell
+        sell, = (o for o in live.state.snapshot().active_orders if o.key[3] == 'S')
+        assert sell.side == 'SELL' and sell.venue_status == 'LIVE'
+
+        if cancel_lease is not None:
+            # The same underlying owner/file lease must not admit a BUY or SELL share.
+            for action in ('BUY', 'SELL'):
+                forbidden = execution._lp_d2_acquire(action)
+                if forbidden is not None:
+                    forbidden.release()
+                assert forbidden is None, f'CANCEL lease must not upgrade shared admission to {action}'
+            # Deliberately hand the CANCEL share to the actual BUY dispatch seam.
+            # A blanket "incident permits CANCEL" lease must not authorize this post.
+            token, action = result.start.token, buy.identity
+            terms = action.target.terms
+            record = RequestRecord(WALLET, live.process_epoch, action.request_id,
+                'd2:'+action.request_id, ids['F'][0], ids['F'][1], 'BUY', terms.price,
+                terms.quantity, live._utc_now(), venue=live.venue,
+                cycle_generation=token.cycle_generation, batch_id=token.batch_id,
+                round_number=token.round_number, observation_id=token.observation_id,
+                order_type=terms.order_type, expiration=terms.expiration,
+                post_only=terms.post_only, send_options=terms.send_options)
+            refused = live._buy_admitted(token, action, record, cancel_lease)
+            assert refused.status.value == 'not_sent' and sdk.posts == []
+            assert cancel_lease.allowed(), 'historical incident must preserve CANCEL permission at final recheck'
+        else:
+            assert sdk.cancels == [('A',)], 'historical incident must allow exact unknown-yield BUY protection'
+    finally:
+        if cancel_lease is not None:
+            cancel_lease.release()
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
 def test_d2_execution_preserves_existing_mutation_fences_without_blocking_facts(tmp_path, monkeypatch):
     import fcntl
     # Each existing fence is exercised against the same public read/send path.
