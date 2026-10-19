@@ -1298,6 +1298,9 @@ class LPD2LiveExecution:
                         total_observations=self._yield_rounds_total, round_limit=YIELD_ROUND_LIMIT,
                         row_limit=YIELD_ROW_LIMIT, recent=self._yield_rounds)
                 except Exception:
+                    # Intentionally reset an uncertain ring and rotate its ID so
+                    # consumers see a discontinuity, not partial/corrupt history.
+                    # This resets diagnostics only, never trading state.
                     self._yield_rounds, self._yield_unknown_observations = (), ()
                     self._yield_rounds_total = 0
                     self._yield_diagnostic_instance = uuid4().hex
@@ -1388,7 +1391,7 @@ class LPD2LiveExecution:
                                 enrichment['reason_observation_id'] = latest.get('identity', {}).get('observation_id')
                         row.update(enrichment)
                     except Exception:
-                        row.update(reason_is_current=False, reason_codes=('reason_unavailable',))
+                        row.update(reason_is_current=False, reason_codes=('reason_unavailable',), attempted_reason_codes=())
                 return result
         except Exception:
             logger.exception('prediction_lp_diagnostics_failed')

@@ -737,3 +737,50 @@ def test_ring_update_fault_preserves_existing_iteration_refresh(tmp_path,monkeyp
     finally:
         assert live.close(timeout=3)
         live.trading.close()
+
+
+def test_unknown_row_fault_keeps_attempted_reasons_and_scheduler_alive(tmp_path,monkeypatch):
+    from tests.test_lp_d2_execution_bridge import rotation_runtime
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+    live,execution,sdk,ids,pools,order,qualify=rotation_runtime(tmp_path,monkeypatch)
+    port=live.reader._port
+    class Port:
+        def read(self,name,scope):
+            if name.startswith('market:'): raise ValueError('provider failure')
+            return port.read(name,scope)
+    live.reader._port=Port()
+    sdk.orders=(order('A'),)
+    scheduler=None;worker=None;completed=Event();failures=[]
+    try:
+        execution.lp_auto_scheduled_check()
+        detail,=live._yield_unknown_observations
+        # Corrupt only the new detail for this row, leaving trading facts valid.
+        live._yield_unknown_observations=(dict(detail,unsupported=object()),)
+        diagnostic=execution.lp_auto_state(include_intents=False)['diagnostics']
+        row,=diagnostic['unknown_buy_yields']['recent']
+        assert row['reason_is_current'] is False
+        assert row['reason_codes']==['reason_unavailable']
+        assert row['attempted_reason_codes']==[]
+        assert json.loads(json.dumps(diagnostic,allow_nan=False))==diagnostic
+        scheduler=LPAutoScheduler(execution,clock=live._utc_now)
+        scheduler.request_check()
+        def check():
+            try:
+                assert scheduler.run_due()
+            except BaseException as exc: failures.append(exc)
+            finally: completed.set()
+        worker=Thread(target=check)
+        worker.start()
+        assert completed.wait(3), 'scheduler diagnostic recovery watchdog'
+        worker.join(timeout=1)
+        assert not worker.is_alive() and failures==[]
+        assert scheduler.snapshot()['last_check_error'] is None
+        recovered=execution.lp_auto_state(include_intents=False)['diagnostics']
+        assert recovered['unknown_buy_yields']['total']==1
+        assert json.loads(json.dumps(recovered,allow_nan=False))==recovered
+        assert sdk.posts==sdk.cancels==[]
+    finally:
+        if worker is not None and worker.is_alive(): worker.join(timeout=3)
+        if scheduler is not None: scheduler.stop()
+        assert live.close(timeout=3)
+        live.trading.close()
