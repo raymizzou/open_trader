@@ -1,7 +1,8 @@
 """Value-only calculations; results carry no execution or publication authority."""
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from .polymarket_lp_market_reader import decimal, freeze
+from collections.abc import Mapping
+from .polymarket_lp_market_reader import decimal, freeze, observed_source_error
 from .polymarket_lp_risk import minimum_order_estimate
 
 
@@ -35,6 +36,8 @@ class CalculationResult:
     decision_states: object = field(default_factory=lambda: freeze({}))
     retained_order_ids: tuple[str, ...] = ()
     new_target_keys: tuple[tuple[str, str], ...] = ()
+    incumbent_observations: object = field(default_factory=lambda: freeze({}))
+    candidate_observations: tuple = ()
 
 
 def calculate_current(frame, policy, as_of) -> CalculationResult:
@@ -47,20 +50,51 @@ def calculate_current(frame, policy, as_of) -> CalculationResult:
             and (account is None or account.complete and not account.error)):
         available = max(Decimal(0), min(policy.budget-inventory-reserved, min(funds)-reserved))
     directions = frame.sources.get('directions')
-    estimates = {}
+    estimates, observations = {}, {}
     for row in frame.current_buys:
         estimate = None
+        exception_type = None
         direction = directions.value.get(row['order_id']) if directions and directions.complete else None
         if direction:
             try:
                 estimate = minimum_order_estimate(direction, {'price': row['price'],
-                    'quantity': row['remaining']}, as_of, resting_quantity=row['remaining'])
-            except (ValueError, TypeError, KeyError):
-                pass
+                    'quantity': row['remaining']}, as_of, resting_quantity=row['remaining'],
+                    include_observation=True)
+            except (ValueError, TypeError, KeyError) as exc:
+                exception_type = type(exc).__name__
         estimates[row['order_id']] = (estimate.get('yield_pct_per_hour')
             if estimate and estimate.get('state') == 'known' else None)
+        try:
+            failures = frame.sources.get('direction_failures')
+            detail = dict(failures.value.get(row['order_id'], {})) if failures else {}
+            book = direction.get('book') if isinstance(direction, Mapping) else None
+            source = frame.sources.get('market:'+row['condition_id']+':'+row['token_id'])
+            observations[row['order_id']] = dict(detail, order_id=row['order_id'],
+                account_id=frame.account, condition_id=row['condition_id'], token_id=row['token_id'],
+                state='known' if estimates[row['order_id']] is not None else 'unknown',
+                yield_pct_per_hour=estimates[row['order_id']],
+                exception_type=exception_type,
+                reason_codes=tuple(estimate.get('reason_codes', ())) if estimate else
+                    ('estimator_exception',) if exception_type else
+                    detail.get('reason_codes', ('direction_missing',)))
+            observations[row['order_id']].update(
+                source_id=source.source_id if source else detail.get('source_id'),
+                source_error=observed_source_error(source),
+                **{key: source.diagnostics.get(key) for key in ('error_class',
+                    'http_status', 'retry_cache_hit', 'remaining_retry_seconds', 'inflight_age_seconds')
+                    if source and key in source.diagnostics})
+            observations[row['order_id']].update(
+                placed_at=row.get('created_at'),
+                book_checked_at=book.get('checked_at') if isinstance(book, Mapping) else None,
+                book_received_at=book.get('received_at') if isinstance(book, Mapping) else None,
+                **{key: estimate[key] for key in ('public_depth_at_price', 'resting_quantity',
+                    'estimated_share', 'competition_upper_bound', 'daily_pool_usd', 'capital_usd',
+                    'weighted_bid_score', 'weighted_ask_score', 'checked_at')
+                    if estimate and key in estimate})
+        except Exception:
+            pass
     candidates = frame.sources.get('candidates')
-    candidate_yields = {}
+    candidate_yields, candidate_observations = {}, []
     if candidates and candidates.complete and not candidates.error:
         for row in candidates.value or ():
             if row.get('existing'):
@@ -68,13 +102,22 @@ def calculate_current(frame, policy, as_of) -> CalculationResult:
             try:
                 quantity, price = decimal(row['quantity']), decimal(row['price'])
                 estimate = minimum_order_estimate(row['direction'], {'price': price, 'quantity': quantity},
-                    row.get('evaluation_at', as_of))
+                    row.get('evaluation_at', as_of), include_observation=True)
                 rate = estimate.get('yield_pct_per_hour')
                 candidate_yields[row['token_id']] = rate if estimate.get('state') == 'known' else None
+                try:
+                    candidate_observations.append(dict(estimate,
+                        account_id=frame.account, condition_id=row['condition_id'], token_id=row['token_id'],
+                        market_id=row.get('market_id'),
+                        price=price, quantity=quantity,
+                        reason_codes=tuple(estimate.get('reason_codes', ()))))
+                except Exception:
+                    pass
             except (KeyError, TypeError, ValueError):
                 continue
     result = CalculationResult(reserved, inventory, available, freeze(estimates),
-        candidate_yields=freeze(candidate_yields), policy_version=policy.config_version)
+        candidate_yields=freeze(candidate_yields), policy_version=policy.config_version,
+        incumbent_observations=freeze(observations), candidate_observations=freeze(candidate_observations))
     return select_current_composition(frame, policy, result)
 
 

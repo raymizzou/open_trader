@@ -5,7 +5,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 import json
-from .polymarket_lp_market_reader import CURRENT_ORDER_STATES, SourceResult, freeze
+from .polymarket_lp_market_reader import CURRENT_ORDER_STATES, SourceResult, freeze, observed_source_error
 
 
 def diagnostic_json_copy(value):
@@ -23,6 +23,144 @@ def diagnostic_json_copy(value):
             return dict(item)
         raise TypeError(type(item).__name__)
     return json.loads(json.dumps(value, default=encode, allow_nan=False))
+
+
+# Final caps include room for the existing twenty unknown/rotation samples.
+# The full-cap UTF-8 payload regression enforces the combined 256 KiB budget.
+YIELD_ROW_LIMIT = 2
+YIELD_ROUND_LIMIT = 2
+YIELD_STRING_LIMIT = 96
+
+
+def yield_diagnostic_value(value, *, depth=0):
+    """Bound and detach only observational values; never coerce trading facts."""
+    if depth > 10:
+        return None
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, str):
+        return value.encode('utf-8')[:YIELD_STRING_LIMIT].decode('utf-8',errors='ignore')
+    if isinstance(value, float):
+        import math
+        return value if math.isfinite(value) else None
+    if isinstance(value, Decimal):
+        text = str(value)
+        return text if value.is_finite() and len(text)<=YIELD_STRING_LIMIT else None
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        return {str(k)[:64]: yield_diagnostic_value(
+            v[:8] if k in ('reason_codes', 'attempted_reason_codes', 'selection_reasons')
+                and isinstance(v, (tuple, list)) else v, depth=depth+1)
+            for k, v in list(value.items())[:40]}
+    if isinstance(value, (list, tuple)):
+        return [yield_diagnostic_value(v, depth=depth+1) for v in value[:20]]
+    raise TypeError('unsupported_yield_diagnostic')
+
+
+def bounded_yield_rows(rows, *, limit=YIELD_ROW_LIMIT):
+    rows = tuple(rows)
+    return dict(total=len(rows), samples=yield_diagnostic_value(rows[:limit]),
+        omitted=max(0, len(rows)-limit))
+
+
+def summarize_yield_observation(frame, calculation, ticket, acceptance, evaluated_at,
+                                *, round_start=None, outcomes=(), fixed_plan=None, receipt_orders=()):
+    """Attribute an attempted observation using only its captured sources."""
+    errors = []
+    names = tuple(dict.fromkeys(('balance', 'open_orders', 'positions', 'candidates',
+        'candidate_inventory', *(n for n in frame.sources if n.startswith('market:')))))
+    for name in names:
+        source = frame.sources.get(name)
+        if source is None and name not in ('balance', 'open_orders', 'positions', 'candidates'):
+            continue
+        invalid = name == 'open_orders' and not frame.orders_complete and bool(frame.errors)
+        if source and source.complete and not source.error and source.value is not None and not invalid:
+            continue
+        error = ('invalid_order_identity_or_terms' if invalid else source.error if source else None)
+        error = error or ('source_incomplete' if source else 'source_missing')
+        if source and source.error and source.error not in _REASONS:
+            error = observed_source_error(source)
+        detail = source.diagnostics if source else {}
+        parts = name.split(':', 2) if name.startswith('market:') else ()
+        errors.append(dict(source=name, source_id=source.source_id if source else None,
+            condition_id=parts[1] if len(parts)==3 else None,
+            token_id=parts[2] if len(parts)==3 else None,
+            source_error=str(error)[:64], error_class='input_invalid' if invalid else
+                error if error in ('capacity', 'timeout', 'in_progress', 'closed') else
+                'exception' if source and source.error else 'incomplete' if source else 'missing',
+            http_status=source.error_facts.get('status') if source and type(source.error_facts.get('status')) is int else None,
+            retry_cache_hit=detail.get('retry_cache_hit', False),
+            remaining_retry_seconds=detail.get('remaining_retry_seconds'),
+            inflight_age_seconds=detail.get('inflight_age_seconds')))
+    candidates = frame.sources.get('candidates')
+    supplied = tuple(r for r in candidates.value or () if not r.get('existing')) if candidates else ()
+    ranked = sorted((dict(r) for r in calculation.candidate_observations
+        if r.get('state') == 'known' and r.get('yield_pct_per_hour') is not None),
+        key=lambda r: (-r['yield_pct_per_hour'], r['condition_id'], r['token_id']))
+    candidate_sources = frame.sources.get('candidate_sources')
+    for rank, row in enumerate(ranked, 1):
+        per_direction = (candidate_sources.value.get(row['condition_id']+':'+row['token_id'])
+            if candidate_sources else None)
+        row.update(rank=rank, candidate_count=len(supplied), computed_candidate_count=len(ranked),
+            estimate_source_id=per_direction.source_id if per_direction else candidates.source_id)
+        # A fraction such as 1/20 can acquire last-place Decimal noise from
+        # weighted depth division. Bound reporting precision, never the value
+        # used by the estimator or selection.
+        if isinstance(row.get('estimated_share'), Decimal):
+            row['estimated_share'] = row['estimated_share'].quantize(Decimal('1e-24'))
+            row['share_precision_decimal_places'] = 24
+    placements = []
+    for outcome in outcomes:
+        target = outcome.identity.target
+        if target.kind.value != 'BUY_NEW':
+            continue
+        matches = [r for r in ranked if (r['token_id'], r.get('market_id')) ==
+            (target.token_id, target.market_id)]
+        receipts = [order for order in receipt_orders
+            if order.key[3] == outcome.venue_order_id and order.side == 'BUY'
+            and order.source.source_id == outcome.identity.request_id]
+        placed_at = (receipts[0].source.checked_at if outcome.status.value == 'accepted'
+            and len(receipts) == 1 else None)
+        placements.append(dict(matches[0] if len(matches) == 1 else {'available': False},
+            request_id=outcome.identity.request_id,
+            batch_id=round_start.token.batch_id if round_start and round_start.token else None,
+            observation_id=ticket.observation_id, disposition=outcome.status.value,
+            order_id=outcome.venue_order_id, venue_finality='unavailable',
+            placed_at=placed_at, placement_time_basis='accepted_receipt' if placed_at else 'unavailable'))
+    incumbents = []
+    accepted_orders = {o.key[3]: o for o in acceptance.observation.orders} if acceptance.observation else {}
+    for row in frame.current_buys:
+        detail = dict(calculation.incumbent_observations.get(row['order_id'], {}))
+        accepted_order = accepted_orders.get(row['order_id'])
+        detail.update(reason_observation_id=ticket.observation_id,
+            order_source_id=frame.sources['open_orders'].source_id,
+            accepted_input=bool(accepted_order and accepted_order.presence == 'present'
+                and accepted_order.price.value == row['price']
+                and accepted_order.remaining.value == row['remaining']))
+        incumbents.append(detail)
+    by_id = {r['order_id']: r for r in frame.current_buys}
+    def order_identity(order_id):
+        row = by_id.get(order_id, {})
+        return dict(order_id=order_id, condition_id=row.get('condition_id'), token_id=row.get('token_id'))
+    return yield_diagnostic_value(dict(available=True,
+        identity=dict(account_id=frame.account, generation=ticket.cycle_generation,
+            observation_id=ticket.observation_id),
+        read_ticket=dict(observation_id=ticket.observation_id, read_sequence=ticket.read_sequence,
+            generation=ticket.cycle_generation, started_at=ticket.started_at),
+        evaluated_at=evaluated_at, acceptance=acceptance.status,
+        selection_state=calculation.selection_state,
+        selection_reasons=calculation.selection_reasons,
+        decision_states=calculation.decision_states,
+        source_errors=bounded_yield_rows(errors), reader=frame.reader_diagnostics,
+        candidate_count=len(supplied), computed_candidate_count=len(ranked),
+        candidates=bounded_yield_rows(ranked), placement_estimates=bounded_yield_rows(placements),
+        incumbents=bounded_yield_rows(incumbents),
+        unknown_incumbents=bounded_yield_rows((r for r in incumbents if r.get('state') == 'unknown'), limit=20),
+        selected=bounded_yield_rows(order_identity(o) for o in calculation.retained_order_ids),
+        victims=bounded_yield_rows(order_identity(o) for o in calculation.victim_order_ids),
+        new_targets=bounded_yield_rows(dict(condition_id=c, token_id=t) for c, t in calculation.new_target_keys),
+        fixed_plan='absent' if fixed_plan is None else 'empty' if not fixed_plan.targets else 'nonempty'))
 
 
 _REASONS = frozenset({'producer_fence_changed', 'producer_fence_unknown',
