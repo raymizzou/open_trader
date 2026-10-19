@@ -8,6 +8,16 @@ import sys
 
 
 ERROR_SIGNAL = re.compile(r"traceback|fatal|exception|error", re.IGNORECASE)
+# These redacted metadata fetch failures are expected transient network noise.
+ALLOWED_LP_METADATA_WARNING = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:Z|[+-]\d{4}|[+-]\d{2}:\d{2}) WARNING "
+    r"open_trader\.polymarket_trading lp_metadata_read_failed "
+    r"stage=(?:market|event) "
+    r"(?:error_types=TransportError>"
+    r"(?P<transport>RemoteProtocolError|LocalProtocolError|ConnectTimeout)"
+    r"(?:>(?P=transport))?|error_types=RequestRejectedError status=400)"
+)
 
 
 def unique_object(pairs):
@@ -49,7 +59,9 @@ def check(path: Path) -> str | None:
             ):
                 del payload["last_error"]
             line = line[:start] + json.dumps(payload, ensure_ascii=False)
-        if ERROR_SIGNAL.search(line):
+        if ERROR_SIGNAL.search(line) and re.fullmatch(
+            ALLOWED_LP_METADATA_WARNING, line.rstrip("\r\n")
+        ) is None:
             return "log_error_signal"
     return None
 
