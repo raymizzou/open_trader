@@ -820,6 +820,7 @@ class PredictionExecutionService:
             raise ValueError("lp_d2_attachment_identity")
         self._lp_d2 = lp_d2
         self._lp_d2_control_request = (None, None)
+        self._lp_capture_failure_logged_at = None
         self._lp_d2_lease_lock = threading.Lock()
         self._lp_d2_lease = None
         self._lp_d2_lease_users = 0
@@ -906,9 +907,9 @@ class PredictionExecutionService:
         if live._closed or current.shutdown_requested or current.fatal_id is not None:
             return False
         try:
-            if self._breaker_open or action not in ('BUY', 'MANUAL_BUY', 'SELL', 'CANCEL', 'SELL_CANCEL'):
+            if self._breaker_open or action not in ('BUY', 'MANUAL_BUY', 'SELL', 'CANCEL', 'ROTATION_CANCEL', 'SELL_CANCEL'):
                 return False
-            if action != 'CANCEL' and self._store.unacknowledged_incident() is not None:
+            if (action != 'CANCEL' or not self._n_leg_paused) and self._store.unacknowledged_incident() is not None:
                 return False
             return self._n_leg_paused or self._store.active_execution() is None
         except Exception:
@@ -1144,12 +1145,18 @@ class PredictionExecutionService:
         if self._lp_d2 is not None:
             self._lp_d2.poll()
             attempted_at = self._lp_d2.begin_scheduled_attempt()
+            capture_failed = False
             try:
                 capture = self._lp.capture_qualified_pool()
             except Exception:
+                capture_failed = True
+                now = self._clock()
+                if self._lp_capture_failure_logged_at is None or now - self._lp_capture_failure_logged_at >= 60:
+                    self._lp_capture_failure_logged_at = now
+                    logger.exception('prediction_lp_candidate_capture_failed')
                 self._lp_d2.record_attempt_failure(attempted_at=attempted_at, stage='capture')
                 capture = None  # Unavailable candidates forbid BUY, not account protection.
-            result = self._lp_d2.run_once(capture, attempted_at=attempted_at)
+            result = self._lp_d2.run_once(capture, attempted_at=attempted_at, capture_failed=capture_failed)
             self._lp_d2.run_protection_once()
             return self._lp_d2.dispatch_rotation(result)
         return self._lp_auto_pool().run_once(reuse_facts=True)

@@ -85,7 +85,7 @@ class PermissionPort:
     allowed = True
 
     def acquire(self, kind):
-        assert kind in ('BUY', 'CANCEL', 'MANUAL_BUY')
+        assert kind in ('BUY', 'CANCEL', 'ROTATION_CANCEL', 'MANUAL_BUY')
         if not self.admit:
             return None
         port = self

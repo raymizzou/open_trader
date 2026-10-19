@@ -1161,9 +1161,96 @@ def test_paused_nleg_stale_execution_does_not_block_current_buy_cleanup(tmp_path
         live.trading.close()
 
 
-def test_candidate_capture_failure_keeps_current_order_protection(tmp_path, monkeypatch):
+def test_paused_nleg_stale_execution_allows_buy_after_round0(tmp_path, monkeypatch):
     live, execution, sdk, ids, pools, order, qualify = rotation_runtime(
-        tmp_path, monkeypatch, target=1)
+        tmp_path, monkeypatch, startup=False, target=1)
+    try:
+        execution._n_leg_paused = True
+        row = live.store.create_recovery_execution(
+            dict(reason='historical unfinished execution'), idempotency_key='stale-buy')
+        live.store.transition_execution(row['execution_id'], state='submitting', evidence={})
+        historical = live.store.active_execution()
+        manual_sell = order('S').model_copy(update=dict(side='SELL'))
+        sdk.orders = (order('A'), manual_sell)
+        cleanup = execution.lp_auto_scheduled_check()
+        assert cleanup.start.token.kind.value == 'STARTUP_CANCEL'
+        assert sdk.cancels == [('A',)] and sdk.posts == []
+        sdk.orders = (manual_sell,)  # A's exact cancellation is now reflected by the venue.
+        sdk.advance(1)
+        qualify('F')
+
+        result = execution.lp_auto_scheduled_check()
+
+        buy, = result.outcomes
+        assert buy.status.value == 'accepted' and buy.identity.target.token_id == ids['F'][1]
+        assert len(sdk.posts) == 1 and sdk.posts[0]['side'] == 'BUY'
+        assert sdk.posts[0]['token_id'] == ids['F'][1] and sdk.market_orders == []
+        assert sdk.cancels == [('A',)] and sdk.orders == (manual_sell,)
+        assert live.store.active_execution() == historical
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_nonpaused_incident_denies_exact_buy_cancel(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(
+        tmp_path, monkeypatch, startup=False)
+    try:
+        assert execution._n_leg_paused is False
+        historical = live.store.create_recovery_execution(
+            dict(reason='historical incident'), idempotency_key='nonpaused-incident')
+        incident_id = live.store.open_incident(historical['execution_id'], dict(reason='unacknowledged'))
+        assert live.store.active_execution() is None
+        sdk.orders = (order('A'), order('S').model_copy(update=dict(side='SELL')))
+
+        result = execution.lp_auto_scheduled_check()
+
+        assert result.start.token.kind.value == 'STARTUP_CANCEL'
+        assert {a.target.existing_order_id for a in result.start.token.actions} == {'A'}
+        assert sdk.cancels == [] and sdk.posts == [] and sdk.market_orders == []
+        assert live.store.unacknowledged_incident()['incident_id'] == incident_id
+        assert {o.key[3] for o in live.state.snapshot().active_orders} == {'A', 'S'}
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_paused_incident_denies_rotation_but_allows_protection_cancel(tmp_path, monkeypatch):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path, monkeypatch)
+    try:
+        execution._n_leg_paused = True
+        pools['U'] = None
+        sdk.orders = tuple(order(k) for k in 'ABCDU')
+        execution.lp_auto_scheduled_check()  # Establish U's unknown-yield protection clock.
+        assert sdk.cancels == [] and sdk.posts == []
+        historical = live.store.create_recovery_execution(
+            dict(reason='historical incident'), idempotency_key='rotation-incident')
+        incident_id = live.store.open_incident(historical['execution_id'], dict(reason='unacknowledged'))
+        sdk.orders = tuple(order(k) for k in 'ABCDEFU')
+        sdk.advance(600)
+        pools['G'] = Decimal('200')
+        qualify('G')  # A real replacement BUY would qualify without the incident.
+
+        result = execution.lp_auto_scheduled_check()
+        wait_rotation_idle(live)
+
+        assert {o.order_key[3] for o in result.rotation_outcomes} == {'D', 'E', 'F'}
+        assert result.selection.new_target_keys == (ids['G'],)
+        assert result.outcomes == ()  # Never pre-release victims' real occupied slots for G.
+        assert sdk.cancels == [('U',)], 'only protection may cancel during a paused incident'
+        assert all(o.status == 'not_sent' and o.reason == 'mutation_not_admitted'
+            and o.handle is None for o in result.rotation_outcomes)
+        assert sdk.posts == [] and sdk.market_orders == []
+        assert {'D', 'E', 'F'} <= {o.key[3] for o in live.state.snapshot().active_orders}
+        assert live.store.unacknowledged_incident()['incident_id'] == incident_id
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+def test_candidate_capture_failure_keeps_current_order_protection(tmp_path, monkeypatch, caplog):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(
+        tmp_path, monkeypatch, target=2)
     try:
         execution._n_leg_paused = True
         pools['A'] = None  # Current BUY yield is unknown; existing protection expires at 600s.
@@ -1176,6 +1263,10 @@ def test_candidate_capture_failure_keeps_current_order_protection(tmp_path, monk
         before_observation = first.acceptance.observation.observation_id
         sdk.advance(600)
 
+        qualify('F')  # Fresh eligible candidate with a free slot, even before A is cancelled.
+        assert ids['F'][0] in execution._lp.capture_qualified_pool().rows
+        monotonic = [0.0]
+        execution._clock = lambda: monotonic[0]
         capture_attempts = []
         def unavailable_candidate_clock():
             capture_attempts.append(True)
@@ -1199,6 +1290,24 @@ def test_candidate_capture_failure_keeps_current_order_protection(tmp_path, monk
         assert sdk.cancels == [('A',)], 'unknown-yield protection must survive candidate capture failure'
         sell, = (o for o in snapshot.active_orders if o.key[3] == 'S')
         assert sell.side == 'SELL' and sell.venue_status == 'LIVE'
+        latest = live.diagnostics()['latest_attempt']
+        assert latest['capture_failed'] is True
+        assert latest['capture_failure_reason'] == 'capture_unavailable'
+        def capture_logs():
+            return [r for r in caplog.records if r.message == 'prediction_lp_candidate_capture_failed']
+        assert len(capture_logs()) == 1 and capture_logs()[0].exc_info[0] is RuntimeError
+        # Repeated failures retain the marker but log at most once per 60 monotonic seconds.
+        execution.lp_auto_scheduled_check()
+        assert len(capture_logs()) == 1
+        monotonic[0] = 60.0
+        execution.lp_auto_scheduled_check()
+        assert len(capture_logs()) == 2
+        assert live.diagnostics()['latest_attempt']['capture_failed'] is True
+        assert sdk.posts == []  # In particular, the qualified F must never be posted.
+        # Recovery clears the marker, including if the attempt timestamp is unchanged.
+        monkeypatch.setattr(execution._lp, 'clock', live._utc_now)
+        execution.lp_auto_scheduled_check()
+        assert not live.diagnostics()['latest_attempt'].get('capture_failed', False)
     finally:
         assert live.close(timeout=3)
         live.trading.close()
@@ -1248,6 +1357,7 @@ def test_historical_incident_blocks_new_buy_but_allows_exact_protection_cancel(t
         sell, = (o for o in live.state.snapshot().active_orders if o.key[3] == 'S')
         assert sell.side == 'SELL' and sell.venue_status == 'LIVE'
 
+        assert sdk.cancels == [('A',)], 'historical incident must allow exact unknown-yield BUY protection'
         if cancel_lease is not None:
             # The same underlying owner/file lease must not admit a BUY or SELL share.
             for action in ('BUY', 'SELL'):
@@ -1269,8 +1379,6 @@ def test_historical_incident_blocks_new_buy_but_allows_exact_protection_cancel(t
             refused = live._buy_admitted(token, action, record, cancel_lease)
             assert refused.status.value == 'not_sent' and sdk.posts == []
             assert cancel_lease.allowed(), 'historical incident must preserve CANCEL permission at final recheck'
-        else:
-            assert sdk.cancels == [('A',)], 'historical incident must allow exact unknown-yield BUY protection'
     finally:
         if cancel_lease is not None:
             cancel_lease.release()
