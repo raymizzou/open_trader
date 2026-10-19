@@ -85,7 +85,7 @@ class PermissionPort:
     allowed = True
 
     def acquire(self, kind):
-        assert kind in ('BUY', 'CANCEL', 'MANUAL_BUY')
+        assert kind in ('BUY', 'CANCEL', 'ROTATION_CANCEL', 'MANUAL_BUY')
         if not self.admit:
             return None
         port = self
@@ -93,8 +93,8 @@ class PermissionPort:
         class Lease:
             released = False
 
-            def allowed(self):
-                return not self.released and port.allowed
+            def allowed(self, action=None):
+                return not self.released and port.allowed and (action is None or action == kind)
 
             def release(self):
                 self.released = True

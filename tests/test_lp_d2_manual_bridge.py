@@ -97,6 +97,32 @@ def entry(clock,**changes):
         idempotency_key='manual-key',estimated_target_quantity='999')|changes
 
 
+def test_paused_stale_execution_allows_manual_entry_and_augment(tmp_path, monkeypatch):
+    execution, live, sdk, public, clock = manual_runtime(tmp_path, monkeypatch)
+    try:
+        execution._n_leg_paused = True
+        row = live.store.create_recovery_execution(
+            dict(reason='historical unfinished execution'), idempotency_key='stale-manual')
+        live.store.transition_execution(row['execution_id'], state='submitting', evidence={})
+        historical = live.store.active_execution()
+
+        first = execution.lp_submit_entry(entry(clock))
+        assert first['state'] == 'entry_open' and first['submit_status'] == 'accepted', first
+        augmented = execution.lp_submit_augment(dict(session_id=first['session_id'],
+            quantity='20', price='.28', idempotency_key='stale-augment'))
+
+        assert augmented['state'] == 'entry_open' and augmented['submit_status'] == 'accepted', augmented
+        assert augmented['entry_order_id'] == first['entry_order_id']
+        assert augmented['augment_order_id'] != first['entry_order_id']
+        assert [p['price'] for p in sdk.posts] == [Decimal('.29'), Decimal('.28')]
+        assert all(p['side'] == 'BUY' and p['token_id'] == TOKEN_ID for p in sdk.posts)
+        assert sdk.cancels == [] and sdk.market_orders == []
+        assert live.store.active_execution() == historical
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
 def test_d2_manual_entry_uses_current_frame_and_explicit_terms(tmp_path,monkeypatch):
     execution,live,sdk,public,clock=manual_runtime(tmp_path,monkeypatch)
     try:
