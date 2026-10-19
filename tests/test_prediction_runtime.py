@@ -4530,41 +4530,115 @@ def test_runtime_owns_one_shared_solver_server_for_its_start_stop_lifetime(
     assert events == ["solver.close", "execution.close"]
 
 
-def _assert_actual_reconcile_failure(tmp_path, scenario):
+def _nr_start(child):
+    child.release('metadata')
+    child.start(expected_running=None)
+    child.wait('nr-start-completed')
+    return json.loads(child.marker('nr-start.json').read_text())
+
+
+def _nr_cycle(child, kind='known'):
+    child.wait('nr-cycle-'+kind+'-completed')
+    return json.loads(child.marker('nr-cycle-'+kind+'.json').read_text())
+
+
+def test_d2_paused_restart_ignores_stale_lp_execution_bookkeeping_without_reconcile(tmp_path):
     from tests.lp_d2_service_harness import ServiceChild
-    with ServiceChild(tmp_path, scenario=scenario) as child:
-        child.release("metadata"); child.start(expected_running=None)
-        child.wait("notready-entered")
-        before = json.loads(child.marker("consumer-observations.json").read_text())
-        assert before["state"] == "NOT_READY" and before["production_owner"] is True
-        assert before["scheduler_started"] is before["monitor_thread_started"] is before["history_started"] is False
-        assert before["excluded_before_cleanup"] is True
-        competing_owner = _RuntimeOwnershipLock(child.data_dir / "prediction_arbitrage/runtime.lock")
-        with pytest.raises(PredictionRuntimeOwnershipError):competing_owner.acquire()
+    with ServiceChild(tmp_path,scenario='nr-stale') as child:
+        started=_nr_start(child)
+        assert started['reconcile_calls']==0, 'D2 paused startup must use local admission, not reconcile_startup'
+        assert started['state']=='RUNNING', 'D2 local admission must ignore stale execution bookkeeping'
+        cycle=_nr_cycle(child)
+        assert cycle['scheduler_starts']==1 and cycle['api_before_scheduler'] is False
+        assert cycle['reconcile_calls']==cycle['legacy_ticks']==0
+        assert cycle['orders_complete'] is True
+        assert cycle['cancels']==[['A']]  # Exact round0 BUY set; manual SELL S is excluded.
+        assert cycle['sell_ids']==['S']
+        assert cycle['posts']==child.actual_posts()==0
+        before=json.loads(child.marker('nr-history-before.json').read_text())
+        assert cycle['history']==before  # No invented terminal state or old-request replay.
+        assert cycle['history']['execution']['state']=='submitting'
         child.assert_owned()
-        assert child.actual_posts() == 0
-        child.release("notready")
-        assert child.wait_exit() == 78, child.output.read_text()
-        after = json.loads(child.marker("consumer-observations.json").read_text())
-        assert after["after_idempotent_stop"] == "STOPPED"
-        assert after["permit"]["state"] == "CLAIMED"
-        assert after["connections_at_owner_release"]["active"] == []
-        child.assert_owner_available()
-        competing_owner.acquire(); competing_owner.release()
-        if scenario == "consumer-reconcile-error":assert child.marker("actual-reconcile-sql-failed").exists()
+
+
+def test_d2_account_unknown_stays_online_without_buy_until_fresh_complete_facts(tmp_path):
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(tmp_path,scenario='nr-unknown') as child:
+        started=_nr_start(child)
+        assert started['state']=='RUNNING', 'account API timeout must not make D2 startup NOT_READY'
+        unknown=_nr_cycle(child,'unknown')
+        assert unknown['api_before_scheduler'] is False
+        assert unknown['orders_complete'] is False and unknown['reserved_state']=='unknown'
+        assert unknown['posts']==child.actual_posts()==0 and unknown['cancels']==[]
+        assert unknown['scheduler_starts']==1 and unknown['permit']['state']=='CLAIMED'
+        assert unknown['reconcile_calls']==unknown['legacy_ticks']==0
+        child.assert_owned()
+        child.release('fresh-facts')  # Only the external list availability changes.
+        known=_nr_cycle(child)
+        assert known['orders_complete'] is True and known['reserved_state']=='known'
+        assert known['cancels']==[['A']]
+        assert known['scheduler_starts']==1 and child.process.poll() is None
+        assert known['permit']==started['permit']==unknown['permit']
+        assert known['posts']==0  # Round0 cannot post; old intent is never replayed.
+        child.assert_owned()
+        # This socket-free subprocess proves runtime liveness. HTTP binding is
+        # deliberately left to the service gate outside this sandbox.
 
 
 def test_reconcile_failure_keeps_runtime_locked_and_does_not_start_monitors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _assert_actual_reconcile_failure(tmp_path, "consumer-reconcile-error")
+    """Historical name retained; reliable local control failure remains fatal."""
+    from tests.lp_d2_service_harness import ServiceChild
+    for fault in ('control','settings','identity'):
+        with ServiceChild(tmp_path/fault,scenario='nr-'+fault+'-fatal') as child:
+            failed=_nr_start(child)
+            assert failed['state']=='FAILED' and failed['scheduler_starts']==0
+            assert failed['reconcile_calls']==failed['legacy_ticks']==0
+            assert failed['production_owner'] is False and failed['d2_closed'] is True
+            assert failed['native_inflight']==0 and failed['writer_thread_alive'] is False
+            assert failed['monitor_thread_started'] is failed['history_started'] is False
+            assert failed['permit']['state']=='CLAIMED' and child.actual_posts()==0
+            assert not child.marker('nr-account-read').exists()
+            child.process.terminate()
+            assert child.wait_exit()==78, child.output.read_text()
+            child.assert_owner_available()  # Actual resources drained before owner release.
+            assert json.loads(child.permit_path.read_text())==failed['permit']
+    # An unavailable account list belongs to the Reader retry gate, rather
+    # than the fatal reliable-control path above.
+    with ServiceChild(tmp_path/'account',scenario='nr-unknown') as child:
+        started=_nr_start(child)
+        assert started['state']=='RUNNING', 'account reconciliation failure is not local admission failure'
+        cycle=_nr_cycle(child,'unknown')
+        assert cycle['scheduler_starts']==1 and cycle['posts']==0
+        assert cycle['orders_complete'] is False and cycle['reconcile_calls']==0
+        child.assert_owned()
 
 
 def test_locked_reconcile_result_keeps_runtime_not_ready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A real persisted unacknowledged non-LP incident supplies the locked result.
-    _assert_actual_reconcile_failure(tmp_path, "consumer-reconcile-locked")
+    """Historical incident locks new BUYs, while current BUY protection stays online."""
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(tmp_path,scenario='nr-incident') as child:
+        started=_nr_start(child)
+        assert started['state']=='RUNNING', 'historical incident must not prevent the D2 Scheduler'
+        cycle=_nr_cycle(child)
+        assert cycle['scheduler_starts']==1 and cycle['orders_complete'] is True
+        assert cycle['cancels']==[['A']] and cycle['posts']==child.actual_posts()==0
+        assert cycle['reconcile_calls']==cycle['legacy_ticks']==0
+        store=PredictionArbitrageStore(child.data_dir)
+        incident=store.unacknowledged_incident()
+        assert incident is not None  # Never auto-ack the incident.
+        child.release('new-buy')
+        child.wait('nr-new-buy-completed')
+        assert json.loads(child.marker('nr-new-buy.json').read_text())==dict(
+            state='locked',reason='circuit_breaker_open')
+        assert child.actual_posts()==0 and store.unacknowledged_incident()==incident
+        child.assert_owned()
+        child.process.terminate()
+        assert child.wait_exit()==0, child.output.read_text()
+        child.assert_owner_available()
 
 
 def test_core_initialization_failure_releases_resources_and_owner(
