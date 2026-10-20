@@ -4,6 +4,7 @@
 Prediction，并通过本地 Mac Gateway 和 SSH 隧道访问。默认目标是无凭据、
 N-leg 暂停的 Shadow；它不接管原生产实例，不提交订单。购买、配置、部署、
 凭据迁移和交易各自需要相应授权；本文件不是执行这些操作的授权。
+当前东京决策以[第 0 节](#0-tokyo-decision-baseline--2026-10-20)为准；与引言或下文旧说明冲突时，第 0 节优先。
 
 先读 [云端拓扑及门禁](prediction-cloud.md)、
 [Deployment Preflight](deployment-preflight.md)、
@@ -31,7 +32,9 @@ and authenticated Shadow start needs its own applicable authorization and gates.
 The following remain pending Ray decisions: geography/live trading, disposition
 of existing Tokyo credentials, tat_agent/SSH lockdown, the cross-host owner
 design, the mini release that prevents retired-host relaunch, restart/boot
-policy, and notifications. P3 production-file and P4 owner-handoff implementation
+policy, and notifications. The unresolved Polymarket terms/account/location
+eligibility conflict is part of the geography decision; see [section 5](#5-地域公开可达与订单测试).
+P3 production-file and P4 owner-handoff implementation
 must wait for the geography decision, the real-path gate and separate approval.
 No live cutover is approved. Capacity (#313), metadata (#320) and D3 production
 observation remain separate acceptance requirements; this edit closes none.
@@ -109,10 +112,18 @@ or drop pending history on exit. A database copy cannot prove current trading
 or funds authority. D2 CurrentLPState remains the sole trading authority.
 
 Preserve D3's single same-process database write permit, reliable/control
-priority and FIFO within a priority. Retry only BEGIN, at most three times
-with a 5000 ms bound per attempt; never replay the body or COMMIT. Permit wait
-counts toward the D2 10-second control-save limit. Keep lock order
-`permit → commit_guard/competition lock → queue lock`; never acquire the
+priority and FIFO within a priority. Retry only a failed BEGIN with SQLITE_BUSY,
+at most three BEGIN attempts in total (two retries) within the 15-second chain
+deadline or an earlier caller deadline. Do not retry with less than 5 seconds
+remaining; never replay the body or COMMIT. See
+[`LPWriteCoordinator.run_write()`](../../src/open_trader/lp_persistence.py#L359-L393)
+and [`PredictionArbitrageStore._transaction()`](../../src/open_trader/prediction_arbitrage_store.py#L458-L508).
+The Store's 5000 ms [SQLite busy timeout](../../src/open_trader/prediction_arbitrage_store.py#L437-L445)
+is not a wall-clock limit for the whole transaction.
+Permit wait counts toward each D2 control-save attempt's 10-second deadline:
+[`LPControlOwner._start_attempt()`](../../src/open_trader/polymarket_lp_control.py#L142-L159)
+sets `started + 10`, and the Store uses the earlier admission deadline.
+Keep lock order `permit → commit_guard/competition lock → queue lock`; never acquire the
 permit while holding the memory lock. Background lanes remain bounded at
 3000 entries or 16 MiB and drop the oldest pending item. Missing history stays
 incomplete/UNKNOWN. Daily reports remain paused; no strategy is added or enabled.
@@ -148,7 +159,7 @@ and the cutover need separate approval; no target SHA is established here.
 Preserve failed runtimes for audit. Unknown ownership or an unavailable safe
 anchor blocks restart; do not automatically fail back or add cancel-all/close-all.
 
-## 1. 已验证范围与未完成事项
+## 1. 历史已验证范围与当时未完成事项
 
 The following are historical records. They do not satisfy the prerequisites
 above or prove current host state, deployment or health.
@@ -316,7 +327,7 @@ export UV_PROJECT_ENVIRONMENT="$VENV"
 路径不得 group/world writable。Python symlink 目标也须为可信 root-owned 路径。
 运行期写入只进独立 service-owned runtime。`Dockerfile.dev` 是测试镜像。
 
-### 本次遇到的两个环境阻断
+### 历史环境阻断与当时处理记录
 
 uv 创建的 venv `.lock` 曾为 0666，触发可信路径拒绝。只修正已确认属于本任务
 venv 的这一个普通 root-owned 文件；不要递归 chmod 整棵树掩盖其他漂移：
@@ -439,8 +450,9 @@ restricted. Live remains blocked. Ray must resolve the official
 terms/account/location eligibility conflict and the real-path gate before P3/P4.
 Written clarification or risk acceptance alone cannot override `blocked=true`.
 Any gate change needs a separate approved plan and verification. Do not route
-Tokyo Polymarket traffic through HK to evade this result. The mini's recorded
-HK egress is neither Tokyo authorization nor proof of account eligibility;
+Tokyo Polymarket traffic through HK to evade this result. The recorded HK egress
+is a historical observation for the mini only. It does not authorize HK routing
+or Tokyo trading and does not prove account eligibility for either host;
 Tailscale here transports private Dashboard reads only.
 
 2026-10-10 用户单笔诊断的地域报告与实际订单结果并列记录于第 1 节，
