@@ -702,8 +702,9 @@ bash scripts/prediction-client.sh status --config '<private-client-json>'
 
 ## P2：tailnet 只读 Dashboard（计划功能，尚未部署）
 
-此入口只提供读取能力，不迁移 owner，不启动 PredictionRuntime，也不直接打开
-数据库或读取交易凭据。Tokyo 加入 tailnet、安装 adapter、SSH key/ACL 与服务用户
+此入口只提供读取能力，不迁移 owner，不启动 PredictionRuntime。adapter 具有
+no trading, DB or credential access, no explicit write route；它不直接打开数据库或读取
+交易凭据。Tokyo 加入 tailnet、安装 adapter、SSH key/ACL 与服务用户
 隔离、mini/Air 安装或切换均须 Ray 另行批准；本节不是安装授权，现有云端门禁也
 不因此成为新拓扑的验收证据。
 
@@ -721,14 +722,24 @@ adapter 应使用独立、无交易凭据目录读取权的 UID。部署前必�
 Tokyo 主动连接 mini/Air，不公开 8769/8770，不用公网 SSH alias 代替 tailnet。
 这些主机权限与网络条件尚未现场验证。
 
-**P2 尚有 GET 审计阻断项**：`/lp/dashboard` 与 `/lp/auto/state` 的 D2 投影
-调用 `settings_status()`，后者可能收集已完成的设置保存并发布 effective policy。
-当前尚无 observe-only 状态投影合同；在此项闭环前不能把 allowlist 宣称为严格
-无状态写入，也不能验收或部署 P2。该发现来自源码审计，未做运行时复现；本批次
-未扩大修改设置保存、发布或交易行为。
+`/lp/dashboard` 与 `/lp/auto/state` 的 D2 投影调用 `settings_status()`，可能在
+已完成保存的 iteration boundary 收集并发布 effective policy。用户接受现有的
+in-memory settings adoption 语义：仅在 completed save/iteration boundary 采用，mini
+本地页面继续每 5 秒轮询；本批次不修改 LP execution、设置保存或发布行为。这个
+入口不声明 Tokyo 后端零副作用，adapter 的边界仍是 no trading, DB or credential
+access, no explicit write route。未来如需 observe-only snapshot，应另行提出范围。
 
-每个客户端独立保存随机 URL-safe bearer token（至少 32 字节随机源），Gateway
-的 `token_file` 只保存 token 文本；adapter registry 是 JSON 对象，键为 `mini`、
+每个客户端独立保存随机 URL-safe bearer token（至少 32 个字符，由至少 32 字节随机源
+生成）。下面的命令会生成真实 token；只在私有终端执行，并将输出直接保存到受保护的
+`token_file`（父目录 0700、文件 0600）。本文不包含任何实际 secret：
+
+```sh
+umask 077
+python -c 'import secrets; print(secrets.token_urlsafe(32))' > /PRIVATE-DIR/readonly-token
+chmod 600 /PRIVATE-DIR/readonly-token
+```
+
+Gateway 的 `token_file` 只保存 token 文本；adapter registry 是 JSON 对象，键为 `mini`、
 `air` 等 client id，值为该 token UTF-8 字节的 SHA-256 小写十六进制摘要。
 两种文件均须由对应进程 UID 拥有、0600、单硬链接、非符号链接，直接父目录
 0700 且同 UID。不要把 token 放入命令行、URL、HTML/JS、Git 或日志。
@@ -764,19 +775,23 @@ python -m open_trader.prediction_client stop --config /PRIVATE-DIR/prediction-cl
 ```
 
 `ssh_alias` 在此 profile 必须是 `100.64.0.0/10` 内 IPv4 或完整 `*.ts.net` 名称，
-不接受普通 SSH alias、公网地址、localhost 或 split execution 配置。只读 tunnel
-忽略用户 SSH config，并固定 Hostname、禁用 ProxyCommand/ProxyJump；需要用户或
-专用 key 时显式填写上述两个 SSH 字段。私钥由操作员管理，程序不读入其内容。
+不接受普通 SSH alias、公网地址、localhost 或 split execution 配置。Air 及每个客户端
+必须为精确校验过的 tailnet host 预先写入由独立可信指纹核对得到的 `known_hosts`；
+只读 tunnel 忽略用户 SSH config，固定 Hostname、`StrictHostKeyChecking=yes`，禁用
+ProxyCommand/ProxyJump，不提示接受新 host key。不得使用 `StrictHostKeyChecking=no`
+或未经核验的 `ssh-keyscan` 建立信任。需要用户或专用 key 时显式填写上述两个 SSH
+字段。私钥由操作员管理，程序不读入其内容。
 `mode` 是预期的真实后端 mode；P2 不授权 production 部署。普通 profile 默认
 remote port 8769、原有客户端端口/认证行为不变；只读 profile 默认 8770 和独立
 本地 tunnel port 18879。已有监听者/身份不符会阻断，不接管本机服务。
 
-完整 mini Gateway 可保留所有股票/账户路由，单独把整个 Prediction 前缀切到
-只读通道。Gateway CLI 使用 `--prediction-access read_only`、
+现有 mini control Gateway 的股票/账户路由保持不变；read_only Gateway 必须是
+Prediction-only，不能把完整 mini 路由与只读 profile 混用。Gateway CLI 使用
+`--prediction-only`、`--prediction-access read_only`、
 `--prediction-token-file /PRIVATE-DIR/readonly-token`、
 `--prediction-tailnet-host tokyo.EXAMPLE.ts.net`、
 `--prediction-expected-sha FULL_SHA`、`--prediction-expected-mode shadow` 和
-`--prediction-upstream-port 18879`；Air 还加 `--prediction-only`。route record
+`--prediction-upstream-port 18879`。route record
 仍须为 `service`，保留原 schema，不添加 URL。只读 profile 禁止 split display
 配置，legacy/maintenance route 不会把 Prediction 请求转给本地服务。
 installer/template 新增 `--prediction-upstream-port PORT`（默认仍 8769），只配置
@@ -789,9 +804,9 @@ GET allowlist（除 `/healthz` 外均带 `/api/prediction-arbitrage` 前缀）�
 | --- | --- |
 | `/healthz` | 读取真实运行身份；owner/mode/SHA 不改写。 |
 | `/venues` | 现有缓存/只读账户投影；adapter 发送只抑制 cookie/CSRF 输出的 header，普通 mini bootstrap 不变。 |
-| `/lp/dashboard` | 既有后台快照；附带 D2 auto 投影可能发布已完成设置，须先关闭上述阻断项。 |
+| `/lp/dashboard` | 既有后台快照；D2 auto 投影可在 completed save/iteration boundary 采用已完成设置，沿用已接受的 in-memory 语义。 |
 | `/lp/account/trades` | 既有后台账户成交缓存；只接受单次 `offset`（非负、最多九位）与 `limit`（1–100）。 |
-| `/lp/auto/state`、`/lp/auto/reservations` | state 存在上述 D2 设置发布阻断项；reservations 为状态投影。保留 UNKNOWN 与原新鲜度字段。 |
+| `/lp/auto/state`、`/lp/auto/reservations` | state 沿用已接受的 D2 in-memory settings adoption；reservations 为状态投影。保留 UNKNOWN 与原新鲜度字段。 |
 | `/lp/auto/reports`、`/lp/auto/reports/YYYY-MM-DD` | 当前 reporting pause 响应，不生成或恢复报表 worker。 |
 | `/lp/reports/YYYY-MM-DD` | 仅读取已有不可变日报；ISO 日期必须有效，无自动回填。 |
 

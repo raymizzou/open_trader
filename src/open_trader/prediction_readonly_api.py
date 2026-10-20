@@ -50,7 +50,7 @@ def read_private_file(path: Path) -> str:
 
 def client_token(path: Path) -> str:
     token = read_private_file(path).strip()
-    if not re.fullmatch(r'[A-Za-z0-9_-]{16,512}', token):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{32,512}', token):
         raise ValueError('invalid private client token')
     return token
 
@@ -134,7 +134,7 @@ def create_prediction_readonly_api(*, token_file: Path, host: str = '127.0.0.1',
                 matched = False
                 for expected in entries.values():
                     matched |= hmac.compare_digest(digest, expected)
-                if not token or len(token) > 512 or not matched:
+                if not 32 <= len(token) <= 512 or not matched:
                     raise ValueError('unauthorized')
             except (OSError, ValueError, TypeError):
                 self._json(401, {'code': 'readonly_unauthorized'})

@@ -1115,7 +1115,7 @@ def test_readonly_adapter_auth_policy_revocation_and_identity(tmp_path):
         tokens.write_text(json.dumps({name: hashlib.sha256(token.encode()).hexdigest()
                                       for name, token in clients.items()}))
         tokens.chmod(0o600)
-    save_tokens({'mini': 'mini-fixture-token', 'air': 'air-fixture-token'})
+    save_tokens({'mini': 'mini-fixture-token-0123456789abcdef', 'air': 'air-fixture-token-0123456789abcdef'})
     with _running(_Upstream()) as backend:
         backend.response_body = json.dumps({
             'mode': 'production', 'production_owner': True, 'git_sha': 'a'*40,
@@ -1126,7 +1126,7 @@ def test_readonly_adapter_auth_policy_revocation_and_identity(tmp_path):
         adapter = create_prediction_readonly_api(token_file=tokens, port=0,
                                                 upstream_port=backend.server_port)
         with _running(adapter):
-            def request(path, token='mini-fixture-token', method='GET'):
+            def request(path, token='mini-fixture-token-0123456789abcdef', method='GET'):
                 conn = http.client.HTTPConnection('127.0.0.1', adapter.server_port, timeout=3)
                 headers = {'Cookie': 'browser-cookie', 'X-CSRF-Token': 'browser-csrf'}
                 if token is not None:
@@ -1158,8 +1158,8 @@ def test_readonly_adapter_auth_policy_revocation_and_identity(tmp_path):
             for method in ('POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'CONNECT', 'TRACE'):
                 assert request(path, method=method)[0] == 405
             assert len(backend.requests) == count
-            save_tokens({'air': 'air-fixture-token'})
+            save_tokens({'air': 'air-fixture-token-0123456789abcdef'})
             assert request(path)[0] == 401
-            assert request(path, 'air-fixture-token')[0] == 200
+            assert request(path, 'air-fixture-token-0123456789abcdef')[0] == 200
             tokens.chmod(0o644)
-            assert request(path, 'air-fixture-token')[0] == 401
+            assert request(path, 'air-fixture-token-0123456789abcdef')[0] == 401

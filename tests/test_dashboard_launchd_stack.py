@@ -338,7 +338,9 @@ def test_stack_templates_define_separate_loopback_jobs() -> None:
     assert gateway_args[gateway_args.index("--prediction-upstream-host") + 1] == (
         "127.0.0.1"
     )
-    assert gateway_args[gateway_args.index("--prediction-upstream-port") + 1] == "8769"
+    assert gateway_args[gateway_args.index("--prediction-upstream-port") + 1] == (
+        "OPEN_TRADER_PREDICTION_UPSTREAM_PORT"
+    )
     assert legacy_args[legacy_args.index("-m") : legacy_args.index("-m") + 3] == [
         "-m",
         "open_trader",

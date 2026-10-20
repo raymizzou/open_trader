@@ -151,6 +151,8 @@ def create_frontend_gateway(
     if config.prediction_access not in {"control", "read_only"}:
         raise ValueError("invalid Prediction access profile")
     if readonly:
+        if not config.prediction_only:
+            raise ValueError("read-only access requires prediction-only gateway")
         from .prediction_readonly_api import client_token, require_tailnet_host, allowed_read_target
         require_tailnet_host(config.prediction_tailnet_host)
         if (config.prediction_token_file is None or config.prediction_display_upstream_port is not None
@@ -439,6 +441,7 @@ def create_frontend_gateway(
                 "content-length",
                 "host",
                 "x-open-trader-account-route",
+                "x-open-trader-read-only",
             }
             headers = {
                 name: value

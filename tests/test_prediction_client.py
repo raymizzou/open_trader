@@ -419,7 +419,7 @@ def test_readonly_client_validates_tailnet_token_and_builds_isolated_commands(tm
     private = tmp_path / 'private'
     private.mkdir(mode=0o700)
     token = private / 'token'
-    token.write_text('fixture-private-token')
+    token.write_text('fixture-private-token-0123456789abcdef')
     token.chmod(0o600)
     cfg = dict(release_root=str(tmp_path/'release'), runtime_root=str(tmp_path/'runtime'),
         python='/usr/bin/python3', ssh_alias='tokyo.example.ts.net', expected_sha='a'*40,
@@ -436,10 +436,14 @@ def test_readonly_client_validates_tailnet_token_and_builds_isolated_commands(tm
     assert '--prediction-only' in commands['gateway']
     assert '--prediction-access' in commands['gateway'] and 'read_only' in commands['gateway']
     assert '--prediction-token-file' in commands['gateway']
-    assert 'fixture-private-token' not in json.dumps(commands)
+    assert 'fixture-private-token-0123456789abcdef' not in json.dumps(commands)
     for host in ('43.133.26.236', 'example.com', 'localhost', '127.0.0.1', 'open-trader-tokyo',
                  '100.63.255.255', '100.128.0.1', 'foo.ts.net.evil.com'):
         with pytest.raises(ValueError, match='tailnet'):
+            validate({**cfg, 'ssh_alias': host})
+    for host in ('tokyo.example.ts.net -o ProxyCommand=ssh evil',
+                 'tokyo.example.ts.net;ProxyCommand=ssh evil', 'ProxyCommand=ssh evil'):
+        with pytest.raises(ValueError):
             validate({**cfg, 'ssh_alias': host})
     for host in ('100.64.0.1', '100.127.255.254'):
         validate({**cfg, 'ssh_alias': host})
