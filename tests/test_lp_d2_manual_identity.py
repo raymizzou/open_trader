@@ -39,15 +39,12 @@ def test_manual_entry_identity_claim_replays_across_owners(tmp_path, monkeypatch
     first, second = PredictionArbitrageStore(tmp_path), PredictionArbitrageStore(tmp_path)
     assert first.lp_manual_command(ACCOUNT, 'raw-key') is None
     gate, results, errors = Barrier(2), [], []
-    real_connect = sqlite3.connect
-    class SimultaneousClaims(sqlite3.Connection):
-        def execute(self, sql, *a, **kw):
-            if sql == 'BEGIN IMMEDIATE' and current_thread().name.startswith('manual-claim-'):
-                gate.wait(timeout=3)
-            return super().execute(sql,*a,**kw)
-    monkeypatch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=SimultaneousClaims))))
+    # Race public claims before single-writer admission, as with preview claims.
+    # Native BEGINs cannot rendezvous while one owns the shared permit.
     def claim(store):
-        try: results.append(store.lp_claim_manual_command(command()))
+        try:
+            gate.wait(timeout=3)
+            results.append(store.lp_claim_manual_command(command()))
         except BaseException as exc: errors.append(exc)
     threads=[Thread(target=claim,args=(store,),name='manual-claim-'+str(i)) for i,store in enumerate((first,second))]
     for t in threads: t.start()
@@ -94,14 +91,12 @@ def test_manual_preview_consumption_is_atomic_with_identity_claim(tmp_path, monk
     preview=first.create_preview(payload,created_at=NOW.isoformat(),expires_at=(NOW+timedelta(seconds=30)).isoformat())
     assert datetime.fromisoformat(first.lp_preview(preview)['expires_at'])==NOW+timedelta(seconds=10)
     gate,results,errors=Barrier(2),[],[]
-    real_connect=sqlite3.connect
-    class PreviewRace(sqlite3.Connection):
-        def execute(self,sql,*a,**kw):
-            if sql=='BEGIN IMMEDIATE' and current_thread().name.startswith('manual-preview-'): gate.wait(3)
-            return super().execute(sql,*a,**kw)
-    monkeypatch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=PreviewRace))))
+    # Race the two public invocations before admission. Two native BEGINs
+    # cannot rendezvous inside the single-writer permit.
     def claim(store,index):
-        try: results.append(store.lp_claim_manual_command(command(kind='start',session_id='G'+str(index),
+        try:
+            gate.wait(3)
+            results.append(store.lp_claim_manual_command(command(kind='start',session_id='G'+str(index),
             request_id='R'+str(index),idempotency_key='key'+str(index)),preview_id=preview,now=NOW+timedelta(seconds=9)))
         except BaseException as exc: errors.append(exc)
     threads=[Thread(target=claim,args=(s,i),name='manual-preview-'+str(i)) for i,s in enumerate((first,second))]
@@ -132,6 +127,7 @@ def test_manual_preview_consumption_is_atomic_with_identity_claim(tmp_path, monk
                 armed[0]=False
                 raise sqlite3.OperationalError('actual preview claim commit failure')
             return super().execute(sql,*a,**kw)
+    real_connect = sqlite3.connect
     monkeypatch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=CommitFailure))))
     with pytest.raises(sqlite3.OperationalError,match='commit failure'):
         first.lp_claim_manual_command(command(idempotency_key='rollback',session_id='rollback'),preview_id=pid,now=NOW)

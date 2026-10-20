@@ -944,6 +944,10 @@ class PredictionRuntime:
                 set_cross_venue_monitor(
                     self._cross_runtime or self.cross_venue_monitor
                 )
+            if self._n_leg_paused and self.lp_d2 is not None:
+                # Claim, transport identity, control and settings have been
+                # validated locally. The sole Scheduler owns the first API read.
+                self.execution.admit_d2_paused_startup()
         except Exception as exc:
             if isinstance(exc,(PredictionStartDenied,PredictionRuntimeFatal)):
                 self._fatal=self._fatal or exc
@@ -954,7 +958,10 @@ class PredictionRuntime:
             raise
 
         try:
-            reconcile = self.execution.reconcile_startup()
+            reconcile = (
+                None if self._n_leg_paused and self.lp_d2 is not None
+                else self.execution.reconcile_startup()
+            )
             if isinstance(reconcile, Mapping) and reconcile.get("state") == "locked":
                 self._record_claimed_startup_failure(RuntimeError(
                     str(reconcile.get("reason", "reconcile_locked"))))
@@ -2141,6 +2148,43 @@ class PredictionRuntime:
                 pass  # Admission is closed; collection follows producer stop.
             except BaseException as exc:
                 errors.append(exc)
+        # Cancel independent producers before joining any LP thread. Those
+        # threads can be waiting for the metadata writer's SQLite transaction.
+        if self._cross_runtime is not None:
+            try:
+                self._cross_runtime.stop()
+            except BaseException as exc:
+                errors.append(exc)
+                if self._cross_runtime.thread_alive:
+                    uncertain_thread = True
+                else:
+                    drained_cross_error = exc
+            finally:
+                if not self._cross_runtime.thread_alive:
+                    self._cross_runtime = None
+        if self.monitor is not None:
+            try:
+                self.monitor.stop()
+            except BaseException as exc:
+                errors.append(exc)
+                uncertain_thread = True
+            else:
+                monitor_thread = getattr(self.monitor, "_thread", None)
+                if monitor_thread is not None and monitor_thread.is_alive():
+                    errors.append(RuntimeError("prediction monitor thread did not stop"))
+                    uncertain_thread = True
+                else:
+                    self.monitor = None
+        # Collect metadata before joining possible Store waiters (including
+        # Scheduler/history/candidate work). If the writer is still alive, keep
+        # those threads, shared resources and owner for a later stop, without
+        # spending their join budgets before reaching the writer's own bound.
+        if callable(stop_metadata):
+            try:
+                stop_metadata(timeout=5)
+            except BaseException as exc:
+                errors.append(exc)
+                return errors
         if self._lp_auto_scheduler is not None:
             try:
                 self._lp_auto_scheduler.stop()
@@ -2252,18 +2296,6 @@ class PredictionRuntime:
                 errors.append(exc)
             finally:
                 self.predict_snapshot_refresher = None
-        if self._cross_runtime is not None:
-            try:
-                self._cross_runtime.stop()
-            except BaseException as exc:
-                errors.append(exc)
-                if self._cross_runtime.thread_alive:
-                    uncertain_thread = True
-                else:
-                    drained_cross_error = exc
-            finally:
-                if not self._cross_runtime.thread_alive:
-                    self._cross_runtime = None
         if self.observation_monitor is not None:
             try:
                 self.observation_monitor.stop()
@@ -2271,19 +2303,6 @@ class PredictionRuntime:
                 errors.append(exc)
             finally:
                 self.observation_monitor = None
-        if self.monitor is not None:
-            try:
-                self.monitor.stop()
-            except BaseException as exc:
-                errors.append(exc)
-                uncertain_thread = True
-            else:
-                monitor_thread = getattr(self.monitor, "_thread", None)
-                if monitor_thread is not None and monitor_thread.is_alive():
-                    errors.append(RuntimeError("prediction monitor thread did not stop"))
-                    uncertain_thread = True
-                else:
-                    self.monitor = None
         for attr in (
             "_candidate_scan_thread",
             "_candidate_maintenance_thread",
@@ -2325,15 +2344,6 @@ class PredictionRuntime:
             except RuntimeError as exc:
                 errors.append(exc)
                 return errors  # Keep collaborators and owner for a later stop.
-        # A still-running save owns the Store/client. The generic close loop
-        # clears references even when close raises, so retain all collaborators
-        # and the owner if this real writer has not exited. A later stop retries.
-        if callable(stop_metadata):
-            try:
-                stop_metadata(timeout=5)
-            except BaseException as exc:
-                errors.append(exc)
-                return errors
         # A reported cross-monitor failure can outlive its ended native thread.
         # Close the other resources, but retain the owner and failure below.
         if uncertain_thread or (errors and errors != [drained_cross_error]):

@@ -3,6 +3,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
 
+import pytest
+
 import open_trader.polymarket_lp_current_state as cs
 from open_trader.polymarket_lp_market_reader import CapturedSources, MarketReader, SourceResult
 from open_trader.polymarket_lp_market_calculation import CalculationResult
@@ -10,6 +12,7 @@ from open_trader.polymarket_lp_market_calculation import CalculationResult
 T = datetime(2026, 10, 16, tzinfo=UTC)
 D = Decimal
 KEY = ('A', 'M', 'TOKEN', 'O1')
+WALLET = '0x1AF9e3D4141676Af4c6858509D71471561e00562'
 
 
 class Clock:
@@ -52,6 +55,158 @@ def observe(current, source=None, *, yields=None, capacity=D('16.20')):
     source = source or frame()
     ticket = current.begin_observation('opaque-generation', tuple(source.sources))
     return current.accept(ticket, source, calculation(source, yields, capacity), evaluated_at=T)
+
+
+def wallet_state(owner):
+    current = cs.CurrentLPState(owner, 'process', clock=Clock(), utc_now=lambda: T)
+    current.apply_effective_control(cs.EffectiveControlTransition(
+        owner, 'process', ('process', 0), 0, None, None, True, 'startup'), 'opaque-generation')
+    return current
+
+
+def wallet_frame(owner, row_account, *, with_orders=True):
+    return MarketReader.from_captured_sources(CapturedSources(owner, {
+        'open_orders': SourceResult('wallet-orders',
+            [dict(order(), account_id=row_account)] if with_orders else [], checked_at=T),
+        'positions': SourceResult('wallet-positions', [dict(account_id=row_account,
+            condition_id='M', token_id='TOKEN', quantity='2', cost_usd='1.00',
+            average_price='0.50', redeemable=False)], checked_at=T),
+        'balance': SourceResult('wallet-balance', ('20', '20'), checked_at=T),
+    }))
+
+
+@pytest.mark.parametrize('owner,row_account', [
+    (WALLET, WALLET.lower()), (WALLET.lower(), WALLET), (WALLET, WALLET.upper()),
+])
+def test_wallet_case_variants_accept_orders(owner, row_account):
+    current = wallet_state(owner)
+    source = wallet_frame(owner, row_account)
+    # Isolate the order boundary; the position boundary has its own next case.
+    source = replace(source, positions=tuple(dict(r, account_id=owner) for r in source.positions))
+    accepted = observe(current, source)
+    assert accepted.status == 'accepted'
+    snapshot = current.snapshot()
+    assert snapshot.buy_reserved.value == D('2.80')
+    assert snapshot.inventory_cost.value == D('1.00')
+    assert snapshot.current_exposure.value == D('3.80')
+    assert snapshot.new_capacity.value == D('16.20')
+    assert snapshot.orders[0].key == (owner, 'M', 'TOKEN', 'O1')
+    assert snapshot.observation.account_id == owner
+    assert snapshot.observation.source_frame is source
+    assert source.orders[0]['account_id'] == row_account
+    assert source.sources['open_orders'].value[0]['account_id'] == row_account
+    assert snapshot.orders[0].source.source_id == 'wallet-orders'
+    assert snapshot.orders[0].source.checked_at == T
+
+
+@pytest.mark.parametrize('owner,row_account', [
+    (WALLET, WALLET.lower()), (WALLET.lower(), WALLET), (WALLET, WALLET.upper()),
+])
+def test_wallet_case_variants_accept_positions(owner, row_account):
+    current = wallet_state(owner)
+    source = wallet_frame(owner, row_account, with_orders=False)
+    accepted = observe(current, source, capacity=D('19'))
+    assert accepted.status == 'accepted'
+    snapshot = current.snapshot()
+    assert snapshot.buy_reserved.value == D('0')
+    assert snapshot.inventory_cost.value == D('1')
+    assert snapshot.current_exposure.value == D('1')
+    assert snapshot.new_capacity.value == D('19')
+    assert snapshot.positions[0].account_id == owner
+    assert snapshot.positions[0].quantity.value == D('2')
+    assert snapshot.observation.account_id == owner
+    assert snapshot.observation.source_frame is source
+    assert source.positions[0]['account_id'] == row_account
+    assert source.sources['positions'].value[0]['account_id'] == row_account
+    assert snapshot.positions[0].source.source_id == 'wallet-positions'
+    assert snapshot.positions[0].source.checked_at == T
+
+
+@pytest.mark.parametrize('component', ['orders', 'positions'])
+@pytest.mark.parametrize('mixed', [False, True], ids=['wrong-only', 'mixed-batch'])
+def test_different_wallet_row_is_invalid_identity(component, mixed):
+    current = wallet_state(WALLET)
+    original = wallet_frame(WALLET, WALLET)
+    assert observe(current, original).status == 'accepted'
+    wrong = WALLET[:-1] + '3'  # One hex digit differs; this is a different wallet.
+    rows = getattr(original, component)
+    bad = dict(rows[0], account_id=wrong)
+    if component == 'orders':
+        bad['order_id'] = 'wrong-wallet-order'
+    source = replace(original, **{component: (*rows, bad) if mixed else (bad,)})
+    before = current.snapshot()
+    result = observe(current, source)
+    assert result.status == 'invalid_identity'
+    assert result.observation is None
+    assert current.snapshot() == before
+    # The real reader must mark wrong-wallet input incomplete, never a valid empty account.
+    name = 'open_orders' if component == 'orders' else 'positions'
+    captured = dict(original.sources)
+    captured[name] = replace(captured[name], value=[bad])
+    filtered = MarketReader.from_captured_sources(CapturedSources(WALLET, captured))
+    assert getattr(filtered, component + '_complete') is False
+    assert getattr(filtered, component) == ()
+    assert (filtered.buy_reserved if component == 'orders' else filtered.inventory_cost) is None
+
+
+@pytest.mark.parametrize('component', ['orders', 'positions'])
+@pytest.mark.parametrize('owner,row_account,expected', [
+    (WALLET, None, 'invalid_identity'),
+    (WALLET, WALLET.encode(), 'invalid_identity'),
+    (WALLET, '', 'invalid_identity'),
+    (WALLET, WALLET[:-1], 'invalid_identity'),
+    (WALLET, WALLET + '0', 'invalid_identity'),
+    (WALLET, WALLET.lower() + '\n', 'invalid_identity'),
+    (WALLET, ' ' + WALLET.lower(), 'invalid_identity'),
+    (WALLET, WALLET.lower() + ' ', 'invalid_identity'),
+    ('0x' + 'f' * 40, '0x' + 'ｆ' * 40, 'invalid_identity'),
+    ('0x' + 'a' * 39 + 'ſ', '0x' + 'a' * 39 + 's', 'invalid_identity'),
+    ('0x' + 'A' * 39, '0x' + 'a' * 39, 'invalid_identity'),
+    (' ' + WALLET, WALLET.lower(), 'invalid_identity'),
+    ('Alice', 'alice', 'invalid_identity'),
+    ('A', 'a', 'invalid_identity'),
+    ('Alice', 'Alice', 'accepted'),
+    (WALLET, 'missing', 'accepted'),
+])
+def test_wallet_case_rule_does_not_relax_ticket_or_opaque_identity(component, owner, row_account, expected):
+    current = wallet_state(owner)
+    source = wallet_frame(owner, owner)
+    rows = [dict(r) for r in getattr(source, component)]
+    if row_account == 'missing':
+        rows[0].pop('account_id')
+    else:
+        rows[0]['account_id'] = row_account
+    source = replace(source, **{component: tuple(rows)})
+    before = current.snapshot()
+    result = observe(current, source)
+    assert result.status == expected
+    if expected == 'invalid_identity':
+        assert result.observation is None
+        assert current.snapshot() == before
+    else:
+        assert result.observation.account_id == owner
+    # Wallet equivalence is never authority to alter a frame or read ticket.
+    for field, value, status in (
+        ('account_id', owner.swapcase(), 'invalid_identity'),
+        ('process_epoch', 'other-process', 'invalid_identity'),
+        ('cycle_generation', 'other-generation', 'stale'),
+        ('trade_version_at_start', 999, 'stale'),
+        ('observation_id', 'unissued-read', 'invalid_identity'),
+    ):
+        valid = wallet_frame(owner, owner)
+        ticket = current.begin_observation('opaque-generation', tuple(valid.sources))
+        snapshot = current.snapshot()
+        rejected = current.accept(replace(ticket, **{field: value}), valid, calculation(valid), evaluated_at=T)
+        assert rejected.status == status
+        assert rejected.observation is None
+        assert current.snapshot() == snapshot
+    valid = wallet_frame(owner, owner)
+    ticket = current.begin_observation('opaque-generation', tuple(valid.sources))
+    snapshot = current.snapshot()
+    result = current.accept(ticket, replace(valid, account=owner.swapcase()), calculation(valid), evaluated_at=T)
+    assert result.status == 'invalid_identity'
+    assert result.observation is None
+    assert current.snapshot() == snapshot
 
 
 def test_snapshot_preserves_current_identity_quantity_cost_and_source_time():

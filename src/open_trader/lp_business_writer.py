@@ -84,7 +84,12 @@ class ReceiptRecord:
         _validate_evidence(self, self.received_at)
         if self.reason_code is not None and (type(self.reason_code) is not str or self.reason_code not in {
                 'unsupported_order_shape', 'ambiguous_send_options', 'unsupported_send_option',
-                'invalid_builder_code', 'control_or_native_not_current'}):
+                'invalid_builder_code', 'control_or_native_not_current',
+                'mutation_not_admitted', 'mutation_lease_not_current',
+                'independent_cancel_identity', 'independent_cancel_not_current',
+                'independent_cancel_inflight', 'rotation_not_current',
+                'protection_cancel_owned', 'protection_cancel_not_current',
+                'protection_evidence_not_current', 'native_capacity'}):
             raise ValueError('record_reason_code_invalid')
         if self.outcome not in ('accepted', 'rejected', 'unknown', 'not_sent'):
             raise ValueError('record_outcome_invalid')

@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from datetime import datetime
 
-from .polymarket_lp_market_reader import SourceResult, decimal, freeze
+from .polymarket_lp_market_reader import SourceResult, decimal, freeze, observed_source_error
 
 
 @dataclass(frozen=True)
@@ -47,6 +47,13 @@ def _prepare_qualified(frame, capture, policy, as_of):
     from .polymarket_lp_views import lp_history_eligibility, _next_review_at
     from .polymarket_lp import expiration_for_review
     account = _current_account(frame, as_of)
+    # Qualification considers a possible final composition. The calculator
+    # reserves its retained orders, and the sender separately requires actual
+    # free funds. Keep all order facts for participation/depth gates here.
+    selection_account = ({**account.value,
+        'balance': account.value['balance'] + frame.buy_reserved,
+        'allowance': account.value['allowance'] + frame.buy_reserved}
+        if account.complete else None)
     rows, sources, eligibility = [], {}, {}
     for cid, source in capture.rows.items():
         if not source.complete or source.error:
@@ -71,7 +78,7 @@ def _prepare_qualified(frame, capture, policy, as_of):
                 reason = lp_history_eligibility(direction.get('history_summary'), now=as_of,
                     condition_id=cid, token_id=token)
             evaluated = (dict(state='unknown', reason_codes=(reason,), guidance=None) if reason else
-                evaluate_lp_entry(direction, account=account.value, now=as_of, reservations=(),
+                evaluate_lp_entry(direction, account=selection_account, now=as_of, reservations=(),
                     candidate=True, bid_level=policy.buy_price_level))
             eligibility[key] = evaluated
             guide = evaluated.get('guidance')
@@ -105,24 +112,39 @@ def prepare_current_inputs(frame, captured_candidates, policy, as_of):
     Directions are keyed by exact current order ID; their source provenance stays
     in the original market SourceResults alongside the derived values.
     """
-    directions = {}
+    directions, failures = {}, {}
     for order in frame.current_buys:
         condition, token = order['condition_id'], order['token_id']
         source = frame.sources.get(f'market:{condition}:{token}')
+        def dropped(code):
+            failures[order['order_id']] = dict(order_id=order['order_id'],
+                account_id=frame.account, condition_id=condition, token_id=token,
+                reason_codes=(code,), source_id=source.source_id if source else None,
+                source_error=observed_source_error(source))
         if not source or not source.complete or source.error or not isinstance(source.value, Mapping):
+            dropped('market_source_missing' if not source else 'market_source_failed' if source.error
+                else 'market_source_incomplete' if not source.complete else 'market_payload_invalid')
             continue
         value = source.value
         metadata, catalog, book = (value.get(k) for k in ('metadata', 'rewards', 'book'))
         if not all(isinstance(v, Mapping) for v in (metadata, catalog, book)):
+            dropped(next(code for value, code in ((metadata, 'market_metadata_missing'),
+                (catalog, 'market_rewards_missing'), (book, 'market_book_missing'))
+                if not isinstance(value, Mapping)))
             continue
         if (metadata.get('condition_id') != condition
                 or book.get('condition_id', book.get('market')) != condition
                 or book.get('token_id', book.get('asset_id')) != token
                 or catalog.get('complete') is not True):
+            dropped('metadata_condition_mismatch' if metadata.get('condition_id') != condition
+                else 'book_condition_mismatch' if book.get('condition_id', book.get('market')) != condition
+                else 'book_token_mismatch' if book.get('token_id', book.get('asset_id')) != token
+                else 'reward_catalog_incomplete')
             continue
         rows = [r for r in catalog.get('markets', ())
                 if isinstance(r, Mapping) and r.get('condition_id') == condition]
         if len(rows) != 1:
+            dropped('reward_row_missing' if not rows else 'reward_rows_multiple')
             continue
         reward = rows[0]
         minimum = metadata.get('reward_min_size')
@@ -141,7 +163,8 @@ def prepare_current_inputs(frame, captured_candidates, policy, as_of):
     if type(captured_candidates) is QualifiedPoolCapture:
         values = _prepare_qualified(frame, captured_candidates, policy, as_of)
         return replace(frame, sources=MappingProxyType({**frame.sources, **values,
-            'directions': SourceResult('', freeze(directions))}))
+            'directions': SourceResult('', freeze(directions)),
+            'direction_failures': SourceResult('', freeze(failures))}))
     if captured_candidates is None:
         candidates = SourceResult('', complete=False)
     elif type(captured_candidates) is SourceResult:
@@ -150,7 +173,8 @@ def prepare_current_inputs(frame, captured_candidates, policy, as_of):
     else:
         raise TypeError('captured_candidates_requires_source_result')
     return replace(frame, sources=MappingProxyType({**frame.sources,
-        'directions': SourceResult('', freeze(directions)), 'candidates': candidates}))
+        'directions': SourceResult('', freeze(directions)), 'candidates': candidates,
+        'direction_failures': SourceResult('', freeze(failures))}))
 
 
 def manual_snapshot(frame, request, as_of):

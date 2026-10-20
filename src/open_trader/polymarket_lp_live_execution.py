@@ -5,6 +5,7 @@ from decimal import Decimal
 from collections.abc import Mapping
 import json
 import hashlib
+import logging
 import threading
 import time
 from concurrent.futures import Future
@@ -14,6 +15,9 @@ from types import MappingProxyType
 from .lp_business_writer import LPBusinessWriter, RequestRecord, ReceiptRecord, ProgressRecord
 from .polymarket_lp_control import LPControlOwner
 from .polymarket_lp_current_inputs import prepare_current_inputs
+from .polymarket_lp_diagnostics import (summarize_iteration, project_diagnostics, append_outcome,
+    diagnostic_json_copy, summarize_yield_observation, yield_diagnostic_value,
+    YIELD_ROUND_LIMIT, YIELD_ROW_LIMIT)
 from .polymarket_lp_current_state import (
     AppliedControl, CommittedControl, CurrentLPState, StoredControl, ValidatedStartAdmission,
     ControlRequestResult,
@@ -25,16 +29,26 @@ from .polymarket_lp_current_state import (
     OpeningProtection, OpeningEconomics, OpeningProtectionUpdate,
     ScoringState, ScoringObservation,
     OwnFillEvidence, SellState, ExitAttempt, ExitEvidenceUpdate,
+    external_account_matches,
 )
-from .polymarket_lp_market_calculation import CalculationPolicy, calculate_current
+from .polymarket_lp_market_calculation import CalculationPolicy, calculate_current, select_current_composition
 from .polymarket_lp_market_reader import MarketReader, ReadScope, freeze
 from .polymarket_lp_risk import (estimate_lp_queue_position, first_observation_baseline,
     _executable_bid_value, _projected_taker_fee, _freshness, _levels, _maybe_decimal, TERMINAL_ORDER_STATES)
 from .polymarket_lp import SCORING_POLL_SECONDS, SCORING_STALE_SECONDS, SCORING_FAILURE_WINDOW_SECONDS, STOP_LOSS
 from .polymarket_lp_round import (
     LPRoundCoordinator, CycleStatus, FixedBuyPlan, StartStatus, CancelTarget,
-    LocalOutcome, LocalStatus, BuyTarget, BuyTerms, ActionIdentity,
+    LocalOutcome, LocalStatus, BuyTarget, BuyTerms, ActionIdentity, BatchKind,
 )
+
+
+logger = logging.getLogger(__name__)
+
+_CANCEL_BLOCK_REASONS = frozenset({
+    'mutation_not_admitted', 'mutation_lease_not_current', 'independent_cancel_identity',
+    'independent_cancel_not_current', 'independent_cancel_inflight', 'rotation_not_current',
+    'protection_cancel_owned', 'protection_cancel_not_current', 'protection_evidence_not_current',
+    'native_capacity', 'control_or_native_not_current', 'cancel_in_progress', 'cancel_backoff'})
 
 
 @dataclass(frozen=True)
@@ -63,6 +77,36 @@ class RunResult:
     start: object = None
     finish: object = None
     outcomes: tuple = ()
+    rotation: object = None
+    rotation_outcomes: tuple = ()
+    selection: object = None
+
+
+@dataclass(frozen=True)
+class RotationDecision:
+    account_id: str
+    cycle_generation: str
+    observation_id: str
+    victims: tuple
+    incumbent_yields: tuple = ()
+    candidate_yields: tuple = ()
+    target_tokens: tuple = ()
+
+
+@dataclass(frozen=True)
+class RotationYield:
+    kind: str
+    identity: tuple
+    state: str
+    yield_pct_per_hour: Decimal | None
+
+
+@dataclass(frozen=True)
+class RotationOutcome:
+    order_key: tuple
+    status: str
+    reason: str | None = None
+    handle: object = None
 
 
 @dataclass(frozen=True)
@@ -218,10 +262,13 @@ class _ControlStore:
         return StoredControl(**{**saved, 'account_id': self.account_id})
 
     def save(self, write):
+        return self.save_with_admission(write, None)
+
+    def save_with_admission(self, write, attempt):
         if write.account_id != self.account_id:
             raise ValueError('d2_control_account_identity')
         return CommittedControl(**self.store.lp_save_current_control({
-            **asdict(write), 'account_id': self.pool_account_id}))
+            **asdict(write), 'account_id': self.pool_account_id}, admission=attempt))
 
 
 def _transition_id(value):
@@ -230,7 +277,8 @@ def _transition_id(value):
 
 
 class _StandaloneMutationLease:
-    def allowed(self): return True
+    def __init__(self, action): self.action = action
+    def allowed(self, action=None): return action is None or action == self.action
     def release(self): pass
 
 
@@ -264,6 +312,10 @@ class LPD2LiveExecution:
         self._closed = False
         self._admission = None
         self._record_requests = {}
+        self._yield_rounds = ()
+        self._yield_rounds_total = 0
+        self._yield_diagnostic_instance = uuid4().hex
+        self._yield_unknown_observations = ()
         # Immutable current-process ownership/provenance only. All business
         # quantities, statuses and latches remain exclusively in CurrentLPState.
         self._opening_order_associations = {}
@@ -281,6 +333,17 @@ class LPD2LiveExecution:
         self._last_current_evidence = None
         self._last_buy_uncertainty = None
         self._mutation_owner = self._mutation_acquire = None
+        self._diagnostics = freeze(dict(version=1, latest_attempt=None, accepted_observation=None,
+            admission=None, reader_coverage=None, round_start=None))
+        self._protection_diagnostics = freeze(dict(entered=False, disposition='unavailable', skip_reason=None,
+            attempt_id=None, attempted_at=None, observation_id=None, generation=None))
+        self._diagnostic_outcomes = freeze(dict(total=0, omitted=0, by_kind={}, unknown_subtypes={}, recent=(),
+            protection_cancel_outcomes={}))
+        self._rotation_dispatched = None
+        self._rotation_summary = None
+        self._rotation_pending = ()
+        self._cancel_blocks = freeze(dict(total=0, by_reason={}, recent=()))
+        self._rotation_cancel_backoffs = {}
 
     def manual_call(self, operation):
         """Own the whole explicit command, including reliable SQL, until actual end."""
@@ -643,7 +706,7 @@ class LPD2LiveExecution:
         expires = as_of+timedelta(seconds=10)
         preview_id = self.store.create_preview(self._manual_json(dict(request,
             session_id=group['identity']['session_id'],preflight=facts)),
-            expires_at=expires.isoformat(),created_at=as_of.isoformat())
+            expires_at=expires.isoformat(),created_at=as_of.isoformat(), lp_priority="reliable")
         return dict(state='previewed',preview_id=preview_id,expires_at=expires.isoformat(),
             request=dict(session_id=group['identity']['session_id'],quantity=request['quantity']),
             price=request['price'],preflight=facts,
@@ -696,7 +759,7 @@ class LPD2LiveExecution:
             return dict(state='rejected', reason=str(exc))
         expires = as_of + timedelta(seconds=10)
         preview_id = self.store.create_preview(self._manual_json(dict(request, preflight=facts)),
-            expires_at=expires.isoformat(), created_at=as_of.isoformat())
+            expires_at=expires.isoformat(), created_at=as_of.isoformat(), lp_priority="reliable")
         return dict(state='previewed', preview_id=preview_id, expires_at=expires.isoformat(),
             request=request, preflight=facts,
             queue_protection_estimate=service._queue_protection_preview_estimate(request, values))
@@ -857,7 +920,7 @@ class LPD2LiveExecution:
             self._mutation_owner, self._mutation_acquire = owner, acquire
 
     def _acquire_mutation(self, action):
-        return self._mutation_acquire(action) if self._mutation_acquire else _StandaloneMutationLease()
+        return self._mutation_acquire(action) if self._mutation_acquire else _StandaloneMutationLease(action)
 
     def initialize(self, admission):
         self._admission = admission
@@ -1098,11 +1161,12 @@ class LPD2LiveExecution:
         self.settings_status()
         return self.control.poll(self._clock())
 
-    def run_once(self, captured_candidates=None, *, timeout=2):
+    def run_once(self, captured_candidates=None, *, timeout=2, attempted_at=None, capture_failed=False):
         if self._closed:
             raise RuntimeError('d2_closed')
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError('d2_run_in_progress')
+        stage = 'read'
         try:
             with self._settings_lock:
                 self._collect_settings(publish=True)
@@ -1112,10 +1176,15 @@ class LPD2LiveExecution:
             ticket = self.state.begin_observation(current.cycle_generation, ('balance', 'open_orders', 'positions'))
             frame = self.reader.read_current(ReadScope(self.account_id, related_markets=True), time.monotonic()+timeout)
             as_of = self._utc_now()
+            stage = 'preparation'
             prepared = prepare_current_inputs(frame, captured_candidates, policy, as_of)
+            stage = 'calculation'
             calculation = calculate_current(prepared, policy, as_of)
+            stage = 'acceptance'
             accepted = self.state.accept(ticket, frame, calculation, evaluated_at=as_of)
             if accepted.observation is None:
+                self._record_iteration(ticket, prepared, calculation, accepted, None, (), None,
+                    captured_candidates, as_of, attempted_at, capture_failed=capture_failed)
                 return RunResult(accepted)
             observation = accepted.observation
             source = observation.order_view.orders_source
@@ -1132,29 +1201,208 @@ class LPD2LiveExecution:
             if orders_current and observation.orders_complete:
                 self._associate_current_manual_sells()
                 self._offer_progress(frame)
-            fixed = self._fixed_plan(observation, prepared, calculation)
+            snapshot = self.state.snapshot()
+            accepted_orders = {order.key: order for order in observation.orders}
+            orders_accepted = orders_current and observation.orders_complete
+            for row in frame.orders:
+                order = accepted_orders.get((self.account_id, row['condition_id'], row['token_id'], row['order_id']))
+                if (order is None or (order.side, order.venue_status, order.price.value,
+                        order.original_size.value, order.size_matched.value, order.order_type.value,
+                        order.expiration.value) != (row['side'], row['status'], row['price'],
+                        Decimal(str(row['original_size'])), Decimal(str(row['size_matched'])),
+                        row.get('order_type'), row.get('expiration'))):
+                    orders_accepted = False
+                    break
+            selection = select_current_composition(prepared, policy, calculation,
+                orders_accepted=orders_accepted, positions_accepted=snapshot.inventory_cost.state == 'known',
+                financial_authority=snapshot.new_capacity.state == 'known')
+            fixed = self._fixed_plan(observation, prepared, selection)
             # LPControlOwner uses this same peer coordination lock while its
             # activation callback publishes round then state. No native I/O is
             # performed under it; seal/finish cannot race control application.
             with self.state._lock:
+                stage = 'round_start'
                 start = self.rounds.begin_round(self._control_view(), orders, fixed_buys=fixed)
+            # Observational failures must never replace a control/trading result.
+            self._record_iteration(ticket, prepared, selection, accepted, start, (), fixed,
+                captured_candidates, as_of, attempted_at, capture_failed=capture_failed)
             if start.status != StartStatus.BATCH:
-                return RunResult(accepted, start)
+                return RunResult(accepted, start, selection=selection)
             self._sealed_candidates = {(start.token.batch_id, a.request_id): row
                 for a in start.token.actions if isinstance(a.target, BuyTarget)
                 for row in prepared.sources['candidates'].value
-                if row['token_id'] == a.target.token_id and row.get('market_id') == a.target.market_id}
+                if not row.get('existing') and (row['condition_id'], row['token_id']) in selection.new_target_keys
+                and row['token_id'] == a.target.token_id and row.get('market_id') == a.target.market_id}
             self._sealed_candidate_source = prepared.sources['candidates']
             per_direction = prepared.sources.get('candidate_sources')
             self._sealed_candidate_sources = per_direction.value if per_direction else {}
+            stage = 'local_attempts'
             outcomes = tuple(self._attempt(start.token, action, observation) for action in start.token.actions)
             finish = self.complete_local_attempts(start.token, outcomes)
+            self._record_iteration(ticket, prepared, selection, accepted, start, outcomes, fixed,
+                captured_candidates, as_of, attempted_at, capture_failed=capture_failed)
             self._sealed_candidates.clear()
             self._sealed_candidate_source = None
             self._sealed_candidate_sources = {}
-            return RunResult(accepted, start, finish, outcomes)
+            rotation = None
+            if start.token.kind == BatchKind.NORMAL_BUY:
+                victims = tuple(o for o in observation.order_view.open_orders
+                    if o.side == 'BUY' and o.key[3] in selection.victim_order_ids)
+                rotation = RotationDecision(self.account_id, observation.cycle_generation,
+                    observation.observation_id, victims,
+                    tuple(RotationYield('incumbent', o.key,
+                        'known' if selection.yields.get(o.key[3]) is not None else 'unknown',
+                        selection.yields.get(o.key[3])) for o in observation.order_view.open_orders if o.side == 'BUY'),
+                    tuple(RotationYield('candidate', (token,), 'known' if rate is not None else 'unknown', rate)
+                        for token, rate in selection.candidate_yields.items()), selection.target_tokens)
+            return RunResult(accepted, start, finish, outcomes, rotation, selection=selection)
+        except BaseException:
+            self.record_attempt_failure(attempted_at=attempted_at, stage=stage)
+            raise
         finally:
             self._run_lock.release()
+
+    def _record_iteration(self, ticket, prepared, calculation, accepted, start, outcomes, fixed,
+                          capture, evaluated_at, attempted_at, *, capture_failed=False):
+        try:
+            round_number = self.rounds.snapshot().round_number
+            diagnostic_snapshot = self.state.snapshot()
+            summary = summarize_iteration(attempted_at=attempted_at or ticket.started_at, ticket=ticket,
+                prepared_frame=prepared, calculation=calculation, acceptance=accepted,
+                round_start=start, outcomes=outcomes, fixed_plan=fixed, capture=capture,
+                evaluated_at=evaluated_at, round_number=round_number,
+                accepted_capacity=diagnostic_snapshot.new_capacity)
+            if capture_failed:
+                summary = dict(summary, latest_attempt=dict(summary['latest_attempt'],
+                    capture_failed=True, capture_failure_reason='capture_unavailable'))
+            try:
+                summary = dict(summary, yield_observation=summarize_yield_observation(
+                    prepared, calculation, ticket, accepted, evaluated_at,
+                    round_start=start, outcomes=outcomes, fixed_plan=fixed,
+                    receipt_orders=diagnostic_snapshot.orders))
+            except Exception:
+                summary = dict(summary, yield_observation=dict(available=False))
+            with self.state._lock:
+                try:
+                    observed = summary.get('yield_observation', {})
+                    if observed.get('available'):
+                        observed = dict(observed)
+                        unknown_observations = freeze(observed.pop('unknown_incumbents')['samples'])
+                        summary['yield_observation'] = observed
+                        try:
+                            history = yield_diagnostic_value(self._yield_rounds)
+                        except Exception:
+                            history = []
+                            self._yield_diagnostic_instance = uuid4().hex
+                        identity = observed['identity']['observation_id']
+                        duplicate = any(r['identity']['observation_id'] == identity for r in history)
+                        rounds = freeze([r for r in history
+                            if r['identity']['observation_id'] != identity] + [observed])[-YIELD_ROUND_LIMIT:]
+                        self._yield_unknown_observations = unknown_observations
+                        self._yield_rounds_total += not duplicate
+                        self._yield_rounds = rounds
+                    summary['yield_rounds'] = dict(instance_id=self._yield_diagnostic_instance,
+                        total_observations=self._yield_rounds_total, round_limit=YIELD_ROUND_LIMIT,
+                        row_limit=YIELD_ROW_LIMIT, recent=self._yield_rounds)
+                except Exception:
+                    # Intentionally reset an uncertain ring and rotate its ID so
+                    # consumers see a discontinuity, not partial/corrupt history.
+                    # This resets diagnostics only, never trading state.
+                    self._yield_rounds, self._yield_unknown_observations = (), ()
+                    self._yield_rounds_total = 0
+                    self._yield_diagnostic_instance = uuid4().hex
+                    summary['yield_observation'] = dict(available=False)
+                    summary['yield_rounds'] = dict(available=False)
+                self._diagnostics = freeze({**{k: v for k, v in summary.items() if k != 'local_outcomes'}, 'accepted_observation':
+                    summary['accepted_observation'] or self._diagnostics.get('accepted_observation'),
+                    'round_start': summary['round_start'] if start else self._diagnostics.get('round_start')})
+        except Exception:
+            pass
+
+    def record_attempt_failure(self, *, attempted_at, stage):
+        try:
+            with self.state._lock:
+                self._diagnostics = freeze({**self._diagnostics,
+                    'latest_attempt': dict(attempted_at=attempted_at, stage=stage,
+                        disposition='failed', reason='other', capture=None)})
+        except Exception:
+            pass
+        self._record_protection_status(entered=False, disposition='skipped', skip_reason=stage+'_failed')
+
+    def begin_scheduled_attempt(self):
+        try:
+            attempted_at = self._utc_now()
+        except Exception:
+            attempted_at = None
+        self._record_protection_status(entered=False, disposition='pending',
+            new_attempt=True, attempted_at=attempted_at)
+        return attempted_at
+
+    def _record_protection_status(self, *, entered, disposition, skip_reason=None,
+                                  new_attempt=False, attempted_at=None):
+        try:
+            with self.state._lock:
+                snapshot = self.state.snapshot()
+                values = dict(self._protection_diagnostics)
+                if new_attempt:
+                    values.update(attempt_id=uuid4().hex, attempted_at=attempted_at,
+                        observation_id=None, generation=snapshot.current.cycle_generation)
+                if entered and snapshot.observation is not None:
+                    values.update(observation_id=snapshot.observation.observation_id,
+                        generation=snapshot.observation.cycle_generation)
+                self._protection_diagnostics = freeze(dict(values, entered=entered,
+                    disposition=disposition, skip_reason=skip_reason))
+        except Exception:
+            pass
+
+    def diagnostics(self):
+        try:
+            with self.state._lock:
+                snapshot = self.state.snapshot()
+                result = project_diagnostics(self._diagnostics, as_of=self._utc_now())
+                result['protection'] = {**self._protection_diagnostics,
+                    'cancel_outcomes': self._diagnostic_outcomes['protection_cancel_outcomes']}
+                result['local_outcomes'] = self._diagnostic_outcomes
+                result['cancel_blocks'] = diagnostic_json_copy(self._cancel_blocks)
+                unknown = [y for key, y in snapshot.yields.items() if y.unknown_since_monotonic is not None
+                    and any(o.key == key and o.side == 'BUY' for o in snapshot.active_orders)]
+                now = self._clock()
+                result['unknown_buy_yields'] = dict(total=len(unknown), omitted=max(0, len(unknown)-20),
+                    recent=[dict(order_id=y.order_key[3], unknown_since_at=y.unknown_since_at,
+                        age_seconds=max(0, now-y.unknown_since_monotonic),
+                        due_at_600=now >= y.unknown_deadline_monotonic) for y in unknown[:20]])
+                try:
+                    details = {r.get('order_id'): r for r in self._yield_unknown_observations}
+                except Exception:
+                    details = {}
+                for row, state in zip(result['unknown_buy_yields']['recent'], unknown[:20]):
+                    try:
+                        detail = details.get(row['order_id'], {})
+                        current = bool(detail.get('accepted_input') and any(
+                            s.source_id == detail.get('order_source_id') for s in state.input_sources))
+                        enrichment = dict(yield_diagnostic_value(detail), reason_is_current=current,
+                            reason_codes=detail.get('reason_codes', ()) if current else ('reason_unavailable',),
+                            attempted_reason_codes=detail.get('reason_codes', ()))
+                        if not current:
+                            latest = result.get('yield_observation', {})
+                            relevant = ('open_orders', 'market:'+state.order_key[1]+':'+state.order_key[2])
+                            failures = [error for error in latest.get('source_errors', {}).get('samples', ())
+                                if error.get('source') in relevant or
+                                (error.get('condition_id'),error.get('token_id')) == state.order_key[1:3]]
+                            enrichment['attempted_source_failures'] = [{k: error.get(k) for k in
+                                ('source', 'source_error', 'error_class', 'retry_cache_hit',
+                                 'remaining_retry_seconds', 'inflight_age_seconds', 'http_status')}
+                                for error in failures[:2]]
+                            if failures and not detail:
+                                enrichment['attempted_reason_codes'] = ('order_inputs_not_current',)
+                                enrichment['reason_observation_id'] = latest.get('identity', {}).get('observation_id')
+                        row.update(enrichment)
+                    except Exception:
+                        row.update(reason_is_current=False, reason_codes=('reason_unavailable',), attempted_reason_codes=())
+                return result
+        except Exception:
+            logger.exception('prediction_lp_diagnostics_failed')
+            return dict(version=1, available=False)
 
     def _offer_progress(self, frame):
         # In-process logging identities only: never restore request history or
@@ -1193,17 +1441,30 @@ class LPD2LiveExecution:
 
     def _fixed_plan(self, observation, prepared, calculation):
         source = prepared.sources['candidates']
+        snapshot = self.state.snapshot()
+        independent_excess = (len(prepared.current_buys) > self.policy.target_count
+            or self.policy.budget is not None and snapshot.inventory_cost.state == 'known'
+            and snapshot.buy_reserved.state == 'known'
+            and snapshot.inventory_cost.value + snapshot.buy_reserved.value > self.policy.budget)
         if (self._settings_required and not self._settings_loaded
                 or not source.complete or source.error or source.value is None
-                or self.state.snapshot().new_capacity.state != 'known'):
+                or snapshot.new_capacity.state != 'known'):
+            if (not (self._settings_required and not self._settings_loaded)
+                    and independent_excess and calculation.selection_state == 'DECISION'
+                    and calculation.victim_order_ids and observation.orders_complete
+                    and 'orders_not_accepted' not in calculation.selection_reasons):
+                return FixedBuyPlan(self.account_id, observation.cycle_generation,
+                    observation.observation_id, observation.observation_id + ':fixed', ())
             return None
         if not isinstance(source.value, tuple) or any(not isinstance(row, Mapping) for row in source.value):
             return None
         targets = []
-        for token in calculation.target_tokens:
-            rows = [r for r in source.value if not r.get('existing') and r.get('token_id') == token]
-            if not rows:
-                continue  # retained existing BUY is not a new send
+        snapshot = self.state.snapshot()
+        slots = max(0, self.policy.target_count - sum(o.side == 'BUY' for o in snapshot.active_orders))
+        money = snapshot.new_capacity.value
+        for condition, token in calculation.new_target_keys:
+            rows = [r for r in source.value if not r.get('existing')
+                and r.get('condition_id') == condition and r.get('token_id') == token]
             if len(rows) != 1:
                 return None  # ambiguous identity is not an empty fixed plan
             row = rows[0]
@@ -1216,11 +1477,16 @@ class LPD2LiveExecution:
                 if (any(type(row.get(key)) is not str or not row[key]
                         for key in ('condition_id', 'token_id', 'market_id'))
                         or type(row.get('venue', self.venue)) is not str
-                        or row.get('account_id', self.account_id) != self.account_id):
+                        or not external_account_matches(row.get('account_id', self.account_id), self.account_id)):
                     return None
                 terms = BuyTerms(Decimal(str(row['price'])), Decimal(str(row['quantity'])),
                     row['order_type'], row.get('expiration'), row['post_only'], tuple(row.get('send_options', ())))
+                cost = terms.price * terms.quantity
+                if not slots or cost > money:
+                    continue
                 targets.append(BuyTarget(row.get('venue', self.venue), row['token_id'], row['market_id'], terms))
+                slots -= 1
+                money -= cost
             except (KeyError, TypeError, ValueError):
                 return None
         return FixedBuyPlan(self.account_id, observation.cycle_generation,
@@ -1230,8 +1496,165 @@ class LPD2LiveExecution:
         with self.state._lock:
             return self.rounds.finish_local_attempts(self._control_view(), token, outcomes)
 
+    def _rotation_current(self, decision, order):
+        snapshot = self.state.snapshot()
+        control, observation = self._control_view(), snapshot.observation
+        current = next((o for o in snapshot.active_orders if o.key == order.key), None)
+        return bool(not control.fatal and control.effective_running
+            and control.account_id == decision.account_id
+            and control.cycle_generation == decision.cycle_generation
+            and observation is not None and observation.observation_id == decision.observation_id
+            and observation.orders_complete and current is not None
+            and current.terms_version == order.terms_version
+            and not self._protection_cancel_owned(order.key))
+
+    def dispatch_rotation(self, result):
+        decision = result.rotation
+        with self.state._lock:
+            observation = self.state.snapshot().observation
+            if decision is None:
+                self._remember_rotation(result)
+                return result
+            if (observation is None
+                    or observation.observation_id != decision.observation_id
+                    or self._rotation_dispatched == decision.observation_id):
+                return result
+            self._rotation_dispatched = decision.observation_id
+        outcomes = []
+        for order in decision.victims:
+            if not self._rotation_current(decision, order):
+                self._record_cancel_block('rotation_not_current', phase='before_request', order_key=order.key)
+                outcomes.append(RotationOutcome(order.key, 'not_sent', 'rotation_not_current'))
+                continue
+            with self.state._lock:
+                if self._rotation_cancel_backoff(decision, order):
+                    outcomes.append(RotationOutcome(order.key, 'suppressed', 'cancel_backoff'))
+                    continue
+            try:
+                handle = self.cancel_independent(order.key, rotation_origin=(decision, order))
+                outcomes.append(RotationOutcome(order.key, 'pending' if handle else 'not_sent',
+                    None if handle else 'rotation_not_current', handle))
+            except Exception as exc:
+                reason = str(exc)
+                known = {'mutation_not_admitted', 'independent_cancel_not_current',
+                    'independent_cancel_identity', 'native_capacity'}
+                outcomes.append(RotationOutcome(order.key, 'not_sent' if reason in known else 'error',
+                    reason if reason in known else 'unexpected_dispatch_error'))
+        result = replace(result, rotation_outcomes=tuple(outcomes))
+        self._remember_rotation(result)
+        return result
+
+    def _remember_rotation(self, result):
+        """Keep one bounded value projection; native jobs retain their own lifetime."""
+        try:
+            decision, selection = result.rotation, result.selection
+            def bounded(rows):
+                rows = tuple(rows)
+                return dict(total=len(rows), samples=list(rows[:20]), omitted=max(0, len(rows)-20))
+            def yield_row(row):
+                value = dict(kind=row.kind, identity=list(row.identity), state=row.state,
+                    yield_pct_per_hour=None if row.yield_pct_per_hour is None else str(row.yield_pct_per_hour))
+                if row.kind == 'incumbent' and selection:
+                    try:
+                        value['observation'] = yield_diagnostic_value({k: v for k, v in
+                            selection.incumbent_observations.get(row.identity[3], {}).items()
+                            if k not in ('account_id', 'condition_id', 'token_id', 'order_id', 'state', 'yield_pct_per_hour')})
+                    except Exception:
+                        value['observation'] = None
+                return value
+            known_reasons = {'balance_unknown', 'budget_unknown', 'orders_unknown', 'positions_unknown',
+                'financial_authority_unknown', 'candidates_incomplete', 'orders_not_accepted',
+                'rotation_not_current', 'mutation_not_admitted', 'independent_cancel_not_current',
+                'independent_cancel_identity', 'native_capacity', 'unexpected_dispatch_error', 'cancel_backoff'}
+            def reasons(values):
+                counts = {}
+                for reason in values:
+                    key = reason if reason in known_reasons else 'other'
+                    counts[key] = counts.get(key, 0)+1
+                return counts
+            counts, samples, pending = {}, [], []
+            for outcome in result.rotation_outcomes:
+                counts[outcome.status] = counts.get(outcome.status, 0)+1
+                request_id = outcome.handle.identity.request_id if outcome.handle else None
+                samples.append(dict(order_key=list(outcome.order_key), status=outcome.status,
+                    reason=outcome.reason, request_id=request_id))
+                if outcome.handle:
+                    pending.append((request_id, outcome.handle))
+            outcomes = bounded(samples)
+            outcomes.update(counts=counts, reason_counts=reasons(o.reason for o in result.rotation_outcomes if o.reason))
+            summary = dict(selection_state=selection.selection_state if selection else 'NO_DECISION',
+                reason_counts=reasons(selection.selection_reasons if selection else ()),
+                decision_states=dict(selection.decision_states) if selection else {},
+                selected=bounded(dict(kind='incumbent', order_id=order_id)
+                    for order_id in selection.retained_order_ids) if selection else bounded(()),
+                new_targets=bounded(dict(condition_id=condition, token_id=token)
+                    for condition, token in selection.new_target_keys) if selection else bounded(()),
+                identity=None if decision is None else dict(account_id=decision.account_id,
+                    cycle_generation=decision.cycle_generation, observation_id=decision.observation_id),
+                incumbent_yields=bounded(yield_row(row) for row in decision.incumbent_yields) if decision else bounded(()),
+                candidate_yields=bounded(yield_row(row) for row in decision.candidate_yields) if decision else bounded(()),
+                victims=bounded(dict(order_key=list(order.key), terms_version=order.terms_version,
+                    price=str(order.price.value), remaining=str(order.remaining.value),
+                    original_size=str(order.original_size.value), order_type=order.order_type.value,
+                    expiration=order.expiration.value)
+                    for order in decision.victims) if decision else bounded(()), outcomes=outcomes)
+            with self.state._lock:
+                try:
+                    observation = self._diagnostics.get('yield_observation', {})
+                    summary['source_errors'] = observation.get('source_errors')
+                    summary['read_ticket'] = observation.get('read_ticket')
+                except Exception:
+                    summary['source_errors'], summary['read_ticket'] = None, None
+                self._rotation_summary, self._rotation_pending = summary, tuple(pending)
+        except Exception:
+            # Diagnostics cannot replace or suppress the trading result.
+            logger.exception('prediction_lp_rotation_diagnostics_failed')
+            with self.state._lock:
+                self._rotation_summary = dict(selection_state='UNKNOWN', reason_counts={'other':1},
+                    available=False, error='diagnostics_unavailable')
+                self._rotation_pending = ()
+
+    def rotation_diagnostics(self):
+        """Memory-only GET. Read completed Futures without waiting or replaying."""
+        try:
+            return self._rotation_diagnostics()
+        except Exception:
+            logger.exception('prediction_lp_rotation_diagnostics_failed')
+            return dict(selection_state='UNKNOWN', available=False, error='diagnostics_unavailable')
+
+    def _rotation_diagnostics(self):
+        with self.state._lock:
+            summary = diagnostic_json_copy(self._rotation_summary)
+            pending = self._rotation_pending
+        if summary is None or not pending:
+            return summary
+        outcomes = summary['outcomes']
+        counts = outcomes['counts']
+        for request_id, handle in pending:
+            if not handle._future.done():
+                continue
+            try:
+                completed = handle.result(timeout=0)
+                status = completed.status.value
+                reason = completed.reason_code or 'control_or_native_not_current'
+            except Exception:
+                status = 'error'
+            counts['pending'] -= 1
+            counts[status] = counts.get(status, 0)+1
+            for row in outcomes['samples']:
+                if row['request_id'] == request_id:
+                    row['status'] = status
+                    if status == 'not_sent':
+                        row['reason'] = reason
+            if status == 'not_sent':
+                reasons = outcomes['reason_counts']
+                reasons[reason] = reasons.get(reason, 0)+1
+        if counts.get('pending') == 0:
+            counts.pop('pending')
+        return summary
+
     def _attempt(self, token, action, observation, *, cancel_order=None, mutation_lease=None, protection_target=None,
-                 protection_origin=None):
+                 protection_origin=None, rotation_origin=None):
         target = action.target
         if isinstance(target, CancelTarget):
             order = cancel_order if cancel_order is not None else next(
@@ -1259,34 +1682,52 @@ class LPD2LiveExecution:
             permitted = ((control.effective_running or protection) and not control.fatal
                 and control.cycle_generation == token.cycle_generation and action.account_id == self.account_id
                 and target.venue == self.venue)
+            block_reason = None if permitted else ('independent_cancel_identity'
+                if action.account_id != self.account_id or target.venue != self.venue else 'control_or_native_not_current')
             owned = {h.identity.request_id for h in self._native_jobs.values() if h._thread.is_alive()}
             occupied = (owned | self._active_sends) - {action.request_id}
             if isinstance(target, CancelTarget):
                 existing = self._native_jobs.get((self.account_id, target.venue, target.token_id, target.existing_order_id))
-                permitted = permitted and not (existing and existing._thread.is_alive()
-                    and existing.identity.request_id != action.request_id)
+                if permitted and existing and existing._thread.is_alive() and existing.identity.request_id != action.request_id:
+                    permitted, block_reason = False, 'independent_cancel_inflight'
                 if not isinstance(token, _IndependentContext):
                     # Resume cleanup cannot steal a deferred protection target
                     # or replay an already attempted (including UNKNOWN) one.
-                    permitted = permitted and not self._protection_cancel_owned(order.key)
-            permitted = permitted and len(occupied) < 2
+                    if permitted and self._protection_cancel_owned(order.key):
+                        permitted, block_reason = False, 'protection_cancel_owned'
+            if permitted and len(occupied) >= 2:
+                permitted, block_reason = False, 'native_capacity'
             if permitted:
                 self._active_sends.add(action.request_id)
-        reason = self._preparation_error(target) if isinstance(target, BuyTarget) else None
+        reason = self._preparation_error(target) if isinstance(target, BuyTarget) else block_reason
         if not permitted or reason:
             reason = reason or 'control_or_native_not_current'
             self._last_preparation_rejection = (action.request_id, reason)
             with self.state._lock:
                 self._active_sends.discard(action.request_id)
-            outcome = LocalOutcome(action, LocalStatus.NOT_SENT, True)
+            outcome = LocalOutcome(action, LocalStatus.NOT_SENT, True,
+                reason_code=reason if isinstance(target, CancelTarget) else None)
         else:
             try:
                 outcome = self._cancel(action, observation, order, protection=protection, lease=mutation_lease,
                     protection_key=token.protection_key if protection else None, protection_target=protection_target,
-                    protection_origin=protection_origin) if isinstance(target, CancelTarget) else self._buy(token, action, record)
+                    protection_origin=protection_origin, rotation_origin=rotation_origin) if isinstance(target, CancelTarget) else self._buy(token, action, record)
             finally:
                 with self.state._lock:
                     self._active_sends.discard(action.request_id)
+        reason = outcome.reason_code or reason
+        if isinstance(target, CancelTarget) and outcome.status == LocalStatus.NOT_SENT:
+            self._record_cancel_block(reason, phase='completed', order_key=order.key,
+                request_id=action.request_id, generation=token.cycle_generation)
+            if (rotation_origin is not None and isinstance(token, _IndependentContext)
+                    and token.protection_key is None and protection_origin is None):
+                decision, original_order = rotation_origin
+                with self.state._lock:
+                    self._prune_rotation_cancel_backoffs()
+                    key = (*self._rotation_cancel_key(decision, original_order), reason)
+                    self._rotation_cancel_backoffs[key] = dict(retry_at=self._clock()+10.0, suppressed_count=0)
+                    while len(self._rotation_cancel_backoffs) > 256:
+                        self._rotation_cancel_backoffs.pop(next(iter(self._rotation_cancel_backoffs)))
         self.writer.offer(ReceiptRecord(self.account_id, self.process_epoch, action.request_id,
             record.session_id, record.condition_id, record.token_id, outcome.venue_order_id or record.order_id,
             'accepted' if outcome.status == LocalStatus.ACCEPTED else
@@ -1295,6 +1736,13 @@ class LPD2LiveExecution:
             self._utc_now(), reason))
         if isinstance(token, _IndependentContext) and token.protection_key is not None:
             self._finish_protection_cancel(token.protection_key, outcome)
+        try:
+            with self.state._lock:
+                self._diagnostic_outcomes = append_outcome(self._diagnostic_outcomes, outcome, token=token,
+                    reason=protection_target.reason if protection_target else reason,
+                    protection=isinstance(token, _IndependentContext) and token.protection_key is not None)
+        except Exception:
+            pass
         return outcome
 
     @staticmethod
@@ -1348,9 +1796,10 @@ class LPD2LiveExecution:
 
     def _buy_admitted(self, token, action, record, lease, *, manual_origin=None, manual_command=None, submit_source=None):
         terms = action.target.terms
+        mutation = 'MANUAL_BUY' if manual_origin is not None else 'BUY'
         def current():
             return self._manual_origin_current(manual_origin) if manual_origin is not None else self._dispatch_current(token.cycle_generation, running=True)
-        if not lease.allowed() or not current():
+        if not lease.allowed(mutation) or not current():
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         try:
             signed = self.trading.lp_create_limit_order(token_id=record.token_id, price=terms.price,
@@ -1358,7 +1807,7 @@ class LPD2LiveExecution:
                 **dict(terms.send_options))
         except Exception:
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
-        if not lease.allowed() or not current():
+        if not lease.allowed(mutation) or not current():
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         native_started_at = self._utc_now()
         try:
@@ -1419,39 +1868,42 @@ class LPD2LiveExecution:
         return LocalOutcome(action, LocalStatus.ACCEPTED, True, venue_id, status)
 
     def _cancel(self, action, observation, order, *, protection=False, lease=None,
-                protection_key=None, protection_target=None, protection_origin=None):
+                protection_key=None, protection_target=None, protection_origin=None, rotation_origin=None):
         owned = lease is None
-        lease = self._acquire_mutation('CANCEL') if owned else lease
+        lease = self._acquire_mutation('ROTATION_CANCEL' if rotation_origin is not None else 'CANCEL') if owned else lease
         if lease is None:
-            return LocalOutcome(action, LocalStatus.NOT_SENT, True)
+            return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='mutation_not_admitted')
         try:
             return self._cancel_admitted(action, observation, order, protection=protection, lease=lease,
-                protection_key=protection_key, protection_target=protection_target, protection_origin=protection_origin)
+                protection_key=protection_key, protection_target=protection_target, protection_origin=protection_origin,
+                rotation_origin=rotation_origin)
         finally:
             if owned:
                 lease.release()
 
     def _cancel_admitted(self, action, observation, order, *, protection, lease, protection_key, protection_target,
-                         protection_origin):
+                         protection_origin, rotation_origin=None):
         target = action.target
         if not isinstance(target, CancelTarget) or target.venue != self.venue:
-            return LocalOutcome(action, LocalStatus.NOT_SENT, True)
+            return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='independent_cancel_identity')
         if (order.key[0] != self.account_id or order.key[2:] != (target.token_id, target.existing_order_id)
                 or order.side != 'BUY'):
-            return LocalOutcome(action, LocalStatus.NOT_SENT, True)
-        if not lease.allowed():
-            return LocalOutcome(action, LocalStatus.NOT_SENT, True)
+            return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='independent_cancel_identity')
+        if not lease.allowed('ROTATION_CANCEL' if rotation_origin is not None else 'CANCEL'):
+            return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='mutation_lease_not_current')
         with self.state._lock:
             if not self._dispatch_current(observation.cycle_generation, running=not protection):
-                return LocalOutcome(action, LocalStatus.NOT_SENT, True)
+                return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='control_or_native_not_current')
+            if rotation_origin is not None and not self._rotation_current(*rotation_origin):
+                return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='rotation_not_current')
             if protection_origin is not None and not self._protection_cancel_origin_current(
                     self.state.snapshot(), protection_key, protection_origin):
-                return LocalOutcome(action, LocalStatus.NOT_SENT, True)
+                return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='protection_cancel_not_current')
             if protection_target is not None:
                 snapshot = self.state.snapshot()
                 guard = self._protection_guard(snapshot, protection_key, (order,))
                 if self.state.apply_protection(CancelEvidenceUpdate(guard, protection_target)) != 'applied':
-                    return LocalOutcome(action, LocalStatus.NOT_SENT, True)
+                    return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='protection_evidence_not_current')
         try:
             result = self.trading.cancel_orders_detailed((target.existing_order_id,))
         except Exception:
@@ -1482,7 +1934,55 @@ class LPD2LiveExecution:
                 last_current_evidence=self._last_current_evidence,
                 last_buy_uncertainty=self._last_buy_uncertainty)
 
-    def cancel_independent(self, order_key, *, protection_key=None, reason=None, protection_origin=None):
+    def _record_cancel_block(self, reason, *, phase, order_key=None, request_id=None, generation=None, **details):
+        """Bounded observations only; never invent a request for an early refusal."""
+        if reason not in _CANCEL_BLOCK_REASONS:
+            raise ValueError('cancel_block_reason_invalid')
+        valid_key = (isinstance(order_key, tuple) and len(order_key) == 4
+            and order_key[0] == self.account_id and all(type(v) is str and v for v in order_key))
+        with self.state._lock:
+            values = self._cancel_blocks
+            counts = dict(values['by_reason'])
+            counts[reason] = counts.get(reason, 0)+1
+            sample = dict(phase=phase, reason=reason, **details)
+            if valid_key:
+                sample['order_key'] = list(order_key)
+            if request_id is not None:
+                sample['request_id'] = request_id
+            if generation is not None:
+                sample['generation'] = generation
+            self._cancel_blocks = freeze(dict(total=values['total']+1, by_reason=counts,
+                recent=(*values['recent'], sample)[-20:]))
+        logger.info('lp_cancel_blocked', extra=dict(process_epoch=self.process_epoch,
+            phase=phase, reason_code=reason, request_id=request_id,
+            order_key=order_key if valid_key else None, generation=generation, **details))
+
+    def _rotation_cancel_key(self, decision, order):
+        return (order.key[0], self.venue, *order.key[1:], decision.cycle_generation, order.terms_version)
+
+    def _prune_rotation_cancel_backoffs(self):
+        snapshot, now = self.state.snapshot(), self._clock()
+        orders = {order.key: order.terms_version for order in snapshot.active_orders if order.side == 'BUY'}
+        self._rotation_cancel_backoffs = {key: value for key, value in self._rotation_cancel_backoffs.items()
+            if value['retry_at'] > now and key[5] == snapshot.current.cycle_generation
+            and orders.get((key[0], *key[2:5])) == key[6]}
+
+    def _rotation_cancel_backoff(self, decision, order):
+        """Throttle unchanged never-sent targets, with no request or timer replay."""
+        self._prune_rotation_cancel_backoffs()
+        identity = self._rotation_cancel_key(decision, order)
+        for key, value in self._rotation_cancel_backoffs.items():
+            if key[:-1] == identity:
+                value['suppressed_count'] += 1
+                self._record_cancel_block('cancel_backoff', phase='before_request', order_key=order.key,
+                    generation=decision.cycle_generation, original_reason=key[-1],
+                    remaining_seconds=max(0., value['retry_at']-self._clock()),
+                    suppressed_count=value['suppressed_count'])
+                return True
+        return False
+
+    def cancel_independent(self, order_key, *, protection_key=None, reason=None, protection_origin=None,
+                           rotation_origin=None):
         """Normal exact-ID BUY cancellation outside the sealed BUY barrier.
 
         This native handle remains owned across logical control transitions.
@@ -1492,9 +1992,11 @@ class LPD2LiveExecution:
             existing = self._native_jobs.get((self.account_id, self.venue, order_key[2], order_key[3])) if (
                 isinstance(order_key, tuple) and len(order_key) == 4 and order_key[0] == self.account_id) else None
             if existing and existing._thread.is_alive():
+                self._record_cancel_block('cancel_in_progress', phase='before_request', order_key=order_key)
                 return existing
-        lease = self._acquire_mutation('CANCEL')
+        lease = self._acquire_mutation('ROTATION_CANCEL' if rotation_origin is not None else 'CANCEL')
         if lease is None:
+            self._record_cancel_block('mutation_not_admitted', phase='before_request', order_key=order_key)
             if protection_key is not None:
                 return None
             raise ValueError('mutation_not_admitted')
@@ -1502,15 +2004,21 @@ class LPD2LiveExecution:
         try:
             with self.state._lock:
                 if not isinstance(order_key, tuple) or len(order_key) != 4 or order_key[0] != self.account_id:
+                    self._record_cancel_block('independent_cancel_identity', phase='before_request')
                     raise ValueError('independent_cancel_identity')
                 key = (self.account_id, self.venue, order_key[2], order_key[3])
                 existing = self._native_jobs.get(key)
                 if existing and existing._thread.is_alive():
+                    self._record_cancel_block('cancel_in_progress', phase='before_request', order_key=order_key)
                     return existing
                 self._native_jobs = {k: h for k, h in self._native_jobs.items() if h._thread.is_alive()}
                 snapshot = self.state.snapshot()
+                if rotation_origin is not None and not self._rotation_current(*rotation_origin):
+                    self._record_cancel_block('rotation_not_current', phase='before_request', order_key=order_key)
+                    return None
                 if protection_origin is not None and not self._protection_cancel_origin_current(
                         snapshot, protection_key, protection_origin):
+                    self._record_cancel_block('protection_cancel_not_current', phase='before_request', order_key=order_key)
                     return None  # the original never-started ticket remains deferred
                 control = self._control_view()
                 observation = snapshot.observation
@@ -1524,11 +2032,16 @@ class LPD2LiveExecution:
                         or not observation.orders_complete
                         or observation.cycle_generation != control.cycle_generation
                         or current_order is None):
+                    self._record_cancel_block('independent_cancel_not_current', phase='before_request', order_key=order_key)
                     raise ValueError('independent_cancel_not_current')
                 if len({h.identity.request_id for h in self._native_jobs.values()} | self._active_sends) >= 2:
+                    self._record_cancel_block('native_capacity', phase='before_request', order_key=order_key)
                     if protection:
                         return None  # no fabricated request or attempt on deferral
                     raise RuntimeError('native_capacity')
+                if (rotation_origin is not None and protection_key is None and protection_origin is None
+                        and self._rotation_cancel_backoff(*rotation_origin)):
+                    return None
                 identity = ActionIdentity(str(uuid4()), self.account_id,
                     CancelTarget(self.venue, order_key[2], order_key[3]))
                 context = _IndependentContext(control.cycle_generation, 'independent:' + identity.request_id,
@@ -1540,7 +2053,8 @@ class LPD2LiveExecution:
                 def run():
                     try:
                         outcome = self._attempt(context, identity, observation, cancel_order=current_order,
-                            mutation_lease=lease, protection_target=target, protection_origin=protection_origin)
+                            mutation_lease=lease, protection_target=target, protection_origin=protection_origin,
+                            rotation_origin=rotation_origin)
                     except BaseException as exc:
                         future.set_exception(exc)
                     else:
@@ -2284,14 +2798,15 @@ class LPD2LiveExecution:
                     snapshot.observation.observation_id, attempt.order_type.value, None, kind == 'passive_exit', ())
                 self.writer.offer(record)
                 handle = self._start_protection_native(identity,
-                    lambda: self._execute_exit(scope, attempt, record, generation, lease, dispatch_origin), lease=lease)
+                    lambda: self._execute_exit(scope, attempt, record, generation, lease, dispatch_origin),
+                    lease=lease, diagnostic_record=record)
                 transferred = True
                 return handle
         finally:
             if not transferred:
                 lease.release()
 
-    def _start_protection_native(self, identity, operation, *, lease):
+    def _start_protection_native(self, identity, operation, *, lease, diagnostic_record=None):
         owned = {h.identity.request_id for h in self._native_jobs.values() if h._thread.is_alive()} | self._active_sends
         if len(owned) >= 2:
             raise RuntimeError('native_capacity')
@@ -2300,7 +2815,15 @@ class LPD2LiveExecution:
         def run():
             try: result = operation()
             except BaseException as exc: future.set_exception(exc)
-            else: future.set_result(result)
+            else:
+                if diagnostic_record is not None:
+                    try:
+                        with self.state._lock:
+                            self._diagnostic_outcomes = append_outcome(self._diagnostic_outcomes, result,
+                                record=diagnostic_record, protection=diagnostic_record.kind == 'CANCEL')
+                    except Exception:
+                        pass
+                future.set_result(result)
             finally: lease.release()
         thread = threading.Thread(target=run, name='lp-d2-protection-send', daemon=False)
         handle = NativeAttempt(identity, future, thread)
@@ -2311,14 +2834,14 @@ class LPD2LiveExecution:
     def _execute_exit(self, scope, attempt, record, generation, lease, origin):
         outcome, venue_id, signed = 'not_sent', None, None
         try:
-            if not lease.allowed() or not self._sell_dispatch_current(scope, attempt, generation, origin):
+            if not lease.allowed('SELL') or not self._sell_dispatch_current(scope, attempt, generation, origin):
                 with self.state._lock:
                     self._publish_sell_attempt(scope, replace(attempt, state='rejected', native_state='ended'))
                 return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
             signed = (self.trading.lp_create_limit_order(token_id=scope[2], side='SELL', price=attempt.price.value,
                 quantity=attempt.submit_quantity.value, expiration=None, post_only=True)
                 if attempt.kind == 'passive_exit' else None)
-            if not lease.allowed() or not self._sell_dispatch_current(scope, attempt, generation, origin):
+            if not lease.allowed('SELL') or not self._sell_dispatch_current(scope, attempt, generation, origin):
                 with self.state._lock:
                     self._publish_sell_attempt(scope, replace(attempt, state='rejected', native_state='ended'))
                 return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
@@ -2375,7 +2898,7 @@ class LPD2LiveExecution:
         return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
 
     def _cancel_exit(self, scope, attempt, origin):
-        lease = self._acquire_mutation('CANCEL')
+        lease = self._acquire_mutation('SELL_CANCEL')
         if lease is None:
             return None
         transferred = False
@@ -2401,7 +2924,7 @@ class LPD2LiveExecution:
                 def cancel():
                     outcome = 'unknown'
                     try:
-                        if not lease.allowed():
+                        if not lease.allowed('SELL_CANCEL'):
                             outcome = 'not_sent'
                         else:
                             with self.state._lock:
@@ -2426,7 +2949,7 @@ class LPD2LiveExecution:
                     self.writer.offer(ReceiptRecord(self.account_id, self.process_epoch, identity.request_id,
                         record.session_id, scope[1], scope[2], attempt.order_key[3], outcome, self._utc_now()))
                     return _ProtectionOutcome(identity.request_id, outcome, attempt.order_key[3])
-                handle = self._start_protection_native(identity, cancel, lease=lease)
+                handle = self._start_protection_native(identity, cancel, lease=lease, diagnostic_record=record)
                 transferred = True
                 return handle
         finally:
@@ -2502,6 +3025,17 @@ class LPD2LiveExecution:
                 snapshot = self.state.snapshot()
 
     def run_protection_once(self, *, timeout=2):
+        self._record_protection_status(entered=True, disposition='entered')
+        try:
+            result = self._run_protection_once(timeout=timeout)
+        except BaseException:
+            self._record_protection_status(entered=True, disposition='failed')
+            raise
+        if self._protection_diagnostics['disposition'] == 'entered':
+            self._record_protection_status(entered=True, disposition='completed')
+        return result
+
+    def _run_protection_once(self, *, timeout=2):
         """Evaluate the accepted raw frame; protection never acquires a new book."""
         with self._protection_lock:
             snapshot = self.state.snapshot()
@@ -2510,10 +3044,16 @@ class LPD2LiveExecution:
                     or observation is None or not observation.orders_complete
                     or observation.cycle_generation != snapshot.current.cycle_generation
                     or observation.read_ticket.trade_version_at_start != snapshot.trade_version):
+                reason = ('closed' if self._closed else 'shutdown' if snapshot.current.shutdown_requested else
+                    'fatal' if snapshot.current.fatal_id else 'no_observation' if observation is None else
+                    'orders_incomplete' if not observation.orders_complete else
+                    'generation_changed' if observation.cycle_generation != snapshot.current.cycle_generation else 'stale_observation')
+                self._record_protection_status(entered=True, disposition='skipped', skip_reason=reason)
                 return ()
             self._manual_review_deadlines()
             deadline = time.monotonic()+timeout
             if self._refresh_protection_evidence(deadline):
+                self._record_protection_status(entered=True, disposition='skipped', skip_reason='observation_invalidated')
                 return ()  # receipts invalidate the old observation; ordinary reader supplies the next one
             self._register_first_seen(snapshot)
             snapshot = self.state.snapshot()

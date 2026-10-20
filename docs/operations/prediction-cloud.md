@@ -208,7 +208,7 @@ trading resumes. Stopping the service does not cancel exchange orders.
 Development uses affected-service Docker checks and applicable security checks.
 Use the [PR-first delivery flow](agent-verification.md#first-reviewable-implementation):
 Main's task-only stage/commit/push and normal PR under standing authorization
-without another push/PR question, then independent GLM review and CI. In-scope
+without another push/PR question, then independent review and CI. In-scope
 repairs update the same PR before refreshed review; final review, feedback and
 exact CI gates precede explicit user-approved GitHub merge. Local `main` only synchronizes
 the remote. Deployment Preflight reuses trusted main-push CI for the selected final GitHub

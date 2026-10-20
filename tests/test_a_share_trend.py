@@ -19093,3 +19093,87 @@ def test_cn_runner_reports_reit_update_gap_at_deadline(tmp_path: Path) -> None:
         [600],
         [],
     )
+
+
+def test_frozen_contract_diagnostics_are_sanitized() -> None:
+    payload = {"account_input": {"account_id": "private-account", "token": "private-token"}}
+    assert trend_module.valid_frozen_report_contract(payload) is False
+    reason = trend_module.frozen_report_contract_error(payload)
+    assert reason == "account_input_invalid: field=account_input"
+    assert "private" not in reason
+    assert trend_module.frozen_report_contract_error({}) is None
+
+
+@pytest.mark.parametrize("market", ["CN", "HK", "US"])
+@pytest.mark.parametrize("mode", ["automatic", "manual"])
+def test_current_nominal_rotation_contract_accepts_repeating_atr(
+    market: str, mode: str,
+) -> None:
+    strategy, allocation = current_nominal_strategy(market)
+    exchange, asset, buy_symbol = {
+        "CN": ("SH", "A股", "600999"),
+        "HK": ("HK", "港股", "00999"),
+        "US": ("US", "美股", "NEW"),
+    }[market]
+    positions = tuple(
+        AccountPosition(
+            f"600{index:03d}" if market == "CN" else (
+                f"{index + 1:05d}" if market == "HK" else f"OLD{index}"
+            ),
+            f"Holding {index}", "stock", Decimal("100"), Decimal("10"), Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    snapshots = {
+        position.symbol: holding(position.symbol, asset=asset, strength="70", global_strength="60")
+        for position in positions
+    }
+    captured_bars = {position.symbol: bars() for position in positions}
+    built = build_report(
+        as_of_date="2026-07-14", execution_date="2026-07-15", market=market,
+        account=AccountSnapshot(
+            source_date="2026-07-14", fresh=True,
+            net_value=Decimal("538125"), available_cash=Decimal("100000"),
+            positions=positions if mode == "automatic" else (), exceptions=(),
+            position_count=15 if mode == "automatic" else 0,
+        ),
+        candidates=(candidate(
+            buy_symbol, exchange=exchange, asset=asset, close="43.05", amount="3", market_cap="200",
+            atr="0.8578571428571428571428571429", global_strength="100",
+        ),),
+        holding_snapshots=snapshots if mode == "automatic" else {},
+        bars_by_symbol=captured_bars if mode == "automatic" else {},
+        lot_sizes={buy_symbol: 100}, metadata={"market": market},
+        strategy_snapshot=strategy, allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="538125"),
+        real_holdings=RealHoldingInput(
+            status="available", reason="", source={"broker": "captured"},
+            positions=positions, holding_snapshots=snapshots,
+            bars_by_symbol=captured_bars, prior_state=None,
+            net_value=Decimal("538125"), available_cash=Decimal("100000"), position_count=15,
+        ) if mode == "manual" else None,
+    )
+    field = "simulate_rotation_pairs" if mode == "automatic" else "real_rotation_pairs"
+    pair = (built.simulate_rotation_pairs if mode == "automatic" else built.real_rotation_pairs)[0]
+    # Known Decimal results from the frozen price/line, including its rounding.
+    assert pair.estimated_shares == 500
+    assert pair.estimated_initial_line == Decimal("41.33428571428571428571428571")
+    assert pair.planned_stop_risk == Decimal("879.3821428571428571428571450")
+    payload = trend_module._report_payload(built)
+    assert trend_module.valid_frozen_report_contract(payload, _allow_unfrozen_simulated_plan=True)
+    # Even a last-place change remains invalid; the repair must not add tolerance.
+    tampered = copy.deepcopy(payload)
+    tampered["strategy_judgments"][field][0]["planned_stop_risk"] = "879.3821428571428571428571451"
+    assert not trend_module.valid_frozen_report_contract(tampered, _allow_unfrozen_simulated_plan=True)
+    assert trend_module.frozen_report_contract_error(
+        tampered, _allow_unfrozen_simulated_plan=True,
+    ) == f"rotation_audit_mismatch: field=strategy_judgments.{field}[].planned_stop_risk"
+
+    changed_pair = replace(pair, planned_stop_risk=Decimal("879.3821428571428571428571451"))
+    tampered_report = replace(built, **{field: (changed_pair,)})
+    with pytest.raises(ValueError) as error:
+        trend_module._report_payload(tampered_report)
+    assert str(error.value) == (
+        "frozen report contract is invalid: rotation_audit_mismatch: "
+        f"field=strategy_judgments.{field}[].planned_stop_risk"
+    )

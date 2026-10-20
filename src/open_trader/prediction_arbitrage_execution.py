@@ -29,6 +29,7 @@ from .notifications import (
     render_yes_no_signal_notification,
 )
 from .polymarket_lp import SCORING_STALE_SECONDS, queue_protection_status_view
+from .polymarket_lp_diagnostics import diagnostic_json_copy
 from .polymarket_trading import (
     LpAccountRoundInvalid,
     LegResult,
@@ -768,11 +769,12 @@ def _call(method: object, *args: object, **kwargs: object) -> object:
 
 class _D2MutationLease:
     """One actual call's share of this D2 owner's process/file exclusion."""
-    def __init__(self, execution):
-        self.execution, self.released = execution, False
+    def __init__(self, execution, action):
+        self.execution, self.action, self.released = execution, action, False
 
-    def allowed(self):
-        return not self.released and self.execution._lp_d2_permission()
+    def allowed(self, action=None):
+        return (not self.released and (action is None or action == self.action)
+            and self.execution._lp_d2_permission(self.action))
 
     def release(self):
         if self.released:
@@ -818,13 +820,15 @@ class PredictionExecutionService:
             raise ValueError("lp_d2_attachment_identity")
         self._lp_d2 = lp_d2
         self._lp_d2_control_request = (None, None)
+        self._lp_capture_failure_logged_at = None
         self._lp_d2_lease_lock = threading.Lock()
         self._lp_d2_lease = None
         self._lp_d2_lease_users = 0
         self._lp_d2_manual_lease = False
         self._lp_dashboard_lock = threading.RLock()
         self._lp_reward_percentage_lock = threading.Lock()
-        self._lp_share_watch_notification_lock = threading.Lock()
+        from .lp_persistence import SerializedCalls
+        self._lp_share_watch_notification_lock = SerializedCalls()
         self._lp_share_watch_seen: set[str] = set()
         self._lp_dashboard_cache: dict[str, object] | None = None
         self._lp_account_trades_cache: dict[str, object] | None = None
@@ -865,8 +869,8 @@ class PredictionExecutionService:
         self._legacy_strategy_retired = bool(legacy_retired)
         self._n_leg_paused = False
         self._process_lock = _PROCESS_LOCK
-        # A newly constructed process has not reconciled its dedicated wallet;
-        # only a clean startup/reset path may clear this lock.
+        # Startup admission (local for paused D2, reconciliation otherwise)
+        # must release this latch before mutations can be considered.
         self._breaker_open = True
         self._cross_breaker_open = False
         self._first_live_order_verified = False
@@ -897,13 +901,36 @@ class PredictionExecutionService:
         if lp_d2 is not None:
             lp_d2.bind_mutation_admission(self, self._lp_d2_acquire)
 
-    def _lp_d2_permission(self):
+    def admit_d2_paused_startup(self) -> None:
+        """Release the startup latch after reliable local D2 initialization.
+
+        Runtime initializes control with its validated claim and loads settings
+        first. Current account facts belong to the Scheduler; historical rows
+        are left intact and incident permissions still apply to each mutation.
+        """
+        live = self._lp_d2
+        if live is None or not self._n_leg_paused:
+            raise ValueError('d2_paused_startup_required')
+        status = live.control.status()
+        current = status.current
+        if (live._closed or status.fatal is not None or current.fatal_id is not None
+                or current.shutdown_requested or current.control_version is None
+                or current.account_id != live.account_id
+                or current.process_epoch != live.process_epoch):
+            raise ValueError('d2_local_startup_not_ready')
+        self._breaker_open = False
+
+    def _lp_d2_permission(self, action):
         live = self._lp_d2
         current = live.state.snapshot().current
         if live._closed or current.shutdown_requested or current.fatal_id is not None:
             return False
         try:
-            return not self._breaker_is_open() and self._store.active_execution() is None
+            if self._breaker_open or action not in ('BUY', 'MANUAL_BUY', 'SELL', 'CANCEL', 'ROTATION_CANCEL', 'SELL_CANCEL'):
+                return False
+            if (action != 'CANCEL' or not self._n_leg_paused) and self._store.unacknowledged_incident() is not None:
+                return False
+            return self._n_leg_paused or self._store.active_execution() is None
         except Exception:
             return False  # unavailable mutation safety is never an SDK permission
 
@@ -914,19 +941,19 @@ class PredictionExecutionService:
         with self._lp_d2_lease_lock:
             if self._lp_d2_manual_lease or manual and self._lp_d2_lease_users:
                 return None
-            if not self._lp_d2_permission():
+            if not self._lp_d2_permission(action):
                 return None
             if self._lp_d2_lease is None:
                 lock = self._acquire_global_lock(wait_seconds=_LP_SUBMIT_LOCK_WAIT_SECONDS if manual else 0)
                 if lock is None:
                     return None
-                if not self._lp_d2_permission():
+                if not self._lp_d2_permission(action):
                     self._release_global_lock(lock)
                     return None
                 self._lp_d2_lease = lock
             self._lp_d2_lease_users += 1
             self._lp_d2_manual_lease = manual
-            return _D2MutationLease(self)
+            return _D2MutationLease(self, action)
 
     def _lp_d2_submit_entry(self, payload, *, preview_id=None):
         key = str(payload.get('idempotency_key') or '').strip()
@@ -940,7 +967,7 @@ class PredictionExecutionService:
             return previous['response']
         if self._breaker_is_open():
             return dict(state='locked',reason='circuit_breaker_open')
-        active = self._store.active_execution()
+        active = None if self._n_leg_paused else self._store.active_execution()
         if active is not None:
             return dict(state='busy',reason='active_execution',execution_id=active.get('execution_id'))
         lease = self._lp_d2_acquire('MANUAL_BUY')
@@ -961,7 +988,7 @@ class PredictionExecutionService:
             return dict(state='rejected',reason='idempotency_key_required' if not key else 'session_id_invalid')
         if self._breaker_is_open():
             return dict(state='locked',reason='circuit_breaker_open')
-        active = self._store.active_execution()
+        active = None if self._n_leg_paused else self._store.active_execution()
         if active is not None:
             return dict(state='busy',reason='active_execution',execution_id=active.get('execution_id'))
         lease = self._lp_d2_acquire('MANUAL_BUY')
@@ -1007,6 +1034,16 @@ class PredictionExecutionService:
             if isinstance(value, Mapping): return {str(k): json_value(v) for k, v in value.items()}
             if isinstance(value, (tuple, list)): return [json_value(v) for v in value]
             return value
+        def diagnostic_view(name, read):
+            try:
+                value = diagnostic_json_copy(read())
+                if not isinstance(value, dict) and not (name == 'rotation' and value is None):
+                    raise TypeError('diagnostic_shape')
+                return value
+            except Exception:
+                logger.exception('prediction_lp_diagnostics_failed component=%s', name)
+                return dict(available=False, error='diagnostics_unavailable',
+                    **{'selection_state' if name == 'rotation' else 'state': 'UNKNOWN'})
         with live.state._lock:
             status = live.control.status()
             snapshot = live.state.snapshot()
@@ -1028,6 +1065,8 @@ class PredictionExecutionService:
                 settings_pending=settings['pending'], settings_native_inflight=settings['native_inflight'],
                 settings_error=settings['error'], effective_round_interval_seconds=None,
                 check_interval_seconds=None, cycle_mode='continuous')
+            result['diagnostics'] = diagnostic_view('iteration', live.diagnostics)
+            result['diagnostics']['rotation'] = diagnostic_view('rotation', live.rotation_diagnostics)
             for name, fact in (('buy_reserved_usd', snapshot.buy_reserved),
                     ('inventory_cost_usd', snapshot.inventory_cost), ('current_exposure_usd', snapshot.current_exposure),
                     ('new_capacity_usd', snapshot.new_capacity)):
@@ -1124,9 +1163,21 @@ class PredictionExecutionService:
     def lp_auto_scheduled_check(self):
         if self._lp_d2 is not None:
             self._lp_d2.poll()
-            result = self._lp_d2.run_once(self._lp.capture_qualified_pool())
+            attempted_at = self._lp_d2.begin_scheduled_attempt()
+            capture_failed = False
+            try:
+                capture = self._lp.capture_qualified_pool()
+            except Exception:
+                capture_failed = True
+                now = self._clock()
+                if self._lp_capture_failure_logged_at is None or now - self._lp_capture_failure_logged_at >= 60:
+                    self._lp_capture_failure_logged_at = now
+                    logger.exception('prediction_lp_candidate_capture_failed')
+                self._lp_d2.record_attempt_failure(attempted_at=attempted_at, stage='capture')
+                capture = None  # Unavailable candidates forbid BUY, not account protection.
+            result = self._lp_d2.run_once(capture, attempted_at=attempted_at, capture_failed=capture_failed)
             self._lp_d2.run_protection_once()
-            return result
+            return self._lp_d2.dispatch_rotation(result)
         return self._lp_auto_pool().run_once(reuse_facts=True)
 
     def lp_auto_run_once(self, *, round_id=None):
@@ -1363,13 +1414,11 @@ class PredictionExecutionService:
             return dict(current) if isinstance(current, Mapping) else {}
 
         def save_watch_fields(
-            condition_id: str, fields: Mapping[str, object]
+            condition_id: str, fields: Mapping[str, object], *, expected_share_alert=None
         ) -> dict[str, object] | None:
-            return update_observation(
-                account_id,
-                condition_id,
-                {"share_alert": dict(fields)},
-            )
+            return _call(update_observation, account_id, condition_id,
+                {"share_alert": dict(fields)}, **({'expected_share_alert': expected_share_alert}
+                    if expected_share_alert is not None else {}))
 
         snapshot = self._lp_open_orders_snapshot(stop_event=stop_event)
         # The authenticated reader stamps its result after the network call;
@@ -1601,6 +1650,8 @@ class PredictionExecutionService:
                             "notification_pending": False,
                             "last_attempt_at": _timestamp(send_now),
                         },
+                        expected_share_alert={key: latest.get(key) for key in (
+                            'last_share_checked_at', 'breach_started_at', 'notification_pending')},
                     )
                     continue
                 if stop_event is not None and stop_event.is_set():

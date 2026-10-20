@@ -250,7 +250,8 @@ def test_database_diagnostics_separate_preparation_begin_body_commit_and_counts(
     from decimal import Decimal
     from open_trader import prediction_arbitrage_store as store_module
     store = PredictionArbitrageStore(tmp_path)
-    clock = [0.0]
+    # Keep admission on the real monotonic epoch; control only stage increments.
+    clock = [store_module.monotonic()]
     monkeypatch.setattr(store_module, 'monotonic', lambda: clock[0])
     class TimedConnection(sqlite3.Connection):
         def execute(self, sql, *args):

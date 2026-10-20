@@ -681,7 +681,12 @@ def test_selected_independent_cancel_preserves_late_business_controls(tmp_path, 
                     protection=deepcopy(before['queue_protection'])
                     for bucket in protection.get('levels',{'entry':protection}).values():bucket['state']='triggered'
                     patch={'queue_protection':protection}
-                after=store.lp_update_session(session_id,patch=patch)
+                # The observer still owns this connection's writer permit.
+                # Commit the late control in a new transaction on that same
+                # connection, before returning to dispatch; never nest a writer.
+                super().execute('BEGIN IMMEDIATE')
+                after=store.lp_update_session(session_id,patch=patch,connection=self)
+                super().execute('COMMIT')
                 after_revision=store.lp_session_revision(session_id)
                 assert after_revision>before_revision and store.lp_trade_generation()==generation
                 captures.append(dict(pending=pending,before=deepcopy(before),after=deepcopy(after),patch=deepcopy(patch),
