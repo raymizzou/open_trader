@@ -104,7 +104,7 @@ def test_prediction_parallelism_preserves_scope_and_serial_override() -> None:
     assert "--dist=" not in candidate
 
 
-def test_n_leg_development_pause_is_reversible_and_preserves_active_services() -> None:
+def test_n_leg_manual_diagnostics_preserve_active_services() -> None:
     def preview(*arguments: str) -> str:
         return subprocess.run(
             ["make", "-n", *arguments], cwd=ROOT,
@@ -117,7 +117,6 @@ def test_n_leg_development_pause_is_reversible_and_preserves_active_services() -
         "test_prediction_n_leg_execution.py", "test_run_nleg_no_submit_validation.py",
         "test_prediction_solver_benchmark.py", "test_prediction_solver_worker.py",
         "test_prediction_live_resolver.py", "test_prediction_partial_fill.py",
-        "test_prediction_monitor_selection_driver.py",
     ):
         assert f"tests/{filename}" not in active
         assert f"tests/{filename}" in restored
@@ -125,10 +124,11 @@ def test_n_leg_development_pause_is_reversible_and_preserves_active_services() -
         "test_polymarket_lp.py", "test_prediction_runtime.py",
         "test_prediction_service.py", "test_prediction_arbitrage_store.py",
         "test_prediction_release_launchd.py", "test_prediction_n_leg.py",
+        "test_prediction_monitor_selection_driver.py", "test_prediction_n_leg_cutover.py", "test_run_nleg_cutover.py",
     ):
         assert f"tests/{filename}" in active
-    assert "N-leg dedicated tests paused" in active
-    assert "N-leg dedicated tests paused" not in restored
+    assert "N-leg permanently retired" in active
+    assert "N-leg permanently retired" not in restored
     assert active == preview("test", "SERVICE=prediction", "TEST_N_LEG=0")
     assert "tests/test_prediction_n_leg_execution.py" not in preview(
         "test", "SERVICE=gateway prediction"
@@ -136,7 +136,7 @@ def test_n_leg_development_pause_is_reversible_and_preserves_active_services() -
     assert "tests/test_frontend_gateway.py" in preview("test", "SERVICE=gateway prediction")
     focused = preview("test", "TEST=tests/test_prediction_n_leg_execution.py")
     assert "tests/test_prediction_n_leg_execution.py" in focused
-    assert "N-leg dedicated tests paused" not in focused
+    assert "N-leg permanently retired" not in focused
     assert preview("candidate-acceptance", "TEST_N_LEG=0") == preview(
         "candidate-acceptance", "TEST_N_LEG=1"
     )
@@ -147,3 +147,58 @@ def test_n_leg_development_pause_is_reversible_and_preserves_active_services() -
         )
         assert invalid.returncode != 0
         assert "TEST_N_LEG must be 0 or 1" in invalid.stdout + invalid.stderr
+
+
+def test_explicit_retirement_manifest_preserves_shared_and_new_tests(tmp_path) -> None:
+    import json
+    import shutil
+    root = tmp_path / 'repo'
+    root.mkdir()
+    shutil.copy(ROOT / 'Makefile', root / 'Makefile')
+    shutil.copytree(ROOT / 'scripts', root / 'scripts')
+    (root / 'tests').mkdir()
+    for source in (ROOT / 'tests').glob('test_*.py'):
+        (root / 'tests' / source.name).write_text('def test_example(): pass\n')
+    (root / 'tests/test_prediction_n_leg_new.py').write_text('def test_new(): pass\n')
+    (root / 'tests/nested').mkdir()
+    (root / 'tests/nested/test_new.py').write_text('def test_new(): pass\n')
+    def selection(*args):
+        output = subprocess.check_output(['make', '-sn', 'test', 'SERVICE=prediction', *args], cwd=root, text=True)
+        return set(re.findall(r'tests/[\w/]+\.py', output))
+    active = selection()
+    for filename in ['test_prediction_monitor_selection_driver.py', 'test_prediction_n_leg_cutover.py',
+                     'test_run_nleg_cutover.py', 'test_prediction_runtime.py', 'test_prediction_service.py',
+                     'test_prediction_n_leg.py', 'test_prediction_n_leg_new.py', 'test_polymarket_lp.py',
+                     'test_polymarket_trading.py', 'test_prediction_arbitrage_store.py']:
+        assert 'tests/' + filename in active
+    assert {str(p.relative_to(ROOT)) for p in (ROOT/'tests').glob('test_lp_*.py')} <= active
+    manifest = json.loads((root/'scripts/ci_nleg_retired.json').read_text())
+    retired = {item['path'] for item in manifest['retired']}
+    assert len(retired) == 29
+    assert not active & retired
+    assert selection('TEST_N_LEG=1') - active == retired
+    assert active == selection('TEST_N_LEG=0')
+    explicit = subprocess.check_output(['make','-sn','test','TEST=tests/test_prediction_n_leg_validation.py'],cwd=root,text=True)
+    assert 'tests/test_prediction_n_leg_validation.py' in explicit
+    parts = subprocess.check_output(['make','-s','ci-test-files'],cwd=root,text=True)
+    assert 'tests/nested/test_new.py' in parts
+
+
+def test_invalid_retirement_manifest_fails_before_execution(tmp_path) -> None:
+    import copy
+    import json
+    manifest = json.loads((ROOT/'scripts/ci_nleg_retired.json').read_text())
+    broken = []
+    duplicate = copy.deepcopy(manifest); duplicate['retired'].append(duplicate['retired'][0]); broken.append(duplicate)
+    for path in ['tests/test_missing.py', '../tests/test_prediction_solver.py',
+                 'tests/test_prediction_runtime.py', 'tests/test_prediction_n_leg_cutover.py']:
+        item = copy.deepcopy(manifest); item['retired'][0]['path'] = path; broken.append(item)
+    wrong_reason = copy.deepcopy(manifest); wrong_reason['retired'][0]['reason']='temporary pause'; broken.append(wrong_reason)
+    unknown = copy.deepcopy(manifest); unknown['policy']='unknown'; broken.append(unknown)
+    for index, data in enumerate(broken):
+        target=tmp_path/f'bad-{index}.json'; target.write_text(json.dumps(data))
+        run=subprocess.run(['make','test','SERVICE=prediction',f'N_LEG_MANIFEST={target}','DOCKER=must-not-run'],
+                           cwd=ROOT,capture_output=True,text=True)
+        assert run.returncode != 0
+        assert 'Invalid retirement selection' in run.stderr
+        assert 'must-not-run build' not in run.stdout

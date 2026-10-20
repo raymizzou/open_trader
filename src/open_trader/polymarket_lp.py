@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import inspect
+import hashlib
+import json
 import logging
 import math
 import os
@@ -12,7 +14,7 @@ import threading
 import uuid
 from time import monotonic
 from copy import deepcopy
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from collections.abc import Callable, Collection, Mapping, MutableMapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from datetime import UTC, date, datetime, time, timedelta
@@ -21,8 +23,10 @@ from typing import Any, cast
 from types import MappingProxyType
 from zoneinfo import ZoneInfo
 
+from .polymarket_lp_reader_comparison import capture as _reader_capture
 from .polymarket_lp_risk import (
     BOOK_FRESHNESS_SECONDS,
+    _MARKET_METADATA_MAX_AGE_SECONDS,
     LP_QUEUE_PROTECTION_THRESHOLD,
     TERMINAL_ORDER_STATES,
     _account_after_reservations,
@@ -37,15 +41,19 @@ from .polymarket_lp_risk import (
     _maybe_decimal,
     _projected_taker_fee,
     _qualify_reward_quote,
+    _select_bid_level,
     _timestamp,
     estimate_lp_queue_position,
+    estimate_lp_stress_exit,
     estimate_lp_target_share_yield,
     evaluate_lp_entry,
     minimum_order_estimate,
     first_observation_baseline,
 )
 from .polymarket_lp_accounting import (
-    build_account_financial_facts, reservation_is_manually_released, reservation_is_released,
+    build_account_financial_facts, build_planning_account_facts, reservation_is_manually_released, reservation_is_released,
+    buy_action_is_covered, unresolved_buy_action, submission_action_kind,
+    project_planning_buy_holds,
 )
 from .polymarket_lp_errors import LpObservationWait
 from .polymarket_lp_notification_batches import (
@@ -53,13 +61,16 @@ from .polymarket_lp_notification_batches import (
     matching_batch_channels,
     plan_notification_batches,
 )
-from .polymarket_lp_scratch import LPReadRows, LPReadScratch
+from .polymarket_lp_scratch import (
+    LPDirectionIndex, LPDirectionScratch, LPReadOverlay, LPReadRows, LPReadScratch,
+)
 from .prediction_arbitrage_store import (
     LP_RESERVED_MANUAL_SESSION_ID,
     PredictionArbitrageStore,
 )
 from .notifications import beijing_clock, notification_delivery_episode
 from .polymarket_trading import (
+    PolymarketTradingClient,
     LpAccountReadError,
     LpAccountRoundInvalid,
     LpNewerAccountFacts,
@@ -70,6 +81,7 @@ from .polymarket_trading import (
     _lp_read_lock,
     _lp_market_read_diagnostic,
     _lp_causal_event,
+    _lp_capture_read_log,
     _lp_trade,
     _safe_read_error_chain,
     _safe_sqlite_error_facts,
@@ -137,6 +149,9 @@ _LP_CANDIDATE_BATCH_MIN_INTERVAL_SECONDS = 2.0
 # paths only read the in-memory cache and never block on a competition read.
 # #181: 密度是慢变量，小时级节奏。
 _LP_COMPETITION_REFRESH_SECONDS = 3600
+# Issue #306: bounded writes and cooperative yield; see the replay measurement record.
+_LP_COMPETITION_BATCH_SIZE = 500
+_LP_COMPETITION_BATCH_PAUSE_SECONDS = 0.01
 # Issue #157: pool publications persist at most once every five seconds.
 _LP_CANDIDATE_SNAPSHOT_SAVE_MIN_INTERVAL_SECONDS = 5.0
 _LP_BOOK_SAMPLE_BATCH_SIZE = 100
@@ -166,6 +181,110 @@ _QUEUE_DATA_FAILURE_REASONS = frozenset(
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _QualifiedPoolCaptureValueError(TypeError):
+    """Describe one unsupported value in a captured candidate packet."""
+
+    def __init__(self, path: str, value: object) -> None:
+        self.path = _capture_safe_path(path)
+        self.value_type = _capture_safe_type(value)
+        super().__init__("qualification_value_invalid")
+
+
+def _capture_safe_type(value: object) -> str:
+    """Return a bounded type name without retaining an object or repr."""
+
+    name = type(value).__name__
+    safe = "".join(character if character.isalnum() or character in "_.-" else "_"
+                    for character in name)
+    return (safe or "unknown_type")[:128]
+
+
+def _capture_safe_path(value: str) -> str:
+    """Return a bounded path suitable for operator diagnostics."""
+
+    safe = "".join(character if character.isalnum() or character in "_.[]-"
+                    else "_" for character in value)
+    return (safe or "packet")[:128]
+
+
+_CAPTURE_PATH_KEYS = frozenset({
+    "packet", "row", "facts", "directions", "checked_at",
+    "global_recovery_generation", "market", "book", "sdk_extra",
+    "condition_id", "token_id", "market_id", "metadata_checked_at",
+    "fees_checked_at", "received_at", "timestamp", "bids", "asks",
+    "price", "size", "history_summary", "reward_checked_at", "send_options",
+    "payload",
+})
+
+
+def _capture_path_key(value: object) -> str:
+    """Keep known field names and hash arbitrary keys before diagnostics."""
+
+    try:
+        text = str(value)
+    except Exception:
+        return "key_unknown"
+    if text in _CAPTURE_PATH_KEYS:
+        return text
+    return "key_" + hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _capture_market_hash(value: object) -> str:
+    """Hash one market identity without retaining or emitting its text."""
+
+    try:
+        text = str(value)
+    except Exception:
+        text = _capture_safe_type(value)
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _capture_freeze(value: object, *, path: str = "packet") -> object:
+    """Freeze capture values while preserving the shared reader contract.
+
+    Mapping and sequence traversal is local so an unsupported leaf can carry a
+    bounded path. Scalar acceptance and immutable output remain delegated to
+    the shared reader freezer.
+    """
+
+    from .polymarket_lp_market_reader import freeze
+
+    # Keep the reader's scalar-before-container isinstance ordering. A value
+    # can be virtually registered as a Mapping while still being a supported
+    # scalar (for example, a str subclass).
+    if value is None or isinstance(value, (str, int, float, bool, datetime)):
+        return freeze(value)
+    if isinstance(value, Decimal):
+        return freeze(value)
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            str(key): _capture_freeze(value_item,
+                                      path=f"{path}.{_capture_path_key(key)}")
+            for key, value_item in value.items()
+        })
+    if isinstance(value, (list, tuple)):
+        return tuple(
+            _capture_freeze(value_item, path=f"{path}[{index}]")
+            for index, value_item in enumerate(value)
+        )
+    try:
+        return freeze(value)
+    except TypeError as exc:
+        raise _QualifiedPoolCaptureValueError(path, value) from exc
+
+
+def _capture_facts_projection(facts: object) -> object:
+    """Copy only the facts keys consumed by the captured D2 packet."""
+
+    if not isinstance(facts, Mapping):
+        return None
+    return {
+        key: facts[key]
+        for key in ("directions", "checked_at", "global_recovery_generation")
+        if key in facts
+    }
 
 
 class AutoEntryNotSent(ValueError):
@@ -388,6 +507,7 @@ def _lp_direction_fact(
     event_end_confirmation: object,
     history_summary: object,
     account: Mapping[str, object] | None,
+    compact_market: bool = False,
 ) -> dict[str, object]:
     """Build one YES/NO direction fact from market and reward rows.
 
@@ -395,11 +515,12 @@ def _lp_direction_fact(
     round-start build and the issue-143 batch renewal, so both produce
     identical market fields (including the ``_lp_reward_terms`` minimum and
     spread resolution and the reward-catalog overlays) from the same code.
+    ``compact_market`` retains just overrides for a candidate scratch reader
+    which reconstructs the rest from its published metadata generation.
     """
 
     reward_minimum, reward_spread = _lp_reward_terms(market_meta, reward_market)
     market: dict[str, object] = {
-        **dict(market_meta),
         "condition_id": condition_id,
         "token_id": token_id,
         "outcome": outcome,
@@ -414,8 +535,11 @@ def _lp_direction_fact(
         market["_metadata_reward_min_size"] = market_meta.get("reward_min_size")
     if market_meta.get("reward_max_spread") is not None:
         market["_metadata_reward_max_spread"] = market_meta.get("reward_max_spread")
+    # Candidate scratch stores just these overrides. Other callers still get
+    # the complete market, and participation sees that same complete value.
+    full_market = {**dict(market_meta), **market}
     direction: dict[str, object] = {
-        "market": market,
+        "market": market if compact_market else full_market,
         "reward_active": (
             reward_market.get("reward_active")
             if isinstance(reward_market.get("reward_active"), bool)
@@ -428,7 +552,7 @@ def _lp_direction_fact(
     }
     if isinstance(history_summary, Mapping):
         direction["history_summary"] = dict(history_summary)
-    if account is not None and _has_market_order(account, market):
+    if account is not None and _has_market_order(account, full_market):
         direction["known_participation"] = True
     return direction
 
@@ -589,6 +713,16 @@ def _candidate_head_source_times(
         for value in _candidate_head_source_values(cached)
     )
     return source_times, any_expired
+
+
+def _lp_candidate_maintenance_log(event: str, facts: Mapping[str, object]) -> None:
+    """Capture only pre-redacted, bounded attempt facts in the existing sink."""
+    try:
+        captured = deepcopy(dict(facts))
+        _lp_capture_read_log(lambda: logger.info(
+            "lp_candidate_maintenance event=%s facts=%s", event, captured))
+    except Exception:
+        pass
 
 
 def _lp_direction_estimate(
@@ -820,23 +954,32 @@ class PolymarketLPService:
         if type(self.exclusions_enabled) is not bool:
             raise ValueError("exclusions_enabled must be a boolean")
         self._candidate_exclusion_revision = 0
+        self._qualified_pool_generation = None
         self._candidate_preparation_wakeup = None
         self.owner_lock = owner_lock
         self._mutation_guard = mutation_guard
+        self._candidate_buy_price_level_reader: Callable[[], int] | None = None
         listener = getattr(store, "set_lp_trade_change_listener", None)
         if callable(listener):
             listener(self._invalidate_lp_account_round)
         self._protection_notifier: Callable[..., object] | None = None
-        self._mutex = threading.RLock()
+        from .lp_persistence import MemoryLock, SerializedCalls
+        self._mutex = MemoryLock('_mutex', reentrant=True)
         self._entry_sends: set[str] = set()
+        self._cancel_sends: set[str] = set()
         self._entry_sends_lock = threading.Lock()
         self._facts_owner = threading.local()
         self._facts_lock = threading.Lock()
         self._facts_apply_lock = threading.Lock()
-        self._first_seen_apply_lock = threading.Lock()
+        self._first_seen_apply_lock = MemoryLock('_first_seen_apply_lock', reentrant=False)
         self._account_registration_attempt = 0
         self._account_order_sync_error: str | None = None
         self._deferred_protection_notices = threading.local()
+        self._protection_cancel_lock = threading.Lock()
+        # Retain consumed action IDs until this instance exits; cache eviction
+        # must never rearm an old notice.
+        self._protection_cancel_events: set[str] = set()
+        self._protection_cancel_enabled = True
         self._facts_inflight: dict[str, dict] = {}
         self._pending_facts: dict[
             str, tuple[Mapping[str, object], int, Mapping[str, object], int]
@@ -846,7 +989,7 @@ class PolymarketLPService:
         self._facts_attention_summary = None
         self._facts_attention_verifier = None
         self._attention_queue_lock = threading.Lock()
-        self._attention_delivery_lock = threading.Lock()
+        self._attention_delivery_lock = SerializedCalls()
         self._attention_delivery_results: dict[tuple[str, bool, str], dict[str, bool]] = {}
         self._attention_pending: dict[str, object] = {}
         self._attention_thread: threading.Thread | None = None
@@ -859,24 +1002,29 @@ class PolymarketLPService:
         self._facts_publisher = None
         self._facts_validator = None
         self._facts_wakeup = None
-        self._reward_refresh_lock = threading.Lock()
-        self._price_history_refresh_lock = threading.Lock()
-        self._report_lock = threading.Lock()
+        self._reward_refresh_lock = SerializedCalls()
+        self._price_history_refresh_lock = SerializedCalls()
+        self._report_lock = SerializedCalls()
         # Issue #146: the full scan and the head maintenance run on
         # independent threads; separate locks let a long scan proceed while
         # maintenance refreshes the published head (and vice versa) without
         # either kind overlapping itself.
-        self._candidate_scan_lock = threading.Lock()
-        self._candidate_maintenance_lock = threading.Lock()
-        self._candidate_state_lock = threading.RLock()
-        self._competition_lock = threading.Lock()
+        self._candidate_scan_lock = SerializedCalls()
+        self._candidate_maintenance_lock = SerializedCalls()
+        self._candidate_state_lock = MemoryLock('_candidate_state_lock', reentrant=True)
+        self._qualified_pool_capture_invalid_last_warn_at: float | None = None
+        self._competition_lock = MemoryLock('_competition_lock', reentrant=False)
+        self._competition_refresh_lock = SerializedCalls()
+        self._competition_version = 0
+        self._candidate_queue_build_sequence = 0
         self._competition_state: dict[str, object] = {}
-        self._preparation_lock = threading.RLock()
+        self._preparation_lock = MemoryLock('_preparation_lock', reentrant=True)
         self._sample_target_lock = threading.Lock()
         self._sample_targets: tuple[tuple[str, str], ...] = ()
         self._sample_target_version = 0
         self._candidate_attempted_at: datetime | None = None
         self._candidate_maintenance_failures = 0
+        self._candidate_maintenance_global_failure = False
         self._candidate_maintenance_last_finished_at: datetime | None = None
         self._candidate_qualification_facts: dict[str, object] = {}
         # Issue #157 rolling pool: valid estimates keyed by condition_id, a
@@ -921,6 +1069,11 @@ class PolymarketLPService:
             "stale": False,
         }
         self._preparation: dict[str, object] | None = None
+        try:
+            self._restore_protection_cancel_events()
+        except Exception as exc:
+            self._protection_cancel_enabled = False
+            logger.warning("lp_protection_cancel_restore_failed notifications_disabled error_type=%s", type(exc).__name__)
         self._restore_preparation()
         self._restore_candidate_snapshot()
         self._evict_excluded_candidates()
@@ -947,25 +1100,34 @@ class PolymarketLPService:
     def _candidate_conditions(self, condition_ids, *, now=None):
         if not self.exclusions_enabled:
             return tuple(condition_ids)
-        return self.store.lp_candidate_conditions(tuple(condition_ids), now=now or self._now())
+        ids, moment = tuple(condition_ids), now or self._now()
+        provider = getattr(self.exchange, "lp_candidate_metadata_tokens", None)
+        if callable(provider):
+            return self.store.lp_candidate_conditions(ids, now=moment,
+                current_tokens=provider(ids, now=moment))
+        return self.store.lp_candidate_conditions(ids, now=moment)
 
     @staticmethod
     def _candidate_global_generation(value: object) -> int:
         return value if type(value) is int and value >= 0 else 0
 
     def _current_candidate_global_generation(self) -> int | None:
-        reader = getattr(self.store, "lp_preparation", None)
-        if not callable(reader):
-            return 0
-        try:
-            preparation = reader()
-        except Exception:
-            return None
-        return (
-            self._candidate_global_generation(preparation.get("global_recovery_generation"))
-            if isinstance(preparation, Mapping)
-            else 0
-        )
+        # Producer reads publish their actual fence for the memory-only port.
+        # Legacy generation defaults retain their old meaning only for legacy
+        # publication; an absent/failed fence never certifies a D2 capture.
+        with self._candidate_state_lock:
+            reader = getattr(self.store, "lp_preparation", None)
+            if not callable(reader):
+                self._qualified_pool_generation = None
+                return 0
+            try:
+                preparation = reader()
+            except Exception:
+                self._qualified_pool_generation = None
+                return None
+            raw = preparation.get("global_recovery_generation") if isinstance(preparation, Mapping) else None
+            self._qualified_pool_generation = raw if type(raw) is int and raw >= 0 else None
+            return self._candidate_global_generation(raw)
 
     def _candidate_generation_allowed(self, expected: int | None) -> bool:
         current = self._current_candidate_global_generation()
@@ -1007,24 +1169,26 @@ class PolymarketLPService:
             until = checked_at + timedelta(seconds=seconds)
         else:
             return False
-        with self._candidate_state_lock:
-            if not self._candidate_generation_allowed(global_recovery_generation):
-                return False
-            if exclusion_revision is not None and exclusion_revision != self._candidate_exclusion_revision:
-                return False
-            inserted = self.store.lp_record_market_exclusion(
-                condition_id, token_id, reason, checked_at=checked_at,
-                cooldown_until=until, now=self._now(),
-                global_recovery_generation=global_recovery_generation,
-            )
-            if inserted:
-                self._candidate_exclusion_revision += 1
-                self._evict_excluded_candidates(condition_id)
-                if callable(self._candidate_preparation_wakeup):
-                    self._candidate_preparation_wakeup()
-            return inserted
+        def publish_exclusion():
+            with self._candidate_state_lock:
+                if not self._candidate_generation_allowed(global_recovery_generation):
+                    return False
+                if exclusion_revision is not None and exclusion_revision != self._candidate_exclusion_revision:
+                    return False
+                inserted = self.store.lp_record_market_exclusion(
+                    condition_id, token_id, reason, checked_at=checked_at,
+                    cooldown_until=until, now=self._now(),
+                    global_recovery_generation=global_recovery_generation,
+                )
+                if inserted:
+                    self._candidate_exclusion_revision += 1
+                    self._evict_excluded_candidates(condition_id)
+                    if callable(self._candidate_preparation_wakeup):
+                        self._candidate_preparation_wakeup()
+                return inserted
+        return self._lp_write_operation(publish_exclusion, priority='background')
 
-    def _candidate_market_rejection(self, reward, market, *, now):
+    def _candidate_market_rejection(self, reward, market, *, now, competition=None):
         """Reuse existing thresholds, cheap public facts before history/books."""
         if not self.exclusions_enabled or any(row.get(key) is True for row in (reward, market) for key in ("closed", "resolved")):
             return None
@@ -1042,12 +1206,8 @@ class PolymarketLPService:
             LP_COMPETITION_DENSITY_MID_MAX,
         )
         cid = str(reward.get("condition_id") or market.get("condition_id") or "")
-        raw_map = self._competition_state.get("competitiveness")
-        entry = _lp_competition_entry(raw_map.get(cid) if isinstance(raw_map, Mapping) else None)
-        stamp = entry["checked_at"]
-        from .polymarket_lp_views import LP_COMPETITION_MAX_AGE
-        if stamp is None or not 0 <= (now - stamp).total_seconds() < LP_COMPETITION_MAX_AGE.total_seconds():
-            entry = _lp_competition_entry(self.store.lp_competitiveness_entry(cid))
+        projection = self._competition_entries((cid,)) if competition is None else competition
+        entry = _lp_competition_entry(projection.get(cid))
         value, stamp = entry["value"], entry["checked_at"]
         if value is not None and stamp is not None and stamp <= now:
             if value == 0:
@@ -1075,15 +1235,17 @@ class PolymarketLPService:
         if not self._candidate_generation_allowed(global_recovery_generation):
             return False
         if self.exclusions_enabled and (market.get("closed") is True or market.get("resolved") is True):
-            with self._candidate_state_lock:
-                if not self._candidate_generation_allowed(global_recovery_generation):
-                    return False
-                if self.store.lp_clear_ended_market_exclusions(
-                    condition_id,
-                    checked_at=checked_at,
-                    global_recovery_generation=global_recovery_generation,
-                ):
-                    self._candidate_exclusion_revision += 1
+            def publish_ended():
+                with self._candidate_state_lock:
+                    if not self._candidate_generation_allowed(global_recovery_generation):
+                        return False
+                    if self.store.lp_clear_ended_market_exclusions(
+                        condition_id,
+                        checked_at=checked_at,
+                        global_recovery_generation=global_recovery_generation,
+                    ):
+                        self._candidate_exclusion_revision += 1
+            self._lp_write_operation(publish_ended, priority='background')
             return True
         return False
 
@@ -1126,8 +1288,11 @@ class PolymarketLPService:
                         values.pop(cid, None)
                     if key == "directions_by_condition":
                         for cid in allowed:
-                            values[cid] = [d for d in values.get(cid, ()) if self._candidate_allowed(
-                                ((cid, str(d.get("market", {}).get("token_id") or "")),))]
+                            if isinstance(values, LPDirectionIndex):
+                                values.filter_tokens(cid, lambda token: self._candidate_allowed(((cid, token),)))
+                            else:
+                                values[cid] = [d for d in values.get(cid, ()) if self._candidate_allowed(
+                                    ((cid, str(d.get("market", {}).get("token_id") or "")),))]
                 self._candidate_queue_condition_ids = tuple(cid for cid in self._candidate_queue_condition_ids if cid not in blocked)
                 for row in (*queue.get("queue_normal", ()), *queue.get("queue_backup", ())):
                     cid, token = str(row.get("condition_id") or ""), str(row.get("token_id") or "")
@@ -1410,6 +1575,9 @@ class PolymarketLPService:
                 saved = reader()
             except Exception:
                 saved = None
+        raw_fence = saved.get("global_recovery_generation") if isinstance(saved, Mapping) else None
+        with self._candidate_state_lock:
+            self._qualified_pool_generation = raw_fence if type(raw_fence) is int and raw_fence >= 0 else None
         with self._preparation_lock:
             if isinstance(saved, Mapping):
                 state = self._new_preparation_state()
@@ -1444,34 +1612,44 @@ class PolymarketLPService:
                 result.update(deepcopy(dict(summary)))
         return result
 
+    def _lp_write_scope(self):
+        scope = getattr(self.store, 'lp_write_scope', None)
+        return scope() if callable(scope) else nullcontext()
+
+    def _lp_write_operation(self, operation, *, priority='background'):
+        run = getattr(self.store, 'lp_write_operation', None)
+        return run(operation, priority=priority) if callable(run) else operation()
+
     def _save_preparation(
         self,
         updates: Mapping[str, object],
         *,
         expected_generation: int | None = None,
     ) -> dict[str, object]:
-        with self._preparation_lock:
-            current = self.preparation_snapshot()
-            merged = {**current, **dict(updates)}
-            if expected_generation is not None and "generation" not in updates:
-                merged["generation"] = expected_generation
-            writer = getattr(self.store, "lp_save_preparation", None)
-            reader = getattr(self.store, "lp_preparation", None)
-            existing = reader() if callable(reader) else None
-            store_expected = (
-                expected_generation if isinstance(existing, Mapping) else None
-            )
-            saved = (
-                writer(merged, expected_generation=store_expected)
-                if callable(writer)
-                else merged
-            )
-            if isinstance(saved, Mapping):
-                self._preparation = deepcopy(dict(saved))
-                return deepcopy(dict(saved))
-            latest = self.preparation_snapshot()
-            self._preparation = latest
-            return latest
+        def save():
+            with self._preparation_lock:
+                current = self.preparation_snapshot()
+                merged = {**current, **dict(updates)}
+                if expected_generation is not None and "generation" not in updates:
+                    merged["generation"] = expected_generation
+                writer = getattr(self.store, "lp_save_preparation", None)
+                reader = getattr(self.store, "lp_preparation", None)
+                existing = reader() if callable(reader) else None
+                store_expected = (
+                    expected_generation if isinstance(existing, Mapping) else None
+                )
+                saved = (
+                    writer(merged, expected_generation=store_expected, initialize_global_fence=True)
+                    if callable(writer)
+                    else merged
+                )
+                if isinstance(saved, Mapping):
+                    self._preparation = deepcopy(dict(saved))
+                    return deepcopy(dict(saved))
+                latest = self.preparation_snapshot()
+                self._preparation = latest
+                return latest
+        return self._lp_write_operation(save, priority='reliable')
 
     def _claim_fault_alert_if_due(
         self, state: Mapping[str, object]
@@ -2186,11 +2364,13 @@ class PolymarketLPService:
         if scope == "global":
             if not callable(item_recoverer):
                 raise RuntimeError("durable preparation recovery is unavailable")
-            with self._candidate_state_lock:
-                item_recoverer((), expected_generation=expected_generation)
-                self._prepared_inputs = None
-                self._prepared_inputs_version += 1
-                self._candidate_queue_state = None
+            def publish_recovery():
+                with self._candidate_state_lock:
+                    item_recoverer((), expected_generation=expected_generation)
+                    self._prepared_inputs = None
+                    self._prepared_inputs_version += 1
+                    self._candidate_queue_state = None
+            self._lp_write_operation(publish_recovery, priority='reliable')
             return {**self.preparation_snapshot(), "recovered_condition_ids": []}
         recovered_items = item_recoverer() if callable(item_recoverer) else ()
         recovered_condition_ids = [
@@ -2390,6 +2570,123 @@ class PolymarketLPService:
         if reason is not None:
             raise ValueError(reason)
 
+    def set_candidate_buy_price_level_reader(self, reader: Callable[[], int]) -> None:
+        """Use the effective persisted Auto quote level for strategy estimates."""
+        self._candidate_buy_price_level_reader = reader
+
+    def _candidate_buy_price_level(self) -> int | None:
+        reader = self._candidate_buy_price_level_reader
+        if reader is None:
+            return 1
+        try:
+            level = reader()
+        except Exception:
+            return None
+        return level if type(level) is int and level in (1, 2) else None
+
+    @staticmethod
+    def _candidate_strategy_projection(
+        row: Mapping[str, object], bid_level: int | None
+    ) -> dict[str, object]:
+        projected = deepcopy(dict(row))
+        # Before level-aware estimates, all saved candidate estimates used
+        # buy one. Preserve that provenance rather than relabeling on reload.
+        estimated_level = row.get("estimate_buy_price_level", 1)
+        if (bid_level is not None and type(estimated_level) is int
+                and estimated_level == bid_level):
+            return projected
+        _apply_row_estimate_fields(projected, None)
+        projected.update(state="unknown", verification="pending",
+                         selected_direction=None, directions={},
+                         estimate_reason_codes=["strategy_level_pending"])
+        for field in ("realtime_price", "realtime_capital", "realtime_checked_at",
+                      "estimated_exit_loss", "estimated_exit_loss_ratio"):
+            projected[field] = None
+        return projected
+
+    def capture_qualified_pool(self):
+        """Copy the complete producer inventory; no acquisition or eviction."""
+        from uuid import uuid4
+        from .polymarket_lp_current_inputs import QualifiedPoolCapture
+        from .polymarket_lp_market_reader import SourceResult, freeze
+        warning_facts = None
+        with self._candidate_state_lock:
+            now = self._now()
+            generation = self._qualified_pool_generation
+            prepared_fence = (self._preparation or {}).get("global_recovery_generation")
+            if generation is not None and type(prepared_fence) is int and prepared_fence > generation:
+                generation = prepared_fence
+            error = "producer_fence_unknown" if generation is None else None
+            rows = {}
+            invalid_count = 0
+            invalid_samples = []
+            for cid, row in self._candidate_pool.items():
+                facts = self._candidate_qualification_facts.get(cid)
+                reason = error
+                if reason is None and (row.get("global_recovery_generation") != generation
+                        or isinstance(facts, Mapping) and facts.get("global_recovery_generation") != generation):
+                    reason = "producer_fence_changed"
+                if reason is None and not isinstance(facts, Mapping):
+                    reason = "qualification_missing"
+                if reason is None and _candidate_pool_row_expired(row, now):
+                    reason = "qualification_expired"
+                checked = None
+                if isinstance(facts, Mapping):
+                    try:
+                        checked = _timestamp(facts.get("checked_at"), name="qualification_checked_at")
+                    except ValueError:
+                        reason = reason or "qualification_time_unknown"
+                source_id = f"qualified:{cid}:{row.get('updated_at')}"
+                packet = dict(row=row, facts=_capture_facts_projection(facts))
+                try:
+                    frozen_packet = _capture_freeze(packet)
+                except _QualifiedPoolCaptureValueError as exc:
+                    invalid_count += 1
+                    if len(invalid_samples) < 10:
+                        invalid_samples.append({
+                            "market_hash": _capture_market_hash(cid),
+                            "path": exc.path,
+                            "type": exc.value_type,
+                        })
+                    rows[cid] = SourceResult(
+                        source_id,
+                        None,
+                        complete=False,
+                        checked_at=checked,
+                        error=reason or "qualification_value_invalid",
+                        error_facts=freeze({"path": exc.path, "type": exc.value_type}),
+                    )
+                else:
+                    rows[cid] = SourceResult(
+                        source_id,
+                        frozen_packet,
+                        complete=reason is None,
+                        checked_at=checked,
+                        error=reason,
+                        error_facts=freeze({}),
+                    )
+            if invalid_count:
+                warning_now = monotonic()
+                last_warning = self._qualified_pool_capture_invalid_last_warn_at
+                if last_warning is None or warning_now - last_warning >= 60:
+                    self._qualified_pool_capture_invalid_last_warn_at = warning_now
+                    warning_facts = {
+                        "event": "lp_qualified_pool_capture_invalid",
+                        "skipped": invalid_count,
+                        "samples": invalid_samples,
+                        "omitted": max(0, invalid_count - len(invalid_samples)),
+                    }
+            capture = QualifiedPoolCapture(str(uuid4()), now, True, generation,
+                self._candidate_exclusion_revision, MappingProxyType(rows), error)
+        if warning_facts is not None:
+            try:
+                _lp_capture_read_log(lambda facts=warning_facts: logger.warning(
+                    "lp_qualified_pool_capture_invalid event=%s facts=%s",
+                    "lp_qualified_pool_capture_invalid", facts))
+            except Exception:
+                pass
+        return capture
+
     def candidate_snapshot(self) -> dict[str, object]:
         """Project the rolling candidate pool without external reads.
 
@@ -2402,6 +2699,7 @@ class PolymarketLPService:
         """
 
         self._evict_excluded_candidates()
+        bid_level = self._candidate_buy_price_level()
         with self._candidate_state_lock:
             pool = deepcopy(self._candidate_pool)
             snapshot = deepcopy(self._candidate_snapshot)
@@ -2409,7 +2707,11 @@ class PolymarketLPService:
             queue_funnel = deepcopy(self._candidate_queue_funnel)
             queue_condition_ids = self._candidate_queue_condition_ids
             rotation = deepcopy(self._candidate_rotation)
-            competition_state = deepcopy(self._competition_state)
+        with self._competition_lock:
+            competition_state = {
+                "state": self._competition_state.get("state"),
+                "not_updated": list(self._competition_state.get("not_updated") or ()),
+            }
         from .polymarket_lp_views import LP_TRIAL_CANDIDATE_LIMIT
 
         now = self._now()
@@ -2428,7 +2730,7 @@ class PolymarketLPService:
                     }
                 )
                 continue
-            valid_rows.append(row)
+            valid_rows.append(self._candidate_strategy_projection(row, bid_level))
         valid_rows.sort(key=_candidate_yield_sort_key)
         published = []
         for row in valid_rows[:LP_TRIAL_CANDIDATE_LIMIT]:
@@ -2521,6 +2823,7 @@ class PolymarketLPService:
             if isinstance(trial_reasons, list):
                 trial_reasons.extend(history_reasons)
         projection = {
+            "buy_price_level": bid_level,
             "state": snapshot_state,
             "complete": snapshot.get("complete") is True,
             "scanning": snapshot.get("scanning") is True,
@@ -2593,13 +2896,14 @@ class PolymarketLPService:
                 == global_recovery_generation
             }
             failures = self._candidate_maintenance_failures
+            global_failure = self._candidate_maintenance_global_failure
             last_finished_at = self._candidate_maintenance_last_finished_at
             pool = deepcopy(self._candidate_pool)
         now = self._now()
         floor = _CANDIDATE_SCHEDULER_WAIT_FLOOR_SECONDS
         ceiling = _CANDIDATE_SCHEDULER_WAIT_CEILING_SECONDS
 
-        if failures > 0 and last_finished_at is not None:
+        if global_failure and failures > 0 and last_finished_at is not None:
             backoff = _CANDIDATE_MAINTENANCE_BACKOFF_SECONDS[
                 min(failures - 1, 2)
             ]
@@ -2615,38 +2919,36 @@ class PolymarketLPService:
             for row in pool.values()
             if isinstance(row, Mapping) and not _candidate_pool_row_expired(row, now)
         ]
-        selected_rows = sorted(
-            valid_rows, key=_candidate_yield_sort_key
-        )[:_LP_CANDIDATE_BATCH_SIZE]
+        ordered = sorted(valid_rows, key=_candidate_yield_sort_key)
+        ready, waiting = [], []
+        for row in ordered:
+            target = ready if self._candidate_rotation_due(
+                str(row.get("condition_id") or ""), now=now) else waiting
+            if len(target) < _LP_CANDIDATE_BATCH_SIZE:
+                target.append(row)
+        selected_rows = ready + waiting
         if not selected_rows:
             return None
-        # Issue #138 round 2: maintenance refreshes the whole published
-        # table, so the wait is governed by the oldest source receipt
-        # across every published row's facts.
-        source_times: list[datetime] = []
+        waits: list[float] = []
         for row in selected_rows:
             condition_id = str(row.get("condition_id") or "").strip()
+            entry = self._candidate_rotation_entry(condition_id)
+            failures = entry.get("failures")
+            attempted = _candidate_row_updated_at({"updated_at": entry.get("last_attempt_at")})
+            if isinstance(failures, int) and failures > 0 and attempted is not None:
+                backoff = _CANDIDATE_MAINTENANCE_BACKOFF_SECONDS[min(failures - 1, 2)]
+                waits.append((attempted + timedelta(seconds=float(backoff)) - now).total_seconds())
+                continue
             cached = qualification_facts.get(condition_id)
             if not isinstance(cached, Mapping):
                 continue
-            for value in _candidate_head_source_values(cached):
-                try:
-                    checked_at = _timestamp(value, name="candidate_source_checked_at")
-                except ValueError:
-                    # An unparseable stamp is degenerate: retry on the floor.
-                    return floor
-                if checked_at > now:
-                    # A future stamp is degenerate: retry on the floor.
-                    return floor
-                source_times.append(checked_at)
-        if not source_times:
-            return None
-        wait_seconds = (
-            min(source_times)
-            + timedelta(seconds=float(LP_RECOMMENDATION_REFRESH_LEAD_SECONDS))
-            - now
-        ).total_seconds()
-        return min(max(wait_seconds, floor), ceiling)
+            times, expired = _candidate_head_source_times(cached, now)
+            if expired or not times:
+                waits.append(floor)
+            else:
+                waits.append((min(times) + timedelta(
+                    seconds=float(LP_RECOMMENDATION_REFRESH_LEAD_SECONDS)) - now).total_seconds())
+        return min(max(min(waits), floor), ceiling) if waits else None
 
     def _publish_sample_targets(
         self, targets: Sequence[tuple[str, str]]
@@ -2997,6 +3299,11 @@ class PolymarketLPService:
                         reason="retry_not_due",
                         display_state="unknown",
                     )
+            # Recovery decisions are complete; none of these rows is needed
+            # by catalog, metadata, or history preparation.
+            existing_preparation_items = ()
+            waiting_items = ()
+            item = None
             preparation = self._begin_preparation(now, generation=generation)
             global_fence = preparation.get("global_recovery_generation")
             if type(global_fence) is int and global_fence > generation:
@@ -3557,6 +3864,9 @@ class PolymarketLPService:
                         continue
                 active_targets.append(identity)
             targets = active_targets
+            # Retain identities and decisions, not the consumed retry snapshot.
+            preparation_items.clear()
+            item = None
             current_items = (
                 preparation_item_reader()
                 if callable(preparation_item_reader)
@@ -3748,6 +4058,8 @@ class PolymarketLPService:
                 )
                 return result
 
+            current_items = ()
+            item = None
             if not self._publish_prepared_inputs(
                 catalog, metadata_value, state="preparing",
                 exclusion_revision=preparation_exclusion_revision, generation=generation,
@@ -4210,40 +4522,10 @@ class PolymarketLPService:
                     break
                 if callable(preparation_retry_claimer):
                     retry_now = self._now()
-                    retryable_items = (
-                        preparation_item_reader()
-                        if callable(preparation_item_reader)
-                        else ()
-                    )
-                    claimable_conditions = tuple(
-                        dict.fromkeys(
-                            str(item.get("condition_id") or "")
-                            for item in retryable_items
-                            if isinstance(item, Mapping)
-                            and str(item.get("condition_id") or "").strip()
-                            and item.get("state") == "waiting_retry"
-                            and item.get("next_retry_at") is not None
-                            and (
-                                str(item.get("condition_id") or "")
-                                in target_identities_by_condition
-                                or (
-                                    item.get("stage") == "metadata"
-                                    and str(item.get("condition_id") or "")
-                                    in condition_ids
-                                )
-                            )
-                            and (
-                                _timestamp(
-                                    item.get("next_retry_at"),
-                                    name="next_retry_at",
-                                )
-                                <= retry_now
-                            )
-                        )
-                    )
                     due_retries = preparation_retry_claimer(
                         now=retry_now,
-                        condition_ids=claimable_conditions,
+                        condition_ids=target_identities_by_condition,
+                        metadata_condition_ids=condition_ids,
                     )
                     due_metadata_ids = tuple(
                         str(item.get("condition_id") or "")
@@ -4892,7 +5174,11 @@ class PolymarketLPService:
             (str(entry.get("order_id")), str(entry.get("amount")))
             for entry in reservations
         )
+        with self._competition_lock:
+            competition_version = self._competition_version
         with self._candidate_state_lock:
+            self._candidate_queue_build_sequence += 1
+            build_sequence = self._candidate_queue_build_sequence
             version = self._prepared_inputs_version
             history_version = self._candidate_history_version
             cached = self._candidate_queue_state
@@ -4900,6 +5186,7 @@ class PolymarketLPService:
             cached is not None
             and cached.get("version") == version
             and cached.get("history_version") == history_version
+            and cached.get("competition_version") == competition_version
             and cached.get("reservation_signature") == reservation_signature
             and self._candidate_global_generation(
                 cached.get("global_recovery_generation")
@@ -4920,6 +5207,12 @@ class PolymarketLPService:
         if not isinstance(raw_markets, (list, tuple, LPReadRows)):
             return None
         market_rows = raw_markets
+        competition_metadata = {}
+        competition = self._competition_entries(
+            tuple(dict.fromkeys(str(row.get("condition_id") or "") for row in market_rows)),
+            metadata=competition_metadata,
+        )
+        competition_version = competition_metadata["version"]
         if self.exclusions_enabled:
             allowed = set(self._candidate_conditions(tuple(str(r.get("condition_id") or "") for r in market_rows)))
             market_rows = LPReadRows(r for r in market_rows if str(r.get("condition_id") or "") in allowed)
@@ -4977,7 +5270,8 @@ class PolymarketLPService:
             if isinstance(saved_confirmations, Mapping)
             else {}
         )
-        direction_facts = LPReadScratch()
+        direction_facts = LPDirectionScratch(LPReadOverlay(metadata_by_condition))
+        direction_keys: dict[str, list[str]] = {}
         direction_index = 0
         complete = (
             isinstance(catalog, Mapping)
@@ -5003,14 +5297,25 @@ class PolymarketLPService:
             if isinstance(outcome, Mapping)
             and str(outcome.get("token_id") or "").strip()
         )
-        cached_summaries: Mapping[tuple[str, str], Mapping[str, object]] = {}
-        if callable(cache_batch_reader):
+        snapshot_reader = getattr(self.store, "lp_price_history_summary_batches", None)
+        cached_summaries = LPReadScratch()
+        if callable(snapshot_reader):
+            from contextlib import closing
+            try:
+                with closing(snapshot_reader(cache_identities, now=checked_at)) as batches:
+                    for summary_batch in batches:
+                        cached_summaries.update((json.dumps(key), value) for key, value in summary_batch.items())
+                        del summary_batch
+            except Exception:
+                cached_summaries.clear()
+        elif callable(cache_batch_reader):
             try:
                 batch_value = cache_batch_reader(cache_identities, now=checked_at)
             except Exception:
                 batch_value = {}
             if isinstance(batch_value, Mapping):
-                cached_summaries = batch_value
+                cached_summaries.update((json.dumps(key), value) for key, value in batch_value.items())
+                del batch_value
         reward_market_by_condition = LPReadScratch()
         for reward_market in market_rows:
             condition_id = str(reward_market.get("condition_id") or "").strip()
@@ -5023,7 +5328,7 @@ class PolymarketLPService:
                     global_recovery_generation=expected_global_generation,
                 ):
                     build_revision = self._candidate_exclusion_revision
-                reason = self._candidate_market_rejection(reward_market, market_meta, now=checked_at)
+                reason = self._candidate_market_rejection(reward_market, market_meta, now=checked_at, competition=competition)
                 if reason:
                     if self._exclude_candidate(condition_id, "", reason, checked_at=checked_at, market=market_meta,
                             exclusion_revision=build_revision,
@@ -5059,7 +5364,7 @@ class PolymarketLPService:
                     continue
                 summary: Mapping[str, object] | None = None
                 cache_key = (condition_id, token_id)
-                cached_summary = cached_summaries.get(cache_key)
+                cached_summary = cached_summaries.get(json.dumps(cache_key))
                 if isinstance(cached_summary, Mapping):
                     summary = cached_summary
                 elif not callable(cache_batch_reader) and callable(cache_reader):
@@ -5092,8 +5397,11 @@ class PolymarketLPService:
                     event_end_confirmation=confirmation,
                     history_summary=summary,
                     account=account,
+                    compact_market=True,
                 )
+                direction_keys.setdefault(condition_id, []).append(str(direction_index))
                 direction_index += 1
+        del cached_summaries
 
         from .polymarket_lp_views import lp_trial_candidates
 
@@ -5115,11 +5423,11 @@ class PolymarketLPService:
                     )
         trial = lp_trial_candidates(
             direction_facts.values(),
-            competition=self._competition_entries(),
+            competition=competition,
             account_budget_facts=available_facts,
             now=checked_at,
             competition_round_checked_at=(
-                self._competition_state.get("round_checked_at")
+                competition_metadata.get("round_checked_at")
             ),
         )
         queue_normal = [
@@ -5132,19 +5440,6 @@ class PolymarketLPService:
             for row in (trial.get("queue_backup") or ())
             if isinstance(row, Mapping)
         ]
-        queue_condition_ids = {str(row.get("condition_id") or "") for row in (*queue_normal, *queue_backup)}
-        directions_by_condition: dict[str, list[Mapping[str, object]]] = {}
-        for direction in direction_facts.values():
-            if not isinstance(direction, Mapping):
-                continue
-            market = direction.get("market")
-            if not isinstance(market, Mapping):
-                continue
-            direction_condition = str(market.get("condition_id") or "").strip()
-            if direction_condition in queue_condition_ids:
-                directions_by_condition.setdefault(
-                    direction_condition, []
-                ).append(direction)
         trial_funnel = dict(trial.get("funnel") or {})
         queue_funnel = {
             key: deepcopy(trial_funnel.get(key))
@@ -5181,21 +5476,22 @@ class PolymarketLPService:
         # Keep the published (JSON-like) funnel shape, as the whole-scan
         # snapshot did through its durable-store round trip.
         queue_funnel = _pool_published_value(queue_funnel)
+        for cid in tuple(reward_market_by_condition):
+            if cid not in queue_condition_ids:
+                del reward_market_by_condition[cid]
         state = {
             "version": version,
             "history_version": history_version,
+            "competition_version": competition_version,
+            "build_sequence": build_sequence,
             "reservation_signature": reservation_signature,
             "queue_normal": queue_normal,
             "queue_backup": queue_backup,
-            "directions_by_condition": {
-                cid: directions_by_condition[cid] for cid in queue_condition_ids
-            },
-            "metadata_by_condition": {
-                cid: metadata_by_condition[cid] for cid in queue_condition_ids
-            },
-            "reward_market_by_condition": {
-                cid: reward_market_by_condition[cid] for cid in queue_condition_ids
-            },
+            "directions_by_condition": LPDirectionIndex(
+                direction_facts, {cid: direction_keys[cid] for cid in queue_condition_ids}
+            ),
+            "metadata_by_condition": LPReadOverlay(metadata_by_condition, queue_condition_ids),
+            "reward_market_by_condition": reward_market_by_condition,
             "catalog_checked_at": catalog.get("checked_at"),
             "catalog_is_known": (
                 isinstance(catalog, Mapping)
@@ -5224,18 +5520,14 @@ class PolymarketLPService:
             if self.exclusions_enabled and build_revision != self._candidate_exclusion_revision:
                 return None
             current = self._candidate_queue_state
-            if (
-                current is None
-                or current.get("version") != version
-                or current.get("history_version") != history_version
-                or current.get("reservation_signature")
-                != reservation_signature
+            if current is not None and (
+                current.get("competition_version", 0) > competition_version
+                or current.get("build_sequence", 0) > build_sequence
             ):
-                self._candidate_queue_state = state
-                self._candidate_queue_funnel = dict(queue_funnel)
-                self._candidate_queue_condition_ids = tuple(
-                    queue_condition_ids
-                )
+                return current
+            self._candidate_queue_state = state
+            self._candidate_queue_funnel = dict(queue_funnel)
+            self._candidate_queue_condition_ids = tuple(queue_condition_ids)
             self._evict_excluded_candidates()
             return self._candidate_queue_state or state
 
@@ -5343,15 +5635,15 @@ class PolymarketLPService:
             return None
 
         directions_by_condition = cast(
-            dict[str, list[Mapping[str, object]]],
+            MutableMapping[str, list[Mapping[str, object]]],
             queue_state["directions_by_condition"],
         )
         metadata_by_condition = cast(
-            dict[str, Mapping[str, object]],
+            MutableMapping[str, Mapping[str, object]],
             queue_state["metadata_by_condition"],
         )
         reward_market_by_condition = cast(
-            dict[str, Mapping[str, object]],
+            MutableMapping[str, Mapping[str, object]],
             queue_state["reward_market_by_condition"],
         )
         evaluation_account = queue_state.get("evaluation_account")
@@ -5405,7 +5697,9 @@ class PolymarketLPService:
                         ):
                             continue
                         fresh_metadata[condition_id] = row
-                    metadata_by_condition.update(fresh_metadata)
+                    with self._candidate_state_lock:
+                        metadata_by_condition.update({cid: row for cid, row in fresh_metadata.items()
+                            if cid in metadata_by_condition and self._candidate_conditions((cid,))})
 
             else:
                 stale_reward_ids = _lp_reward_stale_conditions(
@@ -5463,7 +5757,9 @@ class PolymarketLPService:
                         fresh_reward_stamps[condition_id] = reward_stamp
 
             if self.exclusions_enabled:
-                reward_market_by_condition.update(fresh_rewards)
+                with self._candidate_state_lock:
+                    reward_market_by_condition.update({cid: row for cid, row in fresh_rewards.items()
+                        if cid in reward_market_by_condition and self._candidate_conditions((cid,))})
                 renewal_revision = self._screen_candidate_batch(
                     queue_state,
                     condition_ids,
@@ -5552,7 +5848,9 @@ class PolymarketLPService:
                     )
                 )
             if rebuilt:
-                directions_by_condition[condition_id] = rebuilt
+                with self._candidate_state_lock:
+                    if condition_id in directions_by_condition and self._candidate_conditions((condition_id,)):
+                        directions_by_condition[condition_id] = rebuilt
         return evaluation_account
 
     def _screen_candidate_histories(
@@ -5939,6 +6237,7 @@ class PolymarketLPService:
         global_recovery_generation: int | None = None
         try:
             attempted_at = self._now()
+            bid_level = self._candidate_buy_price_level()
             global_recovery_generation = self._current_candidate_global_generation()
             if global_recovery_generation is None:
                 return self._finish_candidate_scan(
@@ -6001,7 +6300,7 @@ class PolymarketLPService:
             books_reader = getattr(self.exchange, "lp_order_books", None)
             batch_tokens: list[str] = []
             directions_by_condition = cast(
-                dict[str, list[Mapping[str, object]]],
+                MutableMapping[str, list[Mapping[str, object]]],
                 queue_state["directions_by_condition"],
             )
             for _candidate, condition_id in batch:
@@ -6159,6 +6458,7 @@ class PolymarketLPService:
                             now=evaluation_now,
                             reservations=reservations,
                             candidate=True,
+                            bid_level=bid_level,
                         )
                     qualified_directions.append(qualified_direction)
                     result = {
@@ -6262,6 +6562,7 @@ class PolymarketLPService:
                     )
                     continue
                 row = dict(candidate)
+                row["estimate_buy_price_level"] = bid_level
                 row["directions"] = direction_results
                 row["selected_direction"] = selected_direction
                 row["state"] = row_state
@@ -6393,16 +6694,19 @@ class PolymarketLPService:
             self._candidate_scan_lock.release()
 
     def refresh_candidate_recommendations(
-        self, *, stop_event: threading.Event | None = None
+        self, *, stop_event: threading.Event | None = None,
+        condition_ids: Sequence[str] | None = None,
+        refresh_priorities: Mapping[str, Decimal | None] | None = None,
     ) -> dict[str, object]:
         """Refresh the displayed pool rows on one batch book read (issue #157).
 
         The maintenance thread keeps the issue-#146 trigger — the oldest
         source age across the displayed rows with a 30-second lead, plus
-        the 60/120/300s failure backoff — and the whole-table batch read
+        an independent 60/120/300s retry per failed market — and the batch read
         framework (one batched book read plus one account, metadata, and
         targeted reward read per due source class).  Publication rewrites
-        pool rows one by one: a refreshed row re-enters with its new
+        pool rows one by one. Account uncertainty or a failed entire book
+        read retains the account/source-wide backoff. A refreshed row re-enters with its new
         judgment time, a failed row keeps its values marked
         ``refresh_failed`` until its original expiry, and a deterministic
         rejection leaves the pool at once.
@@ -6415,12 +6719,14 @@ class PolymarketLPService:
             return snapshot
         try:
             now = self._now()
+            bid_level = self._candidate_buy_price_level()
             global_recovery_generation = self._current_candidate_global_generation()
             if global_recovery_generation is None:
                 return self.candidate_snapshot()
             exclusion_revision = self._candidate_exclusion_revision
             with self._candidate_state_lock:
                 failures = self._candidate_maintenance_failures
+                global_failure = self._candidate_maintenance_global_failure
                 last_finished_at = self._candidate_maintenance_last_finished_at
                 cached_facts = {
                     condition_id: deepcopy(facts)
@@ -6440,16 +6746,30 @@ class PolymarketLPService:
                     )
                     == global_recovery_generation
                 }
-            # Issue #157: maintenance renews the currently displayed top ten
-            # valid pool rows (whole-table framework, pool publication).
+            # Background maintenance retains its displayed-head selection.
+            # Automatic requalification targets the stale rows that triggered
+            # it, so a fresh stored-yield prefix cannot hide a level-specific
+            # winner. Both paths share the same ten-market bound and retries.
+            requested = set(condition_ids) if condition_ids is not None else None
             valid_rows = [
-                row
-                for row in pool.values()
+                self._candidate_strategy_projection(row, bid_level)
+                for cid, row in pool.items()
                 if isinstance(row, Mapping)
+                and (requested is None or cid in requested)
                 and not _candidate_pool_row_expired(row, now)
             ]
-            valid_rows.sort(key=_candidate_yield_sort_key)
-            selected_rows = valid_rows[:_LP_CANDIDATE_BATCH_SIZE]
+            if refresh_priorities is None:
+                valid_rows.sort(key=_candidate_yield_sort_key)
+            else:
+                def refresh_key(row):
+                    hint = _maybe_decimal(refresh_priorities.get(str(row.get("condition_id") or "")))
+                    return (hint is None, -(hint if hint is not None else Decimal(0)),
+                            *_candidate_yield_sort_key(row))
+                valid_rows.sort(key=refresh_key)
+            selected_rows = [
+                row for row in valid_rows
+                if self._candidate_rotation_due(str(row.get("condition_id") or ""), now=now)
+            ][:_LP_CANDIDATE_BATCH_SIZE]
             if not selected_rows:
                 return self.candidate_snapshot()
 
@@ -6542,7 +6862,11 @@ class PolymarketLPService:
             lead_due = bool(source_times) and min(source_times) + timedelta(
                 seconds=float(LP_RECOMMENDATION_REFRESH_LEAD_SECONDS)
             ) <= now
-            if failures > 0 and last_finished_at is not None:
+            level_changed = any(
+                row.get("estimate_buy_price_level", 1) != bid_level
+                for row in selected_rows
+            )
+            if global_failure and failures > 0 and last_finished_at is not None:
                 # Issue #146: a failed maintenance attempt suppresses further
                 # reads until its backoff window (60/120/300s, counted from
                 # the attempt's finish) has elapsed.
@@ -6554,13 +6878,24 @@ class PolymarketLPService:
                     < backoff
                 ):
                     return self.candidate_snapshot()
-            if not lead_due and not source_expired:
+            if not lead_due and not source_expired and not level_changed:
                 return self.candidate_snapshot()
             if stop_event is not None and stop_event.is_set():
                 return self.candidate_snapshot()
 
             # Issue #146: expose how long each source read took so the
             # operator can see which source drove a refresh.
+            batch_id = uuid.uuid4().hex
+            def market_key(condition_id: str) -> str:
+                return hashlib.sha256(condition_id.encode()).hexdigest()[:16]
+
+            _lp_candidate_maintenance_log("begin", {
+                "batch_id": batch_id, "started_at": now.isoformat(),
+                "markets": [market_key(str(row.get("condition_id") or "")) for row, _ in row_facts],
+            })
+            source_causes: dict[str, str] = {}
+            reward_causes: dict[str, str] = {}
+            metadata_causes: dict[str, str] = {}
             read_seconds: dict[str, float] = {
                 "account": 0.0,
                 "metadata": 0.0,
@@ -6582,7 +6917,8 @@ class PolymarketLPService:
                     refreshed_account = (
                         account_reader() if callable(account_reader) else None
                     )
-                except Exception:
+                except Exception as exc:
+                    source_causes["account"] = self._safe_error_type(type(exc).__name__)
                     refreshed_account = None
                 read_seconds["account"] = float(
                     (self._now() - read_started_at).total_seconds()
@@ -6616,7 +6952,7 @@ class PolymarketLPService:
                 )
             )
             def read_rewards():
-                reward_error: str | None = None
+                reward_errors: dict[str, str] = {}
                 refreshed_rewards: dict[str, Mapping[str, object]] = {}
                 raw_reward: Mapping[str, object] | None = None
                 if reward_due:
@@ -6638,15 +6974,22 @@ class PolymarketLPService:
                                 if callable(reward_reader)
                                 else None
                             )
-                        except Exception:
+                        except Exception as exc:
+                            source_causes["reward"] = self._safe_error_type(type(exc).__name__)
                             raw_reward = None
-                    except Exception:
+                    except Exception as exc:
+                        source_causes["reward"] = self._safe_error_type(type(exc).__name__)
                         raw_reward = None
                     reward_rows = (
                         raw_reward.get("markets")
                         if isinstance(raw_reward, Mapping)
                         else None
                     )
+                    diagnostic_rewards = reward_rows.values() if isinstance(reward_rows, Mapping) else reward_rows
+                    if isinstance(diagnostic_rewards, (list, tuple)) or isinstance(reward_rows, Mapping):
+                        for reward_row in diagnostic_rewards:
+                            if isinstance(reward_row, Mapping) and reward_row.get("error_type"):
+                                reward_causes[str(reward_row.get("condition_id") or "")] = self._safe_error_type(reward_row["error_type"])
                     if isinstance(reward_rows, Mapping):
                         for condition_id in refresh_conditions:
                             candidate_reward = reward_rows.get(condition_id)
@@ -6675,16 +7018,15 @@ class PolymarketLPService:
                         if refreshed_reward_row is None or _candidate_source_expired(
                             reward_checked_at, self._now()
                         ):
-                            reward_error = "reward_unknown"
-                            break
+                            reward_errors[condition_id] = "reward_unknown"
                     read_seconds["reward"] = float(
                         (self._now() - read_started_at).total_seconds()
                     )
 
-                return reward_error, refreshed_rewards, raw_reward
+                return reward_errors, refreshed_rewards, raw_reward
 
             if self.exclusions_enabled:
-                reward_error, refreshed_rewards, raw_reward = read_rewards()
+                reward_errors, refreshed_rewards, raw_reward = read_rewards()
                 for row, cached in refreshable:
                     cid = str(row.get("condition_id") or "")
                     directions = live_directions(cached)
@@ -6699,7 +7041,7 @@ class PolymarketLPService:
                             exclusion_revision = self._candidate_exclusion_revision
                 refresh_conditions = self._candidate_conditions(refresh_conditions)
 
-            metadata_error: str | None = None
+            metadata_errors: dict[str, str] = {}
             refreshed_metadata: dict[str, Mapping[str, object]] = {}
             if metadata_due and refresh_conditions:
                 metadata_reader = getattr(
@@ -6711,10 +7053,12 @@ class PolymarketLPService:
                     )
                 read_started_at = self._now()
                 try:
+                    options = {"stop_event": stop_event}
+                    if getattr(metadata_reader, "__func__", None) is PolymarketTradingClient.lp_market_metadata_fresh:
+                        options["include_diagnostics"] = True
                     raw_metadata = (
-                        metadata_reader(refresh_conditions, stop_event=stop_event)
-                        if callable(metadata_reader)
-                        else None
+                        metadata_reader(refresh_conditions, **options)
+                        if callable(metadata_reader) else None
                     )
                 except TypeError:
                     try:
@@ -6723,10 +7067,19 @@ class PolymarketLPService:
                             if callable(metadata_reader)
                             else None
                         )
-                    except Exception:
+                    except Exception as exc:
+                        source_causes["metadata"] = self._safe_error_type(type(exc).__name__)
                         raw_metadata = None
-                except Exception:
+                except Exception as exc:
+                    source_causes["metadata"] = self._safe_error_type(type(exc).__name__)
                     raw_metadata = None
+                if isinstance(raw_metadata, Mapping):
+                    failure_facts = raw_metadata.get("failure_facts")
+                    if isinstance(failure_facts, Mapping):
+                        for condition_id in refresh_conditions:
+                            failure = failure_facts.get(condition_id)
+                            if isinstance(failure, Mapping) and failure.get("error_type"):
+                                metadata_causes[condition_id] = self._safe_error_type(failure["error_type"])
                 metadata_rows = (
                     raw_metadata.get("markets")
                     if isinstance(raw_metadata, Mapping)
@@ -6739,26 +7092,22 @@ class PolymarketLPService:
                         if isinstance(candidate_market, Mapping):
                             refreshed_metadata[condition_id] = candidate_market
                 metadata_checked_now = self._now()
-                if not refreshed_metadata:
-                    metadata_error = "market_metadata_unknown"
-                else:
-                    for market_row in refreshed_metadata.values():
-                        if _candidate_source_expired(
-                            market_row.get("metadata_checked_at"),
-                            metadata_checked_now,
-                        ):
-                            metadata_error = "market_metadata_unknown"
-                        elif _candidate_source_expired(
-                            market_row.get("fees_checked_at"),
-                            metadata_checked_now,
-                        ):
-                            metadata_error = "market_fees_unknown"
+                for condition_id in refresh_conditions:
+                    market_row = refreshed_metadata.get(condition_id)
+                    if not isinstance(market_row, Mapping) or _candidate_source_expired(
+                        market_row.get("metadata_checked_at"), metadata_checked_now
+                    ):
+                        metadata_errors[condition_id] = "market_metadata_unknown"
+                    elif _candidate_source_expired(
+                        market_row.get("fees_checked_at"), metadata_checked_now
+                    ):
+                        metadata_errors[condition_id] = "market_fees_unknown"
                 read_seconds["metadata"] = float(
                     (self._now() - read_started_at).total_seconds()
                 )
 
             if not self.exclusions_enabled:
-                reward_error, refreshed_rewards, raw_reward = read_rewards()
+                reward_errors, refreshed_rewards, raw_reward = read_rewards()
 
             if self.exclusions_enabled:
                 for row, cached in refreshable:
@@ -6811,9 +7160,11 @@ class PolymarketLPService:
                             if callable(books_reader)
                             else None
                         )
-                    except Exception:
+                    except Exception as exc:
+                        source_causes["books"] = self._safe_error_type(type(exc).__name__)
                         raw_books = None
-                except Exception:
+                except Exception as exc:
+                    source_causes["books"] = self._safe_error_type(type(exc).__name__)
                     raw_books = None
                 read_seconds["books"] = float(
                     (self._now() - read_started_at).total_seconds()
@@ -6824,15 +7175,9 @@ class PolymarketLPService:
                     books_failed = True
 
             reservations = self._candidate_reservations()
-            # One whole-round gate, per the issue-138 round-2 decision: an
-            # account, metadata, reward, or entire-book failure keeps every
-            # published value this cycle instead of half-refreshed tables.
-            round_failed = (
-                account_error is not None
-                or metadata_error is not None
-                or reward_error is not None
-                or books_failed
-            )
+            # Account uncertainty remains account-wide. Market source gaps
+            # retain only that market's old facts and its own retry deadline.
+            round_failed = account_error is not None or books_failed
 
             def evaluate_row(
                 row: Mapping[str, object],
@@ -6847,6 +7192,8 @@ class PolymarketLPService:
                 """
 
                 condition_id = str(row.get("condition_id") or "").strip()
+                if condition_id in metadata_errors or condition_id in reward_errors:
+                    return None, None
                 directions = live_directions(cached)
                 updated_directions: list[Mapping[str, object]] = []
                 direction_results: dict[str, dict[str, object]] = {}
@@ -6867,7 +7214,7 @@ class PolymarketLPService:
                     if (
                         metadata_due
                         and isinstance(refreshed_market, Mapping)
-                        and metadata_error is None
+                        and condition_id not in metadata_errors
                     ):
                         market = {
                             **dict(refreshed_market),
@@ -6887,12 +7234,12 @@ class PolymarketLPService:
                         (
                             metadata_due
                             and isinstance(refreshed_market, Mapping)
-                            and metadata_error is None
+                            and condition_id not in metadata_errors
                         )
                         or (
                             reward_due
                             and condition_id in refreshed_rewards
-                            and reward_error is None
+                            and condition_id not in reward_errors
                         )
                     ):
                         reward_source: dict[str, object] = {}
@@ -6945,7 +7292,7 @@ class PolymarketLPService:
                     if (
                         reward_due
                         and isinstance(refreshed_reward_row, Mapping)
-                        and reward_error is None
+                        and condition_id not in reward_errors
                     ):
                         maintenance_direction["reward_active"] = (
                             refreshed_reward_row.get("reward_active")
@@ -7016,6 +7363,7 @@ class PolymarketLPService:
                                 now=evaluation_now,
                                 reservations=reservations,
                                 candidate=True,
+                                bid_level=bid_level,
                             )
                     updated_directions.append(maintenance_direction)
                     result: dict[str, object] = {
@@ -7081,6 +7429,8 @@ class PolymarketLPService:
                     else None
                 )
                 new_row = dict(row)
+                new_row["estimate_buy_price_level"] = bid_level
+                new_row.pop("estimate_reason_codes", None)
                 new_row["directions"] = direction_results
                 new_row["selected_direction"] = selected_direction
                 new_row["state"] = (
@@ -7138,17 +7488,57 @@ class PolymarketLPService:
                 return new_row, facts
 
             evaluation_now = self._now()
+            def age(value: object) -> float | None:
+                try:
+                    return (evaluation_now - _timestamp(value, name="source_at")).total_seconds()
+                except ValueError:
+                    return None
+
+            try:
+                for source, due in (("account", account_due), ("metadata", metadata_due),
+                                    ("fees", metadata_due), ("reward", reward_due), ("books", book_due)):
+                    markets = []
+                    for row, cached in row_facts:
+                        cid = str(row.get("condition_id") or "")
+                        directions = live_directions(cached) if cached else []
+                        values = []
+                        failed = cached is None
+                        cause = "unknown"
+                        if source == "account":
+                            values = [account.get("checked_at") if not account_error else row_account(cached or {}).get("checked_at")]
+                            failed = failed or account_error is not None
+                            cause = source_causes.get("account", "unknown")
+                        elif source in {"metadata", "fees"}:
+                            stamp = "metadata_checked_at" if source == "metadata" else "fees_checked_at"
+                            failed = failed or cid in metadata_errors or (due and cid not in refreshed_metadata)
+                            values = [refreshed_metadata[cid].get(stamp)] if due and not failed else [d["market"].get(stamp) for d in directions]
+                            cause = metadata_causes.get(cid, source_causes.get("metadata", "unknown"))
+                        elif source == "reward":
+                            failed = failed or cid in reward_errors
+                            reward = refreshed_rewards.get(cid, {})
+                            values = [reward.get("reward_checked_at") or (raw_reward or {}).get("checked_at")] if due and not failed else [d.get("reward_checked_at") for d in directions]
+                            cause = reward_causes.get(cid, source_causes.get("reward", "unknown"))
+                        else:
+                            values = [(books.get(str(d["market"].get("token_id") or "")) if due else d.get("book")) for d in directions]
+                            failed = failed or books_failed or not values or any(not isinstance(v, Mapping) for v in values)
+                            values = [v.get("received_at") if isinstance(v, Mapping) else None for v in values]
+                            cause = source_causes.get("books", "unknown")
+                        ages = [age(value) for value in values]
+                        markets.append({"market": market_key(cid),
+                            "outcome": "failed" if failed else "refreshed" if due else "reused",
+                            "cause": cause if failed else None,
+                            "age_seconds": max(ages) if ages and all(v is not None for v in ages) else None})
+                    _lp_candidate_maintenance_log("source", {"batch_id": batch_id,
+                        "source": source, "used_at": evaluation_now.isoformat(), "markets": markets,
+                        "read_seconds": read_seconds["metadata" if source == "fees" else source]})
+            except Exception:
+                pass  # Diagnostics never change qualification or publication.
+            row_outcomes: dict[str, str] = {}
             # Issue #157: publication rewrites pool rows one by one.  A
             # refreshed row re-enters with its new judgment time, a failed
             # row keeps its values marked refresh_failed until its original
             # expiry, and a deterministically rejected row leaves the pool
             # immediately.
-            round_failure_reason = (
-                account_error
-                or metadata_error
-                or reward_error
-                or ("book_unknown" if books_failed else None)
-            )
             refreshed_any = False
             for row, cached in row_facts:
                 condition_id = str(row.get("condition_id") or "").strip()
@@ -7161,6 +7551,7 @@ class PolymarketLPService:
                     # whose re-read could not produce a verdict: keep the
                     # stored values until their original expiry and mark
                     # the row refresh_failed.
+                    row_outcomes[condition_id] = "failed"
                     self._candidate_pool_record_failure(
                         condition_id,
                         attempted_at=evaluation_now,
@@ -7168,6 +7559,7 @@ class PolymarketLPService:
                     )
                     continue
                 if new_row.get("state") == "rejected":
+                    row_outcomes[condition_id] = "rejected"
                     self._candidate_pool_record_rejection(
                         condition_id,
                         judged_at=evaluation_now,
@@ -7179,7 +7571,7 @@ class PolymarketLPService:
                 # the line.  The row was refreshed either way, so a
                 # guard-rejected success is not a round failure and must not
                 # advance the 60/120/300s maintenance backoff.
-                self._candidate_pool_record_success(
+                published = self._candidate_pool_record_success(
                     condition_id,
                     new_row,
                     judged_at=evaluation_now,
@@ -7187,6 +7579,7 @@ class PolymarketLPService:
                     exclusion_revision=exclusion_revision,
                     global_recovery_generation=global_recovery_generation,
                 )
+                row_outcomes[condition_id] = "refreshed" if published else "publication_guarded"
                 refreshed_any = True
             # Issue #146: the maintenance attempt's backoff bookkeeping is
             # applied together with its publication.
@@ -7197,11 +7590,27 @@ class PolymarketLPService:
                 self._candidate_maintenance_last_finished_at = (
                     maintenance_finished_at
                 )
+                self._candidate_maintenance_global_failure = round_failed
                 if refreshed_any:
                     self._candidate_maintenance_failures = 0
                 else:
                     self._candidate_maintenance_failures += 1
                 failures_now = self._candidate_maintenance_failures
+            try:
+                diagnostic_markets = []
+                for cid, outcome in row_outcomes.items():
+                    entry = self._candidate_rotation_entry(cid)
+                    count = entry.get("failures")
+                    attempted = _candidate_row_updated_at({"updated_at": entry.get("last_attempt_at")})
+                    backoff = float(_CANDIDATE_MAINTENANCE_BACKOFF_SECONDS[min(count - 1, 2)]) if type(count) is int and count > 0 and attempted else 0
+                    diagnostic_markets.append({"market": market_key(cid), "outcome": outcome,
+                        "backoff_seconds": backoff,
+                        "next_attempt_at": (attempted + timedelta(seconds=backoff)).isoformat() if backoff else None})
+                _lp_candidate_maintenance_log("end", {"batch_id": batch_id,
+                    "finished_at": maintenance_finished_at.isoformat(), "markets": diagnostic_markets,
+                    "global_backoff": round_failed, "consecutive_failures": failures_now})
+            except Exception:
+                pass  # Business retry state is independent of log construction.
             notes: dict[str, object] = {
                 "maintenance_consecutive_failures": failures_now,
             }
@@ -7232,122 +7641,228 @@ class PolymarketLPService:
             self._candidate_maintenance_lock.release()
 
     def refresh_competition_cache(
-        self, stop_event: threading.Event | None = None
-    ) -> dict[str, object]:
+        self, stop_event: threading.Event | None = None, *, snapshot: bool = True
+    ) -> dict[str, object] | None:
         """Refresh the in-memory competition cache (issue #157).
 
         Public entry point for the dedicated competition thread: candidate
         batch paths only read the cache and never block on this read.  The
         optional ``stop_event`` flows into the underlying read so a stopping
         runtime cancels an in-flight page pull cooperatively.
+        The monitor passes ``snapshot=False`` because it discards the result.
         """
 
-        return self._refresh_competition(stop_event)
+        return self._refresh_competition(stop_event, snapshot=snapshot)
 
     def _refresh_competition(
-        self, stop_event: threading.Event | None
-    ) -> dict[str, object]:
-        """Pull official competitiveness into the in-process cache.
-
-        #181: every full round is also persisted to the store (explicit
-        zeros included) so later rounds can fall back to the last known
-        value for markets the current round did not pull.  A failed read
-        keeps the previous values (the reader already merges them) and a
-        failed persistence only logs — neither blocks the candidate funnel.
-        """
-
+        self, stop_event: threading.Event | None, *, snapshot: bool = True
+    ) -> dict[str, object] | None:
+        """Publish only committed batches; a failed page is re-read next time."""
         reader = getattr(self.exchange, "lp_market_competitiveness", None)
-        if callable(reader):
-            with self._competition_lock:
-                previous = dict(self._competition_state)
-            try:
-                result = reader(
-                    stop_event=stop_event,
-                    previous=previous.get("competitiveness", {}),
-                    # Issue #177: resume the walk where the last round
-                    # stopped instead of restarting from page one.
-                    start_cursor=previous.get("next_start_cursor"),
-                )
-            except Exception:
-                result = None
-            if isinstance(result, Mapping):
-                if self.exclusions_enabled:
-                    observed_at = result.get("checked_at")
-                    if isinstance(observed_at, datetime):
-                        for cid in result.get("ended_condition_ids", ()):
-                            self._observe_ended_candidate_market(str(cid), {"closed": True}, checked_at=observed_at)
-                stored = {
-                    "state": result.get("state", "unknown"),
-                    "complete": result.get("complete") is True,
-                    "round_checked_at": result.get("round_checked_at"),
-                    "competitiveness": dict(
-                        result.get("competitiveness") or {}
-                    ),
-                    "not_updated": list(result.get("not_updated") or []),
-                    "next_start_cursor": result.get("resume_cursor"),
-                }
+        with self._competition_refresh_lock:
+            if callable(reader):
+                owned = getattr(reader, "__func__", None) is PolymarketTradingClient.lp_market_competitiveness
                 with self._competition_lock:
-                    self._competition_state = stored
-                self._persist_competition(stored)
+                    cursor = self._competition_state.get("next_start_cursor")
+                    previous = None if owned else deepcopy(self._competition_state.get("competitiveness") or {})
+                    untouched = set(self._competition_state.get("competitiveness") or {}) if owned else None
+                progress_reader = getattr(self.store, "lp_competitiveness_progress", None)
+                if callable(progress_reader):
+                    try:
+                        progress = progress_reader()
+                        if progress:
+                            cursor = progress.get("next_start_cursor")
+                    except Exception:
+                        logger.warning("lp competition progress unavailable")
+                        return self._competition_snapshot() if snapshot else None
+                try:
+                    options = {"stop_event": stop_event, "previous": previous, "start_cursor": cursor}
+                    if owned:
+                        def publish_batch(batch, **kwargs):
+                            self._publish_competition_batch(batch, **kwargs)
+                            untouched.difference_update(batch)
+                        options.update(publish_batch=publish_batch, batch_size=_LP_COMPETITION_BATCH_SIZE)
+                    result = reader(**options)
+                    persisted = True
+                    if not owned and isinstance(result, Mapping):
+                        persisted = self._persist_competition(result, stop_event=stop_event, page_cursor=cursor)
+                except Exception:
+                    result, persisted = None, False
+                    logger.warning("lp competition refresh failed", exc_info=True)
+                if isinstance(result, Mapping):
+                    if self.exclusions_enabled:
+                        observed_at = result.get("checked_at")
+                        if isinstance(observed_at, datetime):
+                            for cid in result.get("ended_condition_ids", ()):
+                                self._observe_ended_candidate_market(str(cid), {"closed": True}, checked_at=observed_at)
+                    with self._competition_lock:
+                        self._competition_state.update(
+                            state=result.get("state", "unknown") if persisted else "partial",
+                            complete=result.get("complete") is True and persisted,
+                            round_checked_at=result.get("round_checked_at"),
+                        )
+                        if owned:
+                            not_updated = sorted(untouched)
+                            self._competition_state["not_updated"] = not_updated
+                            if result.get("complete") is True and cursor is None and not_updated:
+                                # Completed non-resumed walks keep absent facts in SQLite, not the live cache.
+                                for cid in not_updated:
+                                    self._competition_state["competitiveness"].pop(cid, None)
+                                self._competition_version += 1
+                        elif persisted:
+                            self._competition_state["not_updated"] = list(result.get("not_updated") or ())
+                            if result.get("complete") is True and cursor is None:
+                                raw = result.get("competitiveness") or {}
+                                absent = [cid for cid in self._competition_state.get("competitiveness", {}) if cid not in raw]
+                                for cid in absent:
+                                    self._competition_state["competitiveness"].pop(cid, None)
+                                if absent:
+                                    self._competition_version += 1
+        return self._competition_snapshot() if snapshot else None
+
+    def _competition_snapshot(self):
         with self._competition_lock:
             return deepcopy(self._competition_state)
 
-    def _persist_competition(self, stored: Mapping[str, object]) -> None:
-        """Write one full round's competitiveness to the store (#181)."""
-
+    def _publish_competition_batch(
+        self, batch, *, page_cursor, resume_cursor, checked_at, stop_event
+    ):
+        """Keep BEGIN/body outside the read lock; fence COMMIT and publication."""
         upsert = getattr(self.store, "lp_competitiveness_upsert", None)
         if not callable(upsert):
-            return
+            raise RuntimeError("competition_store_unavailable")
+        progress = {"next_start_cursor": resume_cursor}
+
+        @contextmanager
+        def commit_guard():
+            with self._competition_lock:
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("competition_cancelled")
+                yield
+
+        def publish():
+            # Called after COMMIT while the short commit guard is still held.
+            values = self._competition_state.setdefault("competitiveness", {})
+            values.update(batch)
+            self._competition_state.update(round_checked_at=checked_at, next_start_cursor=resume_cursor)
+            if batch:
+                self._competition_version += 1
+
+        entries = ((cid, value, stamp) for cid, (value, stamp) in batch.items())
+        parameters = inspect.signature(upsert).parameters
+        if "commit_guard" in parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+            upsert(entries, progress=progress, stop_event=stop_event, commit_guard=commit_guard(), after_commit=publish)
+        else:
+            # Compatibility stores do not expose SQLite/cache publication hooks.
+            upsert(entries)
+            with commit_guard():
+                publish()
+        pause = _LP_COMPETITION_BATCH_PAUSE_SECONDS
+        if stop_event is not None:
+            stop_event.wait(pause)
+        elif pause:
+            threading.Event().wait(pause)
+
+    def _persist_competition(self, stored: Mapping[str, object], *, stop_event=None, page_cursor=None) -> bool:
+        """Bound legacy result maps too; never publish a failed batch."""
         raw_map = stored.get("competitiveness")
         if not isinstance(raw_map, Mapping):
-            return
-        entries: list[tuple[str, Decimal, datetime]] = []
-        for condition_id, value in raw_map.items():
-            if not isinstance(condition_id, str) or not condition_id.strip():
-                continue
-            if isinstance(value, tuple) and len(value) == 2:
-                entry_value, checked_at = value
-            elif isinstance(value, Mapping):
-                entry_value = value.get("value")
-                checked_at = value.get("checked_at")
-            else:
-                continue
-            if not isinstance(entry_value, Decimal):
-                continue
-            if not isinstance(checked_at, datetime) or checked_at.tzinfo is None:
-                continue
-            entries.append((condition_id, entry_value, checked_at))
-        if not entries:
-            return
+            return False
+        batch = {}
+        items = iter(raw_map.items())
         try:
-            upsert(entries)
+            while True:
+                final = False
+                for _ in range(_LP_COMPETITION_BATCH_SIZE):
+                    try:
+                        condition_id, value = next(items)
+                    except StopIteration:
+                        final = True
+                        break
+                    if not isinstance(condition_id, str) or not condition_id.strip():
+                        continue
+                    if isinstance(value, tuple) and len(value) == 2:
+                        entry_value, stamp = value
+                    elif isinstance(value, Mapping):
+                        entry_value, stamp = value.get("value"), value.get("checked_at")
+                    else:
+                        continue
+                    if isinstance(entry_value, Decimal) and isinstance(stamp, datetime) and stamp.tzinfo is not None:
+                        batch[condition_id] = (entry_value, stamp)
+                # Legacy readers have no page boundary; re-read their start until all batches commit.
+                self._publish_competition_batch(batch, page_cursor=page_cursor,
+                    resume_cursor=stored.get("resume_cursor") if final else page_cursor,
+                    checked_at=stored.get("round_checked_at"), stop_event=stop_event)
+                batch = {}
+                if final:
+                    return True
+                if stop_event is not None and stop_event.is_set():
+                    return False
         except Exception:
-            logger.warning(
-                "lp competition persistence failed: rows=%d", len(entries)
-            )
+            logger.warning("lp competition persistence failed", exc_info=True)
+            return False
 
-    def _competition_entries(self) -> dict[str, object]:
+    def _competition_entries(
+        self, condition_ids: Collection[str] | None = None, *, state: Mapping[str, object] | None = None, metadata=None
+    ) -> dict[str, object]:
         """Project the competition map for the trial-candidate view (#181).
 
-        Fresh cache entries (inside the one-hour competition freshness gate)
+        Fresh cache entries (inside the competition freshness gate)
         win with ``source="fresh"``; everything else — a missing cache or an
         entry older than the gate — falls back to the last persisted round
         with ``source="store"`` and the store's own checked_at.  Conditions
         present in neither source are left out entirely: the view owns the
         missing-data exclusion and there is no cold-start exemption.
+        A caller can scope this projection to its complete required identity set.
         """
 
-        # Lazy import: polymarket_lp_views imports this module at load time.
-        from .polymarket_lp_views import LP_COMPETITION_MAX_AGE
-
-        state = self._competition_state
-        round_checked_at = state.get("round_checked_at")
         now = self.clock()
+        with ExitStack() as stack:
+            with self._competition_lock:
+                state = self._competition_state if state is None else state
+                raw = state.get("competitiveness")
+                raw = raw if isinstance(raw, Mapping) else {}
+                state = {"round_checked_at": state.get("round_checked_at"),
+                         "competitiveness": dict(raw) if condition_ids is None else
+                         {cid: raw.get(cid) for cid in condition_ids}}
+                if metadata is not None:
+                    metadata.update(version=self._competition_version, round_checked_at=state.get("round_checked_at"))
+                if condition_ids is not None:
+                    entries = self._competition_projection(condition_ids, state=state, connection=None, read_store=False, now=now)
+                    if all(cid in entries for cid in condition_ids):
+                        return entries
+                reader = getattr(self.store, "lp_competitiveness_map", None)
+                snapshot_reader = getattr(self.store, "lp_competitiveness_snapshot", None)
+                try:
+                    parameter = inspect.signature(reader).parameters.get("connection")
+                    shared_snapshot = (
+                        parameter is not None
+                        and parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+                        and callable(snapshot_reader)
+                    )
+                except (TypeError, ValueError):
+                    shared_snapshot = False
+                if not shared_snapshot:
+                    # Legacy readers reopen SQLite: fence their fallback read with cache capture.
+                    return self._competition_projection(condition_ids, state=state, connection=None, read_store=True, now=now)
+                try:
+                    connection = stack.enter_context(snapshot_reader())
+                except Exception:
+                    logger.warning("lp competition snapshot unavailable")
+                    connection = None
+                if connection is None:
+                    return self._competition_projection(condition_ids, state=state, connection=None, read_store=True, now=now)
+            return self._competition_projection(condition_ids, state=state, connection=connection, read_store=True, now=now)
+
+    def _competition_projection(self, condition_ids, *, state, connection, read_store, now):
+        from .polymarket_lp_views import LP_COMPETITION_MAX_AGE
+        round_checked_at = state.get("round_checked_at")
         entries: dict[str, object] = {}
-        fresh_conditions: set[str] = set()
         raw_map = state.get("competitiveness")
         if isinstance(raw_map, Mapping):
-            for condition_id, value in raw_map.items():
+            requested = (raw_map.items() if condition_ids is None else
+                         ((cid, raw_map.get(cid)) for cid in condition_ids))
+            for condition_id, value in requested:
                 if not isinstance(condition_id, str):
                     continue
                 if isinstance(value, tuple) and len(value) == 2:
@@ -7363,22 +7878,22 @@ class PolymarketLPService:
                     fresh = 0 <= age < LP_COMPETITION_MAX_AGE.total_seconds()
                 if not fresh:
                     continue
-                fresh_conditions.add(condition_id)
                 entries[condition_id] = {
                     "value": entry_value,
                     "checked_at": checked_at,
                     "updated": (
-                        checked_at == round_checked_at
+                        checked_at >= round_checked_at
                         if isinstance(checked_at, datetime)
                         and isinstance(round_checked_at, datetime)
                         else None
                     ),
                     "source": "fresh",
                 }
-        store_map = self._competition_store_map()
+        missing = None if condition_ids is None else tuple(cid for cid in condition_ids if cid not in entries)
+        store_map = self._competition_store_map(missing, connection=connection) if read_store and (missing is None or missing) else {}
         if store_map:
             for condition_id, (value, checked_at) in store_map.items():
-                if condition_id in fresh_conditions:
+                if condition_id in entries:
                     continue
                 entries[condition_id] = {
                     "value": value,
@@ -7388,18 +7903,33 @@ class PolymarketLPService:
                 }
         return entries
 
-    def _competition_store_map(self) -> dict[str, tuple[Decimal, datetime]]:
+    def _competition_store_map(
+        self, condition_ids: Collection[str] | None = None, *, connection=None
+    ) -> dict[str, tuple[Decimal, datetime]]:
         """Read the persisted competition map, tolerating store failures."""
 
         reader = getattr(self.store, "lp_competitiveness_map", None)
         if not callable(reader):
             return {}
         try:
-            store_map = reader()
+            options = {} if condition_ids is None else {"condition_ids": condition_ids}
+            if connection is not None:
+                options["connection"] = connection
+            try:
+                inspect.signature(reader).bind(**options)
+            except (TypeError, ValueError):
+                if connection is not None:
+                    raise
+                options = {}
+            store_map = reader(**options)
         except Exception:
             logger.warning("lp competition store read failed")
             return {}
-        return store_map if isinstance(store_map, dict) else {}
+        if not isinstance(store_map, dict):
+            return {}
+        return store_map if condition_ids is None else {
+            cid: store_map[cid] for cid in condition_ids if cid in store_map
+        }
 
     def _candidate_reservations(self, *, ignore_session_id=None) -> tuple[dict[str, object], ...]:
         reservations: list[dict[str, object]] = []
@@ -7413,10 +7943,8 @@ class PolymarketLPService:
                 # Candidate account snapshots already count actual open IDs.
                 # A later independent BUY must never inherit entry coverage.
                 for action in self.store.lp_actions(str(session["session_id"])):
-                    if (str(action.get("side") or "").upper() == "BUY"
-                            and action.get("role") != "entry"
-                            and action.get("state") in {"pending", "unknown"}
-                            and "cancel" not in str(action.get("action_key") or "")):
+                    if (unresolved_buy_action(action) and submission_action_kind(action) != 'entry'
+                            and not buy_action_is_covered(session, action)):
                         reservations.append({
                             "order_id": str(action.get("order_id") or f"lp-action:{action['action_id']}"),
                             "amount": None,
@@ -7424,6 +7952,20 @@ class PolymarketLPService:
                 continue
             order_id = str(session.get("entry_order_id") or "").strip()
             if not order_id:
+                actions = self.store.lp_actions(str(session["session_id"]))
+                history = self._order_history(session)
+                has_buy = any(str(record.get("side") or "").upper() == "BUY"
+                              for record in history.values()) or any(
+                                  unresolved_buy_action(action)
+                                  and not buy_action_is_covered(session, action)
+                                  for action in actions)
+                has_sell = bool(session.get("passive_exit_order_id")) or any(
+                    str(record.get("side") or "").upper() == "SELL"
+                    for record in history.values())
+                if has_sell and not has_buy:
+                    # A SELL-only imported or manual session has no BUY
+                    # principal to reserve against candidate admission.
+                    continue
                 order_id = f"lp-session:{session.get('session_id', '')}"
             history = self._order_history(session)
             if str(history.get(order_id, {}).get("status") or "").upper() in TERMINAL_ORDER_STATES:
@@ -7649,18 +8191,31 @@ class PolymarketLPService:
         )
 
     def _fetch_candidate_facts(self, identity, *, account=None, candidate=False):
+        if account is None:
+            reader = getattr(self.exchange, "lp_account_snapshot", None)
+            if not callable(reader):
+                raise ValueError("candidate_readers_unavailable")
+            try:
+                account = reader()
+            except Exception as exc:
+                raise ValueError("account_unknown") from exc
+        if not isinstance(account, Mapping):
+            raise ValueError("account_unknown")
+        return {"account": dict(account),
+                "direction": self._fetch_market_direction(identity, candidate=candidate)}
+
+    def _fetch_market_direction(self, identity, *, candidate=False):
         condition_id = str(identity.get("condition_id") or "").strip()
         token_id = str(identity.get("token_id") or "").strip()
         outcome = str(identity.get("outcome") or "").upper()
         if not condition_id or not token_id or outcome not in {"YES", "NO"}:
             raise ValueError("candidate_identity_unknown")
-        account_reader = getattr(self.exchange, "lp_account_snapshot", None)
         metadata_reader = getattr(self.exchange, "lp_market_metadata_fresh", None)
         reward_reader = getattr(self.exchange, "lp_reward_catalog", None)
         books_reader = getattr(self.exchange, "lp_order_books", None)
         if not all(
             callable(reader)
-            for reader in (account_reader, metadata_reader, reward_reader, books_reader)
+            for reader in (metadata_reader, reward_reader, books_reader)
         ):
             raise ValueError("candidate_readers_unavailable")
         def read_reward():
@@ -7707,12 +8262,6 @@ class PolymarketLPService:
                 self._exclude_candidate(condition_id, "", reason, checked_at=read_started,
                     exclusion_revision=exclusion_revision)
                 raise ValueError(reason)
-        try:
-            account = account_reader() if account is None else account
-        except Exception as exc:
-            raise ValueError("account_unknown") from exc
-        if not isinstance(account, Mapping):
-            raise ValueError("account_unknown")
         try:
             try:
                 raw_metadata = metadata_reader((condition_id,), stop_event=None)
@@ -7801,10 +8350,45 @@ class PolymarketLPService:
             ),
             "reward_guidance_deadline": self._reward_guidance_deadline(reward_market),
         }
-        return {"account": dict(account), "direction": direction}
+        return direction
+
+    def _read_plan_market_snapshot(self, identity):
+        """Read execution eligibility without financial qualification or repricing."""
+        if not self._candidate_allowed(((str(identity.get('condition_id') or ''),
+                                         str(identity.get('token_id') or '')),)):
+            raise ValueError('candidate_cooling_down')
+        revision = self._candidate_exclusion_revision
+        direction = self._market_read(identity,
+            lambda: self._fetch_market_direction(identity, candidate=True))
+        if self.exclusions_enabled and revision != self._candidate_exclusion_revision:
+            raise ValueError('candidate_exclusions_changed')
+        market, book = direction['market'], direction['book']
+        now = self._now()
+        for value, age, reason in (
+            (market.get('metadata_checked_at'), _MARKET_METADATA_MAX_AGE_SECONDS, 'market_metadata'),
+            (market.get('fees_checked_at'), _MARKET_METADATA_MAX_AGE_SECONDS, 'market_fees'),
+            (direction.get('reward_checked_at'), 60, 'reward_data'),
+        ):
+            _freshness(value, now, reason, max_age=age)
+        deadline = direction.get('reward_guidance_deadline')
+        if deadline is not None and _timestamp(deadline) <= now:
+            raise ValueError('reward_expired')
+        event_state, event_reason, _, _ = _event_window_check(direction, market, now)
+        if event_state is not None:
+            raise ValueError(event_reason or 'event_timing_unknown')
+        if direction.get('reward_active') is not True:
+            raise ValueError('reward_inactive' if direction.get('reward_active') is False else 'reward_status_unknown')
+        reward = _maybe_decimal(direction.get('daily_pool_usd'))
+        if reward is None or reward <= 0:
+            raise ValueError('reward_pool_unknown' if reward is None else 'reward_pool_empty')
+        if (str(book.get('condition_id', book.get('market'))) != str(identity['condition_id'])
+                or str(book.get('token_id', book.get('asset_id'))) != str(identity['token_id'])):
+            raise ValueError('book_identity_mismatch')
+        return {'market': market, 'book': book, 'candidate_direction': direction}
 
     def _read_candidate_snapshot(
-        self, identity: Mapping[str, object], *, now: datetime, ignore_session_id=None, account=None
+        self, identity: Mapping[str, object], *, now: datetime, ignore_session_id=None,
+        account=None, bid_level=None,
     ) -> dict[str, object]:
         if not self._candidate_allowed(((str(identity.get("condition_id") or ""), str(identity.get("token_id") or "")),)):
             raise ValueError("candidate_cooling_down")
@@ -7813,6 +8397,8 @@ class PolymarketLPService:
         if self.exclusions_enabled and exclusion_revision != self._candidate_exclusion_revision:
             raise ValueError("candidate_exclusions_changed")
         account, direction = facts["account"], facts["direction"]
+        if bid_level is None:
+            bid_level = identity.get("candidate_bid_level", identity.get("bid_level", 1))
         evaluation_now = self._now()
         evaluated = evaluate_lp_entry(
             direction,
@@ -7820,6 +8406,7 @@ class PolymarketLPService:
             now=evaluation_now,
             reservations=self._candidate_reservations(ignore_session_id=ignore_session_id),
             candidate=True,
+            bid_level=bid_level,
         )
         if evaluated.get("state") != "eligible":
             reasons = evaluated.get("reason_codes")
@@ -7853,7 +8440,11 @@ class PolymarketLPService:
             raise ValueError("candidate_cooling_down")
         evaluated = snapshot.get("candidate_evaluation")
         if not isinstance(evaluated, Mapping) or evaluated.get("state") != "eligible":
-            snapshot = self._read_candidate_snapshot(identity, now=now)
+            snapshot = self._read_candidate_snapshot(
+                identity,
+                now=now,
+                bid_level=identity.get("candidate_bid_level", identity.get("bid_level", 1)),
+            )
             evaluated = snapshot.get("candidate_evaluation")
         guidance = evaluated.get("guidance") if isinstance(evaluated, Mapping) else None
         if not isinstance(guidance, Mapping) or not _lp_guidance_is_usable(guidance):
@@ -7965,6 +8556,7 @@ class PolymarketLPService:
                     "quantity": quantity,
                     "review_at": review_at,
                     "candidate_policy": "best_bid_minimum",
+                    "candidate_bid_level": eligible.get("bid_level", 1),
                 }
             )
             facts = self._validate_snapshot(
@@ -9009,7 +9601,8 @@ class PolymarketLPService:
         )
         return result["session"], bool(result["changed"])
 
-    def _register_account_snapshot(self, snapshot: Mapping[str, object]) -> dict[str, object]:
+    def _register_account_snapshot(self, snapshot: Mapping[str, object], *, _planning_only=False,
+                                   _automatic_observation=False) -> dict[str, object]:
         """Register every account-owned order in one complete sync bundle.
 
         One LP session owns one token; a newly discovered SELL joins that
@@ -9022,7 +9615,8 @@ class PolymarketLPService:
             return {"state": "skipped", "reason": "account_snapshot_unknown"}
         required = (
             "balance_complete", "open_orders_complete",
-            "positions_complete", "trades_complete", "pagination_complete",
+            "positions_complete", *(("current_pagination_complete",) if _planning_only
+                                    else ("trades_complete", "pagination_complete")),
         )
         if any(snapshot.get(key) is not True for key in required):
             return {"state": "skipped", "reason": "account_snapshot_incomplete"}
@@ -9075,10 +9669,10 @@ class PolymarketLPService:
                     "state": "failed",
                     "reason": "account_order_identity_unknown",
                 }
-        if "raw_trades" not in snapshot or not isinstance(snapshot["raw_trades"], (list, tuple)):
+        if not _planning_only and ("raw_trades" not in snapshot or not isinstance(snapshot["raw_trades"], (list, tuple))):
             return {"state": "failed", "reason": "account_raw_trades_unknown"}
         raw_orders = [row for row in open_orders if isinstance(row, Mapping)]
-        owned_fills = self._owned_sync_order_rows(snapshot["raw_trades"], wallet)
+        owned_fills = ([] if _planning_only else self._owned_sync_order_rows(snapshot["raw_trades"], wallet))
         known_ids = {
             str(_field(row, "order_id", _field(row, "id", "")) or "") for row in raw_orders
         }
@@ -9096,7 +9690,8 @@ class PolymarketLPService:
             # ownership/trading state before the single account-wide commit.
             scanned = connection.execute(
                 "SELECT session_id,json_extract(payload,'$._lp_trade_revision') AS revision "
-                "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?)",
+                "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?) "
+                "AND coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true'",
                 (account_id,),
             ).fetchall()
             diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1
@@ -9139,52 +9734,176 @@ class PolymarketLPService:
 
             # Validate current exposure before publication. Historical report
             # gaps cannot veto API positions or create additional reservations.
-            financial_facts = build_account_financial_facts(
+            builder = build_planning_account_facts if _planning_only else build_account_financial_facts
+            financial_facts = builder(
                 snapshot, now=self._now(), expected_account_id=account_id,
             )
-            token_results = []
-            created = joined = 0
-            prepare_seconds = monotonic() - prepared_at
-            _lp_causal_event("account_publish_ready", account=snapshot, prepare_seconds=prepare_seconds)
-            lock_started = monotonic()
-            with _lp_read_lock(self._first_seen_apply_lock, "account_registration_apply_lock_wait"):
-                diagnostics["apply_lock_wait_seconds"] = round(monotonic() - lock_started, 3)
-                with self.store._transaction(prepare_seconds=prepare_seconds, diagnostics=diagnostics) as connection:
-                    _lp_causal_event("account_publish_begin", account=snapshot, prepare_seconds=prepare_seconds)
-                    observed = connection.execute(
-                        "SELECT generation FROM lp_trade_generation WHERE singleton=1"
-                    ).fetchone()
-                    if observed is None or int(observed["generation"]) != generation:
-                        raise LpObservationWait("account_round_invalid")
-                    if revisions(connection) != expected_revisions:
-                        raise LpObservationWait("account_round_invalid")
-                    _freshness(read_ended, self._now(), "account_freshness")
-                    session_cache = {}
-                    for token, token_rows, candidate in prepared:
-                        result = self.store.lp_register_exchange_orders(
-                            account_id, token, token_rows, session=candidate,
-                            expected_generation=generation, connection=connection, diagnostics=diagnostics,
-                            _session_cache=session_cache,
-                        )
-                        state = "created" if result["created"] else "joined"
-                        created += int(result["created"])
-                        joined += int(not result["created"])
-                        token_results.append({"token_id": token, "state": state,
-                                              "session_id": result["session"]["session_id"]})
-                    # The empty-account case uses the same fenced transaction:
-                    # it is evidence of zero occupancy, not an early return.
-                    self.store.lp_publish_account_financial_facts(
-                        financial_facts, connection=connection,
-                        expected_generation=generation, diagnostics=diagnostics,
-                    )
-            return {"state": "registered", "tokens": token_results,
-                    "created": created, "joined": joined}
+            def publish_account():
+                token_results = []
+                registered_sessions = {}
+                created = joined = 0
+                prepare_seconds = monotonic() - prepared_at
+                _lp_causal_event("account_publish_ready", account=snapshot, prepare_seconds=prepare_seconds)
+                lock_started = monotonic()
+                with _lp_read_lock(self._first_seen_apply_lock, "account_registration_apply_lock_wait"):
+                    diagnostics["apply_lock_wait_seconds"] = round(monotonic() - lock_started, 3)
+                    with self.store._transaction(prepare_seconds=prepare_seconds, diagnostics=diagnostics, lp_priority="reliable") as connection:
+                        _lp_causal_event("account_publish_begin", account=snapshot, prepare_seconds=prepare_seconds)
+                        observed = connection.execute(
+                            "SELECT generation FROM lp_trade_generation WHERE singleton=1"
+                        ).fetchone()
+                        current_revisions = revisions(connection)
+                        if observed is None:
+                            raise LpObservationWait("account_round_invalid")
+                        current_generation = int(observed['generation'])
+                        if current_generation != generation or current_revisions != expected_revisions:
+                            if not _automatic_observation or current_generation != generation:
+                                raise LpObservationWait("account_round_invalid")
+                            # Monitoring may publish the very IDs in this read.
+                            # Accept that narrow change only after checking every
+                            # changed owner and actual new BUY request/exposure.
+                            buys = {buy['order_id']: buy for buy in financial_facts['buys']}
+                            positions = {position['token_id']: position for position in financial_facts['positions']}
+                            fills = financial_facts.get('order_fills') or {}
+                            owned_fill_rows = {str(fill['order_id']): fill for fill in owned_fills}
+                            for sid in expected_revisions.keys() | current_revisions.keys():
+                                if expected_revisions.get(sid) == current_revisions.get(sid):
+                                    continue
+                                row = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?', (sid,)).fetchone()
+                                session = self.store._lp_row_result(row) if row else None
+                                if not session or session.get('order_identity_conflict'):
+                                    raise LpObservationWait('account_round_invalid')
+                                for audit in self.store.lp_actions(sid, connection=connection):
+                                    stamp = audit.get('submit_requested_at') or audit.get('submit_post_started_at')
+                                    if (submission_action_kind(audit) in ('entry', 'augment')
+                                            and audit.get('side') == 'BUY' and stamp
+                                            and _timestamp(stamp, name='submit_requested_at') >= read_started
+                                            and audit.get('state') in ('pending', 'accepted', 'unknown')):
+                                        raise LpObservationWait('account_round_invalid')
+                                for oid, fact in self._order_history(session).items():
+                                    if fact.get('side') != 'BUY':
+                                        continue
+                                    buy = buys.get(oid)
+                                    matched = _maybe_decimal(fact.get('size_matched'))
+                                    if (fact.get('status') == 'LIVE' or buy is not None) and (
+                                            not buy or fact.get('status') != 'LIVE'
+                                            or str(buy['token_id']) != str(session['token_id'])
+                                            or str(fact.get('token_id')) != str(buy['token_id'])
+                                            or _maybe_decimal(fact.get('price')) != _maybe_decimal(buy['price'])
+                                            or _maybe_decimal(fact.get('original_size', fact.get('quantity'))) != _maybe_decimal(buy['original_quantity'])
+                                            or matched != _maybe_decimal(buy['filled_quantity'])
+                                            or _maybe_decimal(fact.get('remaining_size')) != _maybe_decimal(buy['quantity'])):
+                                        raise LpObservationWait('account_round_invalid')
+                                    if matched is None or matched < Decimal('0'):
+                                        raise LpObservationWait('account_round_invalid')
+                                    if matched > Decimal('0'):
+                                        fill = owned_fill_rows.get(oid, {})
+                                        position = positions.get(str(session['token_id']), {})
+                                        quantity = _maybe_decimal(fact.get('original_size', fact.get('quantity')))
+                                        remaining = _maybe_decimal(fact.get('remaining_size'))
+                                        average = _maybe_decimal(fact.get('average_price'))
+                                        if (fill.get('side') != 'BUY'
+                                                or str(fill.get('token_id')) != str(session['token_id'])
+                                                or str(fill.get('condition_id')) != str(session.get('condition_id'))
+                                                or _maybe_decimal(fills.get(oid)) != matched
+                                                or _maybe_decimal(fill.get('size_matched')) != matched
+                                                or average is None or average <= Decimal('0')
+                                                or _maybe_decimal(fill.get('average_price')) != average
+                                                or quantity is None or quantity < matched
+                                                or remaining is None or remaining != quantity - matched
+                                                or str(fact.get('token_id')) != str(session['token_id'])
+                                                or (_maybe_decimal(fact.get('price')) or Decimal('0')) <= Decimal('0')
+                                                or _maybe_decimal(position.get('quantity')) != _maybe_decimal(session.get('residual_quantity'))
+                                                or _maybe_decimal(position.get('inventory_cost_usd')) is None
+                                                or _maybe_decimal(position['inventory_cost_usd']) != _maybe_decimal(session.get('buy_cost'))):
+                                            raise LpObservationWait('account_round_invalid')
+                        _freshness(read_ended, self._now(), "account_freshness")
+                        pool_row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+                        published = (json.loads(pool_row['payload']).get('account_financial_facts') or {}) if pool_row else {}
+                        capture_only = _automatic_observation and any(
+                            published.get(key) and _timestamp(published[key], name=key) > _timestamp(financial_facts[key], name=key)
+                            for key in ('read_started_at', 'read_ended_at', 'checked_at'))
+                        session_cache = {}
+                        for token, token_rows, candidate in prepared:
+                            result = self.store.lp_register_exchange_orders(
+                                account_id, token, token_rows, session=candidate,
+                                expected_generation=generation, connection=connection, diagnostics=diagnostics,
+                                _session_cache=session_cache,
+                            )
+                            state = "created" if result["created"] else "joined"
+                            created += int(result["created"])
+                            joined += int(not result["created"])
+                            token_results.append({"token_id": token, "state": state,
+                                                  "session_id": result["session"]["session_id"]})
+                            registered_sessions[token] = result['session']
+                        # The empty-account case uses the same fenced transaction:
+                        # it is evidence of zero occupancy, not an early return.
+                        if _planning_only or capture_only:
+                            # Register proven current IDs, without account-wide
+                            # coverage, historical conclusions or full publication.
+                            for buy in financial_facts['buys']:
+                                session = registered_sessions[buy['token_id']]
+                                buy['session_id'] = session['session_id']
+                                for key in ('condition_id', 'market_id', 'outcome'):
+                                    if not buy.get(key):
+                                        buy[key] = session.get(key)
+                        else:
+                            self.store.lp_publish_account_financial_facts(
+                                financial_facts, connection=connection,
+                                expected_generation=generation, diagnostics=diagnostics,
+                            )
+                        # Carry this transaction's exact source through the public
+                        # registration return. A later publisher is not its owner.
+                        row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+                        planning_document = json.loads(row['payload']) if row else {}
+                        if _planning_only or capture_only:
+                            sessions = [self.store._lp_row_result(row) for row in
+                                connection.execute('SELECT * FROM lp_sessions ORDER BY session_id').fetchall()]
+                            holds = project_planning_buy_holds(sessions,
+                                {s['session_id']: self.store.lp_actions(s['session_id'], connection=connection)
+                                 for s in sessions}, planning_document.get('intents') or {}, financial_facts['buys'],
+                                account_id=financial_facts['account_id'], checked_at=financial_facts['checked_at'],
+                                read_started_at=_timestamp(financial_facts['read_started_at'], name='read_started_at'))
+                            financial_facts.update({key: holds[key] for key in
+                                ('pending_buy_actions', 'independent_sell_unknown')})
+                            if holds['account_send_inflight']:
+                                financial_facts['financial_status'] = 'unknown'
+                                financial_facts['reason_codes'] = sorted(set(financial_facts.get('reason_codes') or ())
+                                    | {'account_send_inflight'})
+                            planning_document['_planning_buy_isolation'] = holds['isolation']
+                            planning_document['account_financial_facts'] = deepcopy(financial_facts)
+                            if _planning_only and not capture_only:
+                                self.store.lp_publish_planning_account_facts(financial_facts,
+                                    holds['isolation'], connection=connection)
+                        planning_capture = dict(document=planning_document, validated_at=self._now(),
+                            validated_generation=generation)
+                return {"state": "registered", "tokens": token_results,
+                        "created": created, "joined": joined,
+                        '_planning_capture': planning_capture,
+                        **({'planning_facts': financial_facts} if _planning_only else {})}
+            return self._lp_write_operation(publish_account, priority='reliable')
         except ValueError as exc:
             if isinstance(exc, LpObservationWait):
                 return {"state": "skipped", "reason": "account_round_invalid",
                         "wait_reason": str(exc), "tokens": [], "created": 0, "joined": 0}
             return {"state": "failed", "reason": str(exc),
                     "tokens": [], "created": 0, "joined": 0}
+
+    def _register_planning_account_snapshot(self, snapshot):
+        """Current-only registration cannot clear or replace full-publication diagnostics."""
+        _lp_causal_event('account_publish_wait', account=snapshot)
+        outcome = 'failed'
+        try:
+            result = self._register_account_snapshot(snapshot,
+                _planning_only=snapshot.get('trades_complete') is not True,
+                _automatic_observation=True)
+            outcome = result.get('state', 'failed')
+            return result
+        except LpAccountRoundInvalid:
+            outcome = 'skipped'
+            raise
+        finally:
+            _lp_causal_event('account_publish_end', account=snapshot, outcome=outcome)
 
     def register_account_snapshot(
         self, snapshot: Mapping[str, object]
@@ -9448,146 +10167,157 @@ class PolymarketLPService:
             for episode in self.store.lp_active_first_seen_episodes():
                 if str(episode.get("token_id") or "") == token_id:
                     return {"state": "skipped", "reason": "episode_exists"}
-            ordered = sorted(
-                candidates,
-                key=lambda row: (
-                    _first_seen_stamp_key(row.get("first_seen_at")),
-                    _first_seen_stamp_key(row.get("created_at")),
-                    str(row.get("order_id") or ""),
-                ),
-            )
-            anchor = ordered[0]
-            anchor_price = _maybe_decimal(anchor.get("price"))
-            if anchor_price is None:
-                return {
-                    "state": "registration_failed",
-                    "reason_codes": ["price_unknown"],
-                    "token_id": token_id,
-                }
-            level_rows = [
-                row
-                for row in ordered
-                if _maybe_decimal(row.get("price")) == anchor_price
-            ]
-            own_remaining = Decimal("0")
-            for row in level_rows:
-                remaining = _maybe_decimal(row.get("remaining"))
-                if remaining is None:
-                    own_remaining = None
-                    break
-                own_remaining += remaining
-            book = self._read_first_seen_book(token_id)
-            baseline = first_observation_baseline(
-                book,
-                price=anchor_price,
-                own_remaining=own_remaining,
-            )
-            if baseline["state"] != "known":
-                return {
-                    "state": "registration_failed",
-                    "reason_codes": list(baseline["reason_codes"]),
-                    "token_id": token_id,
-                }
-            anchor_order_ids = [
-                str(row.get("order_id") or "") for row in level_rows
-            ]
-            anchor_order_ids = [order_id for order_id in anchor_order_ids if order_id]
-            first_seen_at = _first_seen_stamp_value(
-                anchor.get("first_seen_at"), default=now
-            )
-            order_placement_times: dict[str, object] = {}
-            placement_datetimes: list[datetime] = []
-            for row in level_rows:
-                order_id = str(row.get("order_id") or "")
-                if not order_id:
-                    continue
-                try:
-                    placement = _timestamp(
-                        row.get("created_at"), name="venue_created_at"
-                    )
-                except ValueError:
-                    order_placement_times[order_id] = None
-                else:
-                    order_placement_times[order_id] = _iso(placement)
-                    placement_datetimes.append(placement)
-
-            def first_text(key: str) -> str | None:
-                for row in ordered:
-                    value = _text(row.get(key))
-                    if value is not None:
-                        return value
-                return None
-
-            market_id = first_text("market_id")
-            market_title = first_text("market_title")
-            market_url = first_text("market_url")
-            outcome = first_text("outcome")
-            received_at = _timestamp(
-                baseline["baseline_book_received_at"], name="book_received_at"
-            )
-            registration_delay = (received_at - first_seen_at).total_seconds()
-            episode_id = uuid.uuid4().hex
-            payload: dict[str, object] = {
-                "token_id": token_id,
-                "condition_id": condition_id,
-                "anchor_order_ids": anchor_order_ids,
-                "anchor_price": str(anchor_price),
-                "baseline_front": baseline["baseline_front"],
-                "baseline_price": baseline["baseline_price"],
-                "baseline_book_received_at": baseline["baseline_book_received_at"],
-                "baseline_book_hash": baseline["baseline_book_hash"],
-                "baseline_source": "first_observation",
-                "baseline_version": 1,
-                "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
-                "first_seen_at": _iso(first_seen_at),
-                "venue_created_at": (
-                    _iso(min(placement_datetimes)) if placement_datetimes else None
-                ),
-                "order_placement_times": order_placement_times,
-                "market_id": market_id,
-                "market_title": market_title,
-                "market_url": market_url,
-                "outcome": outcome,
-                "registration_delay": registration_delay,
-                "data_failures": 0,
-                "state": "monitoring",
-                "notification_sent": False,
-                "blocked_notified": False,
-                "cancel_scope": "own_buys_at_level",
-                "cancel_targets": [],
-                "canceled_order_ids": [],
-                "cancel_target_remaining": {},
-                "canceled_remaining": None,
-                "partially_filled_quantity": None,
-                "cancel_requested_at": None,
-                "cancel_reason": None,
-                "reason_codes": [],
-            }
-            episode = self.store.lp_create_first_seen_episode(
-                episode_id,
-                token_id=token_id,
-                condition_id=condition_id,
-                state="monitoring",
-                payload=payload,
-            )
-            recorder = getattr(self.store, "lp_record_book_samples", None)
-            if callable(recorder):
-                sample = self._first_seen_book_sample(
-                    condition_id=condition_id, token_id=token_id, book=book
-                )
-                if sample is not None:
-                    try:
-                        recorder([sample], now=now)
-                    except Exception:
-                        pass
+        # Resolve the external book before admission or any publication mutex.
+        ordered = sorted(
+            candidates,
+            key=lambda row: (
+                _first_seen_stamp_key(row.get("first_seen_at")),
+                _first_seen_stamp_key(row.get("created_at")),
+                str(row.get("order_id") or ""),
+            ),
+        )
+        anchor = ordered[0]
+        anchor_price = _maybe_decimal(anchor.get("price"))
+        if anchor_price is None:
             return {
-                "state": "registered",
-                "episode_id": episode_id,
-                "episode": episode,
+                "state": "registration_failed",
+                "reason_codes": ["price_unknown"],
                 "token_id": token_id,
-                "anchor_price": str(anchor_price),
-                "baseline_front": baseline["baseline_front"],
             }
+        level_rows = [
+            row
+            for row in ordered
+            if _maybe_decimal(row.get("price")) == anchor_price
+        ]
+        own_remaining = Decimal("0")
+        for row in level_rows:
+            remaining = _maybe_decimal(row.get("remaining"))
+            if remaining is None:
+                own_remaining = None
+                break
+            own_remaining += remaining
+        book = self._read_first_seen_book(token_id)
+        baseline = first_observation_baseline(
+            book,
+            price=anchor_price,
+            own_remaining=own_remaining,
+        )
+        if baseline["state"] != "known":
+            return {
+                "state": "registration_failed",
+                "reason_codes": list(baseline["reason_codes"]),
+                "token_id": token_id,
+            }
+        anchor_order_ids = [
+            str(row.get("order_id") or "") for row in level_rows
+        ]
+        anchor_order_ids = [order_id for order_id in anchor_order_ids if order_id]
+        first_seen_at = _first_seen_stamp_value(
+            anchor.get("first_seen_at"), default=now
+        )
+        order_placement_times: dict[str, object] = {}
+        placement_datetimes: list[datetime] = []
+        for row in level_rows:
+            order_id = str(row.get("order_id") or "")
+            if not order_id:
+                continue
+            try:
+                placement = _timestamp(
+                    row.get("created_at"), name="venue_created_at"
+                )
+            except ValueError:
+                order_placement_times[order_id] = None
+            else:
+                order_placement_times[order_id] = _iso(placement)
+                placement_datetimes.append(placement)
+
+        def first_text(key: str) -> str | None:
+            for row in ordered:
+                value = _text(row.get(key))
+                if value is not None:
+                    return value
+            return None
+
+        market_id = first_text("market_id")
+        market_title = first_text("market_title")
+        market_url = first_text("market_url")
+        outcome = first_text("outcome")
+        received_at = _timestamp(
+            baseline["baseline_book_received_at"], name="book_received_at"
+        )
+        registration_delay = (received_at - first_seen_at).total_seconds()
+        episode_id = uuid.uuid4().hex
+        payload: dict[str, object] = {
+            "token_id": token_id,
+            "condition_id": condition_id,
+            "anchor_order_ids": anchor_order_ids,
+            "anchor_price": str(anchor_price),
+            "baseline_front": baseline["baseline_front"],
+            "baseline_price": baseline["baseline_price"],
+            "baseline_book_received_at": baseline["baseline_book_received_at"],
+            "baseline_book_hash": baseline["baseline_book_hash"],
+            "baseline_source": "first_observation",
+            "baseline_version": 1,
+            "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
+            "first_seen_at": _iso(first_seen_at),
+            "venue_created_at": (
+                _iso(min(placement_datetimes)) if placement_datetimes else None
+            ),
+            "order_placement_times": order_placement_times,
+            "market_id": market_id,
+            "market_title": market_title,
+            "market_url": market_url,
+            "outcome": outcome,
+            "registration_delay": registration_delay,
+            "data_failures": 0,
+            "state": "monitoring",
+            "notification_sent": False,
+            "blocked_notified": False,
+            "cancel_scope": "own_buys_at_level",
+            "cancel_targets": [],
+            "canceled_order_ids": [],
+            "cancel_target_remaining": {},
+            "canceled_remaining": None,
+            "partially_filled_quantity": None,
+            "cancel_requested_at": None,
+            "cancel_reason": None,
+            "reason_codes": [],
+        }
+        def publish_first_seen():
+            with self._mutex:
+                for episode in self.store.lp_active_first_seen_episodes():
+                    if str(episode.get("token_id") or "") == token_id:
+                        return {"state": "skipped", "reason": "episode_exists"}
+                episode = self.store.lp_create_first_seen_episode(
+                    episode_id,
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    state="monitoring",
+                    payload=payload,
+                )
+                return {
+                    "state": "registered",
+                    "episode_id": episode_id,
+                    "episode": episode,
+                    "token_id": token_id,
+                    "anchor_price": str(anchor_price),
+                    "baseline_front": baseline["baseline_front"],
+                }
+        result = self._lp_write_operation(publish_first_seen, priority='background')
+        if result['state'] != 'registered':
+            return result
+        # Optional history keeps its independent transaction/retry boundary.
+        recorder = getattr(self.store, "lp_record_book_samples", None)
+        if callable(recorder):
+            sample = self._first_seen_book_sample(
+                condition_id=condition_id, token_id=token_id, book=book
+            )
+            if sample is not None:
+                try:
+                    recorder([sample], now=now)
+                except Exception:
+                    pass
+        return result
 
     def _read_first_seen_book(self, token_id: str) -> Mapping[str, object] | None:
         """Read one token's book through the bounded SDK batch adapter."""
@@ -9716,6 +10446,29 @@ class PolymarketLPService:
         with self._entry_sends_lock:
             return session_id in self._entry_sends
 
+    def drain_submissions(self, *, timeout: float = 5) -> None:
+        """Shutdown closes the mutation guard before draining local senders."""
+        # Manual entry/augment retain this mutex through receipt application.
+        # Automatic entry can release it, so also check its existing live lanes.
+        if not self._mutex.acquire(timeout=timeout):
+            raise RuntimeError('prediction LP BUY sender did not stop')
+        try:
+            with self._entry_sends_lock:
+                if self._entry_sends:
+                    raise RuntimeError('prediction LP BUY sender did not stop')
+                if self._cancel_sends:
+                    raise RuntimeError('prediction LP cancel sender did not stop')
+        finally:
+            self._mutex.release()
+
+        drain_reads = getattr(self.exchange, 'drain_lp_account_reads', None)
+        if callable(drain_reads):
+            publisher = getattr(self, '_planning_failure_publisher', None)
+            if callable(publisher):
+                drain_reads(timeout=timeout, failure_publisher=publisher)
+            else:
+                drain_reads(timeout=timeout)
+
     def _entry_execute(self, **kwargs) -> dict[str, object]:
         # A durable legacy "sending" field is not proof of a live process.
         # Track the real lane through receipt application and clean up on error.
@@ -9742,6 +10495,7 @@ class PolymarketLPService:
         post: Callable[[object, Callable[[], None]], object] | None = None,
         release_preparation_lock: Callable[[], None] | None = None,
         apply_lock: tuple[Callable[[], object | None], Callable[[object], None]] | None = None,
+        plan_authorization=None,
     ) -> dict[str, object]:
         """Register the session and submit exactly one post-only BUY.
 
@@ -9788,6 +10542,7 @@ class PolymarketLPService:
         session_id = session_id or uuid.uuid4().hex
         intent: dict[str, object] = {
             **request,
+            **(entry_action_base if plan_authorization is not None else {}),
             "account_id": account_id,
             "preflight": facts,
             "entry_order_id": None,
@@ -9853,23 +10608,37 @@ class PolymarketLPService:
         except ValueError as exc:
             return {"state": "rejected", "reason": str(exc)}
         entry_action_key = self._action_key(session_id, "entry-submit")
-        self.store.lp_upsert_action(
-            session_id,
-            entry_action_key,
-            state="pending",
-            payload={
-                "role": "entry",
-                "side": "BUY",
-                "token_id": request["token_id"],
-                "expiration": expiration,
-                **entry_action_base,
-            },
-        )
+        try:
+            self.store.lp_upsert_action(
+                session_id,
+                entry_action_key,
+                state="pending",
+                payload={
+                    "role": "entry",
+                    "side": "BUY",
+                    "token_id": request["token_id"],
+                    "expiration": expiration,
+                    **entry_action_base,
+                },
+            )
+        except sqlite3.Error as exc:
+            if plan_authorization is None:
+                raise
+            # This boundary precedes signing and POST. The automatic caller
+            # rechecks durable identity and the exited sender before cleanup.
+            not_sent = AutoEntryNotSent('entry_audit_registration_failed')
+            not_sent.error_type = type(exc).__name__
+            not_sent.error_code = getattr(exc, 'sqlite_errorname', None)
+            raise not_sent from exc
         if release_preparation_lock is not None:
             release_preparation_lock()
         post_started = False
         post_started_at = None
         send_receipt_base = dict(entry_action_base)
+        if plan_authorization is not None:
+            send_receipt_base.update({key: request[key] for key in
+                ('market_id', 'condition_id', 'token_id', 'outcome', 'price', 'quantity')})
+            send_receipt_base['expiration'] = expiration
 
         def mark_post_started() -> None:
             nonlocal post_started, post_started_at, send_receipt_base
@@ -9904,41 +10673,46 @@ class PolymarketLPService:
                 side="BUY",
                 post_only=True,
                 expiration=expiration,
+                plan_authorization=plan_authorization,
             )
             submit_revision = self.store.lp_session_revision(session_id, trading=True)
             response = execute_post(signed, side="BUY")
         except AutoEntryNotSent as exc:
             stage = str(getattr(exc, "submit_stage", "pre_send_rejected"))
             failure = _submit_failure_facts(exc)
+            finished_at = _iso(self._now())
             self.store.lp_upsert_action(session_id, entry_action_key, state="rejected",
                 payload={
                     "role": "entry", "side": "BUY", "reason": str(exc),
                     **send_receipt_base, "submit_stage": stage,
-                    "submit_finished_at": _iso(self._now()), **failure,
+                    "submit_finished_at": finished_at, **failure,
                 })
             session = self.store.lp_update_session(session_id, state="entry_rejected",
                 patch={
                     "submit_status": "rejected", "reason": str(exc),
                     **send_receipt_base, "submit_stage": stage,
-                    "submit_finished_at": _iso(self._now()),
+                    "submit_finished_at": finished_at,
                     **failure,
                 })
             return self._status_payload(session)
         except Exception as exc:
             if not post_started:
                 failure = _submit_failure_facts(exc)
+                # One ended automatic attempt owns one finish timestamp across
+                # its audit and session writes, even across a native commit.
+                finished_at = _iso(self._now())
                 self.store.lp_upsert_action(session_id, entry_action_key, state="rejected",
                     payload={
                         "role": "entry", "side": "BUY", "reason": "prepare_failed",
                         "error": type(exc).__name__, **send_receipt_base,
                         "submit_stage": "prepare_failed",
-                        "submit_finished_at": _iso(self._now()), **failure,
+                        "submit_finished_at": finished_at, **failure,
                     })
                 session = self.store.lp_update_session(session_id, state="entry_rejected",
                     patch={
                         "submit_status": "rejected", "reason": "prepare_failed",
                         **send_receipt_base, "submit_stage": "prepare_failed",
-                        "submit_finished_at": _iso(self._now()), **failure,
+                        "submit_finished_at": finished_at if plan_authorization is not None else _iso(self._now()), **failure,
                     })
                 return self._status_payload(session)
             failure = _submit_failure_facts(exc)
@@ -9971,11 +10745,16 @@ class PolymarketLPService:
             return self._status_payload(session)
         accepted, order_id = self._order_response(response)
         response_at = _iso(self._now())
-        if not accepted and not (
+        opaque_plan_response = (plan_authorization is not None
+            and _field(response, 'ok', None) is False
+            and _field(response, 'code', None) == 'unknown'
+            and _field(response, 'accepted', None) is None
+            and not order_id)
+        if not accepted and (opaque_plan_response or not (
             _field(response, "accepted", None) is False
             or _field(response, "ok", None) is False
             or str(_field(response, "status", "")).upper() in {"REJECTED", "FAILED"}
-        ):
+        )):
             self.store.lp_upsert_action(session_id, entry_action_key, state="unknown",
                 payload={"role": "entry", "side": "BUY", "token_id": request["token_id"],
                          "expiration": expiration, **send_receipt_base,
@@ -9988,11 +10767,20 @@ class PolymarketLPService:
             return self._status_payload(session)
         if not accepted:
             rejected_at = response_at
+            rejection = {}
+            if plan_authorization is not None:
+                reason = _field(response, 'code', _field(response, 'reason',
+                    _field(response, 'error_code', _field(response, 'errorMsg', None))))
+                rejection['reason'] = str(reason)[:256] if reason else 'exchange_rejected'
+                message = _field(response, 'message', None)
+                if isinstance(message, str):
+                    rejection['exchange_rejection_message'] = message[:256]
             self.store.lp_upsert_action(
                 session_id,
                 entry_action_key,
                 state="rejected",
                 payload={
+                    **rejection,
                     "role": "entry",
                     "side": "BUY",
                     "token_id": request["token_id"],
@@ -10007,7 +10795,7 @@ class PolymarketLPService:
             session = self.store.lp_update_session(
                 session_id,
                 state="entry_rejected",
-                patch={"entry_order_id": order_id, "submit_status": "rejected",
+                patch={**rejection, "entry_order_id": order_id, "submit_status": "rejected",
                        **send_receipt_base, "submit_stage": "exchange_rejected",
                        "submit_finished_at": rejected_at,
                        "submit_receipt_at": rejected_at},
@@ -10194,20 +10982,25 @@ class PolymarketLPService:
                 if str(exc) == "candidate_best_bid_changed":
                     return {"state": "rejected", "reason": "best_bid_changed"}
                 return {"state": "rejected", "reason": str(exc)}
-            # Issue 163 定案 1（评审修复 P1）：默认试挂单锚定本次唯一快照的
-            # 盘口顶档买一 max(bids)——与 _validate_snapshot 的 candidate 检查
-            # 同源同口径（候选行 guidance 价与 UI 预填价即顶档）。奖励资格买一
-            # （facts["best_bid"]，自顶档向下累计到 reward_min_size 才落定）在
-            # 薄顶档市场低于顶档，不得用作锚，否则确认价=顶档时两个检查互斥、
-            # 提交被永久锁死。5%/custom plans do not anchor.
+            # Candidate submissions anchor to the selected configured bid level
+            # from this one snapshot. Manual/custom plans do not anchor.
             if normalized.get("candidate_policy") == "best_bid_minimum":
                 book = snapshot.get("book")
                 bids = self._levels(book.get("bids"), "bids")
-                if (
-                    cast(Decimal, normalized["price"])
-                    != max(level_price for level_price, _ in bids)
-                ):
-                    return {"state": "rejected", "reason": "best_bid_changed"}
+                try:
+                    selected_bid, _selected_bid_size = _select_bid_level(
+                        bids,
+                        normalized.get(
+                            "candidate_bid_level", normalized.get("bid_level", 1)
+                        ),
+                    )
+                except ValueError as exc:
+                    return {"state": "rejected", "reason": str(exc)}
+                if cast(Decimal, normalized["price"]) != selected_bid:
+                    return {
+                        "state": "rejected",
+                        "reason": "candidate_bid_level_changed",
+                    }
             try:
                 expiration = expiration_for_review(
                     _timestamp(normalized["review_at"], name="review_at"),
@@ -10279,14 +11072,18 @@ class PolymarketLPService:
                     attempted_at=now,
                     reason=type(exc).__name__,
                 )
-            with self._mutex:
-                current = self.store.lp_session(str(session["session_id"]))
-                if current is None:
-                    return {"state": "none", "session_id": session.get("session_id")}
+            try:
+                # The Store merges this narrow observation into the current
+                # row atomically. Do not wait for the service mutex while
+                # owning write admission: legacy reconciliation holds it.
                 updated = self.store.lp_update_session(
                     str(session["session_id"]),
                     patch={"reward_observation": observation},
                 )
+            except ValueError as exc:
+                if str(exc) != "lp_session_not_found":
+                    raise
+                return {"state": "none", "session_id": session.get("session_id")}
             return self._status_payload(updated)
 
     @staticmethod
@@ -11136,9 +11933,11 @@ class PolymarketLPService:
             "data_failures": _queue_group_failures_int(failures.get("data_failures")),
             "levels": new_levels,
         }
-        return self.store.lp_update_session(
+        updated = self.store.lp_update_session(
             str(session["session_id"]), patch=session_patch
         )
+        self._notify_committed_protection_cancels(updated)
+        return updated
 
     def tick(self) -> dict[str, object]:
         """Run one deterministic monitoring/reconciliation iteration."""
@@ -11678,17 +12477,21 @@ class PolymarketLPService:
                     statuses.update({oid: str(row.get('status', '')).upper()
                                      for oid, row in self._order_history(current).items()})
                     for action in self.store.lp_actions(session_id):
-                        if action.get('state') not in {'pending', 'unknown'} or 'cancel' not in str(action.get('action_key')):
+                        if action.get('state') not in {'pending', 'unknown'} or submission_action_kind(action) != 'cancel':
                             continue
                         targets = action.get('targets') or [action.get('order_id')]
                         if targets and all(statuses.get(oid) in TERMINAL_ORDER_STATES for oid in targets):
                             resolved_cancels.append(action['action_id'])
+                def publish_normal(current, *, connection, error):
+                    return self._facts_publisher(current, connection=connection, error=error,
+                        normal_facts=snapshot if not error else None)
                 try:
                     with _lp_read_stage("facts_publish", timings):
                         current, changed = self.store.lp_publish_facts(
                             session_id, revision, patch=patch, state=state,
                             trade_generation=observed_trade_generation,
-                            publish=self._facts_publisher, error=error, resolved_cancels=resolved_cancels,
+                            publish=publish_normal if self._facts_publisher else None,
+                            error=error, resolved_cancels=resolved_cancels,
                         )
                 except ValueError as exc:
                     if str(exc) == 'account_round_invalid':
@@ -11740,8 +12543,15 @@ class PolymarketLPService:
         # Their reads and protection sends never own the common publication or
         # execution locks; unrelated sessions can continue reconciling.
         # they must not own the common publication mutex or execution lock.
-        with self._first_seen_apply_lock:
-            self._apply_first_seen_protections()
+        cancel_notices = []
+        self._deferred_protection_notices.cancels = cancel_notices
+        try:
+            with self._first_seen_apply_lock:
+                self._apply_first_seen_protections()
+        finally:
+            self._deferred_protection_notices.cancels = None
+            for notice in cancel_notices:
+                self._start_protection_cancel_notice(*notice)
 
         verifier = self._facts_attention_verifier
         if callable(verifier):
@@ -11819,6 +12629,250 @@ class PolymarketLPService:
             return result[4] or self._status_payload(result[0])
         except Exception as exc:
             return {'state': 'error', 'session_id': session_id, 'error': type(exc).__name__}
+        finally:
+            # This risk rule belongs to normal LP monitoring, including when
+            # the automatic BUY pool is paused or account/history reads fail.
+            self._monitor_buy_yield(session_id)
+
+    def _refresh_buy_yield(self, session_id, *, current_account=None):
+        """Publish only current per-order yield fields, independently of admission."""
+        session = self.store.lp_session(session_id)
+        wallet = str(getattr(getattr(self.exchange, 'config', None), 'wallet_address', '') or '').casefold()
+        if (not session or not wallet or str(session.get('account_id') or '').casefold() != wallet
+                or session.get('order_identity_conflict')):
+            return None
+        history = self._order_history(session)
+        buys = {oid: row for oid, row in history.items()
+            if row.get('side') == 'BUY' and row.get('status') == 'LIVE'
+            and row.get('token_id') == session.get('token_id')
+            and self._queue_row_remaining(row) is not None and self._queue_row_remaining(row) > 0}
+        if not buys:
+            return None
+        anchors = deepcopy(buys)
+        unproven, order_provenance = set(), {}
+        current_generation = None
+        component = (current_account.get('components') or {}).get('open_orders') if isinstance(current_account, Mapping) else None
+        current_orders = (isinstance(component, Mapping) and component.get('state') == 'known'
+            and current_account.get('open_orders_complete') is True)
+        previous_observations = session.get('buy_yield_observations') or {}
+        for oid, anchor in anchors.items():
+            previous = previous_observations.get(oid) or {}
+            if not current_orders and not previous.get('order_current_proof_required') and not previous.get('order_checked_at'):
+                continue  # Default/manual history has no independent current-order proof.
+            try:
+                if current_orders:
+                    checked_at = component.get('checked_at')
+                    read_started_at = component.get('read_started_at')
+                    generation = current_account.get('trade_generation')
+                    if (current_account.get('authenticated') is not True
+                            or str(current_account.get('wallet_address') or '').casefold() != wallet
+                            or str(current_account.get('account_id') or '').casefold() != wallet):
+                        raise ValueError('current_order_identity_unknown')
+                    rows = [r for r in current_account.get('open_orders') or () if r.get('order_id') == oid]
+                    row = rows[0] if len(rows) == 1 else {}
+                else:
+                    # Monitoring can reuse the same proved terms, but cannot
+                    # renew their source time or restore older history as fresh.
+                    if previous.get('order_proof_invalidated_at'):
+                        raise ValueError('current_order_proof_invalidated')
+                    checked_at = previous['order_checked_at']
+                    read_started_at = previous.get('order_read_started_at')
+                    generation = previous.get('order_trade_generation')
+                    row = previous.get('order_terms') or {}
+                    if previous.get('account_id') != wallet or previous.get('order_id') != oid:
+                        raise ValueError('current_order_identity_unknown')
+                _freshness(checked_at, self._now(), 'order_freshness', max_age=60)
+                invalidated_at = previous.get('order_proof_invalidated_at')
+                if invalidated_at and _timestamp(checked_at) <= _timestamp(invalidated_at):
+                    raise ValueError('current_order_proof_invalidated')
+                if type(generation) is not int or generation != self.store.lp_trade_generation():
+                    raise ValueError('current_order_generation_unknown')
+                current_generation = generation
+                original = _maybe_decimal(anchor.get('original_size', anchor.get('quantity')))
+                matched = _maybe_decimal(row.get('size_matched'))
+                old_matched = _maybe_decimal(anchor.get('size_matched'))
+                if (oid not in self._session_order_ids(session) or row.get('order_id') != oid
+                        or row.get('side') != 'BUY' or row.get('status') != 'LIVE'
+                        or row.get('token_id') != session.get('token_id')
+                        or row.get('condition_id') != session.get('condition_id')
+                        or _maybe_decimal(row.get('price')) != _maybe_decimal(anchor.get('price'))
+                        or _maybe_decimal(row.get('original_size', row.get('quantity'))) != original
+                        or original is None or matched is None or old_matched is None
+                        or not old_matched <= matched <= original or original <= matched):
+                    raise ValueError('current_order_terms_unknown')
+                buys[oid] = deepcopy(row)
+                order_provenance[oid] = dict(order_checked_at=checked_at,
+                    order_read_started_at=read_started_at, order_trade_generation=generation,
+                    order_terms=deepcopy(row), order_current_proof_required=True,
+                    order_proof_invalidated_at=None)
+            except (ValueError, TypeError, KeyError):
+                unproven.add(oid)
+                # Retain provenance even for UNKNOWN so a later monitor cannot
+                # treat the historical anchor as newly proved current terms.
+                order_provenance[oid] = {k: deepcopy(previous[k]) for k in
+                    ('order_checked_at', 'order_read_started_at', 'order_trade_generation', 'order_terms')
+                    if k in previous}
+                order_provenance[oid]['order_current_proof_required'] = True
+                invalidated_at = previous.get('order_proof_invalidated_at')
+                if current_orders:
+                    try:
+                        denied_at = _timestamp(component.get('checked_at'))
+                    except (ValueError, TypeError):
+                        denied_at = self._now()
+                    invalidated_at = _iso(max(denied_at, _timestamp(invalidated_at))) if invalidated_at else _iso(denied_at)
+                order_provenance[oid]['order_proof_invalidated_at'] = invalidated_at or _iso(self._now())
+        direction = None
+        error = None
+        started_at = self._now()
+        try:
+            direction = self._market_read(session, lambda: self._fetch_market_direction(session))
+            now = self._now()
+            _freshness(direction.get('reward_checked_at'), now, 'reward_data', max_age=60)
+            _freshness(direction['book'].get('received_at'), now, 'book_freshness', max_age=60)
+        except Exception as exc:
+            now = self._now()
+            direction = None
+            error = type(exc).__name__
+
+        estimates = {}
+        for oid, row in buys.items():
+            remaining = self._queue_row_remaining(row)
+            estimate = None
+            if direction is not None and oid not in unproven:
+                try:
+                    estimate = minimum_order_estimate(direction,
+                        {'price': row['price'], 'quantity': remaining}, now, resting_quantity=remaining)
+                except (ValueError, KeyError, TypeError):
+                    pass
+            estimates[oid] = estimate
+            _reader_capture('yield', order_id=oid, account_id=wallet, direction=direction,
+                order_terms=row, guidance={'price': row['price'], 'quantity': remaining}, as_of=now, resting_quantity=remaining,
+                old=estimate.get('yield_pct_per_hour') if estimate else None)
+
+        def publish(current, connection):
+            timers = deepcopy(current.get('buy_yield_unknown') or {})
+            observations = deepcopy(current.get('buy_yield_observations') or {})
+            for oid, row in buys.items():
+                actual = self._order_history(current).get(oid)
+                if (str(current.get('account_id') or '').casefold() != wallet
+                        or current.get('order_identity_conflict')
+                        or actual != anchors[oid]
+                        or current_generation is not None and int(connection.execute('SELECT generation FROM lp_trade_generation WHERE singleton=1').fetchone()[0]) != current_generation
+                        or _timestamp((observations.get(oid) or {}).get('attempted_at') or _iso(started_at)) > started_at):
+                    continue
+                previous = observations.get(oid) or {}
+                prepared = previous_observations.get(oid) or {}
+                # A later start cannot renew authority read before another
+                # publisher changed its proof or denial. Fence both directions:
+                # stale known and stale UNKNOWN must preserve the current proof.
+                if any(previous.get(key) != prepared.get(key) for key in (
+                        'account_id', 'order_id', 'order_checked_at', 'order_read_started_at',
+                        'order_trade_generation', 'order_terms', 'order_current_proof_required',
+                        'order_proof_invalidated_at')):
+                    continue
+                remaining = self._queue_row_remaining(row)
+                estimate = estimates[oid]
+                known = estimate is not None and estimate.get('state') == 'known'
+                observations[oid] = dict(estimate or {'state': 'unknown'})
+                observations[oid].update(account_id=wallet, order_id=oid,
+                    quantity=str(remaining), price=str(row['price']), attempted_at=_iso(started_at),
+                    checked_at=_iso(now), error=None if known else 'current_order_unknown' if oid in unproven else error or 'buy_yield_unknown',
+                    last_success_at=_iso(now) if known else previous.get('last_success_at'),
+                    reward_checked_at=direction.get('reward_checked_at') if direction else None,
+                    book_received_at=direction['book'].get('received_at') if direction else None)
+                observations[oid].update(order_provenance.get(oid) or {})
+                if known:
+                    timers.pop(oid, None)
+                else:
+                    timers.setdefault(oid, {'account_id': wallet, 'unknown_since': _iso(now)})
+            return {'buy_yield_unknown': timers, 'buy_yield_observations': observations}
+
+        current = self.store.lp_update_session(session_id, patch_builder=publish)
+        return buys, current.get('buy_yield_unknown') or {}, now
+
+    def _monitor_buy_yield(self, session_id):
+        refreshed = self._refresh_buy_yield(session_id)
+        if refreshed is None:
+            return
+        buys, timers, now = refreshed
+        wallet = str(getattr(getattr(self.exchange, 'config', None), 'wallet_address', '') or '').casefold()
+        for oid in buys:
+            timer = timers.get(oid)
+            if (not timer or timer.get('account_id') != wallet
+                    or now - _timestamp(timer['unknown_since']) < timedelta(seconds=600)):
+                continue
+            with self._mutex:
+                if not self._mutation_allowed():
+                    continue
+                current = self.store.lp_session(session_id)
+                if (not current or current.get('order_identity_conflict')
+                        or str(current.get('account_id') or '').casefold() != wallet):
+                    continue
+                actual_timer = (current.get('buy_yield_unknown') or {}).get(oid)
+                if actual_timer != timer:
+                    continue
+                current_order = self._order_history(current).get(oid)
+                remaining = self._queue_row_remaining(current_order)
+                if (not current_order or current_order.get('side') != 'BUY'
+                        or current_order.get('status') != 'LIVE'
+                        or current_order.get('token_id') != current.get('token_id')
+                        or remaining is None or remaining <= 0):
+                    continue
+                previous_key = actual_timer.get('cancel_request_key')
+                if previous_key:
+                    previous = next((a for a in self.store.lp_actions(session_id)
+                        if a.get('action_key') == previous_key), None)
+                    if (not previous or previous.get('session_id') != session_id
+                            or previous.get('order_id') != oid
+                            or previous.get('role') != 'reconciliation_cancel'
+                            or previous.get('reason') != 'buy_yield_unknown_timeout'
+                            or previous.get('state') != 'rejected'
+                            or previous.get('post_started') is not False
+                            or previous.get('submit_stage') != 'pre_send_rejected'):
+                        continue
+                key = self._action_key(session_id, 'reconciliation-cancel', uuid.uuid4().hex)
+                payload = dict(role='reconciliation_cancel', order_id=oid,
+                    submit_requested_at=_iso(self._now()), reason='buy_yield_unknown_timeout')
+                def claim(latest, connection):
+                    # Publication and this claim serialize in the existing
+                    # writer; eligibility from the earlier read grants no send.
+                    latest_timer = (latest.get('buy_yield_unknown') or {}).get(oid)
+                    order = self._order_history(latest).get(oid)
+                    if (latest_timer != timer or oid not in self._session_order_ids(latest)
+                            or self._now() - _timestamp(timer['unknown_since']) < timedelta(seconds=600)
+                            or latest.get('order_identity_conflict')
+                            or str(latest.get('account_id') or '').casefold() != wallet
+                            or (latest.get('buy_yield_observations') or {}).get(oid, {}).get('state') == 'known'
+                            or not order or order.get('side') != 'BUY' or order.get('status') != 'LIVE'
+                            or order.get('token_id') != latest.get('token_id')
+                            or self._queue_row_remaining(order) is None or self._queue_row_remaining(order) <= 0):
+                        return None
+                    if previous_key:
+                        previous_row = connection.execute('SELECT * FROM lp_actions WHERE session_id=? AND action_key=?',
+                            (session_id, previous_key)).fetchone()
+                        previous_payload = json.loads(previous_row['payload']) if previous_row else {}
+                        if (not previous_row or previous_row['state'] != 'rejected'
+                                or previous_payload.get('order_id') != oid
+                                or previous_payload.get('role') != 'reconciliation_cancel'
+                                or previous_payload.get('reason') != 'buy_yield_unknown_timeout'
+                                or previous_payload.get('post_started') is not False
+                                or previous_payload.get('submit_stage') != 'pre_send_rejected'):
+                            return None
+                    saved = deepcopy(latest.get('buy_yield_unknown') or {})
+                    saved[oid] = {**latest_timer, 'cancel_request_key': key}
+                    return {'buy_yield_unknown': saved}
+                registered = self.store.lp_register_fenced_actions(session_id,
+                    [dict(action_key=key, payload=payload)], patch_builder=claim)
+                if not registered:
+                    continue
+                own = [(session_id, key, payload)]
+            try:
+                self._cancel_order(oid, attempts=own)
+            except _MutationBlocked:
+                # The lane committed the exact unsent rejection and its proof.
+                pass
+            except Exception:
+                logger.exception('lp_buy_yield_unknown_cancel_failed')
 
     def _apply_tick_snapshot(
         self, session, snapshot, initial_revision, reason, *,
@@ -11969,6 +13023,8 @@ class PolymarketLPService:
                 production_reconcile = False
                 return reconcile(current)
 
+        cancel_notices = []
+        self._deferred_protection_notices.cancels = cancel_notices
         self._deferred_protection_notices.notices = deferred_notices
         self._facts_apply_lock.acquire()
         try:
@@ -11987,6 +13043,9 @@ class PolymarketLPService:
             finally:
                 self._deferred_protection_notices.notices = None
                 self._facts_apply_lock.release()
+                self._deferred_protection_notices.cancels = None
+        for notice in cancel_notices:
+            self._start_protection_cancel_notice(*notice)
         for title, message, xiaoai, mark_delivered in deferred_notices:
             if self._notify_protection(title, message, xiaoai):
                 mark_delivered()
@@ -12081,6 +13140,7 @@ class PolymarketLPService:
                 current = self.store.lp_merge_queue_protection_bucket(
                     session_id, level_key=key, bucket=converged
                 )
+                self._notify_committed_protection_cancels(current)
         protection = current.get("queue_protection")
         canceling = any(
             str(bucket.get("state")) == "canceling"
@@ -12269,10 +13329,12 @@ class PolymarketLPService:
             targets: list[str] = []
             patch: dict[str, object] = {}
             protected_id = str(current.get("protected_exit_order_id") or "")
-            for key, requested_key in (
+            cancel_fields = [
                 ("entry_order_id", "entry_cancel_requested"),
-                ("passive_exit_order_id", "passive_cancel_requested"),
-            ):
+            ]
+            if reason != "group_fill_collect":
+                cancel_fields.append(("passive_exit_order_id", "passive_cancel_requested"))
+            for key, requested_key in cancel_fields:
                 order_id = str(current.get(key) or "")
                 if (
                     order_id
@@ -12288,7 +13350,11 @@ class PolymarketLPService:
             }
             for order_id, record in history.items():
                 if (
-                    not order_id
+                    (
+                        reason == "group_fill_collect"
+                        and order_id == str(current.get("passive_exit_order_id") or "")
+                    )
+                    or not order_id
                     or order_id == protected_id
                     or order_id in targets
                     or str(record.get("side") or "").upper() != "SELL"
@@ -12405,7 +13471,7 @@ class PolymarketLPService:
         now = self._now()
         blocked: set[str] = set()
         for action in self.store.lp_actions(session_id):
-            if "cancel" not in str(action.get("role")) and "cancel" not in str(action.get("action_key")):
+            if submission_action_kind(action) != 'cancel':
                 continue
             if str(action.get("state")) != "pending":
                 continue
@@ -12527,14 +13593,14 @@ class PolymarketLPService:
             }:
                 continue
             if hasattr(self.store, "lp_merge_queue_protection_bucket"):
-                merger(
+                committed = merger(
                     session_id,
                     level_key=key,
                     bucket=next_bucket,
                     patch=patch,
                 )
             else:
-                merger(
+                committed = merger(
                     session_id,
                     queue_protection={
                         "version": 2,
@@ -12542,6 +13608,7 @@ class PolymarketLPService:
                     },
                     patch=patch,
                 )
+            self._notify_committed_protection_cancels(committed)
             protected_levels.add(key)
             writes += 1
         return protected_levels, writes
@@ -12954,10 +14021,10 @@ class PolymarketLPService:
         *,
         trade_revision: int | None = None,
     ) -> Mapping[str, object]:
-        """Issue 167 D3: after any fill, cancel every owned sweep target.
+        """After any fill, collect owned orders except the managed passive exit.
 
-        ``_cancel_owned_orders`` preserves review/stop semantics for entry,
-        passive, and augment targets while authorizing the complete actual
+        ``_cancel_owned_orders`` retains entry, historical SELL, and augment
+        cleanup with the same ownership checks and authorizes the complete
         batch before its first venue cancel.
         """
 
@@ -12977,6 +14044,7 @@ class PolymarketLPService:
                 snapshot=snapshot,
                 expected_generation=snapshot.get("_lp_trade_generation"),
                 expected_trade_revision=trade_revision,
+                preserve_passive_exit=True,
             )
         except ValueError as exc:
             if str(exc) == "account_round_invalid":
@@ -13122,6 +14190,11 @@ class PolymarketLPService:
             if result.get("review_at") is None
             else _timestamp(result.get("review_at"), name="review_at")
         )
+        if result.get("candidate_policy") == "best_bid_minimum":
+            level = result.get("candidate_bid_level", result.get("bid_level", 1))
+            if type(level) is not int or level not in (1, 2):
+                raise ValueError("bid_level_invalid")
+            result["candidate_bid_level"] = level
         return result
 
     def _read_snapshot(
@@ -13373,6 +14446,28 @@ class PolymarketLPService:
         else:
             available_balance = balance_d
             available_allowance = allowance_d
+        rules = cls._validate_market_rules(request, snapshot)
+        if (available_balance < 0 or available_allowance < 0
+                or available_balance < request["price"] * request["quantity"]
+                or available_allowance < request["price"] * request["quantity"]):
+            raise ValueError("balance_insufficient")
+        facts = cls._validate_market_book(request, snapshot, rules, now=now)
+        return {**facts, "balance": balance_d, "allowance": allowance_d}
+
+    @classmethod
+    def _validate_market_snapshot(cls, request, snapshot, *, now):
+        """Validate the frozen order against current market facts only."""
+        rules = cls._validate_market_rules(request, snapshot)
+        facts = cls._validate_market_book(request, snapshot, rules, now=now)
+        stress = estimate_lp_stress_exit(snapshot.get('book'), market=snapshot['market'],
+            price=request['price'], quantity=request['quantity'],
+            bid_level=request.get('candidate_bid_level', request.get('bid_level', 1)))
+        if stress['state'] != 'eligible':
+            raise ValueError(stress['reason_codes'][0])
+        return facts
+
+    @classmethod
+    def _validate_market_rules(cls, request, snapshot):
         market = snapshot.get("market")
         if not isinstance(market, Mapping):
             raise ValueError("market_unknown")
@@ -13435,13 +14530,14 @@ class PolymarketLPService:
             raise ValueError("price_off_tick")
         if quantity < minimum_d or quantity < reward_min_d:
             raise ValueError("order_size_invalid")
-        if (
-            available_balance < 0
-            or available_allowance < 0
-            or available_balance < price * quantity
-            or available_allowance < price * quantity
-        ):
-            raise ValueError("balance_insufficient")
+        return dict(tick_size=tick_d, minimum_order_size=minimum_d,
+            reward_min_size=reward_min_d, reward_max_spread=reward_spread_d,
+            fee=fee_d, taker_fee_rate=taker_fee_rate_d)
+
+    @classmethod
+    def _validate_market_book(cls, request, snapshot, rules, *, now):
+        price, quantity = request['price'], request['quantity']
+        reward_min_d, reward_spread_d = rules['reward_min_size'], rules['reward_max_spread']
         book = snapshot.get("book")
         if not isinstance(book, Mapping):
             raise ValueError("book_unknown")
@@ -13461,10 +14557,17 @@ class PolymarketLPService:
         bids = cls._levels(book.get("bids"), "bids")
         if not asks or not bids:
             raise ValueError("book_invalid")
+        selected_bid, _selected_bid_size = _select_bid_level(
+            bids,
+            request.get("candidate_bid_level", request.get("bid_level", 1)),
+        )
         if candidate_policy == "best_bid_minimum":
-            external_best_bid = max(level_price for level_price, _ in bids)
-            if price != external_best_bid:
-                raise ValueError("candidate_best_bid_changed")
+            if price != selected_bid:
+                level = request.get("candidate_bid_level", request.get("bid_level", 1))
+                raise ValueError(
+                    "candidate_best_bid_changed" if level == 1
+                    else "candidate_bid_level_changed"
+                )
         bid, ask, midpoint = _qualify_reward_quote(
             bids,
             asks,
@@ -13479,16 +14582,13 @@ class PolymarketLPService:
         review_at = _timestamp(request["review_at"], name="review_at")
         expiration = expiration_for_review(review_at, now=now)
         return {
-            "tick_size": tick_d,
-            "minimum_order_size": minimum_d,
-            "reward_min_size": reward_min_d,
-            "reward_max_spread": reward_spread_d,
-            "fee": fee_d,
-            "taker_fee_rate": taker_fee_rate_d,
-            "balance": balance_d,
-            "allowance": allowance_d,
+            **rules,
             "midpoint": midpoint,
             "best_bid": bid[0],
+            "selected_bid": selected_bid,
+            "selected_bid_level": request.get(
+                "candidate_bid_level", request.get("bid_level", 1)
+            ),
             "best_ask": ask[0],
             "midpoint_source": "local_size_filtered_estimate",
             "checked_at": now,
@@ -13650,6 +14750,96 @@ class PolymarketLPService:
         )
         return updated
 
+    @staticmethod
+    def _protection_cancel_event(session, bucket, *, first_seen=False) -> str:
+        if first_seen:
+            return f"{session['episode_id']}:first-seen-protection-cancel"
+        anchor = str(bucket.get("order_id") or "") or format(
+            _decimal(bucket["baseline_price"], "baseline_price"), "f"
+        )
+        return f"{session['session_id']}:entry-protection-cancel:{anchor}"
+
+    def _restore_protection_cancel_events(self) -> None:
+        """Restore business only: pre-existing cancel actions can never notify."""
+        sessions = self.store.lp_sessions()
+        for session in sessions:
+            actions = self.store.lp_actions(str(session["session_id"]))
+            for action in actions:
+                if action.get("role") == "entry-protection-cancel":
+                    self._protection_cancel_events.add(str(action["action_key"]))
+                elif action.get("role") == "first-seen-protection-cancel":
+                    self._protection_cancel_events.add(
+                        f"{action['episode_id']}:first-seen-protection-cancel"
+                    )
+            # Legacy business images may lack the cancel action audit.
+            for bucket in self._queue_protection_levels(session).values():
+                if bucket.get("cancel_targets") or bucket.get("state") in {"canceling", "canceled", "partially_filled"}:
+                    self._protection_cancel_events.add(self._protection_cancel_event(session, bucket))
+        for episode in self.store.lp_active_first_seen_episodes():
+            if episode.get("cancel_targets") or episode.get("state") == "canceling":
+                self._protection_cancel_events.add(
+                    self._protection_cancel_event(episode, episode, first_seen=True)
+                )
+
+    def _notify_committed_protection_cancels(self, session, *, first_seen=False) -> None:
+        """Consume each real cancel episode once, after its business commit."""
+        if not self._protection_cancel_enabled:
+            return
+        buckets = {"": session} if first_seen else self._queue_protection_levels(session)
+        for bucket in buckets.values():
+            # Non-protection sweeps preset this flag to suppress alerts.
+            if bucket.get("notification_sent") is True:
+                continue
+            canceled = self._merge_order_id_lists(bucket.get("canceled_order_ids"))
+            targets = self._merge_order_id_lists(bucket.get("cancel_targets"))
+            if not canceled or not (
+                bucket.get("state") in {"canceled", "partially_filled"}
+                or (targets and set(targets) <= set(canceled))
+            ):
+                continue
+            event = self._protection_cancel_event(session, bucket, first_seen=first_seen)
+            with self._protection_cancel_lock:
+                if event in self._protection_cancel_events:
+                    continue
+                self._protection_cancel_events.add(event)
+            title = ("LP 位置保护撤单（首见基线）" if first_seen else
+                     self._queue_protection_price_title(session, bucket, "位置保护已触发撤单"))
+            notice = self._queue_protection_success_notification(
+                bucket, session, canceled_count=len(canceled),
+                manual_count=(len(canceled) if first_seen else
+                              sum(order != session.get("entry_order_id") for order in canceled)),
+                canceled_remaining=self._episode_canceled_remaining(
+                    bucket.get("cancel_target_remaining"), canceled
+                ),
+                title=title, trigger_prefix="首见基线 · " if first_seen else "",
+            )
+            # Only volatile work exists after commit; a crash/drop is final.
+            pending = getattr(self._deferred_protection_notices, "cancels", None)
+            if pending is not None:
+                pending.append((event, *notice))
+            else:
+                self._start_protection_cancel_notice(event, *notice)
+
+    def _start_protection_cancel_notice(self, event, title, message, voice) -> threading.Thread | None:
+        # A daemon task owns only this message. Runtime stop does not
+        # wait for it; process exit may drop it, and startup never replays it.
+        event_id = hashlib.sha256(event.encode()).hexdigest()[:16]
+
+        def deliver():
+            results = self._deliver_protection_details(title, message, voice, one_shot=True)
+            for channel, success in results.items():
+                logger.log(logging.INFO if success else logging.WARNING,
+                           "lp_protection_cancel_notice event=%s channel=%s at=%s outcome=%s error_type=%s",
+                           event_id, channel, _iso(self._now()), "success" if success else "unconfirmed",
+                           "none" if success else "delivery_unconfirmed")
+
+        try:
+            worker = threading.Thread(target=deliver, name="lp-protection-cancel-notice", daemon=True)
+            worker.start()
+            return worker
+        except Exception as exc:
+            logger.warning("lp_protection_cancel_enqueue_failed event=%s error_type=%s", event_id, type(exc).__name__)
+
     def _deliver_protection_details(
         self,
         title: str,
@@ -13657,10 +14847,13 @@ class PolymarketLPService:
         xiaoai_text: str,
         *,
         channels: set[str] | None = None,
+        one_shot: bool = False,
     ) -> dict[str, bool]:
         """Return per-channel delivery facts without turning partial success true."""
         callback = self._protection_notifier
         if callback is None:
+            if one_shot:
+                return {}
             if channels is None:
                 return {"feishu": False, "xiaoai": False}
             return {name: False for name in channels}
@@ -13674,16 +14867,27 @@ class PolymarketLPService:
                 pass
             else:
                 kwargs["channels"] = channels
+        if one_shot:
+            try:
+                inspect.signature(callback).bind(
+                    title, message, xiaoai_text, **kwargs, one_shot=True
+                )
+            except (TypeError, ValueError):
+                pass
+            else:
+                kwargs["one_shot"] = True
         try:
             result = callback(title, message, xiaoai_text, **kwargs)
-        except Exception:
+        except Exception as exc:
+            if one_shot:
+                logger.warning("lp_protection_cancel_callback_failed error_type=%s", type(exc).__name__)
             if channels is None:
                 return {"feishu": False, "xiaoai": False}
             return {name: False for name in channels}
         if isinstance(result, Mapping):
             return {
                 str(key): bool(result.get(key))
-                for key in (channels if channels is not None else {"feishu", "xiaoai"})
+                for key in (result if one_shot else channels if channels is not None else {"feishu", "xiaoai"})
             }
         delivered = result is True
         if channels is None:
@@ -14837,34 +16041,6 @@ class PolymarketLPService:
         updated["cancel_requested_at"] = _iso(self._now())
         if failed:
             updated["cancel_failure"] = failure_error or "cancel_not_acknowledged"
-        canceled_set = set(episode_canceled)
-        episode_complete = bool(episode_targets) and all(
-            order_id in canceled_set for order_id in episode_targets
-        )
-        if episode_complete:
-            manual_count = sum(
-                1 for order_id in episode_canceled if order_id != entry_order_id
-            )
-            title, message, xiaoai = self._queue_protection_success_notification(
-                updated,
-                session,
-                canceled_count=len(episode_canceled),
-                manual_count=manual_count,
-                canceled_remaining=episode_remaining,
-                title=self._queue_protection_price_title(
-                    session, updated, "位置保护已触发撤单"
-                ),
-            )
-            if self._notify_bucket_protection(
-                session,
-                updated,
-                bucket_key or str(bucket.get("order_id") or ""),
-                "notification_sent",
-                title,
-                message,
-                xiaoai,
-            ):
-                updated["notification_sent"] = True
 
         session_patch: dict[str, object] = {}
         if entry_order_id in targets and not bool(session.get("entry_cancel_requested")):
@@ -15051,40 +16227,10 @@ class PolymarketLPService:
             updated.get("canceled_order_ids"), receipt_canceled
         )
         updated["canceled_order_ids"] = canceled
-        if updated.get("notification_sent") is not True and canceled:
-            entry_order_id = str(session.get("entry_order_id") or "")
-            # Issue 152 review fix: report the total from the per-target
-            # cancel-time remaining persisted at request time, so orders the
-            # venue canceled without our acknowledgment keep their share
-            # instead of fabricating 0.
+        if canceled:
             updated["canceled_remaining"] = self._episode_canceled_remaining(
                 updated.get("cancel_target_remaining"), canceled
             )
-            manual_count = sum(
-                1 for order_id in canceled if order_id != entry_order_id
-            )
-            title, message, xiaoai = self._queue_protection_success_notification(
-                updated,
-                session,
-                canceled_count=len(canceled),
-                manual_count=manual_count,
-                canceled_remaining=_maybe_decimal(
-                    updated.get("canceled_remaining")
-                ),
-                title=self._queue_protection_price_title(
-                    session, updated, "位置保护已触发撤单"
-                ),
-            )
-            if self._notify_bucket_protection(
-                session,
-                updated,
-                bucket_key or str(bucket.get("order_id") or ""),
-                "notification_sent",
-                title,
-                message,
-                xiaoai,
-            ):
-                updated["notification_sent"] = True
         return updated
 
     def _apply_queue_protection(
@@ -15207,6 +16353,7 @@ class PolymarketLPService:
                 session_id,
                 patch={**session_patch, "queue_protection": queue_payload},
             )
+        self._notify_committed_protection_cancels(updated)
         return updated
 
     # ---- Issue 159: first-seen baseline fallback protections ----
@@ -15465,12 +16612,14 @@ class PolymarketLPService:
         """Persist one account-derived observation or reject it as stale."""
 
         try:
-            return self.store.lp_update_first_seen_episode(
+            updated = self.store.lp_update_first_seen_episode(
                 episode_id,
                 state=state,
                 patch=patch,
                 expected_generation=expected_generation,
             )
+            self._notify_committed_protection_cancels(updated, first_seen=True)
+            return updated
         except ValueError as exc:
             if str(exc) == "account_round_invalid":
                 return None
@@ -15837,25 +16986,10 @@ class PolymarketLPService:
             updated.get("canceled_order_ids"), receipt_canceled
         )
         updated["canceled_order_ids"] = canceled
-        if updated.get("notification_sent") is not True and canceled:
+        if canceled:
             updated["canceled_remaining"] = self._episode_canceled_remaining(
                 updated.get("cancel_target_remaining"), canceled
             )
-            # Every first-seen target is a manual web order.
-            manual_count = len(canceled)
-            title, message, xiaoai = self._queue_protection_success_notification(
-                updated,
-                episode,
-                canceled_count=len(canceled),
-                manual_count=manual_count,
-                canceled_remaining=_maybe_decimal(
-                    updated.get("canceled_remaining")
-                ),
-                title="LP 位置保护撤单（首见基线）",
-                trigger_prefix="首见基线 · ",
-            )
-            self._notify_protection(title, message, xiaoai)
-            updated["notification_sent"] = True
         return updated
 
     def _request_first_seen_protection_cancel(
@@ -16144,23 +17278,6 @@ class PolymarketLPService:
         updated["cancel_requested_at"] = _iso(self._now())
         if failed:
             updated["cancel_failure"] = failure_error or "cancel_not_acknowledged"
-        canceled_set = set(episode_canceled)
-        episode_complete = bool(episode_targets) and all(
-            order_id in canceled_set for order_id in episode_targets
-        )
-        if episode_complete:
-            manual_count = len(episode_canceled)
-            title, message, xiaoai = self._queue_protection_success_notification(
-                updated,
-                episode,
-                canceled_count=len(episode_canceled),
-                manual_count=manual_count,
-                canceled_remaining=episode_remaining,
-                title="LP 位置保护撤单（首见基线）",
-                trigger_prefix="首见基线 · ",
-            )
-            self._notify_protection(title, message, xiaoai)
-            updated["notification_sent"] = True
         return updated
 
     @staticmethod
@@ -16349,11 +17466,17 @@ class PolymarketLPService:
             and _maybe_decimal(fact.get("fee")) is not None
         )
 
-    def _create_limit(self, **kwargs: object) -> object:
+    def _create_limit(self, *, plan_authorization=None, **kwargs: object) -> object:
         self._require_mutation()
+        if plan_authorization is not None:
+            from .polymarket_lp_auto import _PlanEntryAuthorization
+            if not isinstance(plan_authorization, _PlanEntryAuthorization) or plan_authorization.pool.lp is not self:
+                raise _MutationBlocked('plan_authorization_invalid')
+            plan_authorization.validate(kwargs)
         if (
             str(kwargs.get("side") or "").upper() == "BUY"
             and self._account_order_sync_error is not None
+            and plan_authorization is None
         ):
             raise _MutationBlocked(self._account_order_sync_error)
         direct = getattr(self.exchange, "lp_create_limit_order", None)
@@ -16370,11 +17493,18 @@ class PolymarketLPService:
         *,
         side: str | None = None,
         on_post_started: Callable[[], None] | None = None,
+        plan_authorization=None,
     ) -> object:
         self._require_mutation()
+        if plan_authorization is not None:
+            from .polymarket_lp_auto import _PlanEntryAuthorization
+            if not isinstance(plan_authorization, _PlanEntryAuthorization) or plan_authorization.pool.lp is not self:
+                raise _MutationBlocked('plan_authorization_invalid')
+            plan_authorization.validate()
         if (
             str(side or "").upper() == "BUY"
             and self._account_order_sync_error is not None
+            and plan_authorization is None
         ):
             raise _MutationBlocked(self._account_order_sync_error)
         direct = getattr(self.exchange, "lp_post_order", None)
@@ -17008,6 +18138,13 @@ class PolymarketLPService:
             if current_id != order_id:
                 continue
             status = str(_field(order, "status", "")).upper()
+            if status in TERMINAL_ORDER_STATES and session is not None:
+                prior = self._order_history(session).get(order_id, {})
+                if (str(prior.get("status") or "").upper() == "UNKNOWN"
+                        and not self._verified_fill_completed(session, order_id, prior)):
+                    # A terminal-looking aggregate row cannot resolve an old
+                    # BUY whose receipt lacks the original size/terminal proof.
+                    return False
             return status in TERMINAL_ORDER_STATES
         if session is not None:
             status = str(self._order_history(session).get(order_id, {}).get("status") or "").upper()
@@ -17290,6 +18427,7 @@ class PolymarketLPService:
         snapshot: Mapping[str, object] | None = None,
         expected_generation: int | None = None,
         expected_trade_revision: int | None = None,
+        preserve_passive_exit: bool = False,
     ) -> None:
         current = dict(self.store.lp_session(str(session["session_id"])) or session)
         if current.get("order_identity_conflict"):
@@ -17298,10 +18436,10 @@ class PolymarketLPService:
         history = self._order_history(current)
         pending_cancels = self._recent_pending_cancel_order_ids(session_id)
         specs: list[tuple[str, str, str]] = []
-        for key, requested_key, role in (
-            ("entry_order_id", "entry_cancel_requested", "entry"),
-            ("passive_exit_order_id", "passive_cancel_requested", "passive_exit"),
-        ):
+        cancel_fields = [("entry_order_id", "entry_cancel_requested", "entry")]
+        if not preserve_passive_exit:
+            cancel_fields.append(("passive_exit_order_id", "passive_cancel_requested", "passive_exit"))
+        for key, requested_key, role in cancel_fields:
             order_id = str(current.get(key) or "")
             if not order_id or bool(current.get(requested_key)) or order_id in pending_cancels:
                 continue
@@ -17461,8 +18599,9 @@ class PolymarketLPService:
             return str(response_id or "") == target and status in TERMINAL_ORDER_STATES
         return target in {str(value) for value in values}
 
-    def begin_order_cancel(self, order_ids: Collection[str], *, serialized=True):
+    def begin_order_cancel(self, order_ids: Collection[str], *, serialized=True, plan_round_id=None):
         """Persist exact owned cancel attempts before allowing network I/O."""
+        import sqlite3
         attempts = []
         with self._mutex if serialized else nullcontext():
             targets = set(order_ids)
@@ -17472,7 +18611,16 @@ class PolymarketLPService:
                     key = self._action_key(session_id, 'reconciliation-cancel', uuid.uuid4().hex)
                     payload = dict(role='reconciliation_cancel', order_id=order_id,
                                    submit_requested_at=_iso(self._now()))
-                    self.store.lp_upsert_action(session_id, key, state='pending', payload=payload)
+                    if plan_round_id is not None:
+                        payload['rotation_round_id'] = plan_round_id
+                    try:
+                        self.store.lp_upsert_action(session_id, key, state='pending', payload=payload)
+                    except sqlite3.Error as exc:
+                        for sid, previous_key, previous in attempts:
+                            self.store.lp_finish_cancel(sid, previous_key, state='rejected',
+                                payload={**previous, 'post_started': False, 'submit_stage': 'pre_send_rejected',
+                                    'reason': str(exc)})
+                        raise
                     attempts.append((session_id, key, payload))
         return attempts
 
@@ -17484,14 +18632,28 @@ class PolymarketLPService:
         if attempts and self._facts_wakeup:
             self._facts_wakeup()
 
-    def _cancel_order(self, order_id: str, *, attempts=None) -> bool:
+    def _cancel_order(self, order_id: str, *, attempts=None, on_response=None) -> bool:
+        sender = uuid.uuid4().hex
+        with self._entry_sends_lock:
+            self._cancel_sends.add(sender)
+        try:
+            return self._cancel_order_in_lane(order_id, attempts=attempts, on_response=on_response)
+        finally:
+            with self._entry_sends_lock:
+                self._cancel_sends.discard(sender)
+
+    def _cancel_order_in_lane(self, order_id: str, *, attempts=None, on_response=None) -> bool:
         try:
             self._require_mutation()
         except _MutationBlocked:
             # The guard ran before any venue call: a preclaimed intent was
             # definitely not sent and must not suppress the next cancel.
-            for session_id, key, _payload in attempts or ():
-                self.store.lp_reject_pending_cancel(session_id, key)
+            for session_id, key, payload in attempts or ():
+                if (payload.get('role') == 'reconciliation_cancel'
+                        and payload.get('reason') == 'buy_yield_unknown_timeout'):
+                    self.store.lp_reject_pending_cancel(session_id, key, record_unsent=True)
+                else:
+                    self.store.lp_reject_pending_cancel(session_id, key)
             raise
         # Cancel intent/receipt persistence is serialized with strategy and
         # generation fences; the venue request between those short sections is
@@ -17504,10 +18666,14 @@ class PolymarketLPService:
             if callable(direct):
                 response = direct(order_id)
             else:
-                method = getattr(self.exchange, "cancel_orders", None)
+                method = getattr(self.exchange, "cancel_orders_detailed", None) if on_response is not None else None
+                if not callable(method):
+                    method = getattr(self.exchange, "cancel_orders", None)
                 if not callable(method):
                     raise RuntimeError("cancel_adapter_unavailable")
                 response = method((order_id,))
+            if on_response is not None:
+                on_response(response)
             acknowledged = self._cancel_acknowledged(response, order_id)
             return acknowledged
         finally:
@@ -17524,7 +18690,8 @@ class PolymarketLPService:
         # and must not prevent management of actual orders/inventory.
         covered = reservation_is_released(session)
         if (covered and not reservation_is_manually_released(session)
-                and str(session.get("submit_stage") or "") in {"preparing", "sending"}):
+                and str(session.get("submit_stage") or "") in {"preparing", "sending"}
+                and (session.get('reservation_coverage') or {}).get('basis') != 'runtime_owner_exit'):
             return True
         if not covered:
             if str(session.get("state") or "") == "entry_submit_pending":
@@ -17560,6 +18727,16 @@ class PolymarketLPService:
         if self._has_unresolved_submission(session):
             return
         history = self._order_history(session)
+        if any(
+            str(record.get("side") or "").upper() == "BUY"
+            and str(record.get("status") or "").upper() == "UNKNOWN"
+            and not self._verified_fill_completed(session, order_id, record)
+            for order_id, record in history.items()
+        ):
+            # A filled quantity and current inventory do not resolve an old
+            # BUY receipt whose original size or terminal proof is missing.
+            # Keep the existing exit identity until that prerequisite is known.
+            return
         managed_passive = str(session.get("passive_exit_order_id") or "")
         blocking_sells = [
             order_id

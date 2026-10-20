@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -290,8 +291,10 @@ def test_prediction_live_acceptance_reports_authenticated_no_submit_evidence() -
 
 def test_make_acceptance_excludes_external_prediction_live_registry() -> None:
     repo_root = Path(__file__).parents[1]
+    # Control opaque build metadata so hash digits cannot mimic a forbidden port.
+    source_sha = "a" * 40
     plan = subprocess.run(
-        ["make", "-n", "acceptance"],
+        ["make", "-n", "acceptance", f"SOURCE_SHA={source_sha}"],
         cwd=repo_root,
         check=True,
         capture_output=True,
@@ -318,7 +321,8 @@ def test_make_acceptance_excludes_external_prediction_live_registry() -> None:
     )
 
     portable = subprocess.run(
-        ["make", "-n", "test-ci-portable"], cwd=repo_root, check=True,
+        ["make", "-n", "test-ci-portable", f"SOURCE_SHA={source_sha}"],
+        cwd=repo_root, check=True,
         capture_output=True, text=True,
     ).stdout
     assert "scripts/deployment_preflight.py" in normalized
@@ -9658,13 +9662,65 @@ def test_account_snapshot_refresh_rejects_persistent_503() -> None:
 
 
 def test_container_and_runtime_gates_keep_python_interpreter_selection_explicit() -> None:
-    makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
+    root = Path(__file__).parents[1]
+    makefile = (root / "Makefile").read_text(encoding="utf-8")
 
     assert (
         "PYTHON_BIN ?= $(if $(OPEN_TRADER_PYTHON),$(OPEN_TRADER_PYTHON),"
         "$(REPOSITORY_ROOT)/.venv/bin/python)"
     ) in makefile
-    assert 'BACKEND_PYTEST := env PYTHONSAFEPATH=1 PYTHONPATH=/workspace:/workspace/src' in makefile
+    selected = (
+        "tests/test_dashboard_acceptance.py::"
+        "test_container_and_runtime_gates_keep_python_interpreter_selection_explicit"
+    )
+    host_python = "/host-interpreter-sentinel/python-bin"
+    host_open_trader_python = "/host-interpreter-sentinel/open-trader-python"
+    source_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True,
+    ).strip()
+    for artifacts in ("0", "1"):
+        preview = subprocess.run(
+            [
+                "make", "-n", "test", f"TEST={selected}",
+                f"CI_TEST_ARTIFACTS={artifacts}", "TEST_WORKERS=1",
+                "DOCKER=docker", "DOCKER_IMAGE=interpreter-contract-test-image",
+                f"PYTHON_BIN={host_python}",
+            ],
+            cwd=root,
+            env={**os.environ, "OPEN_TRADER_PYTHON": host_open_trader_python},
+            capture_output=True, text=True, check=True,
+        )
+        commands = [shlex.split(line) for line in preview.stdout.splitlines() if line.strip()]
+        runs = [command for command in commands if command[:2] == ["docker", "run"]]
+        assert len(runs) == 1
+        run = runs[0]
+        assert all(
+            sentinel not in token
+            for sentinel in (host_python, host_open_trader_python)
+            for token in run
+        )
+        invocation = run[run.index("interpreter-contract-test-image") + 1:]
+        assert invocation[0] == "env"
+        pytest_index = invocation.index("pytest")
+        assignments = invocation[1:pytest_index]
+        assert all("=" in assignment for assignment in assignments)
+        environment = dict(assignment.split("=", 1) for assignment in assignments)
+        assert len(environment) == len(assignments)
+        assert environment["PYTHONSAFEPATH"] == "1"
+        assert environment["PYTHONPATH"] == "/workspace:/workspace/src"
+        arguments = invocation[pytest_index + 1:]
+        assert selected in arguments
+        assert arguments[arguments.index("-m") + 1] == "not pressure and not browser"
+        if artifacts == "1":
+            assert environment["CI_TEST_METRICS"] == "/tmp/open-trader-ci-evidence/metrics.json"
+            assert environment["CI_TEST_SOURCE_SHA"] == source_sha
+            assert environment["CI_TEST_WORKERS"] == "1"
+            assert arguments[arguments.index("-p") + 1] == "scripts.ci_test_metrics"
+            assert "--junitxml=/tmp/open-trader-ci-evidence/junit.xml" in arguments
+        else:
+            assert not any(key.startswith("CI_TEST_") for key in environment)
+            assert "scripts.ci_test_metrics" not in arguments
+            assert not any(argument.startswith("--junitxml") for argument in arguments)
     assert '$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST))' in makefile
     assert '"$(PYTHON_BIN)" -m pytest -q -m pressure' in makefile
     assert '"$(PYTHON_BIN)" -m open_trader' in makefile

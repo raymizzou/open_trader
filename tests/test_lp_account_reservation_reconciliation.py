@@ -158,6 +158,27 @@ def _advance(runtime, seconds=1):
     runtime.clock[0] += timedelta(seconds=seconds)
 
 
+def advance_api_wait(runtime, execution, *, refresh=True):
+    """Use the public deadline and publish new external qualification facts."""
+    from datetime import datetime
+    waiting = execution.lp_auto_state()['plan_wait']
+    if waiting and datetime.fromisoformat(waiting['deadline']) > runtime.clock[0]:
+        runtime.clock[0] = datetime.fromisoformat(waiting['deadline'])
+    if refresh:
+        lp = execution._lp
+        for condition, cached in tuple(lp._candidate_qualification_facts.items()):
+            directions = []
+            account = None
+            for direction in cached.get('directions', ()):
+                market = direction['market']
+                facts = lp._read_candidate_facts({k: market[k] for k in ('market_id', 'condition_id', 'token_id', 'outcome')})
+                directions.append(facts['direction'])
+                account = facts['account']
+            if directions:
+                lp._candidate_pool_record_success(condition, dict(condition_id=condition), judged_at=lp._now(),
+                    facts=dict(directions=directions, account=account))
+
+
 def _amount(state, name):
     return Decimal(state["funds"][name])
 
@@ -269,7 +290,15 @@ def test_two_old_reservations_are_replaced_once_by_complete_account_truth(runtim
     elif entrypoint == "reconcile":
         state = execution.lp_auto_reconcile_unknown()
     else:
-        state = execution.lp_auto_run_once(round_id="one-complete-account-round")
+        state = execution.lp_auto_run_once(round_id="one-current-only-round")
+        assert state["funds"]["status"] == "unknown"
+        _assert_unknown_audit(store, execution, originals)
+        assert account.posts == account.cancels == []
+        # Historical local holds need genuine full account evidence, not a
+        # planning-only response or absence converted to a rejected audit.
+        _advance(runtime)
+        assert execution.refresh_lp_dashboard_snapshot()["state"] == "ready"
+        state = execution.lp_auto_state()
     assert state["funds"]["status"] == "known", state
     assert _amount(state, "buy_reserved_usd") == (8 if actual_buy else 0), state
     assert _amount(state, "available_usd") == (92 if actual_buy else 100)
@@ -646,7 +675,15 @@ def test_enabled_round_refills_covered_legacy_market_once_without_overspending(r
         "valid_until": lp._now() + timedelta(days=1),
     })
 
+    planning_as_of = []
+    financial_calls = []
+    balance = account.get_balance_allowance
+    def observed_balance(**kwargs):
+        financial_calls.append(bool(execution.lp_auto_state()['active_plan']))
+        return balance(**kwargs)
+    account.get_balance_allowance = observed_balance
     def signed_order(**kwargs):
+        planning_as_of.append(execution.lp_auto_state()["funds"]["as_of"])
         assert kwargs["price"] == Decimal(".40")
         assert kwargs["size"] == Decimal("20")
         _advance(runtime)  # Signing precedes the next generation-fenced account read.
@@ -671,10 +708,20 @@ def test_enabled_round_refills_covered_legacy_market_once_without_overspending(r
     assert len(account.posts) == 1, {"last_round": first["last_round"], "blocks": first["block_reasons"]}
     assert _amount(first, "buy_reserved_usd") == 8
     assert first["slots"]["occupied"] == 1
+    assert first['funds']['status'] == 'unknown' and first['funds']['as_of'] == planning_as_of[-1]
+    assert planning_as_of[-1] and first['funds']['available_usd'] is None and first['funds']['spendable_usd'] is None
+    assert not any(financial_calls)
     _advance(runtime)
     second = execution.lp_auto_run_once(round_id="refill-repeat")
     assert len(account.posts) == 1
     assert _amount(second, "buy_reserved_usd") == 8
+    assert second['funds']['status'] == 'known'
+    assert second['funds']['as_of'] != planning_as_of[-1]
+    assert _amount(second, 'available_usd') == 0 and not any(financial_calls)
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    second = execution.lp_auto_state()
+    assert second['funds']['status'] == 'known' and _amount(second, 'total_usd') == 8
     assert _amount(second, "available_usd") == 0
     assert second["slots"]["occupied"] == 1
     assert len(second["intents"]) == 2
@@ -792,6 +839,8 @@ def test_late_same_generation_snapshot_waits_without_overwriting_newer_account_t
 
 @pytest.mark.parametrize("reverse_input", [False, True], ids=["survivor-is-anchor", "victim-is-anchor"])
 def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_account(runtime, reverse_input):
+    import json
+    from tests.test_lp_auto_independent_cancel_contract import _wait_round_cancels
     orders = (
         _open_order("rank-a", "BUY", price="0.40", original="20"),
         _open_order("rank-b", "BUY", price="0.40", original="20"),
@@ -829,19 +878,46 @@ def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_acco
     _advance(runtime)
     rotating = execution.lp_auto_run_once(round_id="real-overcapacity")
     # Same yield, condition and token: the stable exchange-ID tie-break keeps A.
+    requests = _wait_round_cancels(store, rotating)
+    assert len(requests) == 1 and requests[0]['order_id'] == 'rank-b' and requests[0]['state'] == 'accepted'
     assert account.cancels == [("rank-b",)], rotating["last_round"]
     assert rotating["slots"]["occupied"] == 2
-    assert rotating["slots"]["canceling"] == 1
+    assert rotating["slots"]["canceling"] == 0
     assert _amount(rotating, "buy_reserved_usd") == 16
     assert account.posts == account.market_orders == []
     assert rotating["intents"] == []
-    assert_survivor_protected()
+    assert next(iter(lp._queue_protection_levels(store.lp_session(sid)).values())) == initial_bucket
 
     # Current complete account facts release the absent order's slot without
     # inventing a terminal receipt for the historical cancel audit.
     account.orders = tuple(order for order in orders if order.id == "rank-a")
     _advance(runtime)
-    absent = execution.lp_auto_run_once(round_id="cancel-absent")
+    advance_api_wait(runtime, execution, refresh=False)
+    original_audit = deepcopy(store.lp_actions(sid))
+    balance = account.get_balance_allowance
+    balance_reads = []
+    def observed_balance(**kwargs):
+        balance_reads.append(kwargs)
+        return balance(**kwargs)
+    account.get_balance_allowance = observed_balance
+    pending = execution.lp_auto_run_once(round_id="cancel-absent")
+    assert rotating['active_plan'] is None and rotating['last_round']['completed_at']
+    assert rotating['plan_wait'] is None
+    assert pending['active_plan'] is None and pending['last_round']['round_id'] == 'cancel-absent'
+    assert pending['last_round']['completed_at'] and pending['plan_wait'] is None
+    assert pending['slots']['occupied'] == 1 and _amount(pending, 'buy_reserved_usd') == 8
+    assert _amount(pending, 'available_usd') == 8
+    assert balance_reads, 'New current check acquires actual complete wallet inputs'
+    reads_after_current = len(balance_reads)
+    assert store.lp_actions(sid) == original_audit
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    absent = execution.lp_auto_state()
+    assert len(balance_reads) in (reads_after_current, reads_after_current + 1)
+    (store.path.parent / 'CI-C-current-absence-proof.json').write_text(json.dumps(dict(
+        current_check=pending, after_dashboard=absent, original_audit=original_audit,
+        current_read_count=reads_after_current, total_read_count=len(balance_reads)), default=str, indent=2))
+    assert store.lp_actions(sid) == original_audit
     assert absent["slots"]["occupied"] == 1, absent
     assert absent["slots"]["canceling"] == 0
     assert _amount(absent, "buy_reserved_usd") == 8
@@ -850,7 +926,7 @@ def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_acco
     assert account.cancels == [("rank-b",)]
     assert account.posts == account.market_orders == []
     assert absent["intents"] == []
-    assert_survivor_protected()
+    assert next(iter(lp._queue_protection_levels(store.lp_session(sid)).values())) == initial_bucket
 
     receipt_reads = []
 
@@ -864,6 +940,7 @@ def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_acco
     assert receipt_reads == ["rank-b"]
     assert store.lp_session(sid)["order_history"]["rank-b"]["status"] == "CANCELED"
     _advance(runtime)
+    advance_api_wait(runtime, execution, refresh=False)
     settled = execution.lp_auto_run_once(round_id="exact-terminal")
     assert settled["slots"]["occupied"] == 1
     assert settled["slots"]["canceling"] == 0
@@ -920,6 +997,7 @@ class _FiveMarketPublic(_CandidateSDKPublic):
 @pytest.mark.parametrize('history', ['matching', 'missing', 'different-quantity'])
 def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runtime, budget, expected_buys, history):
     from polymarket.models.clob import SignedOrder
+    from threading import Lock
 
     _, inventory_condition, inventory_token = _refill_identity(6)
     historical_quantity = '10' if history == 'different-quantity' else '20'
@@ -957,7 +1035,12 @@ def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runti
         })
     assert len(execution._auto_pool.candidates()) == 5
 
+    planning_as_of = []
+    planning_capture = Lock()
     def signed_order(**kwargs):
+        with planning_capture:
+            if not planning_as_of:
+                planning_as_of.append(execution.lp_auto_state()["funds"]["as_of"])
         assert kwargs["price"] == Decimal(".40")
         assert kwargs["size"] == Decimal("20")
         _advance(runtime)
@@ -988,12 +1071,22 @@ def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runti
         repeated = execution.lp_auto_run_once(round_id="five-historical-refill")
         assert len(account.posts) == 5
         assert repeated["slots"]["occupied"] == 5
-    assert refilled["funds"]["status"] == "known", refilled
+    if expected_buys:
+        assert len(planning_as_of) == 1 and planning_as_of[0]
+        assert datetime.fromisoformat(planning_as_of[0]) <= runtime.clock[0]
+        assert refilled["funds"]["status"] == "unknown", refilled
+        assert refilled["funds"]["as_of"] == planning_as_of[0]
+    else:
+        assert planning_as_of == []
+        assert refilled["funds"]["status"] == "known", refilled
     assert refilled["slots"]["active"] == expected_buys
     assert refilled["slots"]["occupied"] == expected_buys
     assert _amount(refilled, "buy_reserved_usd") == expected_buys * 8
     assert _amount(refilled, "inventory_cost_usd") == 8
-    assert _amount(refilled, "available_usd") == Decimal(budget) - 8 - expected_buys * 8
+    if expected_buys:
+        assert refilled["funds"]["available_usd"] is None
+    else:
+        assert _amount(refilled, "available_usd") == Decimal(budget) - 8
     assert account.cancels == account.market_orders == []
     if not expected_buys:
         assert refilled["last_round"]["reason"] == "candidates_or_funds_insufficient"
@@ -1009,6 +1102,10 @@ def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runti
         assert state["slots"]["occupied"] == expected_buys
         assert _amount(state, "buy_reserved_usd") == expected_buys * 8
         assert _amount(state, "inventory_cost_usd") == 8
+        assert state["funds"]["status"] == "known"
+        assert _amount(state, "available_usd") == Decimal(budget) - 8 - expected_buys * 8
+        if expected_buys:
+            assert _amount(state, "available_usd") == 52
         for row in originals:
             assert store.lp_actions(row["session_id"]) == audit[row["session_id"]]
             assert store.lp_session(row["session_id"])["reservation_coverage"] == markers[row["session_id"]]

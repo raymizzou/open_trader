@@ -42,16 +42,16 @@ def test_completed_history_batch_becomes_candidate_before_full_catalog_finishes(
         return result
 
     service._save_preparation = progress
-    summaries = store.lp_price_history_summaries
+    summaries = store.lp_price_history_summary_batches
 
     def read_summaries(identities, **kwargs):
-        result = summaries(identities, **kwargs)
-        if publish_during_build and len(identities) == 21 and not build_started.is_set():
-            build_started.set()
-            assert build_release.wait(10)
-        return result
+        for result in summaries(identities, **kwargs):
+            if publish_during_build and len(identities) == 21 and not build_started.is_set():
+                build_started.set()
+                assert build_release.wait(10)
+            yield result
 
-    store.lp_price_history_summaries = read_summaries
+    store.lp_price_history_summary_batches = read_summaries
     service.refresh_competition_cache()
     with ThreadPoolExecutor(max_workers=2) as workers:
         job = workers.submit(service.refresh_price_history, stop_event=stop)

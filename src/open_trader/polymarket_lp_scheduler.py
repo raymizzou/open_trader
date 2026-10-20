@@ -1,6 +1,7 @@
 """Schedule the single LP admission path; durable intent belongs to that path."""
 
 from datetime import UTC, datetime, timedelta
+from collections.abc import Mapping
 import logging
 import threading
 from typing import Callable
@@ -22,38 +23,81 @@ class LPAutoScheduler:
         self._next_check_at = self.clock()
         self._checking = False
         self._error: str | None = None
+        self._api_retry_interval_seconds = 60
+        self._retry_not_before: datetime | None = None
+        try:
+            self._restore_deadline()
+        except Exception as exc:
+            self._state_read_failed(exc)
         register = getattr(execution, "set_lp_auto_wakeup", None)
         if callable(register):
             register(self.request_check)
+
+    def _core_state(self):
+        read = getattr(self.execution, 'lp_auto_state', None)
+        core = read(include_intents=False) if callable(read) else {}
+        if not isinstance(core, Mapping):
+            raise TypeError('lp_auto_state_shape')
+        interval = core.get('api_retry_interval_seconds')
+        if type(interval) is int and interval > 0:
+            self._api_retry_interval_seconds = interval
+        return core
+
+    def _state_read_failed(self, exc, *, event='prediction_lp_auto_state_failed'):
+        with self._state:
+            self._checking = False
+            self._error = type(exc).__name__
+            self._retry_not_before = self.clock() + timedelta(seconds=self._api_retry_interval_seconds)
+            self._next_check_at = self._retry_not_before
+            self._wake.clear()
+        logger.exception(event)
+
+    def _restore_deadline(self, *, future_only=False, core=None):
+        waiting = (self._core_state() if core is None else core).get('plan_wait')
+        if waiting and waiting.get('kind') == 'dependencies':
+            deadline = datetime.fromisoformat(waiting['deadline'])
+            if not future_only or deadline > self.clock():
+                self._next_check_at = deadline
 
     def snapshot(self) -> dict[str, object]:
         with self._state:
             return {
                 "last_check_at": self._last_check_at.isoformat() if self._last_check_at else None,
                 "next_check_at": None if self._checking else (
-                    self.clock() if self._wake.is_set() else self._next_check_at
+                    self._next_check_at
                 ).isoformat(),
                 "check_in_progress": self._checking,
                 "last_check_error": self._error,
                 "scheduler_running": self._thread is not None and self._thread.is_alive(),
-                "check_interval_seconds": 60,
+                "check_interval_seconds": None,
+                "cycle_mode": "continuous",
             }
 
     def request_check(self) -> None:
-        self._wake.set()
+        with self._state:
+            now = self.clock()
+            self._next_check_at = max(now, self._retry_not_before or now)
+            if self._next_check_at <= now:
+                self._wake.set()
 
     def run_due(self) -> bool:
         if not self._cycle.acquire(blocking=False):
             return False
         try:
             with self._state:
-                if self._stop.is_set() or (
-                    not self._wake.is_set() and self.clock() < self._next_check_at
-                ):
+                if self._stop.is_set() or self.clock() < self._next_check_at:
                     return False
                 self._wake.clear()
                 self._checking = True
                 self._last_check_at = self.clock()
+            try:
+                # Unknown state cannot authorize another execution cycle.
+                self._core_state()
+            except Exception as exc:
+                self._state_read_failed(exc)
+                return True
+            with self._state:
+                self._retry_not_before = None
             try:
                 # This always reconciles, including while manually paused.
                 # Only the core may decide whether a new BUY can be sent.
@@ -67,16 +111,19 @@ class LPAutoScheduler:
                 with self._state:
                     self._error = None
             finally:
-                with self._state:
-                    self._checking = False
-                    now = self.clock()
-                    # The 60-second budget starts when the check starts. A
-                    # slower check becomes due immediately rather than adding
-                    # its own latency on top of another full interval.
-                    self._next_check_at = max(
-                        now,
-                        (self._last_check_at or now) + timedelta(seconds=60),
-                    )
+                try:
+                    core = self._core_state()
+                    with self._state:
+                        self._checking = False
+                        now = self.clock()
+                        self._next_check_at = (now + timedelta(seconds=self._api_retry_interval_seconds)
+                            if self._error is not None else now)
+                        # Do not restore an expired dependency deadline after failure.
+                        self._restore_deadline(future_only=self._error is not None, core=core)
+                        if self._wake.is_set():
+                            self._next_check_at = now
+                except Exception as exc:
+                    self._state_read_failed(exc)
             return True
         finally:
             self._cycle.release()
@@ -89,9 +136,14 @@ class LPAutoScheduler:
 
         def run() -> None:
             while not self._stop.is_set():
-                self.run_due()
+                try:
+                    self.run_due()
+                except Exception as exc:
+                    self._state_read_failed(exc, event='prediction_lp_auto_monitor_failed')
                 with self._state:
                     delay = max(0, (self._next_check_at - self.clock()).total_seconds())
+                if self._stop.is_set():
+                    break
                 self._wake.wait(min(delay, 60))
 
         self._thread = threading.Thread(target=run, name="prediction-lp-auto", daemon=True)

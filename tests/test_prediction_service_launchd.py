@@ -40,7 +40,9 @@ def test_template_runs_only_the_loopback_shadow_service() -> None:
         "--release-manifest", "OPEN_TRADER_RELEASE_MANIFEST",
     ]
     assert payload["RunAtLoad"] is True
-    assert payload["KeepAlive"] is True
+    assert payload["KeepAlive"] == {"SuccessfulExit": False}
+    assert type(payload["ExitTimeOut"]) is int
+    assert payload["ExitTimeOut"] == 0
     assert payload["StandardOutPath"] == "OPEN_TRADER_RUNTIME_ROOT/logs/prediction_service/launchd.out.log"
     assert payload["StandardErrorPath"] == "OPEN_TRADER_RUNTIME_ROOT/logs/prediction_service/launchd.err.log"
 
@@ -58,6 +60,8 @@ def test_installer_dry_run_renders_only_explicit_isolated_paths(tmp_path: Path) 
     )
 
     payload = plistlib.loads(result.stdout.encode())
+    assert payload["KeepAlive"] is True
+    assert "ExitTimeOut" not in payload
     assert payload["WorkingDirectory"] == str(ROOT)
     assert payload["ProgramArguments"] == [
         sys.executable, "-m", "open_trader", "prediction-service", "--mode", "shadow",
@@ -144,21 +148,14 @@ def test_installer_rejects_invalid_proxy_before_writing(tmp_path: Path, proxy: s
 
 
 def test_production_installer_applies_explicit_startup_settings_on_same_release(tmp_path: Path) -> None:
-    repo = _copy_repo(tmp_path)
-    (repo / "src/open_trader").mkdir(parents=True)
-    shutil.copy2(ROOT / "src/open_trader/prediction_release.py", repo / "src/open_trader/prediction_release.py")
-    shutil.copy2(ROOT / "ops/prediction-service-release.json", repo / "ops/prediction-service-release.json")
-    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@example.com",
-         "commit", "-qm", "release fixtures"],
-        check=True,
-    )
-
-    runtime = tmp_path / "runtime"
-    agents = tmp_path / "LaunchAgents"
-    agents.mkdir()
-    config = tmp_path / "prediction.json"
+    from test_prediction_release_launchd import ReleaseHarness
+    # Actual clean source/config and verifier inputs; only this scenario's
+    # external management commands differ from the shared release harness.
+    harness = ReleaseHarness(tmp_path)
+    repo = harness.candidate.path
+    runtime = harness.runtime_root
+    agents = harness.agents
+    config = harness.config
     calls = tmp_path / "calls"
     state = tmp_path / "launchd-state.json"
     health_log = tmp_path / "health.log"
@@ -191,7 +188,7 @@ def test_production_installer_applies_explicit_startup_settings_on_same_release(
         "n_leg": {"status": "running", "code": "N_LEG_RUNNING"},
     }
     state.write_text(
-        json.dumps({"loaded": True, "pid": 4242, "pause": "0", "started_at": "initial-start"}),
+        json.dumps({"loaded": False, "listener": False, "pid": 4242, "pause": "0", "started_at": "initial-start"}),
         encoding="utf-8",
     )
 
@@ -223,13 +220,17 @@ def test_production_installer_applies_explicit_startup_settings_on_same_release(
         "    raise SystemExit(0)\n"
         "if args and args[0] == 'bootout':\n"
         "    current['loaded'] = False\n"
+        "    current['listener'] = False\n"
+        "    current['previous_pid'] = current['pid']\n"
+        "    current['pid'] = 0\n"
         "    state_path.write_text(json.dumps(current), encoding='utf-8')\n"
         "    raise SystemExit(0)\n"
         "if args and args[0] == 'bootstrap':\n"
         "    payload = plistlib.loads(Path(args[-1]).read_bytes())\n"
         "    env = payload.get('EnvironmentVariables', {})\n"
         "    current['loaded'] = True\n"
-        "    current['pid'] = int(current.get('pid', 4241)) + 1\n"
+        "    current['listener'] = True\n"
+        "    current['pid'] = max(int(current.get('pid', 4241)), int(current.get('previous_pid', 4241))) + 1\n"
         "    current['pause'] = env.get('OPEN_TRADER_NLEG_PAUSED', '0')\n"
         "    current['proxy'] = env.get('HTTPS_PROXY', '')\n"
         "    current['started_at'] = 'start-' + str(current['pid'])\n"
@@ -278,12 +279,16 @@ def test_production_installer_applies_explicit_startup_settings_on_same_release(
         encoding="utf-8",
     )
     ps.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, sys\n"
+        "#!" + sys.executable + "\n"
+        "import json, os, plistlib, shlex, sys\n"
         "from pathlib import Path\n"
-        f"state = json.loads(Path({str(state)!r}).read_text(encoding='utf-8'))\n"
+        f"state = json.loads(Path({str(state)!r}).read_text())\n"
+        f"plist = Path({str(plist)!r})\n"
         "pid = sys.argv[sys.argv.index('-p') + 1]\n"
-        "raise SystemExit(0 if state.get('loaded') and str(state.get('pid')) == pid else 1)\n",
+        "if not state.get('loaded') or str(state.get('pid')) != pid: raise SystemExit(1)\n"
+        "if '-o' in sys.argv:\n"
+        "    args = plistlib.loads(plist.read_bytes())['ProgramArguments']\n"
+        "    print(pid + ' ' + str(os.getuid()) + ' ' + shlex.join(args))\n",
         encoding="utf-8",
     )
     owner_probe.write_text(
@@ -297,68 +302,30 @@ def test_production_installer_applies_explicit_startup_settings_on_same_release(
     for command in (launchctl, lsof, curl, ps, owner_probe):
         command.chmod(0o755)
 
-    candidate = {
-        "checkout": str(repo),
-        "git_sha": expected_sha,
-        "source_state": "clean",
-        "reader_generation": 2,
-        "contract_generation": 2,
-    }
-    ready = {
-        "pid": 4242,
-        "cwd": str(repo),
-        "listener": "127.0.0.1:8769",
-        "health_schema": production_health["schema_version"],
-        "health_module": production_health["module"],
-        "health_status": production_health["status"],
-        "mode": production_health["mode"],
-        "production_owner": production_health["production_owner"],
-        "mutations": production_health["mutations"],
-        "git_sha": expected_sha,
-        "release_schema_version": production_health["release_schema_version"],
-        "reader_generation": 2,
-        "contract_generation": 2,
-        "process_started_at": "initial-start",
-        "logs": {"stdout": str(stdout_path), "stderr": str(stderr_path)},
-    }
     runtime_record = runtime / "prediction-service-runtime.json"
-    runtime_record.parent.mkdir(parents=True)
-    runtime_record.write_text(
-        json.dumps({
-            "schema_version": "open_trader.prediction_service.runtime.v1",
-            "state": "ready",
-            "candidate": candidate,
-            "previous_release": None,
-            "transition_started_at": "initial-start",
-            "updated_at": "initial-start",
-            "failure_reason": "",
-            "ready": ready,
-        }),
-        encoding="utf-8",
-    )
-    plist_payload = {
-        "Label": LABEL,
-        "ProgramArguments": [sys.executable, "-m", "open_trader", "prediction-service", "--mode", "production", "--data-dir", str(data_dir), "--config", str(config), "--host", "127.0.0.1", "--port", "8769", "--notifier-config", str(runtime / "config/daily_premarket.env"), "--release-manifest", str(manifest)],
-        "EnvironmentVariables": {"OPEN_TRADER_NLEG_PAUSED": "0"},
-        "WorkingDirectory": str(repo),
-        "StandardOutPath": str(stdout_path),
-        "StandardErrorPath": str(stderr_path),
-    }
-    plist.write_bytes(plistlib.dumps(plist_payload))
-
     command = [
         str(repo / INSTALLER.relative_to(ROOT)), "--runtime-root", str(runtime), "--repo-root", str(repo),
         "--python", sys.executable, "--config", str(config), "--launch-agents-dir", str(agents),
         "--release-manifest", str(manifest), "--wait-seconds", "1", "--mode", "production",
     ]
     environment = {
-        **os.environ,
+        **harness._env(harness.candidate),
+        "FAKE_STATE": str(state),
         "LAUNCHCTL_BIN": str(launchctl),
         "LSOF_BIN": str(lsof),
         "CURL_BIN": str(curl),
         "PS_BIN": str(ps),
         "OWNER_PROBE_BIN": str(owner_probe),
     }
+
+    # The unchanged installer and producer create the initial trusted
+    # selected record/binding. Setup is outside the original call measure.
+    initial = subprocess.run(command, capture_output=True, text=True, env=environment)
+    assert initial.returncode == 0, initial.stderr
+    assert runtime_record.stat().st_mode & 0o777 == 0o600
+    assert json.loads(runtime_record.read_text())["candidate"]["lp_validation"]["config_selection"]["path"] == str(config)
+    calls.write_text("")
+    health_log.write_text("")
 
     changed = subprocess.run(command + ["--n-leg-paused", "1"], capture_output=True, text=True, env=environment)
     assert changed.returncode == 0, changed.stderr

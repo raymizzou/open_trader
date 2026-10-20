@@ -27,7 +27,7 @@ jobs:
           persist-credentials: false
       - name: Test routing and fail-closed aggregation
         run: python3 -m unittest discover -s tests -p 'test_ci_*.py' -v
-      - name: Plan full backend checks
+      - name: Plan active backend checks
         id: route
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -47,7 +47,7 @@ jobs:
         env:
           TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
         run: bash scripts/run_ci_service.sh "gateway" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
-      - name: Preserve exact-SHA test and dependency evidence
+      - name: Preserve exact-SHA evidence including phase metrics and JUnit
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -70,7 +70,7 @@ jobs:
         env:
           TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
         run: bash scripts/run_ci_service.sh "legacy" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
-      - name: Preserve exact-SHA test and dependency evidence
+      - name: Preserve exact-SHA evidence including phase metrics and JUnit
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -93,7 +93,7 @@ jobs:
         env:
           TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
         run: bash scripts/run_ci_service.sh "account" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
-      - name: Preserve exact-SHA test and dependency evidence
+      - name: Preserve exact-SHA evidence including phase metrics and JUnit
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -116,7 +116,7 @@ jobs:
         env:
           TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
         run: bash scripts/run_ci_service.sh "prediction" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
-      - name: Preserve exact-SHA test and dependency evidence
+      - name: Preserve exact-SHA evidence including phase metrics and JUnit
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -139,7 +139,7 @@ jobs:
         env:
           TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
         run: bash scripts/run_ci_service.sh "portable" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
-      - name: Preserve exact-SHA test and dependency evidence
+      - name: Preserve exact-SHA evidence including phase metrics and JUnit
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -162,7 +162,7 @@ jobs:
         env:
           TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
         run: bash scripts/run_ci_service.sh "trend-curve" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
-      - name: Preserve exact-SHA test and dependency evidence
+      - name: Preserve exact-SHA evidence including phase metrics and JUnit
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

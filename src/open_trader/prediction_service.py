@@ -15,6 +15,7 @@ import secrets
 import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Callable, Mapping
@@ -33,7 +34,8 @@ from .prediction_n_leg_canary_report import build_canary_report
 from .prediction_n_leg_confirm import NLegConfirmRejected, confirm_enqueue
 from .prediction_n_leg_mode import NLegVersionConflict
 from .prediction_release import load_prediction_release_manifest
-from .prediction_runtime import PredictionRuntime
+from .prediction_runtime import PredictionRuntime, PredictionRuntimeFatal
+from .prediction_start_guard import PredictionStartDenied
 from .relation_catalog import RelationConflictError
 
 
@@ -108,6 +110,7 @@ class _PredictionHTTPServer(ThreadingHTTPServer):
         self._request_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_HTTP_REQUESTS)
         self._http_load_lock = threading.Lock()
         self._http_active = 0
+        self._http_accepting = True
         self._overload_rejections = 0
         self._history_cache_hits = 0
         self._history_cache_misses = 0
@@ -126,8 +129,18 @@ class _PredictionHTTPServer(ThreadingHTTPServer):
             + _BUSY_BODY
         )
 
+    def close_admission(self):
+        with self._http_load_lock:self._http_accepting=False
+        self.socket.close()
+
     def process_request(self, request: object, client_address: object) -> None:
-        if not self._request_slots.acquire(blocking=False):
+        # Admission and active ownership publish under the same lock as stop.
+        # Cleanup cannot see zero handlers between admission and publication.
+        with self._http_load_lock:
+            admitted=self._http_accepting and self._request_slots.acquire(blocking=False)
+            if admitted:
+                self._http_active+=1
+        if not admitted:
             self._record_overload()
             try:
                 request.sendall(self._busy_response)  # type: ignore[attr-defined]
@@ -136,7 +149,6 @@ class _PredictionHTTPServer(ThreadingHTTPServer):
             finally:
                 self.shutdown_request(request)  # type: ignore[arg-type]
             return
-        self._record_admitted()
         try:
             super().process_request(request, client_address)  # type: ignore[arg-type]
         except BaseException:
@@ -978,7 +990,16 @@ def create_prediction_server(
                     if path == lp_auto_prefix + "reservations/release":
                         result = execution.lp_auto_release_reservations(payload, audit=audit)
                     elif path == lp_auto_prefix + "config":
-                        expected = {"budget_usd", "target_buy_count"}
+                        if 'round_interval_seconds' in payload:
+                            raise ValueError('round_interval_seconds_retired_in_continuous_mode')
+                        timing_fields = {'round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds'}
+                        trading = bool(set(payload) & {'budget_usd', 'target_buy_count', 'buy_price_level'})
+                        expected = {"budget_usd", "target_buy_count"} if trading else set()
+                        expected.update(set(payload) & timing_fields)
+                        if not trading and not expected:
+                            raise ValueError('auto_config_invalid')
+                        if "buy_price_level" in payload:
+                            expected.add("buy_price_level")
                         if "expected_config_version" in payload:
                             expected.add("expected_config_version")
                         self._require_schema(payload, expected)
@@ -1117,7 +1138,7 @@ def create_prediction_server(
                     result = lp_augment_preview(payload)
                 elif path == lp_submit_entry_path:
                     # Issue 163: strict schema — eight required fields plus
-                    # the two optional ones; anything missing or extra is a
+                    # explicit optional fields; anything missing or extra is a
                     # 400 before the facade runs.  A non-decimal price or
                     # quantity raises through _normalize_request and lands
                     # here as a 400 with the reason.
@@ -1133,6 +1154,7 @@ def create_prediction_server(
                     }
                     lp_entry_optional = {
                         "candidate_policy",
+                        "candidate_bid_level",
                         "estimated_target_quantity",
                     }
                     if not lp_entry_required <= set(payload) or set(payload) - lp_entry_required - lp_entry_optional:
@@ -1559,6 +1581,8 @@ def serve_prediction_service(
     mode: str = "shadow",
     release_manifest_path: Path | None = None,
     notifier_config_path: Path | None = None,
+    lp_clock=None,
+    lp_utc_now=None,
 ) -> int:
     _require_loopback_host(host)
     if mode not in {"shadow", "production"}:
@@ -1595,10 +1619,14 @@ def serve_prediction_service(
         enable_n_leg_background=(
             os.environ.get("OPEN_TRADER_DISABLE_NLEG_BACKGROUND") != "1"
         ),
+        **(dict(lp_clock=lp_clock) if lp_clock is not None else {}),
+        **(dict(history_clock=lp_utc_now) if lp_utc_now is not None else {}),
     )
     server: ThreadingHTTPServer | None = None
     previous_handlers: dict[int, Any] = {}
     stopping = False
+    ready = False
+    exit_code = 0
 
     def stop_handler(_signum: int, _frame: Any) -> None:
         nonlocal stopping
@@ -1619,21 +1647,53 @@ def serve_prediction_service(
             port=port,
             runtime_metadata=metadata,
         )
+        ready = True
         while not stopping:
             server.handle_request()
             if mode == "shadow":
                 runtime.poll_shadow_failure()
-        return 0
+            else:
+                fatal=runtime.poll_fatal()
+                if fatal is not None:
+                    exit_code=78
+                    stopping=True
+    except (PredictionStartDenied,PredictionRuntimeFatal) as exc:
+        logging.getLogger(__name__).error('prediction_service_fatal origin=startup error=%s',exc)
+        exit_code=78
+    except Exception as exc:
+        record_failure = getattr(runtime, "_record_claimed_startup_failure", None)
+        if not callable(record_failure) or not record_failure(exc):
+            raise
+        logging.getLogger(__name__).exception(
+            "prediction_service_fatal origin=%s error=%s",
+            "owner_loop" if ready else "startup", exc)
+        exit_code = 78
     finally:
         try:
-            try:
-                runtime.stop()
-            finally:
-                if server is not None:
-                    server.server_close()
+            begin=getattr(runtime,'begin_stop',None)
+            if callable(begin):begin()
+            if server is not None:
+                server.close_admission()
+                while server.http_load_snapshot()['active']:
+                    if mode=='production':runtime.poll_fatal()
+                    time.sleep(.01)
+                server.server_close()
+            while True:
+                try:
+                    runtime.stop()
+                except RuntimeError:
+                    if runtime.state!='STOPPING':raise
+                    if mode=='production' and runtime.poll_fatal() is not None:exit_code=78
+                    time.sleep(.01)
+                else:
+                    if mode=='production' and runtime.poll_fatal() is not None:exit_code=78
+                    break
         finally:
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
+    if exit_code==78 and runtime.launchd_fatal_exit_verified:
+        return 0
+    return exit_code
 
 
 def _configure_entry_logging() -> None:
@@ -1661,8 +1721,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8769)
     parser.add_argument("--release-manifest", type=Path)
     parser.add_argument("--notifier-config", type=Path)
+    operator = parser.add_mutually_exclusive_group()
+    operator.add_argument('--operator-start',action='store_true')
+    operator.add_argument('--operator-restart',action='store_true')
     args = parser.parse_args(argv)
     _configure_entry_logging()
+    if args.operator_start or args.operator_restart:
+        from .prediction_start_guard import _prepare_foreground_operator
+        try:
+            actual_manifest=Path(__file__).resolve().parents[2]/'ops/prediction-service-release.json'
+            if (args.mode!='production' or args.release_manifest is None
+                    or args.release_manifest.resolve(strict=True)!=actual_manifest):
+                raise PredictionStartDenied('foreground operator requires the actual production release manifest')
+            identity=_prepare_foreground_operator(data_dir=args.data_dir,config=args.config,
+                host=args.host,port=args.port,restart=args.operator_restart)
+            if identity is None:return 0
+            command=[identity.interpreter,'-m','open_trader','prediction-service','--mode','production',
+                '--data-dir',identity.data_dir,'--config',identity.config,'--host',identity.host,
+                '--port',str(identity.port),'--release-manifest',str(actual_manifest)]
+            if args.notifier_config is not None:
+                command.extend(['--notifier-config',str(args.notifier_config.expanduser().absolute())])
+            os.chdir(identity.code_root)
+            os.execv(identity.interpreter,command)
+            raise RuntimeError('foreground exec returned unexpectedly')
+        except (PredictionStartDenied,OSError) as exc:
+            logging.getLogger(__name__).error('prediction_service_fatal origin=foreground_operator error=%s',exc)
+            return 78
     from .prediction_shadow_resources import shadow_resource_guard
     with shadow_resource_guard(args.mode):
         return serve_prediction_service(

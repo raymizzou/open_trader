@@ -370,6 +370,36 @@ def test_lp_runtime_notification_reports_each_channel() -> None:
     ) == {"feishu": False}
 
 
+@pytest.mark.parametrize("feishu_result", ["false", "timeout", "lost_response"])
+def test_lp_cancel_runtime_logs_unconfirmed_and_continues_voice(feishu_result, caplog):
+    calls = []
+    class Voice(XiaoaiSSHNotifier):
+        def notify(self, title, message):
+            calls.append("voice")
+    def deliver(*args):
+        calls.append("feishu")
+        if feishu_result != "false":
+            raise TimeoutError("https://secret-webhook/token")
+        return False
+    execution = SimpleNamespace(_deliver_feishu_notification=deliver)
+    voice = CompositeNotifier([Voice(host="fake", ssh_key=Path("/not-used"))])
+    assert _deliver_lp_protection_with_runtime(
+        execution, voice, "title", "message", "voice", one_shot=True
+    ) == {"feishu": False, "xiaoai": True}
+    assert calls == ["feishu", "voice"]
+    assert "channel=feishu" in caplog.text
+    assert ("delivery_unconfirmed" if feishu_result == "false" else "TimeoutError") in caplog.text
+    assert "secret-webhook" not in caplog.text
+
+
+def test_lp_cancel_runtime_skips_unconfigured_voice_without_failure(caplog):
+    execution = SimpleNamespace(_deliver_feishu_notification=lambda *args: True)
+    assert _deliver_lp_protection_with_runtime(
+        execution, NullNotifier(), "title", "message", "voice", one_shot=True
+    ) == {"feishu": True}
+    assert "xiaoai" not in caplog.text
+
+
 def test_runtime_wires_lp_auto_scheduler_to_execution(tmp_path: Path) -> None:
     checked = threading.Event()
 
@@ -416,6 +446,8 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
 
     import open_trader.prediction_arbitrage_execution as execution_module
 
+    d2_root = tmp_path / "actual-d2"
+    tmp_path = tmp_path / "legacy-helper"
     business_now = [datetime(2026, 9, 16, 12, tzinfo=UTC)]
 
     class BusinessDatetime(datetime):
@@ -829,10 +861,28 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
     monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 0.01)
     monkeypatch.setattr(runtime_module, "_LP_BOOK_SAMPLE_SECONDS", 0.01)
 
+    def start_legacy_helpers(runtime: PredictionRuntime) -> None:
+        # Session/reward/preparation values are legacy helper invariants only.
+        # Actual default Runtime RUNNING is proved below in the clean child.
+        runtime._owner.acquire()
+        runtime.store = PredictionArbitrageStore(tmp_path)
+        runtime._prediction_trading = trading
+        runtime.lp = PolymarketLPService(runtime.store, trading, owner_lock=runtime._owner,
+            clock=lambda: business_now[0])
+        runtime.monitor = runtime_module.PolymarketMonitor(store=runtime.store, trading=trading)
+        runtime.execution = PredictionExecutionService(store=runtime.store, monitor=runtime.monitor,
+            trading=trading, notifier=runtime._notifier,
+            lock_path=tmp_path / "prediction_arbitrage/execution.lock", lp=runtime.lp)
+        runtime._start_lp_monitor()
+        runtime._start_history_monitor()
+        runtime._start_candidate_scan_monitor()
+        runtime._start_candidate_maintenance_monitor()
+        runtime._start_lp_dashboard_monitor()
+        runtime._start_reward_monitor()
+
     runtime = make_runtime()
     try:
-        runtime.start()
-        assert runtime.state == "RUNNING"
+        start_legacy_helpers(runtime)
         assert all(event.wait(timeout=3) for event in lp_events.values())
         candidate = runtime.lp.candidate_snapshot()  # type: ignore[union-attr]
         deadline = time.monotonic() + 2
@@ -907,7 +957,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         assert Decimal(str(risk_session["paid_rewards"])) == Decimal("0")
         assert Decimal(str(risk_session["trade_pnl"])) == Decimal("0")
     finally:
-        runtime.stop()
+        assert runtime._cleanup_resources() == []
 
     accounting_after = store.n_leg_control()
     session_after = store.lp_session("lp-session")
@@ -946,8 +996,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
     warm_restart_started_at = business_now[0]
     restarted = make_runtime()
     try:
-        restarted.start()
-        assert restarted.state == "RUNNING"
+        start_legacy_helpers(restarted)
         assert all(
             event.wait(timeout=3)
             for name, event in lp_events.items()
@@ -1023,7 +1072,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
             for key in ("checked_at", "window_start", "window_end")
         } == summary_timestamps_before_restart
     finally:
-        restarted.stop()
+        assert restarted._cleanup_resources() == []
 
     assert store.n_leg_control()["total_unsettled_capital_units"] == 1_000_000
     assert not solver_calls
@@ -1034,6 +1083,36 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         for call in calls
         if call[0] == "notification" and "N_LEG" in repr(call[1])
     ]
+
+
+    # N-leg pause leaves a legitimately RUN LP current cycle active. Empty
+    # current orders/positions and budget None cannot cause mutation here.
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(d2_root, scenario="consumer-nleg-paused-run") as child:
+        child.release("metadata")
+        child.start(expected_running=True)
+        for run in range(2):
+            child.wait("nleg-current-read-1" if run == 0 else "nleg-current-read-3")
+            state = child.wait_state(lambda row: row.get("buy_reserved_usd") == "0"
+                and row.get("current_exposure_usd") == "0")
+            assert child.request("/healthz")["runtime_state"] == "RUNNING"
+            assert state["desired_running"] is True and state["effective_running"] is True
+            assert state["account_buys"] == [] and state["inventory_cost_usd"] == "0"
+            assert state["new_capacity_usd"] is None
+            initial = len(list(child.events.glob("nleg-current-read-*")))
+            child.advance(1 + run * 2)
+            child.wait("nleg-current-read-" + str(initial + 1))
+            current_store = PredictionArbitrageStore(child.data_dir)
+            assert current_store.n_leg_control()["total_unsettled_capital_units"] == 1_000_000
+            assert current_store.n_leg_control()["active_batch_id"] is None
+            assert current_store.lp_sessions() == []
+            child.assert_owned()
+            assert not child.marker("unexpected-nleg-construction").exists()
+            assert child.actual_posts() == 0 and list(child.events.glob("cancel-call-*")) == []
+            child.process.terminate(); assert child.wait_exit() == 0
+            child.assert_owner_available()
+            if run == 0:
+                child.launch("automatic-consumer-nleg-paused-run", expected_running=True)
 
 
 @pytest.mark.parametrize("reader_generation", (True, False, 0, -1))
@@ -1108,6 +1187,9 @@ def test_restart_preserves_manual_orders_and_resumes_monitoring(
     import open_trader.polymarket_monitor as monitor_module
     import open_trader.prediction_runtime as runtime_module
 
+    d2_root = tmp_path / "actual-d2"
+    tmp_path = tmp_path / "isolated-legacy"
+    # Explicit private legacy component loop, never default Runtime.start.
     account_orders = [
         {
             "id": "manual-no-order",
@@ -1336,7 +1418,16 @@ def test_restart_preserves_manual_orders_and_resumes_monitoring(
             enable_n_leg_background=False,
         )
         try:
-            runtime.start()
+            runtime._owner.acquire()
+            runtime.store = PredictionArbitrageStore(tmp_path)
+            runtime._prediction_trading = FakeTrading()
+            runtime.lp = PolymarketLPService(runtime.store, runtime._prediction_trading, owner_lock=runtime._owner)
+            runtime.monitor = runtime_module.PolymarketMonitor(store=runtime.store, trading=runtime._prediction_trading,
+                public_client_factory=FakePublicClient)
+            runtime.execution = PredictionExecutionService(store=runtime.store, monitor=runtime.monitor,
+                trading=runtime._prediction_trading, notifier=runtime._notifier,
+                lock_path=tmp_path / "prediction_arbitrage/execution.lock", lp=runtime.lp)
+            runtime._start_lp_monitor()
             assert runtime.store is not None
             assert runtime.execution is not None
             # Issue #146: poll like the page does until the background
@@ -1364,7 +1455,6 @@ def test_restart_preserves_manual_orders_and_resumes_monitoring(
             )
             observations.append(
                 {
-                    "state": runtime.state,
                     "dashboard_state": dashboard["state"],
                     "stale": dashboard["stale"],
                     "orders": [
@@ -1382,11 +1472,9 @@ def test_restart_preserves_manual_orders_and_resumes_monitoring(
                 }
             )
         finally:
-            if runtime.state not in {"NEW", "STOPPED"}:
-                runtime.stop()
+            assert runtime._cleanup_resources() == []
 
     expected = {
-        "state": "RUNNING",
         "dashboard_state": "ready",
         "stale": False,
         "orders": expected_orders,
@@ -1395,6 +1483,41 @@ def test_restart_preserves_manual_orders_and_resumes_monitoring(
     assert observations == [expected, expected]
     assert owners_by_run[0] == owners_by_run[1]
     assert mutations == []
+
+    # Default production has separate data and real current/round/control
+    # authority. Persisted pause makes this no exception to RUN BUY cleanup.
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(d2_root, scenario='rollback-current-manual-preserved') as child:
+        child.release('metadata')
+        child.start(expected_running=False)
+        for run in range(2):
+            state = child.wait_state(lambda state: state.get('buy_reserved_usd') == '63.00')
+            assert child.request('/healthz')['runtime_state'] == 'RUNNING'
+            assert state['desired_running'] is False and state['effective_running'] is False
+            actual = sorted((row['key'][3], row['side'], row['price']['value'],
+                row['original_size']['value']) for row in state['account_buys'])
+            assert actual == [('manual-no-order', 'BUY', '0.36', '100'),
+                              ('manual-yes-order', 'BUY', '0.27', '100')]
+            assert state['inventory_cost_usd'] == '0' and state['current_exposure_usd'] == '63.00'
+            assert state['new_capacity_usd'] is None
+            dashboard = child.request('/api/prediction-arbitrage/lp/dashboard')
+            rows = {row['order_id']: row for row in dashboard.get('orders', [])}
+            deadline = time.monotonic() + 5
+            while set(rows) != {'manual-no-order', 'manual-yes-order'} and time.monotonic() < deadline:
+                time.sleep(.01)
+                dashboard = child.request('/api/prediction-arbitrage/lp/dashboard')
+                rows = {row['order_id']: row for row in dashboard.get('orders', [])}
+            assert set(rows) == {'manual-no-order', 'manual-yes-order'}
+            assert all(row['management'] == 'manual_read_only' and row['read_only'] is True
+                and row['session_id'] is None for row in rows.values())
+            assert dashboard['open_orders_complete'] is True
+            assert dashboard['positions_complete'] is True
+            assert PredictionArbitrageStore(child.data_dir).lp_sessions() == []
+            child.assert_owned()
+            assert child.actual_posts() == 0 and list(child.events.glob('cancel-call-*')) == []
+            child.process.terminate(); assert child.wait_exit() == 0
+            child.assert_owner_available()
+            if run == 0: child.launch('operator-rollback-current-manual-preserved', expected_running=False)
 
 
 def test_lp_restart_owns_one_session_and_preserves_monitoring(
@@ -1518,6 +1641,8 @@ def test_lp_report_waits_for_restart_reconciliation(
     import open_trader.prediction_arbitrage_execution as execution_module
     import open_trader.prediction_runtime as runtime_module
 
+    d2_root = tmp_path / "actual-d2"
+    tmp_path = tmp_path / "isolated-legacy"
     clock_time = datetime(2026, 9, 15, 0, 3, tzinfo=UTC)
     cutoff = datetime(2026, 9, 15, 0, 0, tzinfo=UTC)
 
@@ -1684,9 +1809,18 @@ def test_lp_report_waits_for_restart_reconciliation(
         solver_server_factory=lambda: object(),
         enable_n_leg_background=False,
     )
-    runtime.start()
+    runtime._owner.acquire()
+    runtime.store = seed_store
+    runtime._prediction_trading = trading
+    runtime.lp = PolymarketLPService(seed_store, trading, owner_lock=runtime._owner)
+    runtime.monitor = runtime_module.PolymarketMonitor(store=seed_store, trading=trading)
+    runtime.execution = PredictionExecutionService(store=seed_store, monitor=runtime.monitor,
+        trading=trading, notifier=runtime._notifier,
+        lock_path=tmp_path / "prediction_arbitrage/execution.lock", lp=runtime.lp)
+    runtime._start_lp_monitor()
+    runtime._start_history_monitor()
+    runtime._start_candidate_scan_monitor()
     try:
-        assert runtime.state == "RUNNING"
         assert runtime.store is not None
         assert trading.snapshot_started.wait(timeout=2)
         assert trading.candidate_catalog_started.wait(timeout=2)
@@ -1718,10 +1852,33 @@ def test_lp_report_waits_for_restart_reconciliation(
         assert report["cutoff_market_data_status"] == "unknown"
     finally:
         trading.release_snapshot.set()
-        runtime.stop()
+        assert runtime._cleanup_resources() == []
 
     reopened = PredictionArbitrageStore(tmp_path)
     assert reopened.lp_daily_report("2026-09-15") == report
+
+    # A separate real paused D2 startup leaves the old due row historical.
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(d2_root, scenario='rollback-current-stale-report') as child:
+        child.release('metadata'); child.start(expected_running=False)
+        state = child.wait_state(lambda state: state.get('current_exposure_usd') == '3.80')
+        assert child.request('/healthz')['runtime_state'] == 'RUNNING'
+        assert state['effective_running'] is False and state['desired_running'] is False
+        assert state['buy_reserved_usd'] == '3.20' and state['inventory_cost_usd'] == '0.60'
+        # The stale legacy deadline is already a month overdue. Advance one
+        # current iteration without also triggering D2's independent600s guard.
+        child.advance(1)
+        state = child.wait_state(lambda state: state.get('last_check_at') == '2026-10-16T12:00:01+00:00'
+            and state.get('current_exposure_usd') == '3.80')
+        assert state['desired_running'] is False and state['current_exposure_usd'] == '3.80'
+        current_store = PredictionArbitrageStore(child.data_dir)
+        assert current_store.lp_daily_report('2026-09-15') is None
+        old = current_store.lp_session('old-report-only')
+        assert old['residual_quantity'] == '12' and old['entry_order_id'] == 'old-history-order'
+        assert child.actual_posts() == 0 and list(child.events.glob('cancel-call-*')) == []
+        child.assert_owned()
+        child.process.terminate(); assert child.wait_exit() == 0
+        child.assert_owner_available()
 
 
 def test_lp_dashboard_refresh_cannot_block_risk_monitor(
@@ -2034,10 +2191,26 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
             notifier=TestNotifier(),
         )
 
+    def start_legacy_helpers(runtime: PredictionRuntime) -> None:
+        runtime._owner.acquire()
+        runtime.store = PredictionArbitrageStore(tmp_path)
+        runtime._prediction_trading = FakeTrading(probe_holder[0])
+        runtime.lp = PolymarketLPService(runtime.store, runtime._prediction_trading, owner_lock=runtime._owner)
+        runtime.monitor = FakeMonitor()
+        runtime.observation_monitor = FakeObservationMonitor()
+        runtime.execution = PredictionExecutionService(store=runtime.store, monitor=runtime.monitor,
+            trading=runtime._prediction_trading, notifier=runtime._notifier,
+            lock_path=tmp_path / "prediction_arbitrage/execution.lock", lp=runtime.lp)
+        runtime._start_lp_monitor()
+        runtime._start_history_monitor()
+        runtime._start_candidate_scan_monitor()
+        runtime._start_lp_dashboard_monitor()
+        runtime._start_reward_monitor()
+
     first = new_runtime()
-    first.start()
+    start_legacy_helpers(first)
     try:
-        assert first.state == "RUNNING"
+        # Actual RUNNING and repeated start denial move to the clean child.
         # No Dashboard request is made while this external catalog read is
         # blocked; the runtime-owned worker still starts the refresh.
         assert probe_holder[0].catalog_started.wait(timeout=2)
@@ -2053,19 +2226,22 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
         # the reward reader has entered its blocked state.
         assert probe_holder[0].risk_snapshot_started.wait(timeout=2)
         session = first.store.lp_session("runtime-reward-session")  # type: ignore[union-attr]
+        # External snapshot entry precedes the real tick's durable publication.
+        deadline = time.monotonic() + 2
+        while (not isinstance(session, dict) or session.get("book_checked_at") is None) and time.monotonic() < deadline:
+            threading.Event().wait(.01)
+            session = first.store.lp_session("runtime-reward-session")
         assert session is not None
         assert session["book_checked_at"] is not None
         assert not probe_holder[0].release_reward.is_set()
         assert probe_holder[0].active == 1
         assert probe_holder[0].max_active == 1
-        with pytest.raises(RuntimeError, match="cannot start from RUNNING"):
-            first.start()
         stop_finished = threading.Event()
         stop_errors: list[BaseException] = []
 
         def stop_runtime() -> None:
             try:
-                first.stop()
+                assert first._cleanup_resources() == []
             except BaseException as exc:
                 stop_errors.append(exc)
             finally:
@@ -2087,8 +2263,8 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
         probe_holder[0].release_reward.set()
         probe_holder[0].release_catalog.set()
         probe_holder[0].release_after_stop.set()
-        if first.state not in {"STOPPED", "NEW"}:
-            first.stop()
+        if first._owner.held:
+            assert first._cleanup_resources() == []
     assert probe_holder[0].active == 0
 
     # Public stop/start recovery creates one fresh runtime task while the
@@ -2098,9 +2274,9 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
     normal_reward_grace = runtime_module._LP_REWARD_STOP_GRACE_SECONDS
     monkeypatch.setattr(runtime_module, "_LP_REWARD_STOP_GRACE_SECONDS", 0.0)
     second = new_runtime()
-    second.start()
+    start_legacy_helpers(second)
     try:
-        assert second.state == "RUNNING"
+        # No manufactured state for the explicitly driven legacy helper.
         assert probe_holder[0].catalog_started.wait(timeout=2)
         assert probe_holder[0].catalog_finished.wait(timeout=2)
         assert probe_holder[0].catalog_calls == 1
@@ -2113,9 +2289,8 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
         assert refresh_thread is not None
         second._start_reward_monitor()
         assert second._reward_thread is refresh_thread
-        with pytest.raises(RuntimeError, match="prediction runtime cleanup failed"):
-            second.stop()
-        assert second.state == "STOPPING"
+        errors = second._cleanup_resources()
+        assert any("reward monitor thread did not stop" in str(error) for error in errors)
         assert probe_holder[0].stop_observed.wait(timeout=2)
         assert probe_holder[0].active == 1
         assert probe_holder[0].monitor_stopped.is_set()
@@ -2127,7 +2302,7 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
         assert second.store.lp_session("runtime-reward-session") is not None
         competing = new_runtime()
         with pytest.raises(PredictionRuntimeOwnershipError):
-            competing.start()
+            competing._owner.acquire()
         probe_holder[0].release_after_stop.set()
         assert probe_holder[0].reward_finished.wait(timeout=2)
         monkeypatch.setattr(
@@ -2135,8 +2310,7 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
             "_LP_REWARD_STOP_GRACE_SECONDS",
             normal_reward_grace,
         )
-        second.stop()
-        assert second.state == "STOPPED"
+        assert second._cleanup_resources() == []
         assert probe_holder[0].close_called.is_set()
         assert probe_holder[0].catalog_calls == 1
         assert probe_holder[0].calls == 1
@@ -2150,9 +2324,46 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
             "_LP_REWARD_STOP_GRACE_SECONDS",
             normal_reward_grace,
         )
-    if second.state not in {"STOPPED", "NEW"}:
-        second.stop()
+    if second._owner.held:
+        assert second._cleanup_resources() == []
     assert probe_holder[0].active == 0
+
+
+    _assert_current_progress_with_blocked_optional_source(tmp_path / "actual-d2", "catalog")
+
+
+def _assert_actual_candidate_queue(root: Path) -> None:
+    from tests.lp_d2_service_harness import ServiceChild
+    from open_trader.lp_auto_cli import _Client
+    with ServiceChild(root, scenario="consumer-rollback-current-producer-candidate") as child:
+        child.release("metadata")
+        child.start(expected_running=False)
+        child.wait("producer-preparation-result.json")
+        client = _Client(child.base, 4)
+        bootstrap = client.request("/api/prediction-arbitrage/venues")
+        # HTTP ACCEPTED is emitted only when the real public queue method
+        # returns True while Runtime and its candidate worker are running.
+        assert client.request("/api/prediction-arbitrage/lp/candidates/refresh", {},
+            csrf=bootstrap["csrf_token"]) == {"state": "queued"}
+        child.wait("optional-entered")
+        before = len(list(child.events.glob("optional-current-read-*")))
+        child.advance(1)
+        child.wait("optional-current-read-" + str(before + 1))
+        state = child.wait_state(lambda row: row.get("current_exposure_usd") == "0")
+        assert state["buy_reserved_usd"] == "0" and state["inventory_cost_usd"] == "0"
+        assert not child.marker("optional-ended").exists()
+        assert json.loads(child.marker("optional-native-counts.json").read_text()) == dict(calls=1, active=1, max_active=1)
+        child.release("optional")
+        child.wait("producer-candidate-source-1")
+        assert client.request("/api/prediction-arbitrage/lp/candidates/refresh", {},
+            csrf=bootstrap["csrf_token"]) == {"state": "queued"}
+        child.wait("producer-candidate-source-2")
+        assert child.actual_posts() == 0 and list(child.events.glob("cancel-call-*")) == []
+        assert PredictionArbitrageStore(child.data_dir).lp_sessions() == []
+        child.process.terminate(); assert child.wait_exit() == 0
+        stopped = json.loads(child.marker("producer-stopped.json").read_text())
+        assert stopped == dict(state="STOPPED", queue_accepted=False)
+        child.assert_owner_available()
 
 
 def test_candidate_monitors_run_independently(
@@ -2250,7 +2461,16 @@ def test_candidate_monitors_run_independently(
     )
     wake = _ControlledRuntimeEvent()
     runtime._lp_candidate_refresh_requested = wake
-    runtime.start()
+    # Controlled source-loop portion: no fabricated public Runtime state.
+    runtime._owner.acquire()
+    runtime.store = PredictionArbitrageStore(tmp_path)
+    runtime._prediction_trading = FakeTrading()
+    runtime.lp = StubLP(runtime.store, runtime._prediction_trading, owner_lock=runtime._owner)
+    runtime.monitor = FakeMonitor()
+    runtime.execution = FakeExecution()
+    runtime._start_candidate_scan_monitor()
+    runtime._start_candidate_maintenance_monitor()
+    runtime._start_lp_dashboard_monitor()
     try:
         assert runtime.lp is not None
         # The scan parks inside refresh_candidates; the maintenance thread
@@ -2271,15 +2491,15 @@ def test_candidate_monitors_run_independently(
         scan_release.set()
         wake.wait_until_waiting(1)
         assert wake.waits == [2.0]
-        assert runtime.queue_lp_candidate_refresh() is True
+        wake.set()  # Source-loop wake; public True admission is proved below.
         wake.wait_until_waiting(2)
         assert len(runtime.lp.scan_forces) == 2
         assert runtime.lp.scan_forces[0] is True
         assert runtime.lp.scan_forces[1] is True
     finally:
         scan_release.set()
-        runtime.stop()
-    assert runtime.state == "STOPPED"
+        assert runtime._cleanup_resources() == []
+    _assert_actual_candidate_queue(tmp_path / "actual-d2")
 
 
 def test_candidate_monitor_scan_cadence(
@@ -2368,7 +2588,16 @@ def test_candidate_monitor_scan_cadence(
     )
     wake = _ControlledRuntimeEvent()
     runtime._lp_candidate_refresh_requested = wake
-    runtime.start()
+    # Controlled source-loop portion: no fabricated public Runtime state.
+    runtime._owner.acquire()
+    runtime.store = PredictionArbitrageStore(tmp_path)
+    runtime._prediction_trading = FakeTrading()
+    runtime.lp = StubLP(runtime.store, runtime._prediction_trading, owner_lock=runtime._owner)
+    runtime.monitor = FakeMonitor()
+    runtime.execution = FakeExecution()
+    runtime._start_candidate_scan_monitor()
+    runtime._start_candidate_maintenance_monitor()
+    runtime._start_lp_dashboard_monitor()
     try:
         assert runtime.lp is not None
         # Waiting is reached only after the preceding batch has completed.
@@ -2383,13 +2612,38 @@ def test_candidate_monitor_scan_cadence(
         assert wake.waits == [2.0, 2.0]
 
         # Manual refresh interrupts the floor and starts exactly one batch.
-        assert runtime.queue_lp_candidate_refresh() is True
+        wake.set()  # Source-loop wake; public True admission is proved below.
         wake.wait_until_waiting(3)
         assert runtime.lp.calls == [True, True, True]
         assert wake.waits == [2.0, 2.0, 2.0]
     finally:
-        runtime.stop()
-    assert runtime.state == "STOPPED"
+        assert runtime._cleanup_resources() == []
+    _assert_actual_candidate_queue(tmp_path / "actual-d2")
+
+
+def _assert_actual_trial_maintenance(root: Path) -> None:
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(root, scenario="consumer-producer-trial") as child:
+        child.release("metadata")
+        child.start(expected_running=False)
+        # No dashboard/queue request initiates this real maintenance work.
+        child.wait("optional-entered")
+        before = len(list(child.events.glob("optional-current-read-*")))
+        child.advance(32)
+        child.wait("optional-current-read-" + str(before + 1))
+        state = child.wait_state(lambda row: row.get("current_exposure_usd") == "0")
+        assert state["effective_running"] is False and state["buy_reserved_usd"] == "0"
+        assert json.loads(child.marker("optional-native-counts.json").read_text()) == dict(calls=1, active=1, max_active=1)
+        child.process.terminate(); child.wait("optional-stopping-retained")
+        child.assert_owned()
+        assert not child.marker("optional-trading-closed").exists()
+        child.release("optional")
+        assert child.wait_exit() == 0
+        assert child.marker("producer-trial-missing-no").exists()
+        assert child.marker("optional-runtime-stopped").exists()
+        assert child.marker("optional-trading-closed").exists()
+        child.assert_owner_available()
+        assert child.actual_posts() == 0 and list(child.events.glob("cancel-call-*")) == []
 
 
 def test_lp_trial_maintenance_runs_without_page_and_stops(
@@ -2632,6 +2886,19 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
     PredictionArbitrageStore(tmp_path).lp_competitiveness_upsert(
         (condition_id, Decimal("2"), clock["now"]) for condition_id in condition_ids
     )
+    def start_source_helpers(runtime: PredictionRuntime) -> None:
+        runtime._owner.acquire()
+        runtime.store = PredictionArbitrageStore(runtime._data_dir)
+        runtime._prediction_trading = FakeTrading()
+        runtime.lp = PolymarketLPService(runtime.store, runtime._prediction_trading,
+            owner_lock=runtime._owner, clock=read_clock)
+        runtime.monitor = FakeMonitor()
+        runtime.execution = FakeExecution()
+        runtime._start_lp_monitor()  # Explicit legacy risk_tick_seen compatibility only.
+        runtime._start_history_monitor()
+        runtime._start_candidate_scan_monitor()
+        runtime._start_candidate_maintenance_monitor()
+
     runtime = PredictionRuntime(
         data_dir=tmp_path,
         prediction_config_path=tmp_path / "prediction.json",
@@ -2642,9 +2909,9 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
         history_clock=read_clock,
         history_wait=wait_for_history,
     )
-    runtime.start()
+    start_source_helpers(runtime)
     try:
-        assert runtime.state == "RUNNING"
+        # Actual RUNNING/current protection is proved by the clean child.
         assert history_waiting.wait(timeout=5)
         assert runtime.lp is not None
         deadline = time.monotonic() + 5
@@ -2676,8 +2943,7 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
         assert set(book_calls[1]) == expected_all
         assert risk_tick_seen.wait(timeout=2)
     finally:
-        runtime.stop()
-    assert runtime.state == "STOPPED"
+        assert runtime._cleanup_resources() == []
     assert maintenance_stop_seen.is_set()
     calls_after_stop = len(book_calls)
     time.sleep(0.05)
@@ -2714,9 +2980,9 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
     scan_wait = _ControlledRuntimeEvent()
     runtime2._candidate_maintenance_wakeup = maintenance_wait
     runtime2._lp_candidate_refresh_requested = scan_wait
-    runtime2.start()
+    start_source_helpers(runtime2)
     try:
-        assert runtime2.state == "RUNNING"
+        # Source wait arithmetic is not public Runtime state.
         assert history_waiting.wait(timeout=5)
         assert runtime2.lp is not None
         deadline = time.monotonic() + 5
@@ -2738,8 +3004,46 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
         assert all(interval >= 1.0 for interval in maintenance_wait.waits)
         assert len(book_calls) == 2
     finally:
-        runtime2.stop()
-    assert runtime2.state == "STOPPED"
+        assert runtime2._cleanup_resources() == []
+    _assert_actual_trial_maintenance(tmp_path / "actual-d2")
+
+
+def _assert_current_progress_with_blocked_optional_source(root: Path, source: str) -> None:
+    from tests.lp_d2_service_harness import ServiceChild
+    scenario = ("consumer-optional-metadata" if source == "metadata" else "consumer-rollback-current-optional-" + source)
+    with ServiceChild(root, scenario=scenario) as child:
+        child.release("metadata")
+        child.start(expected_running=False)
+        child.wait("optional-entered")
+        child.wait("optional-runtime-started")
+        assert child.request("/healthz")["runtime_state"] == "RUNNING"
+        initial = len(list(child.events.glob("optional-current-read-*")))
+        assert initial >= 1
+        child.advance(1)
+        child.wait("optional-current-read-" + str(initial + 1))
+        exposure, reserved, inventory = ("0", "0", "0") if source == "metadata" else ("3.80", "3.20", "0.60")
+        current = child.wait_state(lambda row: row.get("current_exposure_usd") == exposure)
+        assert current["effective_running"] is False and current["desired_running"] is False
+        assert current["buy_reserved_usd"] == reserved and current["inventory_cost_usd"] == inventory
+        assert not child.marker("optional-ended").exists()
+        assert json.loads(child.marker("optional-native-counts.json").read_text()) == dict(calls=1, active=1, max_active=1)
+        assert child.actual_posts() == 0 and list(child.events.glob("cancel-call-*")) == []
+        assert PredictionArbitrageStore(child.data_dir).lp_sessions() == []
+        started = json.loads(child.marker("optional-runtime-started").read_text())
+        assert started["obsolete_sampler"] is False and started["scheduler_count"] == 1
+        child.process.terminate()
+        child.wait("optional-stopping-retained")
+        child.assert_owned()
+        assert not child.marker("optional-trading-closed").exists()
+        assert not child.marker("optional-owner-released").exists()
+        child.release("optional")
+        child.wait("optional-ended")
+        assert child.wait_exit() == 0
+        assert child.marker("optional-trading-closed").exists()
+        assert child.marker("optional-owner-released").exists()
+        assert child.marker("optional-runtime-stopped").exists()
+        assert json.loads(child.marker("optional-native-counts.json").read_text()) == dict(calls=1, active=0, max_active=1)
+        child.assert_owner_available()
 
 
 def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
@@ -2872,6 +3176,9 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
             pass
 
     class FakeLP:
+        def _now(self):
+            return datetime.now(UTC)
+
         def __init__(self, _store: object, _trading: object, **_kwargs: object) -> None:
             self.probe = probe_holder[0]
 
@@ -3012,11 +3319,33 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
             enable_n_leg_background=False,
         )
 
+    def start_legacy_observation_helpers(runtime: PredictionRuntime, trading: object) -> None:
+        # Only legacy observation/formula/tick oracles run in this fixture.
+        # Public Runtime state and native ownership are tested in the clean child.
+        runtime._owner.acquire()
+        runtime.store = PredictionArbitrageStore(runtime._data_dir)
+        runtime._prediction_trading = trading
+        runtime.lp = runtime_module.PolymarketLPService(runtime.store, trading, owner_lock=runtime._owner)
+        runtime.monitor = runtime_module.PolymarketMonitor(store=runtime.store, trading=trading)
+        runtime.execution = runtime_module.PredictionExecutionService(store=runtime.store,
+            monitor=runtime.monitor, trading=trading, notifier=runtime._notifier,
+            lock_path=runtime._data_dir / "prediction_arbitrage/execution.lock", lp=runtime.lp)
+        set_notifier = getattr(runtime.lp, "set_protection_notifier", None)
+        if callable(set_notifier):
+            set_notifier(lambda title, message, voice, channels=None, one_shot=False:
+                _deliver_lp_protection_with_runtime(runtime.execution, runtime._notifier,
+                    title, message, voice, channels=channels, one_shot=one_shot))
+        runtime._start_lp_monitor()
+        runtime._start_history_monitor()
+        runtime._start_candidate_scan_monitor()
+        runtime._start_lp_dashboard_monitor()
+        runtime._start_reward_monitor()
+
     normal_probe = Probe()
     normal = new_runtime(normal_probe, "normal-runtime")
-    normal.start()
+    start_legacy_observation_helpers(normal, FakeTrading(normal_probe))
     try:
-        assert normal.state == "RUNNING"
+        # Actual RUNNING is asserted by the clean-child portion below.
         assert normal_probe.observation_started.wait(timeout=2)
         assert normal_probe.notification_sent.wait(timeout=2)
         assert normal_probe.rate_thread_name == "prediction-lp-reward-monitor"
@@ -3026,21 +3355,19 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
         assert "达到 10% 警戒线" in normal_probe.notifications[0]
         assert normal_probe.order_writes == normal_probe.cancellations == 0
     finally:
-        normal.stop()
-    assert normal.state == "STOPPED"
+        assert normal._cleanup_resources() == []
     assert normal_probe.monitor_stopped.is_set()
 
     blocked_probe = Probe(block_rate=True)
     blocked = new_runtime(blocked_probe, "blocked-runtime")
-    blocked.start()
+    start_legacy_observation_helpers(blocked, FakeTrading(blocked_probe))
     assert blocked_probe.rate_started.wait(timeout=2)
     assert blocked_probe.lp_tick_seen.wait(timeout=2)
     # Issue #146: concurrent observation refreshes coalesce onto the shared
     # dashboard snapshot pipeline, so some calls return early instead of
     # queueing behind the blocked rate read. The risk monitor must still
     # keep ticking while the rate read is parked.
-    blocked.stop()
-    assert blocked.state == "STOPPED"
+    assert blocked._cleanup_resources() == []
     assert blocked_probe.rate_cancelled.is_set()
     assert blocked_probe.observation_finished.is_set()
     assert blocked_probe.monitor_stopped.is_set()
@@ -3328,12 +3655,12 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
     )
     protection_wait = _ControlledRuntimeEvent()
     isolated._lp_stop_event = protection_wait
-    isolated.start()
+    start_legacy_observation_helpers(isolated, isolation_trading)
     account_id = hashlib.sha256(
         isolation_trading.config.wallet_address.casefold().encode("utf-8")
     ).hexdigest()
     try:
-        assert isolated.state == "RUNNING"
+        # No manufactured Runtime state in the isolated legacy helper.
         assert isolation_probe.catalog_started.wait(timeout=2)
         checked_at_values: set[str] = set()
         deadline = time.monotonic() + 2
@@ -3375,14 +3702,16 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
         assert "达到 10% 警戒线" in isolation_probe.notifications[0]
         assert isolation_probe.order_writes == isolation_probe.cancellations == 0
     finally:
-        isolated.stop()
-    assert isolated.state == "STOPPED"
+        assert isolated._cleanup_resources() == []
     assert isolation_probe.catalog_cancelled.is_set()
     assert isolation_probe.catalog_finished.is_set()
     assert isolation_probe.close_called.is_set()
     assert not isolated.production_owner
     with isolation_probe._lock:
         assert isolation_probe.active_reads == 0
+
+
+    _assert_current_progress_with_blocked_optional_source(tmp_path / "actual-d2", "catalog")
 
 
 def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
@@ -3733,8 +4062,20 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
 
     dashboard_thread = None
     try:
-        runtime.start()
-        assert runtime.state == "RUNNING"
+        # Source-only share-watch contract; actual public Runtime lifecycle
+        # and the same producer's native drain run in the clean child below.
+        runtime._owner.acquire()
+        runtime.store = PredictionArbitrageStore(data_dir)
+        runtime._prediction_trading = trading
+        runtime.lp = FakeLP(runtime.store, trading, owner_lock=runtime._owner)
+        runtime.monitor = FakeMonitor()
+        runtime.observation_monitor = FakeObservationMonitor()
+        runtime.execution = TestExecution(store=runtime.store, monitor=runtime.monitor,
+            trading=trading, notifier=runtime._notifier,
+            lock_path=data_dir / "prediction_arbitrage/execution.lock", lp=runtime.lp)
+        runtime._start_lp_share_watch()
+        runtime._start_lp_dashboard_monitor()
+        runtime._start_reward_monitor()
         wait_for(probe.first_percentage_read.is_set)
         assert probe.percentage_reads == 1
         wait_for(probe.first_order_read.is_set)
@@ -3888,7 +4229,7 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
 
         def stop_runtime() -> None:
             try:
-                runtime.stop()
+                stop_errors.extend(runtime._cleanup_resources())
             except BaseException as exc:
                 stop_errors.append(exc)
             finally:
@@ -3899,7 +4240,7 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
         assert stop_done.wait(timeout=1)
         stop_thread.join(timeout=1)
         assert stop_errors
-        assert runtime.state == "STOPPING"
+        # Genuine STOPPING is retained by the actual-child assertion below.
         assert runtime.production_owner is True
         assert runtime.store is not None
         assert not probe.trading_closed.is_set()
@@ -3916,21 +4257,23 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
         assert not share_worker.is_alive()
         assert probe.order_reads == reads_after_release
         assert probe.percentage_reads == percentage_reads_at_stop
-        runtime.stop()
-        assert runtime.state == "STOPPED"
+        assert runtime._cleanup_resources() == []
         assert runtime.production_owner is False
         assert probe.trading_closed.is_set()
         assert probe.lp_closed.is_set()
     finally:
-        if runtime.state not in {"NEW", "STOPPED"}:
+        if runtime._owner.held:
             probe.orders_blocked = False
             probe.orders_release.set()
             probe.percentage_release.set()
-            runtime.stop()
+            assert runtime._cleanup_resources() == []
 
         if dashboard_thread is not None:
             dashboard_thread.join(timeout=2)
             assert not dashboard_thread.is_alive()
+
+
+    _assert_current_progress_with_blocked_optional_source(tmp_path / "actual-d2", "share")
 
 
 def test_runtime_owner_lock_excludes_a_real_second_process(tmp_path: Path) -> None:
@@ -4008,878 +4351,355 @@ def test_runtime_owner_lock_releases_after_owner_process_exit(tmp_path: Path) ->
 def test_runtime_starts_and_stops_prediction_resources_in_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.prediction_runtime as runtime_module
-
-    events: list[str] = []
-    original_acquire = runtime_module._RuntimeOwnershipLock.acquire
-    original_release = runtime_module._RuntimeOwnershipLock.release
-
-    def acquire(lock: object) -> None:
-        original_acquire(lock)  # type: ignore[arg-type]
-        events.append("owner.acquire")
-
-    def release(lock: object) -> None:
-        original_release(lock)  # type: ignore[arg-type]
-        events.append("owner.release")
-
-    class FakeStore:
-        def __init__(self, _data_dir: Path) -> None:
-            events.append("store.construct")
-            events.append("store.open")
-
-        def apply_safety_policy(
-            self, policy: object, *, git_sha: str
-        ) -> dict[str, object]:
-            events.append("policy.apply")
-            assert isinstance(policy, dict)
-            assert git_sha == "sha-1"
-            return {"state": "baseline_enrolled"}
-
-        def close(self) -> None:
-            events.append("store.close")
-
-    class FakeTrading:
-        def close(self) -> None:
-            events.append("trading.close")
-
-    class FakeTradingClient:
-        @classmethod
-        def from_keychain(cls, _config: object) -> FakeTrading:
-            events.append("client.construct")
-            return FakeTrading()
-
-    class FakeMonitor:
-        def __init__(self, **_: object) -> None:
-            events.append("monitor.construct")
-
-        def set_ready_observer(self, _observer: object) -> None:
-            pass
-
-        def set_observation_observer(self, _observer: object) -> None:
-            pass
-
-        def set_auto_eat_observer(self, _observer: object) -> None:
-            events.append("auto_eat.bind")
-
-        def set_failure_observer(self, _observer: object) -> None:
-            pass
-
-        def start(self) -> None:
-            events.append("polymarket.start")
-
-        def stop(self) -> None:
-            events.append("polymarket.stop")
-
-    class FakeExecution:
-        def __init__(self, **_: object) -> None:
-            events.append("execution.construct")
-
-        def reconcile_startup(self) -> dict[str, object]:
-            events.append("reconcile")
-            return {"status": "ready"}
-
-        def notify_ready_opportunity(self, *_: object) -> dict[str, object]:
-            return {"status": "ignored"}
-
-        def notify_observation(self, *_: object) -> dict[str, object]:
-            return {"status": "ignored"}
-
-        def notify_monitor_failure(self, *_: object) -> dict[str, object]:
-            return {"status": "ignored"}
-
-        def auto_eat_threshold(self, *_: object) -> dict[str, object]:
-            return {"status": "ignored"}
-
-        def set_cross_venue_monitor(self, _monitor: object) -> None:
-            pass
-
-        def close(self) -> None:
-            events.append("execution.close")
-
-    class FakeCrossMonitor:
-        async def start(self) -> None:
-            events.append("cross.start")
-
-        async def stop(self) -> None:
-            events.append("cross.stop")
-
-        def snapshot(self) -> dict[str, object]:
-            return {"status": "ready"}
-
-    monkeypatch.setattr(
-        runtime_module,
-        "load_trading_config",
-        lambda _path: SimpleNamespace(
-            signer_address="0x1111111111111111111111111111111111111111",
-            wallet_address="0x2222222222222222222222222222222222222222",
-            predict=None,
-        ),
-        raising=False,
-    )
-    monkeypatch.setattr(runtime_module._RuntimeOwnershipLock, "acquire", acquire)
-    monkeypatch.setattr(runtime_module._RuntimeOwnershipLock, "release", release)
-    monkeypatch.setattr(
-        runtime_module,
-        "read_minimum_reader_generation",
-        lambda _data_dir: events.append("generation.read") or 1,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "PolymarketTradingClient",
-        FakeTradingClient,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "PredictTradingClient",
-        SimpleNamespace(from_keychain=lambda _config: None),
-        raising=False,
-    )
-    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore, raising=False)
-    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor, raising=False)
-    monkeypatch.setattr(
-        runtime_module, "PredictionExecutionService", FakeExecution, raising=False
-    )
-    monkeypatch.setattr(
-        runtime_module, "LlmRelationValidator", lambda *_args, **_kwargs: object(), raising=False
-    )
-    monkeypatch.setattr(
-        runtime_module, "LlmTitleTranslator", lambda *_args, **_kwargs: object(), raising=False
-    )
-
-    runtime = PredictionRuntime(
-        data_dir=tmp_path,
-        prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8766/",
-        cross_venue_monitor=FakeCrossMonitor(),
-        git_sha="sha-1",
-        reader_generation=1,
-    )
-    runtime.start()
-    try:
-        assert runtime.state == "RUNNING"
-        assert runtime.production_owner is True
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(tmp_path / "actual-runtime", scenario="consumer-resource-order") as child:
+        child.release("metadata")
+        child.start(expected_running=False)
+        child.assert_owned()
+        assert child.request("/healthz")["runtime_state"] == "RUNNING"
+        child.process.terminate(); assert child.wait_exit() == 0, child.output.read_text()
+        child.assert_owner_available()
+        observed = json.loads(child.marker("consumer-observations.json").read_text())
+        events = observed["events"]
         assert events.index("owner.acquire") < events.index("generation.read")
         assert events.count("generation.read") == 1
         assert events.index("generation.read") < events.index("store.construct")
         assert events.index("store.construct") < events.index("client.construct")
         assert events.index("policy.apply") < events.index("execution.construct")
+        assert observed["policy_sha"] == child.sha
         assert events.index("auto_eat.bind") < events.index("reconcile")
         assert events.index("reconcile") < events.index("polymarket.start")
         assert events.index("polymarket.start") < events.index("cross.start")
-        with pytest.raises(RuntimeError, match="cannot start from RUNNING"):
-            runtime.start()
-    finally:
-        runtime.stop()
-        runtime.stop()
+        assert observed["repeat_start_denied"] is True
+        assert events.index("cross.stop") < events.index("polymarket.stop")
+        assert events.index("polymarket.stop") < events.index("trading.close")
+        assert events.index("trading.close") < events.index("owner.release")
+        assert events.count("trading.close") == events.count("owner.release") == 1
+        native = observed["connections_at_owner_release"]
+        assert native["opened"] and sorted(native["opened"]) == sorted(native["closed"])
+        assert native["active"] == []
+        assert child.actual_posts() == 0
 
+    # These optional hooks are cleanup compatibility labels. The actual
+    # Execution and Store above have no close() method; probes never start.
+    events = []
+    class StopProbe:
+        thread_alive = False
+        def __init__(self, label):self.label = label
+        def stop(self):events.append(self.label)
+    class CloseProbe:
+        def __init__(self, label):self.label = label
+        def close(self):events.append(self.label)
+    native_release = _RuntimeOwnershipLock.release
+    def release(owner):
+        native_release(owner)
+        events.append("owner.release")
+    monkeypatch.setattr(_RuntimeOwnershipLock, "release", release)
+    runtime = PredictionRuntime(data_dir=tmp_path / "optional-cleanup",
+        prediction_config_path=tmp_path / "unused.json", dashboard_url="http://127.0.0.1:8766/")
+    runtime._owner.acquire()
+    runtime._cross_runtime = StopProbe("cross.stop")
+    runtime.monitor = StopProbe("polymarket.stop")
+    runtime.execution = CloseProbe("execution.close")
+    runtime._prediction_trading = CloseProbe("trading.close")
+    runtime.store = CloseProbe("store.close")
+    assert runtime._cleanup_resources() == []
+    runtime.stop(); runtime.stop()
     assert runtime.production_owner is False
     assert events.index("cross.stop") < events.index("polymarket.stop")
     assert events.index("polymarket.stop") < events.index("execution.close")
     assert events.index("execution.close") < events.index("trading.close")
     assert events.index("trading.close") < events.index("store.close")
     assert events.index("store.close") < events.index("owner.release")
+    assert all(events.count(event) == 1 for event in events)
 
 
 def test_disabled_n_leg_background_skips_resolver_and_driver(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.prediction_runtime as runtime_module
-
-    class Fake:
-        def __init__(self, *_: object, **__: object) -> None:
-            pass
-
-        def observation_snapshot(self) -> dict[str, object]:
-            return {}
-
-        def apply_safety_policy(
-            self, _policy: object, *, git_sha: str
-        ) -> dict[str, object]:
-            return {"state": "baseline_enrolled"}
-
-        def reconcile_startup(self) -> dict[str, object]:
-            return {"status": "ready"}
-
-        def notify_ready_opportunity(self, *_: object) -> None:
-            pass
-
-        def notify_observation(self, *_: object) -> None:
-            pass
-
-        def notify_monitor_failure(self, *_: object) -> None:
-            pass
-
-        def auto_eat_threshold(self, *_: object) -> None:
-            pass
-
-        def set_ready_observer(self, _observer: object) -> None:
-            pass
-
-        def set_observation_observer(self, _observer: object) -> None:
-            pass
-
-        def set_auto_eat_observer(self, _observer: object) -> None:
-            pass
-
-        def set_failure_observer(self, _observer: object) -> None:
-            pass
-
-        def set_cross_venue_monitor(self, _monitor: object) -> None:
-            pass
-
-        def start(self) -> None:
-            pass
-
-        def stop(self) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    monkeypatch.setattr(
-        runtime_module,
-        "load_trading_config",
-        lambda _path: SimpleNamespace(
-            signer_address="0x1111111111111111111111111111111111111111",
-            wallet_address="0x2222222222222222222222222222222222222222",
-            predict=None,
-        ),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "PolymarketTradingClient",
-        SimpleNamespace(from_keychain=lambda _config: Fake()),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "PredictTradingClient",
-        SimpleNamespace(from_keychain=lambda _config: None),
-        raising=False,
-    )
-    for name in (
-        "PredictionArbitrageStore",
-        "RelationCatalog",
-        "PolymarketMonitor",
-        "PredictionExecutionService",
-        "LlmRelationValidator",
-        "LlmTitleTranslator",
-        "PredictionLiveResolver",
-        "PredictionMonitorSelectionDriver",
-    ):
-        monkeypatch.setattr(runtime_module, name, Fake, raising=False)
-
-    runtime = PredictionRuntime(
-        data_dir=tmp_path,
-        prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8766/",
-        solver_server_factory=lambda: object(),
-        cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
-        enable_n_leg_background=False,
-    )
-    runtime.start()
-    try:
-        assert runtime.state == "RUNNING"
-        assert runtime.live_resolver is None
-        assert runtime.monitor_selection_driver is None
-    finally:
-        runtime.stop()
-
-    assert runtime.state == "STOPPED"
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(tmp_path, scenario="consumer-disabled-background") as child:
+        child.release("metadata"); child.start(expected_running=False)
+        assert child.request("/healthz")["runtime_state"] == "RUNNING"
+        child.assert_owned()
+        child.process.terminate(); assert child.wait_exit() == 0, child.output.read_text()
+        observed = json.loads(child.marker("consumer-observations.json").read_text())
+        assert observed["resolver_is_none"] is observed["selection_is_none"] is True
+        assert "resolver.start" not in observed["events"] and "selection.start" not in observed["events"]
+        child.assert_owner_available()
 
 
 def test_incompatible_release_stops_before_writable_resources_and_releases_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.prediction_runtime as runtime_module
-
-    constructed: list[str] = []
-    probes: list[Path] = []
-    monkeypatch.setattr(
-        runtime_module,
-        "read_minimum_reader_generation",
-        lambda path: probes.append(path) or 2,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "PredictionArbitrageStore",
-        lambda _path: constructed.append("store") or object(),
-    )
-    monkeypatch.setattr(
-        runtime_module.PolymarketTradingClient,
-        "from_keychain",
-        lambda _config: constructed.append("client") or object(),
-    )
-    runtime = PredictionRuntime(
-        data_dir=tmp_path,
-        prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8769",
-        reader_generation=1,
-    )
-
-    with pytest.raises(
-        runtime_module.PredictionRuntimeCompatibilityError,
-        match="reader generation 1 is below required 2",
-    ):
-        runtime.start()
-
-    assert constructed == []
-    assert probes == [tmp_path]
-    assert runtime.production_owner is False
-    probe = runtime_module._RuntimeOwnershipLock(
-        tmp_path / "prediction_arbitrage" / "runtime.lock"
-    )
-    probe.acquire()
-    probe.release()
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(tmp_path, scenario="consumer-incompatible") as child:
+        child.start(expected_running=None)
+        assert child.wait_exit() == 78, child.output.read_text()
+        result = json.loads(child.marker("consumer-observations.json").read_text())
+        assert result["error_type"] == "PredictionRuntimeCompatibilityError"
+        assert result["error"] == "prediction reader generation 1 is below required 2"
+        assert result["generation_probes"] == [str(child.data_dir)]
+        assert result.get("actual_store_constructed", False) is False
+        assert not child.marker("runtime-sdk-factory-consumer-incompatible").exists()
+        assert result["state"] == "FAILED" and result["after_idempotent_stop"] == "STOPPED"
+        assert result["permit"]["state"] == "CLAIMED"
+        assert child.actual_posts() == 0
+        child.assert_owner_available()
 
 
 def test_legacy_runtime_without_release_generation_skips_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.prediction_runtime as runtime_module
-
-    class FakeStore:
-        def __init__(self, _data_dir: Path) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    monkeypatch.setattr(
-        runtime_module,
-        "read_minimum_reader_generation",
-        lambda _path: (_ for _ in ()).throw(AssertionError("generation probed")),
-        raising=False,
-    )
-    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
-    monkeypatch.setattr(
-        runtime_module,
-        "load_trading_config",
-        lambda _path: (_ for _ in ()).throw(RuntimeError("config reached")),
-    )
-    runtime = PredictionRuntime(
-        data_dir=tmp_path,
-        prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8766",
-    )
-
-    with pytest.raises(RuntimeError, match="config reached"):
-        runtime.start()
-    runtime.stop()
+    from tests.lp_d2_service_harness import ServiceChild
+    # The existing public None reader-generation input still skips its probe;
+    # the actual guard/claim is mandatory and the later SDK failure is real.
+    with ServiceChild(tmp_path, scenario="consumer-legacy-no-generation") as child:
+        child.start(expected_running=None)
+        assert child.wait_exit() == 78, child.output.read_text()
+        result = json.loads(child.marker("consumer-observations.json").read_text())
+        assert result["generation_probes"] == []
+        assert result["actual_store_constructed"] is True
+        assert result["error_type"] == "PolymarketTradingError"
+        assert result["error"] == "polymarket trading error: unavailable"
+        assert result["state"] == "FAILED" and result["permit"]["state"] == "CLAIMED"
+        assert child.actual_posts() == 0
+        child.assert_owner_available()
 
 
 def test_failed_runtime_is_terminal_and_stop_does_not_repeat_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.prediction_runtime as runtime_module
-
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(tmp_path / "actual-failure", scenario="consumer-core-init-failure") as child:
+        child.start(expected_running=None)
+        assert child.wait_exit() == 78, child.output.read_text()
+        result = json.loads(child.marker("consumer-observations.json").read_text())
+        assert result["state"] == "FAILED" and result["repeat_start_denied"] is True
+        assert result["after_idempotent_stop"] == "STOPPED"
+        native = result["connections_at_owner_release"]
+        assert native["opened"] and sorted(native["opened"]) == sorted(native["closed"])
+        assert native["active"] == []
+        assert result["permit"]["state"] == "CLAIMED" and child.actual_posts() == 0
+        child.assert_owner_available()
+    # Preserve exactly-once optional hook dispatch without pretending that the
+    # real Store has a close API or supplying any production startup authority.
     closed: list[str] = []
-
-    class FakeStore:
-        def __init__(self, _data_dir: Path) -> None:
-            pass
-
-        def close(self) -> None:
-            closed.append("store")
-
-    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
-    monkeypatch.setattr(
-        runtime_module,
-        "load_trading_config",
-        lambda _path: (_ for _ in ()).throw(RuntimeError("bad config")),
-    )
-    runtime = PredictionRuntime(
-        data_dir=tmp_path,
-        prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8766/",
-    )
-
-    with pytest.raises(RuntimeError, match="bad config"):
-        runtime.start()
-    with pytest.raises(RuntimeError, match="cannot start from FAILED"):
-        runtime.start()
-
-    runtime.stop()
-    runtime.stop()
+    class CloseProbe:
+        def close(self):closed.append("store")
+    runtime = PredictionRuntime(data_dir=tmp_path / "optional-cleanup",
+        prediction_config_path=tmp_path / "unused.json", dashboard_url="http://127.0.0.1:8766/")
+    runtime._owner.acquire(); runtime.store = CloseProbe()
+    assert runtime._cleanup_resources() == []
+    runtime.stop(); runtime.stop()
     assert closed == ["store"]
 
 
 def test_runtime_owns_one_shared_solver_server_for_its_start_stop_lifetime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.prediction_runtime as runtime_module
-
-    events: list[str] = []
-
-    class FakeStore:
-        def __init__(self, _path: Path) -> None:
-            pass
-
-        def apply_safety_policy(self, *_args: object, **_kwargs: object) -> None:
-            pass
-
-        def close(self) -> None:
-            events.append("store.close")
-
-    class FakeTrading:
-        def close(self) -> None:
-            events.append("trading.close")
-
-    monitors: list[object] = []
-
-    class FakeMonitor:
-        def __init__(self, **_kwargs: object) -> None:
-            self.shadow_observer = None
-            monitors.append(self)
-
-        def set_ready_observer(self, _observer: object) -> None:
-            pass
-
-        def set_observation_observer(self, _observer: object) -> None:
-            pass
-
-        def set_auto_eat_observer(self, _observer: object) -> None:
-            pass
-
-        def set_failure_observer(self, _observer: object) -> None:
-            pass
-
-        def set_shadow_observer(self, observer: object) -> None:
-            self.shadow_observer = observer
-
-        def start(self) -> None:
-            events.append("monitor.start")
-
-        def stop(self) -> None:
-            events.append("monitor.stop")
-
-    class FakeExecution:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
-
-        def reconcile_startup(self) -> dict[str, object]:
-            return {"state": "ready"}
-
-        def notify_ready_opportunity(self, *_args: object) -> dict[str, object]:
-            return {}
-
-        def notify_observation(self, *_args: object) -> dict[str, object]:
-            return {}
-
-        def auto_eat_threshold(self, *_args: object) -> dict[str, object]:
-            return {}
-
-        def notify_monitor_failure(self, *_args: object) -> dict[str, object]:
-            return {}
-
-        def set_cross_venue_monitor(self, _monitor: object) -> None:
-            pass
-
-        def close(self) -> None:
-            events.append("execution.close")
-
-    class FakeSolverServer:
-        def close(self) -> None:
-            events.append("solver.close")
-
-    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
-    monkeypatch.setattr(
-        runtime_module,
-        "RelationCatalog",
-        lambda _path: SimpleNamespace(observation_snapshot=lambda: {}),
-    )
-    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
-    monkeypatch.setattr(runtime_module, "PolymarketTradingClient", SimpleNamespace(from_keychain=lambda _config: FakeTrading()))
-    monkeypatch.setattr(runtime_module, "PredictTradingClient", SimpleNamespace(from_keychain=lambda _config: None))
-    monkeypatch.setattr(runtime_module, "LlmRelationValidator", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(runtime_module, "LlmTitleTranslator", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
-    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
-    monkeypatch.setattr(
-        runtime_module,
-        "PredictionLiveResolver",
-        lambda **_kwargs: SimpleNamespace(
-            start=lambda: events.append("resolver.start"),
-            stop=lambda: events.append("resolver.stop"),
-            is_idle=lambda: True,
-            solutions=lambda: [],
-        ),
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "PredictionMonitorSelectionDriver",
-        lambda **_kwargs: SimpleNamespace(
-            start=lambda: events.append("selection.start"),
-            stop=lambda: events.append("selection.stop"),
-            status=lambda: {
-                "selection_pending": 0,
-                "selection_failures_consecutive": 0,
-                "selection_applied_generation": None,
-            },
-        ),
-    )
-    cross_observers: list[object] = []
-    monkeypatch.setattr(
-        runtime_module,
-        "_build_cross_venue_monitor",
-        lambda **kwargs: (
-            cross_observers.append(kwargs["shadow_observer"])
-            or _UnavailableCrossVenueMonitor("test")
-        ),
-    )
-    servers: list[FakeSolverServer] = []
-
-    runtime = PredictionRuntime(
-        data_dir=tmp_path,
-        prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8766/",
-        solver_server_factory=lambda: servers.append(FakeSolverServer()) or servers[-1],
-    )
-    runtime.start()
-    assert runtime.n_leg_shadow is not None
-    assert callable(getattr(monitors[0], "shadow_observer", None))
-    assert cross_observers == [monitors[0].shadow_observer]
-    runtime.stop()
-
-    assert len(servers) == 1
-    assert events.index("selection.stop") < events.index("resolver.stop")
-    assert events.index("resolver.stop") < events.index("solver.close")
-    assert events.index("monitor.stop") < events.index("solver.close")
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(tmp_path / "actual-runtime", scenario="consumer-solver-order") as child:
+        child.release("metadata"); child.start(expected_running=False)
+        child.assert_owned()
+        child.process.terminate(); assert child.wait_exit() == 0, child.output.read_text()
+        observed = json.loads(child.marker("consumer-observations.json").read_text())
+        events = observed["events"]
+        assert observed["shadow_exists"] is True and observed["monitor_shadow_callable"] is True
+        assert observed["cross_observer_same"] is True
+        assert events.count("solver.construct") == 1
+        assert events.index("selection.stop") < events.index("resolver.stop")
+        assert events.index("resolver.stop") < events.index("solver.close")
+        assert events.index("polymarket.stop") < events.index("solver.close")
+        assert events.index("solver.close") < events.index("trading.close")
+        child.assert_owner_available()
+    # Execution.close was an optional collaborator hook in the original unit.
+    # Keep its literal order in cleanup only; real native solver proof is above.
+    events = []
+    class CloseProbe:
+        def __init__(self, label):self.label = label
+        def close(self):events.append(self.label)
+    runtime = PredictionRuntime(data_dir=tmp_path / "optional-cleanup",
+        prediction_config_path=tmp_path / "unused.json", dashboard_url="http://127.0.0.1:8766/")
+    runtime._owner.acquire()
+    runtime.solver_server = CloseProbe("solver.close")
+    runtime.execution = CloseProbe("execution.close")
+    assert runtime._cleanup_resources() == []
+    runtime.stop(); runtime.stop()
     assert events.index("solver.close") < events.index("execution.close")
+    assert events == ["solver.close", "execution.close"]
+
+
+def _nr_start(child):
+    child.release('metadata')
+    child.start(expected_running=None)
+    child.wait('nr-start-completed')
+    return json.loads(child.marker('nr-start.json').read_text())
+
+
+def _nr_cycle(child, kind='known'):
+    child.wait('nr-cycle-'+kind+'-completed')
+    return json.loads(child.marker('nr-cycle-'+kind+'.json').read_text())
+
+
+def test_d2_paused_restart_ignores_stale_lp_execution_bookkeeping_without_reconcile(tmp_path):
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(tmp_path,scenario='nr-stale') as child:
+        started=_nr_start(child)
+        assert started['reconcile_calls']==0, 'D2 paused startup must use local admission, not reconcile_startup'
+        assert started['state']=='RUNNING', 'D2 local admission must ignore stale execution bookkeeping'
+        cycle=_nr_cycle(child)
+        assert cycle['scheduler_starts']==1 and cycle['api_before_scheduler'] is False
+        assert cycle['reconcile_calls']==cycle['legacy_ticks']==0
+        assert cycle['orders_complete'] is True
+        assert cycle['cancels']==[['A']]  # Exact round0 BUY set; manual SELL S is excluded.
+        assert cycle['sell_ids']==['S']
+        assert cycle['posts']==child.actual_posts()==0
+        before=json.loads(child.marker('nr-history-before.json').read_text())
+        assert cycle['history']==before  # No invented terminal state or old-request replay.
+        assert cycle['history']['execution']['state']=='submitting'
+        child.assert_owned()
+
+
+def test_d2_account_unknown_stays_online_without_buy_until_fresh_complete_facts(tmp_path):
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(tmp_path,scenario='nr-unknown') as child:
+        started=_nr_start(child)
+        assert started['state']=='RUNNING', 'account API timeout must not make D2 startup NOT_READY'
+        unknown=_nr_cycle(child,'unknown')
+        assert unknown['api_before_scheduler'] is False
+        assert unknown['orders_complete'] is False and unknown['reserved_state']=='unknown'
+        assert unknown['posts']==child.actual_posts()==0 and unknown['cancels']==[]
+        assert unknown['scheduler_starts']==1 and unknown['permit']['state']=='CLAIMED'
+        assert unknown['reconcile_calls']==unknown['legacy_ticks']==0
+        child.assert_owned()
+        child.release('fresh-facts')  # Recover the external list availability.
+        child.advance(60)  # Then reach the Reader retry deadline; no failed-read race.
+        known=_nr_cycle(child)
+        assert known['orders_complete'] is True and known['reserved_state']=='known'
+        assert known['cancels']==[['A']]
+        assert known['scheduler_starts']==1 and child.process.poll() is None
+        assert known['permit']==started['permit']==unknown['permit']
+        assert known['posts']==0  # Round0 cannot post; old intent is never replayed.
+        child.assert_owned()
+        # This socket-free subprocess proves runtime liveness. HTTP binding is
+        # deliberately left to the service gate outside this sandbox.
 
 
 def test_reconcile_failure_keeps_runtime_locked_and_does_not_start_monitors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.prediction_runtime as runtime_module
-
-    events: list[str] = []
-
-    class FakeStore:
-        def __init__(self, _data_dir: Path) -> None:
-            pass
-
-        def close(self) -> None:
-            events.append("store.close")
-
-    class FakeTrading:
-        def close(self) -> None:
-            events.append("trading.close")
-
-    class FakeTradingClient:
-        @classmethod
-        def from_keychain(cls, _config: object) -> FakeTrading:
-            return FakeTrading()
-
-    class FakeMonitor:
-        def __init__(self, **_: object) -> None:
-            pass
-
-        def set_ready_observer(self, _observer: object) -> None:
-            pass
-
-        def set_observation_observer(self, _observer: object) -> None:
-            pass
-
-        def set_auto_eat_observer(self, _observer: object) -> None:
-            pass
-
-        def set_failure_observer(self, _observer: object) -> None:
-            pass
-
-        def start(self) -> None:
-            events.append("monitor.start")
-
-        def stop(self) -> None:
-            events.append("monitor.stop")
-
-    class FakeExecution:
-        def __init__(self, **_: object) -> None:
-            pass
-
-        def reconcile_startup(self) -> dict[str, object]:
-            raise RuntimeError("reconcile failed")
-
-        def notify_ready_opportunity(self, *_: object) -> dict[str, object]:
-            return {"state": "ignored"}
-
-        def notify_observation(self, *_: object) -> dict[str, object]:
-            return {"state": "ignored"}
-
-        def auto_eat_threshold(self, *_: object) -> dict[str, object]:
-            return {"state": "ignored"}
-
-        def notify_monitor_failure(self, *_: object) -> dict[str, object]:
-            return {"state": "ignored"}
-
-        def set_cross_venue_monitor(self, _monitor: object) -> None:
-            pass
-
-    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
-    monkeypatch.setattr(runtime_module, "PolymarketTradingClient", FakeTradingClient)
-    monkeypatch.setattr(
-        runtime_module,
-        "PredictTradingClient",
-        SimpleNamespace(from_keychain=lambda _config: None),
-    )
-    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
-    monkeypatch.setattr(runtime_module, "LlmRelationValidator", lambda *_a, **_k: object())
-    monkeypatch.setattr(runtime_module, "LlmTitleTranslator", lambda *_a, **_k: object())
-    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
-    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
-
-    runtime = PredictionRuntime(
-        data_dir=tmp_path,
-        prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8766/",
-    )
-    runtime.start()
-
-    assert runtime.state == "NOT_READY"
-    assert runtime.production_owner is True
-    assert "monitor.start" not in events
-    competing_owner = _RuntimeOwnershipLock(
-        tmp_path / "prediction_arbitrage" / "runtime.lock"
-    )
-    with pytest.raises(PredictionRuntimeOwnershipError):
-        competing_owner.acquire()
-    runtime.stop()
-    assert runtime.production_owner is False
-    competing_owner.acquire()
-    competing_owner.release()
+    """Historical name retained; reliable local control failure remains fatal."""
+    from tests.lp_d2_service_harness import ServiceChild
+    for fault in ('control','settings','identity'):
+        with ServiceChild(tmp_path/fault,scenario='nr-'+fault+'-fatal') as child:
+            failed=_nr_start(child)
+            assert failed['state']=='FAILED' and failed['scheduler_starts']==0
+            assert failed['reconcile_calls']==failed['legacy_ticks']==0
+            assert failed['production_owner'] is False and failed['d2_closed'] is True
+            assert failed['native_inflight']==0 and failed['writer_thread_alive'] is False
+            assert failed['monitor_thread_started'] is failed['history_started'] is False
+            assert failed['permit']['state']=='CLAIMED' and child.actual_posts()==0
+            assert not child.marker('nr-account-read').exists()
+            child.process.terminate()
+            assert child.wait_exit()==78, child.output.read_text()
+            child.assert_owner_available()  # Actual resources drained before owner release.
+            assert json.loads(child.permit_path.read_text())==failed['permit']
+    # An unavailable account list belongs to the Reader retry gate, rather
+    # than the fatal reliable-control path above.
+    with ServiceChild(tmp_path/'account',scenario='nr-unknown') as child:
+        started=_nr_start(child)
+        assert started['state']=='RUNNING', 'account reconciliation failure is not local admission failure'
+        cycle=_nr_cycle(child,'unknown')
+        assert cycle['scheduler_starts']==1 and cycle['posts']==0
+        assert cycle['orders_complete'] is False and cycle['reconcile_calls']==0
+        child.assert_owned()
 
 
 def test_locked_reconcile_result_keeps_runtime_not_ready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.prediction_runtime as runtime_module
-
-    events: list[str] = []
-
-    class FakeTrading:
-        def close(self) -> None:
-            pass
-
-    class FakeTradingClient:
-        @classmethod
-        def from_keychain(cls, _config: object) -> FakeTrading:
-            return FakeTrading()
-
-    class FakeMonitor:
-        def __init__(self, **_: object) -> None:
-            pass
-
-        def set_ready_observer(self, _observer: object) -> None:
-            pass
-
-        def set_observation_observer(self, _observer: object) -> None:
-            pass
-
-        def set_auto_eat_observer(self, _observer: object) -> None:
-            pass
-
-        def set_failure_observer(self, _observer: object) -> None:
-            pass
-
-        def start(self) -> None:
-            events.append("monitor.start")
-
-        def stop(self) -> None:
-            events.append("monitor.stop")
-
-    class FakeExecution:
-        def __init__(self, **_: object) -> None:
-            pass
-
-        def reconcile_startup(self) -> dict[str, object]:
-            return {"state": "locked", "reason": "account_unavailable"}
-
-        def notify_ready_opportunity(self, *_: object) -> None:
-            pass
-
-        def notify_observation(self, *_: object) -> None:
-            pass
-
-        def auto_eat_threshold(self, *_: object) -> None:
-            pass
-
-        def notify_monitor_failure(self, *_: object) -> None:
-            pass
-
-        def set_cross_venue_monitor(self, _monitor: object) -> None:
-            pass
-
-    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", lambda _dir: object())
-    monkeypatch.setattr(runtime_module, "PolymarketTradingClient", FakeTradingClient)
-    monkeypatch.setattr(
-        runtime_module,
-        "PredictTradingClient",
-        SimpleNamespace(from_keychain=lambda _config: None),
-    )
-    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
-    monkeypatch.setattr(runtime_module, "LlmRelationValidator", lambda *_a, **_k: object())
-    monkeypatch.setattr(runtime_module, "LlmTitleTranslator", lambda *_a, **_k: object())
-    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
-    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
-
-    runtime = PredictionRuntime(
-        data_dir=tmp_path,
-        prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8766/",
-    )
-    runtime.start()
-    try:
-        assert runtime.state == "NOT_READY"
-        assert events == []
-    finally:
-        runtime.stop()
+    """Historical incident locks new BUYs, while current BUY protection stays online."""
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(tmp_path,scenario='nr-incident') as child:
+        started=_nr_start(child)
+        assert started['state']=='RUNNING', 'historical incident must not prevent the D2 Scheduler'
+        cycle=_nr_cycle(child)
+        assert cycle['scheduler_starts']==1 and cycle['orders_complete'] is True
+        assert cycle['cancels']==[['A']] and cycle['posts']==child.actual_posts()==0
+        assert cycle['reconcile_calls']==cycle['legacy_ticks']==0
+        store=PredictionArbitrageStore(child.data_dir)
+        incident=store.unacknowledged_incident()
+        assert incident is not None  # Never auto-ack the incident.
+        child.release('new-buy')
+        child.wait('nr-new-buy-completed')
+        assert json.loads(child.marker('nr-new-buy.json').read_text())==dict(
+            state='locked',reason='circuit_breaker_open')
+        assert child.actual_posts()==0 and store.unacknowledged_incident()==incident
+        child.assert_owned()
+        child.process.terminate()
+        assert child.wait_exit()==0, child.output.read_text()
+        child.assert_owner_available()
 
 
 def test_core_initialization_failure_releases_resources_and_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.prediction_runtime as runtime_module
+    from tests.lp_d2_service_harness import ServiceChild
 
+    # Actual selected release, Store and SQLite: the external SDK constructor
+    # fails after the real claim. Observers call every production method through.
+    with ServiceChild(tmp_path / "actual-init", scenario="consumer-core-init-failure") as child:
+        child.release("metadata")
+        child.start(expected_running=None)
+        assert child.wait_exit() == 78, child.output.read_text()
+        observed = json.loads(child.marker("consumer-observations.json").read_text())
+        assert observed["state"] == "FAILED"
+        assert observed["actual_store_constructed"] is True
+        assert observed["error_type"] == observed["cause_type"] == "PolymarketTradingError"
+        assert observed["error"] == "polymarket trading error: unavailable"
+        assert observed["fatal_type"] == "PredictionRuntimeFatal"
+        assert observed["excluded_before_release"] is True
+        native = observed["connections_at_owner_release"]
+        assert native["opened"] and sorted(native["opened"]) == sorted(native["closed"])
+        assert native["active"] == []
+        assert observed["permit"]["state"] == "CLAIMED"
+        assert json.loads(child.permit_path.read_text()) == observed["permit"]
+        child.assert_owner_available()
+        assert child.actual_posts() == 0
+
+    # Compatibility only: "store" labels the optional collaborator slot.
+    # This probe never enters startup, SQL, current facts or admission.
     closed: list[str] = []
-
-    class FakeStore:
-        def __init__(self, _data_dir: Path) -> None:
-            pass
-
-        def close(self) -> None:
+    class CloseProbe:
+        def close(self):
             closed.append("store")
-
-    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
-    monkeypatch.setattr(
-        runtime_module,
-        "load_trading_config",
-        lambda _path: (_ for _ in ()).throw(RuntimeError("bad config")),
-    )
-    runtime = PredictionRuntime(
-        data_dir=tmp_path,
-        prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8766/",
-    )
-
-    with pytest.raises(RuntimeError, match="bad config"):
-        runtime.start()
-
-    assert runtime.state == "FAILED"
+    runtime = PredictionRuntime(data_dir=tmp_path / "optional-cleanup",
+        prediction_config_path=tmp_path / "unused.json", dashboard_url="http://127.0.0.1:8766/")
+    runtime._owner.acquire()
+    runtime.store = CloseProbe()
+    assert runtime._cleanup_resources() == []
+    runtime.stop(); runtime.stop()
     assert closed == ["store"]
-    owner = _RuntimeOwnershipLock(
-        tmp_path / "prediction_arbitrage" / "runtime.lock"
-    )
-    owner.acquire()
-    owner.release()
+    owner = _RuntimeOwnershipLock(tmp_path / "optional-cleanup/prediction_arbitrage/runtime.lock")
+    owner.acquire(); owner.release()
 
 
 def test_cross_start_failure_degrades_only_cross_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.prediction_runtime as runtime_module
-
-    events: list[str] = []
-
-    class FakeStore:
-        def __init__(self, _data_dir: Path) -> None:
-            pass
-
-    class FakeTrading:
-        def close(self) -> None:
-            pass
-
-    class FakeTradingClient:
-        @classmethod
-        def from_keychain(cls, _config: object) -> FakeTrading:
-            return FakeTrading()
-
-    class FakeMonitor:
-        def __init__(self, **_: object) -> None:
-            pass
-
-        def set_ready_observer(self, _observer: object) -> None:
-            pass
-
-        def set_observation_observer(self, _observer: object) -> None:
-            pass
-
-        def set_auto_eat_observer(self, _observer: object) -> None:
-            pass
-
-        def set_failure_observer(self, _observer: object) -> None:
-            pass
-
-        def start(self) -> None:
-            events.append("polymarket.start")
-
-        def stop(self) -> None:
-            events.append("polymarket.stop")
-
-    class FakeExecution:
-        def __init__(self, **_: object) -> None:
-            pass
-
-        def reconcile_startup(self) -> dict[str, object]:
-            return {"state": "ready"}
-
-        def notify_ready_opportunity(self, *_: object) -> None:
-            pass
-
-        def notify_observation(self, *_: object) -> None:
-            pass
-
-        def auto_eat_threshold(self, *_: object) -> None:
-            pass
-
-        def notify_monitor_failure(self, *_: object) -> None:
-            pass
-
-        def set_cross_venue_monitor(self, _monitor: object) -> None:
-            pass
-
-    class FailingCrossMonitor:
-        async def start(self) -> None:
-            raise RuntimeError("cross start failed")
-
-        async def stop(self) -> None:
-            pass
-
-        def snapshot(self) -> dict[str, object]:
-            return {"status": "degraded"}
-
-    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
-    monkeypatch.setattr(runtime_module, "PolymarketTradingClient", FakeTradingClient)
-    monkeypatch.setattr(
-        runtime_module,
-        "PredictTradingClient",
-        SimpleNamespace(from_keychain=lambda _config: None),
-    )
-    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
-    monkeypatch.setattr(runtime_module, "LlmRelationValidator", lambda *_a, **_k: object())
-    monkeypatch.setattr(runtime_module, "LlmTitleTranslator", lambda *_a, **_k: object())
-    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
-    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
-
-    runtime = PredictionRuntime(
-        data_dir=tmp_path,
-        prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8766/",
-        cross_venue_monitor=FailingCrossMonitor(),
-    )
-    runtime.start()
-    try:
-        assert runtime.state == "RUNNING"
-        assert events == ["polymarket.start"]
-        assert isinstance(
-            runtime.cross_venue_monitor,
-            runtime_module._UnavailableCrossVenueMonitor,
-        )
-    finally:
-        runtime.stop()
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(tmp_path, scenario="consumer-cross-start-failure") as child:
+        child.release("metadata"); child.start(expected_running=False)
+        assert child.request("/healthz")["runtime_state"] == "RUNNING"
+        child.wait("external-cross-task-start-failed")
+        child.assert_owned()
+        child.process.terminate(); assert child.wait_exit() == 0, child.output.read_text()
+        observed = json.loads(child.marker("consumer-observations.json").read_text())
+        assert observed["state"] == "RUNNING" and observed["cross_unavailable"] is True
+        assert [event for event in observed["events"] if event.endswith(".start")] == ["polymarket.start"]
+        assert child.actual_posts() == 0
+        child.assert_owner_available()
 
 
 def test_cross_runtime_start_timeout_is_reported(
@@ -5443,6 +5263,8 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
 ) -> None:
     import open_trader.prediction_runtime as runtime_module
 
+    d2_root = tmp_path / "actual-d2"
+    tmp_path = tmp_path / "legacy-helper"
     now = datetime.now(UTC)
     risk_seen = threading.Event()
     candidate_scan_seen = threading.Event()
@@ -5714,8 +5536,20 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
         enable_n_leg_background=False,
     )
     try:
-        runtime.start()
-        assert runtime.state == "RUNNING"
+        # Explicit legacy source/session oracle, never default startup.
+        runtime._owner.acquire()
+        runtime.store = PredictionArbitrageStore(tmp_path)
+        runtime._prediction_trading = trading
+        runtime.lp = runtime_module.PolymarketLPService(runtime.store, trading, owner_lock=runtime._owner)
+        runtime.monitor = FakeMonitor()
+        runtime.execution = PredictionExecutionService(store=runtime.store, monitor=runtime.monitor,
+            trading=trading, notifier=runtime._notifier,
+            lock_path=tmp_path / "prediction_arbitrage/execution.lock", lp=runtime.lp)
+        runtime._start_lp_monitor()
+        runtime._start_history_monitor()
+        runtime._start_candidate_scan_monitor()
+        runtime._start_lp_dashboard_monitor()
+        runtime._start_reward_monitor()
         assert runtime.store is not None
         assert runtime.lp is not None
         assert runtime.execution is not None
@@ -5778,9 +5612,9 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
         assert trading.lp_snapshot_calls > 0
         assert runtime._book_sampler_thread is None
         assert sampler_book_calls == []
-        with pytest.raises(RuntimeError, match="history monitor thread did not stop"):
-            runtime.stop()
-        assert runtime.state == "STOPPING"
+        errors = runtime._cleanup_resources()
+        assert any("history monitor thread did not stop" in str(error) for error in errors)
+        # Real STOPPING is asserted at the actual clean-child boundary below.
         assert runtime.lp is not None
         assert runtime.execution is not None
         assert runtime._prediction_trading is trading
@@ -5810,9 +5644,9 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
             until=now + timedelta(minutes=1),
         ) == []
         # A published summary still does not permit closing live collaborators.
-        with pytest.raises(RuntimeError, match="history monitor thread did not stop"):
-            runtime.stop()
-        assert runtime.state == "STOPPING"
+        errors = runtime._cleanup_resources()
+        assert any("history monitor thread did not stop" in str(error) for error in errors)
+        # Real STOPPING is asserted at the actual clean-child boundary below.
         assert runtime.lp is not None
         assert runtime.execution is not None
         assert runtime._prediction_trading is trading
@@ -5822,8 +5656,7 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
         release_history_monitor.set()
         runtime._history_thread.join(timeout=2)
         assert not runtime._history_thread.is_alive(), "history monitor did not exit"
-        runtime.stop()
-        assert runtime.state == "STOPPED"
+        assert runtime._cleanup_resources() == []
         assert runtime._history_thread is None
         assert trading.closed
         assert not runtime._owner.held
@@ -5838,8 +5671,49 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
         if history_thread is not None:
             history_thread.join(timeout=5)
             assert not history_thread.is_alive(), "history monitor did not exit"
-        if runtime.state not in {"NEW", "STOPPED"}:
-            runtime.stop()
+        if runtime._owner.held:
+            assert runtime._cleanup_resources() == []
+
+
+    _assert_current_progress_with_blocked_optional_source(d2_root, "history")
+
+
+def _start_source_preparation_helpers(runtime, trading, monitor_factory, execution_factory):
+    from open_trader import prediction_runtime as runtime_module
+    # Active source producer only. No public-start/guard/state substitution.
+    runtime._owner.acquire()
+    runtime.store = PredictionArbitrageStore(runtime._data_dir)
+    runtime._prediction_trading = trading
+    attach = getattr(trading, "attach_metadata_cache", None)
+    if callable(attach): attach(runtime.store)
+    runtime.lp = runtime_module.PolymarketLPService(runtime.store, trading, owner_lock=runtime._owner)
+    runtime.lp.clock = runtime._history_clock
+    runtime.monitor = monitor_factory(store=runtime.store, trading=trading)
+    runtime.execution = execution_factory(store=runtime.store, monitor=runtime.monitor,
+        trading=trading, notifier=runtime._notifier,
+        lock_path=runtime._data_dir / "prediction_arbitrage/execution.lock", lp=runtime.lp)
+    runtime._start_history_monitor()
+
+
+def _assert_actual_preparation_result(root: Path, profile: str, expected: str) -> None:
+    from tests.lp_d2_service_harness import ServiceChild
+    with ServiceChild(root, scenario="consumer-producer-prep-" + profile) as child:
+        child.release("metadata")
+        child.start(expected_running=False)
+        child.wait("producer-preparation-result.json")
+        result = json.loads(child.marker("producer-preparation-result.json").read_text())
+        assert result["preparation"]["state"] == expected
+        before = len(list(child.events.glob("optional-current-read-*")))
+        child.advance(1)
+        child.wait("optional-current-read-" + str(before + 1))
+        state = child.wait_state(lambda row: row.get("current_exposure_usd") == "0")
+        assert state["effective_running"] is False and state["buy_reserved_usd"] == "0"
+        assert child.request("/healthz")["runtime_state"] == "RUNNING"
+        assert PredictionArbitrageStore(child.data_dir).lp_sessions() == []
+        child.process.terminate(); assert child.wait_exit() == 0
+        assert child.marker("optional-runtime-stopped").exists()
+        child.assert_owner_available()
+        assert child.actual_posts() == 0 and list(child.events.glob("cancel-call-*")) == []
 
 
 @pytest.mark.parametrize(
@@ -6067,7 +5941,7 @@ def test_lp_preparation_retries_after_five_minutes_and_alerts_on_repeat_failure(
         )
 
     runtime = make_runtime()
-    runtime.start()
+    _start_source_preparation_helpers(runtime, trading, FakeMonitor, TestExecution)
     try:
         assert first_call.wait(timeout=2)
         assert len(catalog_calls) == 1
@@ -6080,11 +5954,13 @@ def test_lp_preparation_retries_after_five_minutes_and_alerts_on_repeat_failure(
         if catalog_unknown:
             assert preparation["last_error"] == "TimeoutError"
 
-        runtime.stop()
+        assert runtime._cleanup_resources() == []
     finally:
         release_299.set()
-        if runtime.state not in {"STOPPED", "FAILED"}:
-            runtime.stop()
+        if runtime._owner.held:
+            assert runtime._cleanup_resources() == []
+
+    _assert_actual_preparation_result(tmp_path / "actual-d2", "failure", "waiting_retry")
 
     if retry_succeeds:
         # The unique retry can succeed at the exact five-minute deadline. It
@@ -6093,7 +5969,7 @@ def test_lp_preparation_retries_after_five_minutes_and_alerts_on_repeat_failure(
         trading.fail_catalog = False
         success_call.clear()
         runtime = make_runtime()
-        runtime.start()
+        _start_source_preparation_helpers(runtime, trading, FakeMonitor, TestExecution)
         try:
             assert success_call.wait(timeout=2)
             assert len(catalog_calls) == 2
@@ -6103,8 +5979,8 @@ def test_lp_preparation_retries_after_five_minutes_and_alerts_on_repeat_failure(
             assert preparation["state"] == "ready"
             assert preparation["failure_count"] == 0
         finally:
-            if runtime.state not in {"NEW", "STOPPED", "FAILED"}:
-                runtime.stop()
+            if runtime._owner.held:
+                assert runtime._cleanup_resources() == []
         return
 
     # A reconstructed runtime honors the original due time. The retry can fail
@@ -6112,7 +5988,7 @@ def test_lp_preparation_retries_after_five_minutes_and_alerts_on_repeat_failure(
     # fault episode sends one notice and continues on its bounded probe/retry
     # schedule.
     runtime = make_runtime()
-    runtime.start()
+    _start_source_preparation_helpers(runtime, trading, FakeMonitor, TestExecution)
     try:
         assert paused_wait.wait(timeout=2)
         assert len(catalog_calls) >= 2
@@ -6140,9 +6016,9 @@ def test_lp_preparation_retries_after_five_minutes_and_alerts_on_repeat_failure(
         assert runtime.lp.preparation_snapshot()["failure_count"] == 0  # type: ignore[union-attr]
     finally:
         release_paused.set()
-        if runtime.state not in {"NEW", "STOPPED", "FAILED"}:
-            runtime.stop()
-        assert runtime.state == "STOPPED"
+        if runtime._owner.held:
+            assert runtime._cleanup_resources() == []
+        assert not runtime.production_owner
 
 
 def test_lp_partial_preparation_uses_item_retry_deadline(
@@ -6153,6 +6029,25 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
     import open_trader.prediction_runtime as runtime_module
 
     clock = [datetime(2026, 9, 18, 12, 0, tzinfo=UTC)]
+    clock_lock = threading.Lock()
+
+    @contextmanager
+    def clock_boundary():
+        # Use the same real-time watchdog as the fixture's event waits. Logical
+        # time must not expire facts midway through a real candidate refresh.
+        assert clock_lock.acquire(timeout=2), "fixture clock boundary did not become available"
+        try:
+            yield
+        finally:
+            clock_lock.release()
+
+    class ClockStableLP(PolymarketLPService):
+        def refresh_candidates(
+            self, *, stop_event: threading.Event | None = None, force: bool = False
+        ) -> dict[str, object]:
+            with clock_boundary():
+                return super().refresh_candidates(stop_event=stop_event, force=force)
+
     history_calls: list[tuple[str, ...]] = []
     history_wait_calls: list[float] = []
     notifications: list[tuple[str, str]] = []
@@ -6375,6 +6270,7 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
     )
     monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
     monkeypatch.setattr(runtime_module, "PredictionExecutionService", TestExecution)
+    monkeypatch.setattr(runtime_module, "PolymarketLPService", ClockStableLP)
     monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 3600)
     monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 3600)
     monkeypatch.setattr(runtime_module, "_LP_SHARE_WATCH_SECONDS", 3600)
@@ -6390,19 +6286,24 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
             hourly_wait.set()
             return stop_event.wait()
         if 0 < seconds < 3600:
-            retry_deadline = datetime(2026, 9, 18, 12, 5, tzinfo=UTC)
-            if (
-                not at_299.is_set()
-                and clock[0] + timedelta(seconds=seconds)
-                >= retry_deadline - timedelta(seconds=1)
-            ):
-                clock[0] = retry_deadline - timedelta(seconds=1)
-                at_299.set()
+            with clock_boundary():
+                retry_deadline = datetime(2026, 9, 18, 12, 5, tzinfo=UTC)
+                pause_at_299 = (
+                    not at_299.is_set()
+                    and clock[0] + timedelta(seconds=seconds)
+                    >= retry_deadline - timedelta(seconds=1)
+                )
+                if pause_at_299:
+                    clock[0] = retry_deadline - timedelta(seconds=1)
+                    at_299.set()
+                else:
+                    clock[0] += timedelta(seconds=seconds)
+            # The scan and shutdown must remain free to run while we wait.
+            if pause_at_299:
                 while not release_299.wait(timeout=0.01):
                     if stop_event.is_set():
                         return True
                 return stop_event.is_set()
-            clock[0] += timedelta(seconds=seconds)
             return stop_event.is_set()
         raise AssertionError(f"unexpected history wait: {seconds}")
 
@@ -6427,7 +6328,7 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
     )
     runtime_started = False
     try:
-        runtime.start()
+        _start_source_preparation_helpers(runtime, trading, FakeMonitor, TestExecution)
         runtime_started = True
         assert first_history_done.wait(timeout=2)
         assert history_wait_called.wait(timeout=2)
@@ -6482,11 +6383,14 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
         assert runtime.lp.preparation_snapshot()["fault_alert_state"] == "sent"
     finally:
         release_299.set()
-        if runtime_started and runtime.state not in {"STOPPED", "FAILED"}:
-            runtime.stop()
-        assert runtime.state == "STOPPED"
+        if runtime_started and runtime._owner.held:
+            assert runtime._cleanup_resources() == []
+        assert not runtime.production_owner
     assert history_calls == [("token-a", "token-b"), ("token-b",)]
     assert len(notifications) == 1
+
+
+    _assert_actual_preparation_result(tmp_path / "actual-d2", "partial", "partial")
 
 
 def test_lp_all_metadata_failures_keep_five_minute_retry(
@@ -6755,7 +6659,7 @@ def test_lp_all_metadata_failures_keep_five_minute_retry(
     )
     runtime_started = False
     try:
-        runtime.start()
+        _start_source_preparation_helpers(runtime, trading, FakeMonitor, TestExecution)
         runtime_started = True
         assert at_299.wait(timeout=2) or paused_wait.wait(timeout=2)
         assert history_wait_calls[0] == pytest.approx(60)
@@ -6781,9 +6685,12 @@ def test_lp_all_metadata_failures_keep_five_minute_retry(
         release_hourly.set()
     finally:
         release_299.set()
-        if runtime_started and runtime.state not in {"STOPPED", "FAILED"}:
-            runtime.stop()
-        assert runtime.state == "STOPPED"
+        if runtime_started and runtime._owner.held:
+            assert runtime._cleanup_resources() == []
+        assert not runtime.production_owner
+
+
+    _assert_actual_preparation_result(tmp_path / "actual-d2", "metadata", "partial")
 
 
 def test_lp_confirmed_absent_catalog_item_finishes_pending_work(
@@ -7080,7 +6987,7 @@ def test_lp_confirmed_absent_catalog_item_finishes_pending_work(
     )
     runtime_started = False
     try:
-        runtime.start()
+        _start_source_preparation_helpers(runtime, trading, FakeMonitor, TestExecution)
         runtime_started = True
         assert first_wait_started.wait(timeout=2)
         assert normal_wait_started.wait(timeout=2) or zero_wait_seen.wait(timeout=2)
@@ -7114,9 +7021,12 @@ def test_lp_confirmed_absent_catalog_item_finishes_pending_work(
         assert runtime.store.lp_preparation_items() == []
     finally:
         release_normal_wait.set()
-        if runtime_started and runtime.state not in {"STOPPED", "FAILED"}:
-            runtime.stop()
-        assert runtime.state == "STOPPED"
+        if runtime_started and runtime._owner.held:
+            assert runtime._cleanup_resources() == []
+        assert not runtime.production_owner
+
+
+    _assert_actual_preparation_result(tmp_path / "actual-d2", "absent", "ready")
 
 
 def test_lp_metadata_warmup_advances_beyond_one_batch(
@@ -7124,6 +7034,7 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
 ) -> None:
     """The real adapter warms 1501 metadata IDs and stops without overlap."""
 
+    from test_polymarket_trading import _wait_lp_metadata_persistence
     import open_trader.polymarket_trading as trading_module
     import open_trader.prediction_runtime as runtime_module
     from open_trader.polymarket_trading import (
@@ -7379,8 +7290,10 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
     )
     stop_thread: threading.Thread | None = None
     try:
-        runtime.start()
-        assert runtime.state == "RUNNING"
+        _start_source_preparation_helpers(runtime, trading, runtime_module.PolymarketMonitor,
+            PredictionExecutionService)
+        # Real RUNNING/STOPPING/native metadata lifetime is checked below;
+        # this portion retains the full actual adapter 1501-ID oracle once.
         assert retry_wait_entered.wait(timeout=60)
         assert first_failure.is_set()
         lp = runtime.lp
@@ -7407,6 +7320,7 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
             .isoformat(timespec="microseconds")
             .replace("+00:00", "Z")
         )
+        _wait_lp_metadata_persistence(trading)
         first_entries = store.lp_metadata_cache_entries(now=clock[0])
         assert set(first_entries) == set(initial_ids)
         assert len(first_entries) == 1500
@@ -7455,6 +7369,7 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
             for condition_id in batch
         ) == set(condition_ids)
 
+        _wait_lp_metadata_persistence(trading)
         final_entries = store.lp_metadata_cache_entries(now=clock[0])
         assert set(final_entries) == set(condition_ids)
         assert len(final_entries) == 1501
@@ -7495,7 +7410,7 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
         def stop_runtime() -> None:
             stop_started.set()
             try:
-                runtime.stop()
+                stop_errors.extend(runtime._cleanup_resources())
             except BaseException as exc:
                 stop_errors.append(exc)
             finally:
@@ -7512,7 +7427,7 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
         stop_thread.join(timeout=2)
         assert not stop_thread.is_alive()
         assert not stop_errors
-        assert runtime.state == "STOPPED"
+        assert not runtime.production_owner
         with request_lock:
             assert dispatch_after_stop_signal == []
             assert len(metadata_requests) == requests_before_busy
@@ -7526,10 +7441,13 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
         release_metadata.set()
         if stop_thread is not None:
             stop_thread.join(timeout=60)
-        if runtime.state not in {"NEW", "STOPPED", "FAILED"}:
-            runtime.stop()
-    assert runtime.state == "STOPPED"
+        if runtime._owner.held:
+            assert runtime._cleanup_resources() == []
+    assert not runtime.production_owner
     assert catalog_calls[0] == 3
+
+
+    _assert_current_progress_with_blocked_optional_source(tmp_path / "actual-d2", "metadata")
 
 
 def test_lp_minute_risk_does_not_wait_for_hourly_catalog_preparation(
@@ -7841,8 +7759,21 @@ def test_lp_minute_risk_does_not_wait_for_hourly_catalog_preparation(
         enable_n_leg_background=False,
     )
     try:
-        runtime.start()
-        assert runtime.state == "RUNNING"
+        # Ancillary producer/legacy reward-session compatibility only. The
+        # default current authority and true lifecycle run separately below.
+        runtime._owner.acquire()
+        runtime.store = PredictionArbitrageStore(tmp_path)
+        runtime._prediction_trading = trading
+        runtime.lp = runtime_module.PolymarketLPService(runtime.store, trading, owner_lock=runtime._owner)
+        runtime.monitor = FakeMonitor()
+        runtime.execution = PredictionExecutionService(store=runtime.store, monitor=runtime.monitor,
+            trading=trading, notifier=runtime._notifier,
+            lock_path=tmp_path / "prediction_arbitrage/execution.lock", lp=runtime.lp)
+        runtime._start_history_monitor()
+        runtime._start_candidate_scan_monitor()
+        runtime._start_candidate_maintenance_monitor()
+        runtime._start_lp_dashboard_monitor()
+        runtime._start_reward_monitor()
         assert history_prepared.wait(timeout=2)
         assert runtime.store is not None
         runtime.store.lp_create_session(
@@ -7900,12 +7831,14 @@ def test_lp_minute_risk_does_not_wait_for_hourly_catalog_preparation(
         assert selected_metadata_calls == [("condition-A",)]
         assert selected_reward_calls == [("condition-A",)]
         release_catalog.set()
-        runtime.stop()
-        assert runtime.state == "STOPPED"
+        assert runtime._cleanup_resources() == []
     finally:
         release_catalog.set()
-        if runtime.state not in {"NEW", "STOPPED"}:
-            runtime.stop()
+        if runtime._owner.held:
+            assert runtime._cleanup_resources() == []
+
+
+    _assert_current_progress_with_blocked_optional_source(tmp_path / "actual-d2", "hourly")
 
 
 def test_lp_history_batches_are_bounded_and_persist_public_summaries(
@@ -10313,12 +10246,14 @@ def test_candidate_competition_monitor_refreshes_and_stops(
     class FakeLP:
         def __init__(self) -> None:
             self.calls: list[threading.Event | None] = []
+            self.snapshots: list[bool] = []
             self.first_call = threading.Event()
 
         def refresh_competition_cache(
-            self, *, stop_event: threading.Event | None = None
+            self, *, stop_event: threading.Event | None = None, snapshot: bool = True
         ) -> dict[str, object]:
             self.calls.append(stop_event)
+            self.snapshots.append(snapshot)
             self.first_call.set()
             return {"state": "unknown"}
 
@@ -10345,6 +10280,7 @@ def test_candidate_competition_monitor_refreshes_and_stops(
             time.sleep(0.01)
         assert len(lp.calls) >= 3
         assert all(call is runtime._reward_stop_event for call in lp.calls)
+        assert lp.snapshots and not any(lp.snapshots)
 
         runtime._start_candidate_competition_monitor()
         assert runtime._candidate_competition_thread is thread

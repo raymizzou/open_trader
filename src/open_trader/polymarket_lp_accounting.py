@@ -22,7 +22,8 @@ ZERO = Decimal('0')
 def default_account_pool_document(path, pool_account_id: str | None, now: datetime) -> dict[str, object]:
     return dict(run_id=uuid.uuid5(uuid.NAMESPACE_URL, str(Path(path).resolve()) + str(pool_account_id)).hex,
         account_id=pool_account_id, config_version=0, desired_running=False, ever_enabled=False,
-        enabled_at=None, target_buy_count=0, budget_usd=None, allocations=[], intents={}, events={},
+        enabled_at=None, target_buy_count=0, budget_usd=None, buy_price_level=1,
+        allocations=[], intents={}, events={},
         rounds={}, last_round={}, last_reconciled_at=None, updated_at=now.isoformat())
 
 
@@ -220,6 +221,21 @@ def _account_trade_report(snapshot, orders, positions, *, wallet, now):
 def build_account_financial_facts(
     snapshot: Mapping[str, object], *, now: datetime, expected_account_id: str | None = None,
 ) -> dict[str, object]:
+    return _build_account_exposure_facts(snapshot, now=now, expected_account_id=expected_account_id)
+
+
+def build_planning_account_facts(
+    snapshot: Mapping[str, object], *, now: datetime, expected_account_id: str | None = None,
+) -> dict[str, object]:
+    """Price complete current exposure without claiming full historical authority."""
+    return _build_account_exposure_facts(snapshot, now=now,
+        expected_account_id=expected_account_id, planning=True)
+
+
+def _build_account_exposure_facts(
+    snapshot: Mapping[str, object], *, now: datetime, expected_account_id: str | None = None,
+    planning: bool = False,
+) -> dict[str, object]:
     """Validate an authenticated round and price actual account exposure once.
 
     Current positions and open orders are authoritative for exposure. Trade
@@ -228,7 +244,7 @@ def build_account_financial_facts(
     if snapshot.get('authenticated') is not True:
         raise ValueError('account_snapshot_unknown')
     required = ('balance_complete', 'open_orders_complete', 'positions_complete',
-                'trades_complete', 'pagination_complete')
+                *(('current_pagination_complete',) if planning else ('trades_complete', 'pagination_complete')))
     if any(snapshot.get(key) is not True for key in required):
         raise ValueError('account_snapshot_incomplete')
     wallet = str(snapshot.get('wallet_address') or '').strip().casefold()
@@ -245,7 +261,7 @@ def build_account_financial_facts(
         raise ValueError('account_read_order_invalid')
     _freshness(checked, now, 'account_freshness')
     _freshness(ended, now, 'account_freshness')
-    for name in ('open_orders', 'positions', 'raw_trades'):
+    for name in ('open_orders', 'positions', *(('raw_trades',) if not planning else ())):
         if not isinstance(snapshot.get(name), (tuple, list)):
             raise ValueError('account_' + name + '_unknown')
     balance = _number(snapshot.get('balance'), 'account_balance_unknown')
@@ -315,6 +331,8 @@ def build_account_financial_facts(
         positions[token] = quantity
         position_costs[token] = cost
     try:
+        if planning and snapshot.get('trades_complete') is not True:
+            raise ValueError('account_trade_history_unavailable')
         report = _account_trade_report(snapshot, orders, positions, wallet=wallet, now=now)
     except ValueError as exc:
         report = dict(realized_pnl_usd=None, report_status='unknown',
@@ -343,14 +361,165 @@ def build_account_financial_facts(
         positions=[dict(token_id=token, quantity=str(positions[token]),
             inventory_cost_usd=str(position_costs[token]) if position_costs[token] is not None else None)
             for token in sorted(positions)])
+    if planning:
+        result.update(publication_scope='planning', trades_complete=snapshot.get('trades_complete') is True)
     result['snapshot_id'] = hashlib.sha256(json.dumps(result, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     return result
 
 
+def submission_action_fingerprint(action):
+    return hashlib.sha256(json.dumps(action, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def buy_attempt_identity(action):
+    return [action.get(key) for key in ('action_id', 'action_key', 'role', 'side', 'token_id',
+                                      'created_at', 'submit_requested_at')]
+
+
+_CANCEL_OPERATIONS = frozenset({'cancel', 'entry-cancel', 'passive-cancel', 'passive_exit-cancel',
+    'augment-cancel', 'owned-cancel', 'owned-sell-cancel-cancel', 'reconciliation-cancel',
+    'entry-protection-cancel', 'first-seen-protection-cancel'})
+_CANCEL_ROLES = _CANCEL_OPERATIONS | {'owned-sell-cancel', 'reconciliation_cancel', 'passive_exit_cancel', 'owned_sell_cancel'}
+
+
+def submission_action_kind(action):
+    """Producer role/operation; user idempotency suffixes are never operation tags."""
+    role = str(action.get('role') or '')
+    prefix = str(action.get('session_id') or '') + ':'
+    key = str(action.get('action_key') or '')
+    operation = key[len(prefix):].partition(':')[0] if key.startswith(prefix) else ''
+    if key in _CANCEL_OPERATIONS:  # Legacy bare operation, never a user suffix.
+        operation = key
+    if role in _CANCEL_ROLES:
+        return 'cancel'
+    # Owned-cancel producers reuse entry/passive_exit as the target's role.
+    if role in {'', 'entry', 'passive_exit'} and operation in _CANCEL_OPERATIONS:
+        return 'cancel'
+    if role:
+        return role
+    return {'entry-submit': 'entry', 'augment-submit': 'augment'}.get(operation, '')
+
+
+def unresolved_buy_action(action):
+    return (action.get('side') == 'BUY' and submission_action_kind(action) != 'cancel'
+        and (action.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
+             or action.get('state') == 'accepted' and not action.get('order_id')))
+
+
+def submission_owner_identity(session):
+    return [session.get(key) for key in ('session_id', 'idempotency_key', 'account_id',
+        'wallet_address', 'token_id', 'condition_id', 'market_id', 'outcome',
+        'submit_requested_at', 'post_started', 'submit_post_started_at')]
+
+
+def ended_buy_action_evidence(session, action, *, read_started_at):
+    """Local completion or owner exit; neither is a venue outcome."""
+    if (session.get('order_identity_conflict') or action.get('side') != 'BUY'
+            or not action.get('token_id') or action.get('token_id') != session.get('token_id')):
+        return None
+    marker = (session.get('submission_owner_exit') or {}).get(str(action.get('action_id')))
+    if (isinstance(marker, Mapping) and marker.get('session_identity') == submission_owner_identity(session)
+            and marker.get('action_fingerprint') == submission_action_fingerprint(action)):
+        try:
+            stamp = _timestamp(marker.get('ended_at'), name='owner_ended_at')
+        except ValueError:
+            return None
+        if stamp < read_started_at:
+            return {'request_finished_at': stamp.isoformat(), 'basis': 'runtime_owner_exit'}
+    if (action.get('state') not in {'unknown', 'rejected', 'accepted', 'accepted_without_order_id'}
+            or action.get('submit_stage') in {'preparing', 'sending'}):
+        return None
+    try:
+        raw = action.get('submit_finished_at') or action.get('submit_receipt_at')
+        stamp = _timestamp(raw or action.get('updated_at'), name='submit_finished_at')
+        requested = (_timestamp(action['submit_requested_at'], name='submit_requested_at')
+                     if action.get('submit_requested_at') else stamp)
+        if action.get('submit_post_started_at') and _timestamp(action['submit_post_started_at'], name='post_started_at') > stamp:
+            return None
+    except ValueError:
+        return None
+    if requested <= stamp < read_started_at:
+        return {'request_finished_at': stamp.isoformat(), 'basis': 'ended_send' if raw else 'legacy_finished_action'}
+    return None
+
+
+def buy_action_is_covered(session, action):
+    marker = (session.get('account_action_coverage') or {}).get(str(action.get('action_id')))
+    return (isinstance(marker, Mapping) and action.get('side') == 'BUY'
+        and marker.get('attempt_identity') == buy_attempt_identity(action)
+        and reservation_is_covered({**session, 'reservation_coverage': marker}))
+
+
+def project_planning_buy_holds(sessions, actions_by_session, intents, current_buys, *,
+                               account_id, checked_at, read_started_at):
+    """Project local requests without assigning coverage or changing their audit."""
+    bindings = {}
+    for intent in intents.values():
+        bindings.setdefault(str(intent.get('session_id') or ''), []).append(intent)
+    current = {(b['order_id'], b['token_id'], b['side'], b.get('session_id'))
+               for b in current_buys}
+    holds, isolation, inflight = [], {}, False
+    independent_sell = False
+    for session in sessions:
+        sid = session['session_id']
+        bound = bindings.get(sid, ())
+        explicit = str(session.get('account_id') or '').strip().casefold()
+        legacy_owned = (not explicit and len(bound) == 1 and
+            session['idempotency_key'] == 'lp-auto:' + str(bound[0].get('intent_id') or ''))
+        if explicit != account_id and not legacy_owned:
+            continue
+        actions = actions_by_session[sid]
+        independent_sell |= has_independent_unresolved_action(session,
+            [a for a in actions if a.get('side') == 'SELL'])
+
+        def isolatable(row):
+            try:
+                _number(row.get('inventory_cost_usd', 0), 'inventory_cost_usd')
+                _number(row.get('reserved_usd'), 'reserved_usd')
+            except ValueError:
+                return False
+            return bool(row.get('condition_id') and row.get('token_id')
+                and row.get('inventory_cost_usd', 0) is not None and row.get('reserved_usd') is not None
+                and not session.get('order_identity_conflict') and not row.get('order_identity_conflict')
+                and 'identity' not in str(row.get('reconcile_reason') or '')
+                and row.get('reconcile_reason') not in {'owned_order_token_mismatch', 'owned_order_side_mismatch'}
+                and not any(a.get('side') == 'BUY' and a.get('role') != 'entry' for a in actions))
+
+        for intent in bound:
+            isolation[intent['intent_id']] = isolatable(intent)
+        for action in actions:
+            if not unresolved_buy_action(action) or buy_action_is_covered(session, action):
+                continue
+            is_entry = submission_action_kind(action) == 'entry'
+            identity_valid = (not session.get('order_identity_conflict')
+                and action.get('token_id') == session.get('token_id'))
+            if identity_valid and (action.get('order_id'), action.get('token_id'), 'BUY', sid) in current:
+                continue
+            if (is_entry and len(bound) == 1 and identity_valid
+                    and session['idempotency_key'] == 'lp-auto:' + str(bound[0].get('intent_id') or '')):
+                continue
+            try:
+                price = _number(action.get('price', session.get('price') if is_entry else None), 'price', positive=True)
+                quantity = _number(action.get('quantity', session.get('quantity') if is_entry else None), 'quantity', positive=True)
+            except ValueError:
+                price = quantity = None
+            hold = dict(intent_id='action:' + str(action['action_id']), action_id=action['action_id'],
+                session_id=sid, order_id=action.get('order_id'), token_id=action.get('token_id'), side='BUY',
+                condition_id=session.get('condition_id'), state='unknown', financial_status='unknown',
+                inventory_cost_usd='0', reserved_usd=str(price * quantity) if price is not None else None,
+                checked_at=checked_at, price=str(price) if price is not None else None,
+                quantity=str(quantity) if quantity is not None else None)
+            if not identity_valid:
+                hold['order_identity_conflict'] = True
+            holds.append(hold)
+            isolation[hold['intent_id']] = isolatable(hold)
+            inflight |= ended_buy_action_evidence(session, action, read_started_at=read_started_at) is None
+    return dict(pending_buy_actions=holds, independent_sell_unknown=independent_sell,
+                isolation=isolation, account_send_inflight=inflight)
+
+
 def ended_reservation_evidence(intent, session, actions, *, account_id, pool_account_id, read_started_at):
     """Return durable ended-send evidence; missing timing never means absent."""
-    if intent.get('state') == 'reserved':
-        return None
     explicit_account = str(session.get('account_id') or '').strip().casefold()
     if explicit_account:
         if explicit_account != account_id:
@@ -362,8 +531,20 @@ def ended_reservation_evidence(intent, session, actions, *, account_id, pool_acc
         return None
     if pool_account_id != hashlib.sha256(account_id.encode()).hexdigest():
         return None
-    entries = [action for action in actions if action.get('role') == 'entry'
-               or str(action.get('action_key') or '').endswith('entry-submit')]
+    entry = next((a for a in actions if submission_action_kind(a) == 'entry'
+                  and a.get('action_key') == str(session.get('session_id')) + ':entry-submit'), None)
+    if (entry and not intent.get('order_identity_conflict')
+            and (not intent.get('order_id') or intent['order_id'] in
+                 set(session.get('owned_order_ids') or ()) | set(session.get('order_history') or ()) | {session.get('entry_order_id')})
+            and session.get('idempotency_key') == 'lp-auto:' + str(intent.get('intent_id') or '')
+            and all(session.get(key) == intent.get(key) and intent.get(key)
+                    for key in ('token_id', 'condition_id', 'market_id', 'outcome'))):
+        evidence = ended_buy_action_evidence(session, entry, read_started_at=read_started_at)
+        if evidence:
+            return evidence
+    if intent.get('state') == 'reserved':
+        return None
+    entries = [action for action in actions if submission_action_kind(action) == 'entry']
     if any(action.get('state') == 'pending' for action in entries):
         return None
     if session.get('submit_stage') in {'preparing', 'sending'}:
@@ -424,11 +605,28 @@ def has_independent_unresolved_action(session, actions) -> bool:
            for key in ('passive_exit_attempt_state', 'protected_exit_attempt_state')):
         return True
     for action in actions:
-        if action.get('role') == 'entry' or str(action.get('action_key') or '').endswith('entry-submit'):
+        if buy_action_is_covered(session, action):
+            continue
+        kind = submission_action_kind(action)
+        if kind == 'entry':
             continue
         if (action.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
                 or action.get('state') == 'accepted' and action.get('side') in {'BUY', 'SELL'}
-                and not action.get('order_id') and 'cancel' not in str(action.get('action_key') or '')):
+                and not action.get('order_id') and kind != 'cancel'):
+            return True
+    return False
+
+
+def has_independent_unresolved_buy_action(session, actions) -> bool:
+    """Return whether an unresolved extra BUY still needs account admission."""
+    for action in actions:
+        if action.get('side') != 'BUY' or buy_action_is_covered(session, action):
+            continue
+        kind = submission_action_kind(action)
+        if kind == 'entry':
+            continue
+        if (action.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
+                or action.get('state') == 'accepted' and not action.get('order_id')):
             return True
     return False
 
@@ -439,10 +637,13 @@ def can_resume_covered_management(session, actions, facts) -> bool:
     Account ownership can prove exposure without resolving which request made
     it. Stop decisions, exit uncertainty and unrelated attention remain intact.
     """
+    owner_ended = (session.get('reservation_coverage') or {}).get('basis') == 'runtime_owner_exit'
     if (not reservation_is_released(session, facts.get('account_id'))
             or facts.get('financial_status') != 'known'
-            or session.get('state') not in {'needs_attention', 'entry_submit_pending'}
-            or session.get('submit_status') not in {'unknown', 'accepted_without_order_id'}
+            or session.get('state') not in ({'needs_attention', 'entry_submit_pending', 'review'} if owner_ended
+                                           else {'needs_attention', 'entry_submit_pending'})
+            or session.get('submit_status') not in ({None, 'pending', 'unknown', 'accepted_without_order_id'} if owner_ended
+                                                  else {'unknown', 'accepted_without_order_id'})
             or session.get('resume_state') not in {None, '', 'entry_submit_pending'}):
         return False
     if any(session.get(key) for key in ('stop_requested', 'stop_loss_latched',
@@ -460,12 +661,13 @@ def can_resume_covered_management(session, actions, facts) -> bool:
            for row in history.values()):
         return False
     own_ids = set(history) | set(session.get('owned_order_ids') or ())
-    if not own_ids:
+    token = str(session.get('token_id') or '')
+    inventory = account_position_quantity(facts, token) > ZERO
+    if not own_ids and not (owner_ended and inventory):
         return False
     active_buy = any(buy.get('session_id') == session.get('session_id')
         and buy.get('order_id') in own_ids and buy.get('state') == 'active' for buy in facts.get('buys', ()))
-    token = str(session.get('token_id') or '')
-    return active_buy or account_position_quantity(facts, token) > ZERO
+    return active_buy or inventory
 
 
 def account_cancel_is_pending(session, actions, order_id: str) -> bool:
@@ -476,7 +678,7 @@ def account_cancel_is_pending(session, actions, order_id: str) -> bool:
            for key in ('augment_cancel_requested', 'owned_cancel_requested')):
         return True
     return any(action.get('state') in {'pending', 'unknown', 'accepted'}
-        and ('cancel' in str(action.get('action_key') or '') or 'cancel' in str(action.get('role') or ''))
+        and submission_action_kind(action) == 'cancel'
         and (str(action.get('order_id') or '') == order_id
              or order_id in {str(value) for value in _items(action.get('targets'))})
         for action in actions)

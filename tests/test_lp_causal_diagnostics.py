@@ -27,37 +27,62 @@ def test_read_publish_and_auto_use_share_timestamps_during_sqlite_wait(runtime, 
     caplog.set_level(logging.INFO)
     store, adapter, account, lp, execution = runtime()
     started, release = Event(), Event()
+    import inspect
     connect = store._connection
+    holders, publications, source_reads = [], [], []
+    for name in ('get_balance_allowance', 'list_open_orders', 'list_positions'):
+        native = getattr(account, name)
+        def read_source(*args, _name=name, _native=native, **kwargs):
+            with connect() as probe:
+                probe.execute('BEGIN IMMEDIATE')
+                probe.rollback()
+            source_reads.append(_name)
+            return _native(*args, **kwargs)
+        monkeypatch.setattr(account, name, read_source)
     class ObservedConnection(sqlite3.Connection):
         def execute(self, sql, *args):
             if sql == 'BEGIN IMMEDIATE':
-                started.set()
-                assert release.wait(5), 'Independent SQLite publication watchdog'
+                frame = inspect.currentframe()
+                try:
+                    while frame and frame.f_code.co_name != '_register_account_snapshot':
+                        frame = frame.f_back
+                    if frame and frame.f_locals.get('_automatic_observation') is True:
+                        publications.append(dict(frame.f_locals['snapshot']))
+                        holder = sqlite3.connect(store.path, isolation_level=None, check_same_thread=False)
+                        holder.execute('BEGIN IMMEDIATE')
+                        holders.append(holder)
+                        started.set()
+                        assert release.wait(5), 'Independent exact account publication watchdog'
+                finally:
+                    del frame
             return super().execute(sql, *args)
     def observed():
         connection = sqlite3.connect(store.path, isolation_level=None, factory=ObservedConnection)
         connection.row_factory = sqlite3.Row
         return connection
-    # The holder is a real writer. Gate the attempt so the assertion has no
-    # dependency on scheduler speed or the production busy timeout.
-    holder = connect()
-    holder.execute('BEGIN IMMEDIATE')
     monkeypatch.setattr(store, '_connection', observed)
-    with ThreadPoolExecutor(1) as workers:
-        job = workers.submit(execution._auto_pool.run_once)
-        try:
-            assert started.wait(5)
-            wait_read_logs()
-            assert not job.done()
-            assert events(caplog, 'account_read_begin')
-            assert events(caplog, 'account_read_end')
-            assert events(caplog, 'account_publish_wait')
-            assert not events(caplog, 'account_publish_end')
-        finally:
-            holder.rollback()
-            holder.close()
-            release.set()
-        result = job.result(timeout=5)
+    try:
+        with ThreadPoolExecutor(1) as workers:
+            job = workers.submit(execution.lp_auto_run_once)
+            try:
+                assert started.wait(5)
+                wait_read_logs()
+                assert not job.done()
+                assert set(source_reads) == {'get_balance_allowance', 'list_open_orders', 'list_positions'}
+                assert len(publications) == 1
+                assert events(caplog, 'account_read_begin')
+                assert events(caplog, 'account_read_end')
+                assert events(caplog, 'account_publish_wait')
+                assert not events(caplog, 'account_publish_end')
+            finally:
+                for holder in holders:
+                    holder.rollback()
+                    holder.close()
+                release.set()
+            result = job.result(timeout=5)
+    finally:
+        release.set()
+        lp.drain_submissions()
     wait_read_logs()
     read = events(caplog, 'account_read_end')[-1]
     for name in ('account_publish_wait', 'account_publish_begin', 'account_publish_end', 'auto_account_use'):
@@ -167,50 +192,60 @@ def test_failed_execution_attempt_never_attributes_a_later_owner(runtime, monkey
 
 
 @pytest.mark.parametrize('reject', [False, True], ids=['sent-once', 'sendtime-funds-rejected'])
-def test_both_presend_account_uses_log_the_actual_distinct_reads(runtime, monkeypatch, caplog, reject):
+def test_planning_account_use_logs_actual_source_without_presend_reads(runtime, monkeypatch, caplog, reject):
     from copy import deepcopy
+    from polymarket.models.clob import RejectedOrder
     from tests.test_lp_auto_refill_contract import prepare
 
     caplog.set_level(logging.INFO)
-    _, _, account, lp, execution, _ = prepare(runtime, count=1, target=1)
-    used = []
-    reader = lp._read_candidate_snapshot
-    def record_use(request, **kwargs):
-        used.append(dict(account=deepcopy(kwargs['account']), used_at=lp._now(),
-                         sending=bool(kwargs.get('ignore_session_id'))))
-        return reader(request, **kwargs)
-    monkeypatch.setattr(lp, '_read_candidate_snapshot', record_use)
+    store, _, account, lp, execution, _ = prepare(runtime, count=1, target=1)
+    balance, post, sign = account.get_balance_allowance, account.post_order, account.create_limit_order
+    forbidden, planning = [], []
+    def balances(**kwargs):
+        if execution.lp_auto_state()['active_plan']:
+            forbidden.append(lp._now())
+            raise TimeoutError('no execution finance calls')
+        return balance(**kwargs)
+    monkeypatch.setattr(account, 'get_balance_allowance', balances)
+    def signing(**kwargs):
+        if not planning:
+            planning.append(deepcopy(execution.lp_auto_state()))
+        return sign(**kwargs)
+    monkeypatch.setattr(account, 'create_limit_order', signing)
     if reject:
-        sign = account.create_limit_order
-        balance = account.get_balance_allowance
-        def depleted(**kwargs):
-            return balance(**kwargs).__class__(balance='100000000',
-                allowances={account.environment.standard_exchange: '0'})
-        def sign_then_deplete(**kwargs):
-            signed = sign(**kwargs)
-            monkeypatch.setattr(account, 'get_balance_allowance', depleted)
-            return signed
-        monkeypatch.setattr(account, 'create_limit_order', sign_then_deplete)
+        def refusal(signed):
+            account.posts.append(signed)
+            return RejectedOrder(code='not_enough_balance', message='literal venue balance refusal')
+        monkeypatch.setattr(account, 'post_order', refusal)
     before = account.position_reads
-    state = execution.lp_auto_run_once(round_id='causal-two-presend-reads')
+    state = execution.lp_auto_run_once(round_id='causal-planning-source')
     wait_read_logs()
-    assert len(used) == 2 and [row['sending'] for row in used] == [False, True]
-    assert used[0]['account']['read_started_at'] != used[1]['account']['read_started_at']
-    assert account.position_reads - before == 4, 'Initial, two necessary per-BUY reads and final refresh'
-    for name, actual in zip(('auto_presend_account_use', 'auto_send_account_use'), used, strict=True):
-        records = events(caplog, name)
-        assert len(records) == 1, (name, records)
-        for key in ('read_started_at', 'read_ended_at', 'checked_at'):
-            assert records[0][key] == actual['account'][key].isoformat()
-        assert records[0]['used_at'] == actual['used_at'].isoformat()
-    assert len(account.posts) == (0 if reject else 1), state['last_round']
+    assert forbidden == [] and account.position_reads - before == 1
+    assert len(planning) == 1 and planning[0]['funds']['as_of']
+    actual = planning[0]['active_plan']['approval_account_facts']
+    records = events(caplog, 'auto_account_use')
+    assert len(records) == 1
+    for key in ('read_started_at', 'read_ended_at', 'checked_at'):
+        assert records[0][key] == actual[key]
+    assert not events(caplog, 'auto_presend_account_use') and not events(caplog, 'auto_send_account_use')
+    assert not events(caplog, 'auto_order_result_use')
+    assert len(account.posts) == 1
+    action, = state['last_round']['actions']
+    assert action['action_id'] == planning[0]['active_plan']['actions'][0]['action_id']
+    audit, = store.lp_actions(action['session_id'])
+    assert audit['post_started'] is True and audit['submit_receipt_at']
     if reject:
-        assert state['last_round']['actions'][0]['state'] == 'entry_rejected'
-        assert state['last_round']['actions'][0]['reason'] == 'balance_insufficient'
+        assert action['state'] == 'rejected' and action['request_state'] == 'entry_rejected'
+        assert action['reason'] == audit['reason'] == 'not_enough_balance'
+        assert audit['state'] == 'rejected'
     else:
-        replay = execution.lp_auto_run_once(round_id='causal-two-presend-reads')
-        assert replay['slots']['occupied'] == 1
-        assert len(account.posts) == 1
+        assert action['state'] == 'success' and audit['state'] == 'accepted'
+        assert state['funds']['status'] == 'unknown'
+        assert state['funds']['as_of'] == planning[0]['funds']['as_of']
+    original = deepcopy(audit)
+    replay = execution.lp_auto_run_once(round_id='causal-planning-source')
+    assert replay['slots']['occupied'] == (0 if reject else 1)
+    assert len(account.posts) == 1 and store.lp_actions(action['session_id']) == [original]
 
 
 @pytest.mark.parametrize('failed', [False, True], ids=['success', 'exception'])

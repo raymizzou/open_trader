@@ -1,5 +1,7 @@
 """#196 runs the actual #195 pool, SQLite state and LP order lifecycle."""
 
+from tests.test_lp_auto_pool import advance_auto_wait
+
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -60,6 +62,7 @@ def test_restart_reconciles_before_refill_and_preserves_manual_intent(tmp_path, 
 
     exchange.lp_snapshot = unavailable
     after_restart = LPAutoScheduler(restored, clock=lambda: pool.NOW)
+    advance_auto_wait(restored, monkeypatch)
     assert after_restart.run_due()
     assert len(exchange.posts) == (1 if paused else 2)
     assert restored.lp_auto_state()["desired_running"] is (not paused)
@@ -67,17 +70,19 @@ def test_restart_reconciles_before_refill_and_preserves_manual_intent(tmp_path, 
     exchange.lp_snapshot = read_snapshot
     monkeypatch.setattr(pool, "NOW", pool.NOW + timedelta(seconds=60))
     refresh_candidates(restored_lp, exchange)
+    advance_auto_wait(restored, monkeypatch)
     assert after_restart.run_due()
     assert len(exchange.posts) == (1 if paused else 2)
     assert restored.lp_auto_state()["run_id"] == execution.lp_auto_state()["run_id"]
     if paused:
         restored.lp_auto_set_desired_running(True)
         after_restart.request_check()
+        advance_auto_wait(restored, monkeypatch)
         assert after_restart.run_due()
         assert len(exchange.posts) == 2
 
 
-def test_pause_during_reconciliation_survives_late_result(tmp_path):
+def test_pause_during_reconciliation_survives_late_result(tmp_path, monkeypatch):
     execution, exchange, lp, store = pool.setup(tmp_path, 2)
     execution.lp_auto_configure({"budget_usd": "100", "target_buy_count": 2})
     second = lp._candidate_qualification_facts.pop("m01")
@@ -93,6 +98,7 @@ def test_pause_during_reconciliation_survives_late_result(tmp_path):
         return read_snapshot(request)
 
     exchange.lp_snapshot = delayed
+    advance_auto_wait(execution, monkeypatch)
     scheduler = LPAutoScheduler(execution, clock=lambda: pool.NOW)
     worker = threading.Thread(target=scheduler.run_due)
     worker.start()
@@ -118,6 +124,7 @@ def test_midnight_gtd_termination_refills_from_fresh_candidates(tmp_path, monkey
     assert not exchange.posts
     execution.lp_auto_set_desired_running(True)
     scheduler.request_check()
+    advance_auto_wait(execution, monkeypatch)
     assert scheduler.run_due()
     assert len(exchange.posts) == 1
     identity = execution.lp_auto_state()["run_id"]
@@ -136,7 +143,7 @@ def test_midnight_gtd_termination_refills_from_fresh_candidates(tmp_path, monkey
     assert state["slots"]["occupied"] == 1
 
 
-def test_terminal_pause_confirmation_blocks_unsigned_remainder_and_keeps_buy(tmp_path, capsys):
+def test_terminal_pause_confirmation_blocks_unsigned_remainder_and_keeps_buy(tmp_path, monkeypatch, capsys):
     from open_trader import cli
     from tests.test_lp_auto_control import runtime_for
     from tests.test_prediction_service import _server
@@ -154,6 +161,7 @@ def test_terminal_pause_confirmation_blocks_unsigned_remainder_and_keeps_buy(tmp
         assert release.wait(3)
 
     exchange.before_sign = before_sign
+    advance_auto_wait(execution, monkeypatch)
     scheduler = LPAutoScheduler(execution, clock=lambda: pool.NOW)
     runtime = runtime_for(tmp_path)
     runtime.execution = execution
@@ -176,39 +184,204 @@ def test_terminal_pause_confirmation_blocks_unsigned_remainder_and_keeps_buy(tmp
 
 @pytest.mark.parametrize("pause_while_blocked", [False, True])
 def test_durable_receipt_reconciles_after_interrupted_submit_without_overriding_pause(tmp_path, monkeypatch, pause_while_blocked):
+    import json
+    import uuid
+    from collections import Counter
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+
+    monkeypatch.setattr(pool, 'NOW', pool.NOW)
     execution, exchange, lp, store = pool.setup(tmp_path, 2)
+    result_reader = install_order_result_reader(exchange, monkeypatch)
     execution.lp_auto_configure({"budget_usd": "100", "target_buy_count": 2})
     execution.lp_auto_set_desired_running(True)
+    current, phase = [execution], ['original_local_attempts']
+    evidence = dict(parameter=pause_while_blocked,faults=[],states=[],result_packets=[],full_snapshot_reads=[],financial_reads=[])
+    def document():
+        with sqlite3.connect(store.path.as_uri()+'?mode=ro',uri=True) as connection:
+            return json.loads(connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
+    def capture(label):
+        engine=current[0];state=deepcopy(engine.lp_auto_state())
+        evidence['states'].append(dict(label=label,state=state,document=document(),sessions=engine._store.lp_sessions(),
+            audits={s['session_id']:engine._store.lp_actions(s['session_id']) for s in engine._store.lp_sessions()},
+            orders=deepcopy(exchange.orders),posts=deepcopy(exchange.posts)))
+        return state
+    account=exchange.lp_account_snapshot
+    def financial():
+        value=account()
+        evidence['financial_reads'].append(dict(phase=phase[0],active_plan=bool(current[0].lp_auto_state()['active_plan']),at=pool.NOW))
+        return value
+    monkeypatch.setattr(exchange,'lp_account_snapshot',financial)
+    original_snapshot=exchange.lp_snapshot
+    unavailable=[False]
+    def full_snapshot(request):
+        row=dict(phase=phase[0],request=deepcopy(request),at=pool.NOW,unavailable=unavailable[0],
+            active_plan=bool(current[0].lp_auto_state()['active_plan']))
+        evidence['full_snapshot_reads'].append(row)
+        if unavailable[0]:
+            try:
+                raise OSError("read unavailable")
+            except OSError as exc:
+                row['actual_error']=dict(type=type(exc).__name__,message=str(exc))
+                raise
+        value=original_snapshot(request);row['packet']=deepcopy(value);return value
+    monkeypatch.setattr(exchange,'lp_snapshot',full_snapshot)
+    def results(request):
+        value=result_reader(request)
+        for field in ('orders','open_orders'):
+            for row in value[field]:
+                if (row.get('side')=='BUY' and row.get('token_id')==row.get('condition_id')
+                        and row.get('token_id') in ('m00','m01') and row.get('status')=='LIVE'
+                        and row.get('fill_quantity_known') in (None,True)
+                        and Decimal(str(row['price']))==Decimal('.40') and Decimal(str(row['original_size']))==20
+                        and Decimal(str(row['size_matched']))==0):
+                    row['fill_quantity_known']=True
+        evidence['result_packets'].append(deepcopy(dict(phase=phase[0],request=request,packet=value)))
+        return value
+    monkeypatch.setattr(exchange,'lp_order_result_snapshot',results)
     update = store.lp_update_session
-
     def fail_after_receipt(session_id, **kwargs):
         if (kwargs.get("patch") or {}).get("submit_status") == "accepted":
-            raise OSError("interrupted after durable accepted action")
+            observed=dict(session_id=session_id,patch=deepcopy(kwargs['patch']),session=store.lp_session(session_id),
+                audits=store.lp_actions(session_id),phase=phase[0],at=pool.NOW)
+            evidence['faults'].append(observed)
+            try:
+                raise OSError("interrupted after durable accepted action")
+            except OSError as exc:
+                observed['actual_error']=dict(type=type(exc).__name__,message=str(exc))
+                raise
         return update(session_id, **kwargs)
-
     monkeypatch.setattr(store, "lp_update_session", fail_after_receipt)
     scheduler = LPAutoScheduler(execution, clock=lambda: pool.NOW)
-    scheduler.run_due()
-    assert len(exchange.posts) == 1
-    assert scheduler.snapshot()["last_check_error"] == "OSError"
-    restored, restored_lp = restart(tmp_path, exchange, lp)
-    read_snapshot = exchange.lp_snapshot
-    exchange.lp_snapshot = lambda request: (_ for _ in ()).throw(OSError("read unavailable"))
-    recovered = LPAutoScheduler(restored, clock=lambda: pool.NOW)
-    recovered.run_due()
-    assert len(exchange.posts) == 2
-    assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01']
-    assert restored.lp_auto_state()["block_reasons"]
-    if pause_while_blocked:
-        assert restored.lp_auto_set_desired_running(False)["pause_confirmed"] is True
-    exchange.lp_snapshot = read_snapshot
-    monkeypatch.setattr(pool, "NOW", pool.NOW + timedelta(seconds=60))
-    refresh_candidates(restored_lp, exchange)
-    recovered.run_due()
-    assert not restored.lp_auto_state()["block_reasons"]
-    assert len(exchange.posts) == 2  # no duplicate after receipt recovery or pause
-    assert restored.lp_auto_state()["desired_running"] is (not pause_while_blocked)
-
+    def observe_without_replay(engine, checking_scheduler, state, label):
+        before = len(exchange.posts)
+        checking_scheduler.request_check()
+        assert checking_scheduler.run_due()
+        current_state = engine.lp_auto_state()
+        assert current_state['last_round']['round_id'] != state['last_round']['round_id']
+        assert current_state['active_plan'] is None and current_state['last_round']['actions'] == []
+        assert len(exchange.posts) == before
+        capture(label)
+        return current_state
+    def audit_immutable(engine,originals):
+        for sid,row in originals.items():
+            assert engine._store.lp_actions(sid)==[row]
+        assert {x['session_id'] for x in engine._store.lp_sessions()}==set(originals)
+    try:
+        assert scheduler.run_due()
+        original=capture('both_original_requests_locally_complete_with_apply_failures')
+        original_round=deepcopy(original['last_round'])
+        assert original['active_plan'] is None and original_round['completed_at']
+        assert original['plan_wait'] is None
+        assert Counter(p['token_id'] for p in exchange.posts)==Counter(['m00','m01'])
+        assert all(p['side']=='BUY' and Decimal(p['price'])==Decimal('.40') and Decimal(p['quantity'])==20 and p['post_only'] is True for p in exchange.posts)
+        assert len(exchange.orders)==2 and all(o['status']=='LIVE' and Decimal(o['price'])==Decimal('.40')
+            and Decimal(o['original_size'])==20 and Decimal(o['size_matched'])==0 for o in exchange.orders)
+        actual_ids={o['token_id']:o['order_id'] for o in exchange.orders}
+        assert set(actual_ids)=={'m00','m01'} and len(set(actual_ids.values()))==2
+        canonical={};audits={}
+        for action in original_round['actions']:
+            assert action['kind']=='buy' and action['state']=='unknown'
+            assert action['error_type']=='OSError' and action['reason']=='interrupted after durable accepted action'
+            assert action['request_id']==action['action_id'] and action['request_id'].startswith(original_round['round_id']+':')
+            assert action['order_id']==actual_ids[action['token_id']]
+            sid=action['session_id'];canonical[action['token_id']]=sid
+            row,=[a for a in store.lp_actions(sid) if a.get('role')=='entry']
+            assert row['state']=='accepted' and row['post_started'] is True and row['order_id']==actual_ids[action['token_id']]
+            assert row['token_id']==action['token_id'] and Decimal(row['price'])==Decimal('.40') and Decimal(row['quantity'])==20
+            uuid.UUID(row['action_id']);audits[sid]=deepcopy(row)
+        assert set(canonical)=={'m00','m01'} and len(set(canonical.values()))==2
+        assert {x['session_id'] for x in evidence['faults']}==set(canonical.values())
+        assert all(x['actual_error']==dict(type='OSError',message='interrupted after durable accepted action') for x in evidence['faults'])
+        assert all(store.lp_session(sid).get('submit_status') is None and store.lp_session(sid).get('entry_order_id')==actual_ids[token] for token,sid in canonical.items())
+        assert original['slots']['occupied']==2 and Decimal(original['funds']['buy_reserved_usd'])==16
+        evidence['original_round']=original_round;evidence['original_audits']=audits
+        evidence['canonical']=canonical;evidence['actual_venue_ids']=actual_ids;evidence['scheduler_first']=scheduler.snapshot()
+        phase[0]='full_cold_before_current_recovery'
+        restored, restored_lp = restart(tmp_path, exchange, lp)
+        current[0]=restored
+        recovered = LPAutoScheduler(restored, clock=lambda: pool.NOW)
+        # Restart itself preserves durable original requests until a new read.
+        assert len(exchange.posts)==2 and {o['token_id']:o['order_id'] for o in exchange.orders}==actual_ids
+        assert all(restored._store.lp_session(sid).get('submit_status') is None and restored._store.lp_session(sid).get('entry_order_id')==actual_ids[token] for token,sid in canonical.items())
+        audit_immutable(restored,audits)
+        phase[0]='actual_full_snapshot_failure_and_narrow_recovery'
+        unavailable[0]=True
+        pool.NOW += timedelta(microseconds=1)
+        result_start=len(evidence['result_packets']);full_start=len(evidence['full_snapshot_reads'])
+        assert recovered.run_due()
+        blocked=capture('original_metadata_recovered_independently_of_failed_full_read')
+        assert any(x.get('actual_error')==dict(type='OSError',message='read unavailable') for x in evidence['full_snapshot_reads'][full_start:])
+        packets=evidence['result_packets'][result_start:]
+        assert packets and set(actual_ids.values())<={oid for x in packets for oid in x['request'].get('owned_order_ids',())}
+        assert any(x['packet']['authenticated'] is True and x['packet']['wallet_address']=='test-wallet'
+            and x['packet']['open_orders_complete'] is True and x['packet']['pagination_complete'] is True
+            and {o['order_id'] for o in x['packet']['orders']}==set(actual_ids.values())
+            and all(o['fill_quantity_known'] is True and o['status']=='LIVE' and Decimal(o['price'])==Decimal('.40')
+                and Decimal(o['original_size'])==20 and Decimal(o['size_matched'])==0 for o in x['packet']['orders']) for x in packets)
+        for token,sid in canonical.items():
+            session=restored._store.lp_session(sid)
+            assert session['submit_status']=='accepted' and session['entry_order_id']==actual_ids[token]
+            assert session['token_id']==token and actual_ids[token] in session['owned_order_ids']
+        assert blocked['active_plan'] is None and blocked['last_round']['round_id']!=original_round['round_id']
+        assert blocked['block_reasons']
+        assert blocked['funds']['as_of']==original['funds']['as_of']
+        assert blocked['slots']['occupied']==2 and Decimal(blocked['funds']['buy_reserved_usd'])==16
+        assert blocked['plan_wait'] is None
+        assert len(exchange.posts)==2 and {o['token_id']:o['order_id'] for o in exchange.orders}==actual_ids
+        audit_immutable(restored,audits)
+        if pause_while_blocked:
+            assert restored.lp_auto_set_desired_running(False)['pause_confirmed'] is True
+        assert restored.lp_auto_state()['desired_running'] is (not pause_while_blocked)
+        unavailable[0]=False
+        phase[0]='restored_external_full_read_current_cycle'
+        pool.NOW += timedelta(microseconds=1)
+        for observation_index in range(2):
+            current_state = observe_without_replay(restored,recovered,blocked,f'current-recovery-{observation_index}')
+            assert current_state['desired_running'] is (not pause_while_blocked)
+            assert current_state['slots']['occupied'] == 2 and Decimal(current_state['funds']['buy_reserved_usd']) == 16
+            assert {o['token_id']:o['order_id'] for o in exchange.orders} == actual_ids
+            audit_immutable(restored,audits)
+        phase[0]='next_current_healthy_observation'
+        refresh_candidates(restored_lp, exchange)
+        full_start=len(evidence['full_snapshot_reads'])
+        assert recovered.run_due()
+        healthy=capture('healthy_current_two_owned_orders_pause_preserved')
+        assert healthy['active_plan'] is None and not healthy['block_reasons']
+        assert healthy['last_round']['actions']==[]
+        assert healthy['desired_running'] is (not pause_while_blocked)
+        assert healthy['slots']['occupied']==2 and Decimal(healthy['funds']['buy_reserved_usd'])==16
+        assert healthy['last_round']['round_id'] not in (original_round['round_id'],blocked['last_round']['round_id'])
+        assert healthy['plan_wait'] is None
+        if pause_while_blocked:
+            assert healthy['last_round']['actions']==[] and healthy['last_round']['checked_at']
+        else:
+            assert healthy['last_round']['completed_at']
+        assert len(exchange.posts)==2 and all(p['side']=='BUY' for p in exchange.posts)
+        assert {o['token_id']:o['order_id'] for o in exchange.orders}==actual_ids
+        assert all(o['status']=='LIVE' for o in exchange.orders)
+        assert not any(x.get('actual_error') for x in evidence['full_snapshot_reads'][full_start:])
+        for token,sid in canonical.items():
+            session=restored._store.lp_session(sid)
+            assert session['submit_status']=='accepted' and session['entry_order_id']==actual_ids[token] and not session.get('facts_error')
+        audit_immutable(restored,audits)
+        phase[0]='healthy_full_cold_current_observation'
+        counts=(len(evidence['financial_reads']),len(evidence['full_snapshot_reads']),len(evidence['result_packets']))
+        again,_=restart(tmp_path,exchange,restored_lp);current[0]=again
+        again.lp_auto_run_once()
+        assert len(evidence['financial_reads']) > counts[0]
+        again_state = again.lp_auto_state()
+        assert again_state['last_round']['round_id'] != healthy['last_round']['round_id']
+        assert again_state['active_plan'] is None and again_state['last_round']['actions'] == []
+        assert again.lp_auto_state()['desired_running'] is (not pause_while_blocked)
+        assert len(exchange.posts)==2 and {o['token_id']:o['order_id'] for o in exchange.orders}==actual_ids
+        audit_immutable(again,audits)
+        assert not any(x['active_plan'] for x in evidence['financial_reads'])
+        evidence['completed']='full'
+    finally:
+        evidence.update(phase=phase[0],clock=pool.NOW,state=current[0].lp_auto_state(),document=document(),
+            sessions=current[0]._store.lp_sessions(),audits={s['session_id']:current[0]._store.lp_actions(s['session_id']) for s in current[0]._store.lp_sessions()},
+            orders=exchange.orders,posts=exchange.posts)
+        (tmp_path/'RT-diagnostics.json').write_text(json.dumps(evidence,indent=2,default=str)+'\n')
 
 def test_shadow_auto_http_reads_do_not_initialize_or_write_durable_state(tmp_path):
     from tests.test_lp_auto_control import runtime_for
@@ -243,6 +416,7 @@ def test_paused_inventory_exit_continues_and_confirmed_proceeds_fund_next_buy(tm
     assert len(exchange.posts) == 2
     assert exchange.posts[-1]["side"] == "SELL"
     scheduler.request_check()
+    advance_auto_wait(execution, monkeypatch)
     scheduler.run_due()
     assert Decimal(execution.lp_auto_state()["funds"]["inventory_cost_usd"]) == 8
     assert Decimal(execution.lp_auto_state()["funds"]["available_usd"]) == 0

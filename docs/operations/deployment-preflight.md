@@ -18,8 +18,8 @@ reuses their evidence and does not run backend pytest or build a Docker image.
 The backend still excludes `pressure` and `browser`. Gateway, Account and Legacy
 remain serial. Prediction keeps two xdist workers and its explicit shared-port
 and solver-fixture groups. Portable scenarios run serially. CI checks collected
-nodeids against the full backend collection so new files, nested tests, marker
-changes and omitted partitions cannot silently reduce coverage. The old single
+executed active plus explicitly retired nodeids against the full backend
+collection so new files, nested tests, marker changes and omitted partitions cannot silently reduce coverage. The old single
 cross-service pytest session is not reproduced: arbitrary global test ordering
 is different. No second full backend execution is added to compensate for an
 unspecified ordering dependency. Tests with a real shared-session contract must
@@ -39,10 +39,19 @@ label. Missing API access is BLOCKED. It requires:
 - The correct workflow path, completed current run attempt, all four services,
   portable scenarios and the exact `required` check from GitHub Actions app 15368
 - Unexpired artifacts from that same run and attempt, with matching source,
-  repository, scope, N-leg selection, lock, test and environment metadata
+  repository, scope, active selection, permanent retirement manifest/policy, lock,
+  test metrics and environment metadata
 - The actual selected Python environment, checked read-only against the runtime
   dependency closure in that checkout's `uv.lock`, including selected extras,
   and code imports from that release's source
+
+Each service's recorded executions must equal its active partition in the
+portable collection proof. The proof's retired collection is explicitly not
+executed and is never required to be passed. The preflight checks the exact
+manifest and selection digests against the selected checkout. It rejects missing
+LP/pause executions, unknown policies and false full-coverage claims. There is
+no fixed `TEST_N_LEG=1` requirement and no periodic N-leg full regression.
+See [the permanent retirement policy](ci-nleg-retirement.md).
 
 A later main commit does not invalidate a selected release that has its own
 successful main-push evidence and remains in main history. PR-head and synthetic
@@ -118,6 +127,36 @@ installation; failure requires the existing operator-directed recovery process.
 Cloud deployment must use the cloud readiness and Smoke gates on both machines.
 The wrapper never auto-stops, auto-rolls back, starts a missing check, or submits
 orders beyond the explicitly selected existing install/start action.
+
+## Prediction D2 target binding
+
+Prediction production managers additionally require the tracked, closed
+`ops/lp-runtime-contract.json` capability. The three-key reader manifest stays
+unchanged. Capability alone, old READY evidence and caller-supplied JSON do not
+authorize a start. The manager captures the actual preflight result internally
+and binds its exact source SHA, selected interpreter/runtime report, lock and
+capability digests, CI run/attempt and artifact identities to an operation nonce
+in the existing management record. One prospective binding may be forwarded;
+installers receive its opaque nonce, not a replacement proof.
+
+The binding also fixes the canonical selected config path and its SHA-256.
+Managers recheck the actual bytes and file metadata under the existing operation
+lock before promotion, stop, arm and claim. Systemd uses its strict nested
+config; launchd supports its nested default or an explicitly selected same-user
+private sibling config. A changed selection or mismatched forwarded nonce
+fails closed. A new explicit operator operation can select valid current config
+with a new nonce while independently rechecking retained unchanged source/runtime
+evidence. It cannot reinterpret a mismatched forwarded operation.
+
+A previously validated compatible D2 rollback may reuse its retained CI binding
+after checking the actual unchanged local release, capability, interpreter and
+lock, plus fresh process/listener/owner absence. This does not depend on expired
+forward artifacts and does not rerun backend tests. Missing trusted retained
+evidence requires fresh trusted verification or rejection. D1/old unsupported
+targets are rejected before stopping or arming; a first D2 release with no
+validated compatible predecessor requires stop and fix-forward. There is no
+automatic rollback or request-history reconstruction. Current API facts and
+reliable pause still govern after an authorized rollback.
 
 ## Rollback
 

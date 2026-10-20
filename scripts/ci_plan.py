@@ -6,18 +6,29 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
+import importlib.util
+
 
 BACKEND_SCOPES = ('gateway', 'legacy', 'account', 'prediction')
 REQUIRED_SCOPES = BACKEND_SCOPES + ('portable',)
 SCOPES = REQUIRED_SCOPES + ('trend-curve',)
 
 
+def policy():
+    spec = importlib.util.spec_from_file_location("ci_selection", Path(__file__).with_name("ci_evidence.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    data = module.retirement_policy(Path(__file__).resolve().parents[1])
+    return {key: data[key] for key in ("policy", "manifest_sha256", "retirement_reason")}
+
+
+
 def route(paths):
-    # Paths remain diagnostic evidence only: every branch/PR/main candidate
-    # receives the complete backend partition, including paused N-leg tests.
-    # Legacy includes trend-curve, so its standalone job remains unselected.
-    return {'scopes': list(REQUIRED_SCOPES), 'test_n_leg': '1',
-            'reason': 'full backend and portable coverage for every CI candidate'}
+    # Paths are diagnostic only. Active/shared coverage stays mandatory.
+    return {'scopes': list(REQUIRED_SCOPES), 'test_n_leg': '0',
+            **policy(),
+            'reason': 'all active backend and portable coverage for every CI candidate'}
 
 
 def changed_paths(base, head, cwd=None):
@@ -32,15 +43,16 @@ def required(needs):
             return False, 'plan did not succeed'
         plan = json.loads(needs['plan']['outputs']['plan'])
         scopes = plan['scopes']
-        if (scopes != list(REQUIRED_SCOPES) or plan['test_n_leg'] != '1'
+        if (scopes != list(REQUIRED_SCOPES) or plan['test_n_leg'] != '0'
+                or any(plan.get(key) != value for key, value in policy().items())
                 or not isinstance(plan['reason'], str) or not plan['reason']):
-            return False, 'invalid full-backend plan'
+            return False, 'invalid active-backend plan'
         for scope in SCOPES:
             result = needs[scope.replace('-', '_')]['result']
             expected = 'success' if scope in scopes else 'skipped'
             if result != expected:
                 return False, f'{scope}: expected {expected}, got {result}'
-        return True, 'all backend and portable checks succeeded with N-leg coverage'
+        return True, 'all backend and portable active checks succeeded; N-leg permanently retired'
     except (KeyError, TypeError, ValueError):
         return False, 'missing or malformed plan/job results'
 

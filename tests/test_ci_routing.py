@@ -14,7 +14,7 @@ spec.loader.exec_module(ci)
 
 
 class RoutingTests(unittest.TestCase):
-    def test_every_changed_path_selects_full_backend_with_nleg(self):
+    def test_permanent_nleg_retirement_keeps_all_active_scopes(self):
         for path in ['README.md', 'README.zh-CN.md', 'docs/operations/ci.md',
                      'AGENTS.md', 'CHANGELOG.md', 'ops/release-deployment.md',
                      'src/open_trader/frontend_gateway.py',
@@ -31,27 +31,26 @@ class RoutingTests(unittest.TestCase):
             with self.subTest(path=path):
                 plan = ci.route([path])
                 self.assertEqual(plan['scopes'], list(ci.REQUIRED_SCOPES))
-                self.assertEqual(plan['test_n_leg'], '1')
+                self.assertEqual(plan['test_n_leg'], '0')
+                self.assertEqual(plan['policy'], 'permanent-nleg-retirement-v1')
+                self.assertEqual(plan['retirement_reason'], 'N-leg permanently retired')
                 self.assertNotIn('exemption', plan['reason'])
+
+        self.assertEqual(ci.route([]), ci.route(['deleted.py', 'renamed.py']))
+        self.test_plan_cli_exact_candidate_and_unavailable_diff()
 
     def test_empty_and_mixed_paths_cannot_reduce_coverage(self):
         full = ci.route([])
         self.assertEqual(full['scopes'], list(ci.REQUIRED_SCOPES))
-        self.assertEqual(full['test_n_leg'], '1')
+        self.assertEqual(full['test_n_leg'], '0')
         for paths in [['README.md'], ['tests/test_account_api.py',
                       'src/open_trader/frontend_gateway.py', 'README.md']]:
             self.assertEqual(ci.route(paths), full)
             self.assertEqual(ci.route(list(reversed(paths)) + paths), full)
 
     def test_full_backend_makefile_partition_covers_every_test_once(self):
-        # Execute only Make's variable expansion, never a Docker/test recipe.
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.mk') as extra:
-            extra.write('include Makefile\n.PHONY: ci-partition\nci-partition:\n')
-            for scope in ci.SCOPES[:4]:
-                extra.write(f'\t@echo {scope}:$(sort $(SERVICE_TESTS_{scope}))\n')
-            extra.flush()
-            output = subprocess.check_output(['make', '-sf', extra.name, 'ci-partition'],
-                                             cwd=ROOT, text=True)
+        # Public Make selection; diagnostic inclusion recovers the full universe.
+        output = subprocess.check_output(['make','-s','ci-test-files','TEST_N_LEG=1'],cwd=ROOT,text=True)
         selected = []
         for line in output.splitlines():
             scope, paths = line.split(':', 1)
@@ -85,7 +84,7 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(set(paths), {'src/open_trader/account_api.py',
                              'src/open_trader/prediction_solver.py',
                              'src/open_trader/frontend_gateway.py', 'unknown\nfile.txt'})
-            self.assertEqual(ci.route(paths)['test_n_leg'], '1')
+            self.assertEqual(ci.route(paths)['test_n_leg'], '0')
 
     def test_plan_cli_exact_candidate_and_unavailable_diff(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -119,7 +118,7 @@ class RoutingTests(unittest.TestCase):
                     self.assertEqual(run.returncode, 0, run.stderr)
                     plan = json.loads(run.stdout)
                     self.assertEqual(plan['scopes'], list(ci.REQUIRED_SCOPES))
-                    self.assertEqual(plan['test_n_leg'], '1')
+                    self.assertEqual(plan['test_n_leg'], '0')
                     self.assertEqual(plan['sha'], head)
                     self.assertEqual(plan['base_sha'], before)
                     self.assertEqual(plan['changed_paths'], expected_paths)
@@ -140,6 +139,23 @@ class RequiredTests(unittest.TestCase):
         needs = {'plan': {'result': 'success', 'outputs': {'plan': json.dumps(plan)}}}
         needs.update({scope.replace('-', '_'): {'result': 'success' if scope in plan['scopes'] else 'skipped'} for scope in ci.SCOPES})
         return needs
+
+    def test_retired_policy_requires_every_active_job(self):
+        needs = self.needs(['README.md'])
+        self.assertTrue(ci.required(needs)[0])
+        for scope in ('gateway', 'legacy', 'account', 'prediction', 'portable'):
+            for result in ('failure', 'cancelled', 'skipped', None):
+                candidate = self.needs([])
+                candidate[scope]['result'] = result
+                self.assertFalse(ci.required(candidate)[0], (scope, result))
+            candidate = self.needs([]); del candidate[scope]
+            self.assertFalse(ci.required(candidate)[0])
+        for changes in ({'scopes': []}, {'policy': 'unknown'}, {'retirement_reason': 'temporary'},
+                        {'manifest_sha256': '0'*64}, {'test_n_leg': '1'}):
+            candidate = self.needs([])
+            plan = json.loads(candidate['plan']['outputs']['plan']); plan.update(changes)
+            candidate['plan']['outputs']['plan'] = json.dumps(plan)
+            self.assertFalse(ci.required(candidate)[0], changes)
 
     def test_full_backend_success_including_documentation_changes(self):
         self.assertTrue(ci.required(self.needs(['src/open_trader/account_api.py']))[0])
@@ -169,7 +185,7 @@ class RequiredTests(unittest.TestCase):
                         {'scopes': list(ci.SCOPES)},
                         {'scopes': list(ci.BACKEND_SCOPES)},
                         {'scopes': ['gateway', 'legacy', 'account', 'account']},
-                        {'test_n_leg': '0'}, {'test_n_leg': 1}, {'reason': ''}]:
+                        {'test_n_leg': '1'}, {'test_n_leg': 0}, {'reason': ''}]:
             needs = self.needs(['README.md'])
             plan = json.loads(needs['plan']['outputs']['plan'])
             plan.update(changes)

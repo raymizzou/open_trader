@@ -14,16 +14,20 @@ SOURCE_SHA := $(shell git rev-parse HEAD)
 SOURCE_STATE := $(if $(shell git status --porcelain --untracked-files=all),dirty,clean)
 DOCKER_BUILD = BUILDX_CONFIG="$(BUILDX_CONFIG)" $(DOCKER) build --build-arg SOURCE_SHA="$(SOURCE_SHA)" --build-arg SOURCE_STATE="$(SOURCE_STATE)" --target dev --file "$(WORKTREE_ROOT)/$(DOCKERFILE)" --tag "$(DOCKER_IMAGE)" "$(WORKTREE_ROOT)"
 DOCKER_RUN = $(DOCKER) run --rm --init --network none --cap-drop ALL --security-opt no-new-privileges "$(DOCKER_IMAGE)"
-BACKEND_PYTEST := env PYTHONSAFEPATH=1 PYTHONPATH=/workspace:/workspace/src PYTHONDONTWRITEBYTECODE= PYTHONPYCACHEPREFIX=/tmp/open-trader-bytecache pytest -q -m "not pressure and not browser" -o cache_dir=/tmp/open-trader-pytest-cache --basetemp=/tmp/open-trader-pytest
+# CI retains a named, offline container only long enough to copy test records.
+CI_TEST_ARTIFACTS ?= 0
+CI_TEST_CONTAINER ?= open-trader-test-records
+ifeq ($(CI_TEST_ARTIFACTS),1)
+DOCKER_RUN = $(DOCKER) run --name "$(CI_TEST_CONTAINER)" --init --network none --cap-drop ALL --security-opt no-new-privileges "$(DOCKER_IMAGE)"
+CI_PYTEST_RECORDS = -p scripts.ci_test_metrics --junitxml=/tmp/open-trader-ci-evidence/junit.xml
+CI_PYTEST_ENV = CI_TEST_METRICS=/tmp/open-trader-ci-evidence/metrics.json CI_TEST_SOURCE_SHA=$(SOURCE_SHA) CI_TEST_WORKERS=$(TEST_WORKERS)
+endif
+BACKEND_PYTEST = env $(CI_PYTEST_ENV) PYTHONSAFEPATH=1 PYTHONPATH=/workspace:/workspace/src PYTHONDONTWRITEBYTECODE= PYTHONPYCACHEPREFIX=/tmp/open-trader-bytecache pytest -q $(CI_PYTEST_RECORDS) -m "not pressure and not browser" -o cache_dir=/tmp/open-trader-pytest-cache --basetemp=/tmp/open-trader-pytest
 TEST_WORKERS ?= $(if $(filter prediction,$(SERVICE)),6,1)
 TEST_N_LEG ?= 0
-# N-leg is paused operationally. Keep shared model, service, LP and pause guards active.
-N_LEG_TESTS := $(wildcard tests/test_prediction_n_leg_*.py tests/test_prediction_solver*.py tests/test_run_nleg*.py tests/test_prediction_executable_cost.py tests/test_prediction_live_resolver.py tests/test_prediction_market_solution.py tests/test_prediction_monitor_selection*.py tests/test_prediction_partial_fill.py tests/test_prediction_snapshot_scheduler.py)
-# ponytail: filename routing; add new service prefixes here when a test family lands.
-SERVICE_TESTS_gateway := $(wildcard tests/test_frontend_gateway*.py)
-SERVICE_TESTS_account := $(wildcard tests/test_account*.py tests/test_futu_account.py tests/test_tiger_account.py tests/test_holding_snapshot*.py tests/test_statement_import.py tests/test_real_holding_input.py tests/test_fx.py tests/test_cutover_us_tiger_to_futu.py)
-SERVICE_TESTS_prediction := $(wildcard tests/test_prediction*.py tests/test_predict*.py tests/test_polymarket*.py tests/test_relation*.py tests/test_lp_*.py tests/test_run_nleg*.py tests/test_mechanical_relations.py tests/test_market_scope.py tests/test_problem_canonicalization.py tests/test_validation_eat*.py)
-SERVICE_TESTS_legacy := $(filter-out $(SERVICE_TESTS_gateway) $(SERVICE_TESTS_account) $(SERVICE_TESTS_prediction),$(wildcard tests/test_*.py))
+# The reviewed manifest is the sole retirement selection source.
+N_LEG_MANIFEST ?= scripts/ci_nleg_retired.json
+CI_SELECTION = python3 scripts/ci_evidence.py select --manifest "$(N_LEG_MANIFEST)" --nleg "$(TEST_N_LEG)"
 
 DASHBOARD_URL ?= http://127.0.0.1:8766
 DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/frontend_gateway/launchd.out.log
@@ -43,14 +47,16 @@ test:
 	$(if $(filter-out gateway legacy account prediction,$(SERVICE)),$(error Unknown SERVICE: $(SERVICE)))
 	$(if $(and $(strip $(SERVICE)),$(strip $(TEST))),$(error Use SERVICE or TEST, not both))
 	$(if $(and $(filter 1,$(words $(TEST_N_LEG))),$(filter 0 1,$(TEST_N_LEG))),,$(error TEST_N_LEG must be 0 or 1))
-	$(if $(and $(filter prediction,$(SERVICE)),$(filter 0,$(TEST_N_LEG))),@echo "N-leg dedicated tests paused ($(words $(N_LEG_TESTS)) files); use TEST_N_LEG=1 to include them.")
+	$(eval SELECTED_TESTS := $(shell $(CI_SELECTION) $(if $(SERVICE),--services $(SERVICE)) || echo __INVALID_SELECTION__))
+	$(if $(filter __INVALID_SELECTION__,$(SELECTED_TESTS)),$(error Invalid retirement selection))
+	$(if $(and $(filter prediction,$(SERVICE)),$(filter 0,$(TEST_N_LEG))),@echo "N-leg permanently retired (29 files); use TEST_N_LEG=1 for manual diagnostics.")
 	$(DOCKER_BUILD)
-	$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST)),$(TEST),$(filter-out $(if $(filter 0,$(TEST_N_LEG)),$(N_LEG_TESTS)),$(sort $(foreach service,$(SERVICE),$(SERVICE_TESTS_$(service)))))) $(if $(filter 1,$(TEST_WORKERS)),,-n $(TEST_WORKERS) --dist=loadgroup)
+	$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST)),$(TEST),$(SELECTED_TESTS)) $(if $(filter 1,$(TEST_WORKERS)),,-n $(TEST_WORKERS) --dist=loadgroup)
 
 # CI metadata and collection proof use the identical file partition as make test.
 .PHONY: ci-test-files test-ci-portable
 ci-test-files:
-	@printf '%s\n' 'gateway:$(sort $(SERVICE_TESTS_gateway))' 'legacy:$(sort $(SERVICE_TESTS_legacy))' 'account:$(sort $(SERVICE_TESTS_account))' 'prediction:$(sort $(SERVICE_TESTS_prediction))'
+	@$(CI_SELECTION)
 
 # Preserve one serial session for the portable scenarios; LIVE alone is excluded.
 test-ci-portable:

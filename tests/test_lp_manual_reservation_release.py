@@ -242,7 +242,15 @@ def test_manual_release_wakes_enabled_pool_and_normal_sdk_refill(runtime, reserv
         'state': 'known', 'amplitude': Decimal('.005'), 'checked_at': lp._now(),
         'valid_until': lp._now() + timedelta(days=1),
     })
+    planning_as_of = []
+    financial_calls = []
+    balance = account.get_balance_allowance
+    def observed_balance(**kwargs):
+        financial_calls.append(bool(execution.lp_auto_state()['active_plan']))
+        return balance(**kwargs)
+    account.get_balance_allowance = observed_balance
     def signed_order(**kwargs):
+        planning_as_of.append(execution.lp_auto_state()["funds"]["as_of"])
         _advance(runtime)
         return SignedOrder(builder='0x1', expiration=kwargs['expiration'], maker=WALLET,
             maker_amount=8000000, metadata='0x3', order_type='GTD', salt=1,
@@ -260,7 +268,16 @@ def test_manual_release_wakes_enabled_pool_and_normal_sdk_refill(runtime, reserv
     assert refilled['slots']['occupied'] == 1
     _advance(runtime)
     known = execution.lp_auto_run_once(round_id='confirm-manual-refill')
+    assert planning_as_of[-1] and not any(financial_calls)
+    assert refilled['funds']['status'] == 'unknown' and refilled['funds']['as_of'] == planning_as_of[-1]
+    assert refilled['funds']['available_usd'] is None and refilled['funds']['spendable_usd'] is None
+    assert known['funds']['status'] == 'known' and known['funds']['as_of'] != planning_as_of[-1]
+    assert _amount(known, 'buy_reserved_usd') == 8 and _amount(known, 'available_usd') == 0
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    known = execution.lp_auto_state()
     assert known['funds']['status'] == 'known'
+    assert _amount(known, 'total_usd') == 8 and _amount(known, 'buy_reserved_usd') == 8
     assert _amount(known, 'available_usd') == 0
     assert len(account.posts) == 1
     _assert_unknown_audit(store, execution, originals)
@@ -804,7 +821,15 @@ def test_release_fixed_budget_current_position_and_unknown_report_allow_normal_r
         'state': 'known', 'amplitude': Decimal('.005'), 'checked_at': lp._now(),
         'valid_until': lp._now() + timedelta(days=1),
     })
+    planning_as_of = []
+    financial_calls = []
+    balance = account.get_balance_allowance
+    def observed_balance(**kwargs):
+        financial_calls.append(bool(execution.lp_auto_state()['active_plan']))
+        return balance(**kwargs)
+    account.get_balance_allowance = observed_balance
     def sign(**kwargs):
+        planning_as_of.append(execution.lp_auto_state()["funds"]["as_of"])
         _advance(runtime)
         return SignedOrder(builder='0x1', expiration=kwargs['expiration'], maker=WALLET,
             maker_amount=8000000, metadata='0x3', order_type='GTD', salt=1,
@@ -821,6 +846,15 @@ def test_release_fixed_budget_current_position_and_unknown_report_allow_normal_r
     assert len(account.posts) == 1
     _advance(runtime)
     confirmed = execution.lp_auto_run_once(round_id='joint-fixed-budget-confirm')
+    assert planning_as_of[-1] and not any(financial_calls)
+    assert confirmed['funds']['status'] == 'known' and confirmed['funds']['as_of'] != planning_as_of[-1]
+    assert _amount(confirmed, 'total_usd') == 16
+    assert _amount(confirmed, 'inventory_cost_usd') == Decimal(cost)
+    assert _amount(confirmed, 'buy_reserved_usd') == 8
+    assert _amount(confirmed, 'available_usd') == 8 - Decimal(cost)
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    confirmed = execution.lp_auto_state()
     assert confirmed['funds']['status'] == 'known'
     assert _amount(confirmed, 'total_usd') == 16
     assert _amount(confirmed, 'inventory_cost_usd') == Decimal(cost)

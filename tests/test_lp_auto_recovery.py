@@ -1866,9 +1866,6 @@ def test_runtime_wakes_probe_deadline_and_retries_failed_feishu_delivery(
             pass
 
     class TestExecution(PredictionExecutionService):
-        def reconcile_startup(self) -> dict[str, object]:
-            return {"state": "ready"}
-
         def lp_tick(self) -> dict[str, object]:
             risk_ticks.append(clock[0])
             # This read stands in for the public risk reconciliation boundary;
@@ -1914,27 +1911,6 @@ def test_runtime_wakes_probe_deadline_and_retries_failed_feishu_delivery(
     notifier = FeishuWebhookNotifier(
         webhook_url="https://feishu.invalid/webhook", post_json=post_json
     )
-    monkeypatch.setattr(
-        runtime_module,
-        "load_trading_config",
-        lambda _path: SimpleNamespace(
-            signer_address="0x1111111111111111111111111111111111111111",
-            wallet_address="0x2222222222222222222222222222222222222222",
-            predict=None,
-        ),
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "PolymarketTradingClient",
-        SimpleNamespace(from_keychain=lambda _config: trading),
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "PredictTradingClient",
-        SimpleNamespace(from_keychain=lambda _config: None),
-    )
-    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
-    monkeypatch.setattr(runtime_module, "PredictionExecutionService", TestExecution)
     monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 0.005)
     monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 3600)
     monkeypatch.setattr(runtime_module, "_LP_SHARE_WATCH_SECONDS", 3600)
@@ -1976,7 +1952,12 @@ def test_runtime_wakes_probe_deadline_and_retries_failed_feishu_delivery(
     )
     started = False
     try:
-        runtime.start()
+        # Retained private producer algorithms only: real Store/LP/Execution
+        # components under an actual file lock, without public Runtime.start
+        # or a fabricated RUNNING state. The real default child is below.
+        from tests.test_prediction_runtime import _start_source_preparation_helpers
+        _start_source_preparation_helpers(runtime,trading,FakeMonitor,TestExecution)
+        runtime._start_lp_monitor()
         started = True
         # The history worker is parked at a business deadline while the
         # independent risk loop actually completes two reconciliations.
@@ -2013,9 +1994,15 @@ def test_runtime_wakes_probe_deadline_and_retries_failed_feishu_delivery(
     finally:
         for resume in releases:
             resume.set()
-        if started and runtime.state not in {"STOPPED", "FAILED"}:
+        if started:
+            assert runtime._cleanup_resources() == []
             runtime.stop()
         assert runtime.state == "STOPPED"
+
+    # Actual default current Reader/protection progress and the named hourly
+    # catalog producer's real native drain are distinct from the source oracles.
+    from tests.test_prediction_runtime import _assert_current_progress_with_blocked_optional_source
+    _assert_current_progress_with_blocked_optional_source(tmp_path/'actual-current','catalog')
 
 
 def test_runtime_suppresses_short_fault_notification(
@@ -2359,6 +2346,7 @@ def test_history_probe_has_constant_http_budget_and_rotates(tmp_path: Path) -> N
         )
 
     store = PredictionArbitrageStore(tmp_path / "rotating-history-probe")
+    store.initialize_lp_metadata_cache()
     # 机制实证（2026-09-21，时间炸弹修复）：history 探针解析 token 走
     # `_cached_lp_token_ids`（polymarket_trading），其 warm load 用真实时钟
     # `datetime.now(UTC)`（服务注入的 clock 不参与），store 侧过滤是

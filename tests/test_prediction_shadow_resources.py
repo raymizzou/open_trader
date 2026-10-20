@@ -16,13 +16,126 @@ def test_shadow_unit_bounds_all_children_without_automatic_restart():
     assert 'CPUQuota=100%\n' in unit and 'TasksMax=96\n' in unit
     assert 'Restart=no\n' in unit and 'SendSIGKILL=yes\n' in unit
     assert 'OPEN_TRADER_SHADOW_MEMORY_MAX_BYTES=805306368\n' in unit
-    for maximum in (True, 0, -1, 1_000_000_001):
+    for maximum in (True, 0, -1, 67108864):
         with pytest.raises(ValueError):
             render_unit(replace(cfg, memory_max_bytes=maximum))
     production = render_unit(replace(cfg, mode='production', region='region',
                                      secret='secret', version='v1', role='role'))
     assert 'Restart=on-failure\n' in production and 'SendSIGKILL=no\n' in production
     assert 'OPEN_TRADER_SHADOW_MEMORY_MAX_BYTES' not in production
+
+
+def test_shadow_unit_accepts_configured_two_gib_budget():
+    cfg = CloudConfig(Path('/opt/release'), Path('/var/lib/prediction'),
+                      Path('/opt/venv/bin/python'), 'prediction', 'a' * 40,
+                      '', '', '', '', 'shadow', 1, memory_max_bytes=2147483648)
+    unit = render_unit(cfg)
+    assert 'MemoryMax=2147483648\n' in unit
+    assert 'OPEN_TRADER_SHADOW_MEMORY_MAX_BYTES=2147483648\n' in unit
+    assert 'CPUQuota=100%\n' in unit and 'TasksMax=96\n' in unit
+    assert 'Restart=no\n' in unit
+
+
+@pytest.mark.parametrize('version', ['v1', 'v2'])
+def test_cgroup_reader_accepts_configured_two_gib_budget(tmp_path, version):
+    from open_trader.prediction_shadow_resources import read_resources, stop_reason
+    proc, groups = tmp_path/'proc', tmp_path/'cgroups'
+    (proc/'self').mkdir(parents=True)
+    (proc/'meminfo').write_text('MemAvailable: 3145728 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n')
+    if version == 'v2':
+        (proc/'self/cgroup').write_text('0::/system.slice/probe.service\n')
+        controllers = {'system.slice': {'probe.service/memory.current':'536870912',
+                                        'probe.service/memory.max':'2147483648',
+                                        'probe.service/memory.events':'max 0\noom 0\noom_kill 0\n',
+                                        'probe.service/cpu.max':'100000 100000',
+                                        'probe.service/pids.max':'96'}}
+    else:
+        (proc/'self/cgroup').write_text('7:memory:/probe\n6:cpu,cpuacct:/probe\n5:pids:/probe\n')
+        controllers = {'memory': {'probe/memory.usage_in_bytes':'536870912',
+                                  'probe/memory.limit_in_bytes':'2147483648',
+                                  'probe/memory.failcnt':'0'},
+                       'cpu,cpuacct': {'probe/cpu.cfs_quota_us':'100000',
+                                      'probe/cpu.cfs_period_us':'100000'},
+                       'pids': {'probe/pids.max':'96'}}
+    for controller, files in controllers.items():
+        for name, value in files.items():
+            path = groups/controller/name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value)
+    sample = read_resources(proc, groups)
+    assert sample == dict(current=536870912, limit=2147483648, available=3221225472,
+                          swap_used=0, failures=0)
+    assert stop_reason(sample, 2147483648) is None
+
+
+def test_shadow_guard_accepts_configured_two_gib_with_host_headroom(monkeypatch):
+    from open_trader.prediction_shadow_resources import require_host_headroom, shadow_resource_guard
+    monkeypatch.setenv('OPEN_TRADER_SHADOW_MEMORY_MAX_BYTES', '2147483648')
+    monkeypatch.setenv('OPEN_TRADER_NLEG_PAUSED', '1')
+    files = {'/proc/self/cgroup': '0::/system.slice/probe.service\n',
+             '/proc/meminfo': 'MemAvailable: 3145728 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n',
+             '/sys/fs/cgroup/system.slice/probe.service/memory.current': '536870912',
+             '/sys/fs/cgroup/system.slice/probe.service/memory.max': '2147483648',
+             '/sys/fs/cgroup/system.slice/probe.service/memory.events': 'max 0\noom 0\noom_kill 0\n',
+             '/sys/fs/cgroup/system.slice/probe.service/cpu.max': '100000 100000',
+             '/sys/fs/cgroup/system.slice/probe.service/pids.max': '96'}
+    read_text = Path.read_text
+
+    def read_fixture(path, *args, **kwargs):
+        if str(path) in files:
+            return files[str(path)]
+        if path.is_relative_to('/proc') or path.is_relative_to('/sys/fs/cgroup'):
+            raise AssertionError(f'unexpected host counter read: {path}')
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'read_text', read_fixture)
+    require_host_headroom(2147483648)
+    entered = False
+    with shadow_resource_guard('shadow'):
+        entered = True
+    assert entered
+
+
+@pytest.mark.parametrize(('field', 'value', 'reason'), [
+    ('limit', 2147487744, 'resource_limit_mismatch'),
+    ('limit', 9223372036854771712, 'resource_limit_mismatch'),
+    ('current', 2080374784, 'service_memory_headroom'),
+    ('available', 367001599, 'host_memory_headroom'),
+    ('swap_used', 4096, 'swap_pressure'),
+    ('failures', 1, 'cgroup_memory_limit_hit'),
+    ('current', 2080374783, None),
+])
+def test_two_gib_budget_preserves_resource_guards(field, value, reason):
+    from open_trader.prediction_shadow_resources import stop_reason
+    sample = dict(current=536870912, limit=2147483648, available=3221225472,
+                  swap_used=0, failures=0)
+    assert stop_reason({**sample, field:value}, 2147483648) == reason
+
+
+@pytest.mark.parametrize(('available_kib', 'swap_used_kib', 'accepted'), [
+    (2455552, 0, True),  # 2514485248 bytes: 2GiB + 350MiB.
+    (2455551, 0, False),  # 2514484224 bytes: 1KiB short.
+    (2455552, 4, False),  # Full reserve, but 4096 bytes of used swap.
+])
+def test_two_gib_startup_requires_full_host_reserve(monkeypatch, available_kib,
+                                                   swap_used_kib, accepted):
+    from open_trader.prediction_shadow_resources import require_host_headroom
+    read_text = Path.read_text
+
+    def read_fixture(path, *args, **kwargs):
+        if path == Path('/proc/meminfo'):
+            return (f'MemAvailable: {available_kib} kB\n'
+                    f'SwapTotal: {swap_used_kib} kB\nSwapFree: 0 kB\n')
+        if path.is_relative_to('/proc') or path.is_relative_to('/sys/fs/cgroup'):
+            raise AssertionError(f'unexpected host counter read: {path}')
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'read_text', read_fixture)
+    if accepted:
+        require_host_headroom(2147483648)
+    else:
+        with pytest.raises(ValueError, match='insufficient shared-host memory headroom'):
+            require_host_headroom(2147483648)
 
 
 def test_cgroup_resource_checks_fail_closed_and_keep_host_headroom(tmp_path):

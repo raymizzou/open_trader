@@ -42,6 +42,55 @@ def runtime_for(tmp_path):
     return runtime
 
 
+def test_timing_config_reaches_persistent_runtime_scheduler(tmp_path, monkeypatch, capsys):
+    from tests import test_lp_auto_pool as pool
+    from tests.test_lp_auto_target_convergence import plan_setup
+    from tests.test_lp_auto_plan_scheduler import restart_engine, at_deadline
+    from datetime import datetime, timedelta
+
+    monkeypatch.setattr(pool, 'NOW', pool.NOW)
+    runtime = runtime_for(tmp_path)
+    engine, exchange, _, _ = plan_setup(tmp_path, monkeypatch, ('A', 'B', 'C', 'D', 'I'))
+    from tests.test_lp_auto_plan_execution import install_order_result_reader
+    result_reader = install_order_result_reader(exchange, monkeypatch)
+    exchange.cancel_terminal = False
+    runtime.execution = engine
+    runtime._lp_auto_scheduler = LPAutoScheduler(engine, clock=lambda: pool.NOW)
+    assert runtime._lp_auto_scheduler.run_due()
+    before = runtime.lp_auto_state()
+    root = '/api/prediction-arbitrage/lp/auto/'
+    with _server(runtime, session_token='session-token', csrf_token='csrf-token') as base:
+        code = cli.main(['prediction-arb', 'lp-auto', 'config', '--url', base,
+            '--api-retry-interval-seconds', '30',
+            '--order-check-interval-seconds', '5', '--json'])
+        receipt = json.loads(capsys.readouterr().out)
+        assert code == 0, receipt['reason']
+        assert receipt['result'] == 'CONFIGURED'
+        status, state = _response(base + root + 'state')
+        assert status == 200
+        for key, value in dict(api_retry_interval_seconds=30, order_check_interval_seconds=5).items():
+            assert state[key] == receipt['state'][key] == value
+        assert state['check_interval_seconds'] is None and state['cycle_mode'] == 'continuous'
+        assert state['config_version'] == before['config_version'] + 1
+        for key in ('active_plan', 'plan_wait', 'trading_config_version', 'desired_running', 'budget_usd', 'target_buy_count', 'buy_price_level'):
+            assert state[key] == before[key]
+        for invalid in ({'round_interval_seconds': 120, 'order_check_interval_seconds': 0},
+                        {'order_check_interval_seconds': 7, 'budget_usd': '200', 'target_buy_count': 5},
+                        {'api_retry_interval_seconds': 1.5}):
+            assert _response(_production_request(base, root + 'config', json.dumps(invalid).encode()))[0] == 400
+            assert _response(base + root + 'state')[1] == state
+        runtime.execution = restart_engine(engine, exchange)
+        runtime._lp_auto_scheduler = LPAutoScheduler(runtime.execution, clock=lambda: pool.NOW)
+        restored = _response(base + root + 'state')[1]
+        for key in ('active_plan', 'plan_wait', 'desired_running', 'round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds'):
+            assert restored[key] == state[key]
+        runtime._lp_auto_scheduler.request_check()
+        assert runtime._lp_auto_scheduler.run_due()
+        assert _response(base + root + 'state')[1]['plan_wait'] is None
+        runtime._lp_auto_scheduler = None
+        assert runtime.lp_auto_state()['check_interval_seconds'] is None
+
+
 def test_dashboard_omits_intents_without_materializing_detail_projection(tmp_path, monkeypatch):
     from open_trader import polymarket_lp_auto
     from tests.test_lp_auto_pool import setup
@@ -158,13 +207,38 @@ await controlLpAuto("pause");
 const unconfirmed = state.predictionMarket.lpAutoMessage;
 predictionPost = async (path, body) => { calls.push({path, body}); return auto; };
 await controlLpAuto("config");
-console.log(JSON.stringify({before, draft, running, unconfirmed, calls}));
+const d2 = {desired_running: false, effective_running: false, pause_confirmed: true,
+  scheduler_running: true, budget_usd: '100', target_buy_count: 3, config_version: 7,
+  control_save_state: 'saved', requested_control_version: 2, saved_control_version: 2,
+  control_native_inflight: false, settings_pending: false, fatal: null};
+state.predictionMarket.lpAutoDraft = null;
+const d2Paused = predictionLpAutoControls(d2, false);
+const d2Pending = predictionLpAutoControls({...d2, desired_running: true, effective_running: true,
+  control_save_state: 'pending', requested_control_version: 3, saved_control_version: 2,
+  control_native_inflight: true}, false);
+const d2Fatal = predictionLpAutoControls({...d2, fatal: {origin: 'control_save'}}, false);
+state.predictionMarket.lpDashboard = {auto: {...d2, desired_running: true, effective_running: true}};
+predictionPost = async () => ({...d2, pause_confirmed: false, control_save_state: 'pending',
+  requested_control_version: 3, saved_control_version: 2, control_native_inflight: true});
+await controlLpAuto('pause');
+console.log(JSON.stringify({before, draft, running, unconfirmed, calls, d2Paused, d2Pending,
+  d2Fatal, immediate: state.predictionMarket.lpDashboard.auto, pendingMessage: state.predictionMarket.lpAutoMessage}));
 '''))
     assert "启用自动补位" in result["before"]
     assert 'value="120"' in result["draft"]
     assert "暂停新增" in result["running"]
     assert "操作未确认" in result["unconfirmed"]
     assert result["calls"][1]["body"] == {"budget_usd": "120", "target_buy_count": 3, "expected_config_version": 7}
+    assert 'data-lp-auto-field="budget_usd"' in result['d2Paused']
+    assert 'value="100" disabled' not in result['d2Paused']
+    assert '有效状态：暂停' in result['d2Paused']
+    assert '请求版本 3 · 已保存版本 2' in result['d2Pending']
+    assert '保存待确认' in result['d2Pending'] and '故障停机' in result['d2Fatal']
+    assert 'data-lp-auto-action="enable" disabled' in result['d2Fatal']
+    assert result['immediate']['effective_running'] is False
+    assert result['immediate']['control_native_inflight'] is True
+    assert result['immediate']['saved_control_version'] == 2
+    assert '操作未确认' in result['pendingMessage']
 
 
 def test_old_dashboard_poll_cannot_overwrite_confirmed_manual_pause():
@@ -253,6 +327,7 @@ def test_pause_can_persist_when_scheduler_is_unavailable(tmp_path):
 
 def test_cli_uses_one_deadline_for_bootstrap_and_pause(monkeypatch, capsys):
     from io import BytesIO
+    from open_trader import lp_auto_cli
 
     clock = [100.0]
     calls = []
@@ -268,8 +343,8 @@ def test_cli_uses_one_deadline_for_bootstrap_and_pause(monkeypatch, capsys):
             assert timeout == pytest.approx(0.15)
             raise TimeoutError("pause exceeded the remaining shared deadline")
 
-    monkeypatch.setattr(cli, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    monkeypatch.setattr(cli, "build_opener", lambda *args: Opener())
+    monkeypatch.setattr(lp_auto_cli, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(lp_auto_cli, "build_opener", lambda *args: Opener())
     assert cli.main(["prediction-arb", "lp-auto", "pause", "--url", "http://127.0.0.1:8769", "--timeout", "0.3"]) == 2
     output = capsys.readouterr().out
     assert "UNKNOWN" in output and "PAUSED" not in output

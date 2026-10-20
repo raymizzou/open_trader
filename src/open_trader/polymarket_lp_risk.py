@@ -171,6 +171,25 @@ def _levels(value: object, name: str) -> list[tuple[Decimal, Decimal]]:
     return rows
 
 
+def _select_bid_level(
+    bids: Sequence[tuple[Decimal, Decimal]], level: int = 1
+) -> tuple[Decimal, Decimal]:
+    """Return a distinct positive-size bid level in descending price order."""
+
+    if type(level) is not int or level < 1:
+        raise ValueError("bid_level_invalid")
+    by_price: dict[Decimal, Decimal] = {}
+    for price, size in bids:
+        by_price[price] = by_price.get(price, Decimal("0")) + size
+    ordered = sorted(
+        ((price, size) for price, size in by_price.items() if size > 0),
+        reverse=True,
+    )
+    if len(ordered) < level:
+        raise ValueError("second_bid_insufficient")
+    return ordered[level - 1]
+
+
 def _qualify_reward_quote(
     bids: Sequence[tuple[Decimal, Decimal]],
     asks: Sequence[tuple[Decimal, Decimal]],
@@ -470,8 +489,9 @@ def estimate_lp_stress_exit(
     price: Decimal,
     quantity: Decimal,
     own_orders: object = (),
+    bid_level: int = 1,
 ) -> dict[str, object]:
-    """Estimate full exit value after removing the proposed best-bid level."""
+    """Estimate full exit value after removing the actual best bid level."""
 
     unknown = {
         "state": "unknown",
@@ -511,8 +531,15 @@ def estimate_lp_stress_exit(
         unknown["reason_codes"] = ["book_unknown"]
         return unknown
     best_bid = max(level_price for level_price, _ in bids)
-    if best_bid != price:
-        unknown["reason_codes"] = ["best_bid_changed"]
+    try:
+        selected_bid, _selected_bid_size = _select_bid_level(bids, bid_level)
+    except ValueError as exc:
+        unknown["reason_codes"] = [str(exc)]
+        return unknown
+    if selected_bid != price:
+        unknown["reason_codes"] = [
+            "best_bid_changed" if bid_level == 1 else "bid_level_changed"
+        ]
         return unknown
 
     bid_size_by_price, order_error = _external_bid_sizes(
@@ -528,7 +555,7 @@ def estimate_lp_stress_exit(
     remaining_bids = {
         level_price: size
         for level_price, size in bid_size_by_price.items()
-        if level_price != price
+        if level_price != best_bid
     }
     gross_exit_value, exit_fee = _lp_exit_values(market, remaining_bids, quantity)
     if gross_exit_value is None:
@@ -911,6 +938,8 @@ def evaluate_lp_entry(
     now: datetime,
     reservations: object = (),
     candidate: bool = False,
+    bid_level: int = 1,
+    _account_observed_at: datetime | None = None,
 ) -> dict[str, object]:
     """Return a manual LP entry guide when current input facts pass risk checks."""
 
@@ -1015,7 +1044,7 @@ def evaluate_lp_entry(
         )
         _freshness(
             account.get("checked_at"),
-            checked_at,
+            _account_observed_at if _account_observed_at is not None else checked_at,
             "account_freshness",
             max_age=(candidate_max_age or BOOK_FRESHNESS_SECONDS),
         )
@@ -1041,9 +1070,13 @@ def evaluate_lp_entry(
         return {"state": "unknown", "reason_codes": ["account_facts_unknown"], "guidance": None}
     if not bids or not asks:
         return {"state": "unknown", "reason_codes": ["book_invalid"], "guidance": None}
-    price = max(level_price for level_price, _ in bids)
+    try:
+        price, _selected_bid_size = _select_bid_level(bids, bid_level)
+    except ValueError as exc:
+        return {"state": "unknown", "reason_codes": [str(exc)], "guidance": None}
+    best_bid = max(level_price for level_price, _ in bids)
     best_ask = min(level_price for level_price, _ in asks)
-    if price >= best_ask:
+    if best_bid >= best_ask or price >= best_ask:
         return {"state": "unknown", "reason_codes": ["book_crossed"], "guidance": None}
 
     tick = _maybe_decimal(market.get("tick_size"))
@@ -1102,6 +1135,7 @@ def evaluate_lp_entry(
         market=market,
         price=price,
         quantity=quantity,
+        bid_level=bid_level,
     )
     if stress["state"] != "eligible":
         return {"state": stress["state"], "reason_codes": list(stress["reason_codes"]), "guidance": None}
@@ -1127,6 +1161,8 @@ def evaluate_lp_entry(
             "expires_at": expires_at.isoformat(timespec="microseconds").replace("+00:00", "Z"),
         }
     )
+    if bid_level != 1:
+        guidance["bid_level"] = bid_level
     return {
         "state": "eligible",
         "reason_codes": ["event_coverage_incomplete"]
@@ -1281,8 +1317,8 @@ def estimate_lp_target_share_yield(
 LP_QUEUE_PROTECTION_THRESHOLD = Decimal("0.5")
 
 
-def minimum_order_estimate(direction, guidance, now, *, resting_quantity=Decimal(0)):
-    """Reuse reward weights, recompute the share at the actual legal quantity."""
+def minimum_order_estimate(direction, guidance, now, *, resting_quantity=Decimal(0), include_observation=False):
+    """Keep the persisted estimate stable; extra observation fields are opt-in."""
     ZERO = Decimal(0)
     market = direction['market']
     estimate = estimate_lp_target_share_yield(
@@ -1296,17 +1332,26 @@ def minimum_order_estimate(direction, guidance, now, *, resting_quantity=Decimal
     # conclusive failures of the actual resting quote mean zero, not unknown.
     if resting_quantity and ((estimate['state'] == 'known' and quantity < _decimal(market['reward_min_size'], 'money'))
             or set(estimate.get('reason_codes', [])) in ({'reward_distance_invalid'}, {'reward_score_zero'})):
-        return dict(state='known', basis='resting_non_scoring_order', quantity=quantity,
+        result = dict(state='known', basis='resting_non_scoring_order', quantity=quantity,
                     price=price, capital_usd=price*quantity, hourly_reward_usd=ZERO,
                     yield_pct_per_hour=ZERO, checked_at=now)
+        if include_observation:
+            result.update(estimated_share=None, competition_upper_bound=None,
+                daily_pool_usd=direction.get('daily_pool_usd'))
+        return result
     if estimate['state'] != 'known':
         return estimate
     weight = (1 - abs(price - estimate['midpoint']) / _decimal(market['reward_max_spread'], 'money')) ** 2
     competition = estimate['competition_upper_bound']
+    scores = None
     if resting_quantity:
         bids = _levels(direction['book'].get('bids'), 'bids')
-        if sum((size for p, size in bids if p == price), ZERO) < resting_quantity:
-            return dict(state='unknown', reason_codes=['own_order_depth_unknown'])
+        public_depth = sum((size for p, size in bids if p == price), ZERO)
+        if public_depth < resting_quantity:
+            result = dict(state='unknown', reason_codes=['own_order_depth_unknown'])
+            if include_observation:
+                result.update(public_depth_at_price=public_depth, resting_quantity=resting_quantity)
+            return result
         # Keep the observed reward midpoint; remove our score from competition,
         # since public depth already contains this resting order.
         scores = []
@@ -1319,10 +1364,17 @@ def minimum_order_estimate(direction, guidance, now, *, resting_quantity=Decimal
         competition = min(scores) + abs(scores[0] - scores[1]) / 3
     own_score = quantity * weight / 3
     share = own_score / (competition + own_score)
-    reward = _decimal(direction['daily_pool_usd'], 'money') * share / 24
-    return dict(state='known', basis='resting_scoring_order' if resting_quantity else 'minimum_scoring_order', quantity=quantity,
+    pool = _decimal(direction['daily_pool_usd'], 'money')
+    reward = pool * share / 24
+    result = dict(state='known', basis='resting_scoring_order' if resting_quantity else 'minimum_scoring_order', quantity=quantity,
                 price=price, capital_usd=price*quantity, hourly_reward_usd=reward,
                 yield_pct_per_hour=reward/(price*quantity)*100, checked_at=now)
+    if include_observation:
+        result.update(estimated_share=share, competition_upper_bound=competition,
+            daily_pool_usd=pool,
+            weighted_bid_score=scores[0] if scores is not None else None,
+            weighted_ask_score=scores[1] if scores is not None else None)
+    return result
 
 
 def estimate_lp_queue_position(

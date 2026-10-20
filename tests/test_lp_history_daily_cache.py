@@ -4,6 +4,10 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from http.client import IncompleteRead
 from pathlib import Path
+from contextlib import closing
+import sqlite3
+
+import pytest
 
 from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.polymarket_lp_views import lp_shortlist
@@ -11,6 +15,39 @@ from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 
 
 T = datetime(2026, 9, 18, tzinfo=UTC)
+
+
+def test_history_summary_batches_keep_one_snapshot_and_close_early(tmp_path, monkeypatch):
+    store = PredictionArbitrageStore(tmp_path)
+    identities = tuple((f"c{i}", f"t{i}") for i in range(805))
+    def write(marker):
+        store.lp_save_price_history_batch({"condition_id": cid, "token_id": token,
+            "samples": [], "summary": {"state": "known", "checked_at": T, "marker": marker}}
+            for cid, token in identities)
+    write("old")
+    connections = []
+    original = store._connection
+    def observed():
+        connection = original()
+        connections.append(connection)
+        return connection
+    monkeypatch.setattr(store, "_connection", observed)
+    with closing(store.lp_price_history_summary_batches(identities, now=T)) as reader:
+        first = next(reader)
+        assert len(first) == 400
+        read_connection = connections[0]
+        assert read_connection.in_transaction
+        write("new")
+        rest = list(reader)
+        assert [len(batch) for batch in rest] == [400, 5]
+        assert all(row["marker"] == "old" for batch in (first, *rest) for row in batch.values())
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        read_connection.execute("SELECT 1")
+    with closing(store.lp_price_history_summary_batches(identities, now=T)) as reader:
+        assert next(reader)[identities[0]]["marker"] == "new"
+        early_connection = connections[-1]
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        early_connection.execute("SELECT 1")
 
 
 def _direction(condition_id: str, summary: dict[str, object]) -> dict[str, object]:
@@ -358,8 +395,13 @@ def test_daily_history_refresh_only_fetches_missing_or_expired_directions(
 def test_daily_history_failure_preserves_cache_and_per_market_budget(
     tmp_path: Path,
 ) -> None:
+    from collections import Counter
+    from threading import Event
+    import json
+
     data_dir = tmp_path / "data"
     current = [T]
+    next_day_ac_appended = Event()
     db = PredictionArbitrageStore(data_dir)
     db.lp_save_price_history_batch(
         (
@@ -438,7 +480,11 @@ def test_daily_history_failure_preserves_cache_and_per_market_budget(
             stop_event: object = None,
         ) -> dict[str, object]:
             del fidelity, stop_event
+            if self.include_c and token_ids == ("token-b",):
+                assert next_day_ac_appended.wait(5), "Next-day A/C SDK arrival watchdog"
             self.history_calls.append(token_ids)
+            if self.include_c and token_ids == ("token-a", "token-c"):
+                next_day_ac_appended.set()
             if "token-b" in token_ids and self.b_failures < 2:
                 self.b_failures += 1
                 raise IncompleteRead(b"partial")
@@ -488,7 +534,9 @@ def test_daily_history_failure_preserves_cache_and_per_market_budget(
     )
     refreshed = next_day.refresh_price_history()
     assert refreshed["request_count"] == 2
-    assert exchange.history_calls[-1] == ("token-a", "token-c")
+    assert Counter(exchange.history_calls) == Counter({("token-b",): 3, ("token-a", "token-c"): 1})
+    # The external Event exercises the old failure's legitimate arrival order.
+    assert exchange.history_calls[-2:] == [("token-a", "token-c"), ("token-b",)]
     updated_a = next_day.store.lp_price_history_summary(
         "condition-a", "token-a", now=current[0]
     )
@@ -498,6 +546,17 @@ def test_daily_history_failure_preserves_cache_and_per_market_budget(
     assert updated_a is not None and updated_a["checked_at"] == "2026-09-19T01:00:00.000000Z"
     assert updated_c is not None and updated_c["state"] == "known"
     assert exchange.history_calls.count(("token-b",)) == 3
+    (tmp_path / "history-observation.json").write_text(json.dumps({
+        "history_calls": exchange.history_calls,
+        "next_day_history_calls": exchange.history_calls[-2:],
+        "next_day_ac_appended": next_day_ac_appended.is_set(),
+        "b_failures": exchange.b_failures,
+        "request_count": refreshed["request_count"],
+        "original_a": original_a,
+        "updated_a": updated_a,
+        "updated_c": updated_c,
+        "current_time": current[0],
+    }, default=str, indent=2) + "\n")
 
 
 def test_latest_failed_refresh_blocks_valid_old_summary_until_success(

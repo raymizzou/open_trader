@@ -297,6 +297,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "lp_screening_snapshot",
         "lp_market_observations",
         "lp_market_competitiveness",
+        "lp_competition_progress",
         "lp_market_exclusions",
             "lp_preparation",
             "lp_preparation_items",
@@ -3554,6 +3555,7 @@ def test_lp_recovery_fences_only_recovered_condition(tmp_path: Path) -> None:
 
 def test_lp_metadata_cache_store_round_trip_and_prune(tmp_path: Path) -> None:
     db = store(tmp_path)
+    db.initialize_lp_metadata_cache()
     now = datetime(2026, 9, 17, 12, tzinfo=UTC)
     now_epoch = now.timestamp()
     payload = {
@@ -3726,6 +3728,7 @@ def test_lp_active_sessions_lists_non_terminal_newest_first(tmp_path: Path) -> N
 @pytest.mark.parametrize("proof", ["{}", '{"closed_checked":false}', '{"closed_checked":1}', '{"closed_checked":"true"}', "bad-json"])
 def test_unproven_negative_metadata_cache_is_not_loaded(tmp_path: Path, proof: str) -> None:
     db = store(tmp_path)
+    db.initialize_lp_metadata_cache()
     expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()
     db.lp_metadata_cache_store_entries({"missing": (expiry, None)})
     with sqlite3.connect(db.path) as connection:
@@ -4183,3 +4186,49 @@ def test_incident_history_equal_timestamps_uses_descending_id(tmp_path: Path, st
     first = db.open_incident(execution["execution_id"], {"kind": "first"})
     second = db.open_incident(execution["execution_id"], {"kind": "second"})
     assert [row["incident_id"] for row in db.histories("incidents")] == sorted((first, second), reverse=True)
+
+
+def test_lp_facts_callback_update_is_atomic_and_returned_current(tmp_path: Path, store_clock):
+    db = store(tmp_path)
+    sid = 'facts-callback-atomic'
+    original = db.lp_create_session(sid, 'facts-callback-atomic-key', state='awaiting_facts',
+        payload={'condition_id': 'condition-callback', 'token_id': 'token-callback',
+                 'outcome': 'YES', 'client_note': 'original'})
+    observed = []
+
+    def abort(session, *, connection, error):
+        assert error is None and connection.in_transaction
+        assert session['facts_note'] == 'first observation'
+        updated = db.lp_update_session(sid, connection=connection,
+            state='entry_open', patch={'client_note': 'aborted callback'})
+        assert updated['client_note'] == 'aborted callback'
+        assert connection.in_transaction
+        observed.append(updated)
+        raise RuntimeError('client publication aborted')
+
+    with pytest.raises(RuntimeError, match='client publication aborted'):
+        db.lp_publish_facts(sid, 0, patch={'facts_note': 'first observation'}, publish=abort)
+    assert len(observed) == 1
+    assert db.lp_session(sid) == original
+    assert db.lp_session_revision(sid) == 0
+    assert db.lp_session_revision(sid, trading=True) == 0
+
+    def complete(session, *, connection, error):
+        assert error is None and connection.in_transaction
+        assert session['facts_note'] == 'second observation'
+        updated = db.lp_update_session(sid, connection=connection,
+            state='entry_open', patch={'client_note': 'committed callback'})
+        assert updated['client_note'] == 'committed callback'
+        assert connection.in_transaction
+        observed.append(updated)
+        return True
+
+    returned, changed = db.lp_publish_facts(sid, 0,
+        patch={'facts_note': 'second observation'}, publish=complete)
+    assert changed is True and len(observed) == 2
+    assert returned == observed[-1] == db.lp_session(sid)
+    assert returned['state'] == 'entry_open'
+    assert returned['client_note'] == 'committed callback'
+    assert returned['facts_note'] == 'second observation'
+    assert db.lp_session_revision(sid) == 2
+    assert db.lp_session_revision(sid, trading=True) == 0

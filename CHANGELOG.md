@@ -3,6 +3,421 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-20
+
+- 修复 CN 趋势报告轮换风险校验与生成器的 Decimal 运算顺序不一致，循环小数 ATR 不再使合法冻结报告被拒绝；保持严格校验及旧版报告内容。冻结契约错误新增脱敏规则与字段路径，完成离线复现及直接受影响回归；未部署或重启控制器。
+
+- With N-leg paused, D2 startup uses reliable local admission and leaves the first account read to its sole Scheduler. API timeouts keep the runtime online with UNKNOWN LP facts and no new BUYs until complete facts arrive. Admission preserves historical execution/incident states; round0 BUY cleanup and SELL protections remain in place. Offline startup checks cover admission, retry and fatal control/settings/identity failures.
+
+## 2026-10-19
+
+- With N-leg paused, D2 LP actions no longer stop on unfinished historical executions. Unacknowledged incidents still block BUY/SELL posts and rotation cancellations but allow exact protective BUY cancellations. Failed candidate capture keeps account reads and protection running without new BUYs, with bounded failure diagnostics and throttled exception logs. Offline checks cover these permissions and current-state safeguards; startup reconciliation is unchanged.
+- LP writes in one process now share admission per database, with control and reliable saves ahead of background work. Only a failed BEGIN can retry within a bounded budget; transaction bodies and commits never replay. Every new BEGIN checks the original deadline after guard and connection preparation; expiry fails as known not written and retains control-save retry eligibility. Retries also recheck the remaining five-second budget after admission, and short publication phases release their guards before requeueing. First-seen registration reads books outside its publication mutex. Preparation retry scans run outside the write transaction and retain atomic claims. Reward observations merge atomically into the current session without waiting for its service mutex. Offline contention checks cover 8.6-second holders, the 10-second control deadline, visible timeout failure, shutdown and external writers. Bounded queue, retry-chain, timeout and WAL diagnostics are available in logs; non-LP admission and production observation remain follow-up work.
+- LP yield-ranking fix v2, PR-1 observability: no behaviour change. Automatic status now reports bounded BUY yield reasons, failed decision sources, reader retry/in-flight details, selection estimates and the last two rounds (two rows per list; new diagnostic strings have a 96-byte cap; existing UNKNOWN/rotation samples keep their twenty-row bounds). The GET-only `scripts/lp_yield_baseline.py` analyses saved JSONL or samples status; placement estimates and round history are in-memory and are lost on restart. The summary marks restart, eviction and missing-data gaps. Offline checks cover estimator literals, unchanged decisions, diagnostic isolation and the 256 KiB payload budget.
+- BUY cancellations that stop before SDK dispatch now retain the exact local refusal reason in audit receipts and bounded diagnostics. Unchanged normal rotation targets wait 10 seconds after a never-sent attempt before a fresh decision may retry, reducing repeated audit writes. Queue, scoring and 600-second unknown-yield protection keep their existing admission and currentness checks without this delay; UNKNOWN native outcomes retain their no-replay rules. Offline regressions cover reason persistence, request-free deferrals, retry boundaries and identity changes. SQLite/D3 lock work is tracked separately; historical refusal gates remain unknown.
+- LP rotation diagnostics serialize date/time values as ISO strings. Unavailable diagnostics return an UNKNOWN marker without breaking automatic status or dashboard responses. State-read and monitor failures are logged and retried after the API retry interval; unreadable state cannot start a new execution cycle. Offline regressions cover SDK expiration values, HTTP isolation and scheduler recovery while preserving trading and risk guards.
+
+## 2026-10-18
+
+- US/HK trend protection now skips weekends and Futu calendar holidays. Calendar failures or empty/unusable 21-day calendar windows keep weekday protection active; only a usable window excluding today establishes a holiday. Abnormal diagnostics and blocker alerts include bounded, redacted exception or health-gate reasons. Offline controller/watcher regressions preserve trading-day guards and the opening alert buffer; not deployed.
+- D2 diagnostics now count completed protective SELLs and exit cancellations with their original request and observation identity. Selected and retained target counts use the accepted selection and typed order identities. Offline regressions preserve UNKNOWN outcomes, native completion, no replay and unchanged trading rules.
+- Trend allocation now converts host-local clocks to Shanghai time while preserving the instant, including daylight saving time. Aware clocks use the same conversion. Offline regressions cover allocation dates, the post-close attempt window, and status timestamps on a Los Angeles host.
+- D2 ranks current account BUYs and qualified new choices together, keeps one desired BUY per market, and cancels exact losing IDs after protection runs. Equal yields keep incumbents; existing orders retain real funds and slots until fresh current facts permit refill. Funding fallback reconsiders affordable lower-ranked choices after an expensive replacement is ruled out. Offline bridge checks cover partial fills, final-composition funding, UNKNOWN protection, stale-request refusal, unchanged-book stability and bounded read-only rotation diagnostics.
+
+## 2026-10-17
+
+- D2 automatic LP status now includes bounded read-only diagnostics for attempts, accepted source age, candidate rejection reasons, Reader role coverage, protection and local action outcomes. Offline bridge and HTTP checks preserve trading/control behavior, distinguish UNKNOWN from empty data, and verify redaction and no extra reads. Rotation policy is unchanged.
+- Trend market controller heartbeat timestamps now convert host-local clocks to the configured timezone while preserving the instant, including daylight saving time. Aware clocks use the same conversion. Focused regressions cover CN/HK timestamps and preserve strict dashboard health thresholds.
+- LP D2 capture now transfers only consumed qualification facts and isolates unsupported retained values per candidate with bounded redacted diagnostics. SDK-bearing cache, current-facts, GTD, scheduler, protection and shared-cache focused checks pass; no deployment performed.
+- Remove the mandatory reviewer model and profile from the agent delivery workflow and linked guides. Independent review and CI remain required; documentation diff inspection and whitespace checks completed, with no backend tests or reviewer launches for this documentation-only task.
+- D2 accepts case-equivalent valid wallet addresses in current orders, positions and captured BUY candidates. Internal account IDs, stored keys, audit identities and strict receipt checks remain unchanged. Offline contracts cover startup cancellation, a nonempty later-round BUY, wrong-wallet rejection and UNKNOWN capacity blocking. This does not clear preparation pauses or deploy the fix.
+
+## 2026-10-16
+
+- #351 服务评审修复：当前预留读取与设置提交并发完成，金额保持同一 API 快照；显式 systemd 重启在精确缺席证明后恢复历史 ready／failed 记录；前台启动固定到已验证发布目录；READY 后意外 owner 循环故障保留 CLAIMED，真实 HTTP／原生工作排空后以致命状态退出，人工恢复继续遵守持久暂停。逐案及直接消费者证据见任务记录；未安装或部署。
+
+- #351 默认生产服务接入当前 API D2 与唯一调度器；启动先在真实 owner 下领用一次性许可，再读取可靠控制和设置。启动失败或控制保存致命失败保留 CLAIMED，实际 HTTP／原生工作全部结束后退出；迟到成功不清除故障。UI／CLI 区分请求、有效、已保存、待定与故障，未保存暂停不冒充可靠确认。支持显式管理恢复、精确配置摘要与可信目标证据绑定；不兼容回滚在停旧服务前拒绝，已验证 D2 回滚使用保留证据与当前 API，不重放历史请求。Mac／Linux 生产监督策略保留完整排空，人工恢复不覆盖持久暂停。逐案及直接消费者验证见任务证据；本变更未安装、激活或部署，发布、评审与精确提交 CI 由 Main 负责。
+
+- #351 显式接入 D2 的手动预览、候选预览、开仓、命名加量、当前状态、精确撤单及停止使用共享当前读取、可靠原幂等键与原复核期限；默认运行仍未接入。真实 BUY 回执与 POST 未知结果交给当前状态 owner，重启只按当前 API 精确订单绑定身份，不恢复历史金额或止损状态。手动 BUY 保留进程／文件互斥至 SDK 和可靠保存均结束；暂停的看板 BUY／SELL 撤单保留原逃生条件，ID 确认不冒充最终成交量。停止仅进入复核并撤销原组订单，不强制平仓。 等待领用、签名或安全查询后，手动发送重新校验原凭据、来源、历史与 GTD 期限及命名保护组修订；条件撤单读取失败继续报错通知，命名加量保留原数量／价格拒绝原因。逐案和直接消费者验证记录见任务证据；独立评审、精确提交 CI、默认服务切换由 Main 继续，未激活或部署。
+- #351 新增未接入默认运行的 D2 组合：同一次 Reader 原始帧经纯计算交给当前状态 owner，再由轮次 owner 封存固定 BUY／启动撤单身份和价量。显式恢复重置轮零、旧读取等待及 UNKNOWN 计时；独立精确撤单不阻塞 BUY 完成，实际原生调用未结束时关闭保持未完成。业务留档可丢且不阻塞当前回执／轮次，旧展示和财务围栏隔离留档容器；完整封存选项保留，显式 builder_code 才转发，其他不支持的选项在发送前明确拒绝。当前回执新增订单可直接精确撤单；控制保存沿用账户哈希身份；撤单确认不假定最终成交量，可能已执行的未知 BUY 将金额和容量置为 UNKNOWN，待新鲜完整 API 对账。显式保护 tick 复用同一当前帧，接入精确价格桶／首次观察基线、9／10 失败及 600 秒 UNKNOWN 撤单、当前开仓止损／评分复核和 SELL 余量对账。订单／相关市场成交／评分读取共用原 Reader 限额与原生排空；仅 ID 的撤单确认或未完成 SELL 不能授权替换，缺失价量费用仍为 UNKNOWN。互补成交按精确己方腿归属；撤单容量不足仅延后未尝试目标，部分成交的同价 BUY 余量仍可撤销；触发锚点成功撤销后保留原待撤身份，最终成交量未知时由原 Reader 对提交或手动首次观察锚点精确补证，确证零成交后继续。SELL 准入绑定原计算观察。手动 SELL 归属跨列表缺项保留；已解决保护退出可按真实余量继续，迟到费用仅更新原请求，完整开仓对账后显式释放退出记录，后续开仓使用独立作用域。普通持仓读取显式覆盖小额余额，零余额闭合仍需完整来源、真实成交金额及原生结束。新增只读完整候选池捕获、逐方向来源覆盖与同帧纯资格计算，实际 GTD 价量／复核期限由同一不可变策略封存；可靠设置使用严格账户哈希与窄 CAS 保存，原生保存待定时保留旧有效策略并阻止恢复，真实提交仅在迭代边界发布，已知失败不自动重试，关闭保留实际原生任务。设置准入仅在精确终态零成交、新鲜完整零持仓和所有相关义务已解决时豁免未关闭开仓；保留原开仓、金额 UNKNOWN 及生命周期。新增显式 Execution／原调度器桥接，当前控制及策略仅作内存投影；自动 BUY、独立与保护撤单及 SELL 复用既有熔断、非 LP 执行和进程／文件互斥。原生调用共享租约保留两个并发槽位，直至所有实际调用结束才释放；未开始的保护目标不因准入拒绝丢失。等待安全查询后再次以内存控制／代次校验发送；延后撤单携带原触发、完整锚点及目标条款，新观察、正成交或未知终态不能沿用旧准入。SELL 在最后安全查询后仍绑定原观察、成交版本与提交价量，持仓减少或新手动 SELL 不得授权旧数量发送。同 tick 评分先发布再捕获 SELL 保护来源，避免自身评分更新误拒绝精确撤单；保护测试核验真实原生结束及两个并发目标的外部屏障。延后撤单保留原目标条款，并以每次尝试的当前修订与余量校验；部分成交使等待中的旧尝试失效，但新鲜帧可继续撤销原目标的真实余量。新增尚未接入路由的手动命令身份端口：沿用既有会话／动作／preview 表原子领用原幂等键和一次性凭据，重试仅重放原响应，结果严格绑定原身份且未知不转成重发许可；命名加量保留原期限与真实订单关联，身份容器从旧业务／资金扫描及注册修订围栏隔离，不恢复旧金额或止损状态。聚焦逐案及直接消费者证据见任务记录；服务／UI／运维切换、独立评审和精确提交 CI 由 Main 继续，未激活或部署。
+- #352 新增独立 LP 轮次协调模块：启动和真正恢复先封装当前完整 BUY 的精确 ID 撤单批次，暂停只观察；随后保持固定 BUY 价量和请求身份，本地拒绝、未发送或 UNKNOWN 也可结束尝试。重复控制、重复完成和旧代次不会重复推进；连续运行不累积已完成批次的动作数据，迟到有效结果仍可防重。不代表真实发送资源结束。8 个公开组件用例逐案 RED/GREEN，未接入现有交易入口；跨模块接线、独立评审和精确提交 CI 由 Main 继续，未合并或部署。
+- #357 交付独立的 LP 当前内存状态与可靠控制保存组件：保留精确订单、持仓、金额、原来源时间和 UNKNOWN；暂停立即生效，恢复等待真实保存，旧结果不能覆盖新控制。保存明确失败后等待 1 秒重试一次；超过 10 秒未返回则保持 UNKNOWN 并请求停止，迟到成功不撤销停止，实际 writer 结束前保留资源。真正恢复仅重置 BUY 收益未知计时。仅含订单 ID 的取消确认保留成交进度原来源，最终数量待新证据补全；实际 BUY 执行结果未知立即使资金权威为 UNKNOWN，仅由事件后完整来源恢复，并拒绝请求重放。退出请求合法替换后保留原提交事实与来源，迟到回执仅更新原请求；仅在已关闭、持仓与金额对账及精确终态证据齐全后显式释放完整记录，保留本进程身份排除以防重放。组件合同的聚焦验证与证据由任务记录保存；D2 共享接线、交易启用和整进程退出验证由 #351 负责，本组件未启用或部署。
+- #349 评审修正：默认完整 metadata 读取仅在展示投影仍留存时使用旧值回退；缺少展示且 API 失败时保留 UNKNOWN／失败。3000 行限制只用于客户端启动预热，既有 Store 完整读取继续覆盖持仓通知所需的全部有效身份。聚焦回归及直接消费者检查记录在任务证据，精确提交复审／CI 由 Main 继续。
+
+- #349 LP metadata 在客户端启动时一次建表并有界预热；正常读取使用独立 RAM 快照，核心最多 3000 条／16 MiB，展示附属最多 3000 条／4 MiB。计划入口从原始投影跳过展示字段，保留 60 秒动态事实门槛与原正／负 TTL；当前 token 排除使用有效 RAM 身份，不等待持久副本。过期清理进入原 Writer，每事务最多删除 400 行，成功续段排到队尾，失败不重放；退出丢弃待处理项并保留 owner 直到实际 DELETE 结束。真实 SQLite 锁、FIFO、UNKNOWN、身份与停止回归及直接消费者聚焦检查记录在任务证据；独立评审和精确提交 CI 由 Main 继续，未合并或部署。
+
+## 2026-10-15
+
+- #349 LP metadata 公开读取在当前事实处理完成后异步保存持久缓存，不再等待该保存。普通 FIFO 按 3000 条或 16 MiB（含执行中快照）限额，丢弃最旧待写项；失败记录结果未知且不重放。退出立即丢弃待写项，只回收实际执行中的保存；未结束时保留客户端、Store 与 runtime owner，保存等待不阻止其他生产者停止。原来源时间、正／负缓存 TTL、排除读取及 UNKNOWN 语义保留；聚焦验证记录在任务证据，独立评审与精确提交 CI 由 Main 继续。未合并或部署。
+
+- #350 旁路 Reader 对照记录通过原有有界异步输出队列写入标准输出（`launchd.out.log`），保留时间、差异及完整计数字段，避免正常 `error=0` 摘要被现有 Smoke 误判为业务错误。业务 stderr 与 Smoke 检查器保持不变；公开默认输出回归和直接受影响检查记录在任务证据中，精确版本 CI／复审及部署由 Main 交付。
+
+- #350 新增不可变当前市场 Reader 与纯资金／收益／目标计算，并在原 LP 自动轮次旁路抽样同一来源的输入作日志对照。比较最多一项执行加一项最新待处理，差异、UNKNOWN、跳过和错误分别计数；不增加线上 API 请求，不改变交易、暂停或保护计时权威。独立并行读取仅作离线验证，线上日志不冒充该能力的生产证据；聚焦检查与精确版本的 CI／独立评审由任务证据和 Main 交付流程确认，未合并或部署。
+
+## 2026-10-14
+
+- #344 BUY 收益发布在同一事务内重新核对当前订单证据及撤销身份，旧准备结果不能覆盖更新的有效证据或 UNKNOWN 期间；更晚的真实当前归属订单仍可恢复收益。原生只读屏障证明旧监控读取后，自动轮次先提交撤销、监控再恢复的竞争真实 2 项 RED，修复后同 2 项 GREEN；一次 14 个受影响函数选择器执行 25 项全部通过，保留 1 条既有警告，子进程及外层均退出 0。原财务、控制、审计及禁止重放约束保留；精确提交 CI 与独立复审由 Main 继续，未重跑全后端。
+
+- #344 离线旧版状态生产器显式使用归档源码及测试根路径，继续校验原始模块来源、归档哈希和真实 900 秒旧间隔状态。指定 PYTHONSAFEPATH=1 后，同一旧版冷重启用例在工作树及无 Git 历史源码副本各通过一次，子进程及外层均退出 0；首次当前测试收集路径失败另行保留。生产源码、归档及 F4 收益撤销用例不变，精确提交 CI 与独立复审由 Main 继续。
+
+- #344 当前 BUY 收益证据被更新的完整挂单观测否定后，普通监控保持 UNKNOWN 及原计时，保留旧来源供审计；只有更晚且有效的原归属订单观测才能恢复收益。保留资金 UNKNOWN、原始占用、审计、控制及禁止重放约束。两参数公开用例真实 2 项 RED 后 2 项 GREEN；一次 14 个受影响函数选择器实际执行 25 项全部通过，保留 1 条既有警告，原生子进程及外层均退出 0。精确提交 CI 与独立复审由 Main 继续，未重跑或声明全后端通过。
+
+- #344 后续边界修复：普通监控保留已验证的当前 BUY 数量及原始来源时间；无可恢复订单 ID 的历史 UNKNOWN 不再阻止真实依赖等待；公开关闭流程先保存迟到读取错误的实际重试期限，再释放读取资源。自动规划补齐真实读取／发布／使用诊断。CI 用例迁移保留资金、身份、控制及禁止重放断言；旧版间隔状态由校验过的原始 de24 离线源码产生，同一用例在正常工作树及无 Git 历史的源码副本各通过一次。三项边界均保留真实 RED/GREEN；本批定向结果分别记录；最终源码的一次 91 个受影响函数选择器实际执行 187 项全部通过，保留 1 条既有警告；原生子进程与外层均退出 0，运行期间文件字节未变。精确提交 CI 与独立复审仍待 Main 完成，未声明全后端或 428 项全通过。
+
+- #344 评审修复：规划读取保留真实 Retry-After；共享鉴权／限流错误缺少该头时使用配置的重试期限，迟到读取和冷重启不延长或绕过期限。BUY 收益恢复与 UNKNOWN 超时撤单原子登记；仅 SELL 的会话等待真实依赖期限；账户分项失败时，已纳管 BUY 收益使用独立确证的当前剩余数量，不刷新资金权限。公开 SDK／原生屏障 RED/GREEN 与原始失败已保存；一次 42 个函数选择器实际执行 77 项全部通过，包含默认完整读取和原生 Store 回调消费者。独立复审及修复提交 CI 由 Main 继续，未合并或部署。
+
+- #344 自动 LP 改为连续串行事实轮次：暂停、空计划和局部读取失败时仍发布独立有效的当前 BUY 收益。LP Facts Reader 的正常规划只读取余额／allowance、当前挂单和持仓，预算仍包含库存成本；全量成交历史留给必要的 UNKNOWN／成交恢复和报告。历史正常轮次间隔可读但不生效，HTTP／CLI 新设置明确失败。原请求、防重、真实占用、独立撤单及 600 秒收益未知保护保留；超时底层读取继续占用容量，关闭等待实际资源结束。一次 162 个函数选择器实际执行 428 项，426 通过、2 失败；原失败证据保留。最后两项仅迁移测试的当前事实／单向时钟和实际发送器完成观测：首次定向 2 项通过记录保留，最后完成观测修正后单项通过，两个同时运行的独立进程各 2 项通过；没有重跑整个 union 或声明当前版本 428 项全通过。独立评审和精确提交 CI 由 Main 交付，未合并或部署。
+
+- #339 修正自动 LP 同轮撤单与空位 BUY 回归的完成观测：释放阻塞撤单后，以既有 5 秒独立事件等待实际 SDK 返回。保留撤单阻塞期间 D/E 已完成的负断言、精确订单与资金占用约束；生产源码不变。定向串行及双进程并行结果记录在任务证据，后续 CI 与独立评审由 Main 确认。
+
+- #339 排名回归补齐原生全会话 SELECT 次数上限（固定公开场景最多 11 次），隔离的旧源码以 15 次命中新断言。新增公开测试改用既有 30 秒独立进程监督器，超时回收整个子进程组；业务时钟、资金、UNKNOWN、固定价量与禁止重放断言保留。
+  生产源码及共享监督器不变；3 项排名用例与 2 项监督器超时／后代进程回收用例通过，两个同时运行的独立进程各通过同一 3 项排名用例，实际退出与子进程组回收证据已保存。43 项原验证不重复；更新提交的独立复审与 CI 由 Main 确认。
+
+- #339 自动 LP 候选筛选复用本轮已验证的当前挂单、持仓及未释放请求占位，按市场和 token 建立索引，避免逐候选读取全部历史会话。行情在各自资格校验时检查有效期；后续选单耗时不撤销已经校验的目标，账户身份检查继续生效。
+  固定 BUY 目标和价量各尝试一次，真实拒绝或 UNKNOWN 不触发同轮替换。公开 SDK 回归证明原生全会话 SELECT 从 15 次降至 11 次，早期行情因后续读取超过 60 秒的回归已有 RED／GREEN；43 项直接受影响检查通过，最终新增用例的观察及资源回收断言另行通过。独立评审与精确提交 CI 由 Main 确认，尚未合并或部署。
+
+## 2026-10-13
+
+- #339 日历史并发测试按精确请求身份与次数核对 B 的重试及 A/C 的刷新；外部事件固定合法的 A/C 先到、B 后到顺序，保留 299/300 秒边界、冷重启、缓存不变与次日新缓存断言。生产源码不变，定向串行与双进程并行结果保存在任务证据，更新提交的 CI 与复审由 Main 确认。
+
+- #339 并发测试观测修正：按两笔原始 token 分别记录真实签名与同一规划财务时间，五单补位仅同步首个财务基线的记录；轮换在读取发送次数、修改终态和保存不可变审计前，等待精确 ID 的独立撤单终态。
+  生产源码不变；保留 UNKNOWN、独立请求、原审计、资金占用及禁止重放约束，定向串行与双进程并行验证记录在任务证据，更新提交的 CI 与复审由 Main 确认。
+
+- #339 评审修复：BUY 收益未知超时撤单在真实发送前被运行权限拒绝时，同一事务保存拒绝与未发送证明；首次提交后中断并冷重启仍可登记不同请求，保留原审计与首次未知时间，已受理或 UNKNOWN 请求不重放。
+  公共 SDK／原生 COMMIT 中断回归已有 RED／GREEN；默认撤单写入与终态竞态的直接消费者另行验证，精确提交 CI 与复审由 Main 确认。
+
+- #339 评审修复：按行情读取完成后的时间校验已纳管 BUY 的当前预计收益，避免健康新盘口被误判为未知。风险撤单在运行权限撤销后若已证实未发送，权限恢复时可登记新请求；保留首次未知时间与原审计，已受理或 UNKNOWN 请求不重放。
+  独立撤单结束后的真实零成交终态可在余额读取失败时修正原单占位与本金；仍保留原财务时间、BUY 准入失败、身份／完整性检查及禁止重放约束。
+  公共 SDK／原生事务回归覆盖时间推进、真实启动权限围栏及冷重启；直接受影响检查记录在任务证据，精确提交 CI 与复审由 Main 确认。
+
+- #339 将自动 LP 的 BUY 计划与精确 ID 撤单分开；买计划完成或为空后开始原配置间隔，下一轮按当前订单、库存、资金及候选重新选优。部分成交 BUY 的剩余挂单可以轮换，已成交成本保留；保护撤单后的候选可用新 ID 和新盘口基线重新入选。
+  已纳管 BUY（含手动来源）预计做市收益连续未知 600 秒后由正常监控撤单；暂停自动 BUY 时保护继续，SELL 与历史收益报表未知不使用此计时。首次未知时间跨重启保留，已知收益清除，新 ID 独立计时。
+  原请求、回执和真实占用分别保留，关闭运行资源等待实际撤单发送结束。新增公共回归及直接消费者验证记录在任务证据；独立评审与精确 SHA CI 由 Main 交付流程确认，未合并或部署。
+
+- #336 落实[已确认的工作流决策](https://github.com/raymizzou/open_trader/issues/336#issuecomment-6138175836)：Main 在实施前维护简短影响清单；范围、风险或工期实质扩大时先评估并获得批准，再由 worker 按共同原因自主成批修复。
+  新增／修改及已知直接受影响检查通过后及时发布普通 PR，独立审查与完整 CI 并行；保留财务、身份、UNKNOWN、禁止重放、TDD、精确 SHA 及合并／部署边界。
+  工作树与证据持久存放，执行记录一次、交接只更新变化；连续十分钟无实际进展时由 Main 报告，模型切换由用户决定。
+  本项仅修改仓库文档；核对差异、空白及本地链接／锚点，不运行后端测试；独立审查与 CI 由 Main 交付流程确认。
+
+- #336 测试同步修正：暂停签名后在既有 5 秒限时内等待实际发送线程的进入事件，再单独核对线程数量；保留线程回收及零发送断言。
+  生产源码不变；同一暂停用例串行一次及两个独立进程并行各一次全部通过，更新提交的 CI 待确认。
+
+- #336 修正两个并发测试：轮换按市场的原请求、会话及审计绑定订单身份；暂停时保留未结束签名的占资，原发送线程结束后再检查最新公共状态。
+  生产源码不变；两项串行检查及两个独立进程各一项的并行检查全部通过，原 CI 失败记录保留，更新提交的 CI 待确认。
+
+- #336 评审修复：自动 BUY 按本轮余额及 allowance 扣除已有预留后的净额规划；真实代次变化或原订单成交、消失时，旧账户观测不能批准新请求。
+  真实 SDK 历史仅用于采集与核对，持久规划保存规范化账户字段；自动账户发布补齐真实写入等待及完成诊断。
+  自动规划读取失败只拥有本次等待状态，健康的新观测可恢复，不清除其他发布者的账户诊断；手动、SELL、普通保护及完整账户注册规则保留。
+  旧 CI 失败用例按当前轮次、原生 CAS、真实 SDK 及工作线程生命周期迁移，保留全部失败和实际别名；最终 26 个受影响选择器执行 81 项全部通过，已在同一源码通过的独立组复用。
+  原发布提交的 push/PR CI 失败仍保留；修复提交的独立复审及 CI 待交付流程确认，未执行本地全后端、合并或部署。
+
+- #336 自动 LP 改为启动、重启及每轮按新采集的当前事实选优；旧未发送计划不再拥有发送权限，不承诺持续保持五单。
+  每个动作只做一次本地尝试，受理、明确拒绝、明确未发送及 UNKNOWN 均结束该次尝试；全部本地尝试或必要读取检查结束后，默认等待 30 秒，保留显式保存的自定义间隔。
+  独立空位 BUY 与撤单可并发，依赖撤单释放的补位留到下一当前轮次；执行保留规划时固定价量、资格与 post-only，不重复整套行情审批。
+  原请求结果、成交账本与保护归属按精确身份和当前证明恢复，UNKNOWN 审计及真实敞口保留，实际 Future 在真正结束前仍计入资源；手动、SELL 与普通保护规则不变。
+  C01–C12 有序公开边界检查及定向修复证据已保存；最终 103 个选择器实际执行 280 项，253 通过、27 失败，同一生产源码的失败项迁移与定向纠正后，全部 27 项各有通过证据，保留所有中间失败。
+  未执行本地全后端或稳定门；PR 发布、独立评审与精确提交 CI 由交付流程确认，未合并或部署。
+
+## 2026-10-12
+
+- #331 补齐原 accepted BUY 从 LIVE 自然结束后仍为 unknown 的回执恢复：仅在原发送身份与时间戳一致、会话已完成且精确终态零成交、当前账户事实完整并无矛盾时补齐原回执。
+  精确查询不可用或返回真实终态零成交均使用既有证明；当前订单优先，空值不证明完成，不扩展原 UNKNOWN、无 ID 或正成交请求权限。
+  保留停止、撤单、保护、覆盖、零账本、原审计与财务时间戳；真实 SDK 公共回归已有 RED/GREEN，当前终态结果保持不变、重启及完整 60 秒后新身份补位通过，一次受影响检查共 40 项通过。
+  新 PR、独立评审、CI 与现场原请求恢复仍由交付流程分别确认。
+
+## 2026-10-11
+
+- #331 补齐 LP 自动计划中已绑定 LIVE 订单的显式 unknown 提交元数据恢复：仅在唯一原 accepted 审计、精确当前订单及原发送时间戳一致时补齐回执，写入前在既有锁内重新核对。
+  保留会话管理状态、停止、保护、覆盖、账本、原审计及财务时间戳，不重复发送或撤单；不扩展 unknown 终态或无 ID 请求的恢复权限。
+  真实 SDK、真实文件锁与公共核对/登记回归已有 RED/GREEN；重启、完整 60 秒等待及两笔 LIVE 原单保留通过，一次受影响检查共 38 项通过。
+  保留首次公共发布时序的无效 fixture 失败；新 PR、独立评审、CI 及现场原请求验证由交付流程另行确认。
+
+- #331 补齐 LP 自动计划的已完成零成交回执恢复：当前精确查询返回空值时，仅以原请求审计、已持久化的精确终态及完整当前挂单、成交、持仓事实恢复提交元数据。
+  空值或读取错误不证明完成；当前订单优先，保留停止、撤单、保护、账本、覆盖、原审计及财务时间戳，不重放原订单。
+  真实 SDK 空值公共回归已有 RED/GREEN，完整性负例、API 等待、重启与完整 60 秒后新身份补位通过；一次受影响检查共 37 项通过。
+  保留首次重启签名载体缺失的 fixture 失败；新 PR、独立评审、CI 及现场恢复验证由交付流程另行确认。
+
+- #331 修复 LP 自动计划中已绑定订单但缺少提交状态的成功 BUY 回执恢复：核对原请求、审计和精确订单后补齐回执元数据，不重复登记或发送原订单。
+  保留已完成会话、停止、撤单、保护、成交及覆盖事实；原轮次结清后仍等待完整轮次间隔，下一轮用新请求按新事实补位。
+  首版（bb2366ac）LIVE 公共入口回归已有真实 RED/GREEN，终态零成交、新轮次补位及 26 项受影响开发检查通过。
+  中断回执及暂停回归补齐模拟场所的独立订单结果读取；两种原参数的全部断言通过，保留完整会话读取故障、两次原发送及防重要求。
+  首次 push/PR CI 的两项失败证据保留；修复后的 CI、独立复审、合并及部署待完成，未执行实盘操作。
+
+- #329 评审修复：注册事务直接保留本轮账户观测，后续等价发布不撤销规划；历史传输失败时，手动 UNKNOWN BUY 仍占用原本金和 BUY 名额。
+  独立加仓及无法确定金额的 BUY 保持零新增发送；不改写未知请求审计、覆盖标记或完整账户发布。
+  注册返回竞争与手动预留已有真实 RED/GREEN；严格控制及原 CI 失败用例已有定向证据，最终受影响检查、新提交 CI 与复审待完成。
+
+- #329 修复 LP 自动规划被后台账户刷新反复撤销的问题：每轮先读取并校验真实余额、allowance、完整当前挂单、持仓成本及已知预留，排名与固定动作使用同一规划观测。
+  后续时间戳、财务代次、规划耗时或后台发布失败不重新审批整份财务计划；行情、精确订单、停止、身份、防重及保护检查保留。
+  仅历史成交传输失败时，可使用独立完整的当前敞口规划，历史报告保持 UNKNOWN；不替换完整财务发布、不释放未知请求预留、不重放动作。
+  定向 RED/GREEN、初始读取失败与当前敞口负例已有证据；最终受影响检查、CI 及独立评审待确认，未执行实盘、合并或部署。
+
+- #322 修复 LP 同轮精确撤单重试后的延后保护恢复：以完整真实请求集合及当前终态结果确认原业务动作结束，保留每次请求审计和独立 UNKNOWN 控制。
+  独立撤单稍后结束时，可从原收益撤单的已取消价位恢复真实基线并锚定同会话存活订单；不重放请求、不刷新或重新审批财务。
+  两种公开终态时序 RED/GREEN 和 56 项受影响检查通过；新提交稳定验收、CI 及独立评审待确认，未执行实盘、合并或部署。
+
+- #322 修复 LP 撤单拒绝后的重启恢复：真实会话提交后，以原请求、审计及完整结果幂等完成保护收尾，保留原动作引用与固定轮次。
+  同价独立撤单阻塞时保留真实基线；其终态确认后，由既有正常事实发布在同一写事务内恢复保护，保留停止、独立控制、财务来源及原审计，不重放请求。
+  公开入口 RED/GREEN 与 24 项定向修复检查通过，保留原 105 项受影响检查的失败及修复证据；新提交稳定验收、CI 和独立评审待确认，未执行实盘、合并或部署。
+
+- #322 修复 LP 普通撤单终态阻塞后续收益轮次保护恢复的问题：已接受且精确归属的普通撤单可使用真实终态历史完成；当前结果仍优先。
+  按价格恢复已结束的收益保护，保留其他价格的 LIVE 撤单、独立保护、停止控制及真实基线观测；不重新审批财务或重放请求。
+  公开入口 RED/GREEN 和 35 项受影响复核通过，原有身份、占资、UNKNOWN 及时间戳断言保留；新提交稳定验收、CI 和独立评审待确认。
+
+- #322 修复 LP 撤单结束时保护状态的并发覆盖：在既有 SQLite 写事务内读取当前会话与审计，原子恢复真实基线并保留独立保护、停止及 LIVE 撤单意图。
+  已退役的旧轮次仅以精确归属与终态证明释放；当前结果优先，固定原数量、订单占资、财务 UNKNOWN 与时间戳规则保留。
+  真实公开入口并发 RED/GREEN、40 项受影响复核及未改动的默认 Store 消费者已有证据；保留所有中间失败。
+  新提交稳定验收、CI 及独立修复评审待确认，未执行实盘、合并或部署。
+
+- #322 修复跨轮 LP 保护恢复：全成功撤单后退役精确终态订单的旧轮次归属，重启恢复使用原审计、会话身份及当前完整结果确认。
+  后续明确拒绝恢复真实保护基线；当前 LIVE 优先于旧终态记录，占资按精确订单计一次，保持财务 UNKNOWN、原时间戳及未决请求。
+  原版 0906 的真实 SQLite 检查点、公开入口 RED/GREEN 与 102 项受影响检查已有证据；不重建已丢失的历史基线。
+  新提交稳定验收、CI 及独立修复评审待确认，未执行实盘、合并或部署。
+
+- #322 修复首次 LP 计划批准遗漏账户完整性失效及注册并发的边界；失效时先等待，保持批准后的固定动作不重新验资。
+  同批撤单结果分次到达时恢复原保护基线，保留停止、独立保护与精确订单身份；明确未发送的拒绝使用同一完成事件时间，重启后保留不同请求重试。
+  隔离账户旋转测试的共享时钟；公开入口有序 RED/GREEN、152 项受影响检查及原生产者先于七个 CI 消费者的八例检查通过。
+  新稳定提交验收、CI 与独立修复评审待确认，未执行实盘、合并或部署。
+
+- #322 修复首次 LP 计划批准与账户代次、时效校验的原子性，并保留仅修改等待间隔的配置语义。
+  固定 BUY 在准备及发送前继续检查当前压力退出风险；同批撤单拒绝恢复原保护基线，终态订单仅以同一会话的存活订单重新锚定。
+  资源明确未发送的持久拒绝在重启后保留原审计并使用不同请求重试；完整当前敞口可清除旧执行名额，计划使用原有效容器退休证明而不重新验资。
+  公开入口聚焦开发检查与精确旧断言迁移已有证据；稳定提交验收、CI 及独立修复评审待确认，未执行实盘、合并或部署。
+
+## 2026-10-10
+
+- #322 修订自动 LP 为规划时校验账户、执行固定动作并独立确认结果。已批准计划不因财务 TTL 或代次变化重新验资；局部失败、明确拒单及实际名额不足只结束当前动作，资源等待与 UNKNOWN 保留原请求。明确撤单拒绝且确认 LIVE 不在同轮暗中重试。真实成交库存保留，预算在下一轮重新分配，不承诺执行期连续敞口上限。手动入场、独立增仓、保护及财务发布规则保留。分支聚焦证据与旧节点迁移单独记录；CI、独立评审、合并与部署未在此确认。
+
+- #322 修复排名、首次撤单及 BUY 最终安全复核中的账户失效等待：账户事实过期或
+  代际失效时按独立 API 间隔恢复原计划；明确未提交的 BUY 保留原失败审计并使用新请求身份。
+  保留精确订单、报价、占资及单笔明确拒绝语义。公开入口有序 RED/GREEN 与相关聚焦检查通过；
+  新候选的独立评审及 CI 待确认，未执行实盘或部署。
+
+- 明确交付规则：独立新增的 `CHANGELOG.md` 条目发生冲突时可直接保留双方内容并解决；
+  已发布任务分支可用正常 merge 同步 `origin/main`，仍须完成规定检查和独立评审。
+
+- 东京部署 SOP 文档收尾：区分 `9eab8d32` 的停止安装、Mac-mini.local 上
+  `lpprobe tokyo` 的只读解析验证，以及用户在 SSH pane 执行原生 `self-test`
+  的真实单笔结果。回执于 `2026-10-10T09:45:42.976862Z` 核对为 PASS：
+  价格 0.001、数量 5.00、名义额 0.00500 USDC，观察 LIVE、撤单 ACK、
+  CANCELED、零成交，身份、资金及零持仓对账通过。地域仍为 blocked/JP/13。
+  后台保持停止 Shadow、N-leg paused、2 GiB；保留历史 Smoke 失败和 TDD
+  证据限制，不宣称 Mac wrapper 端到端实盘、云服务健康或 #313/#320 验收。
+  本文档变更仅核对既有证据、差异、Markdown 链接及 whitespace；未执行新的
+  交易、后台测试或部署，实测源码不等于本文档提交。
+
+- 一命令 Polymarket 诊断在有界扫描中跳过过旧或未来时间的盘口，继续寻找新鲜
+  候选；保留 `[0,10]` 秒门禁、选择后复核和全部金额/单次提交/精确撤单保护。
+  提交前失败报告实际阶段、盘口/服务器时间、年龄及明确未提交结论；私有诊断
+  sidecar 与恢复回执分离，仅提供存在的证据路径。已有未知 ID 提交仍保持
+  UNKNOWN、不重发、不覆盖原回执。合成 HTTP 回归新增 5 例（未来盘口用例继承
+  GREEN），完整 probe/直接入口聚焦检查共 86 项通过，syntax/whitespace 通过；
+  未执行实盘、运行时修改或部署。此前 PR #324 时效 RED
+  缺口及 PR #325 F2 fixture 混杂的历史限制仍保留。
+
+- PR #325 评审修复一命令诊断的两个阻断项：应用 Python 使用 `-P`，防止 SSH
+  继承目录中的同名包覆盖已核对源码；自动恢复保留同一订单的持久撤单 ACK，
+  对已验证终态不重复撤单，并仍要求新鲜终态、零成交及完整对账才能 PASS。
+  未知终态、缺少历史 ACK 和仍 LIVE 的订单保持 UNKNOWN；人工命令语义不变。
+  实际 Python 解析与合成 HTTP 回归覆盖修复，增量 5 例及聚焦回归共 100 项通过；
+  初始 F2 完整有序 RED 受 fixture 历史丢失影响；一次标注的旧基线重放核对
+  实际导入路径及 Git blob 散列，确认回归敏感性，不能改记为有序 RED。
+  未执行真实主机或实盘验证。
+
+- 新增独立 `lpprobe tokyo` 一命令诊断入口与专属安装器：从当前托管发布及其
+  已配置可信 Python 自动解析，以 Prediction 用户扫描至多 3 页/20 个盘口，
+  选择一 tick 买价和向上取整的最小份额，保留 1 USDC 上限、一次 POST、精确
+  撤单和完整对账。新模式记录 `single_writer=not_claimed`；私有钱包回执锁支持
+  已知 ID 自动恢复，未知 ID 不重发，其他订单或持仓变化不能误报 PASS。
+  保留人工 check/run/status/cancel；地域独立报告。合成 HTTP、离线安装/SSH
+  与解析器进程/文件边界及相关认证的 95 项聚焦检查通过，shell/离线入口检查通过；
+  未安装真实入口、连接东京、部署或下单。
+
+- LP 自动 BUY 在未满池与满池时统一选优，固定本轮目标和报价；单笔明确拒绝后继续其余动作。
+  API 暂时失败、撤单 ACK 后仍 LIVE、订单确认消失与短暂资源争用均可自动接续原计划，
+  保留精确订单身份、未知提交防重、部分成交库存及保护门禁。新增独立持久参数
+  `--round-interval-seconds`、`--api-retry-interval-seconds`、`--order-check-interval-seconds`，
+  默认 60/60/10 秒；运行中修改只影响下一次等待，CLI 校验服务持久状态回执。
+  已完成 #322 的 16 项公开入口契约逐案 RED/GREEN 或不变式验证，以及相关聚焦消费者修复；
+  最终候选检查、独立评审及 CI 由交付流程确认，未执行实盘或部署。
+
+- 新增 #321 人工 Polymarket 单笔诊断 CLI：只读 check、GET-only status 与明确确认的
+  run/cancel；仅 BUY/post-only/GTD，名义金额硬上限 1 USDC，记录真实地域结果，
+  不修改 Shadow 或 production 门禁。私有原子回执在提交前保存 attempted，未知结果
+  不重发、不猜 ID；仅撤明确自有订单，并核对终态、成交、资金和选定 token 持仓。
+  独立评审修复签名金额比对的有损取整及长精度数量被舍入、已接受订单的后续 GET 被误记为提交拒绝，
+  以及提交前遗漏最终 CLOB 时间对应盘口年龄检查的问题；用户输入不被隐式截断。
+  合成凭据、SDK 外部 HTTP fixture 与相关认证用例共 56 项聚焦检查通过，
+  shell 语法和离线入口一致性通过；事实时效用例的有序 RED 证据缺口已披露。
+  未执行实盘下单、部署或跨主机互斥验证，独立评审及 CI 由 Main 接手。
+
+- Paused cloud Shadow now accepts configured finite memory budgets above 1 GB,
+  including 2 GiB, while retaining the 768 MiB default, host and service reserves,
+  swap/CPU/task checks, bounded shutdown and `Restart=no`. Integrates the reusable
+  Tokyo deployment SOP with the current configurable budget and preserves its
+  historical guard-stop evidence and unresolved acceptance limits. Raising the budget
+  does not establish #226 capacity acceptance. Ordered renderer, cgroup v1/v2
+  and guard RED/GREEN checks passed; the focused union finished with 24 passed
+  and one existing Linux-only skip on macOS. No cloud restart or deployment;
+  2 GiB long-run resource evidence remains unavailable.
+
+## 2026-10-09
+
+- 新增 Prediction 东京新 Linux 主机中文部署 SOP，记录 Ubuntu 初始准备、锁定环境、
+  权限/packaging/临时传输阻断及正式两主机门禁；区分无凭据 Shadow、认证账户读取、
+  待验收 live-feed/容量与未执行交易，保留地域阻断和 1 USDC 诊断方案边界。
+  补记认证 Shadow 的服务内存 headroom guard 停止；区别于主机 RAM 耗尽、kernel OOM
+  或回滚，metadata transport 错误与服务预算触发仍分别未解决，未重启或提交订单。
+  本文档变更核对源码命令、Markdown 链接、shell 语法及 `git diff --check`，
+  文档检查未运行后端测试、部署门禁或交易；Main 另行授权的云端操作结果单独记载。
+
+- First-publication instructions and active README, CI, cloud, release and dependency workflow summaries now require Main to push the first completed task version after applicable focused checks and open a normal PR before independent review, so dots can begin review promptly. Standing task-branch/PR authorization includes in-scope repair updates; GitHub CI, final independent review, merge approval and deployment gates remain required. Verified the precise documentation diffs, targeted publication/review consistency searches and `git diff --check`; no backend tests or deployment gates were run.
+- Project review-publication instructions now carry the standing 2026-10-09 same-PR reviewer result-comment authorization across every checkout, including Air and Mini, removing redundant separate-confirmation prompts while preserving local-only, pre-publication, and reviewer read-only boundaries. Verified documentation portability, semantics, reviewer task/tab/pane ownership and placement, Markdown anchors/fences, changed paths, and `git diff --check`; no tests, deployment gates, or external publication.
+- #311 LP Auto 对完整账户事实中的零成交 BUY 使用精确回执恢复轮换资格，保留原提交审计，
+  独立未决 BUY/SELL、在途发送与身份冲突继续阻止对应轮换。新鲜盘口确认挂单偏离配置档位时
+  先撤原订单，真实终态核清后按当前收益率和预算全局补位，同市场可重新入选；撤单 ACK 不释放占用，
+  部分成交保留库存成本。已确认的档位偏离不因替代报价超出余额、配置档位暂缺或奖励时间过期
+  而保留旧单；撤单只依赖原订单、账户及盘口的有效安全事实，不推定可补入的新报价或未知收益。
+  不再用替代报价与旧单价不同推定离档，保留手动/增仓订单及发送审计的真实归属。
+  未满池的入场不足原因与旧单轮换阻断分别记录。满池选优按收益率逐项跳过不可负担候选，
+  最多保留五个 BUY 名额；两轮保护补位验证保留逐次资金读取守卫，另核算有界排序读取。
+  复用有界诊断队列记录首个阻断判断及当时账户/会话输入，包括撤单登记前的最终守卫；
+  身份脱敏，日志故障不改变交易决策。
+  隔离 SQLite 与离线交易边界的定向验证随证据交付；两项旧预算断言按批准的可负担选择契约更新，
+  保留手动订单、精确撤单 ID、ACK 占资与不得提前新增订单的保护。独立评审及远端 CI 待 Main 完成；
+  未发布、部署或执行实际交易。
+
+- #309 LP 候选、推荐排序及 Dashboard 的策略预估跟随当前买一/买二配置，
+  探索与维护统一使用真实档位和最小计奖数量；估值保存档位来源，配置切换或重启后
+  旧档位报价、占资及收益率显示待测，刷新成功后恢复当前档位值。
+  账户挂单奖励与已到账记录保持独立；隔离 SDK/SQLite 定向验证覆盖双向切换、排序、
+  自动下单一致性、缺档/离线与重启恢复，保留原有配置、资金及压力退出门限。
+  独立评审修复手动试挂链路：弹窗与 HTTP 保留展示报价的买档，缺省仍为买一；
+  提交时重新核对所选档位，报价漂移仍拒绝，custom/追加及单次提交幂等行为不变。
+  CI 修复首次加载的待刷新 Dashboard 同样返回已配置买档，页面读取不触发场所查询；
+  历史回放保持原夹具和全量哈希，仅单独验证新增档位来源字段，保留排序及负向检查。
+  未执行生产操作、发布或部署；独立评审及 Git 交付由 Main 负责。
+
+- #310 LP 候选按市场隔离元数据、奖励和盘口刷新失败；健康市场继续刷新，失败市场沿用
+  60/120/300 秒恢复期限。自动比较在过滤过期事实前进行有界复核，失败时用合格候选补位，
+  恢复后重新竞争；复核明确指向过期市场，避免新鲜展示前十挡住当前报价档位的更优候选。
+  多个候选同时过期时，按配置档位的缓存数学估算安排刷新优先级；仅决定读取顺序，
+  不更新旧事实时间或授权下单，仍由新鲜资格和收益比较决定执行。
+  保持原有执行时效、账户与提交保护。复用有界日志记录关联来源年龄、
+  安全错误类别和实际恢复期限；隔离来源/账户、固定时钟与日志拥塞定向验证随证据交付。
+  区分 300 秒历史展示与执行资格；历史首发来源仍未知。未部署或执行实际交易。
+
+- 修正 GLM 评审前置检查：按实际启动环境的 Codex 版本与 `CODEX_HOME` 核查独立 profile，
+  不以主配置缺少 profile/provider 段判定缺失；区分配置加载、凭据/API 与实际启动证据。
+  本机 CLI 0.161.0 help 已核对，支持的只读加载命令退出 0、输出解析为 JSON list；
+  文档差异与 Markdown 检查通过，未进行新的 GLM 启动/API 调用、后端测试或配置修改。
+
+- #306 LP 竞争事实改为有界分页、提交后按批发布；失败仅回滚本批，重启重读未完成页，
+  旧事实继续排序，完整非续传轮缺席项退出活动缓存而保留数据库事实。
+  排序使用稳定 cache/SQLite 投影，竞争版本在现有调度合并重排，防止旧构建覆盖新结果。
+  独立 Spec P1 修复要求显式 connection 与已固定快照，泛化 `**kwargs` fallback 保持发布锁；
+  修复 fresh cache 重复开库：本机固定 20,000 市场 probe 连接 20,000→0、耗时 10.50→0.102 s，
+  完整返回一致；混合/缺失/超龄仍固定 SQLite 快照，空请求不读库，全库投影保留未缓存事实。
+  同步过期测试真实读取阶段与精确 schema 预期，内部队列字段单独验证，保留原业务 golden；
+  本轮 83 项串行/13 项两 worker 聚焦检查通过，过期错误 mutation 两分支均被负断言拒绝。
+  首轮 rebase 后 163 项聚焦通过；128,500 行本机公开缓存派生回放完整事实/候选排序 hash 一致，
+  最大事务观测跨度约 807→43 ms、历史 BEGIN 最大等待约 821→12 ms；刷新约 1→8 s，RSS 无下降。
+  非云端原样回放；已发布 head CI 三项失败，本轮修复待独立复审及新 head CI；未部署或执行交易。
+
+- #302 新增 macOS 用户级稳定 `lpauto` 入口：显式安装/修复/卸载，每次调用核对当前
+  受管 Prediction 发布、解释器与服务身份，分别报告 launcher 和部署版本；不依赖临时
+  shell 函数或开发目录。保持单次 CLI 委托、UNKNOWN 与既有认证/控制边界，持有只读
+  发布操作共享锁直至命令退出；安装说明与隔离公开接口定向验证随本变更交付。
+  评审阻断修复核对 installer 与提交 blob 的精确字节，拒绝未提交/未跟踪源码冒充版本；
+  完整暂存、原子替换和有界所有权日志支持显式安装中断恢复，保留未知文件；
+  非对象 ready 元数据返回 UNKNOWN，保留历史观察语义。隔离故障回归及受影响接口定向验证随证据交付。
+  PR #308 反馈修复拒绝 `--u`/`--ur` 目标缩写（含等号形式），防止完整 URL 后的缩写绕过受管端点；
+  安装管理在读归属前按固定顺序锁定规范化入口/载荷资源，持有排他锁至完成，竞争操作返回
+  `INSTALLATION_IN_PROGRESS`，卸载保留目录外协调锁。隔离双服务与受控并发回归随证据交付。
+  首个协调锁先完整写入并同步私有标记，再通过不覆盖的硬链接发布；写入中断不暴露残缺权威锁，
+  发布后私有链接残留仍以完整标记和同一 inode 安全核验，拒绝未知标记且不替换/删除既有锁。
+  未执行实际安装、交易操作、部署或本地完整后端测试；独立评审和远端 CI 待 Main 完成。
+
+- #300 稳定 PR #299 的 LP 候选预览 CI 成功样例：使用远离北京时间 08:00 截止的固定业务时间，
+  保留原价格变动、资金、奖励等拒绝断言及幂等重放断言；
+  独立截止测试仍验证短 GTD 窗口拒绝。
+  受控时钟对照确认该样例的日历依赖；历史失败缺少原始时钟与拒绝原因，未唯一证明其根因，
+  修复后的远端 CI 待验证；未改生产规则或部署。
+
+- #296 第一阶段修正 LP Auto CLI 人类状态输出：明确无原因/错误显示 `NONE`，
+  缺失字段仍为 `UNKNOWN`；新增活动 BUY/目标进度和检查中、最近轮次时间/原因，
+  保留各占位计数及实际运行状态，不从旧轮次原因推断当前阻塞。
+  公开 CLI/隔离 HTTP 合同定向验证通过，JSON、只读 status、认证遮蔽及控制边界保持；
+  未运行本地完整后端或部署，#296 的其他范围仍待后续处理。
+
+- #293 协调 #271/#214 的 PR 交付规范：首版完成必要检查和独立评审后及时授权发布，
+  独立 GLM-5.3/max 评审与 CI 并行。Main 在每次 PR 更新及请求或执行已授权合并前，
+  完整分页核查各来源反馈，记录线程 resolved/unresolved 状态及其他评论的处置、阻断判断和负责人；
+  负责阻断修复、评论证据与交接，不以 CI 全绿、outdated 或代码变化代替反馈核查。
+  明确 reviewer 结果评论的单 PR 授权、精确 SHA 门禁及 worker 收尾条件，保留独立合并和部署授权。
+  文档静态检查完成；各 head 的交付证据保存在 PR/交接记录，旧 head 的评审及 CI 不转移。
+  修复 CI 命令计划测试误报：不透明 SOURCE_SHA 含端口数字时触发既有禁用词断言；
+  两个 make dry-run 命令现使用固定 40 位十六进制 SHA，保留全部禁用词及正负断言。
+  该单项测试本地 Python 3.12.12 定向 1 项通过（CI 为 3.12.14），保留既有依赖弃用警告；
+  未运行本地全套或部署，修复后的远端 CI 待验证。
+
+- #297 减少 LP 竞争数据刷新、落库与候选投影的全量副本：原生 reader 移交新 map，
+  monitor 不再构造被丢弃的 snapshot；自定义 reader 与需要 snapshot 的调用者保留隔离。
+  SQLite 逐条校验、编码并在同一事务写入，后段校验、输入或写入失败整轮回滚。
+  按完整方向集合投影，仅补查缺失/过期 identity；保留零值、精度、全池排名、来源/更新时间、
+  UNKNOWN、分页重试/取消及旧轮到新轮的原子发布。候选 snapshot 只在竞争锁内复制所需轮次字段，
+  不复制竞争 map，也不新增嵌套锁。校正回归在归档基线 19 项 RED；87 项定向检查串行与双 worker 通过，
+  另 8 项 snapshot 消费者回归通过。未运行本地全套或部署；独立全规模测量另行提供，
+  本票不宣称云端容量问题已解决，历史 SQLite 文件缓存与 metadata/Smoke 问题仍另行处理。
+  PR #298 发布阻断修复仅同步提交测试：终态先落库、通知随后执行，helper 现等待仍登记的
+  提交 worker 完成，兼容已移除 worker，保留原 5 秒 watchdog、通知内容、恰好一次及负向断言。
+  通知前/后 barrier 在旧 helper 上确定性 RED；18 项直接消费者检查按 3 轮串行、3 轮双 worker 通过，
+  漏通知、重复通知与错误文本注入均被原断言拒绝。原 CI 及首版 helper 的 KeyError 失败记录保留；
+  未改生产行为，未运行服务全套、CI 重试或部署，更新后的远端 CI 待验证。
+
+## 2026-10-08
+
+- #292 新增 LP Auto CLI 的 `status`、`config`、`on`、`off`，保留同义 `pause`；
+  通过运行中的 Prediction 服务与 Dashboard 共用状态。配置使用当前版本栅栏且不启用，
+  开启保留已保存参数并显示实际阻塞状态；关闭只暂停新增 BUY，保留订单和退出保护。
+  各命令支持单文档 JSON、HTTP loopback 限制和有限超时；不确定回执返回 UNKNOWN/2，
+  提示只读核对，不重发写请求或伪称回滚，输出遮蔽认证值。新增公开 CLI/HTTP 合同和原暂停回归定向验证；
+  未运行本地完整后端或部署，未在生产启用或修改 Auto。
+  PR 评审修复未知选项的错误边界：各 LP Auto 命令的 `--json` 仍返回单个 UNKNOWN/2 文档，
+  不发送请求；其他 CLI 保留原 argparse 错误。补充五个 LP 动作及非 LP 边界的公开回归。
+  CI 稳定性修复仅同步部分准备测试的逻辑时钟推进与完整候选刷新，保留真实后台线程、
+  五分钟重试及过期盘口拒绝；不改变生产新鲜度窗口、调度或断言。
+  原推送 CI 失败证据保留；修复后的远端 CI 待验证。
+
+- #290 LP 候选队列保留固定元数据代次、条件到方向键索引及 SQLite 覆盖行，
+  不再在队列返回或逐批续读、排除时保留全量展开的方向/元数据字典。
+  同路径协调 #284：历史摘要按最多 400 个方向在同一 SQLite 读快照中消费，
+  临时磁盘缓存不累积 Python 全量摘要；第二批失败时丢弃全部部分结果并关闭读事务。
+  保留完整排名、准备期间的可用候选、UNKNOWN/新鲜度、交易事实及代次保护；
+  排除、续读、旧读者与 deepcopy 同步，并拒绝续读期间已排除条件重新进入队列。
+  基线 3 项存储/摘要回归 RED，方向恢复与排除后复活回归亦先失败；
+  筛选阶段重复奖励写回回归也先失败；独立评审发现的非队列条件排除 KeyError
+  经服务入口回归 RED→GREEN，缺席条件过滤不创建空条目并保留旧读者内容；最终消费者联合定向检查 60 项通过。
+  仅有既有 websockets.legacy 依赖弃用警告，无线程异常或 unraisable 警告。
+  未改历史并发、资源限额或部署；RSS/cgroup 容量由后续独立对照验证，不宣称已降低云端峰值。
+
+- #288 自动池将独立 UNKNOWN SELL 保留为审计且不计入未确认回款，但不再单独占用 BUY 名额、资金或阻止有效的 100/5 配置与补位；未知 BUY、身份/账户事实和代次栅栏仍阻止新增。导入持仓的旧 BUY 回执 UNKNOWN 时保留会话指定的当前被动 SELL，避免重复撤单/重挂；其他自有历史 SELL 仍按原校验清理及重试，未知前置订单仍不授权新的退出。新增持久化 `buy_price_level`（1/2，旧存储文档缺字段默认 1、后续旧请求省略时保留原值）；自动 BUY 的 2 档为第二高的不同正深度买价，候选、收益估算、提交和 POST 前复核统一使用该价，缺档或漂移拒绝且不回退。评审修复同时拒绝真实买卖盘交叉，并按实际买一计算 2 档压力退出。CI 阻断修复恢复人工追加的 `best_bid_changed` 校验及缺省 1 档 guidance 载荷；47 项既有回归、4 项清理负例及 14 项 Issue #288 合同共 65 项本地定向通过。原 push/PR 的 29 项失败证据保留；本次未运行本地全套或部署，新远端 CI 待验证。
+
+- PR #285 对齐容器解释器安全回归：用 `make -n test` 展开的真实 Docker run 命令替代旧 Makefile 赋值文本断言，
+  在普通及 CI 记录两种模式中严格核对容器 Python 路径、字面 `pytest`、宿主解释器隔离及 metrics/JUnit 参数。
+  保留其余宿主解释器门禁断言；修复 nodeid 两种模式、104 项定向检查及 78 个 subtest 本地通过，不执行真实 Docker。
+  保留暂停护栏首次 8 通过、1 个准备期间响应耗时断言失败（1.596 秒，要求小于 1 秒）的证据。
+  同一护栏的受控环境对照支持原生 urllib 系统代理路径为延迟贡献因素；仅在检查命令中设置
+  `no_proxy=127.0.0.1,localhost,::1` 后，未插桩的 9 项暂停护栏单次通过；未改测试、阈值、源码或系统代理配置。
+  原 push/PR 的 legacy 失败证据保留；未宣称新远端 CI 通过，未部署或改变业务代码。
+
+- PR #285 修复 pytest 子测试证据核算：此前新 push/PR 的 legacy 均通过 5297 项测试及 82 个子测试，
+  但成功证据校验因 JUnit 总数包含子测试而失败。记录器现将真实子报告与父节点阶段分开，保留结果、耗时及 worker；
+  共用校验器严格核对父 testcase 加子报告总数，以及父/子跳过记录和 XML 元素数量，拒绝失败子报告冒充成功。
+  真实串行/双 worker 的通过、多个跳过及失败子测试回归通过，计数和子报告篡改均被拒绝；
+  本地定向 109 项及 78 个 subtest、宿主 stdlib 32 项检查通过。保留全部原失败及未改写的 CI/JUnit 记录，
+  未运行完整 legacy 套件、部署或宣称修复后的远端 CI 已通过。
+
 ## 2026-10-07
 
 - Production Smoke 失败改为明确的 `SMOKE_FAILED`，区分输入、版本身份、健康/进程、
@@ -10,12 +425,76 @@ operator-facing: what changed, which workflow is affected, and what was verified
   明示 `rollback_recommendation=review_required rollback_executed=false`，避免把验收失败误读为已回滚。
   原失败条件、非零退出、真实日志拒绝和只读边界保持；定向离线回归覆盖失败原因及未执行回滚的输出。
 
+- #282 LP 历史准备在阶段结束时释放已消费的重试快照；历史批次由 SQLite 按标的及 metadata 阶段范围筛选到期重试，
+  不再为每组历史请求读取全部活动重试行。保留单事务认领、所有权、截止时间/标的排序、SQLite 参数分批和代次栅栏；
+  初始认领规则不变，历史派发仍拒绝无时区或无效截止时间且不消耗任何重试。
+  既有定向回归 16 项先通过；生命周期、阶段范围及批次读取回归合计 22 项通过，时间戳回归 6 项 RED→GREEN，
+  修正后认领/回滚/所有权定向 6 项通过。离线同输入 61 条重试、181 个历史标的完整输出与基线一致；
+  历史边界存活快照行 244→0，总重试行解码 489→306，临时 SQLite 页占用不变。未部署；RSS/cgroup 与云端容量未验证。
+
+- #283 LP 候选方向临时库只保存 YES/NO 的身份和覆盖字段，按读取时保留的已发布元数据代次重建完整详情。
+  保留未知扩展字段、奖励回退、参与标记、历史摘要、时间和 Decimal；重复读取独立，旧读者不受新代发布影响。
+  资源回归先 RED；定向 30 项通过，完整正常/备用队列及业务轨迹 hash 与基线一致，成功、取消和异常退出均释放读者资源。
+  同环境离线 40 市场/80 方向合成对照：方向 SQLite 页占用 5,365,760→77,824 字节，序列化载荷 5,341,600→54,600 字节；
+  已发布元数据占用不变，每次构建增加 400 次临时库 SELECT。完整队列仍保存完整详情，Python 最终分配略增，
+  不将临时库节省等同 RSS 节省；单次计时不构成速度保证，cgroup 和云端容量未验证。未部署。
+
+- #279 澄清任务工作树规则：保留本地 `main` 的分叉提交及改动，从新抓取的
+  `origin/main` 创建任务；任务 checkout 的 `AGENTS.md` 与其链接的运行手册一起读取，
+  不把单独复制 `AGENTS.md` 当作迁移源码或工作流。已核对文档差异、Markdown 链接目标
+  和 `git diff --check`；未进行运行时、测试、CI、部署或机器一致性验证。
+
+- #279 将 N-leg 视为永久停用：默认 CI 仍要求四个后端服务和 non-LIVE portable，
+  仅把显式审定的 29 个专属文件记为未执行；三份共享文件、LP、暂停及 paused-shadow 护栏保持活动。
+  Make、CI 和部署证据共用严格选择策略；完整收集必须等于活动执行与退役集合的不相交并集。
+  新增 nodeid、阶段耗时、结果及 JUnit 记录，保留失败退出码；预检拒绝遗漏 LP/暂停执行、策略/哈希篡改、旧 attempt 与 false-full 证明。
+  Python 3.12.14 锁环境下修复后定向 103 项及 78 个 subtest 通过；此前 9 个暂停护栏通过；串行/双 worker 的真实 pytest 记录验证通过，保留 nodeid 中的 `@` 参数；
+  CPU 型号与架构分列并记录来源，原生读取及不可用时显式 unknown 的回归通过。
+  成功证据必须含完整阶段、环境与 CPU 状态；生产者和预检共用 JUnit 解析校验，拒绝空/重复/遗漏 testcase、
+  不一致的身份/结果及非有限耗时；失败仍保留部分记录和原始退出码。
+  历史失败证据保留，未运行全后端、GitHub CI 或部署；同源双 worker 耗时对照待稳定评审后进行，尚不宣称节省。
+
+- 开发规则随项目统一：明确 TDD、任务委派、Herdr 实施模型和 Ponytail 的适用边界，
+  不再依赖某台机器未定义的全局约定。新增 Air/Mini 独立开发环境设置与逐项比对步骤，
+  复用锁文件及依赖清单，保留服务使用的 Python 环境和各机凭据；两机均验证后才报告一致。
+  Air 独立 Python 3.12.14 环境按锁安装 98 个包，版本及依赖检查通过，4 项定向检查通过；
+  文档链接、命令语法、已有环境/符号链接及脏工作树拒绝验证通过；验证后复核源码身份。
+  Mini SSH 不可达，跨机一致性仍未验证。
+
+- #276 LP 候选筛选只保存市场到方向键/位置的索引，复用当前代方向详情，移除第二份完整临时详情库。
+  保留列表、元组、ValuesView 输入、完整正常/备用遍历、YES/NO、UNKNOWN、新鲜度、冷却和代次栅栏。
+  两个真实调用入口的复制回归先 4 failed；兼容性初审另检出内建 dict.values() 两项 RED；最终定向串行 68 passed、双 worker 19 passed，
+  局部类保留源的负向实验仍被拒绝；完整六步排名、三步补位及公开缓存筛选 hash 均与基线一致。
+  Linux 正反两轮同输入对照：筛选相位新增文件缓存减少 31.88 MiB，新增 cgroup 占用减少约 32.13 MiB；
+  返回后临时库及时释放，筛选与队列构建耗时均已记录，不新增速度上限。
+  详见 [验证记录](docs/operations/issue-276-direction-index-validation.md)。未部署，整体云端容量仍由 #263 跟踪。
+
+- #270 自动入场、手动入场及独立增仓 BUY 的临时占资，在本地发送结束或独占 runtime owner 交接后，由更晚的完整新鲜账户 API 覆盖。
+  旧 pending/preparing/sending 与 UNKNOWN 审计保留，不伪造交易所结果；关闭先阻止新发送，五秒内未排空的 HTTP 入场/增仓保留 owner 与资源并报告 STOPPING，完成后可再次关闭。空会话可补位，真实 API 敞口恢复纳管。
+  精确相同订单身份只计一次，包含部分成交的剩余买单占资及当前持仓成本；独立在途 BUY（含无 ID 的 accepted）继续保护自动与手动准入，SELL 不确定性及身份/时点/代次/停止/配置栅栏保持；动作类型按持久角色和操作身份区分，用户幂等键不改变类型，真实撤单不增加 BUY 占位；预留豁免、退役、轮换与审计共用类型判断。
+  真实隔离进程、SQLite 与离线 adapter 定向验证自动 4→5、手动/增仓 POST 前后中断、重复重启不重放、迟到敞口、部分成交及新请求隔离；串行与 n2/loadgroup 各 320 项通过。迟到 BUY 保留已核实成交与 API 成本，独立 UNKNOWN SELL 仍阻止准入；坏交易/MINED 在有效空账户覆盖前保留未知，退役不改写动作审计。
+  未部署或操作真实服务、账户与交易。
+
 - #270 后台核对不再把本进程尚未 POST 的自动 BUY 准备意图误改为 UNKNOWN，避免补位被自身发送前校验拒绝。
   仅在同一事务确认 reserved、活动入场 lane 与精确 pending/preparing entry action 时保留原预留及名额；
   同时检查 session 的 POST 标志，已发送、无本进程 lane、身份冲突和独立未决动作仍按原 UNKNOWN 规则处理。
   真实 adapter/SQLite、受控 Event 验证签名及发送前账户读取期间两笔补位 3→5、重放防重、停止/配置栅栏与迟到回执；
   旧逻辑两个重叠用例 RED，移除 session POST 检查的负向对照 RED；定向串行及双 worker 各 65 项通过。
   未部署或操作真实交易；慢读取、线上目标数量及自然撤单后的持续恢复仍需独立运行验收。
+
+- #273 位置保护撤单事实成功提交后，每个真实撤单 action 仅在本进程排入一次异步通知；
+  已配置渠道各调用一次，失败、超时、回执未知仅记事件/渠道/时间/错误类别的脱敏日志，未配置小爱直接跳过。
+  重启不补发已有撤单（包括重启后才完成的撤单）；启动读取失败禁用本实例此类通知，业务核对及撤单重试继续。
+  不增加通知持久化、业务字段或依赖，不把排队/尝试写为已送达；needs-attention/recovery、受阻通知及资金状态机保持原契约。
+  业务提交到投递之间进程退出可丢通知；每事件一个 daemon 任务，顺序调用渠道，沿用底层发送及语音锁等待行为。
+  真实 tick/runtime、隔离 SQLite 与事件/屏障回归验证重复/并发、恢复、新事件、丢任务和安全日志；
+  初审修复既有静默边界遗漏：尊重预设 notification_sent=True，成交收集与复查截止撤单在收敛后不发保护通知；
+  排队/尝试仍不写此字段。真实两价位收敛回归先 2 failed，最小 guard 修复后直接相关检查 76 passed；
+  受控并发三次各 5 passed，先前六项负向故障注入记录保留；两 worker 检查因指定环境缺 pytest-xdist 为 BLOCKED。
+  未部署或真实发送。
+  CI/评审后续：迁移三处跨文件通知消费者，保留撤单、回执与代次断言，等待实际任务并验证收敛/重启不重发；
+  FILLED 与账户栅栏静默路径直接断言零入队，受控错误入队和重复消费均被回归拒绝。
+  使用已有隔离 Python 环境补齐 xdist，相关串行与双 worker 各 98 项通过；保留原 CI 三项失败及诊断脚本路径错误记录。
 
 ## 2026-10-06
 

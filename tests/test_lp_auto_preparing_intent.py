@@ -11,92 +11,133 @@ from tests.test_lp_order_registration_contract import _open_order
 
 
 @pytest.mark.parametrize('reconcile', [False, True], ids=['control', 'overlap'])
-@pytest.mark.parametrize('phase', ['signing', 'presend-account-read'])
+@pytest.mark.parametrize('phase', ['signing', 'after-sign'])
 def test_three_to_five_keeps_both_preparing_reservations(runtime, reconcile, phase):
-    store, adapter, account, lp, execution, _ = prepare(runtime)
-    account.orders = tuple(_open_order(f'manual-{i}', 'BUY', price='.40', original='20',
+    import json
+    from collections import Counter
+    from copy import deepcopy
+    from datetime import datetime
+    store, adapter, account, lp, execution, public = prepare(runtime)
+    original_orders = tuple(_open_order(f'manual-{i}', 'BUY', price='.40', original='20',
         token_id=_refill_identity(i)[2]).model_copy(update={
-            'market': _refill_identity(i)[1], 'condition_id': _refill_identity(i)[1]})
-        for i in range(1, 4))
-    entered, release = [Event(), Event()], [Event(), Event()]
-    signing_entered, signing_release = [Event(), Event()], [Event(), Event()]
+            'market': _refill_identity(i)[1], 'condition_id': _refill_identity(i)[1]}) for i in range(1, 4))
+    account.orders = original_orders
+    tokens = [_refill_identity(i)[2] for i in (4, 5)]
+    entered = {token: Event() for token in tokens}
+    release = {token: Event() for token in tokens}
+    signing_entered = {token: Event() for token in tokens}
+    signing_release = {token: Event() for token in tokens}
     original_sign = account.create_limit_order
-    armed = [None]
-    rounds = []
-
-    def pause(index):
-        entered[index].set()
-        assert release[index].wait(5), 'Independent preparation watchdog'
-
+    signed_objects, rounds, captures = {}, {}, []
+    latest_financial_as_of, pending_audits = [], {}
     def sign(**kwargs):
-        index = len(account.posts)
+        token = kwargs['token_id']
+        assert token in entered
         if phase == 'signing':
-            pause(index)
+            entered[token].set()
+            assert release[token].wait(5), 'Independent preparation watchdog'
         else:
-            signing_entered[index].set()
-            assert signing_release[index].wait(5), 'Independent signing watchdog'
-            armed[0] = index
-        return original_sign(**kwargs)
-
-    def positions_read(_):
-        index, armed[0] = armed[0], None
-        if index is not None:
-            pause(index)
-
+            signing_entered[token].set()
+            assert signing_release[token].wait(5), 'Independent signing watchdog'
+        signed = original_sign(**kwargs)
+        signed_objects[token] = signed
+        if phase == 'after-sign':
+            entered[token].set()
+            assert release[token].wait(5), 'Independent signed-result watchdog'
+        return signed
     account.create_limit_order = sign
-    account.before_positions = positions_read
     with ThreadPoolExecutor(1) as workers:
         pending = workers.submit(execution.lp_auto_run_once, round_id='refill-two')
         try:
-            for index in range(2):
-                account_round = None
-                if phase == 'presend-account-read':
-                    assert signing_entered[index].wait(5)
-                    # The adapter serializes private reads. Complete the
-                    # reconciler's real round before blocking the send read;
-                    # its facts publish while that later read is still active.
+            if phase == 'after-sign':
+                for token in tokens:
+                    assert signing_entered[token].wait(5), 'Both exact SDK signers entered'
+                for token in tokens:
                     account_round = adapter.lp_account_round_begin(store.lp_trade_generation)
-                    rounds.append(account_round)
-                    adapter.lp_account_snapshot(account_round=account_round)
-                    signing_release[index].set()
-                assert entered[index].wait(5), 'Independent auto-submit watchdog'
+                    rounds[token] = account_round
+                    packet = adapter.lp_account_snapshot(account_round=account_round)
+                    captures.append(dict(token=token, phase='pre-sign-account', packet=deepcopy(packet)))
+                    signing_release[token].set()
+            for token in tokens:
+                assert entered[token].wait(5), 'Both actual token-bound external results held'
+            before_all = execution.lp_auto_state()
+            assert account.orders == original_orders and account.posts == []
+            assert before_all['slots']['occupied'] == 5
+            assert Decimal(before_all['funds']['buy_reserved_usd']) == 40
+            by_token = {i['token_id']: i for i in before_all['intents'] if i['token_id'] in tokens}
+            assert set(by_token) == set(tokens)
+            assert len({i['session_id'] for i in by_token.values()}) == 2
+            assert len({i['intent_id'] for i in by_token.values()}) == 2
+            for token in tokens:
                 before = execution.lp_auto_state()
-                intent = next(i for i in before['intents'] if i['state'] == 'reserved')
+                intent = by_token[token]
                 sid = intent['session_id']
+                assert intent['state'] == 'reserved' and Decimal(intent['reserved_usd']) == 8
                 assert lp.entry_send_inflight(sid)
-                assert len(account.orders) == 3 + index and len(account.posts) == index
-                action = next(a for a in store.lp_actions(sid) if a['role'] == 'entry')
+                assert account.orders == original_orders and account.posts == []
+                if phase == 'after-sign':
+                    assert signed_objects[token].token_id == token
+                action, = [a for a in store.lp_actions(sid) if a['role'] == 'entry']
+                pending_audits[token] = deepcopy(action)
                 assert action['state'] == 'pending'
                 assert action['submit_stage'] == 'preparing' and action['post_started'] is False
-                # These fields are initially on the action, not the session.
-                assert store.lp_session(sid).get('post_started') is None
+                assert action['token_id'] == token and action['session_id'] == sid
+                assert store.lp_session(sid).get('post_started') is False
+                assert store.lp_session(sid)['submit_stage'] == 'preparing'
+                financial_as_of = before['funds']['as_of']
+                assert financial_as_of
                 if reconcile:
-                    lp.reconcile_facts(sid, apply_lock=(
-                        execution._acquire_global_lock, execution._release_global_lock),
-                        account_round=account_round)
+                    reconciled = lp.reconcile_facts(sid, apply_lock=(execution._acquire_global_lock,
+                        execution._release_global_lock), account_round=rounds.get(token))
                     after = execution.lp_auto_state()
                     current = next(i for i in after['intents'] if i['intent_id'] == intent['intent_id'])
-                    assert current['state'] == 'reserved', current
-                    assert current['reserved_usd'] == intent['reserved_usd']
-                    assert current['financial_status'] == 'known'
-                    assert after['slots']['occupied'] == before['slots']['occupied']
-                    assert not current.get('reconcile_reason')
-                release[index].set()
+                    captures.append(dict(token=token, phase='ordinary-overlap', current=deepcopy(current),
+                        result_error=reconciled[3], state=deepcopy(after)))
+                    (store.path.parent / 'CI-D-overlap-held-proof.json').write_text(json.dumps(dict(
+                        phase=phase, held=before_all, captures=captures, pending_audits=pending_audits),
+                        default=str, indent=2))
+                    assert current['state'] == 'reserved' and current['reserved_usd'] == intent['reserved_usd']
+                    assert current['financial_status'] == 'known', (current, reconciled[3])
+                    assert reconciled[3] is None and not current.get('reconcile_reason'), (current, reconciled[3])
+                    assert after['slots']['occupied'] == before['slots']['occupied'] == 5
+                    assert after['funds']['as_of'] == financial_as_of
+                assert account.posts == [] and account.orders == original_orders
+                assert all(next(i for i in execution.lp_auto_state()['intents'] if i['intent_id'] == held['intent_id'])['reserved_usd'] == held['reserved_usd'] for held in by_token.values())
+                latest_financial_as_of.append(execution.lp_auto_state()['funds']['as_of'])
+                assert latest_financial_as_of[-1]
+            assert len({a['action_id'] for a in pending_audits.values()}) == 2
+            assert len({a['action_key'] for a in pending_audits.values()}) == 2
         finally:
-            for event in (*release, *signing_release):
+            for event in (*release.values(), *signing_release.values()):
                 event.set()
-            for account_round in rounds:
+            for account_round in rounds.values():
                 adapter.lp_account_round_end(account_round)
         state = pending.result(timeout=5)
     assert len(account.orders) == state['slots']['occupied'] == 5
-    assert len(account.posts) == 2
+    assert Counter(p.token_id for p in account.posts) == Counter(tokens)
+    assert all(p.post_only is True and p.maker_amount == 8000000 and p.taker_amount == 20000000 for p in account.posts)
     assert Decimal(state['funds']['buy_reserved_usd']) == 40
-    assert state['funds']['status'] == 'known'
+    assert datetime.fromisoformat(latest_financial_as_of[-1]) <= runtime.clock[0]
+    assert state['funds']['status'] == 'unknown'
+    assert state['funds']['as_of'] == latest_financial_as_of[-1]
+    accepted_audits = {}
+    for token, before in pending_audits.items():
+        action, = store.lp_actions(before['session_id'])
+        assert action['state'] == 'accepted' and action['post_started'] is True
+        assert action['action_id'] == before['action_id'] and action['action_key'] == before['action_key']
+        assert action['token_id'] == token and action['session_id'] == before['session_id']
+        accepted_audits[before['session_id']] = deepcopy(store.lp_actions(before['session_id']))
     _advance(runtime)
     assert execution.lp_auto_run_once(round_id='refill-two')['slots']['occupied'] == 5
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
     assert execution.lp_auto_run_once(round_id='next-round')['slots']['occupied'] == 5
-    assert len(account.posts) == 2
+    assert Counter(p.token_id for p in account.posts) == Counter(tokens)
     assert account.cancels == account.market_orders == []
+    assert {sid: store.lp_actions(sid) for sid in accepted_audits} == accepted_audits
+    (store.path.parent / 'CI-D-two-native-proof.json').write_text(json.dumps(dict(
+        phase=phase, reconcile=reconcile, held=before_all, captures=captures,
+        pending_audits=pending_audits, accepted_audits=accepted_audits, final=state,
+        current=execution.lp_auto_state(), post_tokens=[p.token_id for p in account.posts]), default=str, indent=2))
 
 
 @pytest.mark.parametrize('fence, reason', [
@@ -104,40 +145,71 @@ def test_three_to_five_keeps_both_preparing_reservations(runtime, reconcile, pha
     ('config', 'config_version_changed'),
 ])
 def test_preparing_publication_keeps_send_fences(runtime, fence, reason):
+    import json
+    from copy import deepcopy
+    from time import monotonic
     store, _, account, lp, execution, _ = prepare(runtime, target=1, count=1)
     entered, release = Event(), Event()
     original_sign = account.create_limit_order
-
     def sign(**kwargs):
         entered.set()
         assert release.wait(5), 'Independent signing watchdog'
         return original_sign(**kwargs)
-
     account.create_limit_order = sign
     with ThreadPoolExecutor(1) as workers:
         pending = workers.submit(execution.lp_auto_run_once, round_id='fenced-entry')
         try:
             assert entered.wait(5)
-            intent = execution.lp_auto_state()['intents'][0]
+            intent, = execution.lp_auto_state()['intents']
             sid = intent['session_id']
-            lp.reconcile_facts(sid, apply_lock=(
-                execution._acquire_global_lock, execution._release_global_lock))
+            original_audit, = deepcopy(store.lp_actions(sid))
+            assert original_audit['state'] == 'pending' and original_audit['post_started'] is False
+            lp.reconcile_facts(sid, apply_lock=(execution._acquire_global_lock, execution._release_global_lock))
             assert execution.lp_auto_state()['intents'][0]['state'] == 'reserved'
             if fence == 'pause':
                 execution.lp_auto_set_desired_running(False)
+                deadline = monotonic() + 5
+                while True:
+                    local = execution.lp_auto_state()
+                    if local['active_plan'] is None and local['last_round']['completed_at']:
+                        break
+                    assert monotonic() < deadline, 'Public paused local closure watchdog'
+                    Event().wait(.01)
+                action, = local['last_round']['actions']
+                assert action['state'] == 'not_sent' and action['reason'] == 'cycle_ended'
+                assert lp.entry_send_inflight(sid), 'Held real SDK signature has not ended with local closure'
+                assert account.posts == []
             elif fence == 'stop':
                 execution.lp_stop(sid)
+                assert store.lp_session(sid)['stop_requested'] is True
             else:
-                # Inject a durable version invalidation. Public configuration
-                # correctly refuses edits while an entry is still occupied.
-                execution._auto_pool._update(lambda d: d.update(config_version=d['config_version'] + 1))
+                # Existing durable-version fixture; public occupied config correctly refuses edits.
+                execution._auto_pool._update(lambda d: d.update(config_version=d['config_version'] + 1, trading_config_version=d['trading_config_version'] + 1))
         finally:
             release.set()
         state = pending.result(timeout=5)
+        deadline = monotonic() + 5
+        while lp.entry_send_inflight(sid):
+            assert monotonic() < deadline, 'Original native sender completion watchdog'
+            Event().wait(.01)
     assert account.posts == account.cancels == []
-    assert state['last_round']['actions'][0]['reason'] == reason
-    assert store.lp_session(sid)['post_started'] is False
-    assert store.lp_actions(sid)[0]['state'] == 'rejected'
+    action, = state['last_round']['actions']
+    assert action['reason'] == ('cycle_ended' if fence == 'pause' else 'prepare_failed')
+    assert action['state'] == ('not_sent' if fence == 'pause' else 'rejected')
+    assert state['active_plan'] is None and state['last_round']['completed_at']
+    current = store.lp_session(sid)
+    audit, = store.lp_actions(sid)
+    assert current['idempotency_key'] == 'lp-auto:' + intent['intent_id']
+    assert audit['action_id'] == original_audit['action_id'] and audit['action_key'] == original_audit['action_key']
+    assert audit['token_id'] == original_audit['token_id'] and audit['session_id'] == sid
+    assert audit['state'] == 'rejected'
+    assert not current.get('entry_order_id') and not audit.get('order_id')
+    for fact in (current, audit):
+        assert fact['submit_stage'] == 'prepare_failed'
+        assert fact['post_started'] is False and fact['submit_post_started_at'] is None
+    (store.path.parent / 'CI-D-control-native-proof.json').write_text(json.dumps(dict(
+        fence=fence, original_reason_label=reason, state=state, intent=intent,
+        original_audit=original_audit, session=current, audit=audit), default=str, indent=2))
 
 
 @pytest.mark.parametrize('uncertainty', [
@@ -200,15 +272,25 @@ def test_preparing_uncertainty_still_becomes_unknown(runtime, uncertainty):
             assert current['reserved_usd'] == intent['reserved_usd']
             assert owner.lp_auto_state()['slots']['occupied'] == 1
             assert account.posts == []
+            financial_as_of = owner.lp_auto_state()['funds']['as_of']
         finally:
             release.set()
         pending.result(timeout=5)
-    assert account.posts == account.cancels == []
+    if uncertainty == 'read-error':
+        assert len(account.posts) == 1 and account.cancels == []
+        assert account.posts[0].token_id == intent['token_id']
+        assert account.posts[0].maker_amount == 8000000 and account.posts[0].taker_amount == 20000000
+        final = execution.lp_auto_state()
+        assert final['funds']['status'] == 'unknown' and final['funds']['as_of'] == financial_as_of
+        assert financial_as_of
+    else:
+        assert account.posts == account.cancels == []
 
 
 @pytest.mark.parametrize('receipt', ['late', 'missing', 'idless'])
 @pytest.mark.parametrize('stale_reserved', [False, True], ids=['sending-intent', 'stale-reserved-intent'])
 def test_post_started_with_stale_preparing_action_keeps_unknown_until_receipt(runtime, receipt, stale_reserved):
+    from datetime import datetime
     store, _, account, lp, execution, _ = prepare(runtime, target=1, count=1)
     entered, release = Event(), Event()
     original_post = account.post_order
@@ -248,6 +330,8 @@ def test_post_started_with_stale_preparing_action_keeps_unknown_until_receipt(ru
             assert current['reserved_usd'] == intent['reserved_usd']
             assert not current.get('reservation_coverage')
             assert execution.lp_auto_state()['slots']['occupied'] == 1
+            financial_as_of = execution.lp_auto_state()['funds']['as_of']
+            assert financial_as_of and datetime.fromisoformat(str(financial_as_of).replace('Z', '+00:00'))
         finally:
             release.set()
         state = pending.result(timeout=5)
@@ -258,7 +342,8 @@ def test_post_started_with_stale_preparing_action_keeps_unknown_until_receipt(ru
         assert session['entry_order_id'] == action['order_id'] == 'refill-1'
         assert action['state'] == 'accepted'
         assert state['slots']['occupied'] == 1
-        assert state['funds']['status'] == 'known'
+        assert state['funds']['status'] == 'unknown'
+        assert state['funds']['as_of'] == financial_as_of
     else:
         assert not session['entry_order_id']
         assert session['submit_status'] == ('unknown' if receipt == 'missing' else 'accepted_without_order_id')

@@ -1,5 +1,7 @@
 """Shared LP facts must recover without weakening the automatic funds fence."""
 
+from tests.test_lp_auto_pool import advance_auto_wait
+
 import pytest
 
 from decimal import Decimal
@@ -230,15 +232,19 @@ def test_fresh_funds_survive_refresh_but_expire_and_recovery_wakes_scheduler(tmp
     from tests import test_lp_auto_pool as venue
     from open_trader.polymarket_lp_scheduler import LPAutoScheduler
 
-    execution, exchange, _, _ = setup(tmp_path)
+    execution, exchange, lp, store = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
     execution.lp_auto_run_once()
     execution.lp_auto_set_desired_running(False)
     scheduler_now = venue.NOW
     scheduler = LPAutoScheduler(execution, clock=lambda: scheduler_now)
+    scheduler_now = venue.NOW
     assert scheduler.run_due()
-    assert not scheduler.run_due()
+    first_round = execution.lp_auto_state()['last_round']['round_id']
+    assert scheduler.run_due(), 'Paused automatic observation stays continuously runnable'
+    assert execution.lp_auto_state()['last_round']['round_id'] != first_round
+    assert execution.lp_auto_state()['plan_wait'] is None
     entered, release = Event(), Event()
     read = exchange.lp_snapshot
 
@@ -260,8 +266,16 @@ def test_fresh_funds_survive_refresh_but_expire_and_recovery_wakes_scheduler(tmp
             release.set()
         tick.result(timeout=5)
     assert execution.lp_auto_state()['funds']['status'] == 'known'
-    assert scheduler.run_due(), 'recovery should not wait another polling interval'
-    assert not scheduler.run_due(), 'one recovery produces a coalesced wake'
+    scheduler_now = venue.NOW
+    assert scheduler.run_due(), 'recovery runs after the persisted deadline has elapsed'
+    recovered_round = execution.lp_auto_state()['last_round']['round_id']
+    assert scheduler.run_due(), 'Healthy current cycles remain runnable after the recovery wake'
+    assert execution.lp_auto_state()['last_round']['round_id'] != recovered_round
+    assert execution.lp_auto_state()['plan_wait'] is None
+    assert Decimal(execution.lp_auto_state()['funds']['buy_reserved_usd']) == 0
+    assert Decimal(execution.lp_auto_state()['funds']['available_usd']) == 100
+    scheduler.stop()
+    lp.drain_submissions()
     assert len(exchange.posts) == 1
 
 
@@ -466,8 +480,8 @@ def test_review_cancel_omitted_from_snapshot_stays_outside_common_mutex(
     from tests.test_lp_auto_pool import _manual_request
 
     execution, exchange, lp, store = setup(tmp_path)
-    now = datetime(2026, 9, 27, 8, tzinfo=UTC)
-    lp.clock = lambda: now
+    from tests import test_lp_auto_pool as venue
+    now = venue.NOW
     store.lp_create_session(
         "review-off-lock",
         "review-off-lock",
@@ -530,6 +544,13 @@ def test_review_cancel_omitted_from_snapshot_stays_outside_common_mutex(
     finally:
         release.set()
         worker.join(5)
+        import json
+        from tests import test_lp_auto_pool as venue
+        (tmp_path / 'manual-review-observation.json').write_text(json.dumps(dict(
+            results=results, session=store.lp_session("review-off-lock"),
+            lp_now=lp._now(), venue_now=venue.NOW, entered=entered.is_set()), default=str, indent=2))
+        assert not worker.is_alive()
+        lp.drain_submissions()
     assert not worker.is_alive()
     assert cancel_calls == ["o1"]
     row = store.lp_session("review-off-lock")
@@ -542,8 +563,8 @@ def test_converged_queue_buy_allows_protected_sell_outside_common_mutex(tmp_path
     from tests.test_lp_auto_pool import _manual_request
 
     execution, exchange, lp, store = setup(tmp_path)
-    now = datetime(2026, 9, 27, 8, tzinfo=UTC)
-    lp.clock = lambda: now
+    from tests import test_lp_auto_pool as venue
+    now = venue.NOW
     store.lp_create_session(
         "protected-off-lock",
         "protected-off-lock",
@@ -622,7 +643,8 @@ def test_converged_queue_buy_allows_protected_sell_outside_common_mutex(tmp_path
         return {"order_id": "sell-o1", "status": "LIVE"}
 
     exchange.submit_protected_sell = protected_sell
-    worker = Thread(target=execution.lp_tick)
+    results = []
+    worker = Thread(target=lambda: results.append(execution.lp_tick()))
     worker.start()
     try:
         assert entered.wait(5)
@@ -639,6 +661,13 @@ def test_converged_queue_buy_allows_protected_sell_outside_common_mutex(tmp_path
     finally:
         release.set()
         worker.join(5)
+        import json
+        from tests import test_lp_auto_pool as venue
+        (tmp_path / 'manual-protected-observation.json').write_text(json.dumps(dict(
+            results=results, session=store.lp_session("protected-off-lock"),
+            lp_now=lp._now(), venue_now=venue.NOW, entered=entered.is_set()), default=str, indent=2))
+        assert not worker.is_alive()
+        lp.drain_submissions()
     assert not worker.is_alive()
     assert len(sell_calls) == 1
     assert sell_calls[0]["token_id"] == "m00"
@@ -733,26 +762,39 @@ def test_partial_fill_collects_remaining_buy_before_scoring(tmp_path):
     assert len(exchange.posts) == 1
 
 
-def test_scheduler_reuses_published_facts_and_leaves_settled_history_alone(tmp_path):
+def test_scheduler_reuses_published_facts_and_leaves_settled_history_alone(tmp_path, monkeypatch):
     execution, exchange, _, _ = setup(tmp_path)
+    exchange.get_order_scoring = lambda order_id: True
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
     execution.lp_auto_run_once()
     execution.lp_auto_set_desired_running(False)
     execution.lp_tick()
     from open_trader.polymarket_lp_scheduler import LPAutoScheduler
-    from tests.test_lp_auto_pool import NOW
-    scheduler = LPAutoScheduler(execution, clock=lambda: NOW)
+    from tests import test_lp_auto_pool as venue
+    scheduler = LPAutoScheduler(execution, clock=lambda: venue.NOW)
     read = exchange.lp_snapshot
     calls = []
     exchange.lp_snapshot = lambda request: calls.append(request['token_id']) or read(request)
+    advance_auto_wait(execution, monkeypatch)
+    published = execution.lp_tick()
+    assert published['facts_error'] is None
+    assert venue._maybe_datetime(published['facts_checked_at']) == venue.NOW
+    assert execution.lp_auto_state()['intents'][0]['financial_status'] == 'known'
+    calls.clear()
     assert scheduler.run_due()
     assert calls == [], 'scheduler must reuse the facts tick just published'
     exchange.orders[0]['status'] = 'CANCELED'
     execution.lp_tick()
     calls.clear()
+    advance_auto_wait(execution, monkeypatch)
+    execution.lp_tick()
+    calls.clear()
     assert scheduler.run_due()
     scheduler.request_check()
+    advance_auto_wait(execution, monkeypatch)
+    execution.lp_tick()
+    calls.clear()
     assert scheduler.run_due()
     assert calls == [], 'settled history must leave high-frequency account reads'
     assert execution.lp_auto_state()['funds']['status'] == 'known'
@@ -760,16 +802,29 @@ def test_scheduler_reuses_published_facts_and_leaves_settled_history_alone(tmp_p
 
 def test_session_and_funds_publication_roll_back_together(tmp_path):
     import sqlite3
+    from copy import deepcopy
     execution, exchange, _, store = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
     sid = execution.lp_auto_run_once()['intents'][0]['session_id']
     before = store.lp_session(sid)
+    audits = deepcopy(store.lp_actions(sid))
+    funds = deepcopy(execution.lp_auto_state()['funds'])
     exchange.orders[0]['status'] = 'CANCELED'
     with sqlite3.connect(store.path) as connection:
         connection.execute("CREATE TRIGGER fail_funds BEFORE UPDATE ON lp_auto_pool BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
     assert execution.lp_tick()['state'] == 'error'
-    assert store.lp_session(sid) == before
+    after = store.lp_session(sid)
+    observed = after['buy_yield_observations']['o1']
+    assert observed['state'] == 'known' and observed['order_id'] == 'o1'
+    assert Decimal(observed['quantity']) == 20 and Decimal(observed['capital_usd']) == 8
+    assert observed['checked_at'] and observed['reward_checked_at'] and observed['book_received_at']
+    expected = deepcopy(before)
+    expected.update(buy_yield_observations=after['buy_yield_observations'],
+        buy_yield_unknown={}, updated_at=after['updated_at'])
+    assert after == expected, 'Only the independent successful yield publication committed'
+    assert store.lp_actions(sid) == audits
+    assert execution.lp_auto_state()['funds'] == funds
     assert Decimal(execution.lp_auto_state()['funds']['buy_reserved_usd']) == 8
     with sqlite3.connect(store.path) as connection:
         connection.execute('DROP TRIGGER fail_funds')
@@ -778,7 +833,7 @@ def test_session_and_funds_publication_roll_back_together(tmp_path):
     assert Decimal(execution.lp_auto_state()['funds']['buy_reserved_usd']) == 0
 
 
-def test_missing_submitted_session_keeps_reservation(tmp_path):
+def test_missing_submitted_session_keeps_reservation(tmp_path, monkeypatch):
     import sqlite3
     execution, exchange, _, store = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
@@ -786,6 +841,7 @@ def test_missing_submitted_session_keeps_reservation(tmp_path):
     sid = execution.lp_auto_run_once()['intents'][0]['session_id']
     with sqlite3.connect(store.path) as connection:
         connection.execute('DELETE FROM lp_sessions WHERE session_id=?', (sid,))
+    advance_auto_wait(execution, monkeypatch)
     result = execution.lp_auto_run_once()
     assert result['funds']['status'] == 'unknown'
     assert Decimal(result['funds']['buy_reserved_usd']) == 8
@@ -915,7 +971,9 @@ def test_production_trade_structure_preserves_funds_until_reconciled(tmp_path, m
         Decimal(1000), Decimal(1000), [], [], current[0], (trade,), True
     )
     lp.exchange = adapter
+    accepted_audit = store.lp_actions(sid)
     result = execution.lp_auto_reconcile_unknown()
+    assert store.lp_actions(sid) == accepted_audit
     if trade_kind != 'failed':
         assert store.lp_session(sid)['state'] != 'complete'
         assert result['funds']['status'] == 'unknown'
@@ -925,23 +983,47 @@ def test_production_trade_structure_preserves_funds_until_reconciled(tmp_path, m
             assert store.lp_session(sid)['facts_error'] == 'trade_not_confirmed'
     # A reliable failed trade and zero-fill terminal receipt can settle safely.
     audit_before = store.lp_actions(sid)
+    session_before = store.lp_session(sid)
     current[0] += timedelta(seconds=1)
     trade.clear()
     trade.update(id='t1', token_id='m00', taker_order_id='o1', status='FAILED')
     result = execution.lp_auto_reconcile_unknown()
     assert result['funds']['status'] == 'known'
-    assert store.lp_session(sid)['reservation_coverage']['state'] == 'covered'
-    if trade_kind == 'mined':
-        assert store.lp_session(sid)['state'] == 'entry_open'
-        assert store.lp_session(sid)['facts_error'] == 'trade_not_confirmed'
-    # Account-wide coverage releases funds; the independent LP lane still
-    # owns the accepted session's terminal recovery (as in the normal tick).
+    covered = store.lp_session(sid)
+    facts = execution._auto_pool._read()['account_financial_facts']
+    assert facts['financial_status'] == 'known' and facts['reason_codes'] == []
+    assert facts['buys'] == facts['positions'] == facts['pending_buy_actions'] == []
+    assert facts['read_started_at'] == current[0].isoformat()
+    assert facts['trade_generation'] == store.lp_trade_generation()
+    assert facts['report_status'] == 'known' and facts['confirmed_fill_facts'] == []
+    assert covered['reservation_coverage']['state'] == 'covered'
+    assert covered['reservation_coverage']['snapshot_id'] == facts['snapshot_id']
+    assert covered['reservation_coverage']['request_finished_at'] < facts['read_started_at']
+    if trade_kind == 'failed':
+        assert session_before['state'] == 'complete'
+        assert covered.get('account_coverage_retired') is None
+        assert covered['order_history']['o1']['status'] == 'CANCELED'
+    else:
+        assert covered['account_coverage_retired']['reason'] == 'account_observation_no_exposure'
+        assert covered['account_coverage_retired']['snapshot_id'] == facts['snapshot_id']
+    assert covered['state'] == 'complete'
+    assert covered['facts_error'] == session_before['facts_error']
+    assert covered['order_history'] == session_before['order_history']
+    for key in ('buy_filled_quantity', 'buy_cost', 'residual_quantity'):
+        assert covered[key] == session_before[key]
+        assert Decimal(covered[key]) == 0
+    assert store.lp_actions(sid) == audit_before
+    assert result['slots']['occupied'] == 0
+    # API coverage retires empty management without rewriting old trade audit.
+    # An explicit report read can settle that audit; the active monitor skips it.
     if recovery_lane == 'explicit':
         lp.reconcile_facts(sid)
+        assert store.lp_session(sid)['facts_error'] is None
     else:
-        execution.lp_tick()
+        assert execution.lp_tick()['state'] == 'none'
+        assert store.lp_session(sid)['facts_error'] == session_before['facts_error']
+        assert store.lp_session(sid)['order_history'] == session_before['order_history']
     assert store.lp_session(sid)['state'] == 'complete'
-    assert store.lp_session(sid)['facts_error'] is None
     assert not execution._auto_pool._excluded('m00')
     assert store.lp_session(sid)['submit_status'] == 'accepted'
     assert store.lp_actions(sid) == audit_before
@@ -1083,16 +1165,15 @@ def test_tick_recovers_saved_accepted_id_after_receipt_apply_was_busy(tmp_path):
     execution, exchange, _, store = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
-    original = exchange.lp_post_order
-    with (tmp_path / 'execution.lock').open('a+') as lock:
-        def posted(signed):
-            result = original(signed)
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return result
-        exchange.lp_post_order = posted
+    from copy import deepcopy
+    from tests.test_lp_auto_plan_execution import _native_unbound_receipt
+    with _native_unbound_receipt(store, 'm00'):
         result = execution.lp_auto_run_once()
         sid = result['intents'][0]['session_id']
         assert not store.lp_session(sid).get('entry_order_id')
+        audit, = store.lp_actions(sid)
+        assert audit['state'] == 'accepted' and audit['post_started'] is True and audit['order_id'] == 'o1'
+        original_audit = deepcopy(audit)
         assert result['funds']['status'] == 'unknown'
     exchange.orders.append(dict(order_id='extra', token_id='m00', condition_id='m00', side='BUY',
         status='CANCELED', original_size='1', size_matched='0', price='.4'))
@@ -1102,6 +1183,7 @@ def test_tick_recovers_saved_accepted_id_after_receipt_apply_was_busy(tmp_path):
     assert store.lp_session(sid)['entry_order_id'] == 'o1'
     assert execution.lp_auto_state()['funds']['status'] == 'known'
     assert len(exchange.posts) == 1
+    assert store.lp_actions(sid) == [original_audit]
 
 
 def test_fresh_read_during_manual_cancel_cannot_restore_known_funds(tmp_path):
@@ -1253,7 +1335,7 @@ def test_filled_receipt_uses_current_positions_only_when_complete(tmp_path, posi
     assert len(exchange.posts) == 1
 
 
-def test_slow_settled_report_does_not_block_active_recovery_or_new_buy(tmp_path):
+def test_slow_settled_report_does_not_block_active_recovery_or_new_buy(tmp_path, monkeypatch):
     from datetime import timedelta
     from tests.test_lp_auto_pool import NOW
     execution, exchange, _, store = setup(tmp_path, 2)
@@ -1275,6 +1357,7 @@ def test_slow_settled_report_does_not_block_active_recovery_or_new_buy(tmp_path)
             assert release.wait(5)
         return read(request)
     exchange.lp_snapshot = delayed
+    advance_auto_wait(execution, monkeypatch)
     with ThreadPoolExecutor(2) as workers:
         assert execution.lp_generate_due_auto_reports() == []
         assert not entered.is_set()
@@ -1378,7 +1461,7 @@ def test_slow_dashboard_does_not_block_session_and_funds_publication(tmp_path):
         dashboard.result(timeout=5)
 
 
-def test_slow_session_does_not_block_another_market_buy(tmp_path):
+def test_slow_session_does_not_block_another_market_buy(tmp_path, monkeypatch):
     execution, exchange, lp, _ = setup(tmp_path, 2)
     second = lp._candidate_pool.pop('m01')
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=2))
@@ -1397,6 +1480,7 @@ def test_slow_session_does_not_block_another_market_buy(tmp_path):
         return read(request)
 
     exchange.lp_snapshot = delayed
+    advance_auto_wait(execution, monkeypatch)
     with ThreadPoolExecutor(1) as workers:
         result = workers.submit(execution.lp_auto_run_once)
         try:
@@ -1411,7 +1495,7 @@ def test_slow_session_does_not_block_another_market_buy(tmp_path):
         result.result(timeout=5)
 
 
-def test_failed_session_keeps_capital_but_allows_other_market_buy(tmp_path):
+def test_failed_session_keeps_capital_but_allows_other_market_buy(tmp_path, monkeypatch):
     execution, exchange, lp, _ = setup(tmp_path, 2)
     second = lp._candidate_pool.pop('m01')
     execution.lp_auto_configure(dict(budget_usd='16', target_buy_count=2))
@@ -1426,6 +1510,7 @@ def test_failed_session_keeps_capital_but_allows_other_market_buy(tmp_path):
         return read(request)
 
     exchange.lp_snapshot = failed
+    advance_auto_wait(execution, monkeypatch)
     state = execution.lp_auto_run_once()
     assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01']
     assert Decimal(state['funds']['buy_reserved_usd']) >= 16
@@ -1554,7 +1639,7 @@ def test_market_read_timeout_discards_late_result_and_preserves_other_capacity(t
     assert calls == ['m00', 'm00'], 'late abandoned result must not become fresh facts'
 
 
-def test_order_identity_mismatch_cannot_use_isolated_funds(tmp_path):
+def test_order_identity_mismatch_cannot_use_isolated_funds(tmp_path, monkeypatch):
     execution, exchange, lp, _ = setup(tmp_path, 2)
     second = lp._candidate_pool.pop('m01')
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=2))
@@ -1569,6 +1654,7 @@ def test_order_identity_mismatch_cannot_use_isolated_funds(tmp_path):
         return snapshot
 
     exchange.lp_snapshot = conflict
+    advance_auto_wait(execution, monkeypatch)
     state = execution.lp_auto_run_once()
     assert len(exchange.posts) == 1
     assert 'unbounded_financial_uncertainty' in state['admission_block_reasons']

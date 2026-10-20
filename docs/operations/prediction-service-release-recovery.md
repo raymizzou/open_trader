@@ -86,6 +86,50 @@ live production service. A shadow command must be refused before touching the
 production plist, record, data, or process. Keep the production and shadow
 runtime roots explicit when testing or diagnosing.
 
+## D2 startup permission and failed exits
+
+Production starts one current-API D2 owner and the existing sole Scheduler.
+The process must claim its exact single-use permit before it reads reliable
+control or settings. A bare `prediction-service --mode production` entry only
+claims an existing permission; it does not create or repair one. Shadow keeps
+its separate read-only behavior.
+
+A failed claimed startup, a fatal control save, or a crash leaves the permit
+`CLAIMED`. The internal failed exit is 78, after actual native and HTTP work
+ends. A late successful control write records the saved version but does not
+clear the fatal state. Automatic relaunch cannot consume the same claim.
+Production launchd uses `KeepAlive.SuccessfulExit=false` and `ExitTimeOut=0`;
+only a verified exact launchd self-context maps internal 78 to OS exit 0.
+Production systemd uses `RestartPreventExitStatus=78`, infinite stop time, and
+`SendSIGKILL=no`. A stop caller can time out while the owner still drains.
+Do not force-kill, delete the permit, edit its state, or infer native completion
+from a request or Future result.
+
+After investigating the failure, use an explicitly authorized management
+operation. The launchd installer accepts `--restart`; systemd accepts the
+`restart` action. The foreground entry accepts `--operator-start` or
+`--operator-restart` with the actual selected data directory, private config,
+loopback endpoint and tracked release manifest. It validates under the existing
+operation lock, proves the old process/listener/native owner absent, arms once,
+and replaces itself with the service process. Ordinary healthy start is a
+read-only no-op. Preflight, dry-run, record refresh and automatic relaunch never
+arm a new permission. An unknown process, owner, target or config blocks the
+operation before it stops the existing service.
+
+Permission recovery does not resume trading. A saved pause remains paused.
+Check the current API projection for requested and effective running state,
+requested and saved control versions, pending/native writes and fatal status.
+An immediate effective pause with a pending save is not durable confirmation.
+No historical LP session, old request or disposable business row grants replay
+or supplies current money. Incomplete current sources remain UNKNOWN.
+
+The systemd management record is root-owned and readable only by the dedicated
+service group (0640); its start-permit directory and file belong to the exact
+service UID/GID (0700/0600). Ordinary foreground/launchd records remain private
+0600. Missing systemd metadata cannot fall back to an ordinary record when the
+trusted installed unit selects this same runtime. Do not repair permissions or
+substitute another record to bypass a rejection.
+
 ## After an operation
 
 Confirm the command's exit status and inspect the resulting runtime record.

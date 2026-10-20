@@ -16,11 +16,13 @@ import zlib
 from contextlib import contextmanager, nullcontext
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from itertools import chain
 from pathlib import Path
-from time import monotonic
+from time import monotonic, thread_time
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping
 from zoneinfo import ZoneInfo
 
+from .lp_persistence import AdmissionCancelled, AdmissionTimeout, MemoryLock, SLOW_WRITE_SECONDS
 from .polymarket_lp_errors import LpObservationWait
 from .polymarket_lp_notification_batches import matching_batch_channels
 from open_trader.llm_providers import DEFAULT_PROVIDER, PROVIDER_IDS
@@ -40,7 +42,7 @@ SignalHistoryWindow = Literal["24h", "7d", "30d", "all"]
 logger = logging.getLogger(__name__)
 
 _BUSY_TIMEOUT_MS = 5_000
-_SLOW_TRANSACTION_SECONDS = 1.0
+_SLOW_TRANSACTION_SECONDS = SLOW_WRITE_SECONDS
 # Reserved lp_sessions.session_id holding manual-cancel audit anchor rows.
 # Never returned as a "latest" session and skipped by daily-report assembly;
 # direct reads (lp_session) still work.
@@ -389,6 +391,8 @@ class PredictionArbitrageStore:
     def __init__(self, data_dir: Path, *, initialize: bool = True) -> None:
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+        from .lp_persistence import LPWriteCoordinator
+        self._lp_write_coordinator = LPWriteCoordinator(self.path)
         if type(initialize) is not bool:
             raise ValueError("initialize must be a boolean")
         if initialize:
@@ -403,7 +407,7 @@ class PredictionArbitrageStore:
         self._lp_preparation_owner_handle: Any | None = None
         self._lp_preparation_owner_mutex = threading.Lock()
         self._lp_metadata_cache_ready = False
-        self._lp_metadata_cache_schema_lock = threading.Lock()
+        self._lp_metadata_cache_schema_lock = MemoryLock('_lp_metadata_cache_schema_lock')
         self._lp_trade_change_listener: Callable[[str], None] | None = None
         self._lp_trade_change_listener_lock = threading.Lock()
         if initialize:
@@ -420,7 +424,13 @@ class PredictionArbitrageStore:
 
         try:
             with self._read_connection() as connection:
-                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                wal_bytes_before = self._lp_write_coordinator.wal_bytes()
+                checkpoint_started = monotonic()
+                result = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                self._lp_write_coordinator.record_checkpoint(result, seconds=monotonic()-checkpoint_started,
+                    page_size=connection.execute("PRAGMA page_size").fetchone()[0],
+                    autocheckpoint=connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0],
+                    wal_bytes_before=wal_bytes_before, wal_bytes_after=self._lp_write_coordinator.wal_bytes())
         except Exception:
             logger.warning("prediction_arbitrage_wal_checkpoint_failed", exc_info=True)
 
@@ -446,12 +456,75 @@ class PredictionArbitrageStore:
 
     @contextmanager
     def _transaction(self, *, immediate: bool = True, prepared_at: float | None = None,
-                     diagnostics: dict | None = None, prepare_seconds: float = 0.0) -> Iterator[sqlite3.Connection]:
+                     diagnostics: dict | None = None, prepare_seconds: float = 0.0,
+                     commit_guard=None, after_commit: Callable[[], None] | None = None,
+                     lp_priority: str | None = None, admission=None) -> Iterator[sqlite3.Connection]:
+        from .lp_persistence import LP_WRITE_OPERATIONS, write_priority
+        operation = sys._getframe(2).f_code.co_qualname
+        name = operation.rsplit('.', 1)[-1]
+        is_lp = lp_priority is not None or name in LP_WRITE_OPERATIONS
+        chain_started = monotonic()
+        deadline = min(chain_started + 15, admission.real_deadline) if admission is not None else chain_started + 15
+        priority = lp_priority or write_priority(name)
+        borrowed = is_lp and self._lp_write_coordinator.in_scope
+        outer_attempt = self._lp_write_coordinator.write_attempt if self._lp_write_coordinator.in_scope else None
+        if outer_attempt is not None:
+            deadline = min(deadline, outer_attempt['deadline'])
+        retry_chain = outer_attempt if outer_attempt is not None else self._lp_write_coordinator.new_retry_chain(deadline) if is_lp else None
+        for attempt in range(3 if is_lp and immediate and not borrowed else 1):
+            if retry_chain is not None and outer_attempt is None:
+                retry_chain['attempt'] = attempt
+            permit = (self._lp_write_coordinator.acquire(priority, deadline=deadline, cancellation=admission, retry_chain=retry_chain)
+                      if is_lp and not borrowed else nullcontext())
+            body_started = False
+            try:
+                with permit:
+                    # Requeueing consumed the same absolute retry budget. A
+                    # new grant alone does not authorize another full busy wait.
+                    if (attempt or outer_attempt is not None and outer_attempt['attempt']) and deadline - monotonic() < _BUSY_TIMEOUT_MS / 1000:
+                        raise AdmissionTimeout('lp_write_retry_budget_exhausted')
+                    native = self._lp_write_coordinator.native_transaction() if is_lp else nullcontext()
+                    with native, self._native_transaction(immediate=immediate, prepared_at=prepared_at,
+                            diagnostics=diagnostics, prepare_seconds=prepare_seconds,
+                            commit_guard=commit_guard, after_commit=after_commit, operation=operation,
+                            admission=admission, telemetry=is_lp, retry_chain=retry_chain) as connection:
+                        body_started = True
+                        if outer_attempt is not None:
+                            outer_attempt['body_entered'] = True
+                        yield connection
+                return
+            except (AdmissionTimeout, AdmissionCancelled) as error:
+                self._lp_write_coordinator.admission_failed(error, priority=priority, started=chain_started, retry_chain=retry_chain)
+                raise
+            except sqlite3.Error as error:
+                if (body_started or borrowed or not getattr(error, '_lp_begin_not_started', False)
+                        or attempt >= 2 or not is_lp or not immediate
+                        or getattr(error, 'sqlite_errorcode', None) != sqlite3.SQLITE_BUSY
+                        or deadline - monotonic() < _BUSY_TIMEOUT_MS / 1000):
+                    raise
+                self._lp_write_coordinator.record_begin_retry()
+                if admission is not None:
+                    admission.begin_failed()
+                # Close and release a failed pre-body BEGIN before a new ticket.
+
+    def lp_write_scope(self, priority='background'):
+        """Admission before a caller-owned memory lock; commits stay separate."""
+        return self._lp_write_coordinator.scope(priority)
+
+    def lp_write_operation(self, operation, *, priority='background'):
+        """Run a guard-owning publication phase with safe pre-body requeue."""
+        return self._lp_write_coordinator.run_write(operation, priority)
+
+    @contextmanager
+    def _native_transaction(self, *, immediate, prepared_at, diagnostics, prepare_seconds,
+                            commit_guard, after_commit, operation, admission=None, telemetry=False, retry_chain=None):
         started = monotonic()
         connection = self._connection()
-        operation = sys._getframe(2).f_code.co_qualname
         begin_at = monotonic()
         acquired = body_end = commit_end = None
+        cpu_started = thread_time()
+        guard_wait_seconds = after_commit_seconds = 0.0
+        commit_started = None
         try:
             changes_before = connection.total_changes
         except Exception:
@@ -460,16 +533,41 @@ class PredictionArbitrageStore:
         failed = False
         wait_failure = False
         try:
+            if retry_chain is not None:
+                # Guards and connection setup consume the inherited budget too.
+                # An entered body/COMMIT may finish late; a new BEGIN may not.
+                remaining = retry_chain['deadline'] - monotonic()
+                if remaining <= 0:
+                    raise AdmissionTimeout('lp_write_admission_deadline')
+                if retry_chain['attempt'] and remaining < _BUSY_TIMEOUT_MS / 1000:
+                    raise AdmissionTimeout('lp_write_retry_budget_exhausted')
+            # Local refusals must leave control admission cancellable.
+            if admission is not None:
+                admission.start_begin()
+            if retry_chain is not None:
+                retry_chain['begin_attempts'] += 1
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             acquired = monotonic()
             phase = "body"
             yield connection
             body_end = monotonic()
             phase = "commit"
-            connection.execute("COMMIT")
-            commit_end = monotonic()
-            phase = "complete"
+            guard_started = monotonic()
+            with commit_guard if commit_guard is not None else nullcontext():
+                commit_started = monotonic()
+                guard_wait_seconds = commit_started - guard_started
+                connection.execute("COMMIT")
+                commit_end = monotonic()
+                phase = "complete"
+                if after_commit is not None:
+                    after_started = monotonic()
+                    try:
+                        after_commit()
+                    finally:
+                        after_commit_seconds = monotonic() - after_started
         except BaseException as error:
+            if phase == 'begin' and isinstance(error, sqlite3.Error):
+                error._lp_begin_not_started = not connection.in_transaction
             failed = True
             wait_failure = isinstance(error, LpObservationWait) and str(error) in {
                 'session_changed', 'account_round_invalid', 'account_snapshot_superseded', 'account_snapshot_conflict',
@@ -508,6 +606,18 @@ class PredictionArbitrageStore:
             except Exception:
                 changes = 'unknown'
             connection.close()
+            if telemetry:
+                stages = {key: value for key, value in (diagnostics or {}).items()
+                    if key in {'input_rows', 'encode_seconds', 'executemany_seconds', 'bookmark_seconds',
+                        'scan_seconds', 'udf_seconds', 'pk_recheck_seconds', 'update_seconds', 'hydrate_seconds'}
+                    and type(value) in (int, float) and math.isfinite(value) and value >= 0}
+                self._lp_write_coordinator.record_transaction(operation, retry_chain=retry_chain, phase=phase, failed=failed,
+                    wall_seconds=finished-started, thread_cpu_seconds=thread_time()-cpu_started,
+                    begin_seconds=(acquired if acquired is not None else finished)-begin_at,
+                    body_seconds=body_end-acquired if acquired is not None and body_end is not None else 0.0,
+                    guard_wait_seconds=guard_wait_seconds,
+                    commit_seconds=commit_end-commit_started if commit_end is not None and commit_started is not None else 0.0,
+                    after_commit_seconds=after_commit_seconds, stages=stages)
             try:
                 if finished - begin_at >= _SLOW_TRANSACTION_SECONDS:
                     logger.warning(
@@ -993,6 +1103,11 @@ class PredictionArbitrageStore:
                 payload TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(account_id, condition_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS lp_competition_progress (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                payload TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS lp_market_competitiveness (
@@ -2763,6 +2878,7 @@ class PredictionArbitrageStore:
         *,
         expires_at: str,
         created_at: str | None = None,
+        lp_priority: str | None = None,
     ) -> str:
         encoded = _dump_execution_payload(payload)
         created = _parse_timestamp(created_at or _utc_now())
@@ -2771,7 +2887,7 @@ class PredictionArbitrageStore:
         # lifetimes so every preview is at most the fixed ten-second window.
         expiry = min(requested_expiry, created + _PREVIEW_TTL)
         preview_id = _new_id()
-        with self._transaction() as connection:
+        with self._transaction(lp_priority=lp_priority) as connection:
             connection.execute(
                 "INSERT INTO previews(preview_id, payload, created_at, expires_at, consumed_at) VALUES (?, ?, ?, ?, NULL)",
                 (preview_id, encoded, _canonical_timestamp(created), _canonical_timestamp(expiry)),
@@ -2826,6 +2942,338 @@ class PredictionArbitrageStore:
             }
         )
         return payload
+
+    @staticmethod
+    def _lp_manual_text(value):
+        if type(value) is not str or not value.strip():
+            raise ValueError('manual_identity_invalid')
+        return value.strip()
+
+    @staticmethod
+    def _lp_manual_time(value):
+        try:
+            result = value if isinstance(value, datetime) else datetime.fromisoformat(value)
+            if result.tzinfo is None or result.utcoffset() is None:
+                raise ValueError
+            return result.astimezone(UTC)
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError('manual_deadline_invalid') from exc
+
+    @staticmethod
+    def _lp_manual_decimal(value):
+        if type(value) not in (str, int, Decimal):
+            raise ValueError('manual_terms_invalid')
+        try:
+            number = Decimal(value)
+            if not number.is_finite() or number <= 0:
+                raise ValueError
+            encoded = format(number, 'f')
+            return encoded.rstrip('0').rstrip('.') if '.' in encoded else encoded
+        except (ValueError, InvalidOperation) as exc:
+            raise ValueError('manual_terms_invalid') from exc
+
+    @classmethod
+    def _lp_manual_validate(cls, command):
+        fields = {'kind', 'account_id', 'process_epoch', 'request_id', 'session_id', 'idempotency_key',
+            'market_id', 'condition_id', 'token_id', 'outcome', 'price', 'quantity', 'review_at',
+            'expiration', 'order_type', 'post_only'}
+        if not isinstance(command, Mapping) or not fields <= command.keys() or command.keys()-fields-{'estimated_target_quantity'}:
+            raise ValueError('manual_command_invalid')
+        result = {k: cls._lp_manual_text(command[k]) for k in fields-{
+            'price', 'quantity', 'review_at', 'expiration', 'post_only'}}
+        if result['kind'] not in {'entry', 'start', 'augment'} or result['outcome'] not in {'YES', 'NO'}:
+            raise ValueError('manual_command_invalid')
+        if result['order_type'] != 'GTD' or command['post_only'] is not True:
+            raise ValueError('manual_terms_invalid')
+        expiration = command['expiration']
+        review = cls._lp_manual_time(command['review_at'])
+        if type(expiration) is not int or expiration <= 0 or expiration <= review.timestamp():
+            raise ValueError('manual_deadline_invalid')
+        result.update(account_id=result['account_id'].casefold(), price=cls._lp_manual_decimal(command['price']),
+            quantity=cls._lp_manual_decimal(command['quantity']), review_at=review.isoformat(),
+            expiration=expiration, post_only=True)
+        if 'estimated_target_quantity' in command:
+            result['estimated_target_quantity'] = cls._lp_manual_decimal(command['estimated_target_quantity'])
+        return result
+
+    @classmethod
+    def _lp_manual_carrier(cls, payload):
+        keys = {'d2_manual_identity_only', 'schema_version', 'account_id', 'process_epoch', 'condition_id',
+            'token_id', 'command', 'outcome', 'response', 'venue_order_id', 'result_recorded'}
+        if (set(payload) != keys or payload.get('d2_manual_identity_only') is not True
+                or type(payload.get('schema_version')) is not int or payload['schema_version'] != 1
+                or type(payload.get('result_recorded')) is not bool):
+            raise ValueError('manual_provenance_invalid')
+        command = cls._lp_manual_validate(payload['command'])
+        if command != payload['command'] or any(payload[k] != command[k]
+                for k in ('account_id', 'process_epoch', 'condition_id', 'token_id')):
+            raise ValueError('manual_provenance_invalid')
+        if type(payload['outcome']) is not str or payload['outcome'] not in {'unknown', 'accepted', 'rejected', 'not_sent'}:
+            raise ValueError('manual_result_invalid')
+        venue = payload['venue_order_id']
+        if venue is not None and (cls._lp_manual_text(venue) != venue or payload['outcome'] == 'not_sent'):
+            raise ValueError('manual_result_invalid')
+        if not payload['result_recorded'] and (payload['outcome'] != 'unknown' or venue is not None):
+            raise ValueError('manual_result_invalid')
+        return dict(claimed=False, role='manual_identity', command=command, outcome=payload['outcome'],
+            response=cls._lp_manual_response(payload['response']), venue_order_id=venue)
+
+    def _lp_manual_group_read(self, connection, account, session_id):
+        row = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?', (session_id,)).fetchone()
+        if row is None:
+            raise ValueError('manual_group_unavailable')
+        value = _load_payload(str(row['payload']))
+        if self._lp_manual_text(value.get('account_id')).casefold() != account or 'd2_audit_only' in value:
+            raise ValueError('manual_provenance_invalid')
+        pool = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+        if pool is not None:
+            intents = _load_payload(str(pool['payload'])).get('intents', {})
+            if not isinstance(intents, Mapping) or any(isinstance(i, Mapping) and i.get('session_id') == session_id
+                    for i in intents.values()):
+                raise ValueError('automatic_session_augmentation_disabled')
+        if 'd2_manual_identity_only' in value:
+            result = self._lp_manual_carrier(value)
+            identity = result['command']
+            if (row['state'] != 'complete' or identity['session_id'] != session_id
+                    or identity['idempotency_key'] != row['idempotency_key'] or identity['kind'] not in {'entry', 'start'}):
+                raise ValueError('manual_provenance_invalid')
+            role = 'manual_identity'
+            entries = [] if result['venue_order_id'] is None else [self._lp_manual_text(result['venue_order_id'])]
+            augments = []
+        else:
+            identity = {k:self._lp_manual_text(value.get(k)) for k in ('market_id', 'condition_id', 'token_id', 'outcome')}
+            if identity['outcome'] not in {'YES', 'NO'}:
+                raise ValueError('manual_group_unavailable')
+            review = self._lp_manual_time(value.get('review_at'))
+            expiration = value.get('entry_expiration')
+            if type(expiration) is not int or expiration <= review.timestamp():
+                raise ValueError('manual_group_unavailable')
+            identity.update(account_id=account, session_id=session_id,
+                price=self._lp_manual_decimal(value.get('price')), quantity=self._lp_manual_decimal(value.get('quantity')),
+                review_at=review.isoformat(), expiration=expiration)
+            role = 'legacy_identity'
+            entries = [] if value.get('entry_order_id') is None else [self._lp_manual_text(value['entry_order_id'])]
+            augments = value.get('augment_order_ids', [])
+            if not isinstance(augments, list):
+                raise ValueError('manual_group_unavailable')
+            augments = [self._lp_manual_text(v) for v in augments]
+        rows = connection.execute('SELECT * FROM lp_actions WHERE session_id=? ORDER BY created_at,action_id',
+            (session_id,)).fetchall()
+        for action in rows:
+            payload = _load_payload(str(action['payload']))
+            if 'd2_manual_identity_only' in payload:
+                result = self._lp_manual_carrier(payload)
+                original = result['command']
+                if (original['kind'] != 'augment' or original['session_id'] != session_id
+                        or action['action_key'] != session_id+':augment-submit:'+original['idempotency_key']
+                        or any(original[k] != identity[k] for k in ('account_id','market_id','condition_id','token_id','outcome','review_at','expiration'))):
+                    raise ValueError('manual_provenance_invalid')
+                oid = result['venue_order_id']
+            else:
+                if (payload.get('role') != 'augment' or payload.get('side') != 'BUY'
+                        or payload.get('token_id') != identity['token_id']
+                        or not str(action['action_key']).startswith(session_id+':augment-submit:')):
+                    continue
+                oid = payload.get('order_id')
+            if oid is not None:
+                augments.append(self._lp_manual_text(oid))
+        return dict(role=role, identity=identity, entry_order_ids=list(dict.fromkeys(entries)),
+            augment_order_ids=list(dict.fromkeys(augments)))
+
+    def lp_manual_group(self, account_id, session_id):
+        """Read original group identity and real venue associations, never financial state."""
+        account = self._lp_manual_text(account_id).casefold()
+        sid = self._lp_manual_text(session_id)
+        with self._read_connection() as connection:
+            connection.execute('BEGIN')
+            return self._lp_manual_group_read(connection, account, sid)
+
+    def _lp_manual_existing(self, connection, account, key, session_id=None):
+        if session_id is not None:
+            session_id = self._lp_manual_text(session_id)
+            group = self._lp_manual_group_read(connection, account, session_id)
+            action_key = session_id+':augment-submit:'+key
+            row = connection.execute('SELECT * FROM lp_actions WHERE action_key=?', (action_key,)).fetchone()
+            if row is None:
+                return None
+            payload = _load_payload(str(row['payload']))
+            if row['session_id'] != session_id:
+                raise ValueError('manual_provenance_invalid')
+            if 'd2_manual_identity_only' in payload:
+                result = self._lp_manual_carrier(payload)
+                original = result['command']
+                if (original['account_id'] != account or original['session_id'] != session_id
+                        or original['kind'] != 'augment' or original['idempotency_key'] != key):
+                    raise ValueError('manual_provenance_invalid')
+                return result
+            if (payload.get('role') != 'augment' or payload.get('side') != 'BUY'
+                    or payload.get('token_id') != group['identity']['token_id']):
+                raise ValueError('manual_provenance_invalid')
+            response = dict(payload, action_id=str(row['action_id']), session_id=session_id,
+                action_key=action_key, state=str(row['state']))
+            identity = {k:group['identity'][k] for k in ('account_id','session_id','market_id','condition_id','token_id','outcome','review_at','expiration')}
+            identity.update({k:payload[k] for k in ('price','quantity') if k in payload})
+            identity.update(idempotency_key=key, action_id=str(row['action_id']))
+            return dict(claimed=False, role='legacy_response', command=identity,
+                outcome=str(row['state']) if row['state'] in {'accepted','rejected'} else 'unknown',
+                response=response, venue_order_id=payload.get('order_id'))
+        row = connection.execute('SELECT * FROM lp_sessions WHERE idempotency_key=?', (key,)).fetchone()
+        if row is None:
+            return None
+        payload = _load_payload(str(row['payload']))
+        if self._lp_manual_text(payload.get('account_id')).casefold() != account or 'd2_audit_only' in payload:
+            raise ValueError('manual_provenance_invalid')
+        if 'd2_manual_identity_only' in payload:
+            result = self._lp_manual_carrier(payload)
+            if (row['state'] != 'complete' or result['command']['session_id'] != row['session_id']
+                    or result['command']['idempotency_key'] != row['idempotency_key']
+                    or result['command']['kind'] not in {'entry', 'start'}):
+                raise ValueError('manual_provenance_invalid')
+            return result
+        identity = {k: payload[k] for k in ('account_id', 'market_id', 'condition_id', 'token_id', 'outcome',
+            'price', 'quantity', 'review_at', 'entry_expiration') if k in payload}
+        identity.update(account_id=account, session_id=str(row['session_id']), idempotency_key=key)
+        state = str(row['state'])
+        outcome = 'rejected' if state == 'entry_rejected' else (
+            'accepted' if state == 'entry_open' and payload.get('entry_order_id') else 'unknown')
+        return dict(claimed=False, role='legacy_response', command=identity, outcome=outcome,
+            response=self._lp_row_result(row), venue_order_id=payload.get('entry_order_id'))
+
+    def lp_manual_command(self, account_id, idempotency_key, *, session_id=None):
+        """Replay one explicit manual key; the result grants no current send permission."""
+        account = self._lp_manual_text(account_id).casefold()
+        key = self._lp_manual_text(idempotency_key)
+        with self._read_connection() as connection:
+            connection.execute('BEGIN')
+            return self._lp_manual_existing(connection, account, key, session_id)
+
+    def _lp_manual_consume_preview(self, connection, original, preview_id, now):
+        preview_id = self._lp_manual_text(preview_id)
+        row = connection.execute('SELECT * FROM previews WHERE preview_id=?', (preview_id,)).fetchone()
+        if row is None:
+            raise ValueError('preview_not_found')
+        current = self._lp_manual_time(now if now is not None else datetime.now(UTC))
+        if current >= self._lp_manual_time(row['expires_at']):
+            raise ValueError('preview_expired')
+        if row['consumed_at'] is not None:
+            raise ValueError('preview_consumed')
+        value = _load_payload(str(row['payload']))
+        if any(value.get(k) != original[k] for k in ('market_id', 'condition_id', 'token_id', 'outcome')):
+            raise ValueError('preview_identity_mismatch')
+        if (any(self._lp_manual_decimal(value.get(k)) != original[k] for k in ('price', 'quantity'))
+                or self._lp_manual_time(value.get('review_at')).isoformat() != original['review_at']
+                or value.get('session_id') != (original['session_id'] if original['kind'] == 'augment' else None)
+                or 'account_id' in value and self._lp_manual_text(value['account_id']).casefold() != original['account_id']
+                or 'expiration' in value and (type(value['expiration']) is not int or value['expiration'] != original['expiration'])):
+            raise ValueError('preview_identity_mismatch')
+        if connection.execute('UPDATE previews SET consumed_at=? WHERE preview_id=? AND consumed_at IS NULL',
+                (current.isoformat(), preview_id)).rowcount != 1:
+            raise ValueError('preview_consumed')
+
+    def lp_claim_manual_command(self, command, *, preview_id=None, now=None):
+        """Atomically preserve one original explicit manual identity, never auto intent."""
+        if (not isinstance(command, Mapping) or type(command.get('kind')) is not str
+                or command['kind'] not in {'entry', 'start', 'augment'}):
+            raise ValueError('manual_command_invalid')
+        account = self._lp_manual_text(command.get('account_id')).casefold()
+        key = self._lp_manual_text(command.get('idempotency_key'))
+        sid = self._lp_manual_text(command.get('session_id')) if command['kind'] == 'augment' else None
+        with self._transaction() as connection:
+            existing = self._lp_manual_existing(connection, account, key, sid)
+            if existing is not None:
+                return existing
+            original = self._lp_manual_validate(command)
+            if sid is not None:
+                group = self._lp_manual_group_read(connection, account, sid)
+                if any(original[k] != group['identity'][k] for k in (
+                        'account_id','market_id','condition_id','token_id','outcome','review_at','expiration')):
+                    raise ValueError('manual_group_identity_mismatch')
+            if preview_id is not None:
+                self._lp_manual_consume_preview(connection, original, preview_id, now)
+            n_leg = connection.execute('SELECT active_batch_id FROM n_leg_controls WHERE singleton=1').fetchone()
+            if n_leg is not None and n_leg['active_batch_id'] is not None:
+                raise ValueError('active_n_leg_batch')
+            response = (dict(state='needs_attention', session_id=sid, reason='augment_submit_unknown')
+                if sid is not None else dict(state='needs_attention', session_id=original['session_id'], submit_status='unknown'))
+            payload = dict(d2_manual_identity_only=True, schema_version=1,
+                **{k:original[k] for k in ('account_id','process_epoch','condition_id','token_id')},
+                command=original, outcome='unknown', response=response, venue_order_id=None, result_recorded=False)
+            stamp = _utc_now()
+            if sid is None:
+                connection.execute('INSERT INTO lp_sessions(session_id,idempotency_key,state,payload,created_at,updated_at) VALUES(?,?,?,?,?,?)',
+                    (original['session_id'], key, 'complete', json.dumps(payload, allow_nan=False), stamp, stamp))
+            else:
+                connection.execute('INSERT INTO lp_actions(action_id,session_id,action_key,state,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',
+                    (_new_id(), sid, sid+':augment-submit:'+key, 'unknown', json.dumps(payload, allow_nan=False), stamp, stamp))
+            result = self._lp_manual_carrier(payload)
+            result['claimed'] = True
+            return result
+
+    @staticmethod
+    def _lp_manual_response(response):
+        def valid(value):
+            if value is None or type(value) in (str, bool, int):
+                return True
+            if type(value) is float:
+                return math.isfinite(value)
+            if type(value) is list:
+                return all(valid(v) for v in value)
+            if type(value) is dict:
+                return all(type(k) is str and valid(v) for k, v in value.items())
+            return False
+        if type(response) is not dict or not valid(response):
+            raise ValueError('manual_response_invalid')
+        return json.loads(json.dumps(response, allow_nan=False))
+
+    def lp_finish_manual_command(self, command, *, outcome, response, venue_order_id=None):
+        """Associate an actual result with its exact claim; never create a request."""
+        try:
+            original = self._lp_manual_validate(command)
+        except ValueError:
+            return 'rejected'
+        if type(outcome) is not str or outcome not in {'unknown', 'accepted', 'rejected', 'not_sent'}:
+            raise ValueError('manual_result_invalid')
+        returned = self._lp_manual_response(response)
+        venue = None if venue_order_id is None else self._lp_manual_text(venue_order_id)
+        if outcome == 'not_sent' and venue is not None:
+            return 'rejected'
+        account, key = original['account_id'], original['idempotency_key']
+        sid = original['session_id'] if original['kind'] == 'augment' else None
+        with self._transaction() as connection:
+            try:
+                existing = self._lp_manual_existing(connection, account, key, sid)
+            except ValueError:
+                return 'rejected'
+            if existing is None or existing['role'] != 'manual_identity' or existing['command'] != original:
+                return 'rejected'
+            if sid is None:
+                row = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?', (original['session_id'],)).fetchone()
+            else:
+                row = connection.execute('SELECT * FROM lp_actions WHERE action_key=?',
+                    (sid+':augment-submit:'+key,)).fetchone()
+            if row is None:
+                return 'rejected'
+            payload = _load_payload(str(row['payload']))
+            old_id = existing['venue_order_id']
+            if old_id is not None and venue is not None and old_id != venue:
+                return 'rejected'
+            venue = old_id if venue is None else venue
+            if (outcome == 'not_sent' and venue is not None
+                    or existing['outcome'] != 'unknown' and (outcome != existing['outcome'] or returned != existing['response'])
+                    or payload['result_recorded'] and existing['outcome'] == 'unknown' and outcome == 'not_sent'):
+                return 'rejected'
+            if (payload['result_recorded'] and existing['outcome'] == outcome
+                    and returned == existing['response'] and venue == old_id):
+                return 'replay'
+            payload.update(outcome=outcome, response=returned, venue_order_id=venue, result_recorded=True)
+            stamp = _utc_now()
+            if sid is None:
+                connection.execute('UPDATE lp_sessions SET payload=?,updated_at=? WHERE session_id=?',
+                    (json.dumps(payload, allow_nan=False), stamp, original['session_id']))
+            else:
+                connection.execute('UPDATE lp_actions SET state=?,payload=?,updated_at=? WHERE action_id=?',
+                    (outcome, json.dumps(payload, allow_nan=False), stamp, row['action_id']))
+            return 'applied'
 
     def lp_session_by_idempotency(self, idempotency_key: str) -> dict[str, object] | None:
         with self._read_connection() as connection:
@@ -2941,7 +3389,9 @@ class PredictionArbitrageStore:
 
         with self._read_connection() as connection:
             row = connection.execute(
-                "SELECT * FROM lp_sessions WHERE session_id != ? ORDER BY created_at DESC LIMIT 1",
+                "SELECT * FROM lp_sessions WHERE session_id != ? "
+                "AND coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true' "
+                "ORDER BY created_at DESC LIMIT 1",
                 (LP_RESERVED_MANUAL_SESSION_ID,),
             ).fetchone()
         return None if row is None else self._lp_row_result(row)
@@ -2951,7 +3401,8 @@ class PredictionArbitrageStore:
 
         with self._read_connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM lp_sessions ORDER BY created_at, session_id"
+                "SELECT * FROM lp_sessions WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true' "
+                "ORDER BY created_at, session_id"
             ).fetchall()
         return [self._lp_row_result(row) for row in rows]
 
@@ -3259,7 +3710,18 @@ class PredictionArbitrageStore:
         *,
         now: datetime | None = None,
     ) -> dict[tuple[str, str], dict[str, object]]:
-        """Read only summary columns for many directions in one read batch."""
+        """Compatibility reader for callers that need a complete mapping."""
+
+        return {key: row for batch in self.lp_price_history_summary_batches(identities, now=now)
+                for key, row in batch.items()}
+
+    def lp_price_history_summary_batches(
+        self,
+        identities: Iterable[tuple[str, str]],
+        *,
+        now: datetime | None = None,
+    ) -> Iterator[dict[tuple[str, str], dict[str, object]]]:
+        """Decode at most 400 summaries per batch from one SQLite read snapshot."""
 
         unique = tuple(
             dict.fromkeys(
@@ -3269,9 +3731,9 @@ class PredictionArbitrageStore:
             )
         )
         if not unique:
-            return {}
-        result: dict[tuple[str, str], dict[str, object]] = {}
+            return
         with self._read_connection() as connection:
+            connection.execute("BEGIN")
             for offset in range(0, len(unique), 400):
                 batch = unique[offset : offset + 400]
                 where = " OR ".join("(condition_id=? AND token_id=?)" for _ in batch)
@@ -3279,13 +3741,14 @@ class PredictionArbitrageStore:
                 rows = connection.execute(
                     f"SELECT condition_id,token_id,summary FROM lp_price_history_cache WHERE {where}",
                     params,
-                ).fetchall()
+                )
+                result: dict[tuple[str, str], dict[str, object]] = {}
                 for row in rows:
                     key = (str(row["condition_id"]), str(row["token_id"]))
                     result[key] = self._lp_expire_price_history_summary(
                         _load_payload(str(row["summary"])), now=now
                     )
-        return result
+                yield result
 
     def lp_price_history_samples(
         self, condition_id: str, token_id: str
@@ -3410,10 +3873,10 @@ class PredictionArbitrageStore:
 
     def lp_candidate_conditions(
         self, condition_ids: Sequence[str], *, now: datetime,
+        current_tokens: Mapping[str, Sequence[str]] | None = None,
     ) -> tuple[str, ...]:
-        """Skip shared metadata when all current directions are cooling."""
+        """Prefilter conditions; explicit current mode never reads replica/history identity."""
         current = _canonical_timestamp(now)
-        self._ensure_lp_metadata_cache_schema()
         result = []
         with self._read_connection() as connection:
             for condition in condition_ids:
@@ -3428,10 +3891,20 @@ class PredictionArbitrageStore:
                 ).fetchone():
                     result.append(condition)
                     continue
+                if current_tokens is not None:
+                    tokens = current_tokens.get(condition, ())
+                    # Missing identity permits refresh only; exact direction/risk gates remain mandatory.
+                    if not tokens or any(not connection.execute(
+                        "SELECT 1 FROM lp_market_exclusions WHERE condition_id=? AND token_id=? AND cooldown_until>?",
+                        (condition, token, current),
+                    ).fetchone() for token in tokens):
+                        result.append(condition)
+                    continue
+                table_exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lp_market_metadata_cache'").fetchone()
                 cached = connection.execute(
                     "SELECT payload FROM lp_market_metadata_cache WHERE condition_id=? AND present=1",
                     (condition,),
-                ).fetchone()
+                ).fetchone() if table_exists else None
                 tokens = ()
                 if cached:
                     try:
@@ -3515,31 +3988,33 @@ class PredictionArbitrageStore:
                 (condition_id, _canonical_timestamp(checked_at)),
             ).rowcount
 
-    def _ensure_lp_metadata_cache_schema(self) -> None:
-        """Create `lp_market_metadata_cache` on first use.
+    def initialize_lp_metadata_cache(self) -> None:
+        """Initialize the disposable metadata schema at adapter startup only."""
+        self._ensure_lp_metadata_cache_schema()
 
-        Expand-only companion of the LP price-history cache.  It is created
-        lazily (CREATE TABLE IF NOT EXISTS on the first metadata-cache call)
-        so a store open never mutates the pinned init-time table set.
-        """
+    def _ensure_lp_metadata_cache_schema(self) -> None:
+        """Create the companion table without changing general Store startup."""
 
         if self._lp_metadata_cache_ready:
             return
-        with self._lp_metadata_cache_schema_lock:
-            if self._lp_metadata_cache_ready:
-                return
-            with self._transaction() as connection:
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS lp_market_metadata_cache(
-                        condition_id TEXT PRIMARY KEY,
-                        payload TEXT NOT NULL,
-                        expires_at REAL NOT NULL,
-                        present INTEGER NOT NULL
+        def initialize():
+            with self._lp_metadata_cache_schema_lock:
+                if self._lp_metadata_cache_ready:
+                    return
+                with self._transaction(lp_priority='background') as connection:
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS lp_market_metadata_cache(
+                            condition_id TEXT PRIMARY KEY,
+                            payload TEXT NOT NULL,
+                            expires_at REAL NOT NULL,
+                            present INTEGER NOT NULL
+                        )
+                        """
                     )
-                    """
-                )
-            self._lp_metadata_cache_ready = True
+                self._lp_metadata_cache_ready = True
+
+        self.lp_write_operation(initialize, priority='background')
 
     @staticmethod
     def _lp_metadata_cache_horizon(now: datetime | None) -> float:
@@ -3552,6 +4027,7 @@ class PredictionArbitrageStore:
         self,
         *,
         now: datetime | None = None,
+        limit: int | None = None,
     ) -> dict[str, tuple[float, dict[str, object] | None]]:
         """Bulk-read non-expired rows with their persisted `expires_at`.
 
@@ -3559,15 +4035,19 @@ class PredictionArbitrageStore:
         expiry stamp; a ``None`` payload marks a confirmed-missing row.
         """
 
-        return dict(self.lp_metadata_cache_items(now=now))
+        return dict(self.lp_metadata_cache_items(now=now, limit=limit))
 
     def lp_metadata_cache_items(
         self, *, now: datetime | None = None, exclude_candidates: bool = False,
+        limit: int | None = None,
     ) -> Iterator[tuple[str, tuple[float, dict[str, object] | None]]]:
-        """Stream warm-cache rows without materializing the entire universe."""
-        self._ensure_lp_metadata_cache_schema()
+        """Stream complete compatible reads; startup requests an explicit row bound."""
+        if limit is not None and (type(limit) is not int or limit < 1):
+            raise ValueError("lp_metadata_cache_read_limit_invalid")
         horizon = self._lp_metadata_cache_horizon(now)
         with self._read_connection() as connection:
+            if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lp_market_metadata_cache'").fetchone():
+                return
             rows = connection.execute(
                 """
                 SELECT condition_id, payload, expires_at, present,
@@ -3578,9 +4058,11 @@ class PredictionArbitrageStore:
                 WHERE expires_at > ? AND (?=0 OR NOT EXISTS (
                   SELECT 1 FROM lp_market_exclusions e WHERE e.condition_id=m.condition_id
                     AND e.token_id='' AND e.cooldown_until>?))
-                """,
+                ORDER BY expires_at DESC, condition_id
+                """ + (" LIMIT ?" if limit is not None else ""),
                 (int(exclude_candidates), _canonical_timestamp(now or datetime.now(timezone.utc)),
-                 horizon, int(exclude_candidates), _canonical_timestamp(now or datetime.now(timezone.utc))),
+                 horizon, int(exclude_candidates), _canonical_timestamp(now or datetime.now(timezone.utc)))
+                + ((limit,) if limit is not None else ()),
             )
             for row in rows:
                 condition_id = str(row["condition_id"])
@@ -3603,7 +4085,7 @@ class PredictionArbitrageStore:
     ) -> None:
         """Upsert LP market metadata rows in bounded ~400-row transactions."""
 
-        self._ensure_lp_metadata_cache_schema()
+        prepared_at = monotonic()
         encoded: list[tuple[str, str, float, int]] = []
         for raw_condition, raw_entry in entries.items():
             condition = str(raw_condition or "").strip()
@@ -3628,9 +4110,12 @@ class PredictionArbitrageStore:
                     1,
                 )
             )
+        encode_seconds = monotonic() - prepared_at
         for offset in range(0, len(encoded), 400):
             chunk = encoded[offset : offset + 400]
-            with self._transaction() as connection:
+            diagnostics = dict(input_rows=len(chunk), encode_seconds=encode_seconds)
+            with self._transaction(prepared_at=prepared_at, diagnostics=diagnostics) as connection:
+                execute_started = monotonic()
                 connection.executemany(
                     """
                     INSERT INTO
@@ -3643,17 +4128,23 @@ class PredictionArbitrageStore:
                     """,
                     chunk,
                 )
+                diagnostics["executemany_seconds"] = monotonic() - execute_started
 
-    def lp_metadata_cache_prune(self, *, now: datetime | None = None) -> None:
-        """Delete expired LP market metadata rows."""
-
-        self._ensure_lp_metadata_cache_schema()
+    def lp_metadata_cache_prune(self, *, now: datetime | None = None, limit: int = 400) -> tuple[int, bool]:
+        """Delete one bounded expiry chunk; return count and same-cutoff remainder."""
+        if type(limit) is not int or not 1 <= limit <= 400:
+            raise ValueError("lp_metadata_cache_prune_limit_invalid")
         horizon = self._lp_metadata_cache_horizon(now)
         with self._transaction() as connection:
-            connection.execute(
-                "DELETE FROM lp_market_metadata_cache WHERE expires_at <= ?",
-                (horizon,),
-            )
+            deleted = connection.execute(
+                """DELETE FROM lp_market_metadata_cache WHERE rowid IN (
+                    SELECT rowid FROM lp_market_metadata_cache WHERE expires_at<=?
+                    ORDER BY expires_at, condition_id LIMIT ?)""", (horizon, limit),
+            ).rowcount
+            remaining = connection.execute(
+                "SELECT 1 FROM lp_market_metadata_cache WHERE expires_at<=? LIMIT 1", (horizon,),
+            ).fetchone() is not None
+        return deleted, remaining
 
     def lp_save_screening_snapshot(
         self, payload: Mapping[str, object]
@@ -4345,25 +4836,97 @@ class PredictionArbitrageStore:
         *,
         now: datetime,
         condition_ids: Iterable[str] | None = None,
+        metadata_condition_ids: Iterable[str] | None = None,
     ) -> list[dict[str, object]]:
-        """Atomically spend due retries that the caller is ready to dispatch."""
+        """Atomically spend due retries that the caller is ready to dispatch.
+
+        With metadata_condition_ids, condition_ids selects any stage and the
+        additional scope selects metadata only. This history-dispatch mode
+        filters waiting, due rows before hydrating them. The original initial
+        claim mode remains unchanged when the additional scope is omitted.
+        """
 
         current = _canonical_timestamp(now)
         now_moment = _parse_timestamp(current)
         claimed: list[dict[str, object]] = []
+        diagnostics = dict(udf_seconds=0.0, pk_recheck_seconds=0.0, update_seconds=0.0)
+        scan_started = monotonic()
+        scan_cpu_started = thread_time()
         identities = None if condition_ids is None else tuple(
             dict.fromkeys(
                 str(value).strip() for value in condition_ids if str(value).strip()
             )
         )
-        if identities == ():
+        stage_scoped = metadata_condition_ids is not None
+        metadata_identities = () if metadata_condition_ids is None else tuple(
+            dict.fromkeys(
+                str(value).strip() for value in metadata_condition_ids if str(value).strip()
+            )
+        )
+        if stage_scoped:
+            identities = identities or ()
+            target_conditions = set(identities)
+            metadata_identities = tuple(
+                value for value in metadata_identities if value not in target_conditions
+            )
+        if identities == () and not metadata_identities:
             return claimed
         entered_here = self._lp_preparation_owner_entered_here()
         if not entered_here and self._lp_preparation_owner_handle is None:
             return claimed
         try:
-            with self._transaction() as connection:
-                if identities is None:
+            with self._read_connection() as connection:
+                connection.execute("BEGIN")
+                if stage_scoped:
+                    # Match the history caller's timestamp parser, including
+                    # aware offset forms and its malformed-deadline failure.
+                    # SQLite evaluates eligibility without creating Python row
+                    # snapshots for future, paused, or spent retries.
+                    deadline_errors: list[ValueError] = []
+
+                    def dispatch_due(deadline: object, paused: int, retry_used: int) -> bool:
+                        udf_started = monotonic()
+                        try:
+                            if not isinstance(deadline, str):
+                                raise ValueError("next_retry_at_invalid")
+                            text = deadline.strip()
+                            if text.endswith("Z"):
+                                text = text[:-1] + "+00:00"
+                            moment = datetime.fromisoformat(text)
+                            if moment.tzinfo is None:
+                                raise ValueError("next_retry_at_invalid")
+                            due = moment.astimezone(timezone.utc) <= now_moment
+                        except ValueError:
+                            if not deadline_errors:
+                                deadline_errors.append(ValueError("next_retry_at_invalid"))
+                            return False
+                        finally:
+                            diagnostics['udf_seconds'] += monotonic() - udf_started
+                        return due and paused == 0 and retry_used == 0
+
+                    connection.create_function("lp_dispatch_retry_due", 3, dispatch_due)
+                    batch_size = max(1, connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+                    rows = []
+                    for scoped_ids, stage_filter in (
+                        (identities, ""),
+                        (metadata_identities, "AND stage='metadata'"),
+                    ):
+                        for offset in range(0, len(scoped_ids), batch_size):
+                            batch = scoped_ids[offset : offset + batch_size]
+                            placeholders = ",".join("?" for _ in batch)
+                            rows.extend(connection.execute(
+                                f"""
+                                SELECT * FROM lp_preparation_items
+                                WHERE state='waiting_retry' AND next_retry_at IS NOT NULL
+                                  AND condition_id IN ({placeholders}) {stage_filter}
+                                  AND lp_dispatch_retry_due(next_retry_at,paused,retry_used)
+                                """,
+                                batch,
+                            ).fetchall())
+                    if deadline_errors:
+                        raise deadline_errors[0]
+                    rows.sort(key=lambda row: (row["next_retry_at"], row["condition_id"]))
+                elif identities is None:
                     rows = connection.execute(
                         """
                         SELECT * FROM lp_preparation_items
@@ -4374,7 +4937,7 @@ class PredictionArbitrageStore:
                     ).fetchall()
                 else:
                     # Older deployed SQLite builds allow only 999 parameters.
-                    # Keep every batch and retry spend in this one transaction.
+                    # Keep the complete candidate scan in this one read snapshot.
                     batch_size = max(1, connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
                     rows = []
                     for offset in range(0, len(identities), batch_size):
@@ -4390,29 +4953,62 @@ class PredictionArbitrageStore:
                             batch,
                         ).fetchall())
                     rows.sort(key=lambda row: (row["next_retry_at"], row["condition_id"]))
+                candidates = []
                 for row in rows:
                     try:
                         due = _parse_timestamp(row["next_retry_at"])
                     except ValueError:
                         continue
-                    if due > now_moment:
+                    if due <= now_moment:
+                        candidates.append(row)
+                # End the read snapshot before competing for write admission.
+            diagnostics["scan_seconds"] = monotonic() - scan_started
+            diagnostics["input_rows"] = len(candidates)
+            if not candidates:
+                self._lp_write_coordinator.record_read_stage('PredictionArbitrageStore.lp_claim_preparation_retries',
+                    phase='scan_only', seconds=diagnostics['scan_seconds'],
+                    cpu_seconds=thread_time()-scan_cpu_started, stages=diagnostics)
+                return claimed
+            updated_rows = []
+            with self._transaction(diagnostics=diagnostics) as connection:
+                for snapshot in candidates:
+                    condition = str(snapshot["condition_id"])
+                    recheck_started = monotonic()
+                    row = connection.execute(
+                        "SELECT * FROM lp_preparation_items WHERE condition_id=?", (condition,),
+                    ).fetchone()
+                    diagnostics['pk_recheck_seconds'] += monotonic() - recheck_started
+                    # IMMEDIATE excludes concurrent writers. Full raw version
+                    # comparison also preserves stage, deadline and recovery
+                    # changes between the read snapshot and this short CAS.
+                    if row is None or tuple(row) != tuple(snapshot):
                         continue
-                    condition = str(row["condition_id"])
-                    connection.execute(
+                    update_started = monotonic()
+                    changed = connection.execute(
                         """
                         UPDATE lp_preparation_items
                         SET retry_used=1,state='retrying',retry_started_at=?,
                             next_retry_at=NULL,updated_at=?
-                        WHERE condition_id=? AND paused=0 AND retry_used=0
+                        WHERE condition_id=? AND generation=? AND state=?
+                          AND paused=0 AND retry_used=0 AND next_retry_at=? AND updated_at=?
                         """,
-                        (current, _utc_now(), condition),
+                        (current, _utc_now(), condition, row["generation"], row["state"],
+                         row["next_retry_at"], row["updated_at"]),
                     )
+                    diagnostics["update_seconds"] += monotonic() - update_started
+                    if changed.rowcount != 1:
+                        continue
                     updated = connection.execute(
-                        "SELECT * FROM lp_preparation_items WHERE condition_id=?",
-                        (condition,),
+                        "SELECT * FROM lp_preparation_items WHERE condition_id=?", (condition,),
                     ).fetchone()
                     if updated is not None:
-                        claimed.append(self._lp_preparation_item(updated))
+                        updated_rows.append(updated)
+            hydrate_started, hydrate_cpu = monotonic(), thread_time()
+            claimed = [self._lp_preparation_item(row) for row in updated_rows]
+            self._lp_write_coordinator.record_read_stage('PredictionArbitrageStore.lp_claim_preparation_retries',
+                phase='hydrated_after_commit', seconds=monotonic()-hydrate_started,
+                cpu_seconds=thread_time()-hydrate_cpu,
+                stages={'hydrate_seconds': monotonic()-hydrate_started, 'input_rows': len(updated_rows)})
         finally:
             if entered_here:
                 self.lp_release_preparation_owner()
@@ -4645,6 +5241,7 @@ class PredictionArbitrageStore:
         payload: Mapping[str, object],
         *,
         expected_generation: int | None = None,
+        initialize_global_fence: bool = False,
     ) -> dict[str, object] | None:
         """Persist one preparation snapshot with an optional cycle guard.
 
@@ -4652,7 +5249,9 @@ class PredictionArbitrageStore:
         keep that generation; a stale worker cannot overwrite a newer cycle.
         """
 
-        encoded = _dump_payload(payload)
+        if type(initialize_global_fence) is not bool:
+            raise ValueError('initialize_global_fence_invalid')
+        proposed = dict(payload)
         requested_generation = payload.get("generation")
         if type(requested_generation) is not int or requested_generation < 1:
             requested_generation = 1
@@ -4665,6 +5264,9 @@ class PredictionArbitrageStore:
                 if expected_generation is not None:
                     return None
                 generation = requested_generation
+                if initialize_global_fence and 'global_recovery_generation' not in proposed:
+                    proposed['global_recovery_generation'] = generation
+                encoded = _dump_payload(proposed)
                 connection.execute(
                     "INSERT INTO lp_preparation(singleton,generation,payload,updated_at) VALUES (1,?,?,?)",
                     (generation, encoded, updated_at),
@@ -4679,6 +5281,15 @@ class PredictionArbitrageStore:
                     saved["generation"] = current_generation
                     return saved
                 generation = requested_generation
+                if initialize_global_fence:
+                    stored = _load_payload(str(current['payload']))
+                    if 'global_recovery_generation' in stored:
+                        # Progress cannot replace a real recovery floor, or
+                        # repair an explicitly malformed floor by guessing.
+                        proposed['global_recovery_generation'] = stored['global_recovery_generation']
+                    elif 'global_recovery_generation' not in proposed:
+                        proposed['global_recovery_generation'] = generation
+                encoded = _dump_payload(proposed)
                 connection.execute(
                     "UPDATE lp_preparation SET generation=?,payload=?,updated_at=? WHERE singleton=1",
                     (generation, encoded, updated_at),
@@ -4794,6 +5405,7 @@ class PredictionArbitrageStore:
         account_id: str,
         condition_id: str,
         updates: Mapping[str, object],
+        *, expected_share_alert: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         """Atomically merge selected fields into one LP observation."""
 
@@ -4803,12 +5415,21 @@ class PredictionArbitrageStore:
             raise ValueError("LP observation identity is required")
         if not isinstance(updates, Mapping):
             raise ValueError("LP observation updates must be an object")
+        if expected_share_alert is not None and (
+                not isinstance(expected_share_alert, Mapping) or set(expected_share_alert) != {
+                    'last_share_checked_at', 'breach_started_at', 'notification_pending'}):
+            raise ValueError('lp_share_alert_fence_invalid')
         with self._transaction() as connection:
             current = connection.execute(
-                "SELECT payload FROM lp_market_observations WHERE account_id=? AND condition_id=?",
+                "SELECT payload,updated_at FROM lp_market_observations WHERE account_id=? AND condition_id=?",
                 (account_key, market_key),
             ).fetchone()
             previous = _load_payload(str(current["payload"])) if current is not None else {}
+            if expected_share_alert is not None:
+                alert = previous.get('share_alert')
+                if not isinstance(alert, Mapping) or any(alert.get(k) != v for k, v in expected_share_alert.items()):
+                    return {**previous, 'condition_id': market_key,
+                            'updated_at': current['updated_at'] if current is not None else None}
             merged = dict(previous)
             for key, value in updates.items():
                 old_value = merged.get(str(key))
@@ -4861,40 +5482,77 @@ class PredictionArbitrageStore:
     def lp_competitiveness_upsert(
         self,
         entries: Iterable[tuple[str, Decimal, datetime]],
+        *, progress: Mapping[str, object] | None = None,
+        stop_event: threading.Event | None = None, commit_guard=None,
+        after_commit: Callable[[], None] | None = None,
     ) -> int:
-        """Persist one full competition round in a single transaction (#181).
+        """Persist a supplied batch and its page bookmark atomically.
 
         Rows are keyed by condition_id; a re-read of the same market replaces
         its previous value and checked_at instead of stacking a second row.
+        SQLite consumes one encoded row at a time; later failures roll back all rows.
         """
 
         prepared_at = monotonic()
-        encoded: list[tuple[str, str, str]] = []
-        for condition_id, value, checked_at in entries:
-            condition = str(condition_id).strip()
-            if not condition:
-                raise ValueError("lp_competitiveness_identity_invalid")
-            if not isinstance(value, Decimal):
-                raise ValueError("lp_competitiveness_value_invalid")
-            encoded.append(
-                (
+        diagnostics = {"input_rows": 0}
+
+        def encode():
+            for condition_id, value, checked_at in entries:
+                condition = str(condition_id).strip()
+                if not condition:
+                    raise ValueError("lp_competitiveness_identity_invalid")
+                if not isinstance(value, Decimal):
+                    raise ValueError("lp_competitiveness_value_invalid")
+                row = (
                     condition,
                     _decimal_string(value),
                     _canonical_timestamp(checked_at),
                 )
-            )
-        if not encoded:
+                diagnostics["input_rows"] += 1
+                yield row
+
+        # Production batches are bounded and encoded before BEGIN; legacy callers stream.
+        encoded = iter(tuple(encode())) if progress is not None else encode()
+        first = next(encoded, None)
+        if first is None and progress is None:
             return 0
-        with self._transaction(prepared_at=prepared_at, diagnostics={"input_rows": len(encoded)}) as connection:
+        progress_payload = _dump_relation_payload(dict(progress)) if progress is not None else None
+        diagnostics["encode_seconds"] = monotonic() - prepared_at
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("competition_cancelled")
+        with self._transaction(prepared_at=prepared_at, diagnostics=diagnostics,
+                               commit_guard=commit_guard, after_commit=after_commit) as connection:
+            execute_started = monotonic()
             connection.executemany(
                 """
                 INSERT OR REPLACE INTO lp_market_competitiveness
                 (condition_id, value, checked_at)
                 VALUES (?, ?, ?)
                 """,
-                encoded,
+                chain((first,), encoded) if first is not None else (),
             )
-        return len(encoded)
+            diagnostics["executemany_seconds"] = monotonic() - execute_started
+            bookmark_started = monotonic()
+            if progress_payload is not None:
+                connection.execute("INSERT OR REPLACE INTO lp_competition_progress(singleton,payload) VALUES (1,?)",
+                                   (progress_payload,))
+            diagnostics["bookmark_seconds"] = monotonic() - bookmark_started
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("competition_cancelled")
+        return diagnostics["input_rows"]
+
+    def lp_competitiveness_progress(self) -> dict[str, object]:
+        with self._read_connection() as connection:
+            row = connection.execute("SELECT payload FROM lp_competition_progress WHERE singleton=1").fetchone()
+        return _load_payload(str(row["payload"])) if row else {}
+
+    @contextmanager
+    def lp_competitiveness_snapshot(self):
+        """Pin a read snapshot before a competing cache/SQLite publication."""
+        with self._read_connection() as connection:
+            connection.execute("BEGIN")
+            connection.execute("SELECT condition_id FROM lp_market_competitiveness LIMIT 1").fetchone()
+            yield connection
 
     def lp_competitiveness_entry(self, condition_id: str):
         with self._read_connection() as connection:
@@ -4904,24 +5562,33 @@ class PredictionArbitrageStore:
             ).fetchone()
         return (Decimal(str(row[0])), _parse_timestamp(row[1])) if row else None
 
-    def lp_competitiveness_map(self) -> dict[str, tuple[Decimal, datetime]]:
-        """Read every persisted competition value back keyed by condition_id."""
+    def lp_competitiveness_map(
+        self, *, condition_ids: Iterable[str] | None = None, connection=None
+    ) -> dict[str, tuple[Decimal, datetime]]:
+        """Read all values, or all requested identities in one read snapshot."""
 
-        with self._read_connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT condition_id, value, checked_at
-                FROM lp_market_competitiveness
-                """
-            ).fetchall()
+        identities = None if condition_ids is None else tuple(dict.fromkeys(condition_ids))
+        if identities == ():
+            return {}
         result: dict[str, tuple[Decimal, datetime]] = {}
-        for row in rows:
-            try:
-                value = Decimal(str(row["value"]))
-                checked_at = _parse_timestamp(row["checked_at"])
-            except (ArithmeticError, TypeError, ValueError):
-                continue
-            result[str(row["condition_id"])] = (value, checked_at)
+        with self._read_connection() if connection is None else nullcontext(connection) as connection:
+            if not connection.in_transaction:
+                connection.execute("BEGIN")
+            batches = (None,) if identities is None else (
+                identities[offset:offset + 400] for offset in range(0, len(identities), 400)
+            )
+            for batch in batches:
+                query = "SELECT condition_id, value, checked_at FROM lp_market_competitiveness"
+                params = () if batch is None else batch
+                if batch is not None:
+                    query += " WHERE condition_id IN (" + ",".join("?" for _ in batch) + ")"
+                for row in connection.execute(query, params):
+                    try:
+                        value = Decimal(str(row["value"]))
+                        checked_at = _parse_timestamp(row["checked_at"])
+                    except (ArithmeticError, TypeError, ValueError):
+                        continue
+                    result[str(row["condition_id"])] = (value, checked_at)
         return result
 
     def lp_competitiveness_count(self) -> int:
@@ -5090,7 +5757,7 @@ class PredictionArbitrageStore:
 
     def _lp_manual_retirement_state(self, connection, session_id, payload, state):
         """A late local callback cannot reopen a waived empty request container."""
-        from .polymarket_lp_accounting import reservation_is_manually_released
+        from .polymarket_lp_accounting import reservation_is_manually_released, has_independent_unresolved_action
         retired = payload.get("manual_release_retired")
         account_retired = payload.get("account_coverage_retired")
         api_retired = (isinstance(account_retired, Mapping)
@@ -5107,11 +5774,8 @@ class PredictionArbitrageStore:
                 or any(payload.get(key) in {"pending", "unknown", "accepted_without_order_id"}
                        for key in ("passive_exit_attempt_state", "protected_exit_attempt_state"))):
             return state
-        if any(action.get("state") in {"pending", "unknown", "accepted_without_order_id"}
-               and ("cancel" in str(action.get("action_key") or "")
-                    or action.get("role") != "entry"
-                    and not str(action.get("action_key") or "").endswith("entry-submit"))
-               for action in self.lp_actions(str(session_id), connection=connection)):
+        if has_independent_unresolved_action({**payload, "session_id": str(session_id)},
+                self.lp_actions(str(session_id), connection=connection)):
             return state
         return "complete"
 
@@ -5121,17 +5785,26 @@ class PredictionArbitrageStore:
         *,
         state: str | None = None,
         patch: Mapping[str, object] | None = None,
+        patch_builder: Callable[[dict[str, object], sqlite3.Connection], Mapping[str, object]] | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, object]:
+        if patch is not None and patch_builder is not None:
+            raise ValueError("lp_session_patch_ambiguous")
         now = _utc_now()
-        with self._transaction() as connection:
+        with self._transaction() if connection is None else nullcontext(connection) as connection:
             row = connection.execute(
                 "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
             ).fetchone()
             if row is None:
                 raise ValueError("lp_session_not_found")
             payload = _load_payload(str(row["payload"]))
-            if patch:
-                payload.update(patch)
+            current_patch = patch
+            if patch_builder is not None:
+                current_patch = patch_builder(self._lp_row_result(row), connection)
+                if not isinstance(current_patch, Mapping):
+                    raise TypeError("lp_session_patch_invalid")
+            if current_patch:
+                payload.update(current_patch)
             next_state = self._lp_manual_retirement_state(connection, session_id, payload, str(state or row["state"]))
             try:
                 revision = int(payload.get("_lp_revision", 0))
@@ -5390,7 +6063,8 @@ class PredictionArbitrageStore:
                 loaded = [
                     (row, _load_payload(str(row["payload"])))
                     for row in tx.execute(
-                        "SELECT * FROM lp_sessions ORDER BY updated_at,session_id"
+                        "SELECT * FROM lp_sessions WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true' "
+                        "ORDER BY updated_at,session_id"
                     ).fetchall()
                 ]
                 diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1
@@ -6652,6 +7326,84 @@ class PredictionArbitrageStore:
             return
         listener(session_id)
 
+    def lp_recover_interrupted_submissions(self) -> None:
+        """Called once by startup under the newly acquired exclusive runtime owner.
+
+        Preserve the request/action audit. Only a later complete account round
+        can replace the temporary hold; this is not a venue rejection receipt.
+        """
+        from .polymarket_lp_accounting import (
+            submission_action_fingerprint, submission_owner_identity,
+        )
+        now = _utc_now()
+        with self._transaction() as tx:
+            for row in tx.execute(
+                "SELECT * FROM lp_sessions WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true'"
+            ).fetchall():
+                sid = str(row['session_id'])
+                session = self._lp_row_result(row)
+                payload = _load_payload(str(row['payload']))
+                actions = self.lp_actions(sid, connection=tx)
+                changed = False
+                certificates = payload.setdefault('submission_owner_exit', {})
+                for action in actions:
+                    role, key = action.get('role'), str(action.get('action_key') or '')
+                    if (session.get('order_identity_conflict') or action.get('side') != 'BUY'
+                            or action.get('token_id') != session.get('token_id')
+                            or role not in {'entry', 'augment'}
+                            or (key != sid+':entry-submit' if role == 'entry' else not key.startswith(sid+':augment-submit:'))
+                            or action.get('state') not in {'pending', 'unknown', 'accepted_without_order_id'}
+                                and not (action.get('state') == 'accepted' and not action.get('order_id'))):
+                        continue
+                    try:
+                        if any(_parse_timestamp(action.get(field)) > _parse_timestamp(now)
+                               for field in ('created_at', 'updated_at')):
+                            continue
+                    except ValueError:
+                        continue
+                    fingerprint = submission_action_fingerprint(action)
+                    previous = certificates.get(str(action['action_id'])) or {}
+                    if previous.get('action_fingerprint') == fingerprint and previous.get('session_identity') == submission_owner_identity(session):
+                        continue
+                    certificates[str(action['action_id'])] = dict(ended_at=now,
+                        action_fingerprint=fingerprint, session_identity=submission_owner_identity(session))
+                    changed = True
+                if not changed:
+                    continue
+                payload['_lp_revision'] = self._lp_payload_revision(payload) + 1
+                tx.execute('UPDATE lp_sessions SET payload=? WHERE session_id=?', (_dump_execution_payload(payload), sid))
+                self._lp_register_trade_change(tx, sid)
+
+    def lp_publish_planning_account_facts(self, facts, isolation, *, connection):
+        """Persist current planning exposure without certifying full history."""
+        from .polymarket_lp_accounting import default_account_pool_document
+        value = dict(facts)
+        account = str(value.get('account_id') or '').strip().casefold()
+        pool_account = hashlib.sha256(account.encode()).hexdigest()
+        generation = connection.execute(
+            'SELECT generation FROM lp_trade_generation WHERE singleton=1').fetchone()
+        if not account or generation is None or generation['generation'] != value.get('trade_generation'):
+            raise LpObservationWait('account_round_invalid')
+        row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+        document = (_load_payload(row['payload']) if row else
+            default_account_pool_document(self.path, pool_account, _parse_timestamp(value['checked_at'])))
+        if document.get('account_id') != pool_account:
+            raise ValueError('account_identity_mismatch')
+        previous = document.get('account_planning_facts') or {}
+        if any(previous.get(key) and _parse_timestamp(previous[key]) > _parse_timestamp(value[key])
+               for key in ('read_started_at', 'read_ended_at', 'checked_at')):
+            raise LpObservationWait('account_snapshot_superseded')
+        patch = {'account_planning_facts': value, '_planning_buy_isolation': isolation}
+        if row:
+            connection.execute("UPDATE lp_auto_pool SET payload=json_set(payload,"
+                "'$.account_planning_facts',json_extract(?,'$.account_planning_facts'),"
+                "'$._planning_buy_isolation',json_extract(?,'$._planning_buy_isolation')) WHERE singleton=1",
+                (_dump_execution_payload(patch), _dump_execution_payload(patch)))
+        else:
+            document.update(patch)
+            connection.execute('INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?)',
+                (_dump_execution_payload(document),))
+
     def lp_publish_account_financial_facts(
         self, facts: Mapping[str, object], *, connection: sqlite3.Connection | None = None,
         expected_generation: int | None = None,
@@ -6667,6 +7419,8 @@ class PredictionArbitrageStore:
             account_cancel_is_pending, account_position_quantity,
             can_resume_covered_management, default_account_pool_document,
             ended_reservation_evidence, reservation_is_covered, reservation_is_released,
+            buy_action_is_covered, buy_attempt_identity, ended_buy_action_evidence,
+            has_independent_unresolved_action, unresolved_buy_action, submission_action_kind,
         )
         prepared_at = monotonic()
         diagnostics = {} if diagnostics is None else diagnostics
@@ -6733,7 +7487,8 @@ class PredictionArbitrageStore:
             document["account_confirmed_fill_facts"] = [dict(trade_id=identity[0], order_id=identity[1],
                 fingerprint=fingerprint) for identity, fingerprint in sorted(frontier.items())]
             loaded = [(row, _load_payload(str(row["payload"]))) for row in tx.execute(
-                "SELECT * FROM lp_sessions ORDER BY session_id"
+                "SELECT * FROM lp_sessions WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true' "
+                "ORDER BY session_id"
             ).fetchall()]
             diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1
             diagnostics["session_rows_scanned"] = diagnostics.get("session_rows_scanned", 0) + len(loaded)
@@ -6791,6 +7546,10 @@ class PredictionArbitrageStore:
             # A round begun during a separate BUY submission cannot price
             # its future exposure. Keep account admission blocked even when
             # this session's original entry reservation was already covered.
+            value['pending_buy_actions'] = []
+            value['independent_sell_unknown'] = False
+            source_known = value['financial_status'] == 'known'
+            current_buys = {(b['order_id'], b['token_id'], b['side']) for b in buys}
             for sid, (row, payload) in sessions.items():
                 explicit = str(payload.get("account_id") or "").strip().casefold()
                 bindings = session_bindings.get(sid, ())
@@ -6799,12 +7558,39 @@ class PredictionArbitrageStore:
                 if explicit != account and not legacy_owned:
                     continue
                 actions = session_actions(sid)
+                value['independent_sell_unknown'] |= has_independent_unresolved_action(payload,
+                    [a for a in actions if a.get('side') == 'SELL'])
                 for action in actions:
-                    is_entry = action.get("role") == "entry" or str(action.get("action_key") or "").endswith("entry-submit")
-                    if (action.get("side") != "BUY" or (is_entry and bindings)
-                            or "cancel" in str(action.get("action_key") or "")
-                            or action.get("state") not in {"pending", "unknown"}):
+                    is_entry = submission_action_kind(action) == 'entry'
+                    if not unresolved_buy_action(action):
                         continue
+                    session = {**payload, 'session_id': sid, 'idempotency_key': row['idempotency_key']}
+                    evidence = ended_buy_action_evidence(session, action, read_started_at=started)
+                    if source_known and evidence and not buy_action_is_covered(session, action):
+                        marker = dict(version=1, state='covered', account_id=account, pool_account_id=pool_account,
+                            snapshot_id=value['snapshot_id'], session_id=sid, read_started_at=value['read_started_at'],
+                            checked_at=value['checked_at'], attempt_identity=buy_attempt_identity(action), **evidence)
+                        payload.setdefault('account_action_coverage', {})[str(action['action_id'])] = marker
+                        if is_entry and not bindings:
+                            payload['reservation_coverage'] = marker
+                        payload['_lp_revision'] = self._lp_payload_revision(payload) + 1
+                        tx.execute('UPDATE lp_sessions SET payload=? WHERE session_id=?', (_dump_execution_payload(payload), sid))
+                        session.update(payload)
+                    if buy_action_is_covered(session, action):
+                        continue
+                    if (action.get('order_id'), action.get('token_id'), action.get('side')) in current_buys:
+                        continue
+                    if is_entry and bindings:
+                        continue
+                    price = _maybe_decimal(action.get('price', payload.get('price') if is_entry else None))
+                    quantity = _maybe_decimal(action.get('quantity', payload.get('quantity') if is_entry else None))
+                    value['pending_buy_actions'].append(dict(intent_id='action:'+str(action['action_id']),
+                        session_id=sid, order_id=action.get('order_id'), token_id=action.get('token_id'), side='BUY',
+                        condition_id=payload.get('condition_id'), state='unknown', financial_status='unknown',
+                        inventory_cost_usd='0', reserved_usd=str(price*quantity)
+                            if price is not None and quantity is not None and price > 0 and quantity > 0 else None,
+                        checked_at=value['checked_at'], price=str(price) if price is not None else None,
+                        quantity=str(quantity) if quantity is not None else None))
                     end = action.get("submit_finished_at") or action.get("submit_receipt_at") or action.get("updated_at")
                     try:
                         ended_before = _parse_timestamp(end) < started
@@ -6815,7 +7601,7 @@ class PredictionArbitrageStore:
                         value["financial_status"] = "unknown"
                         value["reason_codes"] = sorted(set(value.get("reason_codes") or ()) | {"account_send_inflight"})
             retained = []
-            if value["financial_status"] == "known":
+            if source_known:
                 for intent_id, intent in intents.items():
                     if reservation_is_released(intent, pool_account):
                         continue
@@ -6845,14 +7631,9 @@ class PredictionArbitrageStore:
                 retained = [key for key, intent in intents.items() if not reservation_is_released(intent, pool_account)]
             value["retained_reservation_ids"] = sorted(retained)
             if value["financial_status"] == "known":
-                for intent in intents.values():
-                    if not reservation_is_released(intent, pool_account):
+                for sid, (row, payload) in sessions.items():
+                    if not reservation_is_released({**payload, 'session_id': sid}, pool_account):
                         continue
-                    sid = str(intent.get("session_id") or "")
-                    entry = sessions.get(sid)
-                    if entry is None:
-                        continue
-                    row, payload = entry
                     actions = session_actions(sid)
                     managed = {**payload, "session_id": sid, "state": row["state"]}
                     if can_resume_covered_management(managed, actions, value):
@@ -6864,15 +7645,11 @@ class PredictionArbitrageStore:
                             (_dump_execution_payload(payload), sid))
                         continue
                     token = str(payload.get("token_id") or "")
-                    if (not token or self._lp_owned_session_ids(payload)
-                            or token in value.get("open_order_tokens", ())
+                    if (not token or token in value.get("open_order_tokens", ())
                             or account_position_quantity(value, token) != 0):
                         continue
                     actions = session_actions(sid)
-                    if any(a.get("state") in {"pending", "unknown"}
-                           and a.get("role") != "entry"
-                           and not str(a.get("action_key") or "").endswith("entry-submit")
-                           for a in actions):
+                    if has_independent_unresolved_action(managed, actions):
                         continue
                     if row["state"] == "complete":
                         continue
@@ -6961,6 +7738,10 @@ class PredictionArbitrageStore:
             ).fetchone()
             session = self._lp_row_result(row)
             changed = publish(session, connection=connection, error=error) if publish else False
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            session = self._lp_row_result(row)
         return session, changed
 
     def lp_register_fenced_actions(
@@ -6971,6 +7752,7 @@ class PredictionArbitrageStore:
         expected_generation: int | None = None,
         expected_trade_revision: int | None = None,
         patch: Mapping[str, object] | None = None,
+        patch_builder: Callable[[dict[str, object], sqlite3.Connection], Mapping[str, object] | None] | None = None,
         state: str | None = None,
         reject_existing: bool = False,
     ) -> list[dict[str, object]]:
@@ -6982,9 +7764,13 @@ class PredictionArbitrageStore:
         action insert share one SQLite transaction, so a lost race cannot leave
         one action authorized while another is rejected. ``reject_existing``
         is the claim boundary for result-unknown BUY/SELL intents; the default
-        preserves the existing exact-ID retry/upsert contract.
+        preserves the existing exact-ID retry/upsert contract. An optional
+        patch_builder validates the current row inside this transaction;
+        returning None declines the claim without authorizing any action.
         """
 
+        if patch is not None and patch_builder is not None:
+            raise ValueError("lp_action_patch_ambiguous")
         if not actions:
             return []
         encoded: list[tuple[str, str]] = []
@@ -7033,6 +7819,12 @@ class PredictionArbitrageStore:
                 ).fetchone()
                 if existing is not None:
                     return []
+            if patch_builder is not None:
+                patch = patch_builder(self._lp_row_result(row), connection)
+                if patch is None:
+                    return []
+                if not isinstance(patch, Mapping):
+                    raise TypeError("lp_action_patch_invalid")
             self._lp_register_trade_change(connection, str(session_id))
             if patch is not None or state is not None:
                 fenced = connection.execute(
@@ -7328,6 +8120,232 @@ class PredictionArbitrageStore:
             assert updated is not None
             return self._lp_row_result(updated)
 
+    @staticmethod
+    def _lp_current_control_values(document, account_id):
+        from types import MappingProxyType
+        if (not isinstance(document, dict) or document.get('account_id') != account_id
+                or type(document.get('desired_running')) is not bool
+                or type(document.get('ever_enabled')) is not bool):
+            raise ValueError('lp_control_identity_or_value_invalid')
+        times = {}
+        for key in ('enabled_at', 'updated_at'):
+            value = document.get(key)
+            if value is None:
+                times[key] = None
+                continue
+            try:
+                stamp = datetime.fromisoformat(value.replace('Z', '+00:00')) if isinstance(value, str) else value
+                if not isinstance(stamp, datetime) or stamp.utcoffset() is None:
+                    raise ValueError
+                times[key] = stamp.astimezone(timezone.utc)
+            except (ValueError, TypeError):
+                raise ValueError('lp_control_timestamp_invalid') from None
+        if ((document['desired_running'] and not document['ever_enabled'])
+                or document['ever_enabled'] != (times['enabled_at'] is not None)):
+            raise ValueError('lp_control_enable_metadata_invalid')
+        return MappingProxyType(dict(account_id=account_id,
+            desired_running=document['desired_running'], ever_enabled=document['ever_enabled'], **times))
+
+    @staticmethod
+    def _lp_current_settings_values(document, account_id):
+        from types import MappingProxyType
+        from decimal import Decimal, InvalidOperation
+        if (type(account_id) is not str or len(account_id) != 64
+                or any(c not in '0123456789abcdef' for c in account_id)
+                or not isinstance(document, dict) or document.get('account_id') != account_id):
+            raise ValueError('lp_settings_account_identity')
+        values = {key: document.get(key, default) for key, default in dict(
+            budget_usd=None, target_buy_count=0, buy_price_level=1, config_version=0,
+            trading_config_version=document.get('config_version', 0),
+            round_interval_seconds=30, api_retry_interval_seconds=60, order_check_interval_seconds=10).items()}
+        raw = values['budget_usd']
+        if raw is not None:
+            try:
+                if isinstance(raw, bool):
+                    raise ValueError
+                budget = Decimal(str(raw))
+                if not budget.is_finite() or budget < 0:
+                    raise ValueError
+            except (InvalidOperation, ValueError, TypeError):
+                raise ValueError('lp_settings_budget_invalid') from None
+            values['budget_usd'] = str(budget)
+        for key in ('target_buy_count', 'config_version', 'trading_config_version'):
+            if type(values[key]) is not int or values[key] < 0:
+                raise ValueError('lp_settings_integer_invalid')
+        if type(values['buy_price_level']) is not int or values['buy_price_level'] not in (1, 2):
+            raise ValueError('lp_settings_price_level_invalid')
+        for key in ('round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds'):
+            if type(values[key]) is not int or values[key] <= 0:
+                raise ValueError('lp_settings_timing_invalid')
+        return MappingProxyType(dict(account_id=account_id, **values))
+
+    def lp_load_current_settings(self, account_id: str):
+        """Read policy only; never reconstruct financial or send authority."""
+        from .polymarket_lp_accounting import default_account_pool_document
+        with self._read_connection() as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+        document = (json.loads(row['payload']) if row is not None else
+            default_account_pool_document(self.path, account_id, datetime.now(timezone.utc)))
+        return self._lp_current_settings_values(document, account_id)
+
+    def lp_save_current_settings(self, account_id: str, *, expected_config_version, changes, actor=None):
+        """CAS a narrow settings merge, returning only after actual commit."""
+        from .polymarket_lp_accounting import default_account_pool_document
+        fields = {'budget_usd', 'target_buy_count', 'buy_price_level',
+                  'api_retry_interval_seconds', 'order_check_interval_seconds'}
+        if (not isinstance(changes, Mapping) or not changes or set(changes) - fields
+                or type(expected_config_version) is not int or expected_config_version < 0
+                or actor is not None and type(actor) is not str
+                or 'budget_usd' in changes and changes['budget_usd'] is None):
+            raise ValueError('lp_settings_changes_invalid')
+        with self._transaction() as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+            document = (json.loads(row['payload']) if row is not None else
+                default_account_pool_document(self.path, account_id, datetime.now(timezone.utc)))
+            current = self._lp_current_settings_values(document, account_id)
+            if current['config_version'] != expected_config_version:
+                raise ValueError('config_version_changed')
+            trading = bool(set(changes) & {'budget_usd', 'target_buy_count', 'buy_price_level'})
+            proposed = {**document, **changes, 'config_version': current['config_version'] + 1,
+                        'trading_config_version': current['trading_config_version'] + int(trading)}
+            saved = self._lp_current_settings_values(proposed, account_id)
+            # Merge fields only, preserving any concurrent control/legacy data.
+            document.update({key: saved[key] for key in (*fields, 'config_version', 'trading_config_version')})
+            document.update(settings_updated_at=datetime.now(timezone.utc).isoformat(), settings_actor=actor)
+            connection.execute('INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?) '
+                'ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload', (json.dumps(document),))
+        return saved
+
+    def lp_load_current_control(self, account_id: str):
+        """Load saved control only; a new account starts paused, never running."""
+        if type(account_id) is not str or not account_id.strip():
+            raise ValueError('lp_control_account_required')
+        with self._read_connection() as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+        if row is None:
+            document = dict(account_id=account_id, desired_running=False, ever_enabled=False,
+                            enabled_at=None, updated_at=None)
+        else:
+            document = json.loads(row['payload'])
+        return self._lp_current_control_values(document, account_id)
+
+    def lp_save_current_control(self, write: Mapping[str, object], *, admission=None):
+        """Merge narrow reliable control in the actual transaction, then receipt.
+
+        This port is synchronous and independent of disposable business logging.
+        It neither advances trading generations nor notifies authorization.
+        """
+        from types import MappingProxyType
+        from .polymarket_lp_accounting import default_account_pool_document
+        required = {'account_id', 'process_epoch', 'request_version', 'request_id',
+                    'desired_running', 'requested_at', 'actor'}
+        if not isinstance(write, Mapping) or set(write) != required:
+            raise ValueError('lp_control_write_invalid')
+        values = dict(write)
+        for key in ('account_id', 'process_epoch', 'request_id'):
+            if type(values[key]) is not str or not values[key].strip():
+                raise ValueError('lp_control_identity_required')
+        requested_at = values['requested_at']
+        if (type(values['request_version']) is not int or values['request_version'] < 0
+                or type(values['desired_running']) is not bool
+                or not isinstance(requested_at, datetime) or requested_at.utcoffset() is None
+                or requested_at.utcoffset().total_seconds() != 0
+                or values['actor'] is not None and type(values['actor']) is not str):
+            raise ValueError('lp_control_write_invalid')
+        with self._transaction(admission=admission) as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+            document = (json.loads(row['payload']) if row is not None else
+                        default_account_pool_document(self.path, values['account_id'], datetime.now(timezone.utc)))
+            self._lp_current_control_values(document, values['account_id'])
+            stamp = datetime.now(timezone.utc).isoformat()
+            document.update(desired_running=values['desired_running'], updated_at=stamp)
+            if values['desired_running']:
+                document['ever_enabled'] = True
+                document['enabled_at'] = document['enabled_at'] or stamp
+            connection.execute('INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?) '
+                'ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload',
+                (json.dumps(document),))
+        return MappingProxyType(dict(request_id=values['request_id'], request_version=values['request_version'],
+            desired_running=values['desired_running'], committed_at=datetime.now(timezone.utc)))
+
+    def lp_log_business_record(self, record) -> bool:
+        """Write closed audit values without business permission or notification.
+
+        Only requests may create an inert complete session audit container.
+        Receipt/progress parents are checked in their own actual transaction;
+        an uncertain prior commit is never retried or fabricated here.
+        """
+        from dataclasses import asdict
+        from .lp_business_writer import RequestRecord, ReceiptRecord, ProgressRecord, _encode_scalar
+        from .polymarket_lp_market_reader import CURRENT_ORDER_STATES
+        from .polymarket_lp_risk import TERMINAL_ORDER_STATES
+        if type(record) not in (RequestRecord, ReceiptRecord, ProgressRecord):
+            raise TypeError('closed_business_record_required')
+        def encode(value):
+            return json.dumps(value, ensure_ascii=False, separators=(',', ':'), default=_encode_scalar)
+        values = asdict(record)
+        with self._transaction() as connection:
+            identity = {k: getattr(record, k) for k in (
+                'account_id', 'process_epoch', 'condition_id', 'token_id')}
+            parent_row = connection.execute('SELECT state,payload FROM lp_sessions WHERE session_id=?',
+                                           (record.session_id,)).fetchone()
+            if parent_row is not None:
+                parent = json.loads(parent_row['payload'])
+                # An audit root has only provenance. It must never acquire old
+                # order ownership, reservations, protection or ledger fields.
+                if (parent_row['state'] != 'complete' or parent.get('d2_audit_only') is not True
+                        or set(parent) != set(identity) | {'d2_audit_only'}
+                        or any(parent.get(k) != value for k, value in identity.items())):
+                    return False
+            elif type(record) is not RequestRecord:
+                return False
+            if type(record) is RequestRecord:
+                if parent_row is None:
+                    parent = dict(identity)
+                    parent['d2_audit_only'] = True
+                    stamp = record.requested_at.isoformat()
+                    connection.execute('INSERT INTO lp_sessions VALUES(?,?,?,?,?,?)',
+                        (record.session_id, 'd2-audit:' + record.session_id, 'complete', encode(parent), stamp, stamp))
+                values['d2_record'] = 'request'
+                stamp = record.requested_at.isoformat()
+                existing = connection.execute('SELECT session_id,payload FROM lp_actions WHERE action_key=?',
+                                              (record.request_id,)).fetchone()
+                if existing is not None:
+                    return existing['session_id'] == record.session_id and json.loads(existing['payload']) == json.loads(encode(values))
+                connection.execute('INSERT INTO lp_actions VALUES(?,?,?,?,?,?,?)',
+                    (record.request_id, record.session_id, record.request_id, 'recorded', encode(values), stamp, stamp))
+                return True
+            row = connection.execute('SELECT session_id,payload FROM lp_actions WHERE action_key=?',
+                                     (record.request_id,)).fetchone()
+            if row is None or row['session_id'] != record.session_id:
+                return False
+            original = json.loads(row['payload'])
+            if (original.get('d2_record') != 'request'
+                    or any(original.get(k) != getattr(record, k) for k in (
+                        'account_id', 'process_epoch', 'request_id', 'condition_id', 'token_id'))):
+                return False
+            known_order = original.get('order_id') or (original.get('receipt') or {}).get('order_id')
+            if known_order is not None and record.order_id != known_order:
+                return False
+            if type(record) is ReceiptRecord:
+                original['receipt'] = values
+                stamp = record.received_at.isoformat()
+            else:
+                if (not known_order or not record.order_id
+                        or record.status not in CURRENT_ORDER_STATES | TERMINAL_ORDER_STATES
+                        or record.status in {'FILLED', 'MATCHED'} and record.size_matched != record.original_size
+                        or Decimal(original['quantity']) != record.original_size
+                        or Decimal(original['price']) != record.price):
+                    return False
+                remaining = record.original_size - record.size_matched
+                values['remaining'] = remaining
+                values['reserved_usd'] = remaining * record.price if record.status in CURRENT_ORDER_STATES else Decimal(0)
+                original['progress'] = values
+                stamp = record.checked_at.isoformat()
+            connection.execute('UPDATE lp_actions SET payload=?,updated_at=? WHERE action_key=? AND session_id=?',
+                               (encode(original), stamp, record.request_id, record.session_id))
+        return True
+
     def lp_upsert_action(
         self,
         session_id: str,
@@ -7383,14 +8401,29 @@ class PredictionArbitrageStore:
         if changed:
             self._notify_lp_trade_change(session_id)
 
-    def lp_reject_pending_cancel(self, session_id: str, action_key: str) -> None:
+    def lp_reject_pending_cancel(self, session_id: str, action_key: str, *, record_unsent: bool = False) -> None:
         """Reject a definitely unsent cancel without overwriting receipt facts."""
         with self._transaction() as connection:
-            changed = connection.execute(
-                "UPDATE lp_actions SET state='rejected',updated_at=? "
-                "WHERE session_id=? AND action_key=? AND state='pending'",
-                (_utc_now(), str(session_id), str(action_key)),
-            ).rowcount
+            if record_unsent:
+                row = connection.execute(
+                    "SELECT payload FROM lp_actions WHERE session_id=? AND action_key=? AND state='pending'",
+                    (str(session_id), str(action_key)),
+                ).fetchone()
+                changed = 0
+                if row is not None:
+                    payload = {**_load_payload(str(row['payload'])),
+                        'post_started': False, 'submit_stage': 'pre_send_rejected'}
+                    changed = connection.execute(
+                        "UPDATE lp_actions SET state='rejected',payload=?,updated_at=? "
+                        "WHERE session_id=? AND action_key=? AND state='pending'",
+                        (_dump_execution_payload(payload), _utc_now(), str(session_id), str(action_key)),
+                    ).rowcount
+            else:
+                changed = connection.execute(
+                    "UPDATE lp_actions SET state='rejected',updated_at=? "
+                    "WHERE session_id=? AND action_key=? AND state='pending'",
+                    (_utc_now(), str(session_id), str(action_key)),
+                ).rowcount
             if changed:
                 self._lp_register_trade_change(connection, session_id)
         if changed:

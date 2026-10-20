@@ -23,7 +23,9 @@ def test_account_registration_reads_session_catalog_once_for_all_tokens(tmp_path
     connect=store._connection
     def traced():
         c=connect()
-        c.set_trace_callback(lambda sql:scans.append(sql) if sql=='SELECT * FROM lp_sessions ORDER BY updated_at,session_id' else None)
+        c.set_trace_callback(lambda sql:scans.append(sql) if sql==(
+            "SELECT * FROM lp_sessions WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true' "
+            "ORDER BY updated_at,session_id") else None)
         return c
     monkeypatch.setattr(store,'_connection',traced)
     lp=PolymarketLPService(store,SimpleNamespace(config=SimpleNamespace(wallet_address=WALLET)),clock=lambda:NOW)

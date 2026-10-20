@@ -1,4 +1,7 @@
 """Issue #253: recovery and same-round filtering through real offline boundaries."""
+
+from tests.test_lp_account_reservation_reconciliation import advance_api_wait
+from tests.test_lp_auto_pool import advance_auto_wait
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 import threading
@@ -17,6 +20,11 @@ from tests.test_lp_order_registration_contract import _open_order
 from open_trader.polymarket_lp import LpObservationWait
 
 def _exercise_recovered_account(runtime, *, cleanup_release=None):
+    import sqlite3
+    from pathlib import Path
+    from dataclasses import asdict,is_dataclass
+    from datetime import datetime
+    evidence={}
     store, adapter, account, lp, execution, public=prepare(runtime,count=5,target=5)
     original_orders=[]
     for i in (1,2,3):
@@ -24,36 +32,142 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
         original_orders.append(_open_order(f'existing-{i}', 'BUY', price='.40', original='20',token_id=token)
                                .model_copy(update={'market':condition,'condition_id':condition}))
     account.orders=tuple(original_orders)
+    active_finance, planning_as_of = [], []
+    balance, sign = account.get_balance_allowance, account.create_limit_order
+    def observed_balance(**kwargs):
+        if execution.lp_auto_state()['active_plan']:
+            active_finance.append(runtime.clock[0])
+        return balance(**kwargs)
+    def observed_sign(**kwargs):
+        planning_as_of.append(execution.lp_auto_state()['funds']['as_of'])
+        return sign(**kwargs)
+    account.get_balance_allowance, account.create_limit_order = observed_balance, observed_sign
     auto=execution._auto_pool
-    assert auto._refresh_account_facts() is True
-    assert auto.state()['slots']['occupied']==3
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state']=='ready'
+    assert execution.lp_auto_state()['slots']['occupied']==3
+    assert Decimal(execution.lp_auto_state()['funds']['buy_reserved_usd'])==24
     _advance(runtime,61)
     for i in (4,5):
         market,condition,token=_refill_identity(i)
         facts=lp._read_candidate_facts(dict(market_id=market,condition_id=condition,token_id=token,outcome='YES'))
         lp._candidate_pool_record_success(condition,dict(condition_id=condition),judged_at=lp._now(),
                                          facts=dict(directions=[facts['direction']],account=facts['account']))
-    real_reader=adapter.lp_account_snapshot_shared
-    entered,release=Event(),Event();reads=[]
+    real_reader=adapter._lp_planning_account_snapshot
+    publisher=adapter.lp_account_snapshot_shared
+    shared_reads=[]
+    def observed_shared(**kwargs):
+        shared_reads.append(dict(kwargs))
+        if execution.lp_auto_state()['active_plan']:
+            active_finance.append(runtime.clock[0])
+        return publisher(**kwargs)
+    adapter.lp_account_snapshot_shared=observed_shared
+    reads=[]
     def reader(*args,**kwargs):
-        reads.append(1)
-        if len(reads)==1:
-            entered.set()
-            assert release.wait(5), 'controlled read watchdog'
-            raise LpObservationWait('account_round_invalid')
-        return real_reader(*args,**kwargs)
-    adapter.lp_account_snapshot_shared=reader
+        record=dict(kwargs);record['sdk_before']=account.position_reads;reads.append(record)
+        try:
+            result=real_reader(*args,**kwargs)
+            record.update(packet=deepcopy(result),read_started_at=result['read_started_at'],checked_at=result['checked_at'],read_ended_at=result['read_ended_at'])
+            return result
+        finally:record['sdk_after']=account.position_reads
+    adapter._lp_planning_account_snapshot=reader
+    def native_barrier(request_records):
+        native_connect=sqlite3.connect
+        reached,release=Event(),Event()
+        original_thread,records,commits,errors=[],[],[],[]
+        armed=[True]
+        revision_sql=("SELECT session_id,json_extract(payload,'$._lp_trade_revision') AS revision "
+            "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?) "
+            "AND coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true'")
+        class NativeCursor(sqlite3.Cursor):
+            def execute(self,sql,parameters=()):
+                self.sql,self.parameters=sql,parameters
+                return super().execute(sql,parameters)
+            def fetchall(self):
+                rows=super().fetchall()
+                if (self.sql==revision_sql and self.parameters==(adapter.config.wallet_address.casefold(),)
+                        and original_thread==[threading.get_ident()] and armed[0]):
+                    armed[0]=False
+                    apply_free=lp._first_seen_apply_lock.acquire(blocking=False)
+                    if apply_free:lp._first_seen_apply_lock.release()
+                    record=dict(thread=threading.get_ident(),sql=self.sql,account=self.parameters[0],
+                        rows=[dict(row) for row in rows],rows_identity=id(rows),
+                        in_transaction=self.connection.in_transaction,apply_free=apply_free,
+                        generation=store.lp_trade_generation(),sdk_reads=account.position_reads,
+                        original_packet=deepcopy(request_records[0]['packet']) if request_records else None)
+                    records.append(record);reached.set()
+                    try:
+                        assert not record['in_transaction'] and record['apply_free']
+                        assert len(request_records)==1 and request_records[0]['sdk_after']-request_records[0]['sdk_before']==1
+                        assert record['original_packet'] is not None
+                        assert release.wait(5),'Native unchanged row delivery independent watchdog'
+                    except BaseException as exc:errors.append(repr(exc));raise
+                    finally:record['returned_rows_identity']=id(rows)
+                return rows
+        class NativeConnection(sqlite3.Connection):
+            def execute(self,sql,parameters=()):
+                result=self.cursor(factory=NativeCursor).execute(sql,parameters)
+                if sql.startswith('UPDATE lp_trade_generation SET generation=generation+1') and result.rowcount==1:
+                    self.generation_advance=dict(sql=sql,parameters=list(parameters),thread=threading.get_ident())
+                if sql=='COMMIT' and getattr(self,'generation_advance',None):
+                    commits.append({**self.generation_advance,'successful_commit':True,'in_transaction_after':self.in_transaction})
+                    self.generation_advance=None
+                return result
+        def observed_connect(database,*args,**kwargs):
+            if Path(database).resolve()==store.path.resolve():kwargs['factory']=NativeConnection
+            return native_connect(database,*args,**kwargs)
+        def run_original(round_id):
+            original_thread.append(threading.get_ident())
+            return execution.lp_auto_run_once(round_id=round_id)
+        return dict(connect=observed_connect,reached=reached,release=release,run=run_original,
+            records=records,commits=commits,errors=errors)
+    gate=native_barrier(reads)
+    release=gate['release']
     try:
-        with ThreadPoolExecutor(1) as workers:
-            pending=workers.submit(execution.lp_auto_run_once,round_id='three-to-five-recovery')
-            try:
-                assert entered.wait(3)
-                _advance(runtime)
-                snapshot=real_reader(max_age_seconds=0,trade_generation_provider=store.lp_trade_generation)
-                assert lp.register_account_snapshot(snapshot)['state']=='registered'
-            finally:
-                release.set()
-            result=pending.result(timeout=5)
+        with pytest.MonkeyPatch.context() as native:
+            native.setattr(sqlite3,'connect',gate['connect'])
+            with ThreadPoolExecutor(1) as workers:
+                pending=workers.submit(gate['run'],'three-to-five-invalidated')
+                try:
+                    assert gate['reached'].wait(3),'Original native outside-writer rows reached'
+                    assert len(gate['records'])==1 and gate['errors']==[]
+                    before=execution.lp_auto_state()
+                    assert before['active_plan'] is None and account.posts==[] and len(account.orders)==3
+                    acquired=reads[0]['packet'];generation=gate['records'][0]['generation']
+                    assert acquired['trade_generation']==generation
+                    assert {o['order_id'] for o in acquired['open_orders']}=={o.id for o in original_orders}
+                    assert store.lp_advance_trade_generation(generation) is True
+                    assert store.lp_trade_generation()==generation+1
+                    assert len(gate['commits'])==1 and gate['commits'][0]['successful_commit'] and not gate['commits'][0]['in_transaction_after']
+                    _advance(runtime)
+                    before_publication=account.position_reads
+                    snapshot=publisher(max_age_seconds=-1,trade_generation_provider=store.lp_trade_generation)
+                    assert account.position_reads==before_publication+1
+                    assert snapshot['read_started_at']>acquired['read_ended_at'] and snapshot['trade_generation']==generation+1
+                    assert {o['order_id'] for o in snapshot['open_orders']}=={o.id for o in original_orders}
+                    publication=lp.register_account_snapshot(snapshot)
+                    assert publication['state']=='registered'
+                    current_facts=publication['_planning_capture']['document']['account_financial_facts']
+                    assert current_facts['snapshot_id'] and current_facts['trade_generation']==snapshot['trade_generation']
+                    evidence.update(acquired=deepcopy(acquired),public_packet=deepcopy(snapshot),public_facts=deepcopy(current_facts))
+                finally:release.set()
+                result=pending.result(timeout=5)
+        assert account.posts==[] and len(reads)==1
+        assert gate['records'][0]['rows_identity']==gate['records'][0]['returned_rows_identity'] and gate['errors']==[]
+        assert result['funds']['status']=='known' and Decimal(result['funds']['buy_reserved_usd'])==24
+        assert result['active_plan'] is None and result['last_round']['actions']==[]
+        assert result['last_round']['completed_at'] and result['last_round']['reason']=='account_round_invalid'
+        assert result['plan_wait'] is None
+        completed=datetime.fromisoformat(result['last_round']['completed_at'])
+        evidence['invalidated']=deepcopy(result)
+        # No old attempt was sent; recovery uses a new current acquisition.
+        assert account.posts == []
+        runtime.clock[0] = completed + timedelta(seconds=1)
+        advance_api_wait(runtime,execution)
+        evidence['original_reads']=list(reads)
+        reads.clear();shared_reads.clear()
+        result=execution.lp_auto_run_once(round_id='three-to-five-fresh-current')
+        assert result['last_round']['round_id']!=evidence['invalidated']['last_round']['round_id']
     finally:
         # Executor exit reclaims the controlled worker before attention cleanup.
         release.set()
@@ -68,12 +182,33 @@ def _exercise_recovered_account(runtime, *, cleanup_release=None):
                     failure.add_note('attention cleanup watchdog')
                 else:
                     raise AssertionError('attention cleanup watchdog')
-    assert len(account.posts)==2, 'fresh publication and two fresh candidates must reach mandatory per-send reads'
+        def serialize(value):
+            if is_dataclass(value):return asdict(value)
+            if hasattr(value,'model_dump'):return value.model_dump(mode='json')
+            return str(value)
+        (store.path.parent/'IJ-recovery-native-proof.json').write_text(json.dumps(dict(
+            evidence=evidence,rows=gate['records'],commits=gate['commits'],errors=gate['errors'],
+            reads=reads,shared_reads=shared_reads,active_finance=active_finance,planning_as_of=planning_as_of,
+            failure_type=type(failure).__name__ if failure else None,current=execution.lp_auto_state(),
+            sessions=store.lp_sessions(),posts=account.posts,cancels=account.cancels),default=serialize,indent=2))
+    assert len(account.posts)==2, 'fresh planning publication and two frozen candidates must execute once: ' + str(result['last_round'])
     assert len(account.orders)==5
     assert result['slots']['occupied']==5
-    assert result['admission_block_reasons']==[]
-    assert result['funds']['status']=='known'
-    assert len(reads)==6, 'initial invalidated read, two reads per send, and final refresh'
+    assert 'account_financial_facts_changed' in result['admission_block_reasons']
+    assert planning_as_of and planning_as_of[0]
+    assert result['funds']['status']=='unknown' and result['funds']['as_of']==planning_as_of[0]
+    assert active_finance == []
+    assert len(reads)==1, 'Exactly one fresh automatic planning read'
+    assert reads[0]['trade_generation_provider'] == store.lp_trade_generation
+    assert reads[0]['read_started_at'] <= reads[0]['checked_at'] <= reads[0]['read_ended_at'] <= runtime.clock[0]
+    assert len(shared_reads) <= 1, 'At most one existing optional maintenance reuse'
+    assert all('max_age_seconds' not in read for read in shared_reads)
+    from collections import Counter
+    assert Counter(p.token_id for p in account.posts)==Counter(_refill_identity(i)[2] for i in (4,5))
+    assert all(p.maker_amount==8000000 and p.taker_amount==20000000 and p.post_only is True for p in account.posts)
+    assert Decimal(result['funds']['buy_reserved_usd'])==40 and account.cancels==account.market_orders==[]
+    assert result['active_plan'] is None and result['last_round']['completed_at']
+    assert result['plan_wait'] is None
 
 
 def test_recovered_account_can_refill_three_to_five(runtime):
@@ -151,18 +286,20 @@ def test_failed_attempt_still_blocks_without_current_durable_facts(runtime, boun
     real_reader = adapter.lp_account_snapshot_shared
     initial_facts = deepcopy(auto._read()['account_financial_facts'])
     reads = []
-    def invalidated(**kwargs):
+    def invalidated(*, trade_generation_provider, retry_seconds, previous_components):
+        assert retry_seconds == 60
+        assert previous_components is None or isinstance(previous_components, dict)
         reads.append(True)
         if boundary != 'no_new_publication':
             _advance(runtime)
-            fresh = real_reader(**kwargs)
+            fresh = real_reader(max_age_seconds=0, trade_generation_provider=trade_generation_provider)
             assert lp.register_account_snapshot(fresh)['state'] == 'registered'
             if boundary == 'generation_changed':
                 store.lp_advance_trade_generation(store.lp_trade_generation())
             else:
                 _advance(runtime, 61)
         raise LpObservationWait('account_round_invalid')
-    adapter.lp_account_snapshot_shared = invalidated
+    adapter._lp_planning_account_snapshot = invalidated
     state = execution.lp_auto_run_once(round_id='counterfactual-' + boundary)
     assert len(reads) == 1
     assert account.posts == account.cancels == []
@@ -190,6 +327,9 @@ def test_zero_candidate_round_keeps_filter_counts(tmp_path, case, reason, count)
     engine.lp_auto_set_desired_running(True)
     if case == 'stale_reward':
         lp._candidate_qualification_facts['m00']['directions'][0]['reward_checked_at'] = pool.NOW - timedelta(seconds=61)
+        # #310 now requalifies before filtering. Keep the source unavailable
+        # so this diagnostic case still observes a genuinely stale fact.
+        exchange.lp_reward_catalog = lambda **kwargs: dict(state='unknown', markets=[])
     elif case == 'missing_facts':
         lp._candidate_qualification_facts.clear()
     elif case == 'expired_pool':
@@ -249,6 +389,9 @@ def test_candidate_diagnostics_uses_consumed_snapshot_under_concurrent_publicati
     engine.lp_auto_configure(dict(budget_usd='100', target_buy_count=5))
     engine.lp_auto_set_desired_running(True)
     lp._candidate_qualification_facts['m00']['directions'][0]['reward_checked_at'] = pool.NOW - timedelta(seconds=61)
+    # This negative snapshot case needs the external reward to remain
+    # unavailable after #310's bounded prefilter refresh, not become fresh.
+    exchange.lp_reward_catalog = lambda **kwargs: dict(state='unknown', markets=[])
     entered, release = Event(), Event()
     excluded = engine._auto_pool._excluded
     def delayed(condition):
@@ -299,11 +442,11 @@ def test_candidate_diagnostics_does_not_add_reads_clocks_or_re_evaluate(tmp_path
             patch.setattr(engine._auto_pool, '_submit', lambda *args, **kwargs: ({'state': 'rejected', 'reason': 'strategy_funds_insufficient'}, None))
             if not enabled:
                 ranked = engine._auto_pool._ranked_buys
-                patch.setattr(engine._auto_pool, '_ranked_buys', lambda state, *, diagnostics=None: ranked(state))
+                patch.setattr(engine._auto_pool, '_ranked_buys', lambda state, *, diagnostics=None, observation=None: ranked(state, observation=observation))
             state = engine.lp_auto_run_once(round_id='counted')
         results.append((calls, state))
     assert results[0][0] == results[1][0]
-    assert results[1][0]['evaluate'] == results[1][0]['estimate'] == 2
+    assert results[1][0]['evaluate'] == results[1][0]['estimate'] == 4
     assert results[0][1]['last_round']['actions'] == results[1][1]['last_round']['actions']
     diagnostics = results[1][1]['last_round']['candidate_filter']
     assert diagnostics['counts']['qualified_directions'] == 2
@@ -376,6 +519,7 @@ def test_candidate_diagnostics_keeps_unknown_estimate_reason(tmp_path, monkeypat
 @pytest.mark.parametrize('outcome, reason', [('rejected', 'market_not_accepting_orders'), ('error', 'market_read_timeout')])
 def test_rotation_recheck_removal_is_distinct_from_initial_qualification(tmp_path, monkeypatch, outcome, reason):
     engine, exchange, lp, _ = rotation.setup(tmp_path, monkeypatch, count=2, target=1)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 2)
     reader = lp._read_candidate_facts
@@ -450,6 +594,9 @@ def test_known_candidate_filter_reasons_survive_real_evaluate(tmp_path, case, re
         direction['book']['bids'][1]['price'] = '.35' if case == 'stress_loss_exceeded' else '.36'
     elif case == 'book_time_invalid':
         direction['book']['received_at'] = None
+        # A successful source read repairs the missing stamp before ranking;
+        # this negative diagnostic needs the external book to remain unknown.
+        exchange.lp_order_books = lambda ids, **kwargs: {}
     elif case == 'account_time_invalid':
         account['checked_at'] = None
     else:
@@ -514,6 +661,7 @@ def test_recovery_probe_failure_preserves_error_and_reclaims_real_threads(runtim
 ])
 def test_rotation_recheck_keeps_real_history_and_freshness_reasons(tmp_path, monkeypatch, reason):
     engine, exchange, lp, store = rotation.setup(tmp_path, monkeypatch, count=2, target=1)
+    advance_auto_wait(engine, monkeypatch)
     exchange.rewards['m01'] = Decimal('25')
     rotation.refresh(lp, exchange, 2)
     if reason.startswith('history_'):

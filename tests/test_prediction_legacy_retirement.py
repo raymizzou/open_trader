@@ -870,321 +870,84 @@ def test_fence1_state_endpoint_keeps_legacy_monitor_rows() -> None:
     assert all(row["engine_owner"] != "N_LEG" for row in opportunities)
 
 
-def test_fence2_runtime_runs_without_wiring_the_legacy_auto_eat_observer(
-    tmp_path, monkeypatch
-) -> None:
-    import types
-
-    import open_trader.prediction_runtime as runtime_module
-
-    events: list[str] = []
-    monkeypatch.setattr(
-        runtime_module,
-        "read_minimum_reader_generation",
-        lambda _data_dir: events.append("fence.read") or 2,
-        raising=False,
-    )
-
-    class FakeStore:
-        def __init__(self, _data_dir) -> None:
-            pass
-
-        def apply_safety_policy(self, _policy, *, git_sha):
-            return {"state": "baseline_enrolled"}
-
-        def n_leg_scope(self, _scope_id):
-            return None
-
-        def close(self) -> None:
-            pass
-
-    class FakeTrading:
-        def close(self) -> None:
-            pass
-
-    class FakeTradingClient:
-        @classmethod
-        def from_keychain(cls, _config):
-            return FakeTrading()
-
-    class FakeMonitor:
-        def __init__(self, **_) -> None:
-            pass
-
-        def set_ready_observer(self, _observer) -> None:
-            pass
-
-        def set_observation_observer(self, _observer) -> None:
-            pass
-
-        def set_auto_eat_observer(self, _observer) -> None:
-            events.append("auto_eat.bind")
-
-        def set_failure_observer(self, _observer) -> None:
-            pass
-
-        def start(self) -> None:
-            pass
-
-        def stop(self) -> None:
-            pass
-
-    class FakeExecution:
-        def __init__(self, **_) -> None:
-            pass
-
-        def reconcile_startup(self):
-            return {"status": "ready"}
-
-        def notify_ready_opportunity(self, *_, **__):
-            pass
-
-        def notify_observation(self, *_, **__):
-            pass
-
-        def notify_monitor_failure(self, *_, **__):
-            pass
-
-        def auto_eat_threshold(self, *_, **__):
-            pass
-
-        def set_cross_venue_monitor(self, _monitor) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    monkeypatch.setattr(
-        runtime_module,
-        "load_trading_config",
-        lambda _path: types.SimpleNamespace(
-            signer_address="0x1111111111111111111111111111111111111111",
-            wallet_address="0x2222222222222222222222222222222222222222",
-            predict=None,
-        ),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        runtime_module, "PolymarketTradingClient", FakeTradingClient, raising=False
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "PredictTradingClient",
-        types.SimpleNamespace(from_keychain=lambda _config: None),
-        raising=False,
-    )
-    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore, raising=False)
-    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor, raising=False)
-    monkeypatch.setattr(
-        runtime_module, "PredictionExecutionService", FakeExecution, raising=False
-    )
-    monkeypatch.setattr(
-        runtime_module, "LlmRelationValidator", lambda *a, **k: object(), raising=False
-    )
-    monkeypatch.setattr(
-        runtime_module, "LlmTitleTranslator", lambda *a, **k: object(), raising=False
-    )
-
-    runtime = runtime_module.PredictionRuntime(
-        data_dir=tmp_path,
-        prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8766/",
-        cross_venue_monitor=runtime_module._UnavailableCrossVenueMonitor("fence2-test"),
-        git_sha="sha-1",
-        reader_generation=2,
-        solver_server_factory=lambda: object(),
-        enable_n_leg_background=False,
-    )
-    runtime.start()
-    try:
-        assert runtime.state == "RUNNING"
-        assert runtime.legacy_retired is True
-        assert "auto_eat.bind" not in events
-        assert events.count("fence.read") == 1
-    finally:
-        runtime.stop()
+def test_fence2_runtime_runs_without_wiring_the_legacy_auto_eat_observer(tmp_path, monkeypatch) -> None:
+    with _observer_wiring_runtime(monkeypatch,tmp_path,fence=2) as (child,events,observed):
+        assert observed['state'] == 'RUNNING'
+        assert observed['legacy_retired'] is True
+        assert 'auto_eat.bind' not in events
+        assert events.count('fence.read') == 1
+        assert observed['n_leg_paused'] is False and observed['production_owner'] is True
+        child.assert_owned()
+        assert child.actual_posts()==0
 
 
-def _observer_wiring_runtime(
-    monkeypatch: object, tmp_path: object, *, fence: int
-) -> tuple[object, list[str]]:
-    """Shared harness of the #109 observer-wiring tests: a production
-    PredictionRuntime whose reader fence is `fence`, built exactly like the
-    auto-eat unwiring test above, whose monitor records every
-    ``set_*_observer`` call as ``<name>.bind``."""
-
-    import types
-
-    import open_trader.prediction_runtime as runtime_module
-
-    events: list[str] = []
-    monkeypatch.setattr(
-        runtime_module,
-        "read_minimum_reader_generation",
-        lambda _data_dir: events.append("fence.read") or fence,
-        raising=False,
-    )
-
-    class FakeStore:
-        def __init__(self, _data_dir) -> None:
-            pass
-
-        def apply_safety_policy(self, _policy, *, git_sha):
-            return {"state": "baseline_enrolled"}
-
-        def n_leg_scope(self, _scope_id):
-            return None
-
-        def close(self) -> None:
-            pass
-
-    class FakeTrading:
-        def close(self) -> None:
-            pass
-
-    class FakeTradingClient:
-        @classmethod
-        def from_keychain(cls, _config):
-            return FakeTrading()
-
-    class FakeMonitor:
-        def __init__(self, **_) -> None:
-            pass
-
-        def set_ready_observer(self, _observer) -> None:
-            events.append("ready.bind")
-
-        def set_observation_observer(self, _observer) -> None:
-            events.append("observation.bind")
-
-        def set_auto_eat_observer(self, _observer) -> None:
-            events.append("auto_eat.bind")
-
-        def set_failure_observer(self, _observer) -> None:
-            events.append("failure.bind")
-
-        def start(self) -> None:
-            pass
-
-        def stop(self) -> None:
-            pass
-
-    class FakeExecution:
-        def __init__(self, **_) -> None:
-            pass
-
-        def reconcile_startup(self):
-            return {"status": "ready"}
-
-        def notify_ready_opportunity(self, *_, **__):
-            pass
-
-        def notify_observation(self, *_, **__):
-            pass
-
-        def notify_monitor_failure(self, *_, **__):
-            pass
-
-        def auto_eat_threshold(self, *_, **__):
-            pass
-
-        def set_cross_venue_monitor(self, _monitor) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    monkeypatch.setattr(
-        runtime_module,
-        "load_trading_config",
-        lambda _path: types.SimpleNamespace(
-            signer_address="0x1111111111111111111111111111111111111111",
-            wallet_address="0x2222222222222222222222222222222222222222",
-            predict=None,
-        ),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        runtime_module, "PolymarketTradingClient", FakeTradingClient, raising=False
-    )
-    monkeypatch.setattr(
-        runtime_module,
-        "PredictTradingClient",
-        types.SimpleNamespace(from_keychain=lambda _config: None),
-        raising=False,
-    )
-    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore, raising=False)
-    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor, raising=False)
-    monkeypatch.setattr(
-        runtime_module, "PredictionExecutionService", FakeExecution, raising=False
-    )
-    monkeypatch.setattr(
-        runtime_module, "LlmRelationValidator", lambda *a, **k: object(), raising=False
-    )
-    monkeypatch.setattr(
-        runtime_module, "LlmTitleTranslator", lambda *a, **k: object(), raising=False
-    )
-
-    runtime = runtime_module.PredictionRuntime(
-        data_dir=tmp_path,
-        prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8766/",
-        cross_venue_monitor=runtime_module._UnavailableCrossVenueMonitor(
-            "observer-wiring-test"
-        ),
-        git_sha="sha-1",
-        reader_generation=fence,
-        solver_server_factory=lambda: object(),
-        enable_n_leg_background=False,
-    )
-    return runtime, events
+def _observer_wiring_runtime(monkeypatch, tmp_path, *, fence, incompatible=False):
+    """Actual clean selected release, persisted fence, and call-through observations."""
+    from contextlib import contextmanager
+    import os, subprocess, sys
+    from tests.lp_d2_service_harness import ServiceChild
+    class FenceChild(ServiceChild):
+        def launch(self, scenario, *, expected_running=None):
+            # Only this new fixture scenario selects its tracked manifest.
+            # Existing ServiceChild bootstrap and native lifecycle stay intact.
+            manifest=self.release_root/'ops/prediction-service-release.json'
+            payload=json.loads(manifest.read_text())
+            payload.update(reader_generation=1 if incompatible else fence,
+                contract_generation=1 if incompatible else fence)
+            manifest.write_text(json.dumps(payload)+'\n')
+            for args in (['add','ops/prediction-service-release.json'],
+                ['-c','user.name=CI fence fixture','-c','user.email=fixture@invalid','commit','-qm','actual selected reader manifest']):
+                subprocess.run(['git','-C',str(self.release_root),*args],check=True,capture_output=True)
+            self.sha=subprocess.check_output(['git','-C',str(self.release_root),'rev-parse','HEAD'],text=True).strip()
+            self.output=self.root/('child-'+scenario+'.log');self.log_handle=self.output.open('w')
+            env=dict(os.environ,PYTHONPATH=str(self.release_root/'src')+os.pathsep+str(self.release_root),
+                PYTHONDONTWRITEBYTECODE='1',OPEN_TRADER_NLEG_PAUSED='0',OPEN_TRADER_DISABLE_NLEG_BACKGROUND='1')
+            self.process=subprocess.Popen([sys.executable,'-m','tests.lp_d2_service_harness','child',
+                str(self.runtime_root),str(self.port),scenario,str(self.config_path)],cwd=self.release_root,
+                env=env,stdout=self.log_handle,stderr=subprocess.STDOUT)
+            self.wait('service-starting')
+            if expected_running is not None:self.wait_state(lambda state:state.get('effective_running') is expected_running)
+    @contextmanager
+    def observed():
+        scenario='consumer-ci-fence-incompatible' if incompatible else 'consumer-ci-fence-'+str(fence)
+        with FenceChild(tmp_path,scenario=scenario) as child:
+            child.release('metadata');child.start(expected_running=None if incompatible else False)
+            if incompatible:assert child.wait_exit()==78,child.output.read_text()
+            path=child.marker('ci-fence-observations.json')
+            child.wait('ci-fence-observations.json')
+            snapshot=json.loads(path.read_text())
+            yield child,snapshot['events'],snapshot
+            if not incompatible:
+                child.process.terminate();assert child.wait_exit()==0,child.output.read_text()
+            child.assert_owner_available()
+    return observed()
 
 
-def test_fence2_runtime_runs_without_wiring_the_legacy_notification_observers(
-    tmp_path, monkeypatch
-) -> None:
-    """Issue #109: at the N_LEG fence the legacy ready/observation alert
-    channels must be silent — no Feishu cards, no legacy opportunity alerts.
-    Mirrors the auto-eat unwiring test above: the production wiring must not
-    arm either observer once legacy_retired is true, while the failure
-    observer keeps its unconditional wiring."""
-
-    runtime, events = _observer_wiring_runtime(
-        monkeypatch, tmp_path, fence=2
-    )
-    runtime.start()
-    try:
-        assert runtime.state == "RUNNING"
-        assert runtime.legacy_retired is True
-        assert "ready.bind" not in events
-        assert "observation.bind" not in events
-        assert "auto_eat.bind" not in events
-        assert "failure.bind" in events
-        assert events.count("fence.read") == 1
-    finally:
-        runtime.stop()
+def test_fence2_runtime_runs_without_wiring_the_legacy_notification_observers(tmp_path, monkeypatch) -> None:
+    with _observer_wiring_runtime(monkeypatch,tmp_path,fence=2) as (child,events,observed):
+        assert observed['state'] == 'RUNNING'
+        assert observed['legacy_retired'] is True
+        assert 'ready.bind' not in events
+        assert 'observation.bind' not in events
+        assert 'auto_eat.bind' not in events
+        assert 'failure.bind' in events
+        assert events.count('fence.read') == 1
+        assert observed['n_leg_paused'] is False and observed['production_owner'] is True
+        child.assert_owned()
+        assert child.actual_posts()==0
 
 
-def test_fence1_runtime_still_wires_all_three_legacy_observers(
-    tmp_path, monkeypatch
-) -> None:
-    """Issue #109 fence-1 pin: below the N_LEG fence the ready, observation,
-    and auto-eat observers keep their exact pre-#109 wiring (one bind each),
-    alongside the unconditional failure observer."""
-
-    runtime, events = _observer_wiring_runtime(
-        monkeypatch, tmp_path, fence=1
-    )
-    runtime.start()
-    try:
-        assert runtime.state == "RUNNING"
-        assert runtime.legacy_retired is False
-        assert events.count("ready.bind") == 1
-        assert events.count("observation.bind") == 1
-        assert events.count("auto_eat.bind") == 1
-        assert events.count("failure.bind") == 1
-    finally:
-        runtime.stop()
+def test_fence1_runtime_still_wires_all_three_legacy_observers(tmp_path, monkeypatch) -> None:
+    with _observer_wiring_runtime(monkeypatch,tmp_path,fence=1) as (child,events,observed):
+        assert observed['state'] == 'RUNNING'
+        assert observed['legacy_retired'] is False
+        assert events.count('ready.bind') == 1
+        assert events.count('observation.bind') == 1
+        assert events.count('auto_eat.bind') == 1
+        assert events.count('failure.bind') == 1
+        assert observed['n_leg_paused'] is False and observed['production_owner'] is True
+        child.assert_owned()
+        assert child.actual_posts()==0
 
 
 def test_fence2_cross_auto_is_observe_only_despite_armed_auto_submit(tmp_path) -> None:
@@ -1242,77 +1005,26 @@ def test_fence2_cross_auto_is_observe_only_despite_armed_auto_submit(tmp_path) -
     assert store.cross_auto_attempts() == []
 
 
-def test_fence2_data_dir_rejects_reader_generation_1_release_manifest(
-    tmp_path, monkeypatch
-) -> None:
-    import open_trader.prediction_runtime as runtime_module
-    from open_trader.prediction_arbitrage_store import (
-        N_LEG_READER_GENERATION,
-        PredictionArbitrageStore,
-        read_minimum_reader_generation,
-    )
+def test_fence2_data_dir_rejects_reader_generation_1_release_manifest(tmp_path, monkeypatch) -> None:
+    from open_trader.prediction_arbitrage_store import read_minimum_reader_generation
     from open_trader.prediction_release import load_prediction_release_manifest
-    from open_trader.prediction_runtime import (
-        PredictionRuntime,
-        PredictionRuntimeCompatibilityError,
-    )
-
-    # A real data dir whose reader fence has been advanced to the N_LEG
-    # generation, plus an old release manifest still pinned at generation 1.
-    data_dir = tmp_path / "data"
-    seed_store = PredictionArbitrageStore(data_dir)
-    assert (
-        seed_store.advance_minimum_reader_generation(N_LEG_READER_GENERATION) == 2
-    )
-    assert read_minimum_reader_generation(data_dir) == 2
-    manifest_path = tmp_path / "release.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "schema_version": "open_trader.prediction_service.release.v1",
-                "reader_generation": 1,
-                "contract_generation": 1,
-            }
-        ),
-        encoding="utf-8",
-    )
-    manifest = load_prediction_release_manifest(manifest_path)
-
-    writes: list[str] = []
-
-    def _forbidden_store(_data_dir):
-        writes.append("store")
-        raise AssertionError("production write store must not be constructed")
-
-    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", _forbidden_store)
-    monkeypatch.setattr(
-        runtime_module.PolymarketTradingClient,
-        "from_keychain",
-        lambda _config: writes.append("trading") or object(),
-    )
-
-    runtime = PredictionRuntime(
-        data_dir=data_dir,
-        prediction_config_path=tmp_path / "prediction.json",
-        dashboard_url="http://127.0.0.1:8769",
-        reader_generation=manifest.reader_generation,
-    )
-
-    with pytest.raises(
-        PredictionRuntimeCompatibilityError,
-        match="reader generation 1 is below required 2",
-    ):
-        runtime.start()
-
-    assert runtime.state == "FAILED"
-    assert runtime.state != "RUNNING"
-    assert runtime.production_owner is False
-    assert writes == []
-    probe = runtime_module._RuntimeOwnershipLock(
-        tmp_path / "prediction_arbitrage" / "runtime.lock"
-    )
-    probe.acquire()
-    probe.release()
+    from open_trader.prediction_runtime import _RuntimeOwnershipLock
+    with _observer_wiring_runtime(monkeypatch,tmp_path,fence=2,incompatible=True) as (child,events,observed):
+        assert read_minimum_reader_generation(child.data_dir)==2
+        assert load_prediction_release_manifest(child.release_root/'ops/prediction-service-release.json').reader_generation==1
+        assert observed['error_type']=='PredictionRuntimeCompatibilityError'
+        assert observed['error']=='prediction reader generation 1 is below required 2'
+        assert observed['state']=='FAILED'
+        assert observed['state']!='RUNNING'
+        assert observed['production_owner'] is False
+        writes=[]
+        if observed.get('writable_store_constructed'):writes.append('store')
+        if child.marker('runtime-sdk-factory-consumer-ci-fence-incompatible').exists():writes.append('trading')
+        assert writes==[]
+        assert events.count('fence.read')==1
+        assert child.actual_posts()==0
+        probe=_RuntimeOwnershipLock(child.data_dir/'prediction_arbitrage/runtime.lock')
+        probe.acquire();probe.release()
 
 
 def test_fence2_history_still_returns_legacy_rows_with_original_strategy_type() -> None:

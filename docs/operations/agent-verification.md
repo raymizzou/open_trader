@@ -1,9 +1,144 @@
 # Agent Verification and Delivery
 
-This runbook is binding with `AGENTS.md` and the global agent instructions.
+This runbook defines the project workflow with `AGENTS.md`; compatible global
+guidance also applies, subject to higher-priority instructions.
 Read it before selecting or running development gates, Deployment Preflight,
 merge, or deployment. Documentation and configuration-only work does not run
 `make test`; other exemptions below remain scope-specific.
+
+## Implementation and TDD
+
+After plan approval, implement within the approved scope in the isolated task
+worktree. For new or changed behavior, including bug fixes, first add a focused
+test that fails for the intended missing or incorrect behavior. Record the RED
+result, make the smallest implementation change, then run that test and the
+directly affected consumers. A failure caused only by missing dependencies does
+not establish RED. For behavior-preserving refactors, run the existing focused
+contract tests before and after the change. Documentation and configuration
+exemptions below remain valid; a skill does not add another approval requirement
+when the project already grants an exemption.
+
+Delegate implementation only when the user or applicable instructions authorize
+it. Give the worker the approved scope, worktree, and verification contract.
+The required independent review remains separate from implementation: the author
+does not serve as their own reviewer. Follow the publication, review and repair
+ordering in `AGENTS.md`; required independent review follows first publication.
+
+When the user selects Herdr for implementation, start new Codex implementation
+workers with `gpt-6.1-sol` and `high` reasoning unless the user chooses otherwise:
+
+```sh
+herdr agent start <worker-name> --kind codex --pane <available-pane-id> -- -m gpt-6.1-sol -c 'model_reasoning_effort="high"'
+```
+
+Before assigning work, use `herdr agent read <worker-name>` to verify the selected
+model. Planning, independent review, and existing sessions retain their separately
+selected models. Herdr is not required for work the user has not assigned to it.
+
+### Implementation impact map
+
+Main owns investigation, requirements, planning and acceptance. Before
+implementation, keep one concise impact map with the approved plan and worker
+brief. Map each changed behavior to its production seam and direct consumers,
+exact affected test nodeids, old expectations to migrate and assertions to
+preserve. Use source/caller evidence to identify consumers, including across
+services for shared production changes. Mark unknown impacts explicitly and
+update this same map when evidence changes. This is planning evidence, not an
+additional gate or a reason to run a full suite.
+
+For serial-to-concurrent migrations, include these checks in the map:
+
+- Match orders/results by request, order, session and audit identity, rather than
+  arrival position or a fixed order number.
+- Wait for the actual completion event or thread/Future completion before
+  observing terminal state. For example, `Event.is_set()` is an observation,
+  not a wait for an asynchronously produced event.
+- State whether an assertion concerns a historical return snapshot or fresh
+  public state. After the original sender completes, fetch current state when
+  testing current resource ownership; do not treat an old snapshot as fresh.
+- Keep an independent real-time watchdog for synchronization, separate from
+  controlled business time. Retain cleanup and negative regression evidence.
+
+Preserve financial, identity, UNKNOWN resource ownership and no-replay
+protections, along with success, boundary and negative assertions. Give the
+worker and reviewer the same approved public seams, exact cases, independent
+expectations, verified runner commands and per-case evidence under the existing
+TDD contract. Do not re-approve unchanged cases or duplicate the TDD cycle across
+roles.
+
+### Scope expansion and reassessment
+
+Pause expanded repairs when modules/services, behavior, architecture, risk or
+expected effort/time materially exceed the approved plan. Main may do bounded
+read-only classification and representative checks before discussion; it need
+not establish every cause first. Group failures by confirmed common cause:
+old expectations, fixture/observation problems, production regressions and
+unknowns. A failure count is not a count of independent defects; no numeric
+failure threshold replaces this assessment.
+
+Main presents the following before requesting approval for expanded work:
+
+- Cause groups and unknowns, target paths/modules, changed behavior and impact
+  relative to the approved contract.
+- Repair batches by common cause, dependencies/order, verification nodeids,
+  preserved assertions, completion and renewed-pause conditions.
+- Risks, exclusions, effort/time uncertainty and viable continue, narrow or
+  split options with their costs.
+
+Obtain user approval before expanded implementation. Routine in-scope fixture,
+field, serialization, assertion or observation-timing corrections that preserve
+the approved contract do not need repeated approval. Do not silently absorb a
+material expansion into such corrections.
+
+### Approved worker batches
+
+Main owns overall assessment, planning, progress, acceptance, Git and publication.
+An approved batch authorizes its worker to complete same-cause scoped repairs
+autonomously, including routine fixture, field, serialization and observation
+corrections. Preserve original failures and protected assertions; batch findings
+and results instead of stopping for a release instruction after every test or
+small correction. Escalate material scope, contract, architecture, risk or effort
+changes through the reassessment procedure above.
+
+Use the same worker for the same target/architecture, with an updated brief when
+needed; use a fresh worker for a new target. The first independent review needs
+a fresh reviewer, reused only for this target's in-scope repairs. Do not add agents
+merely to satisfy a skill recipe. These rules do not expand delegation authority
+or change worker/reviewer Git, model, pane or file-write boundaries.
+
+### Task state and recovery
+
+Keep isolated task worktrees and essential evidence in durable directories,
+never only in `/tmp`. Unique briefs can use `mktemp -d` under a persistent parent.
+Maintain one compact task-state record: task and owner, completed work, pending
+issues, branch/SHA, unsaved or uncommitted edits, active commands/handles, live
+session/pane identity, next action and owner. Update it after a batch or commit;
+do not add a manual handoff after each tool call.
+
+Keep append-only execution evidence. Record each execution once with command,
+test scope, code identity (including uncommitted changes where applicable),
+environment, exit status and original log reference. Preserve failures and
+exact-SHA limits; a later pass does not erase them. Handoffs link existing records
+and update changed facts. Do not copy full histories, rebuild all impact maps or
+hash every repository file for each small repair. Final task diff and version
+checks remain required. Test-only repairs cover affected shared-helper consumers
+but do not re-audit unrelated production code.
+
+On capacity or connection interruption, first check active execution handles so
+an in-flight command is not duplicated. Verify the state record against the
+actual worktree, dirty/unsaved edits and live session/pane ownership, then resume
+the original session and model. Preserve saved work and distinguish missing
+evidence from completed work; do not guess why temporary data disappeared or
+repeat completed commands merely to reconstruct a handoff. Do not move or delete
+other tasks' worktrees.
+
+Actual reads, edits or tool execution establish progress; a `working` badge alone
+does not prove recovery. After 10 continuous minutes without actual progress,
+Main proactively reports the specific blocker and recommends waiting or changing
+the implementation model. Do not continue blind retriggers indefinitely. The
+user decides any model change; this does not authorize model changes for other roles.
+This threshold is not a test/CI timeout and does not authorize interrupting active
+processes.
 
 ## Development verification
 
@@ -26,12 +161,13 @@ affect a testable contract; CI planner/workflow contracts need focused regressio
 checks. Missing dependencies or unavailable environments are blockers to report,
 not passing evidence. Keep TDD, relevant stability checks and independent review.
 
-Docker is not a prerequisite to push a reviewed branch. Optional focused Docker
+Docker is not a prerequisite to task-branch publication. Optional focused Docker
 diagnosis can use `make test TEST='tests/path.py::test_name'`; local development
-does not require whole-service or full-backend suites. GitHub CI owns the full
-existing backend test suite on every branch push and every PR targeting `main`,
+does not require whole-service or full-backend suites. GitHub CI owns the complete active
+backend test suite on every branch push and every PR targeting `main`,
 including the final merged-main push: `gateway`, `legacy`, `account`, and
-`prediction`, always with `TEST_N_LEG=1`, excluding `pressure` and `browser`.
+`prediction`, with `TEST_N_LEG=0` and the permanent retirement manifest, excluding
+`pressure` and `browser`.
 Documentation-only, LP-only, trend-only and unavailable/empty diff cases all run
 that same coverage. Push CI tests the branch head; PR CI tests the synthetic merge
 candidate. These intentionally separate runs cover distinct SHA identities.
@@ -44,14 +180,21 @@ CI reuses `make test SERVICE=<service>` and the worktree-specific `Dockerfile.de
 image. Valid service names are `gateway`, `legacy`, `account`, and `prediction`;
 unscoped `make test` fails before building. Gateway contains `frontend_gateway`
 tests; Legacy contains Dashboard and remaining shared backend test files,
-including standalone trend-curve tests. Keep Makefile prefixes current when
+including standalone trend-curve tests. Keep selection prefixes current when
 adding service-specific test families. The retained standalone trend-curve CI
 job is not selected because legacy already includes its tests.
 
-Makefile's service-scoped default `TEST_N_LEG=0` omits the dedicated N-leg files
-listed in `N_LEG_TESTS`; CI explicitly overrides it with `TEST_N_LEG=1` for every
-service. Explicit `TEST=...` always runs the requested tests, including N-leg
-nodeids. Test selection never changes production `N_LEG_PAUSED`.
+Makefile and CI use `TEST_N_LEG=0`: only the 29 reviewed files in
+`scripts/ci_nleg_retired.json` are omitted from execution because N-leg is
+permanently retired. The three mixed/shared files remain active, as do LP,
+service/runtime and pause guards. Unknown/new files default to active coverage.
+The shared validation fixture file stays importable. `TEST_N_LEG=1` and explicit
+`TEST=...` remain manual diagnostic entries; no scheduled full N-leg regression
+is required. Selection never changes production `N_LEG_PAUSED`.
+See [the retirement classification and evidence](ci-nleg-retirement.md).
+Service routing now lives in `scripts/ci_evidence.py`, shared by Make, the
+collection proof and deployment evidence; update its prefixes for new service
+families. Invalid manifests and empty partitions fail before the test build.
 The Makefile's Prediction service default remains six pytest-xdist workers with
 `--dist=loadgroup`, distributing individual tests across workers; solver benchmark
 tests share one worker to reuse their full-handoff fixture cache. CI overrides
@@ -60,7 +203,9 @@ this to two workers for Prediction. `TEST_WORKERS=4` can reduce busy-host load a
 `TEST=...` selections default to serial, and also accept `TEST_WORKERS`.
 Portable scenarios run serially in CI. Known Prediction shared-port and cached
 fixture groups retain their xdist grouping; global cross-service serial ordering
-is not a separate deployment requirement. CI proves backend collection coverage.
+is not a separate deployment requirement. CI proves complete backend collection equals executed active nodeids plus
+declared retired nodeids, with no gaps or overlap. Each job retains selected
+nodeids, phase durations, outcomes, JUnit and wall time, including failed runs.
 The development image includes Node and `procps`, but excludes npm, Python/JS
 Playwright and Chromium/browser assets. Test containers have no host mounts,
 network, published ports, Docker socket, home directory or credentials.
@@ -135,8 +280,11 @@ they do not change the scope-specific verification routes above.
    a later pass does not erase a failed attempt, and repetition alone does not
    prove correctness. Diagnostic retries must not turn failures into success.
 4. Report all failures and any remaining uncertainty or blocked verification.
-   Restage the exact changes and obtain independent review before publication;
-   existing exact-SHA, rebase, CI, and approval requirements still apply.
+   Main stages/commits only the exact changes and publishes the task update, then
+   obtains refreshed independent review of the published head/base. For unpublished
+   local-only work, restage task files and review `git diff --cached` without
+   publishing. Existing exact-SHA, rebase, CI,
+   and approval requirements still apply.
 
 ## Verification and deployment boundaries
 
@@ -216,17 +364,231 @@ Pure documentation, configuration, test-only, and unrelated changes remain
 exempt from the acceptance and deployment gates; test-only changes still
 receive any development validation relevant to their own scope.
 
+## Authorized PR delivery loop
+
+Main is the existing delivery owner, not a new permanent agent. The bounded loop
+covers the approved implementation, verification and blocker repairs. Task-branch
+publication has the standing authorization below; external replies still need
+their applicable authorization. Read-only review,
+diagnosis and webhook observation do not grant write authority. Once authorized,
+continue that loop without repeated reminders. Escalate changes to scope,
+behavior, architecture, risk or test contracts. Preserve other workers' work.
+This procedure coordinates [#293](https://github.com/raymizzou/open_trader/issues/293),
+[#271](https://github.com/raymizzou/open_trader/issues/271) and
+[#214](https://github.com/raymizzou/open_trader/issues/214).
+
+### First reviewable implementation
+
+The first reviewable implementation covers the approved scope with enough
+evidence for independent review. Complete the new/changed and known directly
+affected tests; for shared production changes, run the relevant consumer union.
+Known confirmed affected failures must be handled before publication; passing
+only new core tests does not establish this condition. Complete applicable
+focused/security checks and add the dated operator-facing `CHANGELOG.md` entry.
+Documentation-only work uses diff inspection and `git diff --check`, without
+local backend tests. First publication does not require later improvements or
+completed remote CI. Full backend CI supplements focused local checks by finding
+previously unrecognized or omitted impacts, including cross-service and
+environment/concurrency differences; it is not a reason to postpone known
+affected failures or expand local verification to a full backend suite.
+
+Standing user authorization dated 2026-10-09, scoped to `raymizzou/open_trader`
+across machines and checkouts, requires Main to promptly stage/commit only the
+task files, push the task branch and open a normal (non-draft) PR targeting
+`main`, or update its existing PR. Do not ask again for push or PR permission.
+Explicit local-only, no-push, do-not-publish or draft instructions override this
+default. Workers never publish. This authorization also covers Main's task-local
+repair commits/pushes to the same PR without repeated permission; it grants no
+force-push, direct `main` push, automatic merge, release/tag or deployment authority.
+This standing authorization supersedes older requirements for completed review
+before publication or separate push/PR permission.
+
+Publish before independent reviewer completion, dots feedback, repair closure,
+final acceptance or merge. A failed, unavailable or not-started reviewer does
+not delay first publication. Do not wait for complete branch CI, add unneeded
+local full suites, or iterate on nonblocking polish before the first PR. Continue
+required independent review and in-scope repairs afterward. Publication is a
+review handoff, not a readiness or approval claim.
+
+Verify the remote PR exists, its URL and exact head/base, and that its head
+matches the pushed task commit. Record issue scope, local verification, known
+limits, unverified work, pending review and CI. Report actual Git, authentication,
+network or PR access/publication failures; do not label standing authorization
+as pending permission. Claim dots has started only with observed evidence.
+
+### Parallel post-publication review and CI
+
+Immediately after publication, start a distinct independent Herdr
+reviewer pane alongside remote CI. Use a fresh reviewer for the initial
+independent review; reuse it for this target's in-scope repairs. An explicitly
+local-only unpublished review uses the staged diff; published reviews use the
+exact PR head/base range. Required final independent review remains a merge gate.
+Give the reviewer the issue requirements, repository/worktree, PR URL, immutable
+published head/base SHAs, applicable checks and verification limits. Review
+`git diff <base>...<head>` against that scope. Record actual startup evidence;
+opening the PR or issuing a launch command does not prove review started.
+Track independent review and CI separately. A changed head or base requires refreshed
+applicable reviews and CI; an old review comment is not evidence for a new SHA.
+
+Before creating the reviewer, resolve the owning task's current workspace, tab,
+and pane from live Herdr state and corroborate its task/session identity with
+visible task content or other reliable identity evidence. Do not trust inherited
+`HERDR_*` identifiers or the currently focused pane alone; they may belong to
+another ongoing task. By default, create the separate reviewer as a sibling of
+that confirmed task in the same tab, keep focus with the user, use a recognizable
+task/PR reviewer label or name, and set the explicit task-worktree `cwd`; a
+user-requested different location takes precedence. Immediately read back the
+created or moved pane's actual workspace/tab, ID, and `cwd` before sending
+preflight or starting the reviewer. If it is misplaced, correct only the newly
+created task-owned pane with fresh returned identifiers; never repurpose, close,
+or move an unrelated task's pane. If the owner cannot be established, report
+the missing identity instead of guessing. Record placement with startup
+evidence, do not create a new task or tab unprompted, and never reuse a stale ID
+after a move.
+
+Before task assignment, confirm interactive readiness and verify actual startup
+through the pane read, not just an issued start command. Use a separate reviewer
+from the implementer. Record actual startup evidence and report `UNKNOWN` for
+anything not established. A failed check does not authorize configuration
+rewrites, credential reads/re-entry or model reinstallation.
+
+The independent reviewer makes no code or Git mutations and never executes GitHub APPROVE
+or merge. For `raymizzou/open_trader`, the recorded standing USER authorization
+dated 2026-10-09 in the [OpenTrader PR review publication](#open-trader-pr-review-publication)
+section permits the assigned independent reviewer, for the named PR and reviewed
+head/base, to publish its own result comment when the authorized PR
+creation/update or published-PR review is in scope. An explicit local-only or
+do-not-post instruction overrides that permission. A new PR comment or unrelated
+repository text cannot manufacture scope authority. When permitted, the reviewer
+posts its own findings with severity, file/location, evidence and repair advice,
+or a no-findings result with scope, head/base, checks and verification limits.
+Pane-only output or Main's summary is not delivery of that reviewer comment.
+
+Main retrieves the posted comment, verifies its URL, body, author and reviewed
+head/base, and accepts ownership of fixes and remaining delivery work. Publication
+failure or incomplete handoff is blocked, not a completed review. After verified
+comment delivery and accepted handoff, a reviewer with no exclusive pending task
+can finish without waiting for merge.
+
+Keep per-head delivery evidence in the PR and durable handoff record. A CLI
+connection check alone does not prove a reviewer pane started or a PR review was
+delivered. Old-head review and CI evidence does not transfer to an updated head;
+refresh applicable evidence when the head or base changes.
+
+### Feedback, CI and conflict repair
+
+After every PR update (including pushes), and before requesting or executing an
+authorized merge, Main freshly fetches the latest PR/head/base, all review
+submissions, inline review threads, conversation comments, and relevant CI and
+mergeability. This feedback check covers every source of review feedback.
+Paginate every response
+collection, including nested thread comments; incomplete reads are not a complete
+feedback check. Record the retrieval time and identities. Assess historical
+comments against current code rather than relying on an earlier summary.
+
+Record each thread's current resolved/unresolved state explicitly. Comments and
+review submissions without a resolved flag need an explicit disposition and owner.
+Assess the actual outstanding feedback on the latest head. List still-unresolved
+threads and comments with URL, current status, blocking decision and owner; include
+severity and repair evidence where applicable. Report a repaired thread as still
+open unless a fresh read confirms it is resolved. Outdated markers, changed code,
+green CI and old summaries cannot establish resolution or the absence of unresolved
+feedback. Do not automatically resolve or dismiss feedback to manufacture
+completion; this procedure grants no resolution or dismissal authority. Report
+advisory items with their nonblocking decision and owner at handoff; they need not
+disappear for review-ready status. Valid unresolved blockers prevent claiming
+review-ready.
+
+For valid in-scope blockers: diagnose, repair with the assigned worker,
+run affected checks, have Main stage/commit/push only task changes to the same PR
+under the standing authorization, then refresh independent review and CI evidence.
+Reuse the assigned reviewer for in-scope repairs. Follow the existing rebase
+rules when the base advances; preserve other workers' commits and test intent.
+After verifying a repair, make an authorized reply in the relevant thread with
+the solution, fix commit and verification evidence, then fetch feedback again.
+Do not falsely mark a thread resolved or treat a reviewer result as approval.
+
+Batch in-scope repairs. Diagnose CI failures and conflicts; do not weaken tests,
+retry until green, or run duplicate full suites. Escalate disputed, out-of-scope
+or externally blocked decisions with the reason, required decision and next owner.
+Do not claim review-ready while a known blocker remains unresolved. Nonblocking
+findings are reported without expanding the approved task or delaying first PR
+publication for polish.
+
+### Review-ready handoff and stopping conditions
+
+A review-ready handoff requires successful current applicable push-head and
+PR-merge `required` checks from GitHub Actions (app ID 15368), completed required
+independent review of the current published target, no known unresolved
+blockers, and fresh feedback and
+mergeability checks. Record the PR head/base, synthetic merge SHA and Actions
+run/check identities; see [CI identity](ci.md). Unknown, pending, cancelled, failed
+or mismatched evidence is not success. A base/head change invalidates applicable
+evidence; refresh it before handoff or merge.
+
+Main monitors until the authorized completion or accepted review-ready handoff,
+cancellation/closure, or a specific external/authorization blocker. Record that
+stop reason, remaining responsibilities and their owner. Never abandon unresolved
+work without an owner. A broader instruction to monitor through merge retains
+that stopping condition. Separate user approval is still required for GitHub
+merge; reviews and CI do not authorize merge/auto-merge, approval on the user's
+behalf, release/tag creation, deployment, trading or repository/security changes.
+PR-head and synthetic-merge evidence never replace final-main-push deployment
+evidence. Existing deployment and cleanup rules remain unchanged.
+
+### Worker lifecycle
+
+Assess each development worker's assigned review/repair work and remaining duties.
+End only a worker whose work is saved and committed or durably handed off, whose
+assigned review/repair work and exclusive fixes, CI problems, conflicts and
+monitoring are complete or accepted by a named new owner, and whose handoff is
+recorded. Preserve all workers' saved work and commits. Retain Main's delivery
+ownership until the stopping condition above. A worker ending does not mean the
+PR is complete.
+
+Ending a session is separate from deleting a worktree or branch. Deletion still
+requires GitHub merge, user confirmation and a clean worktree under
+[AGENTS.md](../../AGENTS.md#delivery-boundaries); never delete dirty work. These
+rules do not authorize closing existing sessions as part of documentation work.
+
+### Handoff and evidence record
+
+Use the existing compact durable [task state and execution evidence](#task-state-and-recovery);
+link original records and update only changed facts at handoff. Use `pending`,
+`blocked`, `unrun` or `unknown` where appropriate, with reasons. The following
+fields apply as relevant; they do not require a new full report per small repair.
+This is a format, not an executed delivery:
+
+```text
+Task/approved scope; delivery owner; publication/reply authority:
+Worktree/branch/SHA; dirty or unsaved edits; active commands/handles; session/pane:
+PR URL; immutable head/base; synthetic merge SHA; Actions run/check IDs/URLs:
+Local focused/security checks: command, environment, identity, result, limits:
+Independent review: published head/base (or unpublished local-only staged tree), result/evidence:
+Reviewer: pane, actual model/reasoning/profile/provider, status, PR/head/base:
+Reviewer comment: URL, verified author/body/identities, Main's accepted handoff:
+Feedback: retrieval time, latest PR/head/base, complete paginated collections:
+Threads/comments: URL, resolved/unresolved state or disposition, blocking decision/owner:
+Repairs: fix commits, checks, independent review, update/reply evidence:
+CI: push-head and PR-merge required/app 15368 results; mergeability check/time:
+Pending decisions/blockers; next action and owner; monitoring stop reason:
+Workers: saved work, exclusive duties/new owner, accepted handoff, lifecycle status:
+```
+
 ## Merge, live processes, and deployment
 
 The delivery path is isolated branch/worktree from freshly fetched
-`origin/main` → focused local development checks → staged independent review
-(including a dated `CHANGELOG.md` entry) → authorized branch push → Draft PR
-→ latest CI success → explicit user approval → GitHub merge. Local `main` is
+`origin/main` → focused local development/security checks and dated `CHANGELOG.md`
+entry → Main stages/commits task-only files → prompt task-branch push/normal PR
+→ parallel independent review and CI → feedback/repair loop → review-ready handoff
+→ explicit user approval → GitHub merge. Follow the
+[delivery procedure](#authorized-pr-delivery-loop). Local `main` is
 only a synchronized copy of GitHub `main`, never an integration or repair path.
 When the base advances, fetch/rebase, rerun focused checks and independent
 review, and inspect fresh CI. Rebase and conflict-resolution approval follows
 [AGENTS.md](../../AGENTS.md#review-and-merge). Never force-push `main`.
-A reviewed branch rewrite also requires authorized publication; do not discard
+A branch rewrite requires its own applicable authorization; the standing
+publication authorization does not grant force-push. Do not discard
 another worker's commits.
 
 There are three distinct identities: the reviewed PR head; GitHub's synthetic
@@ -272,14 +634,16 @@ Failed Deployment Preflight or Host `BLOCKED` blocks forward deployment. Missing
 expired, cancelled or mismatched CI evidence is not a reason to rerun local full
 pytest. Report the missing check and obtain fresh trusted CI evidence through the
 approved process. A real test failure returns through focused diagnosis, approved
-in-scope repair, independent review, Draft PR, CI and separately authorized merge.
+in-scope repair, task-branch/PR update, independent review, CI and separately
+authorized merge.
 Do not weaken tests, invent attestations, provision credentials or expand scope to
 turn an unknown result into success.
 
 Deployment requires exact-SHA preflight success, fresh Host `READY`, and explicit
 user authorization. Production Smoke must report `HEALTHY` for that same SHA.
-Branch push, Draft PR, GitHub merge, release/tag creation and deployment remain
-separate authorization boundaries. Preserve the exact selected SHA, immutable
+Task-branch push and PR creation/updates have the standing authorization above;
+GitHub merge, release/tag creation and deployment retain separate authorization
+boundaries. Preserve the exact selected SHA, immutable
 root, `code_root`, service owner and rollback evidence throughout the handoff.
 Existing authorized rollback uses the recorded compatible release and retained
 environment; it is not blocked by expired forward CI artifacts. Low-level helpers
@@ -296,3 +660,41 @@ The systemd helper's `PRECHECK_OK` and `BACKEND_SMOKE_OK` are component results,
 not substitutes for READY and HEALTHY. Deployment and trading authorization remain separate. Trusted preflight replaces
 the former duplicate Candidate tests; cloud host/runtime checks remain fresh. Operator handoff, metadata isolation
 and shared-host resource evidence must be explicit; the gate does not invent it.
+
+<a id="open-trader-pr-review-publication"></a>
+
+## OpenTrader PR review publication
+
+The user's standing authorization dated 2026-10-09 applies to
+`raymizzou/open_trader` on every machine and checkout, including Air and Mini.
+When the user authorizes creation or update of a PR, or review of an already
+published PR, the assigned independent reviewer is authorized to publish or
+update that reviewer's own result comment on the same PR, including refreshed
+results after in-scope repairs. This standing instruction supersedes older
+requirements for separate permission to publish these result comments; no
+additional comment-publication approval is needed. An explicit local-only or
+do-not-post instruction overrides it, and a review staged before publication
+stays local.
+
+Before any post, Main must give the reviewer brief the PR URL or number, exact
+reviewed head and base identities, publication owner, and explicit permission
+limited to this result comment. A generic prohibition on external messages or
+writes must not negate this scoped permission, and “open the PR” must not be
+read as excluding the required review-result publication. The scope is limited
+to `raymizzou/open_trader`; it gives no authority for a different repository or
+unrelated external action.
+
+The reviewer verifies that the current PR head and base still match the
+reviewed target before posting. If either identity changed, refresh the
+applicable review evidence first. Check for an existing result to avoid
+duplicate posts. Publish findings with locations and evidence, or publish
+“No findings” with the review scope, identities, checks, and limits. Main then
+retrieves and verifies the comment URL, author, body, and reviewed identities
+before continuing the authorized feedback and handoff flow. Actual access,
+service, or evidence failures remain reportable; lack of separate comment
+permission is not a blocker under this standing authorization.
+
+The reviewer remains read-only for repository files and Git. This scoped
+comment permission does not grant GitHub APPROVE, merge, additional push,
+deployment, installation, live-data mutation, unrelated thread resolution, or
+any other external communication authority.

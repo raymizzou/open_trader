@@ -29,6 +29,7 @@ from .notifications import (
     render_yes_no_signal_notification,
 )
 from .polymarket_lp import SCORING_STALE_SECONDS, queue_protection_status_view
+from .polymarket_lp_diagnostics import diagnostic_json_copy
 from .polymarket_trading import (
     LpAccountRoundInvalid,
     LegResult,
@@ -766,6 +767,28 @@ def _call(method: object, *args: object, **kwargs: object) -> object:
     return value
 
 
+class _D2MutationLease:
+    """One actual call's share of this D2 owner's process/file exclusion."""
+    def __init__(self, execution, action):
+        self.execution, self.action, self.released = execution, action, False
+
+    def allowed(self, action=None):
+        return (not self.released and (action is None or action == self.action)
+            and self.execution._lp_d2_permission(self.action))
+
+    def release(self):
+        if self.released:
+            return
+        self.released = True
+        execution = self.execution
+        with execution._lp_d2_lease_lock:
+            execution._lp_d2_lease_users -= 1
+            if execution._lp_d2_lease_users == 0:
+                lock, execution._lp_d2_lease = execution._lp_d2_lease, None
+                execution._lp_d2_manual_lease = False
+                execution._release_global_lock(lock)
+
+
 class PredictionExecutionService:
     """One process/file-serialized pair execution state machine."""
 
@@ -781,6 +804,7 @@ class PredictionExecutionService:
         predict_trading: object | None = None,
         legacy_retired: bool = False,
         lp: object | None = None,
+        lp_d2: object | None = None,
     ) -> None:
         self._store = store
         self._monitor = monitor
@@ -790,9 +814,21 @@ class PredictionExecutionService:
         # the existing execution path.  Keep the collaborator optional so
         # shadow and legacy test fixtures retain their read-only surface.
         self._lp = lp
+        if lp_d2 is not None and (lp is None or lp_d2.store is not store
+                or lp_d2.trading is not trading or lp_d2.account_id != trading.config.wallet_address
+                or lp.store is not store or lp.exchange is not trading):
+            raise ValueError("lp_d2_attachment_identity")
+        self._lp_d2 = lp_d2
+        self._lp_d2_control_request = (None, None)
+        self._lp_capture_failure_logged_at = None
+        self._lp_d2_lease_lock = threading.Lock()
+        self._lp_d2_lease = None
+        self._lp_d2_lease_users = 0
+        self._lp_d2_manual_lease = False
         self._lp_dashboard_lock = threading.RLock()
         self._lp_reward_percentage_lock = threading.Lock()
-        self._lp_share_watch_notification_lock = threading.Lock()
+        from .lp_persistence import SerializedCalls
+        self._lp_share_watch_notification_lock = SerializedCalls()
         self._lp_share_watch_seen: set[str] = set()
         self._lp_dashboard_cache: dict[str, object] | None = None
         self._lp_account_trades_cache: dict[str, object] | None = None
@@ -833,20 +869,25 @@ class PredictionExecutionService:
         self._legacy_strategy_retired = bool(legacy_retired)
         self._n_leg_paused = False
         self._process_lock = _PROCESS_LOCK
-        # A newly constructed process has not reconciled its dedicated wallet;
-        # only a clean startup/reset path may clear this lock.
+        # Startup admission (local for paused D2, reconciliation otherwise)
+        # must release this latch before mutations can be considered.
         self._breaker_open = True
         self._cross_breaker_open = False
         self._first_live_order_verified = False
         set_lp_guard = getattr(self._lp, "set_mutation_guard", None)
-        if callable(set_lp_guard):
+        if callable(set_lp_guard) and lp_d2 is None:
             set_lp_guard(self.lp_mutation_allowed)
-        if self._lp is not None:
+        if self._lp is not None and lp_d2 is None:
             from .polymarket_lp_auto import LPAutoPool
             self._auto_pool = LPAutoPool(self)
+            level_reader_setter = getattr(self._lp, "set_candidate_buy_price_level_reader", None)
+            if callable(level_reader_setter):
+                level_reader_setter(self._auto_pool.buy_price_level)
             self._lp._facts_publisher = self._auto_pool.publish_session
             self._lp._facts_validator = self._validate_lp_facts
             self._lp._facts_attention_flusher = self._auto_pool.flush_attention
+        elif self._lp is not None:
+            self._lp.set_candidate_buy_price_level_reader(lambda:self._lp_d2.policy.buy_price_level)
         self._threads: dict[str, threading.Thread] = {}
         self._clock = time.monotonic
         self._sleep = time.sleep
@@ -857,6 +898,113 @@ class PredictionExecutionService:
         # LP_RESERVED_MANUAL_SESSION_ID session; the anchor row is created
         # once, lazily, before the first audit write.
         self._lp_manual_audit_ready = False
+        if lp_d2 is not None:
+            lp_d2.bind_mutation_admission(self, self._lp_d2_acquire)
+
+    def admit_d2_paused_startup(self) -> None:
+        """Release the startup latch after reliable local D2 initialization.
+
+        Runtime initializes control with its validated claim and loads settings
+        first. Current account facts belong to the Scheduler; historical rows
+        are left intact and incident permissions still apply to each mutation.
+        """
+        live = self._lp_d2
+        if live is None or not self._n_leg_paused:
+            raise ValueError('d2_paused_startup_required')
+        status = live.control.status()
+        current = status.current
+        if (live._closed or status.fatal is not None or current.fatal_id is not None
+                or current.shutdown_requested or current.control_version is None
+                or current.account_id != live.account_id
+                or current.process_epoch != live.process_epoch):
+            raise ValueError('d2_local_startup_not_ready')
+        self._breaker_open = False
+
+    def _lp_d2_permission(self, action):
+        live = self._lp_d2
+        current = live.state.snapshot().current
+        if live._closed or current.shutdown_requested or current.fatal_id is not None:
+            return False
+        try:
+            if self._breaker_open or action not in ('BUY', 'MANUAL_BUY', 'SELL', 'CANCEL', 'ROTATION_CANCEL', 'SELL_CANCEL'):
+                return False
+            if (action != 'CANCEL' or not self._n_leg_paused) and self._store.unacknowledged_incident() is not None:
+                return False
+            return self._n_leg_paused or self._store.active_execution() is None
+        except Exception:
+            return False  # unavailable mutation safety is never an SDK permission
+
+    def _lp_d2_acquire(self, action):
+        # These existing incident/execution SQL reads and nonblocking mutex
+        # acquisition always run outside CurrentLPState's coordination lock.
+        manual = action == 'MANUAL_BUY'
+        with self._lp_d2_lease_lock:
+            if self._lp_d2_manual_lease or manual and self._lp_d2_lease_users:
+                return None
+            if not self._lp_d2_permission(action):
+                return None
+            if self._lp_d2_lease is None:
+                lock = self._acquire_global_lock(wait_seconds=_LP_SUBMIT_LOCK_WAIT_SECONDS if manual else 0)
+                if lock is None:
+                    return None
+                if not self._lp_d2_permission(action):
+                    self._release_global_lock(lock)
+                    return None
+                self._lp_d2_lease = lock
+            self._lp_d2_lease_users += 1
+            self._lp_d2_manual_lease = manual
+            return _D2MutationLease(self, action)
+
+    def _lp_d2_submit_entry(self, payload, *, preview_id=None):
+        key = str(payload.get('idempotency_key') or '').strip()
+        if not key:
+            return dict(state='rejected',reason='idempotency_key_required')
+        try:
+            previous = self._store.lp_manual_command(self._lp_d2.account_id,key)
+        except ValueError as exc:
+            return dict(state='rejected',reason=str(exc))
+        if previous is not None:
+            return previous['response']
+        if self._breaker_is_open():
+            return dict(state='locked',reason='circuit_breaker_open')
+        active = None if self._n_leg_paused else self._store.active_execution()
+        if active is not None:
+            return dict(state='busy',reason='active_execution',execution_id=active.get('execution_id'))
+        lease = self._lp_d2_acquire('MANUAL_BUY')
+        if lease is None:
+            return dict(state='busy',reason='execution_lock')
+        try:
+            previous = self._store.lp_manual_command(self._lp_d2.account_id,key)
+            if previous is not None:
+                return previous['response']
+            return self._lp_d2.manual_entry(self._lp,payload,key,lease,preview_id=preview_id)
+        finally:
+            lease.release()
+
+    def _lp_d2_submit_augment(self,payload,*,preview_id=None):
+        key = str(payload.get('idempotency_key') or '').strip()
+        sid = str(payload.get('session_id') or '').strip()
+        if not key or not sid:
+            return dict(state='rejected',reason='idempotency_key_required' if not key else 'session_id_invalid')
+        if self._breaker_is_open():
+            return dict(state='locked',reason='circuit_breaker_open')
+        active = None if self._n_leg_paused else self._store.active_execution()
+        if active is not None:
+            return dict(state='busy',reason='active_execution',execution_id=active.get('execution_id'))
+        lease = self._lp_d2_acquire('MANUAL_BUY')
+        if lease is None:
+            return dict(state='busy',reason='execution_lock')
+        try:
+            try:
+                group = self._lp_d2.manual_group(sid)
+                previous = self._store.lp_manual_command(self._lp_d2.account_id,key,session_id=sid)
+            except ValueError as exc:
+                return dict(state='rejected',reason=str(exc))
+            if previous is not None:
+                return previous['response']
+            return self._lp_d2.manual_entry(self._lp,payload,key,lease,preview_id=preview_id,group=group)
+        finally:
+            lease.release()
 
     def _lp_auto_pool(self):
         if self._lp is None:
@@ -864,10 +1012,75 @@ class PredictionExecutionService:
         return self._auto_pool
 
     def lp_auto_state(self, *, include_intents=True):
+        if self._lp_d2 is not None:
+            return self._lp_d2_projection(include_intents=include_intents)
         return self._lp_auto_pool().state(include_intents=include_intents)
 
+    def _lp_d2_projection(self, *, include_intents):
+        live = self._lp_d2
+        settings = live.settings_status()
+        def policy_view(policy):
+            return dict(budget_usd=None if policy.budget is None else str(policy.budget),
+                target_buy_count=policy.target_count, buy_price_level=policy.buy_price_level,
+                config_version=policy.config_version, trading_config_version=policy.trading_config_version,
+                api_retry_interval_seconds=policy.api_retry_interval_seconds,
+                order_check_interval_seconds=policy.order_check_interval_seconds,
+                round_interval_seconds=policy.round_interval_seconds)
+        def json_value(value):
+            if isinstance(value, Decimal): return str(value)
+            if isinstance(value, datetime): return value.isoformat()
+            if hasattr(value, '__dataclass_fields__'):
+                return {f.name: json_value(getattr(value, f.name)) for f in fields(value)}
+            if isinstance(value, Mapping): return {str(k): json_value(v) for k, v in value.items()}
+            if isinstance(value, (tuple, list)): return [json_value(v) for v in value]
+            return value
+        def diagnostic_view(name, read):
+            try:
+                value = diagnostic_json_copy(read())
+                if not isinstance(value, dict) and not (name == 'rotation' and value is None):
+                    raise TypeError('diagnostic_shape')
+                return value
+            except Exception:
+                logger.exception('prediction_lp_diagnostics_failed component=%s', name)
+                return dict(available=False, error='diagnostics_unavailable',
+                    **{'selection_state' if name == 'rotation' else 'state': 'UNKNOWN'})
+        with live.state._lock:
+            status = live.control.status()
+            snapshot = live.state.snapshot()
+            round_state = live.rounds.snapshot() if snapshot.current.cycle_generation else None
+            result = policy_view(settings['effective'])
+            result.update(desired_running=status.requested_running,
+                effective_running=snapshot.current.effective_running,
+                pause_confirmed=(status.requested_running is False and snapshot.current.effective_running is False
+                    and status.saved_version == status.requested_version and status.save_state == 'saved'
+                    and not status.native_save_in_flight and status.fatal is None),
+                control_request_status=self._lp_d2_control_request[0],
+                control_request_reason=self._lp_d2_control_request[1],
+                control_save_state=status.save_state, control_error=status.error_code,
+                requested_control_version=status.requested_version, saved_control_version=status.saved_version,
+                control_native_inflight=status.native_save_in_flight, fatal=json_value(status.fatal),
+                current_phase=snapshot.current.phase, round=json_value(round_state),
+                effective_settings=policy_view(settings['effective']),
+                pending_settings=policy_view(settings['requested']) if settings['pending'] else None,
+                settings_pending=settings['pending'], settings_native_inflight=settings['native_inflight'],
+                settings_error=settings['error'], effective_round_interval_seconds=None,
+                check_interval_seconds=None, cycle_mode='continuous')
+            result['diagnostics'] = diagnostic_view('iteration', live.diagnostics)
+            result['diagnostics']['rotation'] = diagnostic_view('rotation', live.rotation_diagnostics)
+            for name, fact in (('buy_reserved_usd', snapshot.buy_reserved),
+                    ('inventory_cost_usd', snapshot.inventory_cost), ('current_exposure_usd', snapshot.current_exposure),
+                    ('new_capacity_usd', snapshot.new_capacity)):
+                result[name] = str(fact.value) if fact.state == 'known' else None
+            if include_intents:
+                result['account_buys'] = [json_value(o) for o in snapshot.active_orders if o.side == 'BUY']
+                result['intents'] = [dict(request_id=request_id) for request_id in sorted(
+                    live._active_sends | {h.identity.request_id for h in live._native_jobs.values() if h._thread.is_alive()})]
+            return result
+
     def set_lp_auto_wakeup(self, wakeup):
-        if self._lp is not None:
+        if self._lp_d2 is not None:
+            self._lp.set_candidate_preparation_wakeup(wakeup)
+        elif self._lp is not None:
             self._lp._facts_wakeup = wakeup
 
     def set_lp_auto_scheduler(self, scheduler):
@@ -888,9 +1101,43 @@ class PredictionExecutionService:
         _freshness(account.get('checked_at'), self._lp._now(), 'account_facts', max_age=Decimal(60))
 
     def lp_auto_reservations(self):
+        if self._lp_d2 is not None:
+            live=self._lp_d2
+            with live.state._lock:
+                snapshot=live.state.snapshot()
+                status=live.control.status()
+                rows=[]
+                for order in snapshot.active_orders:
+                    if order.side!='BUY':continue
+                    known=order.price.state==order.remaining.state=='known'
+                    rows.append(dict(order_id=order.key[3],condition_id=order.key[1],token_id=order.key[2],
+                        remaining_quantity=str(order.remaining.value) if order.remaining.state=='known' else None,
+                        price=str(order.price.value) if order.price.state=='known' else None,
+                        amount_usd=str(order.price.value*order.remaining.value) if known else None,
+                        releasable=False,reason='current_api_reservations_not_releasable'))
+                return dict(authority='current_api',account_id=live.account_id,
+                    desired_running=status.requested_running,reservations=rows,
+                    **{name:str(fact.value) if fact.state=='known' else None
+                        for name,fact in (('buy_reserved_usd',snapshot.buy_reserved),
+                            ('inventory_cost_usd',snapshot.inventory_cost),
+                            ('current_exposure_usd',snapshot.current_exposure),
+                            ('new_capacity_usd',snapshot.new_capacity))})
         return self._lp_auto_pool().reservations()
 
     def lp_auto_release_reservations(self, payload, *, audit=None):
+        if self._lp_d2 is not None:
+            if not isinstance(payload,Mapping):raise ValueError('manual_release_selection_or_confirmation_invalid')
+            single='intent_id' in payload
+            expected={'confirm','reason','intent_id' if single else 'all_releasable'}
+            if set(payload)!=expected or payload.get('confirm') is not True:
+                raise ValueError('manual_release_selection_or_confirmation_invalid')
+            if single:
+                if type(payload['intent_id']) is not str or not payload['intent_id'].strip():raise ValueError('intent_id_invalid')
+            elif payload['all_releasable'] is not True:raise ValueError('all_releasable_must_be_true')
+            if type(payload['reason']) is not str or not payload['reason'].strip() or len(payload['reason'])>500:
+                raise ValueError('manual_release_reason_invalid')
+            return dict(released=[],already_released=[],skipped=[],released_amount_usd='0',
+                reason='current_api_reservations_not_releasable',state=self.lp_auto_state())
         result = self._lp_auto_pool().release_reservations(payload, audit=audit)
         if result['released'] and result['state']['desired_running']:
             scheduler = getattr(self._lp_auto_scheduler, 'request_check', None)
@@ -899,26 +1146,66 @@ class PredictionExecutionService:
         return result
 
     def lp_auto_configure(self, payload, *, audit=None):
+        if self._lp_d2 is not None:
+            self._lp_d2.configure(payload, actor=(audit or {}).get('actor'))
+            self._lp_d2_wake()
+            return self.lp_auto_state(include_intents=False)
         return self._lp_auto_pool().configure(payload, audit=audit)
 
     def lp_auto_set_desired_running(self, running, *, audit=None):
+        if self._lp_d2 is not None:
+            result = self._lp_d2.request_running(running, actor=(audit or {}).get('actor'))
+            self._lp_d2_control_request = (result.status, result.reason)
+            self._lp_d2_wake()
+            return self.lp_auto_state(include_intents=False)
         return self._lp_auto_pool().set_desired_running(running, audit=audit)
 
     def lp_auto_scheduled_check(self):
+        if self._lp_d2 is not None:
+            self._lp_d2.poll()
+            attempted_at = self._lp_d2.begin_scheduled_attempt()
+            capture_failed = False
+            try:
+                capture = self._lp.capture_qualified_pool()
+            except Exception:
+                capture_failed = True
+                now = self._clock()
+                if self._lp_capture_failure_logged_at is None or now - self._lp_capture_failure_logged_at >= 60:
+                    self._lp_capture_failure_logged_at = now
+                    logger.exception('prediction_lp_candidate_capture_failed')
+                self._lp_d2.record_attempt_failure(attempted_at=attempted_at, stage='capture')
+                capture = None  # Unavailable candidates forbid BUY, not account protection.
+            result = self._lp_d2.run_once(capture, attempted_at=attempted_at, capture_failed=capture_failed)
+            self._lp_d2.run_protection_once()
+            return self._lp_d2.dispatch_rotation(result)
         return self._lp_auto_pool().run_once(reuse_facts=True)
 
     def lp_auto_run_once(self, *, round_id=None):
+        if self._lp_d2 is not None:
+            return self._lp_d2_wake()
         return self._lp_auto_pool().run_once(round_id=round_id)
 
     def lp_auto_reconcile_unknown(self):
+        if self._lp_d2 is not None:
+            return self._lp_d2_wake()
         return self._lp_auto_pool().reconcile_unknown()
 
+    def _lp_d2_wake(self):
+        scheduler = self._lp_auto_scheduler
+        if scheduler is not None:
+            scheduler.request_check()
+        return {'state': 'scheduled' if scheduler is not None else 'idle'}
+
     def lp_auto_report_facts(self, period_start=None, period_end=None):
+        if self._lp_d2 is not None:
+            return dict(state='paused',reason='lp_auto_reporting_paused')
         return self._lp_auto_pool().report_facts(period_start, period_end)
 
     def lp_preview(self, request: Mapping[str, object]) -> dict[str, object]:
         """Run the LP read-only preflight through the production collaborator."""
 
+        if self._lp_d2 is not None:
+            return self._lp_d2.manual_call(lambda: self._lp_d2.manual_preview(self._lp,request))
         service = self._lp
         preview = getattr(service, "preview", None)
         if not callable(preview):
@@ -930,6 +1217,8 @@ class PredictionExecutionService:
     ) -> dict[str, object]:
         """Create a candidate preview with price and size fixed by live facts."""
 
+        if self._lp_d2 is not None:
+            return self._lp_d2.manual_call(lambda: self._lp_d2.manual_preview(self._lp,candidate,candidate=True))
         service = self._lp
         preview = getattr(service, "preview_candidate", None)
         if not callable(preview):
@@ -937,6 +1226,8 @@ class PredictionExecutionService:
         return preview(candidate)
 
     def lp_status(self, session_id: str | None = None) -> dict[str, object]:
+        if self._lp_d2 is not None:
+            return self._lp_d2.manual_call(lambda: self._lp_d2.manual_status(session_id))
         service = self._lp
         status = getattr(service, "status", None)
         if not callable(status):
@@ -1123,13 +1414,11 @@ class PredictionExecutionService:
             return dict(current) if isinstance(current, Mapping) else {}
 
         def save_watch_fields(
-            condition_id: str, fields: Mapping[str, object]
+            condition_id: str, fields: Mapping[str, object], *, expected_share_alert=None
         ) -> dict[str, object] | None:
-            return update_observation(
-                account_id,
-                condition_id,
-                {"share_alert": dict(fields)},
-            )
+            return _call(update_observation, account_id, condition_id,
+                {"share_alert": dict(fields)}, **({'expected_share_alert': expected_share_alert}
+                    if expected_share_alert is not None else {}))
 
         snapshot = self._lp_open_orders_snapshot(stop_event=stop_event)
         # The authenticated reader stamps its result after the network call;
@@ -1361,6 +1650,8 @@ class PredictionExecutionService:
                             "notification_pending": False,
                             "last_attempt_at": _timestamp(send_now),
                         },
+                        expected_share_alert={key: latest.get(key) for key in (
+                            'last_share_checked_at', 'breach_started_at', 'notification_pending')},
                     )
                     continue
                 if stop_event is not None and stop_event.is_set():
@@ -1779,8 +2070,13 @@ class PredictionExecutionService:
         """Issue #146 D2: first-visit payload while the background snapshot
         thread has not published yet. Key-complete, value-empty."""
 
+        try:
+            buy_price_level = self._lp_d2.policy.buy_price_level if self._lp_d2 is not None else self._lp_auto_pool().buy_price_level()
+        except Exception:
+            buy_price_level = None
         return {
             "state": "snapshot_pending",
+            "buy_price_level": buy_price_level,
             "stale": True,
             "orders": [],
             "positions": [],
@@ -1917,6 +2213,20 @@ class PredictionExecutionService:
         cached = self._lp_dashboard_cache
         if cached is not None:
             result = deepcopy(cached)
+            if self._lp is not None and hasattr(self._lp, "set_candidate_buy_price_level_reader"):
+                try:
+                    level = self._lp_d2.policy.buy_price_level if self._lp_d2 is not None else self._auto_pool.buy_price_level()
+                except Exception:
+                    level = None
+                if result.get("buy_price_level", 1) != level:
+                    # Only the candidate projection changes with strategy.
+                    # Account facts, resting rewards and paid history retain
+                    # their own background observations and timestamps.
+                    strategy = self._lp.candidate_snapshot()
+                    for field in ("candidates", "recommendations", "selected_results",
+                                  "selected_market_ids", "buy_price_level"):
+                        result[field] = deepcopy(strategy.get(field))
+                    result["candidate_state"] = strategy.get("state", "unknown")
             if getattr(self, "_display_only", False) and self._lp_account_snapshot_expired(result.get("checked_at")):
                 result.update(state="stale", stale=True, reason="account_snapshot_expired")
             return result
@@ -1990,6 +2300,25 @@ class PredictionExecutionService:
         selector_payload: dict[str, object] = {
             name: request.get(name) for name in selector_names
         }
+        if self._lp_d2 is not None:
+            displayed = None
+            if scope_selector is not None:
+                cache = self._lp_dashboard_cache
+                if cache is None:
+                    raise RuntimeError('lp_dashboard_snapshot_pending')
+                displayed = [str(row.get('order_id',row.get('id','')) or '')
+                    for row in cache.get('lp_orders_today',()) if isinstance(row,Mapping)]
+                displayed = [oid for oid in displayed if oid]
+            try:
+                result = self._lp_d2.manual_cancel(order_ids=requested_ids if order_ids_selector is not None else None,
+                    condition_id=str(condition_selector) if condition_selector is not None else None,displayed_ids=displayed)
+            except Exception as exc:
+                self._deliver_feishu_notification('LP 撤单失败','账户读取或撤单失败：'+_safe_lp_cancel_reason(exc))
+                raise
+            if result['not_canceled']:
+                self._deliver_feishu_notification('LP 撤单失败',_lp_cancel_failure_message(
+                    result['canceled'],result['not_canceled'],result['skipped'],None,self._lp_cancel_order_titles()))
+            return result
         manual_session_ready = self._lp_manual_audit_ready
 
         def audit(
@@ -2462,7 +2791,7 @@ class PredictionExecutionService:
                 registration_reader = getattr(
                     self._lp, "register_account_snapshot", None
                 )
-                if callable(registration_reader) and not getattr(self, "_display_only", False):
+                if self._lp_d2 is None and callable(registration_reader) and not getattr(self, "_display_only", False):
                     registration = _call(registration_reader, snapshot)
                     if isinstance(registration, Mapping) and (
                         registration.get("reason") == "account_round_invalid"
@@ -3035,6 +3364,7 @@ class PredictionExecutionService:
                     "lp_orders_today": lp_orders_today,
                     "non_lp_row_count": non_lp_row_count,
                     "candidates": candidates,
+                    "buy_price_level": candidate_snapshot.get("buy_price_level", 1),
                     "recommendations": recommendations,
                     "selected_results": selected_results,
                     "preparation": preparation,
@@ -3182,6 +3512,7 @@ class PredictionExecutionService:
                     else {}
                 )
                 candidate_projection = {
+                    "buy_price_level": candidate_snapshot.get("buy_price_level", 1),
                     "candidates": [
                         dict(row)
                         for row in candidate_rows
@@ -4414,6 +4745,9 @@ class PredictionExecutionService:
     def lp_start(self, preview_id: str, idempotency_key: str) -> dict[str, object]:
         """Start one LP session under the shared execution mutex."""
 
+        if self._lp_d2 is not None:
+            return self._lp_d2.manual_call(lambda: self._lp_d2_submit_entry(
+                dict(idempotency_key=idempotency_key),preview_id=str(preview_id)))
         service = self._lp
         start = getattr(service, "start", None)
         if not callable(start):
@@ -4475,6 +4809,12 @@ class PredictionExecutionService:
     def lp_stop(self, session_id: str | None = None) -> dict[str, object]:
         """Claim one stop durably, then cancel outside the shared locks."""
 
+        if self._lp_d2 is not None:
+            def permission():
+                return self.lp_mutation_allowed('submit') and self._lp._mutation_allowed('submit')
+            if not permission():
+                return dict(state='locked',reason='mutation_blocked')
+            return self._lp_d2.manual_call(lambda: self._lp_d2.manual_stop(session_id,permission))
         service = self._lp
         stop = getattr(service, "stop", None)
         if not callable(stop):
@@ -4484,6 +4824,8 @@ class PredictionExecutionService:
     def lp_augment_preview(self, request: Mapping[str, object]) -> dict[str, object]:
         """Run the LP augment read-only preflight through the LP service."""
 
+        if self._lp_d2 is not None:
+            return self._lp_d2.manual_call(lambda: self._lp_d2.manual_augment_preview(self._lp,request))
         service = self._lp
         preview = getattr(service, "augment_preview", None)
         if not callable(preview):
@@ -4500,6 +4842,9 @@ class PredictionExecutionService:
         active-LP-session busy gate — the augment requires the session.
         """
 
+        if self._lp_d2 is not None:
+            return self._lp_d2.manual_call(lambda: self._lp_d2_submit_augment(
+                dict(session_id=str(session_id),idempotency_key=idempotency_key),preview_id=str(preview_id)))
         service = self._lp
         augment = getattr(service, "augment", None)
         if not callable(augment):
@@ -4532,6 +4877,8 @@ class PredictionExecutionService:
         preview plumbing — the payload carries the full order intent.
         """
 
+        if self._lp_d2 is not None:
+            return self._lp_d2.manual_call(lambda: self._lp_d2_submit_entry(payload))
         service = self._lp
         submit = getattr(service, "submit_entry", None)
         if not callable(submit):
@@ -4611,6 +4958,8 @@ class PredictionExecutionService:
         active-LP busy gate must not block it.
         """
 
+        if self._lp_d2 is not None:
+            return self._lp_d2.manual_call(lambda: self._lp_d2_submit_augment(payload))
         service = self._lp
         submit = getattr(service, "submit_augment", None)
         if not callable(submit):
@@ -4659,6 +5008,8 @@ class PredictionExecutionService:
         venue while another submission is in flight.
         """
 
+        if self._lp_d2 is not None:
+            return self._lp_d2_wake()
         service = self._lp
         tick_with_lock = getattr(service, "tick_with_apply_lock", None)
         if callable(tick_with_lock):
@@ -6487,6 +6838,13 @@ class PredictionExecutionService:
     def reconcile_startup(self) -> dict[str, object]:
         """Reconcile live account state before allowing a new opportunity."""
         self._breaker_open = True
+        if self._lp_d2 is not None and self._store.active_execution() is None:
+            if self._store.unacknowledged_incident() is not None:
+                return {'state':'locked','reason':'unacknowledged_incident'}
+            # The sole current Reader/Scheduler observes LP account facts; old
+            # registration/session bookkeeping is no primary startup authority.
+            self._breaker_open=False
+            return {'state':'ready','readiness':'current_api'}
         snapshot = self._fresh_account_snapshot()
         if snapshot is None:
             return {"state": "locked", "reason": "account_unavailable"}

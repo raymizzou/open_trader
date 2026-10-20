@@ -98,7 +98,7 @@ def verify_checkout(root, expected_sha):
             'Ignored files in source/scripts can change release behavior')
 
 
-def expected_selection(scope, root):
+def ci_contract(root):
     spec = importlib.util.spec_from_file_location('release_ci_evidence', Path(root) / 'scripts/ci_evidence.py')
     module = importlib.util.module_from_spec(spec)
     previous = sys.dont_write_bytecode
@@ -107,7 +107,11 @@ def expected_selection(scope, root):
         spec.loader.exec_module(module)
     finally:
         sys.dont_write_bytecode = previous
-    return module.expected_selection(scope, Path(root))
+    return module
+
+
+def expected_selection(scope, root):
+    return ci_contract(root).expected_selection(scope, Path(root))
 
 
 def read_archive(data):
@@ -145,18 +149,30 @@ def verify_artifact(api, artifact, scope, run, root, now):
     files = read_archive(data)
     metadata = json.loads(files['evidence.json'])
     lock_hash = sha256((root/'uv.lock').read_bytes())
-    fixed = dict(schema_version=1, source_sha=sha, repository=REPOSITORY,
+    fixed = dict(schema_version=2, source_sha=sha, repository=REPOSITORY,
                  workflow_ref=f'{REPOSITORY}/{WORKFLOW}@refs/heads/main', event_name='push', ref='refs/heads/main',
-                 run_id=str(run['id']), run_attempt=str(run['run_attempt']), scope=scope, test_n_leg='1',
+                 run_id=str(run['id']), run_attempt=str(run['run_attempt']), scope=scope, test_n_leg='0',
                  workers=2 if scope == 'prediction' else 1, lock_sha256=lock_hash, status='success', exit_status=0,
-                 evidence_role='test-only', selection=expected_selection(scope, root))
+                 evidence_role='test-only', selection=expected_selection(scope, root),
+                 selection_sha256=ci_contract(root).selection_sha256(expected_selection(scope, root)),
+                 policy=ci_contract(root).retirement_policy(root))
     require(all(metadata.get(key) == value and type(metadata.get(key)) is type(value)
                 for key, value in fixed.items()), f'{scope} test metadata mismatch')
     require(metadata['environment'].get('runner_os') == 'Linux'
             and metadata['environment'].get('runner_arch') == 'X64', f'{scope} runner environment mismatch')
     for filename, field in [('dependency-manifest.json', 'dependency_manifest_sha256'),
-                            ('image.json', 'image_inspect_sha256')]:
+                            ('image.json', 'image_inspect_sha256'), ('metrics.json', 'metrics_sha256'),
+                            ('selected-nodeids.json', 'selected_nodeids_sha256'), ('junit.xml', 'junit_sha256')]:
         require(metadata['environment'].get(field) == sha256(files[filename]), f'{scope} environment hash mismatch')
+    try:
+        nodes = json.loads(files['selected-nodeids.json'])
+        metrics = ci_contract(root).validate_metrics(json.loads(files['metrics.json']), nodes, sha, fixed['workers'])
+        ci_contract(root).validate_junit(files['junit.xml'], metrics)
+        require(metadata.get('selected_nodeids') == nodes, f'{scope} selected-nodeid metadata mismatch')
+        require(all(node.split('::', 1)[0] in fixed['selection']['roots'] for node in nodes),
+                f'{scope} nodeid outside active selection')
+    except (KeyError, ValueError, TypeError) as error:
+        raise PreflightError(f'{scope} incomplete test metrics') from error
     manifest = json.loads(files['dependency-manifest.json'])
     require(manifest.get('role') == 'test-only; synthetic Git snapshot is not a release SHA'
             and manifest.get('source_sha') == sha and manifest.get('source_state') == 'clean'
@@ -173,18 +189,16 @@ def verify_artifact(api, artifact, scope, run, root, now):
     require(config['Labels'].get('org.open-trader.image-role') == 'test-only'
             and f'OPEN_TRADER_TEST_SOURCE_SHA={sha}' in config['Env']
             and 'OPEN_TRADER_TEST_SOURCE_STATE=clean' in config['Env'], f'{scope} image is not exact-SHA test-only evidence')
+    partition = None
     if scope == 'portable':
         require(metadata['environment'].get('partition_sha256') == sha256(files['partition.json']),
                 'Partition evidence digest mismatch')
-        partition = json.loads(files['partition.json'])
-        counts = partition['counts']
-        require(partition.get('schema_version') == 1 and partition.get('status') == 'success'
-                and partition.get('marker') == 'not pressure and not browser'
-                and set(counts) == set(SCOPES)-{'portable'} and all(type(n) is int and n > 0 for n in counts.values())
-                and partition['complete_count'] == partition['partition_count'] == sum(counts.values())
-                and bool(re.fullmatch('[0-9a-f]{64}', partition['complete_sha256']))
-                and partition['complete_sha256'] == partition['partition_sha256'], 'Incomplete backend partition evidence')
-    return {'scope':scope, 'id':artifact['id'], 'digest':artifact['digest']}
+        try:
+            partition = ci_contract(root).validate_partition(root, json.loads(files['partition.json']))
+        except (ValueError, KeyError, TypeError) as error:
+            raise PreflightError('Incomplete active/retired backend partition evidence') from error
+    return {'scope':scope, 'id':artifact['id'], 'digest':artifact['digest'],
+            'selected_nodeids':nodes, 'partition':partition}
 
 
 def verify_main_membership(api, sha):
@@ -240,6 +254,12 @@ def verify_ci(api, sha, root, now):
         matches = [artifact for artifact in artifacts if artifact['name'] == name]
         require(len(matches) == 1, f'Missing or ambiguous current-attempt artifact: {scope}')
         evidence.append(verify_artifact(api, matches[0], scope, run, root, now))
+    proof = evidence[-1]['partition']
+    for artifact in evidence[:-1]:
+        require(artifact['selected_nodeids'] == proof['partitions'][artifact['scope']],
+                f"{artifact['scope']} executed nodeids do not cover active partition")
+    evidence = [{key: value for key, value in item.items() if key not in ('selected_nodeids', 'partition')}
+                for item in evidence]
     # Close the obvious mutable-run and main-reference race before returning.
     require(api.json(f'{prefix}/actions/runs/{run["id"]}') == run, 'CI run changed during verification')
     latest = max(api.items(runs_path, 'workflow_runs'), key=lambda item:(item['run_number'], item['id']))
