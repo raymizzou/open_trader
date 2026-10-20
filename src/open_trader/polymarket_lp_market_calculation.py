@@ -18,6 +18,10 @@ class CalculationPolicy:
     api_retry_interval_seconds: int = 60
     order_check_interval_seconds: int = 10
     round_interval_seconds: int = 30
+    allocation_mode: str = 'minimum'
+    allocation_weights: tuple[str, ...] = ()
+    allocation_shadow_enabled: bool = False
+    allocation_fields: tuple[str, ...] = ()  # Preserve absent fields in legacy state JSON.
 
 
 @dataclass(frozen=True)
@@ -38,6 +42,7 @@ class CalculationResult:
     new_target_keys: tuple[tuple[str, str], ...] = ()
     incumbent_observations: object = field(default_factory=lambda: freeze({}))
     candidate_observations: tuple = ()
+    allocation_shadow: object = None
 
 
 def calculate_current(frame, policy, as_of) -> CalculationResult:
@@ -118,11 +123,12 @@ def calculate_current(frame, policy, as_of) -> CalculationResult:
     result = CalculationResult(reserved, inventory, available, freeze(estimates),
         candidate_yields=freeze(candidate_yields), policy_version=policy.config_version,
         incumbent_observations=freeze(observations), candidate_observations=freeze(candidate_observations))
-    return select_current_composition(frame, policy, result)
+    return select_current_composition(frame, policy, result, as_of=as_of)
 
 
 def select_current_composition(frame, policy, calculation, *, orders_accepted=True,
-                               positions_accepted=True, financial_authority=True):
+                               positions_accepted=True, financial_authority=True, as_of=None,
+                               shadow_blocked_conditions=None):
     """Re-gate values against accepted authority without recalculating yields."""
     reserved, inventory = calculation.buy_reserved, calculation.inventory_cost
     estimates = calculation.yields
@@ -237,7 +243,19 @@ def select_current_composition(frame, policy, calculation, *, orders_accepted=Tr
     new_keys = tuple((row['condition_id'], row['token_id']) for row, _, _ in selected if not row.get('existing'))
     victims = tuple(row['order_id'] for row in frame.current_buys
         if selection_valid and estimates[row['order_id']] is not None and row['order_id'] not in retained_ids)
-    return replace(calculation, targets=tuple(targets), target_tokens=tuple(tokens),
+    shadow = None
+    if policy.allocation_shadow_enabled and shadow_blocked_conditions is not None:
+        try:
+            from .polymarket_lp_allocation import rank_weights_shadow, shadow_result
+            if as_of is None:
+                as_of = next((row.get('evaluation_at') for row in candidates.value or ()
+                    if row.get('evaluation_at') is not None), balance.checked_at if balance else None)
+            shadow = freeze(rank_weights_shadow(frame, policy, calculation, as_of,
+                authority=replacement_valid, blocked_conditions=shadow_blocked_conditions))
+        except Exception as exc:
+            shadow = freeze(shadow_result('error', target_count=policy.target_count, checked_at=as_of,
+                error=type(exc).__name__, reason_codes=('shadow_exception',)))
+    return replace(calculation, allocation_shadow=shadow, targets=tuple(targets), target_tokens=tuple(tokens),
         selection_state='DECISION' if selection_valid else 'NO_DECISION',
         selection_reasons=tuple(dict.fromkeys(reasons)), victim_order_ids=victims,
         retained_order_ids=retained_ids, new_target_keys=new_keys,

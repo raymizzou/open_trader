@@ -8147,7 +8147,8 @@ class PredictionArbitrageStore:
             desired_running=document['desired_running'], ever_enabled=document['ever_enabled'], **times))
 
     @staticmethod
-    def _lp_current_settings_values(document, account_id):
+    def _lp_current_settings_values(document, account_id, *, validate_allocation=True):
+        from .polymarket_lp_accounting import allocation_settings
         from types import MappingProxyType
         from decimal import Decimal, InvalidOperation
         if (type(account_id) is not str or len(account_id) != 64
@@ -8177,23 +8178,24 @@ class PredictionArbitrageStore:
         for key in ('round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds'):
             if type(values[key]) is not int or values[key] <= 0:
                 raise ValueError('lp_settings_timing_invalid')
-        return MappingProxyType(dict(account_id=account_id, **values))
+        return MappingProxyType(dict(account_id=account_id, **values, **(allocation_settings(document) if validate_allocation else {})))
 
-    def lp_load_current_settings(self, account_id: str):
+    def lp_load_current_settings(self, account_id: str, *, validate_allocation=True):
         """Read policy only; never reconstruct financial or send authority."""
         from .polymarket_lp_accounting import default_account_pool_document
         with self._read_connection() as connection:
             row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
         document = (json.loads(row['payload']) if row is not None else
             default_account_pool_document(self.path, account_id, datetime.now(timezone.utc)))
-        return self._lp_current_settings_values(document, account_id)
+        return self._lp_current_settings_values(document, account_id, validate_allocation=validate_allocation)
 
     def lp_save_current_settings(self, account_id: str, *, expected_config_version, changes, actor=None):
         """CAS a narrow settings merge, returning only after actual commit."""
         from .polymarket_lp_accounting import default_account_pool_document
+        from .polymarket_lp_accounting import ALLOCATION_FIELDS
         fields = {'budget_usd', 'target_buy_count', 'buy_price_level',
                   'api_retry_interval_seconds', 'order_check_interval_seconds'}
-        if (not isinstance(changes, Mapping) or not changes or set(changes) - fields
+        if (not isinstance(changes, Mapping) or not changes or set(changes) - fields - set(ALLOCATION_FIELDS)
                 or type(expected_config_version) is not int or expected_config_version < 0
                 or actor is not None and type(actor) is not str
                 or 'budget_usd' in changes and changes['budget_usd'] is None):
@@ -8202,7 +8204,7 @@ class PredictionArbitrageStore:
             row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
             document = (json.loads(row['payload']) if row is not None else
                 default_account_pool_document(self.path, account_id, datetime.now(timezone.utc)))
-            current = self._lp_current_settings_values(document, account_id)
+            current = self._lp_current_settings_values(document, account_id, validate_allocation=False)
             if current['config_version'] != expected_config_version:
                 raise ValueError('config_version_changed')
             trading = bool(set(changes) & {'budget_usd', 'target_buy_count', 'buy_price_level'})
@@ -8211,6 +8213,7 @@ class PredictionArbitrageStore:
             saved = self._lp_current_settings_values(proposed, account_id)
             # Merge fields only, preserving any concurrent control/legacy data.
             document.update({key: saved[key] for key in (*fields, 'config_version', 'trading_config_version')})
+            document.update({key: saved[key] for key in ALLOCATION_FIELDS if key in saved})
             document.update(settings_updated_at=datetime.now(timezone.utc).isoformat(), settings_actor=actor)
             connection.execute('INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?) '
                 'ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload', (json.dumps(document),))

@@ -993,9 +993,11 @@ def create_prediction_server(
                         if 'round_interval_seconds' in payload:
                             raise ValueError('round_interval_seconds_retired_in_continuous_mode')
                         timing_fields = {'round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds'}
+                        from .polymarket_lp_accounting import ALLOCATION_FIELDS
                         trading = bool(set(payload) & {'budget_usd', 'target_buy_count', 'buy_price_level'})
                         expected = {"budget_usd", "target_buy_count"} if trading else set()
                         expected.update(set(payload) & timing_fields)
+                        expected.update(set(payload) & set(ALLOCATION_FIELDS))
                         if not trading and not expected:
                             raise ValueError('auto_config_invalid')
                         if "buy_price_level" in payload:

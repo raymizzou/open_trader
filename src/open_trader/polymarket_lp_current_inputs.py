@@ -95,13 +95,34 @@ def _prepare_qualified(frame, capture, policy, as_of):
                     direction=direction, evaluation_at=as_of, policy_version=policy.config_version,
                     review_at=review, order_type='GTD', expiration=expiration, post_only=True,
                     send_options=direction.get('send_options', source.value['row'].get('send_options', ()))))
-    return dict(current_account=account,
+    values = dict(current_account=account,
         candidate_inventory=SourceResult(capture.capture_id, tuple(capture.rows),
             complete=capture.inventory_complete, checked_at=capture.captured_at, error=capture.error),
         candidate_sources=SourceResult('', MappingProxyType(sources)),
         candidate_eligibility=SourceResult('', freeze(eligibility)),
         candidates=SourceResult(capture.capture_id, freeze(rows), complete=capture.inventory_complete,
             error=capture.error))
+    if policy.allocation_shadow_enabled:
+        try:
+            # Keep funding-rejected ranks; native minimum candidates remain unchanged.
+            shadow_rows = []
+            for cid, source in capture.rows.items():
+                if cid in eligibility:
+                    shadow_rows.append(dict(condition_id=cid, token_id=None, direction=None,
+                        eligibility=eligibility[cid]))
+                    continue
+                for direction in source.value['facts']['directions']:
+                    market = direction['market']
+                    token = market['token_id']
+                    shadow_rows.append(dict(condition_id=cid, token_id=token, market_id=market.get('market_id'),
+                        direction=direction, eligibility=eligibility[f'{cid}:{token}']))
+            values['allocation_candidates'] = SourceResult(capture.capture_id, freeze(shadow_rows),
+                complete=capture.inventory_complete,
+                checked_at=as_of, error=capture.error)
+        except Exception as exc:
+            values['allocation_candidates'] = SourceResult(capture.capture_id, complete=False,
+                error='shadow_capture_exception', diagnostics=dict(exception_type=type(exc).__name__))
+    return values
 
 
 def prepare_current_inputs(frame, captured_candidates, policy, as_of):
