@@ -233,7 +233,7 @@ def test_supported_rollback_uses_current_api_without_disposable_record_audit(tmp
             else:
                 assert Decimal(current['inventory_cost_usd'])==Decimal('.60')
                 assert Decimal(current['current_exposure_usd'])==Decimal('3.80')
-                assert Decimal(current['new_capacity_usd'])==Decimal('36.20')
+                assert Decimal(current['new_capacity_usd'])==Decimal('36.80')
             reservations=child.request('/api/prediction-arbitrage/lp/auto/reservations')
             assert reservations['authority']=='current_api'
             assert Decimal(reservations['buy_reserved_usd'])==Decimal('3.20')

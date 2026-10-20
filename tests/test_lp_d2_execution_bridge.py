@@ -791,7 +791,7 @@ def test_case_fix_preserves_persisted_identity_and_unknown_gate(tmp_path, monkey
         settings = live.store.lp_load_current_settings(account)
         healthy = live.run_once()
         assert healthy.acceptance.status == 'accepted'
-        assert live.state.snapshot().new_capacity.value == Decimal('39')
+        assert live.state.snapshot().new_capacity.value == Decimal('40')
         assert live.state.snapshot().current.account_id == MIXED_WALLET
         assert live.rounds.snapshot().account_id == MIXED_WALLET
         assert live.rounds.snapshot().round_number == 1
@@ -2379,7 +2379,7 @@ def test_d2_existing_selection_counts_reserved_money_once(tmp_path, monkeypatch,
         calculation = result.acceptance.observation.calculation
         assert calculation.buy_reserved == (Decimal('45') if case=='partial-fill' else Decimal('50'))
         assert calculation.inventory_cost == Decimal('20')
-        assert calculation.new_capacity == (Decimal('35') if case=='partial-fill' else Decimal('0') if case=='low-wallet-defensive' else Decimal('5') if case=='wallet55' else Decimal('0') if case in ('fundable-replacement','unfundable-replacement') else Decimal('30'))
+        assert calculation.new_capacity == (Decimal('55') if case=='partial-fill' else Decimal('0') if case=='low-wallet-defensive' else Decimal('5') if case=='wallet55' else Decimal('0') if case in ('fundable-replacement','unfundable-replacement') else Decimal('50'))
         if case=='fundable-replacement':
             assert set(calculation.target_tokens) == {'A','B','C','D',ids['F'][1]}
             attempt, = result.rotation_outcomes
@@ -2443,7 +2443,7 @@ def test_d2_yield_replacement_cancels_exact_victim_before_refill(tmp_path, monke
 
 @pytest.mark.parametrize('case', ['over-target', 'over-budget'])
 def test_d2_over_target_current_buys_converge_without_selling_inventory(tmp_path, monkeypatch, case):
-    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch,budget='60' if case=='over-budget' else '100')
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch,budget='40' if case=='over-budget' else '100')
     try:
         sdk.orders = tuple(order(k) for k in ('ABCDE' if case=='over-budget' else 'ABCDEF'))
         sdk.positions = (dict(user=WALLET,condition_id=ids['Z'][0],token_id=ids['Z'][1],
@@ -2470,6 +2470,198 @@ def wait_rotation_idle(live):
     while live.status()['native_inflight'] and time.monotonic() < deadline:
         time.sleep(.001)
     assert live.status()['native_inflight'] == 0, 'native lifetime watchdog'
+
+
+@pytest.mark.parametrize('funds', ['sufficient', 'wallet', 'allowance', 'unknown'])
+def test_d2_inventory_above_buy_budget_still_allows_buy(tmp_path, monkeypatch, funds):
+    from types import SimpleNamespace
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path, monkeypatch, wallet='400')
+    try:
+        sdk.positions = (dict(user=WALLET, condition_id=ids['Z'][0], token_id=ids['Z'][1],
+            size='300', initial_value='115.6884', redeemable=False),)
+        sentinel = order('Z', 'manual-sell', original='20').model_copy(update=dict(side='SELL', price=Decimal('.60')))
+        sdk.orders = None if funds == 'unknown' else (sentinel,)
+        sdk.get_balance_allowance = lambda **kw: SimpleNamespace(
+            balance='9000000' if funds == 'wallet' else '400000000',
+            allowances={sdk.environment.standard_exchange:'9000000' if funds == 'allowance' else '400000000'})
+        qualify('F')
+        result = execution.lp_auto_scheduled_check()
+        calculation = result.acceptance.observation.calculation
+        assert calculation.inventory_cost == Decimal('115.6884')
+        assert calculation.buy_reserved == (None if funds == 'unknown' else Decimal('0'))
+        if funds == 'sufficient':
+            assert len(sdk.posts) == 1
+            assert (sdk.posts[0]['side'], sdk.posts[0]['token_id'], sdk.posts[0]['price'], sdk.posts[0]['size']) == (
+                'BUY', ids['F'][1], Decimal('.50'), Decimal('20'))
+            assert result.outcomes[0].status.value == 'accepted'
+            assert live.state.snapshot().buy_reserved.value == Decimal('10')
+        else:
+            assert sdk.posts == []
+            if funds == 'unknown': assert calculation.new_capacity is None
+        assert sdk.orders == (None if funds == 'unknown' else (sentinel,))
+        assert sdk.cancels == sdk.market_orders == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('remaining', ['40', '110'])
+def test_d2_inventory_alone_does_not_trigger_budget_cancel(tmp_path, monkeypatch, remaining):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path, monkeypatch, wallet='400')
+    attempts = []
+    try:
+        incumbents = ((order('A', original='80'),) if remaining == '40' else
+            (order('A', original='80'), order('B', original='80'), order('C', original='60')))
+        sdk.orders = incumbents
+        sdk.positions = (dict(user=WALLET, condition_id=ids['Z'][0], token_id=ids['Z'][1],
+            size='300', initial_value='115.6884', redeemable=False),)
+        result = execution.lp_auto_scheduled_check()
+        attempts = list(result.rotation_outcomes)
+        for attempt in attempts:
+            assert attempt.handle is not None, attempt
+            assert attempt.handle.result(timeout=3).status.value == 'accepted'
+            attempt.handle._thread.join(timeout=3)
+            assert not attempt.handle._thread.is_alive()
+        calculation = result.acceptance.observation.calculation
+        assert calculation.inventory_cost == Decimal('115.6884')
+        assert calculation.buy_reserved == Decimal(remaining)
+        assert calculation.decision_states['over_budget'] == ('NO_DECISION' if remaining == '40' else 'DECISION')
+        if remaining == '110':
+            # Independent rational fixture oracle: midpoint=.51, weights=.81/.64,
+            # external competition=307/3; pools A/B/C=100/99/98, sizes=80/80/60.
+            # Yields are 3375/1859, 1215/676, 945/508 percent/hour respectively.
+            assert tuple(calculation.yields[k].quantize(Decimal('.000001')) for k in 'ABC') == (
+                Decimal('1.815492'), Decimal('1.797337'), Decimal('1.860236'))
+            assert calculation.yields['C'] > calculation.yields['A'] > calculation.yields['B']
+            assert calculation.target_tokens == ('C', 'A')
+        assert calculation.victim_order_ids == (() if remaining == '40' else ('B',))
+        assert sdk.cancels == ([] if remaining == '40' else [('B',)])
+        assert sdk.orders == incumbents  # ACK does not rewrite the current API orders.
+        assert sdk.posts == sdk.market_orders == []
+    finally:
+        for attempt in attempts:
+            if attempt.handle: attempt.handle._thread.join(timeout=3)
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('status', ['PARTIALLY_FILLED', 'PENDING_CANCEL'])
+@pytest.mark.parametrize('receipt', ['accepted', 'no_id'])
+def test_d2_open_bot_buy_notional_never_exceeds_budget(tmp_path, monkeypatch, status, receipt):
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path, monkeypatch, wallet='400')
+    entered, release = Event(), Event()
+    results, errors, workers, cancels = [], [], [], []
+    from open_trader.polymarket_lp_market_reader import ReadScope
+    def check():
+        try: results.append(live.run_once(execution._lp.capture_qualified_pool()))
+        except BaseException as exc: errors.append(exc)
+    def post(signed):
+        sdk.posts.append(dict(signed))
+        if len(sdk.posts) == 1:
+            entered.set()
+            assert release.wait(8), 'BUY native completion watchdog'
+        oid = 'F-actual' if signed['token_id'] == ids['F'][1] else 'G-actual'
+        letter = 'F' if oid == 'F-actual' else 'G'
+        sdk.orders = (*sdk.orders, order(letter, oid))
+        if receipt == 'no_id' and len(sdk.posts) == 1:
+            return dict(accepted=True, status='LIVE', taking_amount='0')
+        return dict(accepted=True, status='LIVE', order_id=oid, taking_amount='0')
+    def notional(rows):
+        return sum(((o.original_size-o.size_matched)*o.price for o in rows
+            if o.side == 'BUY'), Decimal('0'))
+    try:
+        incumbent = order('A', original='200', matched='20').model_copy(update=dict(status=status))
+        sdk.orders = (incumbent,)
+        sdk.positions = (dict(user=WALLET, condition_id=ids['Z'][0], token_id=ids['Z'][1],
+            size='300', initial_value='115.6884', redeemable=False),)
+        sdk.post_order = post
+        qualify('F')
+        worker = threading.Thread(target=check, name='budget-native-submit')
+        workers.append(worker); worker.start()
+        assert entered.wait(3), 'BUY submit startup watchdog'
+        assert live.status()['native_inflight'] == 1
+        assert len(sdk.posts) == 1
+        assert (sdk.posts[0]['price'], sdk.posts[0]['size']) == (Decimal('.50'), Decimal('20'))
+        assert notional(sdk.orders) == Decimal('90')
+        assert notional(sdk.orders) + sdk.posts[0]['price']*sdk.posts[0]['size'] == Decimal('100')
+        # Actual fresh external reads confer no concurrent round/send authority.
+        sdk.advance(1)
+        frame = live.reader.read_current(ReadScope(WALLET), time.monotonic()+3)
+        assert frame.orders_complete and frame.buy_reserved == Decimal('90')
+        assert frame.inventory_cost == Decimal('115.6884')
+        with pytest.raises(RuntimeError, match='d2_run_in_progress'):
+            live.run_once(execution._lp.capture_qualified_pool())
+        assert len(sdk.posts) == 1 and not results
+        release.set(); worker.join(timeout=3)
+        assert not worker.is_alive() and errors == []
+        result, = results
+        assert result.outcomes[0].status.value == ('accepted' if receipt == 'accepted' else 'unknown_error')
+        assert live.complete_local_attempts(result.start.token, result.outcomes).status.value == 'duplicate'
+        if receipt == 'no_id':
+            assert live.status()['last_buy_uncertainty'].venue_order_id is None
+            assert live.state.snapshot().new_capacity.state == 'unknown'
+        for _ in range(2):
+            sdk.advance(1)
+            current = live.run_once(execution._lp.capture_qualified_pool())
+            assert current.acceptance.observation.calculation.buy_reserved == Decimal('100')
+            assert current.acceptance.observation.calculation.new_capacity == Decimal('0')
+            assert notional(sdk.orders) == Decimal('100') and len(sdk.posts) == 1
+        # New partial-fill facts free only the proven remaining notional;
+        # their additional inventory cost does not consume the BUY cap again.
+        sdk.orders = (order('A', original='200', matched='40'), order('F', 'F-actual'))
+        sdk.positions = (dict(user=WALLET, condition_id=ids['Z'][0], token_id=ids['Z'][1],
+            size='320', initial_value='125.6884', redeemable=False),)
+        sdk.advance(1); qualify('G')
+        filled = live.run_once(execution._lp.capture_qualified_pool())
+        assert filled.acceptance.observation.calculation.inventory_cost == Decimal('125.6884')
+        assert filled.acceptance.observation.calculation.buy_reserved == Decimal('90')
+        assert filled.acceptance.observation.calculation.new_capacity == Decimal('10')
+        assert [p['token_id'] for p in sdk.posts] == [ids['F'][1], ids['G'][1]]
+        assert notional(sdk.orders) == Decimal('100')
+        cancel = live.cancel_independent((WALLET, *ids['A'], 'A')); cancels.append(cancel)
+        assert cancel.result(timeout=3).status.value == 'accepted'
+        cancel._thread.join(timeout=3)
+        assert not cancel._thread.is_alive()
+        assert live.state.snapshot().new_capacity.state == 'unknown'
+        assert notional(sdk.orders) == Decimal('100')  # ACK did not change the API or prove final fill.
+        assert all(p['side'] == 'BUY' for p in sdk.posts) and sdk.market_orders == []
+    finally:
+        release.set()
+        for worker in workers: worker.join(timeout=3)
+        for cancel in cancels: cancel._thread.join(timeout=3)
+        assert all(not worker.is_alive() for worker in workers)
+        assert live.close(timeout=3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('facts,expected', [('complete', '30'), ('wallet', '0'),
+    ('allowance', '0'), ('unknown_terms', None)])
+def test_d2_bot_buy_budget_preserves_other_buy_wallet_constraints(tmp_path, monkeypatch, facts, expected):
+    """Ray's updated cap counts every active BUY, regardless of its origin."""
+    from types import SimpleNamespace
+    live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path, monkeypatch)
+    try:
+        buys = (order('A', 'auto-or-manual', original='80'), order('B', 'unknown-origin', original='60'))
+        if facts == 'unknown_terms': buys = (buys[0], buys[1].model_copy(update=dict(price=None)))
+        sentinel = order('Z', 'manual-sell', original='20').model_copy(update=dict(side='SELL', price=Decimal('.60')))
+        sdk.positions = (dict(user=WALLET, condition_id=ids['Z'][0], token_id=ids['Z'][1],
+            size='300', initial_value='115.6884', redeemable=False),)
+        sdk.get_balance_allowance = lambda **kw: SimpleNamespace(
+            balance='65000000' if facts == 'wallet' else '100000000',
+            allowances={sdk.environment.standard_exchange:'65000000' if facts == 'allowance' else '100000000'})
+        for with_sell in (False, True, False):
+            sdk.orders = (*buys, sentinel) if with_sell else buys
+            sdk.advance(1)
+            result = live.run_once(execution._lp.capture_qualified_pool())
+            calculation = result.acceptance.observation.calculation
+            assert calculation.buy_reserved == (None if facts == 'unknown_terms' else Decimal('70'))
+            assert calculation.inventory_cost == Decimal('115.6884')
+            assert calculation.new_capacity == (None if expected is None else Decimal(expected))
+            assert sdk.orders == ((*buys, sentinel) if with_sell else buys)
+            assert sdk.posts == sdk.cancels == sdk.market_orders == []
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
 
 
 def test_d2_unknown_incumbent_reserves_slot_until_existing_protection_deadline(tmp_path, monkeypatch):

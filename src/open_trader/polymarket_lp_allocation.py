@@ -37,8 +37,8 @@ def rank_weights_shadow(frame, policy, calculation, as_of, *, authority=True, bl
             leftover_cash_usd=None, would_send_count=0, not_sent_count=policy.target_count,
             omitted_ranks=0, rank_limit=RANK_LIMIT, checked_at=as_of)
     wallet = min(account.value['balance'], account.value['allowance'])
-    total = max(ZERO, min(policy.budget-inventory, wallet))
-    free = max(ZERO, min(policy.budget-inventory-reserved, wallet-reserved))
+    total = max(ZERO, min(policy.budget, wallet))
+    free = max(ZERO, min(policy.budget-reserved, wallet-reserved))
     cash = free
     occupied = {row['condition_id'] for row in frame.current_buys}
     ranked, excluded = [], []

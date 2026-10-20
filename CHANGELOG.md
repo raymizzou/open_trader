@@ -13,6 +13,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - LP 当前读取为财务事实保留准入：真实读取总上限仍为 2，市场及保护合计至多 1，Reader 内奖励读取也保持串行。已核实身份、闭市且无盘口的纯持仓市场保留持仓与成本，以明确不可交易状态避免重复读取；有订单或证明不足时保留原门禁。兼容既有仅含账户的读取 scope：缺少可选闭市字段时仍走完整市场证据路径。诊断容量夹具改用符合新准入的真实两槽占用，保留 UNKNOWN、年龄及不发送断言。离线验证覆盖超时资源所有权、关闭、60 秒及 Retry-After 恢复、身份与 600 秒保护；未改预算、SELL 或生产配置，未部署。
 
+- LP BUY 预算改为只限制账户全部活跃 BUY 的未成交占款，包括自动、LP 手动及来源未知的 BUY；已成交持仓和 SELL 不再扣该上限。余额、allowance、完整财务事实、取消中占用与 UNKNOWN 防重仍独立生效；组合选优、独立超额判断及 compute-only shadow 使用一致口径。离线定向回归覆盖库存超预算仍可买、真实 BUY 超额收敛、部分成交、无 ID 提交、取消 ACK 和 shadow 不改实际发单；未部署。
+
 - LP C1 can save validated rank weights and an optional compute-only shadow through the current D2 settings, state and CLI. Live rank_weights is rejected until C2; default minimum orders and estimator payloads stay unchanged. Shadow uses final-size risk/yield checks, retains cash after a blocked rank and bounds diagnostics; failures do not alter trading. The C1 review repair keeps startup/control and repair saves available for invalid stored allocations, excludes unknown candidates while protecting unknown incumbents, computes shadow once per live selection, reuses matching native yields and isolates diagnostic/log failures with a consistent schema. Weight strings reject whitespace, underscores and non-ASCII digits. Focused offline verification and sandbox-limited HTTP checks are recorded in the C1 fix handoff.
 
 - 修复 CN 趋势报告轮换风险校验与生成器的 Decimal 运算顺序不一致，循环小数 ATR 不再使合法冻结报告被拒绝；保持严格校验及旧版报告内容。冻结契约错误新增脱敏规则与字段路径，完成离线复现及直接受影响回归；未部署或重启控制器。

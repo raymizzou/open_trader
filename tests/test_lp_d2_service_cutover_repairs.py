@@ -70,7 +70,7 @@ def test_reservations_and_settings_configuration_complete_concurrently(tmp_path)
             assert order['releasable'] is False
             assert order['reason']=='current_api_reservations_not_releasable'
             for name,expected in (('buy_reserved_usd','3.20'),('inventory_cost_usd','.60'),
-                    ('current_exposure_usd','3.80'),('new_capacity_usd','36.20')):
+                    ('current_exposure_usd','3.80'),('new_capacity_usd','36.80')):
                 assert Decimal(view[name])==Decimal(expected)
             settled=child.wait_state(lambda value:not value['settings_pending']
                 and value['effective_settings']['config_version']==2)

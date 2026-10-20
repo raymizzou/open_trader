@@ -198,7 +198,7 @@ def test_qualified_candidates_use_same_frame_and_independent_source_coverage(tmp
         policy = CalculationPolicy(Decimal('40'),2) if level==1 else CalculationPolicy(Decimal('40'),2,buy_price_level=2)
         prepared = prepare_current_inputs(raw,pool,policy,now)
         result = calculate_current(prepared,policy,now)
-        assert (result.buy_reserved,result.inventory_cost,result.new_capacity)==(Decimal('4'),Decimal('3'),Decimal('33'))
+        assert (result.buy_reserved,result.inventory_cost,result.new_capacity)==(Decimal('4'),Decimal('3'),Decimal('36'))
         assert result.target_tokens == ('other-buy', 'candidate-t')
         row, = prepared.sources['candidates'].value
         assert row['price']==price and row['quantity']==Decimal('20')
