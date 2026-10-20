@@ -53,7 +53,9 @@ def calculate_current(frame, policy, as_of) -> CalculationResult:
     account = frame.sources.get('current_account')
     if (policy.budget is not None and all(v is not None for v in (*funds, reserved, inventory))
             and (account is None or account.complete and not account.error)):
-        available = max(Decimal(0), min(policy.budget-inventory-reserved, min(funds)-reserved))
+        # The configured cap covers remaining active BUYs. Inventory remains
+        # required financial evidence, but does not consume this order budget.
+        available = max(Decimal(0), min(policy.budget-reserved, min(funds)-reserved))
     directions = frame.sources.get('directions')
     estimates, observations = {}, {}
     for row in frame.current_buys:
@@ -154,7 +156,7 @@ def select_current_composition(frame, policy, calculation, *, orders_accepted=Tr
         and len(frame.current_buys) > policy.target_count)
     budget_reduction = (frame.orders_complete and orders_accepted and frame.positions_complete and positions_accepted
         and reserved is not None and inventory is not None and policy.budget is not None
-        and reserved + inventory > policy.budget)
+        and reserved > policy.budget)
     selection_valid = replacement_valid or count_reduction or budget_reduction
     ranked = []
     if replacement_valid:
@@ -171,7 +173,7 @@ def select_current_composition(frame, policy, calculation, *, orders_accepted=Tr
         x[0].get('order_id', '') if x[0].get('existing') else '',
         x[0]['condition_id'], x[0]['token_id']))
     remaining = min(funds) if all(v is not None for v in funds) else None
-    capacity = (max(Decimal(0), policy.budget - inventory)
+    capacity = (max(Decimal(0), policy.budget)
         if policy.budget is not None and inventory is not None else None)
     if policy.selection_wallet is not None:
         remaining = policy.selection_wallet
