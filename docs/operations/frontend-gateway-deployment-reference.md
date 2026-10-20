@@ -5,6 +5,42 @@
 [#16](https://github.com/raymizzou/open_trader/issues/16) 和
 [#17](https://github.com/raymizzou/open_trader/issues/17)，用于验证和运维本地双进程链路。
 
+## Tokyo P2 read-only target — planned, not deployed
+
+The [Tokyo decision baseline](prediction-tokyo-deployment-sop.md#0-tokyo-decision-baseline--2026-10-20)
+governs the planned Tokyo path. P1 documents it; a separate P2 PR implements it.
+These are target requirements, not supported installer instructions or deployment
+evidence. The current phase is read-only access plus authenticated paused
+Shadow. The mini remains the sole live writer; no live cutover is approved.
+
+Planned path: browser → loopback Gateway (`8766`, parallel check `8876`) →
+local tunnel `127.0.0.1:18879` → Tailscale-only SSH → Tokyo read-only adapter
+`127.0.0.1:8770` → core service `127.0.0.1:8769`. Do not forward the ordinary
+Dashboard key directly to core 8769. Limit that key to the adapter destination,
+with no shell or other forwarding. Do not publish these ports or the DB.
+The adapter runs under a separate identity with no wallet credential access.
+
+Use a distinct private token for each client. Inject it at the Gateway server;
+do not expose it to browser storage/code, URLs, argv or logs. Audit GET paths
+for side effects and exclude session creation. Reject writes and strip browser
+Cookie/CSRF/Authorization capabilities. Show true owner/mode/SHA with separate
+read-only access and disabled write controls. Core session/Origin/CSRF/mode,
+identity, funds and geography gates remain unchanged.
+
+Choose the backend through deployment configuration; keep route JSON's existing
+schema without a URL or in-page switch. The mini retains non-Prediction routes;
+Air uses a Prediction-only Gateway. An unavailable or wrong-identity target must
+return structured 503 and stale/UNKNOWN state, without local 8769, Legacy or
+old-DB fallback and without starting any service. A route change grants no
+ownership. This path does not use #204 split display/control identities.
+
+Tokyo re-accumulates history; do not migrate mini DB/WAL/reports/full runtime.
+The planned display must identify source and cutover/history start, and mark
+missing history incomplete/UNKNOWN. It must not show missing results as zero
+or join them into continuous returns. Verify these P2 requirements on the
+actual accepted release before claiming access is deployed. Host/client
+installation and authenticated runs retain separate approval and prerequisites.
+
 ## 当前范围
 
 当前版本的默认 launchd 安装会执行可回滚的生产端口切换：
