@@ -113,7 +113,7 @@ def test_direction_drop_has_exact_order_reason(case, code):
 def test_reader_error_is_attributed_without_extra_reads(case):
     from urllib.error import HTTPError
     release=Event()
-    entered={key:Event() for key in ('a','b')}
+    entered={key:Event() for key in ('balance','open_orders')}
     calls=[]
     class Port:
         def read(self,name,scope):
@@ -126,22 +126,22 @@ def test_reader_error_is_attributed_without_extra_reads(case):
     try:
         if case=='closed':
             assert reader.close(timeout=0)
-            source=reader.read_current(ReadScope('A',('a',)),time.monotonic()+1).sources['a']
+            source=reader.read_current(ReadScope('A',('balance',)),time.monotonic()+1).sources['balance']
             expected='closed'
             assert calls==[]
         elif case=='http-error':
-            source=reader.read_current(ReadScope('A',('a',)),time.monotonic()+1).sources['a']
+            source=reader.read_current(ReadScope('A',('balance',)),time.monotonic()+1).sources['balance']
             expected='HTTPError'
-            assert calls==['a'] and source.error_facts['status']==429
+            assert calls==['balance'] and source.error_facts['status']==429
         else:
-            first=reader.read_current(ReadScope('A',('a','b') if case=='capacity' else ('a',)),time.monotonic()+.02)
-            assert entered['a'].wait(1)
-            if case=='timeout': source=first.sources['a'];expected='timeout'
+            first=reader.read_current(ReadScope('A',('balance','open_orders') if case=='capacity' else ('balance',)),time.monotonic()+.02)
+            assert entered['balance'].wait(1)
+            if case=='timeout': source=first.sources['balance'];expected='timeout'
             else:
-                name='c' if case=='capacity' else 'a'
+                name='positions' if case=='capacity' else 'balance'
                 source=reader.read_current(ReadScope('A',(name,)),time.monotonic()+1).sources[name]
                 expected='capacity' if case=='capacity' else 'in_progress'
-            assert Counter(calls)==Counter(['a','b'] if case=='capacity' else ['a'])
+            assert Counter(calls)==Counter(['balance','open_orders'] if case=='capacity' else ['balance'])
         assert source.error==expected and source.complete is False
         assert source.diagnostics['source_error']==expected
         assert source.diagnostics['error_class']==('exception' if case=='http-error' else expected)
@@ -180,7 +180,7 @@ def test_retry_cache_reports_actual_hit_and_remaining(seconds):
 
 def test_inflight_age_survives_timeout_and_reports_global_slots():
     clock=[10.0]
-    entered={k:Event() for k in ('a','b')};release={k:Event() for k in ('a','b')}
+    entered={k:Event() for k in ('balance','open_orders')};release={k:Event() for k in ('balance','open_orders')}
     calls=[]
     class Port:
         def read(self,name,scope):
@@ -189,21 +189,21 @@ def test_inflight_age_survives_timeout_and_reports_global_slots():
             return ()
     reader=MarketReader(Port(),clock=lambda:clock[0])
     try:
-        original=reader.read_current(ReadScope('A',('a','b')),time.monotonic()+.02)
+        original=reader.read_current(ReadScope('A',('balance','open_orders')),time.monotonic()+.02)
         assert all(e.wait(1) for e in entered.values())
         clock[0]=35
-        same=reader.read_current(ReadScope('A',('a',)),time.monotonic()+1)
-        foreign=reader.read_current(ReadScope('A',('c',)),time.monotonic()+1)
-        assert same.sources['a'].error=='in_progress' and foreign.sources['c'].error=='capacity'
-        assert same.sources['a'].diagnostics['inflight_age_seconds']==25
+        same=reader.read_current(ReadScope('A',('balance',)),time.monotonic()+1)
+        foreign=reader.read_current(ReadScope('A',('positions',)),time.monotonic()+1)
+        assert same.sources['balance'].error=='in_progress' and foreign.sources['positions'].error=='capacity'
+        assert same.sources['balance'].diagnostics['inflight_age_seconds']==25
         for current in (same,foreign):
             assert current.reader_diagnostics['inflight_count']==2
-            assert {tuple(v['key']):v['age_seconds'] for v in current.reader_diagnostics['jobs']}=={('A','a'):25,('A','b'):25}
-        release['a'].set()
+            assert {tuple(v['key']):v['age_seconds'] for v in current.reader_diagnostics['jobs']}=={('A','balance'):25,('A','open_orders'):25}
+        release['balance'].set()
         assert not reader.drain(timeout=.1)
-        current=reader.read_current(ReadScope('A',('b',)),time.monotonic()+1)
+        current=reader.read_current(ReadScope('A',('open_orders',)),time.monotonic()+1)
         assert current.reader_diagnostics['inflight_count']==1
-        assert Counter(calls)==Counter(['a','b'])
+        assert Counter(calls)==Counter(['balance','open_orders'])
         assert original.reader_diagnostics['inflight_count']==2
     finally:
         for e in release.values(): e.set()
@@ -326,10 +326,13 @@ def test_no_decision_records_failed_source_and_read_identity(tmp_path,monkeypatc
     from tests.test_lp_d2_execution_bridge import rotation_runtime
     live,execution,sdk,ids,pools,order,qualify=rotation_runtime(tmp_path,monkeypatch,startup=False)
     original=live.reader._port;release=Event();calls=[]
+    # A financial source plus one nonfinancial source may occupy both slots.
+    held={name:Event() for name in ('positions','hold:a')} if case=='balance-capacity' else {}
     class Port:
         def read(self,name,scope):
             calls.append(name)
-            if name.startswith('hold:') or case=='orders-timeout' and name=='open_orders':
+            if name in held or case=='orders-timeout' and name=='open_orders':
+                if name in held: held[name].set()
                 assert release.wait(3), 'source watchdog'
                 return ()
             if case=='positions-cache' and name=='positions': raise ValueError('SECRET')
@@ -339,7 +342,8 @@ def test_no_decision_records_failed_source_and_read_identity(tmp_path,monkeypatc
     live.reader._port=Port()
     try:
         if case=='balance-capacity':
-            live.reader.read_current(ReadScope(live.account_id,('hold:a','hold:b')),time.monotonic()+.02)
+            live.reader.read_current(ReadScope(live.account_id,tuple(held)),time.monotonic()+.02)
+            assert all(event.wait(1) for event in held.values()), 'actual two-slot admission'
         capture=SourceResult('captured',[],complete=case!='candidates-incomplete',error='qualification_unknown' if case=='candidates-incomplete' else None)
         if case=='positions-cache': live.run_once(capture,timeout=.05)
         result=live.run_once(capture,timeout=.05)
@@ -506,10 +510,11 @@ def test_live_unknown_reason_is_current_or_explicitly_attempted(tmp_path,monkeyp
     sdk.orders=(order('A'),)
     port=live.reader._port
     release=Event()
-    entered={name:Event() for name in ('hold:a','hold:b')}
+    entered={name:Event() for name in ('balance','hold:a')}
+    holding=Event()
     class Port:
         def read(self,name,scope):
-            if name in entered:
+            if holding.is_set() and name in entered:
                 entered[name].set()
                 assert release.wait(3), 'held source watchdog'
                 return ()
@@ -545,6 +550,7 @@ def test_live_unknown_reason_is_current_or_explicitly_attempted(tmp_path,monkeyp
         assert row['reason_is_current'] is False and row['reason_codes']==['reason_unavailable']
         assert row['attempted_reason_codes']==['own_order_depth_unknown']
         assert row['age_seconds']==1 and sdk.posts==sdk.cancels==[]
+        holding.set()
         live.reader.read_current(ReadScope(live.account_id,tuple(entered)),time.monotonic()+.02)
         assert all(event.wait(1) for event in entered.values())
         execution.lp_auto_scheduled_check()

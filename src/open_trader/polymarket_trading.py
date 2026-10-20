@@ -2667,7 +2667,7 @@ class PolymarketTradingClient:
                     if metadata is None:
                         raise ValueError("market_source_unknown")
                     closed_position = (
-                        component in scope.position_only_markets
+                        component in getattr(scope, 'position_only_markets', ())
                         and metadata.get('condition_id') == condition
                         and metadata.get('market_id')
                         and metadata.get('closed') is True
