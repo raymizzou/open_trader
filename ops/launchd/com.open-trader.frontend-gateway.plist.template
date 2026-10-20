@@ -44,7 +44,7 @@
     <string>--prediction-upstream-host</string>
     <string>127.0.0.1</string>
     <string>--prediction-upstream-port</string>
-    <string>8769</string>
+    <string>OPEN_TRADER_PREDICTION_UPSTREAM_PORT</string>
     <string>--public-origin</string>
     <string>http://127.0.0.1:8766</string>
     <string>--static-dir</string>

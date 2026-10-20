@@ -3,6 +3,7 @@ set -euo pipefail
 
 DRY_RUN=0
 MODE="stack"
+PREDICTION_UPSTREAM_PORT=8769
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_ROOT=""
 PYTHON_BIN="${OPEN_TRADER_PYTHON:-$REPO_ROOT/.venv/bin/python}"
@@ -14,7 +15,7 @@ CURL_BIN="${CURL_BIN:-$(command -v curl || true)}"
 WAIT_SECONDS="${DASHBOARD_LAUNCHD_WAIT_SECONDS:-30}"
 
 usage() {
-  echo "usage: $0 [--dry-run] [--mode stack|single|gateway|legacy] [--repo-root PATH] [--runtime-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N]" >&2
+  echo "usage: $0 [--dry-run] [--mode stack|single|gateway|legacy] [--repo-root PATH] [--runtime-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N] [--prediction-upstream-port PORT]" >&2
 }
 
 for arg in "$@"; do
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
     --mode) [[ $# -ge 2 ]] || { usage; exit 2; }; MODE="$2"; shift 2 ;;
     --repo-root) [[ $# -ge 2 ]] || { usage; exit 2; }; REPO_ROOT="$2"; shift 2 ;;
     --runtime-root) [[ $# -ge 2 ]] || { usage; exit 2; }; RUNTIME_ROOT="$2"; shift 2 ;;
+    --prediction-upstream-port) [[ $# -ge 2 ]] || { usage; exit 2; }; PREDICTION_UPSTREAM_PORT="$2"; shift 2 ;;
     --python) [[ $# -ge 2 ]] || { usage; exit 2; }; PYTHON_BIN="$2"; shift 2 ;;
     --launch-agents-dir) [[ $# -ge 2 ]] || { usage; exit 2; }; LAUNCH_AGENTS_DIR="$2"; shift 2 ;;
     --wait-seconds) [[ $# -ge 2 ]] || { usage; exit 2; }; WAIT_SECONDS="$2"; shift 2 ;;
@@ -40,6 +42,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$MODE" == "stack" || "$MODE" == "single" || "$MODE" == "gateway" || "$MODE" == "legacy" ]] || { usage; exit 2; }
+
+[[ "$PREDICTION_UPSTREAM_PORT" =~ ^[0-9]{1,5}$ ]] &&
+  (( 10#$PREDICTION_UPSTREAM_PORT >= 1 && 10#$PREDICTION_UPSTREAM_PORT <= 65535 )) || { usage; exit 2; }
 
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 RUNTIME_ROOT="${RUNTIME_ROOT:-$REPO_ROOT}"
@@ -96,6 +101,7 @@ render_template() {
     -e "s|OPEN_TRADER_REPORTS_DIR|$reports|g" \
     -e "s|OPEN_TRADER_DAILY_CONFIG|$daily_config|g" \
     -e "s|OPEN_TRADER_PREDICTION_ROUTE_STATE|$prediction_route_state|g" \
+    -e "s|OPEN_TRADER_PREDICTION_UPSTREAM_PORT|$PREDICTION_UPSTREAM_PORT|g" \
     -e "s|OPEN_TRADER_REPO|$repo|g" \
     "$template"
 }

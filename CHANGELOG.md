@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-20
 
+- Fix P2 review and CI gaps around the loopback-only Prediction display adapter and tailnet read-only Gateway/client profile: every read-only Gateway requires Prediction-only mode, control requests strip client-supplied read-only headers, client token files require 32–512 URL-safe characters, and incoming adapter bearers require 32–512 characters plus a registered SHA-256 digest match. The adapter boundary is “no trading, DB or credential access, no explicit write route”. Template, HTTP path, SSH alias and token-boundary regressions are covered while existing control auth and mini defaults stay intact. The accepted item-5 semantics keep completed settings adoption at the save/iteration boundary and the mini 5-second poll; no LP execution code changed. P2 remains planned and not deployed; socket/process checks are unrun here and remain operator follow-up. Tailnet enrollment, adapter installation, host permissions and deployment remain subject to separate approval.
+
 - With N-leg paused, D2 startup uses reliable local admission and leaves the first account read to its sole Scheduler. API timeouts keep the runtime online with UNKNOWN LP facts and no new BUYs until complete facts arrive. Admission preserves historical execution/incident states; round0 BUY cleanup and SELL protections remain in place. Offline startup checks cover admission, retry and fatal control/settings/identity failures.
 
 ## 2026-10-19

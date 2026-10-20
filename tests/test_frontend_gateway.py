@@ -1102,3 +1102,64 @@ def test_split_prediction_routes_responsibility_and_isolates_authorization(tmp_p
     assert len(air.requests) == 13
     assert air.requests[1]['path'] == '/api/prediction-arbitrage/venues'
     assert [row['path'] for row in legacy.requests] == ['/api/portfolio']
+
+
+def test_readonly_adapter_auth_policy_revocation_and_identity(tmp_path):
+    import hashlib
+    from open_trader.prediction_readonly_api import create_prediction_readonly_api
+
+    private = tmp_path / 'private'
+    private.mkdir(mode=0o700)
+    tokens = private / 'tokens.json'
+    def save_tokens(clients):
+        tokens.write_text(json.dumps({name: hashlib.sha256(token.encode()).hexdigest()
+                                      for name, token in clients.items()}))
+        tokens.chmod(0o600)
+    save_tokens({'mini': 'mini-fixture-token-0123456789abcdef', 'air': 'air-fixture-token-0123456789abcdef'})
+    with _running(_Upstream()) as backend:
+        backend.response_body = json.dumps({
+            'mode': 'production', 'production_owner': True, 'git_sha': 'a'*40,
+            'mutations': 'enabled', 'stale': True, 'checked_at': 'old',
+            'csrf_token': 'must-remove', 'nested': {'session_token': 'must-remove'},
+        }).encode()
+        backend.response_headers = [('Set-Cookie', 'session=must-remove'), ('X-CSRF-Token', 'must-remove')]
+        adapter = create_prediction_readonly_api(token_file=tokens, port=0,
+                                                upstream_port=backend.server_port)
+        with _running(adapter):
+            def request(path, token='mini-fixture-token-0123456789abcdef', method='GET'):
+                conn = http.client.HTTPConnection('127.0.0.1', adapter.server_port, timeout=3)
+                headers = {'Cookie': 'browser-cookie', 'X-CSRF-Token': 'browser-csrf'}
+                if token is not None:
+                    headers['Authorization'] = 'Bearer ' + token
+                conn.request(method, path, headers=headers)
+                response = conn.getresponse()
+                result = response.status, dict(response.getheaders()), response.read()
+                conn.close()
+                return result
+            path = '/api/prediction-arbitrage/lp/dashboard'
+            assert request(path, None)[0] == 401
+            assert request(path, 'wrong')[0] == 401
+            assert backend.requests == []
+            code, headers, body = request(path)
+            assert code == 200
+            payload = json.loads(body)
+            assert payload == {'mode': 'production', 'production_owner': True, 'git_sha': 'a'*40,
+                               'mutations': 'enabled', 'stale': True, 'checked_at': 'old', 'nested': {}, 'access': 'read_only'}
+            assert 'Set-Cookie' not in headers and 'X-CSRF-Token' not in headers
+            forwarded = {key.lower(): value for key, value in backend.requests[-1]['headers'].items()}
+            assert not {'cookie', 'authorization', 'x-csrf-token'} & forwarded.keys()
+            assert forwarded['x-open-trader-read-only'] == 'true'
+            count = len(backend.requests)
+            for blocked in ('/api/prediction-arbitrage/lp/sessions/current', '/api/prediction-arbitrage/state',
+                            path+'?refresh=true', path+'%2f..', path+'?url=http://example.invalid',
+                            '//api/prediction-arbitrage/lp/dashboard', 'http://example.invalid'+path,
+                            '/api/prediction-arbitrage/lp/account/trades?limit=1&limit=2'):
+                assert request(blocked)[0] == 403, blocked
+            for method in ('POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'CONNECT', 'TRACE'):
+                assert request(path, method=method)[0] == 405
+            assert len(backend.requests) == count
+            save_tokens({'air': 'air-fixture-token-0123456789abcdef'})
+            assert request(path)[0] == 401
+            assert request(path, 'air-fixture-token-0123456789abcdef')[0] == 200
+            tokens.chmod(0o644)
+            assert request(path, 'air-fixture-token-0123456789abcdef')[0] == 401

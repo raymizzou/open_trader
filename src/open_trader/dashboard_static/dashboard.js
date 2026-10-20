@@ -3107,7 +3107,9 @@ function predictionWorkspacePage() {
     ? `<section class="pm-readiness" aria-label="Prediction 服务身份状态"><article class="pm-readiness-item"><span>服务身份</span><strong data-service-identity-status>服务身份 UNKNOWN</strong><small>mode/mutations 不一致或不可用；写操作已阻止。</small></article></section>`
     : predictionServiceReadOnly()
       ? `<section class="pm-readiness" aria-label="Shadow 模式状态"><article class="pm-readiness-item"><span>运行模式</span><strong data-shadow-status>Shadow 只读</strong><small>${state.predictionMarket.nLegStatus === "paused" ? "LP 实时数据暂不可用；这不是生产正常交易看板。" : "写操作已阻止；这不是生产正常交易看板。"}</small></article></section>`
-      : "";
+      : predictionAccessReadOnly()
+        ? `<section class="pm-readiness" aria-label="Prediction 只读访问"><article class="pm-readiness-item"><span>运行模式</span><strong>${escapeHtml(identity.label)} · 只读访问</strong><small>写操作已阻止；后端运行身份保持不变。</small></article></section>`
+        : "";
   const pane = active === "multi_leg"
     ? predictionUnifiedPage(state.predictionMarket.payload || {status: "loading", events: [], opportunities: []})
     : predictionLpCard({lp_dashboard: state.predictionMarket.lpDashboard, lp_error: state.predictionMarket.lpDashboardError});
@@ -6361,7 +6363,7 @@ function startPredictionPolling() {
   state.predictionMarket.pollId = window.setInterval(async () => {
     renderPredictionMarket();
     await Promise.all([fetchPredictionVenues(), fetchCurrentPredictionPane()]);
-  }, 5000);
+  }, predictionAccessReadOnly() ? 30000 : 5000);
 }
 
 function stopPredictionPolling() {
@@ -6399,6 +6401,11 @@ function predictionNLegStatus(payload) {
   return status === "paused" ? "paused" : status === "running" ? "running" : "unknown";
 }
 
+function predictionAccessReadOnly() {
+  return document.body?.dataset?.predictionAccess === "read_only"
+    || state.predictionMarket.venuesPayload?.access === "read_only";
+}
+
 function predictionServiceReadOnly() {
   return predictionServiceIdentity().state === "shadow";
 }
@@ -6432,7 +6439,7 @@ function predictionServiceIdentity() {
 }
 
 function predictionWritesBlocked() {
-  return ["shadow", "unknown"].includes(predictionServiceIdentity().state);
+  return predictionAccessReadOnly() || ["shadow", "unknown"].includes(predictionServiceIdentity().state);
 }
 
 function predictionNLegReadAllowed() {
@@ -6781,6 +6788,7 @@ function renderPredictionSignalPanel() {
 
 async function predictionPost(path, body) {
   if (predictionServiceIdentity().state === "unknown") throw new Error("prediction service identity UNKNOWN，写操作不可用");
+  if (predictionAccessReadOnly()) throw new Error("只读访问，写操作不可用");
   if (predictionServiceReadOnly()) throw new Error("Shadow 只读，写操作不可用");
   if (predictionNLegPath(path) && !predictionNLegReadAllowed()) throw new Error("N_LEG_PAUSED");
   const response = await fetch(predictionRequestUrl(path), {method: "POST", credentials: "same-origin", headers: {"Content-Type": "application/json", "X-CSRF-Token": state.predictionMarket.csrfToken}, body: JSON.stringify(body)});

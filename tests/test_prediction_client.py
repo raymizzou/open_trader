@@ -412,3 +412,48 @@ def test_split_client_validates_independent_air_cloud_identities_and_ports(tmp_p
         return reader(port)
     monkeypatch.setattr(client,'read_json',offline)
     assert status(base,state)['execution_status'] == 'unavailable'
+
+
+def test_readonly_client_validates_tailnet_token_and_builds_isolated_commands(tmp_path):
+    from open_trader.prediction_client import client_commands
+    private = tmp_path / 'private'
+    private.mkdir(mode=0o700)
+    token = private / 'token'
+    token.write_text('fixture-private-token-0123456789abcdef')
+    token.chmod(0o600)
+    cfg = dict(release_root=str(tmp_path/'release'), runtime_root=str(tmp_path/'runtime'),
+        python='/usr/bin/python3', ssh_alias='tokyo.example.ts.net', expected_sha='a'*40,
+        mode='production', access='read_only', token_file=str(token),
+        ssh_user='readonly', ssh_identity_file='/fixture/readonly-key')
+    validate(cfg)
+    assert client_ports(cfg) == (8766, 18879)
+    commands = client_commands(cfg, tmp_path/'route.json')
+    assert '127.0.0.1:18879:127.0.0.1:8770' in commands['ssh']
+    assert 'Hostname=tokyo.example.ts.net' in commands['ssh']
+    assert commands['ssh'][commands['ssh'].index('-l')+1] == 'readonly'
+    assert commands['ssh'][commands['ssh'].index('-i')+1] == '/fixture/readonly-key'
+    assert 'ProxyCommand=none' in commands['ssh'] and 'ProxyJump=none' in commands['ssh']
+    assert '--prediction-only' in commands['gateway']
+    assert '--prediction-access' in commands['gateway'] and 'read_only' in commands['gateway']
+    assert '--prediction-token-file' in commands['gateway']
+    assert 'fixture-private-token-0123456789abcdef' not in json.dumps(commands)
+    for host in ('43.133.26.236', 'example.com', 'localhost', '127.0.0.1', 'open-trader-tokyo',
+                 '100.63.255.255', '100.128.0.1', 'foo.ts.net.evil.com'):
+        with pytest.raises(ValueError, match='tailnet'):
+            validate({**cfg, 'ssh_alias': host})
+    for host in ('tokyo.example.ts.net -o ProxyCommand=ssh evil',
+                 'tokyo.example.ts.net;ProxyCommand=ssh evil', 'ProxyCommand=ssh evil'):
+        with pytest.raises(ValueError):
+            validate({**cfg, 'ssh_alias': host})
+    for host in ('100.64.0.1', '100.127.255.254'):
+        validate({**cfg, 'ssh_alias': host})
+    for change in ({'remote_port': True}, {'remote_port': 0}, {'remote_port': 65536},
+                   {'execution_port': 8769, 'execution_expected_sha': 'b'*40}, {'token_file': ''}):
+        with pytest.raises(ValueError):
+            validate({**cfg, **change})
+    token.chmod(0o644)
+    with pytest.raises(ValueError):
+        validate(cfg)
+    control = {key: value for key, value in cfg.items() if key not in {'access', 'token_file'}}
+    assert '127.0.0.1:8769:127.0.0.1:8769' in client_commands(control, tmp_path/'route')['ssh']
+    assert '127.0.0.1:8769:127.0.0.1:9000' in client_commands({**control, 'remote_port':9000}, tmp_path/'route')['ssh']
