@@ -1077,36 +1077,44 @@ def valid_frozen_report_contract(
     payload: Mapping[str, object],
     *,
     _allow_unfrozen_simulated_plan: bool = False,
+    _diagnostics: list[str] | None = None,
 ) -> bool:
     """Validate the allocation-era fields once for every frozen-report reader."""
+    def invalid(rule: str, field: str) -> bool:
+        # Only code-owned rule names and schema paths enter errors. Never include
+        # payload values, arbitrary mapping keys, or exception text.
+        if _diagnostics is not None:
+            _diagnostics.append(f"{rule}: field={field}")
+        return False
+
     if "account_input" in payload and not _valid_account_input(
         payload.get("account_input")
     ):
-        return False
+        return invalid("account_input_invalid", "account_input")
     availability = payload.get("plan_availability")
     if availability is not None:
         if not isinstance(availability, Mapping):
-            return False
+            return invalid("plan_availability_type", "plan_availability")
         for account_name, value in availability.items():
             if not isinstance(value, Mapping) or value.get("status") not in {
                 "available", "unavailable"
             }:
-                return False
+                return invalid("plan_status_invalid", "plan_availability.*.status")
             if set(value) - {
                 "status", "reason", "executable", "net_value", "available_cash",
             }:
-                return False
+                return invalid("plan_fields_invalid", "plan_availability.*")
             if not isinstance(value.get("reason", ""), str) or not isinstance(
                 value.get("executable"), bool
             ):
-                return False
+                return invalid("plan_execution_invalid", "plan_availability.*.executable")
             for field in ("net_value", "available_cash"):
                 if field not in value:
                     continue
                 try:
                     parsed = Decimal(str(value[field]))
                 except (InvalidOperation, TypeError, ValueError):
-                    return False
+                    return invalid("plan_amount_invalid", "plan_availability.*.amount")
                 if not parsed.is_finite() or (
                     parsed < 0
                     and not (
@@ -1114,13 +1122,13 @@ def valid_frozen_report_contract(
                         and field == "available_cash"
                     )
                 ):
-                    return False
+                    return invalid("plan_amount_range", "plan_availability.*.amount")
         if "account_input" not in payload:
             real_account = availability.get("real_account")
             if not isinstance(real_account, Mapping) or real_account.get(
                 "status"
             ) != "unavailable":
-                return False
+                return invalid("real_account_identity_missing", "plan_availability.real_account.status")
     allocation = payload.get("allocation")
     judgments = payload.get("strategy_judgments")
     metadata = payload.get("metadata")
@@ -1139,9 +1147,9 @@ def valid_frozen_report_contract(
             if "market" in strategy_snapshot and snapshot_market not in {
                 "CN", "HK", "US",
             }:
-                return False
+                return invalid("strategy_market_invalid", "strategy_snapshot.market")
             if snapshot_market and metadata_market and snapshot_market != metadata_market:
-                return False
+                return invalid("strategy_market_mismatch", "strategy_snapshot.market")
             identity_market = snapshot_market or metadata_market
             identity_version = str(
                 strategy_snapshot.get("strategy_version") or ""
@@ -1156,23 +1164,23 @@ def valid_frozen_report_contract(
                 or strategy_snapshot.get("strategy_id")
                 != f"trend_animals_warm_to_hot/{identity_market}/{identity_version}"
             ):
-                return False
+                return invalid("strategy_identity_mismatch", "strategy_snapshot.strategy_id")
             if identity_version in set(
                 ALLOCATION_REPORT_VERSIONS.get(identity_market, ())
             ):
-                return False
+                return invalid("allocation_missing", "allocation")
         if isinstance(parameters, Mapping) and (
             ALLOCATION_DYNAMIC_PARAMETER_NAMES - {"target_weight"}
         ) & parameters.keys():
-            return False
+            return invalid("allocation_parameters_without_snapshot", "strategy_snapshot.parameters")
         if isinstance(judgments, Mapping) and any(
             field in judgments
             for field in ("simulate_rotation_pairs", "real_rotation_pairs")
         ):
-            return False
+            return invalid("rotation_without_allocation", "strategy_judgments.*_rotation_pairs")
         return True
     if not isinstance(allocation, Mapping):
-        return False
+        return invalid("allocation_type", "allocation")
     market_value = strategy_snapshot.get("market") if isinstance(
         strategy_snapshot, Mapping
     ) else None
@@ -1190,14 +1198,14 @@ def valid_frozen_report_contract(
         else None
     )
     if market_value is not None and snapshot_market is None:
-        return False
+        return invalid("strategy_market_invalid", "strategy_snapshot.market")
     if snapshot_market is not None and (
         metadata_market is not None and metadata_market_text != snapshot_market
     ):
-        return False
+        return invalid("strategy_market_mismatch", "metadata.market")
     market = snapshot_market or metadata_market_text
     if market is None:
-        return False
+        return invalid("market_missing", "strategy_snapshot.market")
     allocation_for_validation = allocation
     if (
         "version" not in allocation
@@ -1207,7 +1215,7 @@ def valid_frozen_report_contract(
     ):
         allocation_for_validation = {**allocation, "version": 2}
     if not valid_frozen_allocation(allocation_for_validation):
-        return False
+        return invalid("allocation_invalid", "allocation")
     allocation_markets = allocation.get("markets")
     allocation_market = (
         allocation_markets.get(market)
@@ -1260,18 +1268,18 @@ def valid_frozen_report_contract(
             )
         )
     ):
-        return False
+        return invalid("allocation_strategy_mismatch", "strategy_snapshot.parameters")
     if not isinstance(judgments, Mapping):
-        return False
+        return invalid("judgments_type", "strategy_judgments")
     try:
         execution_date = str(payload["execution_date"])
         date.fromisoformat(execution_date)
     except (KeyError, TypeError, ValueError):
-        return False
+        return invalid("execution_date_invalid", "execution_date")
     holdings = judgments.get("holding_decisions")
     candidates = judgments.get("top10_candidates")
     if not isinstance(holdings, list) or not isinstance(candidates, list):
-        return False
+        return invalid("judgments_lists_invalid", "strategy_judgments.holding_decisions/top10_candidates")
     simulate_holding_symbols = {
         item.get("symbol")
         for item in holdings
@@ -1310,7 +1318,7 @@ def valid_frozen_report_contract(
                 for item in real_buy_actions
             )
         ):
-            return False
+            return invalid("real_buy_identity_invalid", "strategy_judgments.real_buy_actions")
     strategy_version = str(
         strategy_snapshot.get("strategy_version") or ""
         if isinstance(strategy_snapshot, Mapping)
@@ -1352,7 +1360,7 @@ def valid_frozen_report_contract(
                     or planned_new_seats < 0
                 )
             ):
-                return False
+                return invalid("simulated_plan_missing", "strategy_judgments.simulated_buy_fifo/planned_new_seats")
     raw_candidate_signals = signal_snapshots.get("candidates")
     if (
         _uses_current_nominal_allocation(market, strategy_version)
@@ -1366,7 +1374,7 @@ def valid_frozen_report_contract(
             if not isinstance(symbol, str):
                 continue
             if symbol in seen_candidate_symbols:
-                return False
+                return invalid("candidate_symbol_duplicate", "signal_snapshots.candidates[].symbol")
             seen_candidate_symbols.add(symbol)
     frozen_candidate_signals = {
         str(item.get("symbol")): item
@@ -1410,7 +1418,7 @@ def valid_frozen_report_contract(
                 not isinstance(account, Mapping)
                 or not isinstance(account_positions, list)
             ):
-                return False
+                return invalid("account_positions_invalid", "account.positions")
             sell_symbols = {
                 item.get("symbol")
                 for item in holdings
@@ -1439,18 +1447,18 @@ def valid_frozen_report_contract(
                     str(parameters["initial_protection_atr_multiple"])
                 )
             except (InvalidOperation, KeyError, TypeError, ValueError):
-                return False
+                return invalid("simulated_sizing_input_invalid", "account/strategy_snapshot.parameters")
             risk_summary = payload.get("risk_summary")
             if not isinstance(risk_summary, Mapping):
-                return False
+                return invalid("risk_summary_missing", "risk_summary")
         for item in formal_actions:
             if not isinstance(item, Mapping) or item.get("action") != "BUY":
                 continue
             if "executable" not in item or not isinstance(item.get("executable"), bool):
-                return False
+                return invalid("buy_executable_invalid", "strategy_judgments.formal_actions[].executable")
             candidate = frozen_candidate_signals.get(str(item.get("symbol")))
             if not isinstance(candidate, Mapping):
-                return False
+                return invalid("buy_candidate_missing", "strategy_judgments.formal_actions[].symbol")
             try:
                 item_atr = _decimal(item.get("atr"))
                 candidate_atr = (
@@ -1484,7 +1492,7 @@ def valid_frozen_report_contract(
                         )
                     )
                 ):
-                    return False
+                    return invalid("buy_signal_mismatch", "strategy_judgments.formal_actions[].close/atr")
                 if (
                     explicit_v2
                     and not audit_unavailable
@@ -1493,20 +1501,20 @@ def valid_frozen_report_contract(
                     != _decimal(candidate.get("close"))
                     - protection_multiple * _decimal(candidate.get("atr"))
                 ):
-                    return False
+                    return invalid("buy_initial_line_mismatch", "strategy_judgments.formal_actions[].estimated_initial_line")
             except ValueError:
-                return False
+                return invalid("buy_audit_input_invalid", "strategy_judgments.formal_actions[]")
             try:
                 target_weight = _decimal(item.get("target_weight"))
                 target_amount = _decimal(item.get("target_amount"))
             except (InvalidOperation, TypeError, ValueError):
-                return False
+                return invalid("buy_target_invalid", "strategy_judgments.formal_actions[].target_weight/target_amount")
             if (
                 not target_weight.is_finite()
                 or target_weight <= 0
                 or target_weight > 1
             ):
-                return False
+                return invalid("buy_weight_range", "strategy_judgments.formal_actions[].target_weight")
             raw_lot_size = item.get("lot_size")
             raw_shares = item.get("estimated_shares")
             data_missing = (
@@ -1527,10 +1535,10 @@ def valid_frozen_report_contract(
                     or not target_amount.is_finite()
                     or target_amount < 0
                 ):
-                    return False
+                    return invalid("buy_missing_data_invalid", "strategy_judgments.formal_actions[]")
                 if explicit_v2:
                     if simulated_nav is None or not isinstance(risk_summary, Mapping):
-                        return False
+                        return invalid("simulated_risk_input_missing", "account.net_value/risk_summary")
                     try:
                         target = parameters.get("target_weight")
                         weight = Decimal(
@@ -1544,9 +1552,9 @@ def valid_frozen_report_contract(
                             simulated_nav * weight
                         ).quantize(Decimal("0.01"))
                     except (InvalidOperation, TypeError, ValueError, ArithmeticError):
-                        return False
+                        return invalid("buy_target_input_invalid", "strategy_snapshot.parameters.target_weight")
                     if target_weight != weight or target_amount != expected_amount:
-                        return False
+                        return invalid("buy_target_mismatch", "strategy_judgments.formal_actions[].target_weight/target_amount")
                 continue
             if (
                 not target_amount.is_finite()
@@ -1559,11 +1567,11 @@ def valid_frozen_report_contract(
                 or raw_shares <= 0
                 or raw_shares % raw_lot_size
             ):
-                return False
+                return invalid("buy_lot_or_amount_invalid", "strategy_judgments.formal_actions[].estimated_shares/lot_size/target_amount")
             if not explicit_v2:
                 continue
             if simulated_nav is None or simulated_remaining_cash is None:
-                return False
+                return invalid("simulated_sizing_input_missing", "account.net_value/available_cash")
             try:
                 target = parameters.get("target_weight")
                 weight = Decimal(
@@ -1613,7 +1621,7 @@ def valid_frozen_report_contract(
                 actual_risk = _decimal(item.get("planned_stop_risk"))
                 actual_risk_pct = _decimal(item.get("planned_stop_risk_pct"))
             except (InvalidOperation, KeyError, TypeError, ValueError, ArithmeticError):
-                return False
+                return invalid("buy_sizing_input_invalid", "strategy_judgments.formal_actions[]")
             if (
                 target_weight != weight
                 or isinstance(shares, bool)
@@ -1624,7 +1632,7 @@ def valid_frozen_report_contract(
                 or actual_risk != expected_risk
                 or actual_risk_pct != expected_risk / simulated_nav
             ):
-                return False
+                return invalid("buy_sizing_mismatch", "strategy_judgments.formal_actions[]")
     if (
         _uses_current_nominal_allocation(market, strategy_version)
         and isinstance(real_buy_actions, list)
@@ -1638,7 +1646,7 @@ def valid_frozen_report_contract(
             or "net_value" not in real_plan
             or "available_cash" not in real_plan
         ):
-            return False
+            return invalid("real_plan_invalid", "plan_availability.real_account")
         try:
             real_nav = Decimal(str(real_plan["net_value"]))
             real_remaining_cash = Decimal(str(real_plan["available_cash"]))
@@ -1652,7 +1660,7 @@ def valid_frozen_report_contract(
                 str(parameters["initial_protection_atr_multiple"])
             )
         except (InvalidOperation, KeyError, TypeError, ValueError):
-            return False
+            return invalid("real_sizing_input_invalid", "plan_availability.real_account/strategy_snapshot.parameters")
         if (
             not real_nav.is_finite()
             or real_nav <= 0
@@ -1663,20 +1671,20 @@ def valid_frozen_report_contract(
             or not price_fx.is_finite()
             or price_fx <= 0
         ):
-            return False
+            return invalid("real_sizing_input_range", "plan_availability.real_account/strategy_snapshot.parameters")
         target = parameters.get("target_weight")
         real_risk_summary = payload.get("risk_summary")
         if not isinstance(real_risk_summary, Mapping):
-            return False
+            return invalid("risk_summary_missing", "risk_summary")
         if not isinstance(real_holdings, list):
-            return False
+            return invalid("real_holdings_missing", "strategy_judgments.real_holding_decisions")
         real_sell_symbols = {
             item.get("symbol")
             for item in real_holdings
             if isinstance(item, Mapping) and item.get("action") == "SELL_ALL"
         }
         if not isinstance(real_holding_signals, Mapping):
-            return False
+            return invalid("real_signals_missing", "signal_snapshots.real_holdings")
         position_market_values: dict[str, Decimal] = {}
         for symbol, signal in real_holding_signals.items():
             if (
@@ -1685,33 +1693,33 @@ def valid_frozen_report_contract(
                 or not isinstance(signal, Mapping)
                 or signal.get("symbol") != symbol
             ):
-                return False
+                return invalid("real_signal_identity_invalid", "signal_snapshots.real_holdings.*.symbol")
             if "market_value" in signal:
                 try:
                     market_value = Decimal(str(signal["market_value"]))
                 except (InvalidOperation, TypeError, ValueError):
-                    return False
+                    return invalid("real_position_value_invalid", "signal_snapshots.real_holdings.*.market_value")
                 if (
                     not market_value.is_finite()
                     or market_value <= 0
                     or symbol in position_market_values
                 ):
-                    return False
+                    return invalid("real_position_value_range", "signal_snapshots.real_holdings.*.market_value")
                 position_market_values[symbol] = market_value
         sale_factor = max(Decimal("0"), Decimal("1") - normal_cost_rate)
         for symbol in real_sell_symbols:
             market_value = position_market_values.get(symbol)
             if market_value is None:
-                return False
+                return invalid("real_sale_value_missing", "signal_snapshots.real_holdings.*.market_value")
             real_remaining_cash += market_value * sale_factor
         for item in real_buy_actions:
             if not isinstance(item, Mapping):
-                return False
+                return invalid("real_buy_type", "strategy_judgments.real_buy_actions[]")
             if "executable" in item and not isinstance(item.get("executable"), bool):
-                return False
+                return invalid("real_buy_executable_invalid", "strategy_judgments.real_buy_actions[].executable")
             candidate = candidate_signals.get(str(item.get("symbol")))
             if not isinstance(candidate, Mapping):
-                return False
+                return invalid("real_buy_candidate_missing", "strategy_judgments.real_buy_actions[].symbol")
             try:
                 candidate_close = Decimal(str(candidate["close"]))
                 candidate_atr = (
@@ -1773,7 +1781,7 @@ def valid_frozen_report_contract(
                 actual_risk = _decimal(item.get("planned_stop_risk"))
                 actual_risk_pct = _decimal(item.get("planned_stop_risk_pct"))
             except (InvalidOperation, KeyError, TypeError, ValueError, ArithmeticError):
-                return False
+                return invalid("real_buy_sizing_input_invalid", "strategy_judgments.real_buy_actions[]")
             if (
                 item.get("action") != "BUY"
                 or item.get("target_weight") != format(weight, "f")
@@ -1802,7 +1810,7 @@ def valid_frozen_report_contract(
                 or actual_risk != expected_risk
                 or actual_risk_pct != expected_risk / real_nav
             ):
-                return False
+                return invalid("real_buy_sizing_mismatch", "strategy_judgments.real_buy_actions[]")
     if _uses_current_nominal_allocation(market, strategy_version):
         target = parameters.get("target_weight")
         try:
@@ -1816,7 +1824,7 @@ def valid_frozen_report_contract(
                 str(parameters["initial_protection_atr_multiple"])
             )
         except (InvalidOperation, TypeError, ValueError):
-            return False
+            return invalid("rotation_parameters_invalid", "strategy_snapshot.parameters")
         for pair_field, execution_mode in (
             ("simulate_rotation_pairs", "automatic"),
             ("real_rotation_pairs", "manual"),
@@ -1831,7 +1839,7 @@ def valid_frozen_report_contract(
                         str(payload["account"]["available_cash"])
                     )
                 except (KeyError, InvalidOperation, TypeError, ValueError):
-                    return False
+                    return invalid("rotation_account_amount_invalid", "account.net_value/available_cash")
                 sell_symbols = {
                     str(item.get("symbol"))
                     for item in holdings
@@ -1839,28 +1847,28 @@ def valid_frozen_report_contract(
                 }
                 account_positions = payload.get("account", {}).get("positions", [])
                 if not isinstance(account_positions, list):
-                    return False
+                    return invalid("rotation_positions_type", "account.positions")
                 position_market_values: dict[str, Decimal] = {}
                 for position in account_positions:
                     if not isinstance(position, Mapping):
-                        return False
+                        return invalid("rotation_position_type", "account.positions[]")
                     symbol = position.get("symbol")
                     if not isinstance(symbol, str) or not symbol.strip():
-                        return False
+                        return invalid("rotation_position_symbol_invalid", "account.positions[].symbol")
                     try:
                         market_value = Decimal(str(position["market_value"]))
                     except (KeyError, InvalidOperation, TypeError, ValueError):
-                        return False
+                        return invalid("rotation_position_value_invalid", "account.positions[].market_value")
                     if not market_value.is_finite() or market_value < 0:
-                        return False
+                        return invalid("rotation_position_value_range", "account.positions[].market_value")
                     if symbol in position_market_values:
-                        return False
+                        return invalid("rotation_position_duplicate", "account.positions[].symbol")
                     position_market_values[symbol] = market_value
                 sale_factor = max(Decimal("0"), Decimal("1") - normal_cost_rate)
                 for symbol in sell_symbols:
                     market_value = position_market_values.get(symbol)
                     if market_value is None or market_value <= 0:
-                        return False
+                        return invalid("rotation_sale_value_missing", "account.positions[].market_value")
                     rotation_cash += market_value * sale_factor
             else:
                 real_plan = availability.get("real_account") if isinstance(availability, Mapping) else None
@@ -1869,19 +1877,19 @@ def valid_frozen_report_contract(
                     or real_plan.get("status") != "available"
                     or real_plan.get("executable") is not False
                 ):
-                    return False
+                    return invalid("rotation_real_plan_invalid", "plan_availability.real_account")
                 try:
                     rotation_nav = Decimal(str(real_plan["net_value"]))
                     rotation_cash = Decimal(str(real_plan["available_cash"]))
                 except (KeyError, InvalidOperation, TypeError, ValueError):
-                    return False
+                    return invalid("rotation_real_amount_invalid", "plan_availability.real_account.net_value/available_cash")
                 real_sell_symbols = {
                     str(item.get("symbol"))
                     for item in real_holdings
                     if isinstance(item, Mapping) and item.get("action") == "SELL_ALL"
                 }
                 if not isinstance(real_holding_signals, Mapping):
-                    return False
+                    return invalid("rotation_real_signals_missing", "signal_snapshots.real_holdings")
                 position_market_values: dict[str, Decimal] = {}
                 for symbol, signal in real_holding_signals.items():
                     if (
@@ -1890,18 +1898,18 @@ def valid_frozen_report_contract(
                         or not isinstance(signal, Mapping)
                         or signal.get("symbol") != symbol
                     ):
-                        return False
+                        return invalid("rotation_real_identity_invalid", "signal_snapshots.real_holdings.*.symbol")
                     if "market_value" in signal:
                         try:
                             market_value = Decimal(str(signal["market_value"]))
                         except (InvalidOperation, TypeError, ValueError):
-                            return False
+                            return invalid("rotation_real_value_invalid", "signal_snapshots.real_holdings.*.market_value")
                         if (
                             not market_value.is_finite()
                             or market_value <= 0
                             or symbol in position_market_values
                         ):
-                            return False
+                            return invalid("rotation_real_value_range", "signal_snapshots.real_holdings.*.market_value")
                         position_market_values[symbol] = market_value
                 sale_factor = max(Decimal("0"), Decimal("1") - normal_cost_rate)
                 for symbol in real_sell_symbols:
@@ -1918,27 +1926,27 @@ def valid_frozen_report_contract(
                 or not normal_cost_rate.is_finite()
                 or normal_cost_rate < 0
             ):
-                return False
+                return invalid("rotation_sizing_input_range", "account/plan_availability/strategy_snapshot.parameters")
             for pair in sorted(
                 (item for item in pairs if isinstance(item, Mapping)),
                 key=lambda item: item.get("pair_index", -1),
             ):
                 candidate = candidate_signals.get(str(pair.get("buy_symbol")))
                 if not isinstance(candidate, Mapping):
-                    return False
+                    return invalid("rotation_candidate_missing", "signal_snapshots.candidates[].symbol")
                 if execution_mode == "automatic":
                     sell_symbol = pair.get("sell_symbol")
                     if not isinstance(sell_symbol, str) or not sell_symbol.strip():
-                        return False
+                        return invalid("rotation_sell_symbol_invalid", "strategy_judgments.simulate_rotation_pairs[].sell_symbol")
                     if sell_symbol not in sell_symbols:
                         market_value = position_market_values.get(sell_symbol)
                         if market_value is None or market_value <= 0:
-                            return False
+                            return invalid("rotation_sell_value_missing", "account.positions[].market_value")
                         rotation_cash += market_value * sale_factor
                 else:
                     sell_symbol = pair.get("sell_symbol")
                     if not isinstance(sell_symbol, str) or not sell_symbol.strip():
-                        return False
+                        return invalid("rotation_sell_symbol_invalid", "strategy_judgments.real_rotation_pairs[].sell_symbol")
                     if sell_symbol not in real_sell_symbols:
                         market_value = position_market_values.get(sell_symbol)
                         if market_value is not None:
@@ -1977,15 +1985,16 @@ def valid_frozen_report_contract(
                             * price_fx
                             * normal_cost_rate
                         )
-                        expected_risk = (
-                            Decimal(expected_shares)
-                            * protection_multiple
-                            * candidate_atr
+                        # Match the producer's per-share calculation from the
+                        # frozen line. Decimal subtraction/multiplication cannot
+                        # be reassociated for repeating ATR values.
+                        expected_risk = Decimal(expected_shares) * (
+                            max(Decimal("0"), candidate_close - expected_initial_line)
                             * price_fx
-                            + expected_cost
+                            + candidate_close * price_fx * normal_cost_rate
                         )
                 except (InvalidOperation, KeyError, TypeError, ValueError, ArithmeticError):
-                    return False
+                    return invalid("rotation_sizing_input_invalid", "strategy_judgments.*_rotation_pairs[]")
                 if (
                     pair.get("execution_mode") != execution_mode
                     or not candidate_close.is_finite()
@@ -1998,19 +2007,24 @@ def valid_frozen_report_contract(
                     or shares != expected_shares
                     or _decimal(pair.get("target_weight")) != weight
                     or _decimal(pair.get("target_amount")) != expected_amount
-                    or explicit_v2
-                    and (
-                        pair_atr != candidate_atr
-                        or _decimal(pair.get("close")) != candidate_close
-                        or _decimal(pair.get("estimated_initial_line"))
-                        != expected_initial_line
-                        or _decimal(pair.get("normal_cost")) != expected_cost
-                        or _decimal(pair.get("planned_stop_risk")) != expected_risk
-                        or _decimal(pair.get("planned_stop_risk_pct"))
-                        != expected_risk / rotation_nav
-                    )
                 ):
-                    return False
+                    return invalid("rotation_sizing_mismatch", f"strategy_judgments.{pair_field}[]")
+                if explicit_v2:
+                    for audit_field, expected in (
+                        ("atr", candidate_atr),
+                        ("close", candidate_close),
+                        ("estimated_initial_line", expected_initial_line),
+                        ("normal_cost", expected_cost),
+                        ("planned_stop_risk", expected_risk),
+                        ("planned_stop_risk_pct", expected_risk / rotation_nav),
+                    ):
+                        field_path = f"strategy_judgments.{pair_field}[].{audit_field}"
+                        try:
+                            actual = _decimal(pair.get(audit_field))
+                        except ValueError:
+                            return invalid("rotation_audit_invalid", field_path)
+                        if actual != expected:
+                            return invalid("rotation_audit_mismatch", field_path)
     current_allocation_version = ALLOCATION_PROJECTION_VERSIONS[market]
     require_comparisons = strategy_version == current_allocation_version
     max_rotation_pairs = (
@@ -2028,17 +2042,17 @@ def valid_frozen_report_contract(
     ):
         pairs = judgments.get(field)
         if not isinstance(pairs, list) or len(pairs) > max_rotation_pairs:
-            return False
+            return invalid("rotation_pairs_invalid", "strategy_judgments.*_rotation_pairs")
         if field == "real_rotation_pairs" and pairs and (
             judgments.get("real_holding_decisions_status") != "available"
             or not isinstance(real_holdings, list)
         ):
-            return False
+            return invalid("rotation_real_holdings_missing", "strategy_judgments.real_holding_decisions")
         seen_indices: set[int] = set()
         seen_symbols: set[str] = set()
         for pair in pairs:
             if not isinstance(pair, Mapping):
-                return False
+                return invalid("rotation_pair_type", "strategy_judgments.*_rotation_pairs[]")
             pair_index = pair.get("pair_index")
             if (
                 isinstance(pair_index, bool)
@@ -2050,7 +2064,7 @@ def valid_frozen_report_contract(
                 or pair.get("execution_date") != execution_date
                 or pair.get("reason") != "relative_rotation"
             ):
-                return False
+                return invalid("rotation_pair_identity_invalid", "strategy_judgments.*_rotation_pairs[].pair_index/execution_mode/execution_date/reason")
             sell_symbol, buy_symbol = pair.get("sell_symbol"), pair.get("buy_symbol")
             if (
                 not isinstance(sell_symbol, str)
@@ -2067,7 +2081,7 @@ def valid_frozen_report_contract(
                 or sell_symbol == buy_symbol
                 or {sell_symbol, buy_symbol} & seen_symbols
             ):
-                return False
+                return invalid("rotation_pair_symbols_invalid", "strategy_judgments.*_rotation_pairs[].sell_symbol/buy_symbol")
             try:
                 sell_strength = Decimal(str(pair.get("sell_global_strength")))
                 buy_strength = Decimal(str(pair.get("buy_global_strength")))
@@ -2088,7 +2102,7 @@ def valid_frozen_report_contract(
                 shares = pair.get("estimated_shares")
                 lot_size = pair.get("lot_size")
             except (InvalidOperation, TypeError, ValueError):
-                return False
+                return invalid("rotation_pair_numbers_invalid", "strategy_judgments.*_rotation_pairs[]")
             compared = (
                 (sell_compared, buy_compared)
                 if sell_compared is not None and buy_compared is not None
@@ -2123,7 +2137,7 @@ def valid_frozen_report_contract(
                 or lot_size <= 0
                 or shares % lot_size
             ):
-                return False
+                return invalid("rotation_pair_range", "strategy_judgments.*_rotation_pairs[]")
             if pair.get("strength_basis") is not None:
                 pair_signals = (
                     real_holding_signals if field == "real_rotation_pairs"
@@ -2140,7 +2154,7 @@ def valid_frozen_report_contract(
                     holding_signals=pair_signals,
                     candidate_signals=candidate_signals,
                 ):
-                    return False
+                    return invalid("rotation_pair_comparison_invalid", "strategy_judgments.*_rotation_pairs[].strength_basis/strength_gap")
             seen_indices.add(pair_index)
             seen_symbols.update((sell_symbol, buy_symbol))
     for comparison_field, pair_field, holding_symbols, signals in (
@@ -2160,10 +2174,10 @@ def valid_frozen_report_contract(
         comparisons = judgments.get(comparison_field)
         if comparisons is None:
             if require_comparisons:
-                return False
+                return invalid("rotation_comparisons_missing", "strategy_judgments.*_rotation_comparisons")
             comparisons = []
         if not isinstance(comparisons, list) or len(comparisons) > max_rotation_pairs:
-            return False
+            return invalid("rotation_comparisons_invalid", "strategy_judgments.*_rotation_comparisons")
         pairs = judgments.get(pair_field)
         pairs_by_index = {
             item.get("pair_index"): item
@@ -2174,7 +2188,7 @@ def valid_frozen_report_contract(
         planned_indices: set[int] = set()
         for comparison in comparisons:
             if not isinstance(comparison, Mapping):
-                return False
+                return invalid("rotation_comparison_type", "strategy_judgments.*_rotation_comparisons[]")
             pair_index = comparison.get("pair_index")
             if (
                 isinstance(pair_index, bool)
@@ -2185,7 +2199,7 @@ def valid_frozen_report_contract(
                 or comparison.get("sell_symbol") not in holding_symbols
                 or comparison.get("buy_symbol") not in candidate_symbols
             ):
-                return False
+                return invalid("rotation_comparison_identity_invalid", "strategy_judgments.*_rotation_comparisons[].pair_index/sell_symbol/buy_symbol")
             if comparison.get("outcome") == "planned":
                 planned_indices.add(pair_index)
             if not _valid_rotation_comparison(
@@ -2195,11 +2209,27 @@ def valid_frozen_report_contract(
                 holding_signals=signals,
                 candidate_signals=candidate_signals,
             ):
-                return False
+                return invalid("rotation_comparison_invalid", "strategy_judgments.*_rotation_comparisons[]")
             seen_indices.add(pair_index)
         if require_comparisons and set(pairs_by_index) != planned_indices:
-            return False
+            return invalid("rotation_comparison_pairs_mismatch", "strategy_judgments.*_rotation_comparisons[].pair_index")
     return True
+
+
+def frozen_report_contract_error(
+    payload: Mapping[str, object],
+    *,
+    _allow_unfrozen_simulated_plan: bool = False,
+) -> str | None:
+    """Return the first failed invariant without exposing any input values."""
+    diagnostics: list[str] = []
+    if valid_frozen_report_contract(
+        payload,
+        _allow_unfrozen_simulated_plan=_allow_unfrozen_simulated_plan,
+        _diagnostics=diagnostics,
+    ):
+        return None
+    return diagnostics[0]
 
 
 def live_trend_strategy_snapshot(
@@ -9952,7 +9982,13 @@ def _report_payload(
         payload,
         _allow_unfrozen_simulated_plan=report.planned_new_seats is None,
     ):
-        raise ValueError("frozen report contract is invalid")
+        raise ValueError(
+            "frozen report contract is invalid: "
+            + str(frozen_report_contract_error(
+                payload,
+                _allow_unfrozen_simulated_plan=report.planned_new_seats is None,
+            ))
+        )
     return payload
 
 
@@ -10148,7 +10184,10 @@ def write_frozen_report(
             markdown_temp = Path(handle.name)
         payload = _report_payload(report)
         if not valid_frozen_report_contract(payload):
-            raise ValueError("frozen report contract is invalid")
+            raise ValueError(
+                "frozen report contract is invalid: "
+                + str(frozen_report_contract_error(payload))
+            )
         with NamedTemporaryFile(
             "w", encoding="utf-8", delete=False, dir=reports_dir
         ) as handle:
@@ -11306,7 +11345,10 @@ def _reuse_planning_revision(
         rebuilt, ensure_ascii=False, indent=2, sort_keys=True
     ) + "\n"
     if not valid_frozen_report_contract(rebuilt):
-        raise ValueError("frozen report contract is invalid")
+        raise ValueError(
+            "frozen report contract is invalid: "
+            + str(frozen_report_contract_error(rebuilt))
+        )
     receipt_path = _receipt_path(config.data_dir, artifact_stem)
     receipt = _write_delivery_receipt(
         receipt_path,
@@ -12573,7 +12615,10 @@ def _attempt_report(
         receipt_path = _receipt_path(config.data_dir, artifact_stem)
         payload = _report_payload(report)
         if not valid_frozen_report_contract(payload):
-            raise ValueError("frozen report contract is invalid")
+            raise ValueError(
+                "frozen report contract is invalid: "
+                + str(frozen_report_contract_error(payload))
+            )
         receipt = _write_delivery_receipt(
             receipt_path,
             status="prepared",

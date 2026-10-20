@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-20
 
+- 修复 CN 趋势报告轮换风险校验与生成器的 Decimal 运算顺序不一致，循环小数 ATR 不再使合法冻结报告被拒绝；保持严格校验及旧版报告内容。冻结契约错误新增脱敏规则与字段路径，完成离线复现及直接受影响回归；未部署或重启控制器。
+
 - With N-leg paused, D2 startup uses reliable local admission and leaves the first account read to its sole Scheduler. API timeouts keep the runtime online with UNKNOWN LP facts and no new BUYs until complete facts arrive. Admission preserves historical execution/incident states; round0 BUY cleanup and SELL protections remain in place. Offline startup checks cover admission, retry and fatal control/settings/identity failures.
 
 ## 2026-10-19
