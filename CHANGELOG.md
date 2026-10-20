@@ -7,6 +7,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - LP C1 can save validated rank weights and an optional compute-only shadow through the current D2 settings, state and CLI. Live rank_weights is rejected until C2; default minimum orders and estimator payloads stay unchanged. Shadow uses final-size risk/yield checks, retains cash after a blocked rank and bounds diagnostics; failures do not alter trading. The C1 review repair keeps startup/control and repair saves available for invalid stored allocations, excludes unknown candidates while protecting unknown incumbents, computes shadow once per live selection, reuses matching native yields and isolates diagnostic/log failures with a consistent schema. Weight strings reject whitespace, underscores and non-ASCII digits. Focused offline verification and sandbox-limited HTTP checks are recorded in the C1 fix handoff.
 
+- 修复 CN 趋势报告轮换风险校验与生成器的 Decimal 运算顺序不一致，循环小数 ATR 不再使合法冻结报告被拒绝；保持严格校验及旧版报告内容。冻结契约错误新增脱敏规则与字段路径，完成离线复现及直接受影响回归；未部署或重启控制器。
+
 - With N-leg paused, D2 startup uses reliable local admission and leaves the first account read to its sole Scheduler. API timeouts keep the runtime online with UNKNOWN LP facts and no new BUYs until complete facts arrive. Admission preserves historical execution/incident states; round0 BUY cleanup and SELL protections remain in place. Offline startup checks cover admission, retry and fatal control/settings/identity failures.
 
 ## 2026-10-19
