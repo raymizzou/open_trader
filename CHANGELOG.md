@@ -3,6 +3,10 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-21
+
+- LP 慢会话隔离回归改为先等待健康市场的实际 BUY 回执，再核实轮次完成，避免同一个两秒窗口覆盖对账等待与健康发送调度。测试保持慢读取直至清理，保留精确订单、占资和禁止叠加读取断言，并回收实际原生读取与对账线程。离线验证包含受控健康市场延迟与依赖慢读取的负向故障；未改生产逻辑。
+
 ## 2026-10-20
 
 - 修复 D2 启动失败清理时 writer 已收到停止通知但尚未退出的竞态：生产启动异常给予最多五秒的 D2 收集预算，实际资源退出后才完成 FAILED 并释放 owner；超时仍保留 STOPPING 和 owner。正常 stop 的 D2 零预算不变。离线回归覆盖受控延迟退出、超时保留及启动失败的零发送保护。
