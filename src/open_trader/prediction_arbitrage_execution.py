@@ -1020,12 +1020,15 @@ class PredictionExecutionService:
         live = self._lp_d2
         settings = live.settings_status()
         def policy_view(policy):
-            return dict(budget_usd=None if policy.budget is None else str(policy.budget),
+            result = dict(budget_usd=None if policy.budget is None else str(policy.budget),
                 target_buy_count=policy.target_count, buy_price_level=policy.buy_price_level,
                 config_version=policy.config_version, trading_config_version=policy.trading_config_version,
                 api_retry_interval_seconds=policy.api_retry_interval_seconds,
                 order_check_interval_seconds=policy.order_check_interval_seconds,
                 round_interval_seconds=policy.round_interval_seconds)
+            result.update({key: list(policy.allocation_weights) if key == 'allocation_weights'
+                else getattr(policy, key) for key in policy.allocation_fields})
+            return result
         def json_value(value):
             if isinstance(value, Decimal): return str(value)
             if isinstance(value, datetime): return value.isoformat()

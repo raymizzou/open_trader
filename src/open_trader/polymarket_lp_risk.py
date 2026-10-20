@@ -940,6 +940,7 @@ def evaluate_lp_entry(
     candidate: bool = False,
     bid_level: int = 1,
     _account_observed_at: datetime | None = None,
+    quantity: Decimal | None = None,
 ) -> dict[str, object]:
     """Return a manual LP entry guide when current input facts pass risk checks."""
 
@@ -1087,8 +1088,15 @@ def evaluate_lp_entry(
         return {"state": "unknown", "reason_codes": ["market_rules_unknown"], "guidance": None}
     if tick <= 0 or minimum <= 0 or reward_minimum <= 0 or reward_spread <= 0:
         return {"state": "unknown", "reason_codes": ["market_rules_invalid"], "guidance": None}
-    quantity = max(minimum, reward_minimum)
-    quantity = (quantity / Decimal("0.01")).to_integral_value(rounding=ROUND_CEILING) * Decimal("0.01")
+    if quantity is None:
+        quantity = max(minimum, reward_minimum)
+        quantity = (quantity / Decimal("0.01")).to_integral_value(rounding=ROUND_CEILING) * Decimal("0.01")
+    elif not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity <= 0:
+        return {"state": "rejected", "reason_codes": ["quantity_invalid"], "guidance": None}
+    elif quantity % Decimal('0.01') != 0:
+        return {"state": "rejected", "reason_codes": ["quantity_precision_invalid"], "guidance": None}
+    elif quantity < max(minimum, reward_minimum):
+        return {"state": "rejected", "reason_codes": ["below_reward_minimum"], "guidance": None}
     if price % tick != 0:
         return {"state": "rejected", "reason_codes": ["price_off_tick"], "guidance": None}
     try:

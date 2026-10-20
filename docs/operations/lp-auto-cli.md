@@ -193,3 +193,67 @@ plists, budgets, state, orders and the stable management guards. Neither operati
 authorization. Repository delivery follows
 [agent verification](agent-verification.md); deployment follows the existing
 [release runbook](../../ops/release-deployment.md).
+
+## C1 allocation observation settings
+
+C1 adds optional settings to the current D2 settings CAS, HTTP config/state and
+public CLI. Missing fields retain `minimum`, no weights and shadow disabled;
+legacy default state and estimator payloads keep their existing shape. Requests
+that omit these fields preserve saved values, including dashboard draft saves.
+No dashboard controls, environment variables or separate configuration files
+are added.
+
+For an already configured target of three BUYs, an explicitly authorized
+observation-only configuration can save:
+
+```sh
+open-trader prediction-arb lp-auto config \
+  --allocation-mode minimum --allocation-weights 0.50,0.30,0.20 \
+  --allocation-shadow-enabled true
+```
+
+Weights are Decimal strings, ordered from highest rank. They must be finite,
+positive, non-increasing, match `target_buy_count` and sum **exactly** to one.
+They are never normalized. For zero targets, use `--allocation-weights ''`.
+Saving a new target count with existing weights requires a matching weight list.
+`--allocation-shadow-enabled false` disables observation. Allocation-only saves
+advance the settings CAS version, preserve the trading version and do not enable
+or resize orders. Budget, count and price changes retain their existing pause
+and current-facts gates. Pending saves retain the previous effective settings;
+the CLI reports an unconfirmed save as UNKNOWN without retrying it.
+
+**C1 cannot activate live `rank_weights`:** saving or loading that mode fails
+with `rank_weights_requires_c2`. Weights and the shadow flag may be saved while
+live mode remains `minimum`. This is C1 only: no behavior change, shadow default
+off, no C2. U2 integration, live rank-by-rank sending and cooldowns are deferred.
+No per-order or per-market USDC cap is introduced.
+
+When enabled, `diagnostics.allocation_shadow` and the
+`prediction_lp_allocation_shadow` log record describe a counterfactual from the
+same captured facts. They confer no send authority. The target envelope is
+`max(0, min(budget - inventory_cost, min(balance, allowance)))`; actual current
+BUY reservations are subtracted once for available new cash and still occupy
+physical slots. Known retained BUYs keep their actual quantity. Unknown or
+pending-cancel incumbents block new shadow allocations. Non-funding eligibility
+exclusions are recorded before ranking; unaffordable high ranks remain in rank.
+
+Each rank reports condition/token/market identity, price level, price, target USD,
+quantity rounded down to 0.01 shares, actual USD, final risk state/reasons and
+estimated hourly yield at that size when eligible. Status is `WOULD_SEND`,
+`RETAINED` or `NOT_SENT`. The first reward-minimum, funds, slot, opening, risk or
+unknown failure blocks all later new ranks (`prefix_blocked`); cash is not
+redistributed. Final yield inversion or an unproven comparison with unselected
+candidates rejects all proposed new ranks (`allocation_rank_not_proven`).
+Missing facts produce `state: unknown`; a computation exception produces
+`state: error`, the exception type and `shadow_exception`, without exception
+text or a change to trading. Successful calculations report leftover cash,
+send/retained/not-sent/missing counts and exclusion counts. At most twenty rank
+and twenty exclusion rows are published, with omission counts; strings use the
+existing 96-byte diagnostic bound. No extra source reads, synchronous DB writes,
+order/cancel calls, writer, table or lock order are added by observation.
+
+These values simulate sizing and current risk checks. They do not simulate C2
+U2/cooldown dispatch or guarantee signing, acceptance, fills or net rewards.
+Live enablement remains gated by separate C2 work and operator approval: verify
+protective cancellation and U2 cancel-all for a full reward day in minimum mode,
+then shadow, then an approved trial budget of at most $30.

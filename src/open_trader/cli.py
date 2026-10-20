@@ -1547,6 +1547,9 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--budget")
             command.add_argument("--target-buys")
             command.add_argument("--bid-level")
+            command.add_argument('--allocation-mode', choices=('minimum', 'rank_weights'))
+            command.add_argument('--allocation-weights', help='Comma-separated Decimal strings; no normalization')
+            command.add_argument('--allocation-shadow-enabled', choices=('true', 'false'))
             for option in ('round-interval-seconds', 'api-retry-interval-seconds', 'order-check-interval-seconds'):
                 command.add_argument('--' + option, help=(
                     'Retired in continuous mode; setting this option returns an error'
@@ -2040,6 +2043,9 @@ def main(argv: list[str] | None = None) -> int:
                                budget=getattr(args, "budget", None),
                                target_buys=getattr(args, "target_buys", None),
                                bid_level=getattr(args, "bid_level", None),
+                               allocation_mode=getattr(args, 'allocation_mode', None),
+                               allocation_weights=getattr(args, 'allocation_weights', None),
+                               allocation_shadow_enabled=getattr(args, 'allocation_shadow_enabled', None),
                                round_interval_seconds=getattr(args, 'round_interval_seconds', None),
                                api_retry_interval_seconds=getattr(args, 'api_retry_interval_seconds', None),
                                order_check_interval_seconds=getattr(args, 'order_check_interval_seconds', None))

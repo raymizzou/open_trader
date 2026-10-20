@@ -18,6 +18,41 @@ from .polymarket_trading import _lp_maker_order_is_self, _lp_trade, _model_dict
 
 ZERO = Decimal('0')
 
+ALLOCATION_FIELDS = ('allocation_mode', 'allocation_weights', 'allocation_shadow_enabled')
+
+
+def allocation_settings(document):
+    """Validate C1 settings without adding defaults to legacy documents."""
+    from decimal import Inexact, localcontext
+    mode = document.get('allocation_mode', 'minimum')
+    if mode not in ('minimum', 'rank_weights'):
+        raise ValueError('allocation_mode_invalid')
+    if mode == 'rank_weights':
+        raise ValueError('rank_weights_requires_c2')
+    shadow = document.get('allocation_shadow_enabled', False)
+    if type(shadow) is not bool:
+        raise ValueError('allocation_shadow_enabled_invalid')
+    if 'allocation_weights' in document or shadow:
+        raw = document.get('allocation_weights', [])
+        if type(raw) is not list or len(raw) != document.get('target_buy_count', 0):
+            raise ValueError('allocation_weights_length_invalid')
+        try:
+            if any(type(v) is not str for v in raw):
+                raise ValueError
+            weights = [Decimal(v) for v in raw]
+            if (any(not v.is_finite() or not ZERO < v <= 1 for v in weights)
+                    or any(a < b for a, b in zip(weights, weights[1:]))):
+                raise ValueError
+            with localcontext() as context:
+                context.prec = max(28, sum(len(v.as_tuple().digits) for v in weights) + len(weights))
+                context.traps[Inexact] = True
+                if weights and sum(weights, ZERO) != 1:
+                    raise ValueError
+        except (InvalidOperation, Inexact, ValueError):
+            raise ValueError('allocation_weights_invalid') from None
+    return {key: list(document[key]) if key == 'allocation_weights' else document[key]
+        for key in ALLOCATION_FIELDS if key in document}
+
 
 def default_account_pool_document(path, pool_account_id: str | None, now: datetime) -> dict[str, object]:
     return dict(run_id=uuid.uuid5(uuid.NAMESPACE_URL, str(Path(path).resolve()) + str(pool_account_id)).hex,

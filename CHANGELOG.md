@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-20
 
+- LP C1 can save validated rank weights and an optional compute-only shadow through the current D2 settings, state and CLI. Live rank_weights is rejected until C2; default minimum orders and estimator payloads stay unchanged. Shadow uses final-size risk/yield checks, retains cash after a blocked rank and bounds diagnostics; failures do not alter trading. Offline sizing, CAS and native-call regressions were checked; loopback HTTP checks were blocked by the local sandbox.
+
 - With N-leg paused, D2 startup uses reliable local admission and leaves the first account read to its sole Scheduler. API timeouts keep the runtime online with UNKNOWN LP facts and no new BUYs until complete facts arrive. Admission preserves historical execution/incident states; round0 BUY cleanup and SELL protections remain in place. Offline startup checks cover admission, retry and fatal control/settings/identity failures.
 
 ## 2026-10-19
