@@ -25,8 +25,12 @@ class ServiceChild:
         self.events.mkdir(parents=True);self.data_dir.mkdir()
         self.clock_path=self.events/'clock';self.clock_path.write_text('0')
         self.permit_path=self.runtime_root/'lp-start-guard'/'permit.json'
-        with socket.socket() as sock:
-            sock.bind(('127.0.0.1',0));self.port=sock.getsockname()[1]
+        if scenario.startswith('nr-'):
+            # Runtime-only subprocess: no listener or loopback bind.
+            self.port=8769
+        else:
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1',0));self.port=sock.getsockname()[1]
         self.base=f'http://127.0.0.1:{self.port}'
         self.output=self.root/'child.log';self.http_result=[];self.http_errors=[];self.manual_thread=None;self.manual_result=[];self.manual_errors=[];self.http_handles={}
 
@@ -246,6 +250,8 @@ if port:
 
 def child(runtime_root,port,scenario,config_path):
     """Install external boundaries, arm explicitly, then run the real service."""
+    runtime_only=scenario.startswith('nr-')
+    if runtime_only:scenario='consumer-'+scenario
     import sqlite3,faulthandler,signal
     faulthandler.register(signal.SIGUSR1,all_threads=True)
     import pytest
@@ -257,7 +263,7 @@ def child(runtime_root,port,scenario,config_path):
     from open_trader.prediction_service import serve_prediction_service
     from tests.test_lp_order_registration_contract import _adapter,_SDKPublicClient,WALLET,CONDITION_ID,TOKEN_ID,NO_TOKEN_ID
     release_root=Path(__file__).resolve().parents[1]
-    root=Path(runtime_root);config_path=Path(config_path);events=root/'events';now=datetime(2026,10,16,12,tzinfo=UTC)
+    root=Path(runtime_root);config_path=Path(config_path);events=root/'events';now=datetime.now(UTC) if runtime_only else datetime(2026,10,16,12,tzinfo=UTC)
     def mark(name):(events/name).touch()
     def publish_snapshot(path,serialized):
         from tempfile import NamedTemporaryFile
@@ -519,6 +525,11 @@ def child(runtime_root,port,scenario,config_path):
         if ci_payload['mode']=='incomplete-orders':sdk.list_open_orders=lambda **kw:None
         if ci_payload['mode']=='foreign':
             sdk.orders=tuple(row.model_copy(update={'maker_address':'0x'+'b'*40}) for row in sdk.orders)
+    if runtime_only:
+        from tests.test_lp_order_registration_contract import _open_order
+        sdk.orders=(_open_order('A','BUY',price='.40',original='10'),
+            _open_order('S','SELL',price='.60',original='10'))
+        sdk.positions=()
     native_cancel=sdk.cancel_orders
     def cancel_orders(**kwargs):
         mark('cancel-call-'+str(len(list(events.glob('cancel-call-*')))+1))
@@ -533,6 +544,8 @@ def child(runtime_root,port,scenario,config_path):
             finally:mark('ci-cancel-ended')
         return native_cancel(**kwargs)
     sdk.cancel_orders=cancel_orders
+    def record_nr_api_read():
+        if runtime_only and not (events/'nr-cycle-entered').exists():mark('nr-api-before-scheduler')
     read_balance=sdk.get_balance_allowance
     if scenario.endswith('incomplete'):
         sdk.list_positions=lambda **kw:None
@@ -543,6 +556,7 @@ def child(runtime_root,port,scenario,config_path):
             mark('new-provider-limit-observed')
             return 120
     def balance(**kw):
+        record_nr_api_read()
         if scenario=='resume-reader' and threading.current_thread().name=='lp-reader-source':
             balance_calls.append(business_clock())
             (events/('native-balance-call-'+str(len(balance_calls)))).write_text(str(balance_calls[-1]))
@@ -560,6 +574,11 @@ def child(runtime_root,port,scenario,config_path):
     native_orders=sdk.list_open_orders
     reader_order_calls=[0]
     def current_orders(**kw):
+        if runtime_only:
+            record_nr_api_read()
+            mark('nr-account-read')
+            if scenario=='consumer-nr-unknown' and not (events/'release-fresh-facts').exists():
+                raise TimeoutError('offline account list unavailable before fresh-facts barrier')
         if 'optional-share' in scenario and threading.current_thread().name=='prediction-lp-share-watch':hold_optional()
         if ('optional-' in scenario or 'producer-' in scenario) and threading.current_thread().name=='lp-reader-source':
             mark('optional-current-read-'+str(len(list(events.glob('optional-current-read-*')))+1))
@@ -645,7 +664,7 @@ def child(runtime_root,port,scenario,config_path):
             assert store.advance_minimum_reader_generation(expected_fence)==expected_fence
         import hashlib
         account=hashlib.sha256(WALLET.encode()).hexdigest()
-        store.lp_save_current_control(dict(account_id=account,process_epoch='seed',request_id='running',request_version=1,desired_running=(scenario.startswith('consumer-ci-native-auto-') or scenario.endswith('consumer-nleg-paused-run') or not (scenario.startswith('rollback-current') or scenario.startswith('consumer-'))),requested_at=now,actor=None))
+        store.lp_save_current_control(dict(account_id=account,process_epoch='seed',request_id='running',request_version=1,desired_running=(runtime_only or scenario.startswith('consumer-ci-native-auto-') or scenario.endswith('consumer-nleg-paused-run') or not (scenario.startswith('rollback-current') or scenario.startswith('consumer-'))),requested_at=now,actor=None))
         if not any(name in scenario for name in ('startup-unconfigured','manual-preserved','nleg-paused-run')):
             store.lp_save_current_settings(account,expected_config_version=0,changes=dict(budget_usd='40',target_buy_count=1),actor='offline operator')
         if scenario.endswith('consumer-nleg-paused-run'):
@@ -661,6 +680,21 @@ def child(runtime_root,port,scenario,config_path):
                 reservations=[dict(remaining_units=0,holding_units=1_000_000)],legs=[dict(receipt=dict(state='REJECTED'))]))
             store.n_leg_acknowledge_incident('nleg-accounting-batch',
                 acknowledgement=dict(actor='test',reconciliation='fresh_clean'))
+        if runtime_only:
+            seed_no_reconcile_history(store,unfinished_execution=scenario in ('consumer-nr-stale','consumer-nr-unknown'))
+            publish_snapshot(events/'nr-history-before.json',json.dumps(no_reconcile_history(store),default=str))
+            if scenario=='consumer-nr-incident':
+                recovery=store.create_recovery_execution({'reason':'historical incident'},idempotency_key='nr-incident')
+                store.open_incident(recovery['execution_id'],{'reason':'historical incident'})
+            if scenario.endswith('-fatal'):
+                with sqlite3.connect(store.path) as db:
+                    if scenario=='consumer-nr-control-fatal':
+                        db.execute("UPDATE lp_auto_pool SET payload='invalid-json' WHERE singleton=1")
+                    else:
+                        document=json.loads(db.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
+                        if scenario=='consumer-nr-settings-fatal':document['budget_usd']='invalid-budget'
+                        elif scenario=='consumer-nr-identity-fatal':document['account_id']='f'*64
+                        db.execute('UPDATE lp_auto_pool SET payload=? WHERE singleton=1',(json.dumps(document),))
         if scenario=='consumer-incompatible':store.advance_minimum_reader_generation(2)
         if scenario=='consumer-reconcile-locked' or scenario.startswith('consumer-ci-metadata-') or scenario=='consumer-ci-prune-stop':
             recovery=store.create_recovery_execution({'reason':'offline unresolved non-LP incident'},idempotency_key='actual-incident-seed')
@@ -787,7 +821,8 @@ def child(runtime_root,port,scenario,config_path):
             return real_from_keychain(config,client_factory=external_sdk_init,run=external_keychain,public_client_factory=public_factory)
         return adapter
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=NativeSQL))))
+        if not runtime_only:
+            patch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=NativeSQL))))
         from open_trader.lp_persistence import LPWriteCoordinator
         native_admission = LPWriteCoordinator.acquire
         @contextmanager
@@ -806,7 +841,7 @@ def child(runtime_root,port,scenario,config_path):
                 hold(resource)
             with native_admission(owner, *args, **kwargs) as admitted:
                 yield admitted
-        patch.setattr(LPWriteCoordinator, 'acquire', staged_admission)
+        if not runtime_only:patch.setattr(LPWriteCoordinator, 'acquire', staged_admission)
         if scenario=='rollback-current-repair-lock-order':
             native_thread_join=threading.Thread.join
             def observed_settings_join(thread,*args,**kwargs):
@@ -1403,6 +1438,10 @@ def child(runtime_root,port,scenario,config_path):
             raise SystemExit(main(['--mode','production',action,'--data-dir',str(root/'data'),
                 '--config',str(config_path),'--host','127.0.0.1','--port',str(port),
                 '--release-manifest',str(release_root/'ops/prediction-service-release.json')]))
+        if runtime_only:
+            seed_no_reconcile_permit(root,release_root,config_path,port)
+            return run_no_reconcile_runtime(root,config_path,scenario,sdk,publish_snapshot,mark,
+                business_clock,utc_clock)
         if not scenario.startswith('automatic'):
             from contextlib import ExitStack
             with ExitStack() as operation:
@@ -1555,6 +1594,190 @@ def offline_github_fixture(release,scratch):
     return api
 
 
+def seed_no_reconcile_history(store, *, unfinished_execution=False):
+    """Durable prior-process rows, independent of any new owner's memory."""
+    import sqlite3
+    from open_trader.lp_business_writer import RequestRecord
+    from tests.test_lp_order_registration_contract import WALLET, CONDITION_ID, TOKEN_ID
+    stamp=datetime(2026,10,1,tzinfo=UTC)
+    # The unrelated earnings monitor also starts with the runtime. This old
+    # session already had its post-review reward attempt; preserve the strict
+    # whole-row history oracle without racing an advisory reward refresh.
+    store.lp_create_session('old-session','old-session-key',state='entry_open',payload=dict(
+        market_id='market-1',condition_id=CONDITION_ID,token_id=TOKEN_ID,outcome='YES',
+        price='.40',quantity='10',entry_order_id='missing-old-buy',owned_order_ids=['missing-old-buy'],
+        review_at=stamp.isoformat(),reward_observation=dict(status='unknown',last_attempt_at=stamp.isoformat())))
+    store.lp_log_business_record(RequestRecord(account_id=WALLET,process_epoch='old-process',
+        request_id='old-request',session_id='old-audit',condition_id=CONDITION_ID,token_id=TOKEN_ID,
+        kind='BUY',price=Decimal('.40'),quantity=Decimal('10'),requested_at=stamp,order_id='missing-old-buy'))
+    with sqlite3.connect(store.path) as db:
+        document=json.loads(db.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
+        document['intents']={'old-intent':dict(request_id='old-request',session_id='old-session',
+            order_id='missing-old-buy',state='pending',reserved_usd='4',process_epoch='old-process')}
+        db.execute('UPDATE lp_auto_pool SET payload=? WHERE singleton=1',(json.dumps(document),))
+    if unfinished_execution:
+        row=store.create_recovery_execution(dict(reason='historical unfinished execution'),idempotency_key='nr-stale')
+        store.transition_execution(row['execution_id'],state='submitting',evidence={})
+
+
+def no_reconcile_history(store):
+    import sqlite3
+    with sqlite3.connect(store.path) as db:
+        return dict(sessions=db.execute("SELECT * FROM lp_sessions WHERE session_id IN ('old-session','old-audit','old-sell-audit') ORDER BY session_id").fetchall(),
+            actions=db.execute("SELECT * FROM lp_actions WHERE action_key IN ('old-request','old-sell-request') ORDER BY action_key").fetchall(),
+            intents=json.loads(db.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0]).get('intents'),
+            execution=store.active_execution())
+
+
+def seed_no_reconcile_permit(root,release,config,port):
+    """Fixture ARMED input; real Runtime must acquire, validate and claim it.
+
+    Operator release preparation/listener checks are outside this runtime seam.
+    No OS probe or internal guard method is replaced.
+    """
+    import hashlib
+    from dataclasses import asdict
+    from open_trader.prediction_release import (inspect_prediction_release_checkout,
+        inspect_lp_capability,write_prediction_runtime_record,LP_VALIDATION_SCHEMA)
+    from open_trader.prediction_start_guard import identity_for_runtime,SCHEMA
+    source=inspect_prediction_release_checkout(release)
+    nonce='offline-runtime-admission-input'
+    binding=dict(schema_version=LP_VALIDATION_SCHEMA,source_sha=source['git_sha'],
+        release_root=str(release),runtime_root=str(root),python=sys.executable,
+        capability_digest=inspect_lp_capability(release),operation_nonce=nonce,
+        config_selection=dict(path=str(config),sha256=hashlib.sha256(config.read_bytes()).hexdigest()),
+        runtime=dict(python=sys.executable,python_version=sys.version,platform=sys.platform,
+            source_root=str(release),lock_sha256=hashlib.sha256((release/'uv.lock').read_bytes()).hexdigest(),
+            extras=[],dependencies={'offline-fixture':'runtime-seam'},provenance='test input, not deployment evidence'),
+        ci=dict(run_id=1,run_attempt=1,artifact_role='test-only',
+            run_url='https://github.com/raymizzou/open_trader/actions/runs/1',
+            artifacts=[dict(scope=scope,id=i,digest='sha256:'+'0'*64)
+                for i,scope in enumerate(('gateway','legacy','account','prediction','portable'),1)]))
+    write_prediction_runtime_record(root/'prediction-service-runtime.json',dict(state='stopped',
+        manager='foreground',manager_identity=f'foreground:{os.getuid()}',
+        candidate=dict(source,lp_validation=binding)))
+    identity=identity_for_runtime(data_dir=root/'data',prediction_config_path=config,host='127.0.0.1',port=port)
+    directory=root/'lp-start-guard';directory.mkdir(mode=0o700)
+    permit=directory/'permit.json'
+    permit.write_text(json.dumps(dict(schema_version=SCHEMA,version=1,state='ARMED',identity=asdict(identity),
+        operation_nonce=nonce,claim_id=None,process_epoch=None,pid=None)))
+    permit.chmod(0o600)
+
+
+def run_no_reconcile_runtime(root,config_path,scenario,sdk,publish,mark,clock,utc_now):
+    """Observe real owners with a profiler; never replace their return values."""
+    import signal
+    from open_trader.prediction_runtime import PredictionRuntime
+    from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+    from open_trader.polymarket_lp import PolymarketLPService
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+    events=root/'events'
+    counters=dict(reconcile_calls=0,legacy_ticks=0,scheduler_starts=0)
+    codes={PredictionExecutionService.reconcile_startup.__code__:'reconcile_calls',
+        PolymarketLPService.tick.__code__:'legacy_ticks',LPAutoScheduler.start.__code__:'scheduler_starts'}
+    runtime=PredictionRuntime(data_dir=root/'data',prediction_config_path=config_path,
+        dashboard_url='http://127.0.0.1:8769/',n_leg_paused=True,enable_n_leg_background=False,
+        lp_clock=clock,history_clock=utc_now)
+    def snapshot():
+        observation=runtime.lp_d2.state.snapshot().observation if runtime.lp_d2 else None
+        status=runtime.lp_d2.status() if runtime.lp_d2 else None
+        return dict(counters,state=runtime.state,production_owner=runtime.production_owner,
+            posts=len(list(events.glob('post-call-*'))),cancels=sdk.cancels,
+            api_before_scheduler=(events/'nr-api-before-scheduler').exists(),
+            d2_closed=status['closed'] if status else None,
+            native_inflight=status['native_inflight'] if status else None,
+            writer_thread_alive=status['writer']['thread_alive'] if status else None,
+            monitor_thread_started=getattr(runtime.monitor,'_thread',None) is not None,
+            history_started=runtime._history_thread is not None,
+            orders_complete=observation.orders_complete if observation else None,
+            reserved_state=runtime.lp_d2.state.snapshot().buy_reserved.state if runtime.lp_d2 else None,
+            sell_ids=[o.key[3] for o in runtime.lp_d2.state.snapshot().active_orders if o.side=='SELL'] if runtime.lp_d2 else [],
+            permit=json.loads((root/'lp-start-guard/permit.json').read_text()),
+            history=no_reconcile_history(runtime.store) if runtime.store and not scenario.endswith('-fatal') else None)
+    completed=set()
+    def observe(frame,event,arg):
+        if event=='call' and frame.f_code in codes:counters[codes[frame.f_code]]+=1
+        if frame.f_code is LPAutoScheduler.run_due.__code__:
+            if event=='call':mark('nr-cycle-entered')
+            elif event=='return' and arg is True:
+                record=snapshot()
+                kind='known' if record['orders_complete'] else 'unknown'
+                if kind not in completed:
+                    completed.add(kind)
+                    publish(events/('nr-cycle-'+kind+'.json'),json.dumps(record,default=str))
+                    mark('nr-cycle-'+kind+'-completed')
+        return observe
+    sys.setprofile(observe);threading.setprofile(observe)
+    stopped=threading.Event()
+    signal.signal(signal.SIGTERM,lambda *_:stopped.set())
+    mark('service-starting')
+    code=0
+    try:
+        try:runtime.start()
+        except Exception as exc:
+            publish(events/'nr-start-error.json',json.dumps(dict(type=type(exc).__name__,error=str(exc))))
+            code=78
+        record=snapshot()
+        publish(events/'nr-start.json',json.dumps(record,default=str));mark('nr-start-completed')
+        if runtime.state!='RUNNING':code=78
+        # Remain observable even on the expected pre-admission RED. No second start.
+        deadline=time.monotonic()+40
+        fresh=False;buy_checked=False
+        while not stopped.wait(.01):
+            assert time.monotonic()<deadline,'runtime-only child independent real watchdog'
+            if not fresh and (events/'release-fresh-facts').exists():
+                fresh=True
+                if runtime._lp_auto_scheduler:runtime._lp_auto_scheduler.request_check()
+            if not buy_checked and (events/'release-new-buy').exists():
+                from tests.test_lp_order_registration_contract import CONDITION_ID,TOKEN_ID
+                buy_checked=True
+                response=runtime.execution.lp_submit_entry(dict(idempotency_key='fresh-new-buy',
+                    market_id='market-1',condition_id=CONDITION_ID,token_id=TOKEN_ID,
+                    outcome='YES',price='.40',quantity='10'))
+                publish(events/'nr-new-buy.json',json.dumps(response,default=str))
+                mark('nr-new-buy-completed')
+    finally:
+        runtime.stop()
+        publish(events/'nr-stop.json',json.dumps(dict(state=runtime.state,
+            permit=json.loads((root/'lp-start-guard/permit.json').read_text())),default=str))
+        sys.setprofile(None);threading.setprofile(None)
+    raise SystemExit(code)
+
+
+def restart_invariant_child(root,mode):
+    """A fresh interpreter receives only disk history and external API facts."""
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from open_trader.polymarket_lp_current_state import ValidatedStartAdmission
+    from open_trader.polymarket_lp_market_calculation import CalculationPolicy
+    from tests.test_lp_order_registration_contract import _adapter,_open_order,WALLET
+    orders=() if mode=='empty' else (_open_order('A','BUY',price='.40',original='10'),
+        _open_order('old-bot-sell','SELL',price='.60',original='10'),
+        _open_order('manual-sell','SELL',price='.65',original='10'))
+    adapter,sdk=_adapter(root,orders=orders)
+    store=PredictionArbitrageStore(root)
+    clock=[0.0]
+    live=LPD2LiveExecution(store,adapter,account_id=WALLET,venue='polymarket',
+        process_epoch='fresh-process',policy=CalculationPolicy(Decimal('40')),clock=lambda:clock[0])
+    try:
+        live.initialize(ValidatedStartAdmission('fresh-process','offline-permit'))
+        result=live.run_once()
+        clock[0]=601
+        for handle in live.run_protection_once():handle.result(timeout=3)
+        snap=live.state.snapshot()
+        (root/'restart-result.json').write_text(json.dumps(dict(
+            accepted=result.acceptance.status,orders_complete=snap.observation.orders_complete,
+            observed_orders=[(o.key[3],o.side) for o in result.acceptance.observation.order_view.open_orders],
+            orders=[(o.key[3],o.side) for o in snap.active_orders],reserved=str(snap.buy_reserved.value),
+            cancels=sdk.cancels,posts=sdk.posts,market_orders=sdk.market_orders,
+            history=no_reconcile_history(store)),default=str))
+    finally:
+        assert live.close(timeout=3)
+        adapter.close()
+
+
 if __name__=='__main__':
-    assert sys.argv[1]=='child'
-    child(Path(sys.argv[2]),int(sys.argv[3]),sys.argv[4],Path(sys.argv[5]))
+    if sys.argv[1]=='restart-invariant':restart_invariant_child(Path(sys.argv[2]),sys.argv[3])
+    else:
+        assert sys.argv[1]=='child'
+        child(Path(sys.argv[2]),int(sys.argv[3]),sys.argv[4],Path(sys.argv[5]))

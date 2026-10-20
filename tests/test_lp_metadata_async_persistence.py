@@ -483,7 +483,9 @@ def test_runtime_stop_retains_owner_until_actual_metadata_writer_exit(
     with MetadataChild(tmp_path,scenario=scenario) as child:
         child.release('metadata');child.start(expected_running=None)
         child.wait('ci-metadata-assertions-passed')
-        assert child.wait_exit()==78,child.output.read_text()
+        # Helper assertions passed and cleanup released the claim; the harness
+        # readiness RuntimeError now exits 1 instead of the claimed-failure 78.
+        assert child.wait_exit()==1,child.output.read_text()
         result=json.loads(child.marker('ci-metadata-observations.json').read_text())
         assert result['state']=='STOPPED' and result['production_owner'] is False
         assert result['active_producers'] is active_producers
@@ -498,12 +500,15 @@ def _exercise_actual_runtime_metadata_stop(runtime, adapter, monkeypatch, active
     from open_trader import prediction_runtime as runtime_module
     from open_trader.polymarket_monitor import PolymarketMonitor
     from open_trader.predict_cross_venue import PredictCrossVenueMonitor
-    # Unavailable financial facts remain independently unavailable. A genuine
-    # unrelated persisted incident supplies the NOT_READY trigger.
+    # Local D2 admission stays RUNNING despite unavailable financial facts and
+    # the persisted incident; the Scheduler owns API reads and keeps BUYs gated.
     with pytest.raises(OSError,match='offline account financial facts unavailable'):
         adapter.lp_reader_source_port().read('balance',SimpleNamespace(account=adapter.config.wallet_address))
-    assert runtime.state == "NOT_READY"
+    assert runtime.state == "RUNNING"
     assert runtime.production_owner is True
+    state = runtime.lp_auto_state()
+    assert state["new_capacity_usd"] is None
+    assert state["scheduler_running"] is True
     store = runtime.store
     assert isinstance(store, PredictionArbitrageStore)
     cross = monitor = monitor_thread = None

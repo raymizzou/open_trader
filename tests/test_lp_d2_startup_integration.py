@@ -327,3 +327,47 @@ def test_native_inflight_survives_logical_resume_and_shutdown(tmp_path):
             assert json.loads(child.permit_path.read_text())['state'] == 'ARMED'
             assert child.actual_posts() == (0 if lane == 'reader' else 1)
             assert child.marker('public-client-closed').read_text() == child.marker('public-client-created').read_text()
+
+
+def _restart_with_history(tmp_path, mode):
+    import json
+    import os
+    import subprocess
+    import sys
+    from tests.lp_d2_service_harness import seed_no_reconcile_history, no_reconcile_history
+    store=PredictionArbitrageStore(tmp_path)
+    seed_running(store)
+    seed_no_reconcile_history(store)
+    if mode=='sells':
+        from open_trader.lp_business_writer import RequestRecord
+        from datetime import UTC, datetime
+        store.lp_log_business_record(RequestRecord(account_id=WALLET,process_epoch='old-process',
+            request_id='old-sell-request',session_id='old-sell-audit',condition_id=CONDITION_ID,
+            token_id=TOKEN_ID,kind='SELL',price=Decimal('.60'),quantity=Decimal('10'),
+            requested_at=datetime(2026,10,1,tzinfo=UTC),order_id='old-bot-sell'))
+    before=json.loads(json.dumps(no_reconcile_history(store),default=str))
+    process=subprocess.run([sys.executable,'-B','-m','tests.lp_d2_service_harness',
+        'restart-invariant',str(tmp_path),mode],capture_output=True,text=True,
+        timeout=20,env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1'))
+    assert process.returncode==0, process.stdout+process.stderr
+    return before,json.loads((tmp_path/'restart-result.json').read_text())
+
+
+def test_restart_discards_missing_old_orders_without_inventing_terminal_results(tmp_path):
+    before,fresh=_restart_with_history(tmp_path,'empty')
+    assert fresh['accepted']=='accepted' and fresh['orders_complete'] is True
+    assert fresh['orders']==[] and Decimal(fresh['reserved'])==0
+    assert fresh['posts']==fresh['market_orders']==fresh['cancels']==[]
+    assert fresh['history']==before  # Pending/audit rows are not FILLED/CANCELED by absence.
+    assert fresh['history']['intents']['old-intent']['state']=='pending'
+
+
+def test_restart_manual_sell_is_visible_and_never_automatically_canceled(tmp_path):
+    before,fresh=_restart_with_history(tmp_path,'sells')
+    assert fresh['orders_complete'] is True
+    assert {tuple(o) for o in fresh['observed_orders']}=={
+        ('A','BUY'),('old-bot-sell','SELL'),('manual-sell','SELL')}
+    assert {tuple(o) for o in fresh['orders']}=={('old-bot-sell','SELL'),('manual-sell','SELL')}
+    assert fresh['cancels']==[['A']]  # Includes first cycle and automatic protection cycle.
+    assert fresh['posts']==fresh['market_orders']==[]  # No duplicate protective SELL.
+    assert fresh['history']==before

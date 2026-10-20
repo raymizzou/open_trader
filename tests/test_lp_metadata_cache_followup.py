@@ -721,7 +721,9 @@ def test_runtime_stop_retains_owner_until_actual_prune_exit(tmp_path, monkeypatc
         child.release('metadata')
         child.start(expected_running=None)
         child.wait('ci-prune-assertions-passed')
-        assert child.wait_exit()==78, child.output.read_text()
+        # Helper assertions passed and cleanup released the claim; the harness
+        # readiness RuntimeError now exits 1 instead of the claimed-failure 78.
+        assert child.wait_exit()==1, child.output.read_text()
         result=json.loads(child.marker('ci-prune-observations.json').read_text())
         assert result['state']=='STOPPED' and result['production_owner'] is False
         assert child.actual_posts()==0
@@ -738,7 +740,11 @@ def _exercise_actual_runtime_prune_stop(runtime, adapter, monkeypatch, real_conn
     from open_trader.predict_cross_venue import PredictCrossVenueMonitor
     with pytest.raises(OSError, match='offline account financial facts unavailable'):
         adapter.lp_reader_source_port().read('balance', SimpleNamespace(account=adapter.config.wallet_address))
-    assert runtime.state == 'NOT_READY' and runtime.production_owner is True
+    # API unreadiness gates BUYs while local D2 admission keeps Runtime online.
+    assert runtime.state == 'RUNNING' and runtime.production_owner is True
+    state = runtime.lp_auto_state()
+    assert state['new_capacity_usd'] is None
+    assert state['scheduler_running'] is True
     store = runtime.store
     assert isinstance(store, PredictionArbitrageStore)
     source_started, source_cancelled = threading.Event(), threading.Event()
