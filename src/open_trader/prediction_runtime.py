@@ -92,6 +92,7 @@ from .relation_catalog import RelationCatalog
 
 logger = logging.getLogger(__name__)
 _CROSS_VENUE_START_TIMEOUT = 5
+_STARTUP_FAILURE_D2_DRAIN_TIMEOUT = 5.0
 _DEFAULT_HOLDING_RECONCILER = object()
 _LP_TICK_SECONDS = 1.0
 _LP_REWARD_SECONDS = 60.0
@@ -953,7 +954,7 @@ class PredictionRuntime:
                 self._fatal=self._fatal or exc
             self._record_claimed_startup_failure(exc)
             self._state = "FAILED"
-            if not self._cleanup_resources():
+            if not self._cleanup_resources(d2_timeout=_STARTUP_FAILURE_D2_DRAIN_TIMEOUT):
                 self._state = "FAILED"
             raise
 
@@ -1114,7 +1115,7 @@ class PredictionRuntime:
         except Exception as exc:
             self._record_claimed_startup_failure(exc)
             self._state = "FAILED"
-            if not self._cleanup_resources():
+            if not self._cleanup_resources(d2_timeout=_STARTUP_FAILURE_D2_DRAIN_TIMEOUT):
                 self._state = "FAILED"
             raise
 
@@ -2110,7 +2111,7 @@ class PredictionRuntime:
         self._lp_reader_comparison = ReaderComparisonObserver()
         self.lp.reader_comparison_observer = self._lp_reader_comparison
 
-    def _cleanup_resources(self) -> list[BaseException]:
+    def _cleanup_resources(self, *, d2_timeout: float = 0) -> list[BaseException]:
         errors: list[BaseException] = []
         drained_cross_error: BaseException | None = None
         try:self.begin_stop()
@@ -2334,7 +2335,9 @@ class PredictionRuntime:
         if self._lp_auto_scheduler is not None:
             # A pending exchange read/send still owns these collaborators.
             return errors
-        if self.lp_d2 is not None and not self.lp_d2.close(timeout=0):
+        # Startup failures collect notified resources within a bounded budget.
+        # Live resources still retain their collaborators and owner.
+        if self.lp_d2 is not None and not self.lp_d2.close(timeout=d2_timeout):
             errors.append(RuntimeError('D2 native resources are still stopping'))
             return errors
         drain_submissions = getattr(self.lp, 'drain_submissions', None)

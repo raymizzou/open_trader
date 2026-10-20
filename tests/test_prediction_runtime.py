@@ -4616,6 +4616,141 @@ def test_reconcile_failure_keeps_runtime_locked_and_does_not_start_monitors(
         child.assert_owned()
 
 
+
+@contextmanager
+def _startup_failure_with_controlled_writer(tmp_path, monkeypatch, *, budget=None):
+    """Run the unchanged offline release with only its writer exit held back."""
+    import subprocess
+    from tests.lp_d2_service_harness import ServiceChild
+
+    native_popen = subprocess.Popen
+    # The fixture launches a fresh interpreter. Install the approved _run
+    # boundary there, before the real runtime constructs the real D2 writer.
+    injection = """
+import json, runpy, sys, threading, time
+from pathlib import Path
+import pytest
+from open_trader.lp_business_writer import LPBusinessWriter
+from open_trader import prediction_runtime
+_events = Path(sys.argv[2]) / 'events'
+_patch = pytest.MonkeyPatch()
+_native_run = LPBusinessWriter._run
+_native_join = threading.Thread.join
+def _controlled_run(writer):
+    _native_run(writer)
+    (_events / 'writer-stop-notified').touch()
+    deadline = time.monotonic() + 15
+    while not (_events / 'release-writer-exit').exists():
+        assert time.monotonic() < deadline, 'controlled writer exit real watchdog'
+        threading.Event().wait(.005)
+    (_events / 'writer-exit-released').touch()
+    held_thread = threading.current_thread()
+    def collect_actual_thread():
+        _native_join(held_thread, 5)
+        assert not held_thread.is_alive(), 'controlled writer join real watchdog'
+        (_events / 'writer-joined').touch()
+    threading.Thread(target=collect_actual_thread, daemon=True).start()
+def _observed_join(thread, timeout=None):
+    # Call through unchanged. This event lets the parent release a delayed
+    # writer only once collection is actually waiting, independent of speed.
+    if thread.name == 'lp-business-writer' and timeout is not None and timeout > 0:
+        (_events / 'writer-drain-waiting').touch()
+    return _native_join(thread, timeout)
+_patch.setattr(LPBusinessWriter, '_run', _controlled_run)
+_patch.setattr(threading.Thread, 'join', _observed_join)
+_native_start = prediction_runtime.PredictionRuntime.start
+def _timed_start(runtime):
+    started = time.monotonic()
+    try:
+        return _native_start(runtime)
+    finally:
+        (_events / 'startup-elapsed.json').write_text(json.dumps(time.monotonic() - started))
+_patch.setattr(prediction_runtime.PredictionRuntime, 'start', _timed_start)
+"""
+    if budget is not None:
+        injection += f"_patch.setattr(prediction_runtime, '_STARTUP_FAILURE_D2_DRAIN_TIMEOUT', {budget!r})\n"
+    injection += "runpy.run_module('tests.lp_d2_service_harness', run_name='__main__')\n"
+
+    def launch_with_writer_gate(args, *a, **kw):
+        if len(args) > 2 and args[1:3] == ['-m', 'tests.lp_d2_service_harness']:
+            args = [args[0], '-c', injection, *args[3:]]
+        return native_popen(args, *a, **kw)
+
+    with ServiceChild(tmp_path, scenario='nr-settings-fatal') as child:
+        with monkeypatch.context() as launch_patch:
+            launch_patch.setattr(subprocess, 'Popen', launch_with_writer_gate)
+            child.release('metadata')
+            child.start(expected_running=None)
+        try:
+            yield child
+        finally:
+            child.release('writer-exit')
+            child.wait('writer-exit-released')
+            child.wait('writer-joined')
+            # ServiceChild teardown stops the real runtime and joins its actual
+            # writer before checking process exit; no held thread survives.
+
+
+def _assert_startup_failure_safety(child, failed):
+    assert failed['scheduler_starts'] == 0
+    assert failed['reconcile_calls'] == failed['legacy_ticks'] == 0
+    assert failed['monitor_thread_started'] is failed['history_started'] is False
+    assert failed['d2_closed'] is True and failed['native_inflight'] == 0
+    assert failed['permit']['state'] == 'CLAIMED'
+    assert json.loads(child.permit_path.read_text()) == failed['permit']
+    assert child.actual_posts() == failed['posts'] == 0
+    assert not child.marker('nr-account-read').exists()
+    error = json.loads(child.marker('nr-start-error.json').read_text())
+    assert error == dict(type='PredictionRuntimeFatal', error='D2 reliable startup read failed')
+
+
+def test_startup_failure_drains_delayed_d2_writer_and_releases_owner(tmp_path, monkeypatch):
+    with _startup_failure_with_controlled_writer(tmp_path, monkeypatch) as child:
+        child.wait('writer-stop-notified')
+        deadline = time.monotonic() + 10  # Independent of all business clocks.
+        while not (child.marker('writer-drain-waiting').exists()
+                   or child.marker('nr-start-completed').exists()):
+            assert time.monotonic() < deadline, 'startup drain rendezvous watchdog'
+            threading.Event().wait(.005)
+        if child.marker('writer-drain-waiting').exists():
+            # Explicit exit barrier, then a controlled ~100ms release delay.
+            timer = threading.Timer(.1, child.release, args=('writer-exit',))
+            timer.start()
+            try:
+                child.wait('nr-start-completed')
+            finally:
+                timer.join(5)
+                assert not timer.is_alive()
+        else:
+            # Preserve the historical snapshot: never wait away the RED.
+            child.wait('nr-start-completed')
+        failed = json.loads(child.marker('nr-start.json').read_text())
+        _assert_startup_failure_safety(child, failed)
+        assert failed['state'] == 'FAILED'
+        assert failed['writer_thread_alive'] is False
+        assert failed['production_owner'] is False
+        child.assert_owner_available()
+
+
+def test_startup_failure_keeps_owner_when_d2_writer_does_not_exit(tmp_path, monkeypatch):
+    # The writer has an explicit exit event, but it is never released during
+    # start(). Shorten only the production D2 drain budget, not a watchdog.
+    budget = .1
+    with _startup_failure_with_controlled_writer(tmp_path, monkeypatch, budget=budget) as child:
+        child.wait('writer-stop-notified')
+        child.wait('nr-start-completed')
+        failed = json.loads(child.marker('nr-start.json').read_text())
+        _assert_startup_failure_safety(child, failed)
+        elapsed = json.loads(child.marker('startup-elapsed.json').read_text())
+        assert budget <= elapsed < 3, 'startup must exhaust its short drain budget and return'
+        assert failed['state'] == 'STOPPING'
+        assert failed['writer_thread_alive'] is True
+        assert failed['production_owner'] is True
+        assert not child.marker('writer-exit-released').exists()
+        child.assert_owned()
+        # The helper finally releases the barrier and joins the actual writer;
+        # only then does ServiceChild stop the runtime and collect the process.
+
 def test_locked_reconcile_result_keeps_runtime_not_ready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
