@@ -108,6 +108,8 @@ def _prepare_qualified(frame, capture, policy, as_of):
             shadow_rows = []
             for cid, source in capture.rows.items():
                 if cid in eligibility:
+                    shadow_rows.append(dict(condition_id=cid, token_id=None, direction=None,
+                        eligibility=eligibility[cid]))
                     continue
                 for direction in source.value['facts']['directions']:
                     market = direction['market']
@@ -115,7 +117,7 @@ def _prepare_qualified(frame, capture, policy, as_of):
                     shadow_rows.append(dict(condition_id=cid, token_id=token, market_id=market.get('market_id'),
                         direction=direction, eligibility=eligibility[f'{cid}:{token}']))
             values['allocation_candidates'] = SourceResult(capture.capture_id, freeze(shadow_rows),
-                complete=capture.inventory_complete and not any(cid in eligibility for cid in capture.rows),
+                complete=capture.inventory_complete,
                 checked_at=as_of, error=capture.error)
         except Exception as exc:
             values['allocation_candidates'] = SourceResult(capture.capture_id, complete=False,

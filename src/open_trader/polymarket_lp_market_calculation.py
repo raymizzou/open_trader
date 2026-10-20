@@ -128,7 +128,7 @@ def calculate_current(frame, policy, as_of) -> CalculationResult:
 
 def select_current_composition(frame, policy, calculation, *, orders_accepted=True,
                                positions_accepted=True, financial_authority=True, as_of=None,
-                               shadow_blocked_conditions=()):
+                               shadow_blocked_conditions=None):
     """Re-gate values against accepted authority without recalculating yields."""
     reserved, inventory = calculation.buy_reserved, calculation.inventory_cost
     estimates = calculation.yields
@@ -244,17 +244,17 @@ def select_current_composition(frame, policy, calculation, *, orders_accepted=Tr
     victims = tuple(row['order_id'] for row in frame.current_buys
         if selection_valid and estimates[row['order_id']] is not None and row['order_id'] not in retained_ids)
     shadow = None
-    if policy.allocation_shadow_enabled:
+    if policy.allocation_shadow_enabled and shadow_blocked_conditions is not None:
         try:
-            from .polymarket_lp_allocation import rank_weights_shadow
+            from .polymarket_lp_allocation import rank_weights_shadow, shadow_result
             if as_of is None:
                 as_of = next((row.get('evaluation_at') for row in candidates.value or ()
                     if row.get('evaluation_at') is not None), balance.checked_at if balance else None)
             shadow = freeze(rank_weights_shadow(frame, policy, calculation, as_of,
                 authority=replacement_valid, blocked_conditions=shadow_blocked_conditions))
         except Exception as exc:
-            shadow = freeze(dict(state='error', error=type(exc).__name__, reason_codes=('shadow_exception',),
-                ranks=(), leftover_cash_usd=None, would_send_count=0))
+            shadow = freeze(shadow_result('error', target_count=policy.target_count, checked_at=as_of,
+                error=type(exc).__name__, reason_codes=('shadow_exception',)))
     return replace(calculation, allocation_shadow=shadow, targets=tuple(targets), target_tokens=tuple(tokens),
         selection_state='DECISION' if selection_valid else 'NO_DECISION',
         selection_reasons=tuple(dict.fromkeys(reasons)), victim_order_ids=victims,

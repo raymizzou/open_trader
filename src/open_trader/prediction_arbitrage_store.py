@@ -8147,7 +8147,7 @@ class PredictionArbitrageStore:
             desired_running=document['desired_running'], ever_enabled=document['ever_enabled'], **times))
 
     @staticmethod
-    def _lp_current_settings_values(document, account_id):
+    def _lp_current_settings_values(document, account_id, *, validate_allocation=True):
         from .polymarket_lp_accounting import allocation_settings
         from types import MappingProxyType
         from decimal import Decimal, InvalidOperation
@@ -8178,16 +8178,16 @@ class PredictionArbitrageStore:
         for key in ('round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds'):
             if type(values[key]) is not int or values[key] <= 0:
                 raise ValueError('lp_settings_timing_invalid')
-        return MappingProxyType(dict(account_id=account_id, **values, **allocation_settings(document)))
+        return MappingProxyType(dict(account_id=account_id, **values, **(allocation_settings(document) if validate_allocation else {})))
 
-    def lp_load_current_settings(self, account_id: str):
+    def lp_load_current_settings(self, account_id: str, *, validate_allocation=True):
         """Read policy only; never reconstruct financial or send authority."""
         from .polymarket_lp_accounting import default_account_pool_document
         with self._read_connection() as connection:
             row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
         document = (json.loads(row['payload']) if row is not None else
             default_account_pool_document(self.path, account_id, datetime.now(timezone.utc)))
-        return self._lp_current_settings_values(document, account_id)
+        return self._lp_current_settings_values(document, account_id, validate_allocation=validate_allocation)
 
     def lp_save_current_settings(self, account_id: str, *, expected_config_version, changes, actor=None):
         """CAS a narrow settings merge, returning only after actual commit."""
@@ -8204,7 +8204,7 @@ class PredictionArbitrageStore:
             row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
             document = (json.loads(row['payload']) if row is not None else
                 default_account_pool_document(self.path, account_id, datetime.now(timezone.utc)))
-            current = self._lp_current_settings_values(document, account_id)
+            current = self._lp_current_settings_values(document, account_id, validate_allocation=False)
             if current['config_version'] != expected_config_version:
                 raise ValueError('config_version_changed')
             trading = bool(set(changes) & {'budget_usd', 'target_buy_count', 'buy_price_level'})

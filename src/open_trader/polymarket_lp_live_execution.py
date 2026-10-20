@@ -307,6 +307,7 @@ class LPD2LiveExecution:
         self._settings_error = None
         self._settings_requested = None
         self._settings_loaded = False
+        self._settings_repairable = False
         self._settings_required = False
         self._protection_lock = threading.Lock()
         self._closed = False
@@ -989,11 +990,22 @@ class LPD2LiveExecution:
                 saved = self.store.lp_load_current_settings(self._settings_account())
                 policy = self._policy_from_settings(saved)
             except BaseException as exc:
+                allocation_error = isinstance(exc, ValueError) and (str(exc).startswith('allocation_')
+                    or str(exc) == 'rank_weights_requires_c2')
                 with self._settings_lock:
-                    self._settings_loaded, self._settings_error = False, type(exc).__name__
-                raise
+                    self._settings_loaded = False
+                    self._settings_repairable = allocation_error
+                    self._settings_error = str(exc) if allocation_error else type(exc).__name__
+                if not allocation_error:
+                    raise
+                # Keep control and repair available; unloaded settings still block native plans.
+                saved = self.store.lp_load_current_settings(self._settings_account(), validate_allocation=False)
+                with self._settings_lock:
+                    self.policy = self._committed_policy = self._policy_from_settings(saved)
+                return None
             with self._settings_lock:
                 self.policy = self._committed_policy = policy
+                self._settings_repairable = False
                 self._settings_loaded, self._settings_error = True, None
             return policy
         finally:
@@ -1009,6 +1021,7 @@ class LPD2LiveExecution:
             except BaseException as exc:
                 self._settings_error = type(exc).__name__
             else:
+                self._settings_loaded, self._settings_repairable = True, False
                 self._settings_error = None
         if publish:
             self.policy = self._committed_policy
@@ -1040,7 +1053,7 @@ class LPD2LiveExecution:
             raise ValueError('auto_config_invalid')
         with self._settings_lock:
             self._collect_settings()
-            if (not self._settings_loaded or self._settings_future is not None
+            if ((not self._settings_loaded and not self._settings_repairable) or self._settings_future is not None
                     or self.policy is not self._committed_policy):
                 raise ValueError('settings_save_pending')
             if self._closed:
@@ -1287,9 +1300,13 @@ class LPD2LiveExecution:
                 summary = dict(summary, latest_attempt=dict(summary['latest_attempt'],
                     capture_failed=True, capture_failure_reason='capture_unavailable'))
             if calculation.allocation_shadow is not None:
-                shadow = yield_diagnostic_value(calculation.allocation_shadow)
+                try:
+                    shadow = yield_diagnostic_value(calculation.allocation_shadow)
+                    logger.info('prediction_lp_allocation_shadow %s', shadow)
+                except Exception as exc:
+                    from .polymarket_lp_allocation import shadow_result
+                    shadow = shadow_result('error', error=type(exc).__name__, reason_codes=('shadow_exception',))
                 summary = dict(summary, allocation_shadow=shadow)
-                logger.info('prediction_lp_allocation_shadow %s', shadow)
             try:
                 summary = dict(summary, yield_observation=summarize_yield_observation(
                     prepared, calculation, ticket, accepted, evaluated_at,

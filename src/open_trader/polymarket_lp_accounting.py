@@ -37,7 +37,8 @@ def allocation_settings(document):
         if type(raw) is not list or len(raw) != document.get('target_buy_count', 0):
             raise ValueError('allocation_weights_length_invalid')
         try:
-            if any(type(v) is not str for v in raw):
+            if any(type(v) is not str or not v.isascii() or '_' in v
+                    or any(c.isspace() for c in v) for v in raw):
                 raise ValueError
             weights = [Decimal(v) for v in raw]
             if (any(not v.is_finite() or not ZERO < v <= 1 for v in weights)
