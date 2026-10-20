@@ -103,7 +103,7 @@ def test_closed_position_without_book_is_non_tradable_without_poisoning_finances
         prepared = prepare_current_inputs(second, None, live.policy, datetime.now(UTC))
         result = calculate_current(prepared, live.policy, datetime.now(UTC))
         assert result.inventory_cost == Decimal('115.6884')
-        assert result.new_capacity == 0  # A preserves the baseline budget formula
+        assert result.new_capacity == Decimal('100')  # Known inventory does not consume the BUY budget.
         snapshot = live.state.snapshot()
         assert snapshot.inventory_cost.state == 'known' and snapshot.inventory_cost.value == Decimal('115.6884')
         assert sdk.posts == [] and sdk.cancels == [] and sdk.market_orders == []
