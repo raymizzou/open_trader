@@ -10,6 +10,8 @@ import uuid
 from decimal import Decimal, InvalidOperation
 from .polymarket_lp_risk import TERMINAL_ORDER_STATES
 
+FINANCIAL_COMPONENTS = frozenset({'balance', 'open_orders', 'positions'})
+
 CURRENT_ORDER_STATES = frozenset({'LIVE', 'OPEN', 'ACCEPTED', 'PARTIALLY_FILLED', 'CANCELING', 'CANCELLING', 'PENDING_CANCEL'})
 
 
@@ -58,6 +60,7 @@ class ReadScope:
     account: str
     components: tuple[str, ...] = ('balance', 'open_orders', 'positions')
     related_markets: bool = False
+    position_only_markets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -108,6 +111,7 @@ class MarketReader:
         self._retry = {}
         self._wait_epoch = 0
         self._closed = False
+        self._closed_positions = {}  # bounded, current position identity only; never financial authority
 
     @staticmethod
     def from_captured_sources(captured: CapturedSources) -> MarketFrame:
@@ -207,7 +211,8 @@ class MarketReader:
 
     def read_current(self, scope: ReadScope, deadline: float) -> MarketFrame:
         sources, own, waiting = {}, {}, list(scope.components)
-        # No queued native work: at most two live tasks, including timed-out calls.
+        # No queued native work: two live tasks, at most one nonfinancial.
+        # Timed-out tasks retain both total and class ownership until actual completion.
         while waiting or own:
             with self._lock:
                 for name in tuple(waiting):
@@ -232,7 +237,10 @@ class MarketReader:
                             pass
                     elif time.monotonic() >= deadline:
                         sources[name] = SourceResult('', complete=False, error='timeout')
-                    elif sum(not f.done() for f in self._jobs.values()) < 2:
+                    elif (sum(not f.done() for f in self._jobs.values()) < 2
+                            and (name in FINANCIAL_COMPONENTS or not any(
+                                not job.done() and other[1] not in FINANCIAL_COMPONENTS
+                                for other, job in self._jobs.items()))):
                         own[name] = self._start(key, scope)
                     else:
                         continue
@@ -263,9 +271,33 @@ class MarketReader:
         if scope.related_markets:
             identities = sorted({(r['condition_id'], r['token_id']) for r in (*frame.orders, *frame.positions)})
             if identities:
-                market_scope = ReadScope(scope.account, tuple('market:' + c + ':' + t for c, t in identities))
+                components = tuple('market:' + c + ':' + t for c, t in identities)
+                order_identities = {(r['condition_id'], r['token_id']) for r in frame.orders}
+                eligible = set('market:' + c + ':' + t for c, t in identities
+                    if (c, t) not in order_identities) if frame.orders_complete and frame.positions_complete else set()
+                with self._lock:
+                    # An order, missing coverage or removed position invalidates applicability.
+                    self._closed_positions = {key: value for key, value in self._closed_positions.items()
+                        if key[0] != scope.account or key[1] in eligible}
+                    retained = {name: self._closed_positions[(scope.account, name)] for name in components
+                        if (scope.account, name) in self._closed_positions}
+                market_scope = ReadScope(scope.account, tuple(n for n in components if n not in retained),
+                    position_only_markets=tuple(sorted(eligible)))
                 markets = self.read_current(market_scope, deadline)
-                frame = self.from_captured_sources(CapturedSources(scope.account, {**sources, **markets.sources}))
+                with self._lock:
+                    for name, source in markets.sources.items():
+                        if (name in eligible and source.complete and not source.error
+                                and isinstance(source.value, Mapping)
+                                and source.value.get('state') == 'non_tradable'):
+                            self._closed_positions[(scope.account, name)] = source
+                    # A finite resource proof cache, with no extension of source time.
+                    while len(self._closed_positions) > 128:
+                        self._closed_positions.pop(next(iter(self._closed_positions)))
+                frame = self.from_captured_sources(CapturedSources(scope.account, {**sources, **retained, **markets.sources}))
+            else:
+                with self._lock:
+                    self._closed_positions = {key: value for key, value in self._closed_positions.items()
+                        if key[0] != scope.account}
         try:
             with self._lock:
                 observed = self._clock()

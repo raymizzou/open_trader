@@ -7,6 +7,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - 修复 D2 启动失败清理时 writer 已收到停止通知但尚未退出的竞态：生产启动异常给予最多五秒的 D2 收集预算，实际资源退出后才完成 FAILED 并释放 owner；超时仍保留 STOPPING 和 owner。正常 stop 的 D2 零预算不变。离线回归覆盖受控延迟退出、超时保留及启动失败的零发送保护。
 
+- LP 当前读取为财务事实保留准入：真实读取总上限仍为 2，市场及保护合计至多 1，Reader 内奖励读取也保持串行。已核实身份、闭市且无盘口的纯持仓市场保留持仓与成本，以明确不可交易状态避免重复读取；有订单或证明不足时保留原门禁。离线验证覆盖超时资源所有权、关闭、60 秒及 Retry-After 恢复、身份与 600 秒保护；未改预算、SELL 或生产配置，未部署。
+
 - LP C1 can save validated rank weights and an optional compute-only shadow through the current D2 settings, state and CLI. Live rank_weights is rejected until C2; default minimum orders and estimator payloads stay unchanged. Shadow uses final-size risk/yield checks, retains cash after a blocked rank and bounds diagnostics; failures do not alter trading. The C1 review repair keeps startup/control and repair saves available for invalid stored allocations, excludes unknown candidates while protecting unknown incumbents, computes shadow once per live selection, reuses matching native yields and isolates diagnostic/log failures with a consistent schema. Weight strings reject whitespace, underscores and non-ASCII digits. Focused offline verification and sandbox-limited HTTP checks are recorded in the C1 fix handoff.
 
 - 修复 CN 趋势报告轮换风险校验与生成器的 Decimal 运算顺序不一致，循环小数 ATR 不再使合法冻结报告被拒绝；保持严格校验及旧版报告内容。冻结契约错误新增脱敏规则与字段路径，完成离线复现及直接受影响回归；未部署或重启控制器。

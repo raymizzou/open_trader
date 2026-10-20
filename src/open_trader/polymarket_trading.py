@@ -2666,8 +2666,29 @@ class PolymarketTradingClient:
                         if condition not in batch["failed_ids"] and condition not in batch["deferred_ids"] else None)
                     if metadata is None:
                         raise ValueError("market_source_unknown")
-                    rewards = adapter.lp_reward_catalog(condition_ids=(condition,))
-                    book = adapter.lp_order_books((token,)).get(token)
+                    closed_position = (
+                        component in scope.position_only_markets
+                        and metadata.get('condition_id') == condition
+                        and metadata.get('market_id')
+                        and metadata.get('closed') is True
+                        and metadata.get('accepting_orders') is False
+                        and any(isinstance(outcome, Mapping) and outcome.get('token_id') == token
+                            for outcome in metadata.get('outcomes', {}).values())
+                    )
+                    if closed_position:
+                        try:
+                            book = adapter.lp_order_books((token,)).get(token)
+                        except Exception as exc:
+                            # A book 404 alone, missing metadata or transport failure proves nothing.
+                            if _safe_history_response_facts(exc).get('status') != 404:
+                                raise
+                            return dict(state='non_tradable', metadata=metadata,
+                                book=None, rewards=None, book_absent=True,
+                                book_absence_status=404, book_checked_at=datetime.now(UTC))
+                    # This Reader owns one nonfinancial slot, including nested SDK reads.
+                    rewards = adapter._lp_selected_reward_catalog((condition,), serial=True)
+                    if not closed_position:
+                        book = adapter.lp_order_books((token,)).get(token)
                     if not metadata or not book or not rewards:
                         raise ValueError('market_source_unknown')
                     return dict(metadata=metadata, rewards=rewards, book=book)
@@ -4467,6 +4488,7 @@ class PolymarketTradingClient:
         condition_ids: Sequence[str],
         *,
         stop_event: threading.Event | None = None,
+        serial: bool = False,
     ) -> dict[str, object]:
         """Read reward facts for a fixed market set without global calls."""
 
@@ -4521,7 +4543,7 @@ class PolymarketTradingClient:
 
         results: dict[tuple[str, bool], tuple[tuple[object, ...], str | None, str | None]] = {}
         with ThreadPoolExecutor(
-            max_workers=min(LP_REWARD_SELECTED_MAX_CONCURRENCY, len(requests)),
+            max_workers=1 if serial else min(LP_REWARD_SELECTED_MAX_CONCURRENCY, len(requests)),
             thread_name_prefix="polymarket-selected-rewards",
         ) as executor:
             for condition_id, sponsored, rows, error, error_type in executor.map(
