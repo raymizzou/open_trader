@@ -1135,3 +1135,28 @@ def test_uninstaller_preserves_plist_when_job_remains_loaded(tmp_path: Path) -> 
     assert result.returncode == 1
     assert plist.exists()
     assert f"still loaded: {GATEWAY_LABEL}" in result.stderr
+
+
+def test_gateway_dry_run_configures_prediction_upstream_port(tmp_path):
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    agents = tmp_path / 'agents'
+    agents.mkdir()
+    forbidden = tmp_path / 'forbidden'
+    _write_executable(forbidden, '#!/bin/sh\nexit 99\n')
+    command = [str(INSTALLER), '--mode', 'gateway', '--dry-run', '--repo-root', str(ROOT),
+               '--runtime-root', str(runtime), '--launch-agents-dir', str(agents),
+               '--python', sys.executable]
+    env = {**os.environ, 'LAUNCHCTL_BIN':str(forbidden), 'CURL_BIN':str(forbidden), 'LSOF_BIN':str(forbidden)}
+    result = subprocess.run([*command, '--prediction-upstream-port', '18879'], env=env,
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    args = plistlib.loads(result.stdout.encode())['ProgramArguments']
+    assert args[args.index('--prediction-upstream-port')+1] == '18879'
+    normal = subprocess.run(command, env=env, capture_output=True, text=True, check=True)
+    args = plistlib.loads(normal.stdout.encode())['ProgramArguments']
+    assert args[args.index('--prediction-upstream-port')+1] == '8769'
+    invalid = subprocess.run([*command, '--prediction-upstream-port', '65536'], env=env,
+                             capture_output=True, text=True)
+    assert invalid.returncode == 2
+    assert not list(agents.iterdir()) and not list(runtime.iterdir())

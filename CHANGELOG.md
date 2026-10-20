@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-20
 
+- Add a loopback-only Prediction display adapter with revocable per-client tokens and a tailnet-only read-only Gateway/client profile. Real backend mode/owner/SHA remain visible, remote failures never fall back locally, and browser write controls stay disabled. Existing mini defaults remain unchanged; remote ports are configurable and read-only pages poll every 30 seconds. Offline HTTP, UI, configuration and template checks cover the new boundaries; real socket/process checks are blocked by the local sandbox. Strict GET audit is still blocked by D2 status reads that can publish completed settings; P2 is not accepted or deployable. Tailnet enrollment, adapter installation, host permissions and deployment require separate approval.
+
 - With N-leg paused, D2 startup uses reliable local admission and leaves the first account read to its sole Scheduler. API timeouts keep the runtime online with UNKNOWN LP facts and no new BUYs until complete facts arrive. Admission preserves historical execution/incident states; round0 BUY cleanup and SELL protections remain in place. Offline startup checks cover admission, retry and fatal control/settings/identity failures.
 
 ## 2026-10-19

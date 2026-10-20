@@ -17,6 +17,10 @@ def main(argv: list[str] | None = None) -> int:
         from .account_api import parity_main
 
         return parity_main(args[1:])
+    if args[:1] == ["prediction-readonly-api"]:
+        from .prediction_readonly_api import main as readonly_main
+
+        return readonly_main(args[1:])
     if args[:1] == ["prediction-service"]:
         from .prediction_service import main as prediction_service_main
 

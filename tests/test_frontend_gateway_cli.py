@@ -156,3 +156,19 @@ def test_cli_frontend_gateway_delegates_to_canonical_entrypoint(
         "--account-upstream-port",
         "18768",
     ]
+
+
+def test_readonly_adapter_entrypoint_does_not_import_runtime_or_credentials():
+    script = """
+import runpy, sys
+sys.argv = ['open_trader', 'prediction-readonly-api', '--help']
+try:
+    runpy.run_module('open_trader', run_name='__main__')
+except SystemExit as error:
+    assert error.code == 0
+for name in ('open_trader.prediction_runtime', 'open_trader.prediction_service',
+             'open_trader.prediction_credentials', 'open_trader.credentials', 'open_trader.cli', 'sqlite3'):
+    assert name not in sys.modules, name
+"""
+    result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr

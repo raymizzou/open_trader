@@ -56,6 +56,7 @@ setImmediate(()=>{
 
 @pytest.mark.parametrize(('service_mode','mutations','n_leg','body_prediction_only','expected_state'), [
     ('production','enabled','running','true','production'),
+    ('production','enabled','running','true','readonly-production'),
     ('shadow','prohibited','paused','true','shadow-paused'),
     ('shadow','prohibited','running','true','shadow'),
     ('unknown','unknown','running','true','unknown'),
@@ -76,10 +77,12 @@ class Element {
 const nodes={}, requests=[];
 let boot;
 const body = new Element(); body.dataset.predictionOnly=process.env.BODY_PREDICTION_ONLY;
+body.dataset.predictionAccess=process.env.EXPECTED_STATE === 'readonly-production' ? 'read_only' : 'control';
+const intervals=[];
 const document={body, addEventListener(name, fn){if(name==='DOMContentLoaded')boot=fn;},
   getElementById(id){return nodes[id] ||= new Element();}, querySelector(){return new Element();}};
 const window={location:{search:'',pathname:'/',hash:''},scrollY:0,
-  setInterval(){return 1;},clearInterval(){},setTimeout(){return 1;},clearTimeout(){}};
+  setInterval(fn,ms){intervals.push(ms);return 1;},clearInterval(){},setTimeout(){return 1;},clearTimeout(){}};
 const sandbox={document,window,console,URLSearchParams,AbortController,
   fetch:async (url,options={})=>{
     requests.push({url,method:options.method||'GET'});
@@ -171,7 +174,7 @@ const keepAlive = setInterval(() => {}, 1000);
     assert.match(html,/data-action="lp-order-entry"/);
     assert.match(html,/data-action="lp-augment-entry"/);
     assert.match(html,/data-lp-auto-action=/);
-    if (process.env.EXPECTED_STATE === 'shadow' || process.env.EXPECTED_STATE === 'unknown') {
+    if (['shadow','unknown','readonly-production'].includes(process.env.EXPECTED_STATE)) {
       assert.match(html,/data-action="lp-cancel-all"[^>]*disabled/);
       assert.match(html,/data-action="lp-cancel-order"[^>]*disabled/);
       assert.match(html,/data-action="lp-order-entry"[^>]*disabled/);
@@ -179,7 +182,16 @@ const keepAlive = setInterval(() => {}, 1000);
       assert.match(html,/data-lp-auto-action="[^"]*"[^>]*disabled/);
     }
   }
-  if (process.env.EXPECTED_STATE === 'unknown') {
+  if (process.env.EXPECTED_STATE === 'readonly-production') {
+    assert.equal(vm.runInContext('predictionServiceIdentity().state',sandbox),'production');
+    assert.match(html,/Production/);
+    assert.match(html,/只读访问/);
+    assert.equal(intervals.includes(30000),true,JSON.stringify(intervals));
+    assert.equal(intervals.includes(5000),false,JSON.stringify(intervals));
+    await assert.rejects(vm.runInContext(
+      'predictionPost("/api/prediction-arbitrage/lp/auto/start",{})',sandbox), /只读访问/);
+    assert.equal(requests.some(request=>request.method==='POST'),false);
+  } else if (process.env.EXPECTED_STATE === 'unknown') {
     assert.match(html,/data-service-identity-status>服务身份 UNKNOWN</);
     vm.runInContext('state.predictionMarket.activeTab="multi_leg";',sandbox);
     vm.runInContext('renderPredictionMarket();',sandbox);

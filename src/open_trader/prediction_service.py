@@ -589,11 +589,12 @@ def create_prediction_server(
                 self._send_unavailable()
                 return
             if parsed.path == "/api/prediction-arbitrage/venues":
+                readonly = self.headers.get("X-Open-Trader-Read-Only") == "true"
                 venues = prediction_venues_payload(
                     store=getattr(runtime, "store", None),
                     monitor=getattr(runtime, "monitor", None),
                     execution=getattr(runtime, "execution", None),
-                    csrf_token="" if mode == "shadow" else prediction_csrf,
+                    csrf_token="" if mode == "shadow" or readonly else prediction_csrf,
                     cross_venue_monitor=getattr(
                         runtime, "cross_venue_monitor", None
                     ),
@@ -606,7 +607,7 @@ def create_prediction_server(
                 self._send_json(
                     HTTPStatus.OK,
                     venues,
-                    set_session=mode == "production",
+                    set_session=mode == "production" and not readonly,
                 )
                 return
             if parsed.path == "/api/prediction-arbitrage/state":

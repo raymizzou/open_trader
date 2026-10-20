@@ -61,6 +61,11 @@ class FrontendGatewayConfig:
     public_origin: str = "http://127.0.0.1:8766"
     upstream_timeout_seconds: float = 30.0
     max_request_body_bytes: int = 20 * 1024 * 1024
+    prediction_access: str = "control"
+    prediction_token_file: Path | None = None
+    prediction_tailnet_host: str = ""
+    prediction_expected_sha: str = ""
+    prediction_expected_mode: str = ""
     prediction_only: bool = False
     prediction_display_upstream_port: int | None = None
 
@@ -142,6 +147,21 @@ def create_frontend_gateway(
     if config.max_request_body_bytes < 0:
         raise ValueError("request body limit must not be negative")
 
+    readonly = config.prediction_access == "read_only"
+    if config.prediction_access not in {"control", "read_only"}:
+        raise ValueError("invalid Prediction access profile")
+    if readonly:
+        from .prediction_readonly_api import client_token, require_tailnet_host, allowed_read_target
+        require_tailnet_host(config.prediction_tailnet_host)
+        if (config.prediction_token_file is None or config.prediction_display_upstream_port is not None
+                or len(config.prediction_expected_sha) != 40
+                or any(c not in "0123456789abcdef" for c in config.prediction_expected_sha)
+                or config.prediction_expected_mode not in {"production", "shadow"}):
+            raise ValueError("read-only access requires token, expected SHA/mode and one upstream")
+        client_token(config.prediction_token_file)
+    elif config.prediction_token_file is not None:
+        raise ValueError("private transport token requires read-only profile")
+
     public_origin = _normalized_origin(config.public_origin)
     upstream_authority = _host_port(config.upstream_host, config.upstream_port)
     upstream_origin = f"http://{upstream_authority}"
@@ -177,6 +197,7 @@ def create_frontend_gateway(
                         "upstream_status": legacy_upstream_status,
                         "legacy_upstream_status": legacy_upstream_status,
                         "account_upstream_status": "disabled" if config.prediction_only else self._account_upstream_status(),
+                        "prediction_access": config.prediction_access,
                         "prediction_only": config.prediction_only,
                         "prediction_split": config.prediction_display_upstream_port is not None,
                         "prediction_display_upstream_port": config.prediction_display_upstream_port,
@@ -199,8 +220,31 @@ def create_frontend_gateway(
                 return
             self._send_error(HTTPStatus.NOT_FOUND, "not_found", "Not found")
 
+        def do_PUT(self) -> None:
+            self._unsupported_method()
+
+        do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = do_CONNECT = do_TRACE = do_PUT
+
+        def _unsupported_method(self) -> None:
+            if readonly and _is_prediction_path(urlsplit(self.path).path):
+                self._send_error(HTTPStatus.METHOD_NOT_ALLOWED, "readonly_method_forbidden", "Read-only access")
+            else:
+                self.send_error(HTTPStatus.NOT_IMPLEMENTED, "Unsupported method")
+
         def _proxy(self) -> None:
             path = urlsplit(self.path).path
+            readonly_route = readonly and _is_prediction_path(path)
+            if readonly_route:
+                if self.command != "GET":
+                    self._send_error(HTTPStatus.METHOD_NOT_ALLOWED, "readonly_method_forbidden", "Read-only access")
+                    return
+                target = self.requestline.split()[1].replace("/execution/identity", "/venues", 1)
+                if not allowed_read_target(target):
+                    self._send_error(HTTPStatus.FORBIDDEN, "readonly_path_forbidden", "Read-only path forbidden")
+                    return
+            elif readonly and "%" in path:
+                self._send_error(HTTPStatus.FORBIDDEN, "readonly_path_forbidden", "Encoded API path forbidden")
+                return
             if config.prediction_only and not _is_prediction_path(path):
                 self._send_error(HTTPStatus.NOT_FOUND, "not_found", "Not found")
                 return
@@ -209,7 +253,7 @@ def create_frontend_gateway(
             )
             display_route = (config.prediction_display_upstream_port is not None
                 and self.command == "GET" and path in _PREDICTION_DISPLAY_PATHS)
-            if not display_route and prediction_route is not None and (prediction_route.mode == "maintenance" or (config.prediction_only and prediction_route.mode != "service")):
+            if not display_route and prediction_route is not None and (prediction_route.mode == "maintenance" or ((config.prediction_only or readonly_route) and prediction_route.mode != "service")):
                 prediction_controller.end()
                 self._send_error(
                     HTTPStatus.SERVICE_UNAVAILABLE,
@@ -290,6 +334,15 @@ def create_frontend_gateway(
                     target_origin=target_origin,
                     account_route=account_route,
                 )
+                if readonly_route:
+                    try:
+                        self._readonly_backend_health()
+                        request_headers = {"Host": target_authority, "Accept": "application/json",
+                            "Authorization": "Bearer " + client_token(config.prediction_token_file)}
+                    except (OSError, ValueError, http.client.HTTPException):
+                        self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "prediction_identity_unavailable",
+                                         "Prediction read-only identity is unavailable")
+                        return
                 if display_route:
                     request_headers = {name: value for name, value in request_headers.items()
                         if name.lower() not in {"cookie", "x-csrf-token", "authorization"}}
@@ -323,6 +376,23 @@ def create_frontend_gateway(
                 finally:
                     connection.close()
 
+                if readonly_route:
+                    if 300 <= status < 400:
+                        self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "prediction_service_unavailable",
+                                         "Prediction redirect refused")
+                        return
+                    try:
+                        from .prediction_readonly_api import strip_auth_capabilities
+                        payload = strip_auth_capabilities(json.loads(response_body))
+                        if not isinstance(payload, dict):
+                            raise ValueError("invalid read-only payload")
+                        payload["access"] = "read_only"
+                        response_body = json.dumps(payload, ensure_ascii=False).encode()
+                        response_headers = [("Content-Type", "application/json"), ("Cache-Control", "no-store")]
+                    except (ValueError, TypeError):
+                        self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "prediction_service_unavailable",
+                                         "Prediction read-only response unavailable")
+                        return
                 excluded = _hop_by_hop_names(response_headers) | {"content-length"}
                 if display_route:
                     excluded.add("set-cookie")
@@ -429,9 +499,35 @@ def create_frontend_gateway(
                 connection.close()
             return "unavailable"
 
+        def _readonly_backend_health(self) -> dict:
+            connection = http.client.HTTPConnection(config.prediction_upstream_host,
+                config.prediction_upstream_port, timeout=config.upstream_timeout_seconds)
+            try:
+                connection.request("GET", "/healthz", headers={
+                    "Authorization": "Bearer " + client_token(config.prediction_token_file)})
+                response = connection.getresponse()
+                payload = json.loads(response.read())
+                expected = dict(module="prediction_service", status="running", access="read_only",
+                    git_sha=config.prediction_expected_sha, source_state="clean",
+                    mode=config.prediction_expected_mode,
+                    production_owner=config.prediction_expected_mode == "production",
+                    mutations="enabled" if config.prediction_expected_mode == "production" else "prohibited")
+                if response.status != 200 or not isinstance(payload, dict) or any(
+                        payload.get(key) != value for key, value in expected.items()):
+                    raise ValueError("Prediction backend identity mismatch")
+                return payload
+            finally:
+                connection.close()
+
         def _prediction_upstream_status(self, route: _PredictionRoute) -> str:
             if route.mode in {"legacy", "maintenance"}:
                 return route.mode
+            if readonly:
+                try:
+                    self._readonly_backend_health()
+                    return "ok"
+                except (OSError, ValueError, http.client.HTTPException):
+                    return "unavailable"
             connection = http.client.HTTPConnection(
                 config.prediction_upstream_host,
                 config.prediction_upstream_port,
@@ -460,8 +556,10 @@ def create_frontend_gateway(
                 self._send_error(HTTPStatus.NOT_FOUND, "not_found", "Not found")
                 return
             body = path.read_bytes()
+            if readonly and path.name == "index.html":
+                body = body.replace(b"<body>", b'<body data-prediction-access="read_only">', 1)
             if config.prediction_only and path.name == "index.html":
-                body = body.replace(b"<body>", b'<body data-prediction-only="true">', 1)
+                body = body.replace(b"<body", b'<body data-prediction-only="true"', 1)
             if config.prediction_display_upstream_port is not None and path.name == "index.html":
                 body = body.replace(b"<body>", b'<body data-prediction-split="true">', 1)
             self.send_response(HTTPStatus.OK)
@@ -548,6 +646,11 @@ def serve_frontend_gateway(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="open-trader frontend-gateway")
     parser.add_argument("--prediction-only", action="store_true")
+    parser.add_argument("--prediction-access", choices=["control", "read_only"], default="control")
+    parser.add_argument("--prediction-token-file", type=Path)
+    parser.add_argument("--prediction-tailnet-host", default="")
+    parser.add_argument("--prediction-expected-sha", default="")
+    parser.add_argument("--prediction-expected-mode", choices=["production", "shadow"], default="")
     parser.add_argument("--prediction-display-upstream-port", type=int)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
@@ -570,6 +673,11 @@ def main(argv: list[str] | None = None) -> int:
         config=FrontendGatewayConfig(
             static_dir=args.static_dir,
             prediction_only=args.prediction_only,
+            prediction_access=args.prediction_access,
+            prediction_token_file=args.prediction_token_file,
+            prediction_tailnet_host=args.prediction_tailnet_host,
+            prediction_expected_sha=args.prediction_expected_sha,
+            prediction_expected_mode=args.prediction_expected_mode,
             prediction_display_upstream_port=args.prediction_display_upstream_port,
             upstream_host=args.upstream_host,
             upstream_port=args.upstream_port,

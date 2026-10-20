@@ -1,6 +1,7 @@
 """Local Prediction Gateway and one owned SSH tunnel; never starts the backend."""
 import argparse
 import fcntl
+import http.client
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,8 @@ def client_ports(c):
     defaults = {'production':(8766,8769), 'shadow':(8876,8879)}
     if 'execution_port' in c:
         defaults['shadow'] = (8766,8879)
+    if c.get('access') == 'read_only':
+        defaults[c['mode']] = (8766, 18879)
     gateway_port = c.get('gateway_port', defaults[c['mode']][0])
     tunnel_port = c.get('tunnel_port', defaults[c['mode']][1])
     if (type(gateway_port) is not int or type(tunnel_port) is not int
@@ -32,7 +35,7 @@ def client_ports(c):
 
 def validate(c):
     if not {'release_root','runtime_root','python','ssh_alias','expected_sha','mode'} <= set(c) \
-       or set(c) - {'release_root','runtime_root','python','ssh_alias','expected_sha','mode','gateway_port','tunnel_port','execution_port','execution_expected_sha','cloud_expected_sha'}:
+       or set(c) - {'release_root','runtime_root','python','ssh_alias','expected_sha','mode','gateway_port','tunnel_port','execution_port','execution_expected_sha','cloud_expected_sha','remote_port','access','token_file','ssh_user','ssh_identity_file'}:
         raise ValueError('invalid client config keys')
     for key in ('release_root','runtime_root','python'):
         if not re.fullmatch(r'/[A-Za-z0-9_./-]+', c[key]) or '..' in Path(c[key]).parts:
@@ -48,6 +51,24 @@ def validate(c):
             or not 1024 <= c['execution_port'] <= 65535
             or not re.fullmatch(r'[0-9a-f]{40}', c.get('execution_expected_sha', ''))):
             raise ValueError('split display requires Shadow and explicit Air execution port/SHA')
+    if 'ssh_user' in c and not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]{0,31}', c['ssh_user']):
+        raise ValueError('invalid SSH user')
+    if 'ssh_identity_file' in c and (not re.fullmatch(r'/[A-Za-z0-9_./-]+', c['ssh_identity_file'])
+            or '..' in Path(c['ssh_identity_file']).parts):
+        raise ValueError('absolute SSH identity path required')
+    if c.get('access', 'control') not in {'control', 'read_only'}:
+        raise ValueError('invalid client access profile')
+    remote_port = c.get('remote_port', 8770 if c.get('access') == 'read_only' else 8769)
+    if type(remote_port) is not int or not 1 <= remote_port <= 65535:
+        raise ValueError('invalid remote port')
+    if c.get('access') == 'read_only':
+        from .prediction_readonly_api import require_tailnet_host, client_token
+        require_tailnet_host(c['ssh_alias'])
+        if 'execution_port' in c or not Path(c.get('token_file', '')).is_absolute():
+            raise ValueError('read-only client requires a private token file and one backend')
+        client_token(Path(c['token_file']))
+    elif 'token_file' in c:
+        raise ValueError('token file requires read-only profile')
     client_ports(c)
     a, b = Path(c['release_root']).resolve(), Path(c['runtime_root']).resolve()
     if a.is_relative_to(b) or b.is_relative_to(a):
@@ -127,7 +148,7 @@ def status(c, state):
     if any(not state.get(k) or not same_process(state[k]) for k in ('ssh','gateway')):
         raise ValueError('client process missing')
     gateway_port, tunnel_port = client_ports(c)
-    gateway, backend = read_json(gateway_port), read_json(tunnel_port)
+    gateway, backend = read_json(gateway_port), backend_health(c)
     split = 'execution_port' in c
     if (gateway.get('pid') != state['gateway']['pid'] or gateway.get('prediction_only') is not (not split)
         or (split and (gateway.get('prediction_split') is not True
@@ -140,6 +161,9 @@ def status(c, state):
     for health, expected in ((gateway, c['expected_sha']), (backend, c.get('cloud_expected_sha', c['expected_sha']))):
         if health.get('git_sha') != expected or health.get('source_state') != 'clean':
             raise ValueError('client/backend release mismatch')
+    if c.get('access') == 'read_only' and (gateway.get('prediction_access') != 'read_only'
+            or backend.get('access') != 'read_only'):
+        raise ValueError('read-only access identity mismatch')
     manifest = client_release(c)
     mode_identity = (
         dict(mode='shadow',production_owner=False,mutations='prohibited',first_violation=None)
@@ -177,6 +201,51 @@ def status(c, state):
             'url':f'http://127.0.0.1:{gateway_port}/', 'gateway_port':gateway_port, 'tunnel_port':tunnel_port}
 
 
+def backend_health(c):
+    if c.get('access') != 'read_only':
+        return read_json(client_ports(c)[1])
+    from .prediction_readonly_api import client_token
+    connection = http.client.HTTPConnection('127.0.0.1', client_ports(c)[1], timeout=10)
+    try:
+        connection.request('GET', '/healthz', headers={
+            'Authorization': 'Bearer ' + client_token(Path(c['token_file']))})
+        response = connection.getresponse()
+        value = json.loads(response.read())
+        if response.status != 200 or not isinstance(value, dict) or value.get('access') != 'read_only':
+            raise ValueError('read-only adapter unavailable')
+        return value
+    finally:
+        connection.close()
+
+
+def client_commands(c, route):
+    gateway_port, tunnel_port = client_ports(c)
+    readonly = c.get('access') == 'read_only'
+    remote_port = c.get('remote_port', 8770 if readonly else 8769)
+    return {
+        'ssh':['ssh','-NT','-o','ControlMaster=no','-o','ControlPath=none','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',
+               '-o','ForwardAgent=no','-o','ExitOnForwardFailure=yes','-o','ConnectTimeout=10',
+               '-o','ServerAliveInterval=30','-o','ServerAliveCountMax=3',
+               '-L',f'127.0.0.1:{tunnel_port}:127.0.0.1:{remote_port}',
+               *(['-l', c['ssh_user']] if 'ssh_user' in c else []),
+               *(['-i', c['ssh_identity_file'], '-o', 'IdentitiesOnly=yes'] if 'ssh_identity_file' in c else []),
+               *(['-F','/dev/null','-o',f'Hostname={c["ssh_alias"]}',
+                      '-o','ProxyCommand=none','-o','ProxyJump=none',
+                      '-o','CanonicalizeHostname=no','-o','PermitLocalCommand=no'] if readonly else []), c['ssh_alias']],
+        'gateway':[c['python'],'-m','open_trader','frontend-gateway',
+                   *([] if 'execution_port' in c else ['--prediction-only']),
+                   '--host','127.0.0.1','--port',str(gateway_port),
+                   '--public-origin',f'http://127.0.0.1:{gateway_port}',
+                   '--prediction-upstream-port',str(c.get('execution_port', tunnel_port)),
+                   *(['--prediction-display-upstream-port',str(tunnel_port)] if 'execution_port' in c else []),
+                   *(['--prediction-access','read_only','--prediction-token-file',c['token_file'],
+                          '--prediction-tailnet-host',c['ssh_alias'],
+                          '--prediction-expected-sha',c.get('cloud_expected_sha', c['expected_sha']),
+                          '--prediction-expected-mode',c['mode']] if readonly else []),
+                   '--prediction-route-state',str(route),'--static-dir',c['release_root']+'/src/open_trader/dashboard_static'],
+    }
+
+
 def client_operation(c, action):
     validate(c)
     root = Path(c['runtime_root'])
@@ -206,19 +275,7 @@ def client_operation(c, action):
         route = root/'prediction-route.json'
         route.write_text(json.dumps(dict(schema_version='open_trader.frontend_gateway.prediction_route.v1',
             mode='service',operation_id='prediction-cloud-client',updated_at=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()))))
-        commands = {
-            'ssh':['ssh','-NT','-o','ControlMaster=no','-o','ControlPath=none','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',
-                   '-o','ForwardAgent=no','-o','ExitOnForwardFailure=yes','-o','ConnectTimeout=10',
-                   '-o','ServerAliveInterval=30','-o','ServerAliveCountMax=3',
-                   '-L',f'127.0.0.1:{tunnel_port}:127.0.0.1:8769',c['ssh_alias']],
-            'gateway':[c['python'],'-m','open_trader','frontend-gateway',
-                       *([] if 'execution_port' in c else ['--prediction-only']),
-                       '--host','127.0.0.1','--port',str(gateway_port),
-                       '--public-origin',f'http://127.0.0.1:{gateway_port}',
-                       '--prediction-upstream-port',str(c.get('execution_port', tunnel_port)),
-                       *(['--prediction-display-upstream-port',str(tunnel_port)] if 'execution_port' in c else []),
-                       '--prediction-route-state',str(route),'--static-dir',c['release_root']+'/src/open_trader/dashboard_static'],
-        }
+        commands = client_commands(c, route)
         state = {'config':c}
         children = {}
         try:
@@ -247,7 +304,7 @@ def client_operation(c, action):
                 if key == 'ssh':
                     while True:
                         try:
-                            health = read_json(tunnel_port)
+                            health = backend_health(c)
                             if health.get('git_sha') != c.get('cloud_expected_sha', c['expected_sha']):
                                 raise ValueError('backend SHA mismatch')
                             break

@@ -699,3 +699,116 @@ bash scripts/prediction-client.sh status --config '<private-client-json>'
 
 新会话必须重新读 inventory 与所选发布 runbook，刷新外部/主机状态。不能把
 本次历史 `HEALTHY`、旧 SHA 或临时 helper 的存在当作当前成功。
+
+## P2：tailnet 只读 Dashboard（计划功能，尚未部署）
+
+此入口只提供读取能力，不迁移 owner，不启动 PredictionRuntime，也不直接打开
+数据库或读取交易凭据。Tokyo 加入 tailnet、安装 adapter、SSH key/ACL 与服务用户
+隔离、mini/Air 安装或切换均须 Ray 另行批准；本节不是安装授权，现有云端门禁也
+不因此成为新拓扑的验收证据。
+
+计划链路为 mini/Air 本地 Gateway → tailnet SSH → Tokyo `127.0.0.1:8770`
+只读 adapter → 已运行的 `127.0.0.1:8769` Prediction 服务。adapter CLI 为：
+
+```sh
+python -m open_trader prediction-readonly-api --token-file /PRIVATE-DIR/readonly-tokens.json
+```
+
+默认 bind 为 `127.0.0.1:8770`，拒绝非 loopback bind；上游固定为本机 8769。
+adapter 应使用独立、无交易凭据目录读取权的 UID。部署前必须实际证明该 UID
+不能读取凭据/DB，并验证 tailnet ACL 只允许指定客户端到 SSH，Dashboard key 只能
+`PermitOpen=127.0.0.1:8770`，禁止 shell/PTY/agent/X11/remote forwarding；禁止
+Tokyo 主动连接 mini/Air，不公开 8769/8770，不用公网 SSH alias 代替 tailnet。
+这些主机权限与网络条件尚未现场验证。
+
+**P2 尚有 GET 审计阻断项**：`/lp/dashboard` 与 `/lp/auto/state` 的 D2 投影
+调用 `settings_status()`，后者可能收集已完成的设置保存并发布 effective policy。
+当前尚无 observe-only 状态投影合同；在此项闭环前不能把 allowlist 宣称为严格
+无状态写入，也不能验收或部署 P2。该发现来自源码审计，未做运行时复现；本批次
+未扩大修改设置保存、发布或交易行为。
+
+每个客户端独立保存随机 URL-safe bearer token（至少 32 字节随机源），Gateway
+的 `token_file` 只保存 token 文本；adapter registry 是 JSON 对象，键为 `mini`、
+`air` 等 client id，值为该 token UTF-8 字节的 SHA-256 小写十六进制摘要。
+两种文件均须由对应进程 UID 拥有、0600、单硬链接、非符号链接，直接父目录
+0700 且同 UID。不要把 token 放入命令行、URL、HTML/JS、Git 或日志。
+registry 每请求重读，删除一个 client id 后该客户端下一请求即 401；其他客户端
+不受影响。用私有临时文件原子替换并保持权限，损坏/缺失/权限错误均拒绝访问。
+
+Air 使用既有客户端模块管理单条 tunnel 和 Prediction-only Gateway，不使用
+stack installer 启动股票服务。示例配置仅含占位符，不含 token：
+
+```json
+{
+  "release_root": "/PATH/TO/IMMUTABLE-RELEASE",
+  "runtime_root": "/PATH/TO/PRIVATE-CLIENT-RUNTIME",
+  "python": "/PATH/TO/QUALIFIED-PYTHON",
+  "ssh_alias": "tokyo.EXAMPLE.ts.net",
+  "ssh_user": "readonly",
+  "ssh_identity_file": "/PATH/TO/DEDICATED-SSH-KEY",
+  "expected_sha": "CLIENT_RELEASE_FULL_SHA",
+  "cloud_expected_sha": "BACKEND_RELEASE_FULL_SHA",
+  "mode": "shadow",
+  "access": "read_only",
+  "token_file": "/PRIVATE-DIR/readonly-token",
+  "gateway_port": 8766,
+  "tunnel_port": 18879,
+  "remote_port": 8770
+}
+```
+
+```sh
+python -m open_trader.prediction_client start --config /PRIVATE-DIR/prediction-client.json
+python -m open_trader.prediction_client status --config /PRIVATE-DIR/prediction-client.json
+python -m open_trader.prediction_client stop --config /PRIVATE-DIR/prediction-client.json
+```
+
+`ssh_alias` 在此 profile 必须是 `100.64.0.0/10` 内 IPv4 或完整 `*.ts.net` 名称，
+不接受普通 SSH alias、公网地址、localhost 或 split execution 配置。只读 tunnel
+忽略用户 SSH config，并固定 Hostname、禁用 ProxyCommand/ProxyJump；需要用户或
+专用 key 时显式填写上述两个 SSH 字段。私钥由操作员管理，程序不读入其内容。
+`mode` 是预期的真实后端 mode；P2 不授权 production 部署。普通 profile 默认
+remote port 8769、原有客户端端口/认证行为不变；只读 profile 默认 8770 和独立
+本地 tunnel port 18879。已有监听者/身份不符会阻断，不接管本机服务。
+
+完整 mini Gateway 可保留所有股票/账户路由，单独把整个 Prediction 前缀切到
+只读通道。Gateway CLI 使用 `--prediction-access read_only`、
+`--prediction-token-file /PRIVATE-DIR/readonly-token`、
+`--prediction-tailnet-host tokyo.EXAMPLE.ts.net`、
+`--prediction-expected-sha FULL_SHA`、`--prediction-expected-mode shadow` 和
+`--prediction-upstream-port 18879`；Air 还加 `--prediction-only`。route record
+仍须为 `service`，保留原 schema，不添加 URL。只读 profile 禁止 split display
+配置，legacy/maintenance route 不会把 Prediction 请求转给本地服务。
+installer/template 新增 `--prediction-upstream-port PORT`（默认仍 8769），只配置
+本地上游端口；这个选项本身不建立隧道、不启用只读 profile。不要只改端口后
+宣称完成只读切换。Air 不需要运行该 installer。
+
+GET allowlist（除 `/healthz` 外均带 `/api/prediction-arbitrage` 前缀）：
+
+| 路径 | 审计依据与边界 |
+| --- | --- |
+| `/healthz` | 读取真实运行身份；owner/mode/SHA 不改写。 |
+| `/venues` | 现有缓存/只读账户投影；adapter 发送只抑制 cookie/CSRF 输出的 header，普通 mini bootstrap 不变。 |
+| `/lp/dashboard` | 既有后台快照；附带 D2 auto 投影可能发布已完成设置，须先关闭上述阻断项。 |
+| `/lp/account/trades` | 既有后台账户成交缓存；只接受单次 `offset`（非负、最多九位）与 `limit`（1–100）。 |
+| `/lp/auto/state`、`/lp/auto/reservations` | state 存在上述 D2 设置发布阻断项；reservations 为状态投影。保留 UNKNOWN 与原新鲜度字段。 |
+| `/lp/auto/reports`、`/lp/auto/reports/YYYY-MM-DD` | 当前 reporting pause 响应，不生成或恢复报表 worker。 |
+| `/lp/reports/YYYY-MM-DD` | 仅读取已有不可变日报；ISO 日期必须有效，无自动回填。 |
+
+所有其他 query/path、编码路径、绝对 URL、重定向和非 GET 方法均拒绝。
+`/execution/identity` 仅由 Gateway 映射至 `/venues`；
+`/lp/sessions/current` 完全拒绝透传。adapter 不把 bearer、Cookie 或 CSRF 送给
+核心服务，移除响应 cookie/header 与嵌套认证能力字段；业务 `session_id` 保留。
+Gateway 在服务端覆盖 transport token，不接受浏览器提供的 token 作为替代。
+
+Gateway 每次读取前核对 adapter health 的精确 SHA、clean source、mode 和 owner
+状态。错误身份、断线返回结构化 503；撤销 token 返回 401（health 验证失败时
+Gateway 返回 503），不回退到本地 8769、legacy 或其他实例。UI 显示真实
+Production/Shadow 与独立的只读访问状态，所有 Prediction 写入口关闭；读取失败
+保留旧时间并标 stale/UNKNOWN。核心写门禁没有放宽。
+
+只读页面改为 30 秒轮询，复用既有页面内 in-flight 去重；没有新增响应缓存，
+不会将旧结果伪装新鲜或跨 owner/client 共享。与旧 5 秒周期相比，固定活跃页面
+的周期触发次数理论上减少 5/6；实际 payload、出网与并发峰值未测，不能把这个
+比例当作流量/内存节省证据。adapter 单次上游响应读取上限 64 MiB，超限失败。跨页面合并、
+摘要/增量 API 和进一步内存优化留待实测后另批。
