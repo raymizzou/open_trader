@@ -13,6 +13,44 @@ subject to its explicit local-only/no-push/do-not-publish/draft overrides.
 GitHub merge, release/tag creation, cloud provisioning, deployment and trading
 retain separate authorization boundaries. The client never starts the cloud backend.
 
+## Tokyo scope and implementation status — 2026-10-20
+
+For Tokyo, the [decision baseline](prediction-tokyo-deployment-sop.md#0-tokyo-decision-baseline--2026-10-20)
+takes precedence over older migration examples here. P1 documentation and P2
+read-only access implementation are approved; no live cutover is approved.
+The current phase is read-only access plus authenticated paused Shadow, with
+the mini as sole live writer. An authenticated run still needs separate
+authorization and verified prerequisites: Ray handles the existing credential
+file, old unit/releases/launchers are blocked, and tat_agent/SSH lockdown is
+complete. These security and credential actions remain pending Ray decisions.
+
+Ray chose a restricted file imported by Ray for the same-wallet target.
+Current cloud code accepts file credentials only for paused Shadow; production
+still requires SSM. The production file profile is a future P3, not an
+implemented capability. P3 and P4 owner-handoff work wait for Ray's geography
+decision, real-path gate approval and separate implementation approval.
+The 2026-10-19 record reports `/api/geoblock` `blocked=true` for JP. API docs
+and Help Center descriptions conflict; this edit did not refresh them. Keep
+production `--require-trading-region` unchanged. Do not use HK egress to evade
+the gate; a past accepted probe order does not override it.
+
+**Planned in P2, not deployed:** mini/Air loopback Gateways use a Tailscale-only
+SSH tunnel (`127.0.0.1:18879`) to a separate Tokyo read-only adapter at
+`127.0.0.1:8770`, not directly to core `127.0.0.1:8769`. Use per-client private
+tokens, audited GET paths with no session creation, and real owner/mode/SHA
+with separate read-only access. Failure returns structured 503 and
+stale/UNKNOWN state, with no local/Legacy fallback or backend start. Select
+the target by deployment configuration, not a page switch or URL in route JSON.
+The older client and #204 split-display examples below do not provide this
+new security boundary or a Tokyo owner transfer.
+
+Do not migrate history DB/WAL, reports or full runtime. Tokyo re-accumulates;
+its planned Dashboard must show the history boundary and incomplete/UNKNOWN
+results. Keep old mini history locally. The cross-host tombstone versus
+registry choice, mini release to prevent retired-host relaunch, restart policy
+and notifications remain pending Ray decisions. No such mechanism is supplied
+by a local file lock or by this document.
+
 ## Optional LP candidate exclusion cooldowns
 
 The first release is an opt-in cloud optimization. Add the strictly boolean,
@@ -97,6 +135,11 @@ that a 704 MiB limit will be met. Tests are in
 
 ## Credentials: service-owned file or Tencent SSM
 
+Ray's chosen Tokyo target is the restricted file. The instructions below
+describe current paused-Shadow file support and compatible SSM support;
+they do not implement production file support or authorize a credential import.
+Apply the Tokyo authentication prerequisites above before any read-auth or start.
+
 For the #202 paused Shadow API probe, use an operator-imported JSON bundle at
 `/var/lib/open-trader/prediction-credentials/polymarket.json`. The parent directory
 must be owned by `prediction` with mode `0700`; the regular file must be owned
@@ -104,7 +147,7 @@ by `prediction` with mode `0600`. The reader rejects symlinks, invalid owners,
 permissions and fields. Keep the bundle outside Git, the release, logs and
 systemd environment; the unit contains only its path. The source credentials
 are in the Mac Keychain; `prediction_arbitrage.json` does not contain them.
-The operator performs the separate one-time private import. Do not run wallet
+Ray performs the separate one-time private import. Do not run wallet
 setup or create, replace or revoke an API key for this probe.
 
 The file backend is explicit: `OPEN_TRADER_CREDENTIAL_BACKEND=file` and
@@ -181,6 +224,12 @@ production owner running and does not migrate its history or runtime data.
 The following handoff procedure applies only to a later authorized trading
 cutover under #203.
 
+For Tokyo, retain local history and start a fresh cloud runtime. Review only
+an explicit allowlist of non-secret account/strategy settings and start durably
+paused. Do not copy old running intent, startup permits, locks or release/PID
+records, or promote the old Tokyo Shadow DB. Dashboard history starts at the
+new source/epoch and must be marked incomplete; missing history is not zero.
+
 A filesystem lock protects one host only. Before a new production owner starts,
 identify the old service, immutable SHA, wallet addresses and authoritative
 runtime root. Reconcile all orders, positions, pending intents and UNKNOWN
@@ -189,23 +238,55 @@ or invent an empty account. Stop the old owner only with deployment/cutover
 authorization and prove the process, listener and lock are gone. Disable its
 automatic restart for the handoff; do not allow two hosts to trade the same wallet.
 
-While the old owner is stopped, copy the complete Prediction runtime data and
-non-secret configuration, retaining a timestamped backup and hashes. For an
-online SQLite backup, use Python `sqlite3.Connection.backup()` with a read-only
-source URI, then `PRAGMA integrity_check` on the backup. Never copy only the main
-SQLite file while WAL writers are active. Final cutover uses a stopped snapshot
-so databases, related files and runtime settings agree. Do not transfer Keychain
-exports or a host-specific ready/PID record as proof of the new host's identity.
+### Historical full-runtime path — superseded for Tokyo
 
-Restore only while the relevant owner is stopped and its lock is free. Preserve
-the failed runtime for audit, restore a verified consistent snapshot, and inspect
-reader/contract generation before choosing a compatible immutable release.
-A database snapshot can be older than exchange facts: re-reconcile before any
-trading resumes. Stopping the service does not cancel exchange orders.
+The following earlier instructions are retained for history. **Do not execute
+them for the Tokyo migration**; #203 chose no history/full-runtime migration.
+
+> While the old owner is stopped, copy the complete Prediction runtime data and
+> non-secret configuration, retaining a timestamped backup and hashes. For an
+> online SQLite backup, use Python `sqlite3.Connection.backup()` with a read-only
+> source URI, then `PRAGMA integrity_check` on the backup. Never copy only the main
+> SQLite file while WAL writers are active. Final cutover uses a stopped snapshot
+> so databases, related files and runtime settings agree. Do not transfer Keychain
+> exports or a host-specific ready/PID record as proof of the new host's identity.
+>
+> Restore only while the relevant owner is stopped and its lock is free. Preserve
+> the failed runtime for audit, restore a verified consistent snapshot, and inspect
+> reader/contract generation before choosing a compatible immutable release.
+> A database snapshot can be older than exchange facts: re-reconcile before any
+> trading resumes. Stopping the service does not cancel exchange orders.
+
+Local consistent backups remain recovery assets on their source host; they are
+not the Tokyo handoff payload. Under D3, immutable in-memory snapshots can be
+newer than persisted history. D2 CurrentLPState and fresh exchange facts govern
+trading; missing history stays incomplete/UNKNOWN. Preserve D3 write priority,
+FIFO, BEGIN-only retries, no body/COMMIT replay and the D2 control-save deadline.
+
+The cross-host handoff is pending Ray's tombstone versus registry choice. Before
+transfer, block new writes, save pause, drain actual native/HTTP work, disable
+restart sources and prove old process/children/listener/locks absent. Local
+locks do not span hosts. Reconcile open orders, positions, trades, funds,
+pending intents, UNKNOWN receipts and reservations; unknown obligations block
+takeover. No automatic failover or extra cancel-all/close-all is authorized.
+
+D2 round0 cancels all BUYs, including manual BUYs, and re-places under current
+rules on startup/resume. SELLs and positions are untouched by restart cleanup.
+An approved cutover/resume must explicitly cover this BUY effect; do not add
+a separate blanket cancellation or replay an old plan.
+
+Rollback is reverse handoff: fence and stop Tokyo, prove actual drain/absence,
+reconcile exchange facts, then explicitly authorize and arm the mini. A URL
+change or DB restore cannot transfer ownership. The proposed rollback anchor
+is a separately authorized and accepted mini release with retired-host
+protection and D2/D3, not an arbitrary old binary. Its release/restart/round0
+authorization and exact SHA are still pending. Preserve failed runtime and
+history separately; unknown ownership blocks restart.
 
 ## Acceptance boundary
 
-Development uses affected-service Docker checks and applicable security checks.
+Development uses focused affected-nodeid checks and applicable security checks.
+Docker is optional; documentation-only changes use the runbook exemption.
 Use the [PR-first delivery flow](agent-verification.md#first-reviewable-implementation):
 Main's task-only stage/commit/push and normal PR under standing authorization
 without another push/PR question, then independent review and CI. In-scope
@@ -285,7 +366,9 @@ automatically, and selecting another mode requires the matching stopped-owner,
 credential, readiness and authorization gates. The helper also accepts simple
 alphanumeric/dash/underscore SSM references and absolute paths without spaces or
 systemd specifiers. Use those names when creating the dedicated credential.
-Production and non-paused Shadow continue to require those four SSM references.
+Current production and non-paused Shadow continue to require those four SSM
+references. This is an implementation limit, not a change to Ray's chosen
+restricted-file target.
 Credentialless paused Shadow requires them to be omitted, pins
 `OPEN_TRADER_CREDENTIAL_BACKEND=disabled`, and never touches Keychain, SSM or
 instance metadata.
@@ -294,9 +377,11 @@ enabling any trading strategy.
 
 For #202, supply only the same-wallet non-secret
 `config/prediction_arbitrage.json` in the independent runtime; do not copy
-local history or trading runtime data. A later #203 trading cutover requires
-the ownership handoff and consistent data backup described above. Notification
-and LLM provider configuration are not automatically imported from the Mac.
+local history or trading runtime data. A later #203 Tokyo cutover also does not
+migrate history or full runtime; it requires the pending ownership design and
+fresh reconciliation described above. Local backups stay on their source host.
+Notification and LLM provider configuration are not automatically imported from
+the Mac.
 
 From the accepted release on CVM, with `OPEN_TRADER_PYTHON` set to that release's
 venv Python, the operator can run:
@@ -354,6 +439,9 @@ and both the listener and runtime lock are absent. A live unknown owner remains
 BLOCKED and requires inspection. Autostart at host boot is a separate operator decision:
 only after Smoke passes, `systemctl enable open-trader-prediction.service` enables
 it. The installer does not silently enable trading after a future reboot.
+For the Tokyo target, restart/boot policy is still pending Ray's decision.
+`Restart=no` with boot disabled is the proposed first production policy, not
+an implemented production profile or approval to enable the unit after Smoke.
 
 View logs with `journalctl -u open-trader-prediction.service --since today`.
 The shared runtime holds `prediction-systemd-release.json` and prior unit backups.
@@ -413,6 +501,11 @@ changed PID blocks signaling. A broken connection reports BLOCKED; inspect
 Closing the browser or stopping this client leaves the cloud service running.
 
 ## #204: cloud display with Air execution
+
+This is the existing split-display workflow, not Tokyo P2 deployment evidence.
+For Tokyo, use the planned single-source read-only path above; do not use a
+display-only route change as an owner handoff. P2 must add its own read-only
+capability and history-boundary display; #204 does not supply those contracts.
 
 The complete Air Dashboard can use a paused, authenticated cloud Shadow for
 selected display reads while the existing Air Prediction remains the sole

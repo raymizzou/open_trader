@@ -11,9 +11,149 @@ N-leg 暂停的 Shadow；它不接管原生产实例，不提交订单。购买�
 [依赖规则](dependency-reproducibility.md)。使用所选发布自己的脚本和规则。
 下列命令由获得授权的操作员执行；占位符必须替换，不能直接照抄为实际证据。
 
+## 0. Tokyo decision baseline — 2026-10-20
+
+This section takes precedence over older Tokyo migration instructions below.
+It aligns [#203](https://github.com/raymizzou/open_trader/issues/203) and the
+D3 decision in [#347](https://github.com/raymizzou/open_trader/issues/347#issuecomment-6259928381)
+with Ray's approved Tokyo plan. P1 changes documentation only. P2 implements
+read-only access in a separate PR. **The P2 topology is planned, not deployed.**
+This document does not authorize a host change, authenticated run or trade.
+
+### Phase and pending decisions
+
+The current phase is read-only access plus authenticated paused Shadow
+validation. The mini remains the sole live writer. Tokyo Shadow must report
+its real Shadow identity; its data is not evidence of live operation.
+Only P1 and P2 implementation are approved. Each host change, client deployment
+and authenticated Shadow start needs its own applicable authorization and gates.
+
+The following remain pending Ray decisions: geography/live trading, disposition
+of existing Tokyo credentials, tat_agent/SSH lockdown, the cross-host owner
+design, the mini release that prevents retired-host relaunch, restart/boot
+policy, and notifications. P3 production-file and P4 owner-handoff implementation
+must wait for the geography decision, the real-path gate and separate approval.
+No live cutover is approved. Capacity (#313), metadata (#320) and D3 production
+observation remain separate acceptance requirements; this edit closes none.
+
+### Credentials and prerequisites for any authenticated Tokyo run
+
+Ray chose the same wallet and a restricted-file credential backend for the
+target deployment. Ray imports secrets privately. SSM remains compatible, but
+is not the chosen target dependency. **The production file profile is not
+implemented.** Current `prediction_cloud.py::render_unit()` accepts file
+credentials only for `mode=shadow` with `n_leg_paused=1`; production still
+requires SSM. Do not remove that restriction by changing configuration alone.
+
+Before any new authenticated Tokyo run, including paused Shadow:
+
+1. Ray must privately decide whether to verify and retain, rotate/revoke, or
+   delete the existing credential file. Record only redacted disposition and
+   ownership evidence. Agents must not read or transfer secret values.
+2. Block the old failed/disabled unit, old releases and every other launcher
+   that can reach the same credentials. A disabled unit alone is not proof.
+   Verify that no residual process can use those startup paths.
+3. Complete separately authorized tat_agent and SSH lockdown. Verify removal
+   or restriction of agent command execution, effective SSH restrictions and
+   a trusted rescue path. Accepting an unverified root command channel is not
+   a substitute for this prerequisite.
+
+These steps are prerequisites, not completed work or approval to perform them.
+Keep the credential file outside release/runtime/log/backup paths, in a
+prediction-owned 0700 directory with a 0600 regular file. Invalid credentials
+fail closed with no fallback. Read-auth success does not resolve possible
+credential exposure, ownership, geography or capacity issues.
+
+### Planned P2 read-only path — not deployed
+
+The planned path is browser → local Gateway → Tailscale-only SSH tunnel →
+Tokyo read-only adapter. Prediction stays at `127.0.0.1:8769`; the separate
+adapter binds `127.0.0.1:8770` and can reach only that fixed local service.
+The mini/Air tunnel binds `127.0.0.1:18879` and forwards only to the adapter.
+Gateways stay at `127.0.0.1:8766` (parallel validation: `8876`). The mini keeps
+its full non-Prediction Dashboard; Air uses a Prediction-only Gateway.
+
+Use distinct per-client read-only tokens, held in private server-side files.
+Tokens must not enter browser code/storage, URLs, argv, Git or logs. Restrict
+the SSH key to forwarding to `127.0.0.1:8770`, without shell or other forwarding.
+The adapter must use a separate identity that cannot read wallet credentials.
+Allow only audited GET paths and queries. Exclude session creation such as
+`/lp/sessions/current`; GET alone does not prove absence of side effects.
+Do not forward cookies, CSRF capabilities or trading requests. Show real
+owner/mode/SHA plus separate read-only access; disable all write controls.
+
+Select the backend through deployment configuration, with no in-page switch.
+Keep the route-state schema unchanged; do not put a URL in route JSON.
+An unavailable or wrong-identity backend must fail closed with structured 503
+and stale/UNKNOWN display state. Never fall back to local `8769`, Legacy or
+an old database, or start a backend automatically. Do not expose 8769/8770 or
+the database publicly. Planned tailnet ACLs deny new Tokyo connections to
+other peers; they do not provide a Polymarket exit node or HK egress path.
+Enrollment, ACLs, tokens and client deployment need separate verification.
+The older direct-to-8769 client examples below are not the P2 access profile.
+
+### History, D2 and D3
+
+Do not migrate the history database, WAL, reports, queues or full runtime to
+Tokyo. Do not copy release/PID records, locks, startup permits or running intent.
+Retain mini history locally; Tokyo re-accumulates in a new isolated runtime.
+Review only an explicit allowlist of non-secret account/strategy settings and
+start durably paused. Do not promote old Tokyo Shadow data into production.
+
+The planned Dashboard must show the source instance, cutover/history start
+and incomplete history. Pre-migration history and unavailable cumulative
+results are missing/UNKNOWN, never zero or a continuous merged return series.
+These display changes belong to P2 and later acceptance, not this docs edit.
+D3 readers use immutable in-memory snapshots; background persistence can lag
+or drop pending history on exit. A database copy cannot prove current trading
+or funds authority. D2 CurrentLPState remains the sole trading authority.
+
+Preserve D3's single same-process database write permit, reliable/control
+priority and FIFO within a priority. Retry only BEGIN, at most three times
+with a 5000 ms bound per attempt; never replay the body or COMMIT. Permit wait
+counts toward the D2 10-second control-save limit. Keep lock order
+`permit → commit_guard/competition lock → queue lock`; never acquire the
+permit while holding the memory lock. Background lanes remain bounded at
+3000 entries or 16 MiB and drop the oldest pending item. Missing history stays
+incomplete/UNKNOWN. Daily reports remain paused; no strategy is added or enabled.
+
+Exchange open orders are the only authority for current orders. Fresh complete
+positions, trades, balance and allowance are also required. Pending intents,
+UNKNOWN receipts and reservations remain obligations until resolved; no-history
+migration does not release funds or permit replay. On startup/resume, **D2
+round0 cancels all BUYs, including manual BUYs, then re-places under current
+rules. SELLs and positions are untouched by this restart cleanup.** Cutover or
+rollback trading authorization must explicitly cover that BUY cancel/replace
+effect. This does not change normal protective or exit behavior.
+
+### Single owner and reverse handoff — design pending
+
+Local `runtime.lock`, `execution.lock`, D2 permits and D3 database admission
+do not span hosts. Ray must choose a durable retired-host tombstone with
+manual handoff or a registry/CAS design. Neither is implemented or approved
+by P1/P2. No heartbeat timeout or lost connection may grant another writer.
+
+A later approved handoff must block new writes, save a reliable pause, drain
+actual native/HTTP work, disable all old restart paths, and independently prove
+process/children/listener/lock absence. Reconcile exchange facts and UNKNOWN
+obligations before granting the new owner. A completed Future is not drain
+evidence. Do not force-kill or delete locks/permits to manufacture proof.
+
+Rollback is the reverse owner handoff, not a URL change or old database restore.
+First stop and fence Tokyo, prove drain/absence, then reconcile exchange facts.
+Only then may an authorized operation arm the mini. The proposed rollback
+anchor must be a separately deployed and accepted mini release that prevents
+retired-host relaunch and retains D2/D3. That release, its restart/round0 effect
+and the cutover need separate approval; no target SHA is established here.
+Preserve failed runtimes for audit. Unknown ownership or an unavailable safe
+anchor blocks restart; do not automatically fail back or add cancel-all/close-all.
+
 ## 1. 已验证范围与未完成事项
 
-### 2026-10-10 当前记录：停止安装与用户单笔实测
+The following are historical records. They do not satisfy the prerequisites
+above or prove current host state, deployment or health.
+
+### 2026-10-10 历史记录：停止安装与用户单笔实测
 
 东京已安装源码为 `9eab8d32ed6cd7d5157a0a3bf76ae355606d9e6b`
 （简称 `9eab8d32`）；PR #324 人工诊断、PR #325 一命令入口及 PR #327
@@ -220,6 +360,10 @@ test -z "$(git -C "$RELEASE" status --porcelain)"
 
 ## 4. 配置及凭据阶段
 
+For Tokyo, apply section 0 before these commands. No authenticated check or
+start may use the existing file until Ray's credential disposition, old-startup
+blocking and authorized tat_agent/SSH lockdown have verified evidence.
+
 准备经过操作员检查的**非秘密** `prediction_arbitrage.json`；
 `polymarket_trading.load_trading_config` 只接受 `signer_address`、`wallet_address`
 及可选 `predict`（其字段为 `wallet_address`、`environment: mainnet`）。
@@ -271,9 +415,11 @@ mutation/notification attempts。`data-check --config <runtime-config> --sample 
 是另一项数据检查，最佳 `PARTIAL` 也不等于完整池/live-feed 验收。普通 SDK
 `create()` 可能创建凭据或钱包，不能替代只读 read-auth。
 
-生产仍按现有 SSM-only profile，使用固定 secret version、最小 CAM 权限、
-明确 SSM region、metadata isolation 和 old-owner 停止证据。file profile
-不成为生产通道。具体非秘密字段和切换条件见 [凭据与所有权](prediction-cloud.md)。
+Current production code still requires the SSM-only profile, fixed secret
+version, least CAM privilege, explicit region, metadata isolation and stopped-owner
+evidence. Ray's chosen restricted-file production target is not implemented;
+it needs a separately approved P3 after the geography decision and real-path
+gate allow it. See [credentials and ownership](prediction-cloud.md).
 
 ## 5. 地域、公开可达与订单测试
 
@@ -284,6 +430,19 @@ mutation/notification attempts。`data-check --config <runtime-config> --sample 
 的地域说明不同；此文档未重新联网核对，保留该冲突为未知原因，不能用文档
 解释覆盖实际 gate。不得绕过限制、使用 proxy/VPN 规避或伪造 region attestation。
 production 的 require-trading-region 保持阻断；Shadow 禁止所有交易 POST。
+
+The 2026-10-19 fact record also reports `/api/geoblock` as
+`blocked=true`, country `JP`, region `13`; this edit did not refresh that probe
+or the external pages. The recorded API docs describe JP as frontend close-only
+with the API unrestricted; the recorded Help Center lists JP as completely
+restricted. Live remains blocked. Ray must resolve the official
+terms/account/location eligibility conflict and the real-path gate before P3/P4.
+Written clarification or risk acceptance alone cannot override `blocked=true`.
+Any gate change needs a separate approved plan and verification. Do not route
+Tokyo Polymarket traffic through HK to evade this result. The mini's recorded
+HK egress is neither Tokyo authorization nor proof of account eligibility;
+Tailscale here transports private Dashboard reads only.
+
 2026-10-10 用户单笔诊断的地域报告与实际订单结果并列记录于第 1 节，
 不能用该订单的接受覆盖地域报告或 production 门禁。
 
@@ -540,6 +699,12 @@ token 导出或 agent forwarding，日志只记目标/状态/字节数。部署�
 上述真实认证 gh 前提，不新增部署工具。任一路线不可用即停止。
 
 ### 两主机 READY → wrapper install/start → client → Smoke
+
+These are existing direct-service client/gate examples, not deployment evidence
+for P2. Do not use the direct 8769 tunnel as the planned restricted read-only
+adapter path. Authenticated runs also require the section 0 prerequisites and
+their own authorization. A future P2 deployment must verify its own exact-SHA
+adapter, token, identity and no-fallback contract.
 
 保存云配置的非秘密本地副本及 operator evidence。Shadow evidence 含
 `git_sha`、`independent_runtime_root`、真实 `resources_reviewed: true` 及带

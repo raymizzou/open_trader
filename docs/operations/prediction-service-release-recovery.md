@@ -4,6 +4,36 @@ This guide covers the managed production launchd release record and the two
 release scripts. It does not authorize a deployment, order submission, runtime
 data repair, or a restart of an unrelated process.
 
+## Tokyo cross-host recovery boundary — 2026-10-20
+
+The [Tokyo decision baseline](prediction-tokyo-deployment-sop.md#0-tokyo-decision-baseline--2026-10-20)
+applies before a Tokyo operation. Current approval covers P1 docs and P2
+read-only access implementation, not a live handoff. Cross-host ownership
+protection is pending Ray's tombstone versus registry decision. The advisory
+locks and D2 permissions described here protect local operations only; they
+do not fence another host or another same-wallet credential client.
+
+Do not copy the mini history database or full runtime to Tokyo. Retain local
+history and re-accumulate cloud history with an explicit incomplete boundary.
+D3 background persistence can lag current memory; a saved database is not
+current trading authority. Old PID records, permits and running intent do not
+authorize a new owner or replay. Preserve unresolved obligations as UNKNOWN.
+
+Tokyo rollback is a reverse owner handoff. Reliably pause, drain actual native
+and HTTP work, stop/fence Tokyo and disable all restart sources. Independently
+prove process/children/listener/lock absence, then reconcile current exchange
+orders, positions, trades, funds and UNKNOWN obligations before arming the mini.
+Loss of contact is not proof of stop. A URL switch or old snapshot restore is
+not sufficient. The proposed target is an accepted mini release with D2/D3
+and retired-host relaunch protection; that release and its exact SHA are not
+established here and need separate approval. Do not start an unprotected old
+binary as a rollback shortcut.
+
+D2 startup/resume round0 cancels all BUYs, including manual BUYs, then re-places
+under current rules. Restart cleanup leaves SELLs and positions untouched.
+Any mini release restart, live cutover or rollback resume must explicitly
+include that trading effect in its authorization. Smoke does not authorize it.
+
 ## Inspect before changing anything
 
 Run the production installer with `--preflight` from the intended clean,
