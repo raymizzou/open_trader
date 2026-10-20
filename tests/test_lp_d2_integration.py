@@ -561,7 +561,7 @@ def test_all_uncertain_buy_results_invalidate_financial_authority(tmp_path, monk
         fresh = live.run_once()
         restored = live.state.snapshot()
         assert restored.buy_reserved.value == Decimal('6.80') and restored.inventory_cost.value == Decimal('1.20')
-        assert restored.current_exposure.value == Decimal('8.00') and restored.new_capacity.value == Decimal('32.00')
+        assert restored.current_exposure.value == Decimal('8.00') and restored.new_capacity.value == Decimal('33.20')
         assert fresh.acceptance.observation.source_frame.sources['open_orders'].checked_at > uncertainty.observed_at
         assert sdk.cancels == [] and len(posts) == 3
         assert stored_actions(store) == []  # current recovery still has no business DB dependency
@@ -2774,7 +2774,7 @@ def test_persistently_invalid_incumbent_qualification_preserves_existing_protect
             assert snapshot.positions and snapshot.positions[0].quantity.value == Decimal('10')
             assert snapshot.buy_reserved.value == Decimal('4')
             assert snapshot.inventory_cost.value == Decimal('3')
-            assert snapshot.new_capacity.value == Decimal('0')
+            assert snapshot.new_capacity.value == Decimal('3')
             baseline = next(iter(snapshot.baselines.values()))
             assert baseline is baseline_before
             assert snapshot.orders[0].key[3] == 'entry-A'

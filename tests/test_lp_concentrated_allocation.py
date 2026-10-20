@@ -234,6 +234,47 @@ def test_rank_weights_allocate_50_30_20():
     assert result.target_tokens==('t1','t2','t3')
 
 
+@pytest.mark.parametrize('reserved,headroom', [('0', '100'), ('40', '60'), ('100', '0')])
+def test_shadow_buy_budget_excludes_inventory_without_changing_native_plan(tmp_path, monkeypatch, reserved, headroom):
+    from tests.test_lp_d2_execution_bridge import rotation_runtime
+    from tests.test_lp_order_registration_contract import WALLET
+    results = []
+    for enabled in (False, True):
+        path = tmp_path/str(enabled)
+        live, execution, sdk, ids, pools, order, qualify = rotation_runtime(path, monkeypatch, wallet='400', target=3)
+        try:
+            if enabled:
+                account = hashlib.sha256(WALLET.casefold().encode()).hexdigest()
+                live.store.lp_save_current_settings(account, expected_config_version=1,
+                    changes=dict(allocation_weights=WEIGHTS, allocation_shadow_enabled=True))
+                live.load_settings()
+            buys = (() if reserved == '0' else (order('A', original='80'),) if reserved == '40' else
+                (order('A', original='80'), order('B', original='80'), order('C', original='40')))
+            sentinel = order('Z', 'manual-sell').model_copy(update=dict(side='SELL', price=Decimal('.60')))
+            sdk.orders = (*buys, sentinel)
+            sdk.positions = (dict(user=WALLET, condition_id=ids['Z'][0], token_id=ids['Z'][1],
+                size='300', initial_value='115.6884', redeemable=False),)
+            qualify('F')
+            result = live.run_once(execution._lp.capture_qualified_pool())
+            assert result.selection.inventory_cost == Decimal('115.6884')
+            assert result.selection.buy_reserved == Decimal(reserved)
+            assert result.selection.new_capacity == Decimal(headroom)
+            if enabled:
+                shadow = result.selection.allocation_shadow
+                assert shadow['target_envelope_usd'] == Decimal('100')
+                assert shadow['available_cash_usd'] == Decimal(headroom)
+            else:
+                assert result.selection.allocation_shadow is None
+            assert sdk.orders == (*buys, sentinel) and sdk.cancels == sdk.market_orders == []
+            assert all(p['side'] == 'BUY' and p['price'] == Decimal('.50') and p['size'] == Decimal('20') for p in sdk.posts)
+            results.append((sdk.posts[:], tuple(a.target for a in result.start.token.actions),
+                tuple(o.status for o in result.outcomes), result.selection.target_tokens))
+        finally:
+            assert live.close(timeout=3)
+            live.trading.close()
+    assert results[0] == results[1]
+
+
 @pytest.mark.parametrize('minimums,existing,expected,reason,leftover', [
     (('20','20','20'),False,['WOULD_SEND']*3,None,'0'),
     (('20','20','60'),False,['WOULD_SEND','WOULD_SEND','NOT_SENT'],'below_reward_minimum','10'),

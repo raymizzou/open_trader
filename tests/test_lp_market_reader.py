@@ -220,11 +220,49 @@ def test_pure_current_finances_use_independent_literals(monkeypatch):
     frame = MarketReader.from_captured_sources(captured(orders=rows, positions=positions))
     result = calculate_current(frame, CalculationPolicy(budget=Decimal('40')), datetime(2026,10,15,tzinfo=UTC))
     assert result.buy_reserved == Decimal('16')
-    assert result.inventory_cost == Decimal('16') and result.new_capacity == Decimal('8')
+    assert result.inventory_cost == Decimal('16') and result.new_capacity == Decimal('24')
     unknown = MarketReader.from_captured_sources(captured(orders=None, positions=positions))
     result = calculate_current(unknown, CalculationPolicy(budget=Decimal('40')), datetime(2026,10,15,tzinfo=UTC))
     assert result.buy_reserved is None and result.new_capacity is None
     assert frame.history_fees is None  # current facts must not invent historical fees
+
+
+@pytest.mark.parametrize('case,expected', [
+    ('empty', '100'), ('reserve40', '60'), ('reserve100', '0'),
+    ('partial', '90'), ('canceling', '60'), ('wallet30', '0'),
+    ('allowance30', '0'), ('orders_unknown', None), ('positions_unknown', None),
+    ('wrong_account', None),
+])
+def test_buy_budget_excludes_held_inventory(case, expected):
+    from dataclasses import replace
+    from open_trader.polymarket_lp_market_reader import MarketReader, SourceResult
+    from open_trader.polymarket_lp_current_inputs import prepare_current_inputs
+    from open_trader.polymarket_lp_market_calculation import calculate_current, CalculationPolicy
+    now = datetime(2026, 10, 15, tzinfo=UTC)
+    buy = dict(order('active-buy'), original_size='80', price='.50')
+    if case == 'reserve100': buy['original_size'] = '200'
+    if case == 'partial': buy.update(original_size='100', size_matched='80', status='PARTIALLY_FILLED')
+    if case == 'canceling': buy['status'] = 'PENDING_CANCEL'
+    if case == 'wrong_account': buy['account_id'] = 'account-B'
+    sell = dict(order('manual-sell'), side='SELL', original_size='200', price='.60')
+    rows = (sell,) if case == 'empty' else (buy, sell)
+    position = dict(condition_id='held', token_id='held-token', quantity='300', cost_usd='115.6884')
+    if case == 'positions_unknown': position.pop('cost_usd')
+    raw = captured(orders=rows if case != 'orders_unknown' else None, positions=(position,))
+    raw = replace(raw, sources={**raw.sources, 'balance': SourceResult('funds',
+        ('30' if case == 'wallet30' else '400', '30' if case == 'allowance30' else '400'), checked_at=now)})
+    frame = MarketReader.from_captured_sources(raw)
+    policy = CalculationPolicy(Decimal('100'))
+    prepared = prepare_current_inputs(frame, SourceResult('candidates', ()), policy, now)
+    result = calculate_current(prepared, policy, now)
+    assert result.new_capacity == (Decimal(expected) if expected is not None else None)
+    assert result.inventory_cost == (None if case == 'positions_unknown' else Decimal('115.6884'))
+    assert frame.positions[0]['quantity'] == Decimal('300')
+    if case == 'orders_unknown':
+        assert frame.orders == () and not frame.orders_complete
+    else:
+        assert next(o for o in frame.orders if o['order_id'] == 'manual-sell')['remaining'] == Decimal('200')
+    assert frame.history_fees is None
 
 
 def direction(pool='24'):

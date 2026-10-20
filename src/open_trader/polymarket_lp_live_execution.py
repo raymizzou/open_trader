@@ -1477,7 +1477,7 @@ class LPD2LiveExecution:
         independent_excess = (len(prepared.current_buys) > self.policy.target_count
             or self.policy.budget is not None and snapshot.inventory_cost.state == 'known'
             and snapshot.buy_reserved.state == 'known'
-            and snapshot.inventory_cost.value + snapshot.buy_reserved.value > self.policy.budget)
+            and snapshot.buy_reserved.value > self.policy.budget)
         if (self._settings_required and not self._settings_loaded
                 or not source.complete or source.error or source.value is None
                 or snapshot.new_capacity.state != 'known'):
