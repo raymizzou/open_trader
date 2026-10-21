@@ -79,6 +79,12 @@ pause/resume/shutdown 不释放尚未退出的实际 HTTP、pool 或 native canc
 close 未排空返回 false，外层 prediction runtime 保留 client、store、claim 和 owner，后续再收集。
 状态诊断提供有界的 scope、deferred、fault、cache、资源上限和失败原因；这些观察不授予交易权限。
 
+读取等待必须与 owner 工作分别仲裁：已完成但未收集的控制保存仍可立即运行，
+不能仅依据原生线程是否存活；`retry_wait` 的真实 completed+1 秒期限与读取期限取最早值，
+到期控制工作优先于仅等待事件。控制两次尝试上限、失败升级和恢复须提交后生效不变。
+Scheduler 检查失败保留自身配置的错误重试期限，不被读取冷却或仅等待事件替换；
+真实完成和显式命令保持原唤醒语义。到期重试本地 owner 工作不提前发起受 Retry-After 限制的 HTTP。
+
 ## 验证边界
 
 20 个公开 async/source/state/live 合同覆盖真实 HTTPX loopback 断连、受控取消/退出、独立期限监督、

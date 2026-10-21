@@ -52,13 +52,12 @@ class LPAutoScheduler:
             self._wake.clear()
         logger.exception(event)
 
-    def _restore_deadline(self, *, future_only=False, core=None):
+    def _restore_deadline(self, *, core=None):
         waiting = (self._core_state() if core is None else core).get('plan_wait')
         if waiting and waiting.get('kind') == 'dependencies':
             deadline = datetime.fromisoformat(waiting['deadline'])
-            if not future_only or deadline > self.clock():
-                self._next_check_at = deadline
-        elif waiting and waiting.get('kind') == 'events' and not future_only:
+            self._next_check_at = deadline
+        elif waiting and waiting.get('kind') == 'events':
             self._next_check_at = None  # no runnable work until a real wakeup
 
     def snapshot(self) -> dict[str, object]:
@@ -120,8 +119,9 @@ class LPAutoScheduler:
                         now = self.clock()
                         self._next_check_at = (now + timedelta(seconds=self._api_retry_interval_seconds)
                             if self._error is not None else now)
-                        # Do not restore an expired dependency deadline after failure.
-                        self._restore_deadline(future_only=self._error is not None, core=core)
+                        # Read waits do not own the configured check-error retry.
+                        if self._error is None:
+                            self._restore_deadline(core=core)
                         if self._wake.is_set():
                             self._next_check_at = now
                 except Exception as exc:

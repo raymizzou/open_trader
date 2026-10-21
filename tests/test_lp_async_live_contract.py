@@ -508,7 +508,14 @@ def test_nonblocking_scheduled_checks_publish_fresh_incumbents_once(tmp_path,mon
         assert old.close(4)
         clock=Clock();clock.utc=old._utc_now
         boundary=Boundary(clock);auth=[];wake=threading.Event()
-        rows=[]
+        rows=[];cancel_release=threading.Event();cancel_entered=threading.Event()
+        actual_cancel=sdk.cancel_orders
+        def held_cancel(*,order_ids):
+            assert case=='replace-zero' and order_ids==('B',)
+            cancel_entered.set()
+            assert cancel_release.wait(4),'external rotation observation watchdog'
+            return actual_cancel(order_ids=order_ids)
+        if case=='replace-zero':sdk.cancel_orders=held_cancel
         def headers(method,path,body):
             assert method=='GET' and body is None
             auth.append(path);return {'test-read-capability':'already-owned'}
@@ -560,7 +567,17 @@ def test_nonblocking_scheduled_checks_publish_fresh_incumbents_once(tmp_path,mon
             for stamp in (5,10):
                 before=next((f.last_attempt for k,f in live.state.snapshot().read_failures.items() if k[3]=='B'),None)
                 sdk.advance(5);clock.value=stamp;live.read_runtime.wake();end=time.monotonic()+4
-                if stamp==10:qualify('F')
+                if stamp==10:
+                    qualify('F')
+                    # Selection must see the actual complete O/B mailbox at10,
+                    # not an earlier financial callback ahead of B's fresh result.
+                    # BUY scope keys name the kind at[3] and exact order at[4].
+                    def named_mailbox():
+                        state=live.read_runtime.status()
+                        scopes={('financial' if s['key'][3]=='financial' else s['key'][4]):s for s in state['scopes']}
+                        return state['ready_count']>=2 and all(k in scopes and
+                            scopes[k]['started']==10 and not scopes[k]['active'] for k in ('financial','B'))
+                    boundary.wait(named_mailbox,timeout=max(0,end-time.monotonic()))
                 while True:
                     started=time.monotonic();result=execution.lp_auto_scheduled_check()
                     assert time.monotonic()-started<1, 'scheduled owner waited for held HTTP'
@@ -581,6 +598,8 @@ def test_nonblocking_scheduled_checks_publish_fresh_incumbents_once(tmp_path,mon
             assert len([s for s in live.read_runtime.status()['scopes'] if s['key'][3]=='financial'])==1
             if case=='replace-zero':
                 assert result.selection.victim_order_ids==('B',)
+                assert cancel_entered.wait(4)
+                cancel_release.set()
                 for outcome in result.rotation_outcomes:outcome.handle.result(4)
                 assert sdk.cancels==[('B',)],(result,live.rotation_diagnostics(),live.status())
             else:
@@ -589,7 +608,7 @@ def test_nonblocking_scheduled_checks_publish_fresh_incumbents_once(tmp_path,mon
             live.dispatch_rotation(result);live.dispatch_rotation(result)
             assert sdk.cancels==([('B',)] if case=='replace-zero' else [])
             assert auth and wake.wait(1)
-        finally:boundary.release.set();assert live.close(4);live.trading.close()
+        finally:cancel_release.set();boundary.release.set();assert live.close(4);live.trading.close()
 
 
 def test_rejected_financial_observation_keeps_independent_market_failure_and_cleanup(tmp_path):
@@ -906,3 +925,193 @@ def test_scheduler_waits_for_cleanup_fault_exit_without_busy_loop(tmp_path):
         finally:
             boundary.release.set();scheduler.stop()
             assert live.close(4)
+
+
+def test_scheduler_preserves_control_retry_and_completed_save_during_read_wait(tmp_path):
+    from datetime import datetime,timedelta
+    import hashlib
+    from open_trader.polymarket_lp import PolymarketLPService
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+    from tests.test_lp_d2_execution_bridge import attach
+    for event_only in (False,True):
+        root=tmp_path/('fault' if event_only else 'cooldown')
+        clock=Clock();boundary=Boundary(clock)
+        class SaveBoundary(PredictionArbitrageStore):
+            armed=False
+            def __init__(self,path):
+                super().__init__(path);self.calls=[];self.threads=[]
+                self.entered=[threading.Event(),threading.Event()]
+                self.releases=[threading.Event(),threading.Event()]
+            def lp_save_current_control(self,write,**kwargs):
+                if not self.armed:return super().lp_save_current_control(write,**kwargs)
+                index=len(self.calls);assert index<2,'no third save permitted'
+                self.calls.append((clock(),dict(write)));self.threads.append(threading.current_thread())
+                self.entered[index].set()
+                assert self.releases[index].wait(4),'external control-save release watchdog'
+                if index==0:raise OSError('offline first save failure')
+                return super().lp_save_current_control(write,**kwargs)
+        store=SaveBoundary(root)
+        store.lp_save_current_control(dict(account_id=hashlib.sha256(b'account').hexdigest(),
+            process_epoch='seed',request_version=1,request_id='seed',desired_running=True,
+            requested_at=clock.utc(),actor=None))
+        trading=Trading();runtime=LPReadRuntime(boundary.factory,clock=clock,utc_now=clock.utc)
+        live=LPD2LiveExecution(store,trading,account_id='account',venue='polymarket',process_epoch='epoch',
+            policy=CalculationPolicy(Decimal(100)),read_runtime=runtime,clock=clock,utc_now=clock.utc)
+        live.initialize(ValidatedStartAdmission('epoch','offline-permit'));store.armed=True
+        producer=PolymarketLPService(store,trading,clock=clock.utc)
+        execution=attach(live,producer,root);scheduler=LPAutoScheduler(execution,clock=clock.utc)
+        execution.set_lp_auto_scheduler(scheduler)
+        notices=[]
+        def notice():
+            status=runtime.status();scheduler.request_check();notices.append(status)
+        execution.set_lp_auto_wakeup(notice)
+        def collect_read(stamp,dependency,faults):
+            clock.value=stamp;runtime.wake()
+            boundary.wait(lambda:any(n['observed_monotonic']==stamp and n['ready_count']>0 for n in notices))
+            assert scheduler.run_due()
+            boundary.wait(lambda:any(n['observed_monotonic']==stamp and n['ready_count']==0
+                and n['next_dependency_monotonic']==dependency and n['cleanup_faults']==faults for n in notices))
+            scheduler.run_due()  # consume the real post-ACK wake, never a periodic request
+        try:
+            assert live.control.status().current.effective_running is True
+            if event_only:
+                boundary.holds={('O','balance')};boundary.mode[('O','balance')]='swallow'
+            else:boundary.mode[('O','balance')]='cooling'  # real HTTP429, Retry-After12
+            assert scheduler.run_due()
+            boundary.wait(lambda:('entered','O','balance',0) in boundary.events)
+            if event_only:
+                collect_read(5,6,0);collect_read(6,None,1)
+                assert execution.lp_auto_state(include_intents=False)['plan_wait']==dict(kind='events')
+                assert scheduler.snapshot()['next_check_at'] is None
+                assert runtime.status()['cleanup_faults']==1 and not runtime.status()['new_buy_allowed']
+            else:
+                collect_read(0,12,0)
+                assert datetime.fromisoformat(scheduler.snapshot()['next_check_at'])==NOW+timedelta(seconds=12)
+            origin=clock();before=list(boundary.events)
+            pause=execution.lp_auto_set_desired_running(False)
+            assert pause['effective_running'] is False
+            assert store.entered[0].wait(4)
+            assert live.control.status().save_state=='saving'
+            assert execution.lp_auto_state(include_intents=False)['plan_wait'] is None
+            # Native save actually returns before its completion is collected.
+            store.releases[0].set();store.threads[0].join(4);assert not store.threads[0].is_alive()
+            uncollected=live.control.status()
+            assert uncollected.save_state=='saving' and not uncollected.native_save_in_flight
+            assert scheduler.run_due()
+            retry=live.control.status()
+            assert retry.save_state=='retry_wait' and retry.retry_at_monotonic==origin+1
+            assert retry.attempt_number==1 and retry.saved_version<retry.requested_version
+            assert datetime.fromisoformat(scheduler.snapshot()['next_check_at'])==NOW+timedelta(seconds=origin+1)
+            assert execution.lp_auto_state(include_intents=False)['plan_wait']==dict(
+                kind='dependencies',deadline=(NOW+timedelta(seconds=origin+1)).isoformat())
+            assert not retry.current.effective_running and retry.fatal is None
+            clock.value=origin+.999
+            assert not scheduler.run_due() and len(store.calls)==1 and boundary.events==before
+            clock.value=origin+1
+            assert scheduler.run_due() and store.entered[1].wait(4)
+            assert live.control.status().save_state=='retrying'
+            assert execution.lp_auto_state(include_intents=False)['plan_wait'] is None
+            store.releases[1].set();store.threads[1].join(4);assert not store.threads[1].is_alive()
+            uncollected=live.control.status()
+            assert uncollected.save_state=='retrying' and not uncollected.native_save_in_flight
+            assert uncollected.saved_version<uncollected.requested_version
+            assert execution.lp_auto_state(include_intents=False)['plan_wait'] is None
+            assert scheduler.run_due()  # completed save remains immediately consumable at1/7
+            saved=live.control.status()
+            assert saved.save_state=='saved' and saved.saved_version==saved.requested_version==1
+            assert not saved.current.effective_running and saved.fatal is None
+            assert [t for t,_ in store.calls]==[origin,origin+1] and boundary.events==before
+            assert not scheduler.run_due() and len(store.calls)==2 and trading.cancels==[]
+            if event_only:
+                financial=next(s for s in runtime.status()['scopes'] if s['key'][3]=='financial')
+                assert financial['active'] and financial['cleanup_fault']
+                assert runtime.status()['pool_count']>=2 and not runtime.status()['new_buy_allowed']
+                assert scheduler.snapshot()['next_check_at'] is None
+            else:
+                assert datetime.fromisoformat(scheduler.snapshot()['next_check_at'])==NOW+timedelta(seconds=12)
+        finally:
+            for release in store.releases:release.set()
+            # Failure evidence must not strand a failed-save retry during close.
+            clock.value=max(clock(),(store.calls[0][0]+1) if store.calls else clock())
+            boundary.release.set();scheduler.stop();assert live.close(4)
+
+
+def test_scheduler_preserves_owner_error_retry_during_provider_cooldown(tmp_path):
+    from datetime import datetime,timedelta
+    import httpx
+    from open_trader.polymarket_lp import PolymarketLPService
+    from open_trader.polymarket_lp_async_source import LPAsyncSourcePort
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+    from tests.test_lp_d2_execution_bridge import attach
+    clock=Clock()
+    class CooldownBoundary(Boundary):
+        def factory(self,demand):
+            async def http(req):
+                source=req.headers['x-lp-source'];order=req.headers['x-lp-order']
+                self.record('entered',order,source)
+                try:
+                    if source=='open_orders':return httpx.Response(200,json=dict(data=[wire_row('A')],next_cursor='LTE='))
+                    if source=='positions':return httpx.Response(200,json=[])
+                    return httpx.Response(429,headers={'Retry-After':'300'})
+                finally:self.record('finally_exited',order,source)
+            return LPAsyncSourcePort({key:httpx.AsyncClient(transport=httpx.MockTransport(http),
+                base_url='http://127.0.0.1') for key in (('clob','data') if demand.kind=='financial' else ('gamma','clob'))},
+                clock=clock,utc_now=clock.utc)
+    class RegistrationBoundary(PredictionArbitrageStore):
+        failing=True
+        def __init__(self,path):super().__init__(path);self.calls=[]
+        def lp_register_exchange_orders(self,*args,**kwargs):
+            self.calls.append(clock())
+            if self.failing:raise OSError('offline order-registration storage fault')
+            return super().lp_register_exchange_orders(*args,**kwargs)
+    boundary=CooldownBoundary(clock);store=RegistrationBoundary(tmp_path);trading=Trading()
+    runtime=LPReadRuntime(boundary.factory,clock=clock,utc_now=clock.utc)
+    live=LPD2LiveExecution(store,trading,account_id='account',venue='polymarket',process_epoch='epoch',
+        policy=CalculationPolicy(Decimal(100)),read_runtime=runtime,clock=clock,utc_now=clock.utc)
+    live.initialize(ValidatedStartAdmission('epoch','offline-permit'))
+    producer=PolymarketLPService(store,trading,clock=clock.utc)
+    execution=attach(live,producer,tmp_path);scheduler=LPAutoScheduler(execution,clock=clock.utc)
+    execution.set_lp_auto_scheduler(scheduler)
+    notices=[]
+    def notice():
+        status=runtime.status();scheduler.request_check();notices.append(status)
+    execution.set_lp_auto_wakeup(notice)
+    try:
+        assert execution.lp_auto_state(include_intents=False)['api_retry_interval_seconds']==60
+        assert scheduler.run_due()
+        end=time.monotonic()+4
+        def settled():
+            return any(n['next_dependency_monotonic']==300 and n['ready_count']==0
+                and n['owned_buy_scopes']==1 and not any(s['active'] for s in n['scopes']) for n in notices)
+        while not settled():
+            scheduler.run_due()
+            left=end-time.monotonic();assert left>0,(runtime.status(),scheduler.snapshot(),boundary.events)
+            with boundary.changed:boundary.changed.wait(min(.01,left))
+        scheduler.run_due()  # consume actual final completion/ACK notice
+        snapshot=live.state.snapshot();status=runtime.status()
+        assert {o.key[3] for o in snapshot.active_orders}=={'A'}
+        assert snapshot.observation.orders_complete and snapshot.new_capacity.state=='unknown'
+        assert status['ready_count']==0 and status['next_dependency_monotonic']==300
+        assert not any(s['active'] for s in status['scopes'])
+        assert store.calls and set(store.calls)=={0}
+        state=scheduler.snapshot();assert state['last_check_error']=='RuntimeError'
+        error_at=datetime.fromisoformat(state['last_check_at'])
+        assert error_at==NOW and datetime.fromisoformat(state['next_check_at'])==error_at+timedelta(seconds=60)
+        assert execution.lp_auto_state(include_intents=False)['plan_wait']==dict(
+            kind='dependencies',deadline=(NOW+timedelta(seconds=300)).isoformat())
+        before=list(boundary.events);registrations=len(store.calls)
+        failures=dict(snapshot.read_failures)
+        clock.value=59.999
+        assert not scheduler.run_due() and len(store.calls)==registrations
+        assert boundary.events==before and dict(live.state.snapshot().read_failures)==failures
+        store.failing=False;clock.value=60
+        assert scheduler.run_due() and len(store.calls)==registrations+1
+        assert store.calls[-1]==60 and scheduler.snapshot()['last_check_error'] is None
+        assert live.status()['read_persistence_error'] is None
+        assert datetime.fromisoformat(scheduler.snapshot()['next_check_at'])==NOW+timedelta(seconds=300)
+        assert not scheduler.run_due() and boundary.events==before
+        assert dict(live.state.snapshot().read_failures)==failures and trading.cancels==[]
+        clock.value=299.999
+        assert not scheduler.run_due() and boundary.events==before
+    finally:
+        store.failing=False;boundary.release.set();scheduler.stop();assert live.close(4)

@@ -2207,14 +2207,19 @@ class LPD2LiveExecution:
             reads=self.read_runtime.status() if self.read_runtime is not None else None
             control=self.control.status()
             dependency=reads.get('next_dependency_monotonic') if reads else None
-            # Only pure read waiting may defer the owner. Existing native,
-            # settings and control work keeps its immediate progress path.
+            # A returned control thread can still have an uncollected Future.
+            # Its completion is runnable; retry_wait owns a separate deadline.
+            now=self._clock()
+            control_pending=control.save_state in ('pending','saving','retrying')
+            retry=control.retry_at_monotonic if control.save_state=='retry_wait' and not control.fatal else None
+            dependencies=[d for d in (dependency,retry) if d is not None]
             wait=None
             if not (owned or self._active_sends
                     or any(h._thread.is_alive() for h in self._manual_jobs.values())
-                    or self._settings_future is not None or control.native_save_in_flight):
-                if dependency is not None and dependency>self._clock():
-                    wait=dict(kind='dependencies',deadline=(self._utc_now()+timedelta(seconds=dependency-self._clock())).isoformat())
+                    or self._settings_future is not None or control.native_save_in_flight or control_pending
+                    or any(d<=now for d in dependencies)):
+                if dependencies:
+                    wait=dict(kind='dependencies',deadline=(self._utc_now()+timedelta(seconds=min(dependencies)-now)).isoformat())
                 elif reads and reads.get('waiting_for_event'):
                     wait=dict(kind='events')
             return dict(read_runtime=reads,plan_wait=wait,
