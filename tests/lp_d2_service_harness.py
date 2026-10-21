@@ -660,7 +660,7 @@ def child(runtime_root,port,scenario,config_path):
     if not (root/'data/prediction_arbitrage/prediction_arbitrage.sqlite3').exists():
         store=PredictionArbitrageStore(root/'data')
         if scenario.startswith('consumer-ci-fence-'):
-            expected_fence=1 if scenario=='consumer-ci-fence-1' else 2
+            expected_fence=1 if scenario.endswith('-1') else 2
             assert store.advance_minimum_reader_generation(expected_fence)==expected_fence
         import hashlib
         account=hashlib.sha256(WALLET.encode()).hexdigest()
@@ -1459,6 +1459,8 @@ def child(runtime_root,port,scenario,config_path):
                 identity=prediction_start_guard.identity_for_runtime(data_dir=root/'data',prediction_config_path=config_path,code_root=Path.cwd(),host='127.0.0.1',port=port)
                 prediction_start_guard.arm_for_operator_start(identity,
                     'offline-operator-recovery' if scenario.startswith('operator') else 'offline-operation-1',operation_fd=operation_fd)
+        if scenario in ('consumer-ci-fence-library-1', 'consumer-ci-fence-library-2'):
+            return run_ci_fence_library(root, config_path, port, release_root, mark, business_clock, utc_clock)
         def observe_external_writer():
             while not (events/'process-finalizing').exists():
                 status=adapter.lp_metadata_persistence_status()
@@ -1470,6 +1472,56 @@ def child(runtime_root,port,scenario,config_path):
         result=serve_prediction_service(data_dir=root/'data',prediction_config_path=config_path,host='127.0.0.1',port=port,mode='production',release_manifest_path=release_root/'ops/prediction-service-release.json',lp_clock=business_clock,lp_utc_now=utc_clock)
         raise SystemExit(result)
 
+
+
+def drain_fixture_runtime(runtime):
+    """Collect only the documented nonblocking D2 STOPPING result."""
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            runtime.stop()
+        except RuntimeError as error:
+            if (runtime.state != 'STOPPING' or str(error) !=
+                    'prediction runtime cleanup failed: RuntimeError: D2 native resources are still stopping'):
+                raise
+            assert time.monotonic() < deadline, 'fixture native drain real watchdog'
+            threading.Event().wait(.01)
+        else:
+            assert runtime.state == 'STOPPED' and runtime.production_owner is False
+            return
+
+
+def run_ci_fence_library(root, config_path, port, release_root, mark, clock, utc_now):
+    """Explicit unpaused library diagnostics; the official service is unchanged."""
+    import signal
+    from open_trader.prediction_release import load_prediction_release_manifest
+    from open_trader.prediction_runtime import PredictionRuntime
+    from open_trader.prediction_service import create_prediction_server
+    manifest = load_prediction_release_manifest(release_root/'ops/prediction-service-release.json')
+    sha = subprocess.check_output(['git', '-C', str(release_root), 'rev-parse', 'HEAD'], text=True).strip()
+    runtime = PredictionRuntime(data_dir=root/'data', prediction_config_path=config_path,
+        dashboard_url=f'http://127.0.0.1:{port}/', mode='production', git_sha=sha,
+        reader_generation=manifest.reader_generation, n_leg_paused=False,
+        enable_n_leg_background=False, lp_clock=clock, history_clock=utc_now)
+    stopped = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stopped.set())
+    server = None
+    mark('service-starting')
+    try:
+        runtime.start()
+        assert runtime.state == 'RUNNING' and runtime.production_owner is True
+        server = create_prediction_server(runtime=runtime, host='127.0.0.1', port=port)
+        deadline = time.monotonic() + 40
+        while not stopped.is_set():
+            assert time.monotonic() < deadline, 'library observer real watchdog'
+            server.handle_request()
+    finally:
+        runtime.begin_stop()
+        if server is not None:
+            server.close_admission()
+            server.server_close()
+        drain_fixture_runtime(runtime)
+    raise SystemExit(0)
 
 
 def _install_ci_fence_observers(patch,events,scenario,observations):
@@ -1737,7 +1789,7 @@ def run_no_reconcile_runtime(root,config_path,scenario,sdk,publish,mark,clock,ut
                 publish(events/'nr-new-buy.json',json.dumps(response,default=str))
                 mark('nr-new-buy-completed')
     finally:
-        runtime.stop()
+        drain_fixture_runtime(runtime)
         publish(events/'nr-stop.json',json.dumps(dict(state=runtime.state,
             permit=json.loads((root/'lp-start-guard/permit.json').read_text())),default=str))
         sys.setprofile(None);threading.setprofile(None)
