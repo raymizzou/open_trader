@@ -89,7 +89,7 @@ def evidence(tmp_path):
     api = FakeAPI(run, jobs, checks)
     project = Path(__file__).resolve().parents[1]
     (tmp_path/'scripts').mkdir()
-    for name in ('ci_evidence.py','ci_partition.py','ci_nleg_retired.json'):
+    for name in ('ci_evidence.py','ci_partition.py','ci_nleg_retired.json','ci_optional_tests.json'):
         shutil.copy(project/'scripts'/name,tmp_path/'scripts'/name)
     (tmp_path/'tests').mkdir()
     retired=json.loads((tmp_path/'scripts/ci_nleg_retired.json').read_text())['retired']
@@ -97,7 +97,7 @@ def evidence(tmp_path):
             'tests/test_frontend_gateway.py', 'tests/test_dashboard_web.py','tests/test_account_api.py',
             'tests/test_lp_example.py', 'tests/test_prediction_runtime.py','tests/test_prediction_service.py',
             'tests/test_prediction_monitor_selection_driver.py','tests/test_prediction_n_leg_cutover.py',
-            'tests/test_run_nleg_cutover.py']:
+            'tests/test_run_nleg_cutover.py', 'tests/test_lp_d2_service_lifecycle.py']:
         (tmp_path/path).write_text('def test_ok(): pass\n')
     runtime=['test_n_leg_pause_keeps_lp_running_without_n_leg_requests',
              'test_n_leg_pause_suppresses_shadow_background_requests']
@@ -119,7 +119,8 @@ def evidence(tmp_path):
     plain='tests/test_prediction_monitor_selection_driver.py::test_ok'
     parts['prediction'][parts['prediction'].index(plain)] = plain+'[literal@parameter]'
     retired_nodes=[item['path']+'::test_ok' for item in retired]
-    proof=partition.verify_partition(sum(parts.values(),[])+retired_nodes,parts,retired_nodes,tmp_path)
+    optional=['tests/test_lp_d2_service_lifecycle.py::test_supported_rollback_uses_current_api_without_disposable_record_audit']
+    proof=partition.verify_partition(sum(parts.values(),[])+retired_nodes+optional,parts,retired_nodes,tmp_path,optional)
     lock = hashlib.sha256((tmp_path/'uv.lock').read_bytes()).hexdigest()
     for i, scope in enumerate(preflight.SCOPES):
         selection=ci.expected_selection(scope,tmp_path)
@@ -157,6 +158,7 @@ def evidence(tmp_path):
             ref='refs/heads/main', run_id='22', run_attempt='2', scope=scope, test_n_leg='0',
             workers=2 if scope=='prediction' else 1, lock_sha256=lock, status='success', exit_status=0,
             selection=selection,selection_sha256=ci.selection_sha256(selection),policy=ci.retirement_policy(tmp_path),
+            optional_policy=ci.optional_policy(tmp_path),test_tier='required',
             selected_nodeids=nodes,environment=env,evidence_role='test-only')
         archive = pack(files)
         artifact = dict(id=i+1, name=f'ci-{scope}-{SHA}-22-2', expired=False,
@@ -178,7 +180,9 @@ def test_trusted_main_active_coverage_is_accepted(evidence):
         proof=json.loads(archive.read('partition.json'))
     assert proof['retired_status']=='not-executed-permanent-retirement'
     assert proof['retired_count']==29
-    assert proof['executed_count']+29==proof['complete_count']
+    assert proof['executed_count']+29+1==proof['complete_count']
+    assert proof['optional_count']==1
+    assert proof['optional_status']=='not-executed-advisory'
     assert proof['retired'] and not set(proof['retired']) & set(sum(proof['partitions'].values(),[]))
 
 

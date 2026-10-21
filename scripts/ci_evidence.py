@@ -17,6 +17,28 @@ def file_sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+OPTIONAL_POLICY = 'rollback-advisory-v1'
+OPTIONAL_NODEIDS = (
+    'tests/test_lp_d2_service_lifecycle.py::test_supported_rollback_uses_current_api_without_disposable_record_audit',
+)
+
+
+def optional_policy(root):
+    path = Path(root)/'scripts/ci_optional_tests.json'
+    data = json.loads(path.read_text())
+    if (not isinstance(data, dict) or set(data) != {'schema_version', 'policy', 'optional'}
+            or type(data['schema_version']) is not int or data['schema_version'] != 1
+            or data['policy'] != OPTIONAL_POLICY or data['optional'] != list(OPTIONAL_NODEIDS)):
+        raise ValueError('invalid or unreviewed optional policy')
+    for node in data['optional']:
+        source = Path(root)/node.split('::', 1)[0]
+        if (not source.is_file() or source.is_symlink()
+                or not source.resolve().is_relative_to(Path(root).resolve())):
+            raise ValueError('missing or unsafe optional test file')
+    return {'policy': OPTIONAL_POLICY, 'manifest_sha256': file_sha256(path),
+            'optional_nodeids': list(OPTIONAL_NODEIDS)}
+
+
 POLICY = 'permanent-nleg-retirement-v1'
 RETIREMENT_REASON = 'N-leg permanently retired'
 # Reviewed exact allowlist. Names alone never retire a future test.
@@ -107,7 +129,9 @@ def service_partitions(root, nleg='0', manifest=None):
 
 
 def expected_selection(scope, root):
-    if scope == 'portable':
+    if scope == 'rollback-advisory':
+        roots = [node.split('::', 1)[0] for node in optional_policy(root)['optional_nodeids']]
+    elif scope == 'portable':
         roots = ['acceptance/test_prediction_arbitrage_scenarios.py']
     elif scope == 'trend-curve':
         roots = ['tests/test_trend_curve_research.py', 'tests/test_trend_curve_backtest.py',
@@ -116,7 +140,19 @@ def expected_selection(scope, root):
         roots = service_partitions(root)[scope]
     else:
         raise ValueError('unknown CI scope')
-    return {'roots': roots, 'marker': MARKER, 'keyword': 'not LIVE' if scope == 'portable' else ''}
+    selection = {'roots': roots, 'marker': MARKER, 'keyword': 'not LIVE' if scope == 'portable' else ''}
+    if scope == 'prediction':
+        selection['deselect'] = optional_policy(root)['optional_nodeids']
+    if scope == 'rollback-advisory':
+        selection['nodeids'] = optional_policy(root)['optional_nodeids']
+    return selection
+
+
+def validate_selected_nodes(selection, nodes):
+    if any(node.split('::', 1)[0] not in selection['roots']
+           or node in selection.get('deselect', [])
+           or ('nodeids' in selection and node not in selection['nodeids']) for node in nodes):
+        raise ValueError('test nodeid outside declared required/optional selection')
 
 
 def selection_sha256(selection):
@@ -128,9 +164,9 @@ def validate_partition(root, proof):
     spec = importlib.util.spec_from_file_location('evidence_partition', Path(__file__).with_name('ci_partition.py'))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    expected = module.verify_partition(proof['complete'], proof['partitions'], proof['retired'], root)
+    expected = module.verify_partition(proof['complete'], proof['partitions'], proof['retired'], root, proof['optional'])
     if proof != expected:
-        raise ValueError('inconsistent active/retired partition proof')
+        raise ValueError('inconsistent required/optional/retired partition proof')
     return proof
 
 
@@ -323,8 +359,7 @@ def build_evidence(root, directory, scope, nleg, workers, status, env):
         metrics = validate_metrics(json.loads(metrics_path.read_text()), nodes, env['GITHUB_SHA'], workers, status == 0)
         if status == 0:
             validate_junit((Path(directory) / 'junit.xml').read_bytes(), metrics)
-        if any(node.split('::', 1)[0] not in selection['roots'] for node in nodes):
-            raise ValueError('test nodeid outside declared selection')
+        validate_selected_nodes(selection, nodes)
     if status == 0 and scope == 'portable':
         validate_partition(root, json.loads((Path(directory) / 'partition.json').read_text()))
     return {
@@ -336,12 +371,20 @@ def build_evidence(root, directory, scope, nleg, workers, status, env):
         'lock_sha256': file_sha256(Path(root) / 'uv.lock'),
         'status': 'success' if status == 0 else 'failure', 'exit_status': status,
         'selection': selection, 'selection_sha256': selection_sha256(selection),
-        'policy': retirement_policy(root), 'selected_nodeids': nodes, 'environment': environment,
+        'policy': retirement_policy(root), 'optional_policy': optional_policy(root),
+        'test_tier': 'optional' if scope == 'rollback-advisory' else 'required',
+        'selected_nodeids': nodes, 'environment': environment,
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    if len(os.sys.argv) > 1 and os.sys.argv[1] == 'optional':
+        parser.add_argument('command')
+        parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
+        args = parser.parse_args()
+        print(' '.join(optional_policy(args.root)['optional_nodeids']))
+        return
     if len(os.sys.argv) > 1 and os.sys.argv[1] == 'select':
         parser.add_argument('command')
         parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])

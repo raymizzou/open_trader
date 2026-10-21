@@ -19,10 +19,12 @@ CI_TEST_ARTIFACTS ?= 0
 CI_TEST_CONTAINER ?= open-trader-test-records
 ifeq ($(CI_TEST_ARTIFACTS),1)
 DOCKER_RUN = $(DOCKER) run --name "$(CI_TEST_CONTAINER)" --init --network none --cap-drop ALL --security-opt no-new-privileges "$(DOCKER_IMAGE)"
+CI_TEST_TIER ?= required
+CI_PYTEST_SELECTION = $(if $(filter optional,$(CI_TEST_TIER)),,-p scripts.ci_partition --ci-required)
 CI_PYTEST_RECORDS = -p scripts.ci_test_metrics --junitxml=/tmp/open-trader-ci-evidence/junit.xml
 CI_PYTEST_ENV = CI_TEST_METRICS=/tmp/open-trader-ci-evidence/metrics.json CI_TEST_SOURCE_SHA=$(SOURCE_SHA) CI_TEST_WORKERS=$(TEST_WORKERS)
 endif
-BACKEND_PYTEST = env $(CI_PYTEST_ENV) PYTHONSAFEPATH=1 PYTHONPATH=/workspace:/workspace/src PYTHONDONTWRITEBYTECODE= PYTHONPYCACHEPREFIX=/tmp/open-trader-bytecache pytest -q $(CI_PYTEST_RECORDS) -m "not pressure and not browser" -o cache_dir=/tmp/open-trader-pytest-cache --basetemp=/tmp/open-trader-pytest
+BACKEND_PYTEST = env $(CI_PYTEST_ENV) PYTHONSAFEPATH=1 PYTHONPATH=/workspace:/workspace/src PYTHONDONTWRITEBYTECODE= PYTHONPYCACHEPREFIX=/tmp/open-trader-bytecache pytest -q $(CI_PYTEST_RECORDS) $(CI_PYTEST_SELECTION) -m "not pressure and not browser" -o cache_dir=/tmp/open-trader-pytest-cache --basetemp=/tmp/open-trader-pytest
 TEST_WORKERS ?= $(if $(filter prediction,$(SERVICE)),6,1)
 TEST_N_LEG ?= 0
 # The reviewed manifest is the sole retirement selection source.
@@ -57,6 +59,16 @@ test:
 .PHONY: ci-test-files test-ci-portable
 ci-test-files:
 	@$(CI_SELECTION)
+
+# Advisory runs only this exact unchanged node, in one serial session.
+.PHONY: test-ci-rollback-advisory
+test-ci-rollback-advisory: CI_TEST_TIER = optional
+test-ci-rollback-advisory:
+	$(if $(filter 1,$(TEST_WORKERS)),,$(error Rollback advisory requires one serial worker))
+	$(eval OPTIONAL_TEST := $(shell python3 scripts/ci_evidence.py optional || echo __INVALID_OPTIONAL__))
+	$(if $(filter __INVALID_OPTIONAL__,$(OPTIONAL_TEST)),$(error Invalid optional selection))
+	$(DOCKER_BUILD)
+	$(DOCKER_RUN) $(BACKEND_PYTEST) $(OPTIONAL_TEST)
 
 # Preserve one serial session for the portable scenarios; LIVE alone is excluded.
 test-ci-portable:

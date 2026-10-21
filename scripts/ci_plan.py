@@ -20,7 +20,8 @@ def policy():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     data = module.retirement_policy(Path(__file__).resolve().parents[1])
-    return {key: data[key] for key in ("policy", "manifest_sha256", "retirement_reason")}
+    return {**{key: data[key] for key in ("policy", "manifest_sha256", "retirement_reason")},
+            "optional_policy": module.optional_policy(Path(__file__).resolve().parents[1])}
 
 
 
@@ -28,7 +29,7 @@ def route(paths):
     # Paths are diagnostic only. Active/shared coverage stays mandatory.
     return {'scopes': list(REQUIRED_SCOPES), 'test_n_leg': '0',
             **policy(),
-            'reason': 'all active backend and portable coverage for every CI candidate'}
+            'reason': 'all required backend and portable coverage; one exact rollback node advisory'}
 
 
 def changed_paths(base, head, cwd=None):
@@ -52,7 +53,7 @@ def required(needs):
             expected = 'success' if scope in scopes else 'skipped'
             if result != expected:
                 return False, f'{scope}: expected {expected}, got {result}'
-        return True, 'all backend and portable active checks succeeded; N-leg permanently retired'
+        return True, 'all required backend and portable checks succeeded; rollback advisory not awaited; N-leg permanently retired'
     except (KeyError, TypeError, ValueError):
         return False, 'missing or malformed plan/job results'
 

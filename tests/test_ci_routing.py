@@ -151,7 +151,7 @@ class RequiredTests(unittest.TestCase):
             candidate = self.needs([]); del candidate[scope]
             self.assertFalse(ci.required(candidate)[0])
         for changes in ({'scopes': []}, {'policy': 'unknown'}, {'retirement_reason': 'temporary'},
-                        {'manifest_sha256': '0'*64}, {'test_n_leg': '1'}):
+                        {'manifest_sha256': '0'*64}, {'optional_policy':{}}, {'test_n_leg': '1'}):
             candidate = self.needs([])
             plan = json.loads(candidate['plan']['outputs']['plan']); plan.update(changes)
             candidate['plan']['outputs']['plan'] = json.dumps(plan)
@@ -161,7 +161,7 @@ class RequiredTests(unittest.TestCase):
         self.assertTrue(ci.required(self.needs(['src/open_trader/account_api.py']))[0])
         ok, reason = ci.required(self.needs(['docs/operations/ci.md']))
         self.assertTrue(ok)
-        self.assertIn('all backend', reason)
+        self.assertIn('all required backend', reason)
 
     def test_failure_cancellation_skip_missing_fail_closed(self):
         for scope in ci.REQUIRED_SCOPES:
