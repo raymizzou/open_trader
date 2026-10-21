@@ -1697,6 +1697,20 @@ def test_scheduler_wakes_read_fault_cancel_after_manual_lease_release(tmp_path,m
             boundary.holds={('O','balance'),('C','book')}
             for key in boundary.holds:boundary.mode[key]='swallow'
             at(5);drive_until(lambda:all(('entered',oid,source,5) in boundary.events for oid,source in boundary.holds))
+            scopes=runtime.status()['scopes']
+            attempts={scope['key']:scope['attempt'] for scope in scopes}
+            assert len(scopes)==2 and {key[3:5] for key in attempts}=={('financial','O'),('buy','C')}
+            assert all(key[:3]==(WALLET,'p16-'+variant,live.state.snapshot().current.cycle_generation) for key in attempts)
+            def unheld_sources_published():
+                state=runtime.status();current=state['scopes']
+                # Both held children remain pending. Two active parents plus
+                # those children means every unheld source has published,
+                # rather than merely returned from its external transport.
+                return (business()==5 and state['managed_tasks']==4 and len(current)==2
+                    and {scope['key']:scope['attempt'] for scope in current}==attempts
+                    and all(scope['active'] and scope['started']==5 and not scope['retiring']
+                        and not scope['cleanup_fault'] for scope in current))
+            boundary.wait(unheld_sources_published)
             collect_at(10,0,11);collect_at(11,2,None)
             assert cancelled==[]
             if variant=='rejected_post_sql_tail':
