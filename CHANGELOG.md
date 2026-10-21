@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-21
 
+- LP 共享 native 容量的完成唤醒补齐手动撤单、保护 SELL/cancel_exit 和实际手动入场 reservation 释放；延期保护撤单不再依赖无关命令或读取。保留真实 cap2、UNKNOWN、不重放及整条手动命令/SQL 所有权；状态查询不产生唤醒。离线回归覆盖三类生产路径、60 数量与止损/finality、20 入场及 SQL 持有交错，未部署。
+
 - LP 精确保护撤单完成后通知既有 Scheduler，并保留有界完成代际直到 owner 完成后续保护容量检查，避免三目标 cap2 延期撤单在纯事件等待中停滞。物理线程退出前仍占容量，权限、UNKNOWN、不重放和读取故障所有权不变；离线真实 Scheduler 回归覆盖受控完成交错、同刻第三目标发送与消费后不空转，未部署。
 
 - LP 读取冷却与仅等待事件时，保留控制保存 completed+1 秒重试，并及时收集已结束的保存；owner 检查失败仍按配置的 60 秒重试，不被提供者 300 秒 Retry-After 延后。离线真实 Scheduler 回归覆盖暂停即时生效、两次保存、无提前 HTTP 和本地持久化恢复；重试/失败升级及资金门禁不变，未部署。

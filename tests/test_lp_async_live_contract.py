@@ -1253,3 +1253,339 @@ def test_scheduler_wakes_deferred_read_fault_cancels_after_native_completion(tmp
         gate=False
         for release in releases.values():release.set()
         boundary.release.set();scheduler.stop();assert live.close(4)
+
+
+def test_scheduler_wakes_deferred_read_fault_cancel_after_manual_cancel_completion(tmp_path,monkeypatch):
+    from open_trader.polymarket_lp import PolymarketLPService
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+    from tests.test_lp_d2_execution_bridge import attach
+    # Observe the approved public admission port while the real service remains
+    # its binding owner and its actual safety lease/permission remains in force.
+    class AdmissionObservedLive(LPD2LiveExecution):
+        def bind_mutation_admission(self,owner,acquire):
+            def observed(action):
+                if not admitted:return None
+                actual=acquire(action)
+                return Lease(actual) if actual is not None else None
+            return super().bind_mutation_admission(owner,observed)
+    clock=Clock();boundary=Boundary(clock);trading=Trading();store=PredictionArbitrageStore(tmp_path)
+    runtime=LPReadRuntime(boundary.factory,clock=clock,utc_now=clock.utc)
+    live=AdmissionObservedLive(store,trading,account_id='account',venue='polymarket',process_epoch='epoch',
+        policy=CalculationPolicy(Decimal(100)),read_runtime=runtime,clock=clock,utc_now=clock.utc)
+    live.initialize(ValidatedStartAdmission('epoch','offline-permit'))
+    # Manual explicit routes read the external legacy source boundary. Keep its
+    # source timestamps on the same isolated business clock as the real runtime.
+    import open_trader.polymarket_lp_market_reader as reader_module
+    from datetime import datetime
+    class ClockMeta(type):
+        def __instancecheck__(cls,value):return isinstance(value,datetime)
+    class BusinessDateTime(datetime,metaclass=ClockMeta):
+        @classmethod
+        def now(cls,tz=None):return clock.utc() if tz is not None else clock.utc().replace(tzinfo=None)
+    monkeypatch.setattr(reader_module,'datetime',BusinessDateTime)
+    manual_reads=[];captured_orders=[]
+    class ManualSources:
+        def read(self,component,scope):
+            manual_reads.append(component)
+            if component=='open_orders':return tuple(captured_orders)
+            if component=='positions':return ()
+            if component=='balance':raise OSError('offline unavailable financial source')
+            raise AssertionError(component)
+    live.reader=MarketReader(ManualSources(),clock=clock)  # external source port, no internal read mocks
+    targets={'A','B','C'}
+    boundary.orders=[wire_row('A'),wire_row('B'),wire_row('C','3')]
+    boundary.book_depth=1000  # isolate read faults from the original queue threshold
+    producer=PolymarketLPService(live.store,trading,clock=clock.utc)
+    execution=attach(live,producer,tmp_path);scheduler=LPAutoScheduler(execution,clock=clock.utc)
+    execution.set_lp_auto_scheduler(scheduler)
+    notices=[]
+    def notice():
+        state=live.read_runtime.status();scheduler.request_check();notices.append(state)
+    execution.set_lp_auto_wakeup(notice)
+    changed=threading.Condition();entered=set();finished=set();threads={}
+    releases={oid:threading.Event() for oid in targets}
+    active=0;maximum=0;admitted=False;gate=False;pair=set();deferred=None
+    manual_phase=False;manual_calls=[];callers={};responses={};errors=[]
+    owner_thread=threading.current_thread();actual_cancel=trading.cancel_orders_detailed
+    def cancel(ids):
+        nonlocal active,maximum
+        assert len(ids)==1 and ids[0] in targets
+        oid=ids[0]
+        manual=threading.current_thread().name=='lp-d2-manual-cancel'
+        if not manual_phase:return actual_cancel(ids)  # separately recorded setup protection ownership
+        with changed:
+            assert oid not in entered,'manual or UNKNOWN cancel must not replay'
+            entered.add(oid);threads[oid]=threading.current_thread()
+            active+=1;maximum=max(maximum,active);changed.notify_all()
+        try:
+            assert releases[oid].wait(4),'external native cancel release watchdog'
+            if manual:
+                manual_calls.append(ids)
+                return dict(canceled=[],not_canceled={oid:'UNKNOWN'})
+            return actual_cancel(ids)
+        finally:
+            with changed:active-=1;finished.add(oid);changed.notify_all()
+    trading.cancel_orders_detailed=cancel
+    def requests():
+        return {t.order_key[3]:t.request_id for p in live.state.snapshot().progress.values()
+            for t in p.cancel_targets if t.order_key[3] in targets}
+    class Lease:
+        def __init__(self,actual):self.actual=actual
+        def allowed(self,action=None):return admitted and self.actual.allowed(action)
+        def release(self):
+            nonlocal gate,pair,deferred
+            self.actual.release()
+            if not gate or threading.current_thread() is not owner_thread:return
+            # This temporary lease belongs to the third cap2 refusal. The live
+            # state lock has exited; external returns can now complete normally.
+            gate=False
+            assert live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)>0
+            boundary.wait(lambda:len(entered)==2)
+            pair=set(entered);deferred=next(iter(targets-pair))
+            assert pair=={'A','B'} and deferred=='C'
+            assert set(requests())==pair and live.status()['native_inflight']==2
+            for oid in pair:releases[oid].set()
+            for oid in pair:threads[oid].join(4);assert not threads[oid].is_alive()
+            for oid in pair:callers[oid].join(4);assert not callers[oid].is_alive()
+            assert errors==[] and set(responses)==pair
+            assert finished==pair and live.status()['native_inflight']==0
+            assert set(requests())==pair  # no fabricated third request/attempt
+    def drive_until(predicate):
+        end=time.monotonic()+4
+        while not predicate():
+            scheduler.run_due()
+            left=end-time.monotonic();assert left>0,(live.status(),boundary.events)
+            with changed:changed.wait(min(.01,left))
+    def collect_at(stamp,dependency,faults):
+        clock.value=stamp;live.read_runtime.wake()
+        boundary.wait(lambda:any(n['observed_monotonic']==stamp and n['ready_count']==4 for n in notices))
+        assert scheduler.run_due()
+        boundary.wait(lambda:any(n['observed_monotonic']==stamp and n['ready_count']==0
+            and n['cleanup_faults']==faults and n['next_dependency_monotonic']==dependency for n in notices))
+        scheduler.run_due()  # actual post-ACK notice, not a manufactured rescue
+    try:
+        assert scheduler.run_due()
+        drive_until(lambda:len(live.state.snapshot().read_failures)==3
+            and all(y.yield_pct_per_hour.state=='known' for y in live.state.snapshot().yields.values())
+            and len(live.state.snapshot().yields)==3)
+        # Start four real held attempts at5; timeout10 and cleanup fault11
+        # preserve the original per-attempt5/6 boundaries.
+        boundary.holds={('O','balance'),*((oid,'book') for oid in targets)}
+        for key in boundary.holds:boundary.mode[key]='swallow'
+        clock.value=5;live.read_runtime.wake()
+        drive_until(lambda:all(('entered',oid,source,5) in boundary.events for oid,source in boundary.holds))
+        collect_at(10,11,0);collect_at(11,None,4)
+        state=live.read_runtime.status();snapshot=live.state.snapshot()
+        assert not snapshot.current.effective_running and snapshot.new_capacity.state=='unknown'
+        assert all('read_cleanup_fault' in f.reason_codes for f in snapshot.read_failures.values())
+        assert len(state['scopes'])==4 and all(s['active'] and s['cleanup_fault'] for s in state['scopes'])
+        assert state['next_dependency_monotonic'] is None and state['ready_count']==0 and state['waiting_for_event']
+        assert not state['new_buy_allowed'] and state['pool_count']==8
+        assert scheduler.snapshot()['next_check_at'] is None
+        assert requests()=={} and trading.cancels==[] and not entered
+        captured_orders.extend(snapshot.observation.source_frame.orders)
+        # Real public protection requests establish A/B UNKNOWN ownership before
+        # the reported manual interleaving; no private cancel markers injected.
+        admitted=True
+        setup_ids={}
+        for oid in ('A','B'):
+            key=('account',CID,'yes',oid);failure=live.state.snapshot().read_failures[key]
+            handle=live.cancel_independent(key,protection_key=failure.protection_key,reason='read_cleanup_fault')
+            assert handle.result(4).status.value=='unknown_error'
+            handle._thread.join(4);assert not handle._thread.is_alive()
+            setup_ids[oid]=handle.identity.request_id
+        assert requests()==setup_ids and trading.cancels==[('A',),('B',)]
+        admitted=False
+        assert scheduler.run_due()  # consume only setup's real completion notice
+        assert scheduler.snapshot()['next_check_at'] is None and not scheduler.run_due()
+        manual_phase=True
+        def manual(oid):
+            try:responses[oid]=execution.lp_cancel_orders(dict(confirm=True,order_ids=[oid]))
+            except BaseException as exc:errors.append(exc)
+        for oid in ('A','B'):
+            callers[oid]=threading.Thread(target=manual,args=(oid,),name='public-manual-'+oid)
+            callers[oid].start();boundary.wait(lambda:oid in entered)
+        assert live.status()['native_inflight']==2 and all(t.is_alive() for t in callers.values())
+        assert requests()==setup_ids
+        before=list(boundary.events);reads_before=list(manual_reads)
+        admitted=True;gate=True
+        # This initial public command starts C's capacity check. Only actual
+        # manual-native completion may rescue C after that check defers it.
+        execution.lp_auto_run_once();assert scheduler.run_due()
+        assert not gate and len(pair)==2 and deferred not in requests()
+        assert set(entered)==finished==pair and manual_calls==[('A',),('B',)] or (
+            set(entered)==finished==pair and manual_calls==[('B',),('A',)])
+        assert trading.cancels==[('A',),('B',)]
+        assert all(responses[oid]==dict(requested=1,canceled=[],not_canceled={oid:'UNKNOWN'},skipped=[]) for oid in pair)
+        assert requests()==setup_ids
+        assert live.status()['native_inflight']==0,(live.diagnostics()['cancel_blocks'],requests(),entered,live.state.snapshot().progress)
+        state=live.read_runtime.status()
+        assert state['next_dependency_monotonic'] is None and state['ready_count']==0
+        assert len(state['scopes'])==4 and not any(s['key'][3]=='exact' for s in state['scopes'])
+        assert boundary.events==before and manual_reads==reads_before and clock()==11
+        assert scheduler.run_due(),'native completion must wake deferred protection at the same business time'
+        boundary.wait(lambda:entered==targets)
+        assert set(requests())==targets and len(set(requests().values()))==3
+        assert clock()==11 and boundary.events==before and maximum==2
+        releases[deferred].set();threads[deferred].join(4);assert not threads[deferred].is_alive()
+        assert scheduler.run_due()  # consume actual C completion, then idle
+        drive_until(lambda:scheduler.snapshot()['next_check_at'] is None)
+        snapshot=live.state.snapshot();state=live.read_runtime.status()
+        assert trading.cancels==[('A',),('B',),('C',)] and finished==targets
+        assert requests()['A']==setup_ids['A'] and requests()['B']==setup_ids['B']
+        assert sorted(manual_calls)==[('A',),('B',)] and manual_reads==reads_before
+        assert maximum==2 and live.status()['native_inflight']==0
+        partial=next(o for o in snapshot.orders if o.key[3]=='C')
+        assert (partial.original_size.value,partial.size_matched.value,partial.remaining.value)==(20,3,17)
+        assert {o.key[3] for o in snapshot.active_orders}==targets and not snapshot.openings
+        assert all(t.local_outcome=='unknown_error' for p in snapshot.progress.values() for t in p.cancel_targets)
+        assert all('read_cleanup_fault' in f.reason_codes for f in snapshot.read_failures.values())
+        assert snapshot.new_capacity.state=='unknown' and not state['new_buy_allowed']
+        assert state['next_dependency_monotonic'] is None and state['cleanup_faults']==4 and state['pool_count']==8
+        assert state['ready_count']==0 and len(state['scopes'])==4 and boundary.events==before
+        assert all(not scheduler.run_due() for _ in range(100))
+        assert len(trading.cancels)==3 and clock()==11
+    finally:
+        gate=False
+        for release in releases.values():release.set()
+        for caller in callers.values():caller.join(4)
+        boundary.release.set();scheduler.stop();assert live.close(4)
+
+
+def test_protection_native_completion_notifies_owner_and_preserves_outcome(tmp_path,monkeypatch):
+    from tests.test_lp_d2_integration import _d2_filled_opening
+    live,sdk,public,clock=_d2_filled_opening(tmp_path,monkeypatch)
+    posted=threading.Event();post_release=threading.Event()
+    cancelled=threading.Event();cancel_release=threading.Event();woken=threading.Event()
+    broken=False;handles=[]
+    def notice():
+        woken.set()
+        if broken:raise RuntimeError('offline owner callback failure')
+    live.set_read_wakeup(notice)
+    post=sdk.post_order;cancel=sdk.cancel_orders
+    def held_post(signed):
+        assert signed['side']=='SELL' and signed['size']==60 and signed['order_type']=='GTC'
+        posted.set();assert post_release.wait(4),'external passive SELL return watchdog'
+        return post(signed)
+    def held_cancel(*,order_ids):
+        assert order_ids==('passive-exit',)
+        cancelled.set();assert cancel_release.wait(4),'external cancel_exit return watchdog'
+        return cancel(order_ids=order_ids)
+    sdk.post_order=held_post;sdk.cancel_orders=held_cancel
+    def tick():
+        live.run_once();current=live.run_protection_once();handles.extend(current)
+        return current
+    try:
+        assert live.read_runtime is None  # no unrelated asynchronous HTTP wake can satisfy this oracle
+        clock[0]=2;public.bid=Decimal('.251')
+        end=time.monotonic()+4;passive=None
+        while passive is None:
+            current=tick()
+            passive=next((h for h in current if h.identity.kind=='passive_exit'),None)
+            assert time.monotonic()<end
+        assert posted.wait(4) and not passive.done()
+        assert live.status()['native_inflight']==1 and not woken.is_set()
+        post_release.set();actual=passive.result(4);passive._thread.join(4)
+        assert passive.done() and (actual.status,actual.order_id)==('accepted','passive-exit')
+        assert live.status()['native_inflight']==0
+        assert woken.wait(4),'released passive SELL must notify the registered owner'
+        snapshot=live.state.snapshot();scope=next(iter(snapshot.openings))
+        assert snapshot.openings[scope].economics.opening_loss_usd.value==Decimal('4.94')
+        assert snapshot.openings[scope].stop_loss_latched.value is False
+        assert snapshot.sells[scope].passive.submit_quantity.value==60
+        assert sdk.posts[-1]['size']==60 and sdk.posts[-1]['price']==Decimal('.32')
+        assert sdk.posts[-1]['expiration'] is None and sdk.posts[-1]['post_only'] is True
+        woken.clear();broken=True;clock[0]=3;public.bid=Decimal('.25')
+        current=tick();exit_cancel,=current
+        assert exit_cancel.identity.kind=='cancel_exit' and cancelled.wait(4)
+        assert not exit_cancel.done() and live.status()['native_inflight']==1 and not woken.is_set()
+        snapshot=live.state.snapshot()
+        assert snapshot.openings[scope].stop_loss_latched.value is True
+        assert snapshot.openings[scope].stop_loss_triggered_loss_usd.value==Decimal('5.00')
+        assert sdk.market_orders==[]
+        cancel_release.set();actual=exit_cancel.result(4);exit_cancel._thread.join(4)
+        assert exit_cancel.done() and (actual.status,actual.order_id)==('accepted','passive-exit')
+        assert woken.wait(4) and live.status()['native_inflight']==0  # callback raised after recording
+        broken=False
+        assert sdk.cancels==[('passive-exit',)] and sdk.market_orders==[]
+        for h in tick():h.result(4);h._thread.join(4)
+        assert sdk.market_orders==[]  # ID-only ACK cannot authorize replacement before exact final0
+        sdk.allow_exact=True
+        for _ in range(2):
+            for h in tick():h.result(4);h._thread.join(4)
+        snapshot=live.state.snapshot()
+        assert len(sdk.market_orders)==1 and sdk.market_orders[0]['shares']==60
+        assert sdk.market_orders[0]['min_price']==Decimal('.25')
+        assert snapshot.sells[scope].passive.state=='terminal'
+        assert snapshot.sells[scope].protected.submit_quantity.value==60
+        for h in tick():h.result(4);h._thread.join(4)
+        assert sdk.cancels==[('passive-exit',)] and len(sdk.market_orders)==1
+    finally:
+        post_release.set();cancel_release.set()
+        assert live.close(4);live.trading.close()
+
+
+def test_manual_entry_capacity_completion_notifies_owner_without_status_wakes(tmp_path,monkeypatch):
+    import sqlite3,fcntl,pytest
+    from tests.test_lp_d2_manual_bridge import manual_runtime,entry
+    execution,live,sdk,public,clock=manual_runtime(tmp_path,monkeypatch)
+    sdk_entered=threading.Event();sdk_release=threading.Event();returned=threading.Event()
+    sql_entered=threading.Event();sql_release=threading.Event();woken=threading.Event()
+    results=[];errors=[];command_threads=[];caller=None
+    post=sdk.post_order;real_connect=sqlite3.connect
+    execution.set_lp_auto_wakeup(woken.set)
+    def held_post(signed):
+        command_threads.append(threading.current_thread())
+        assert signed['side']=='BUY' and signed['price']==Decimal('.29') and signed['size']==20
+        assert signed['order_type']=='GTD' and signed['expiration'] is not None and signed['post_only'] is True
+        sdk_entered.set();assert sdk_release.wait(6),'actual manual native post watchdog'
+        result=post(signed);returned.set();return result
+    sdk.post_order=held_post
+    class HeldFinish(sqlite3.Connection):
+        def execute(self,sql,*args,**kwargs):
+            if sql=='COMMIT' and returned.is_set() and threading.current_thread().name=='lp-d2-manual-command':
+                sql_entered.set();assert sql_release.wait(6),'actual reliable manual-result SQL watchdog'
+            return super().execute(sql,*args,**kwargs)
+    def submit():
+        try:results.append(execution.lp_submit_entry(entry(clock)))
+        except BaseException as exc:errors.append(exc)
+    try:
+        assert live.read_runtime is None and not live.state.snapshot().current.effective_running
+        with monkeypatch.context() as patch:
+            patch.setattr(sqlite3,'connect',lambda *args,**kwargs:real_connect(*args,**(kwargs|dict(factory=HeldFinish))))
+            caller=threading.Thread(target=submit,name='public-manual-entry');caller.start()
+            assert sdk_entered.wait(4) and caller.is_alive()
+            assert live.status()['native_inflight']==1 and not woken.is_set() and sdk.posts==[]
+            sdk_release.set();assert sql_entered.wait(4)
+            assert live.status()['native_inflight']==0 and caller.is_alive() and len(sdk.posts)==1
+            assert woken.wait(4),'actual manual-entry reservation release must notify before reliable SQL ends'
+            assert live.state.snapshot().orders[0].key[3]=='manual-order-1'
+            # Actual native capacity is free; reliable whole-command/file-lock
+            # ownership continues until the real SQL completion, as before.
+            with (tmp_path/'execution.lock').open('a+') as foreign:
+                with pytest.raises(BlockingIOError):fcntl.flock(foreign.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+            sql_release.set();caller.join(4);assert not caller.is_alive() and errors==[]
+            for thread in command_threads:thread.join(4);assert not thread.is_alive()
+        result,=results
+        assert result['state']=='entry_open' and result['submit_status']=='accepted'
+        assert result['entry_order_id']=='manual-order-1' and Decimal(result['price'])==Decimal('.29')
+        assert Decimal(result['quantity'])==20
+        with (tmp_path/'execution.lock').open('a+') as foreign:
+            fcntl.flock(foreign.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+            fcntl.flock(foreign.fileno(),fcntl.LOCK_UN)
+        for handle in live.run_protection_once():handle.result(4);handle._thread.join(4)
+        woken.clear()
+        before=(sdk.balance_reads,sdk.order_reads,sdk.position_reads,public.book_reads,len(sdk.posts),tuple(sdk.cancels))
+        for _ in range(20):
+            assert execution.lp_status(result['session_id'])['entry_order_id']=='manual-order-1'
+            execution.lp_auto_state(include_intents=False)
+        assert not woken.is_set(),'snapshot queries must not become scheduler drivers'
+        assert (sdk.balance_reads,sdk.order_reads,sdk.position_reads,public.book_reads,len(sdk.posts),tuple(sdk.cancels))==before
+        assert execution.lp_submit_entry(entry(clock))==result  # same key replays response, never native work
+        assert execution.lp_submit_entry(entry(clock,idempotency_key=''))['state']=='rejected'
+        assert not woken.is_set() and len(sdk.posts)==1 and sdk.cancels==[]
+        assert live.status()['native_inflight']==0 and live.control.status().fatal is None
+    finally:
+        sdk_release.set();sql_release.set()
+        if caller:caller.join(4)
+        assert live.close(4);live.trading.close()

@@ -537,6 +537,7 @@ class LPD2LiveExecution:
                         self._last_current_evidence=(identity.request_id,'manual_cancel',disposition)
                     future.set_result(dict(canceled=canceled,not_canceled=not_canceled))
                 except BaseException as exc:future.set_exception(exc)
+                finally:self._publish_native_completion()
             thread=threading.Thread(target=cancel,name='lp-d2-manual-cancel',daemon=False)
             handle=NativeAttempt(identity,future,thread)
             for order in selected:self._native_jobs[(self.account_id,self.venue,order.key[2],order.key[3])]=handle
@@ -871,6 +872,8 @@ class LPD2LiveExecution:
         finally:
             with self.state._lock:
                 self._active_sends.discard(action.request_id)
+            if admitted:
+                self._publish_native_completion()
         status = ('accepted' if outcome.status == LocalStatus.ACCEPTED else 'rejected'
             if outcome.status == LocalStatus.REJECTED else 'not_sent' if outcome.status == LocalStatus.NOT_SENT else 'unknown')
         if status == 'accepted':
@@ -3186,7 +3189,11 @@ class LPD2LiveExecution:
                     except Exception:
                         pass
                 future.set_result(result)
-            finally: lease.release()
+            finally:
+                try:
+                    lease.release()
+                finally:
+                    self._publish_native_completion()
         thread = threading.Thread(target=run, name='lp-d2-protection-send', daemon=False)
         handle = NativeAttempt(identity, future, thread)
         self._native_jobs[(self.account_id, self.venue, identity.scope[2], identity.request_id)] = handle

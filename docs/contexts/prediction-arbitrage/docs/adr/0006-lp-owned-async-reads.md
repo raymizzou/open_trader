@@ -91,6 +91,12 @@ Scheduler 检查失败保留自身配置的错误重试期限，不被读取冷�
 不能因 Future 完成或线程刚退出就进入无限事件等待。callback 失败不改原生结果或 lease 清理。
 cap2 仍按真实线程/资源生命周期计数；通知消费后不因已归属 UNKNOWN 或权限拒绝的义务持续空转。
 
+同一有界完成通知还覆盖手动撤单、保护 SELL/cancel_exit 的真实 native 结束，
+以及手动入场实际持有的 `_active_sends` reservation 释放。它们复用既有 owner 唤醒和保护检查消费；
+不提前释放线程容量，也不缩短整条手动命令和可靠 SQL 的所有权。
+同步 owner `_attempt` 仍由同轮保护检查接续，不额外发通知；未获 reservation 不制造完成。
+`manual_call` 不统一发送通知，因为 `lp_status` 也使用该 wrapper；纯状态查询不驱动 Scheduler 或读取。
+
 ## 验证边界
 
 20 个公开 async/source/state/live 合同覆盖真实 HTTPX loopback 断连、受控取消/退出、独立期限监督、
