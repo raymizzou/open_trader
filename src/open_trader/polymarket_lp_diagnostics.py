@@ -1,10 +1,19 @@
 """Bounded value-only D2 observations. These values grant no trading authority."""
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum
 import json
+from collections import OrderedDict
+from contextlib import contextmanager
+import hashlib
+import hmac
+import logging
+import re
+from threading import Lock, local
+from time import monotonic
+import uuid
 from .polymarket_lp_market_reader import CURRENT_ORDER_STATES, SourceResult, freeze, observed_source_error
 
 
@@ -441,3 +450,208 @@ def summarize_iteration(*, attempted_at, ticket, prepared_frame, calculation,
             selected_targets=len(calculation.target_tokens),
             retained_targets=len(calculation.retained_order_ids),
             new_targets=len(fixed_plan.targets) if fixed_plan is not None else None)))
+
+
+# Service-log episodes are separate from the existing value-only D2 views.
+logger = logging.getLogger(__name__)
+_STAGES = frozenset({'reward_native', 'reward_sponsored', 'account_read',
+    'account_publish', 'entry_validate', 'entry_prepare', 'entry_send', 'receipt_apply'})
+_ERROR_REASONS = frozenset({
+    'reward_read_failed', 'reward_read_cancelled', 'account_snapshot_unknown',
+    'account_snapshot_incomplete', 'account_identity_mismatch', 'account_round_invalid',
+    'account_snapshot_stale', 'account_open_orders_unknown', 'account_order_identity_unknown',
+    'account_raw_trades_unknown', 'account_order_sync_unknown', 'account_read_failed',
+    'account_read_in_progress', 'account_read_capacity', 'account_read_timeout',
+    'account_read_cooling_down', 'account_history_unknown', 'account_balance_unknown',
+    'account_positions_unknown', 'account_trades_unknown', 'session_changed',
+    'order_original_quantity_conflict', 'order_limit_price_conflict', 'baseline_unknown',
+    'balance_insufficient', 'allowance_insufficient', 'best_bid_changed',
+    'candidate_bid_level_changed', 'candidate_bid_level_unavailable',
+    'market_read_in_progress', 'market_read_capacity', 'market_read_timeout',
+    'market_read_cooling_down', 'market_closed', 'prepare_failed', 'pre_send_rejected',
+    'send_unknown', 'exchange_rejected', 'receipt_apply_pending', 'receipt_received',
+    'accepted_without_order_id', 'idempotency_key_required', 'mutation_blocked',
+    'lp_session_market_active', 'entry_audit_registration_failed', 'account_identity_unknown',
+    'not_enough_balance', 'not_enough_allowance', 'venue_denied',
+    'order_identity_unknown', 'order_identity_conflict', 'order_fill_exceeds_quantity',
+    'legacy_order_ambiguous', 'account_order_conflict', 'account_order_owner_unknown',
+    'account_read_order_invalid', 'account_financial_facts_unknown', 'credential_invalid',
+    'history_summary_unknown', 'review_at_too_soon', 'execution_lock',
+})
+
+
+def safe_reason(value):
+    return value if type(value) is str and len(value) <= 96 and value in _ERROR_REASONS else 'unknown'
+
+
+def _exception_types(exc):
+    types, seen = [], set()
+    while isinstance(exc, BaseException) and id(exc) not in seen and len(types) < 8:
+        seen.add(id(exc))
+        name = type(exc).__name__
+        types.append(name if re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]{0,63}', name) else 'unknown')
+        exc = exc.__cause__ if exc.__cause__ is not None else None if exc.__suppress_context__ else exc.__context__
+    return types
+
+
+class LPDiagnostics:
+    """One owner, at most 256 scopes, one short state lock, no output under it."""
+    def __init__(self):
+        self._salt = uuid.uuid4().bytes
+        self._owner_id = uuid.uuid4().hex
+        self._scopes = OrderedDict()
+        self._lock = Lock()
+        self._association = local()
+        self._sequence = 0
+        self._evictions = 0
+
+    def opaque(self, value):
+        if type(value) is not str or not value or len(value) > 4096:
+            return 'unknown'
+        return hmac.new(self._salt, value.encode(), hashlib.sha256).hexdigest()[:24]
+
+    def begin(self, scope, identity='scope'):
+        try:
+            if scope not in {'account_full', 'account_planning', 'reward_native', 'reward_sponsored', 'entry'}:
+                return None
+            key = self.opaque(scope + ':' + identity)
+            if key == 'unknown':
+                return None
+            with self._lock:
+                self._sequence += 1
+                attempt = self._sequence
+                if key not in self._scopes:
+                    if len(self._scopes) >= 256:
+                        self._scopes.popitem(last=False)
+                        self._evictions += 1
+                    self._scopes[key] = dict(latest=attempt, episode=None, scope=scope)
+                state = self._scopes[key]
+                state['latest'] = attempt
+                self._scopes.move_to_end(key)
+            return (key, attempt)
+        except Exception:
+            return None
+
+    @contextmanager
+    def associate(self, attempt, *, scope, recovery=True, round_id=None):
+        """Explicit call-scoped propagation; thread identity is never correlation."""
+        previous = getattr(self._association, 'current', None)
+        self._association.current = dict(attempt=attempt, scope=scope,
+            recovery=recovery, round_id=round_id)
+        try:
+            yield
+        finally:
+            self._association.current = previous
+
+    def associated(self, scope):
+        current = getattr(self._association, 'current', None)
+        return current if current and current['scope'] == scope else {}
+
+    def pending(self, scope, identity):
+        """Only an existing episode can be completed by an applied receipt."""
+        try:
+            key = self.opaque(scope + ':' + identity)
+            with self._lock:
+                state = self._scopes.get(key)
+                return (key, state['latest']) if state and state['episode'] else None
+        except Exception:
+            return None
+
+    def record(self, attempt, *, event, stage, cause=None, summary=None, exc=None,
+               event_at=None, request=None, task=None, round_id=None, post_started=None,
+               result=None, error_facts=None, component=None, account=None):
+        try:
+            if attempt is None or stage not in _STAGES or event not in {'failed', 'waiting', 'complete', 'sent'}:
+                return
+            key, number = attempt
+            cause = safe_reason(cause)
+            types = _exception_types(exc)
+            if error_facts is None and exc is not None:
+                error_facts = getattr(exc, 'response_facts', None)
+            if isinstance(error_facts, Mapping):
+                supplied = error_facts.get('error_chain')
+                if isinstance(supplied, (list, tuple)):
+                    captured = [name for name in supplied[:8] if type(name) is str
+                        and len(name) <= 64 and re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]{0,63}', name)]
+                    types = list(dict.fromkeys([*types, *captured]))[:8]
+            stamp = event_at.isoformat() if isinstance(event_at, datetime) else datetime.now(UTC).isoformat()
+            now = monotonic()
+            if task is None:
+                from .polymarket_trading import _lp_read_local
+                active_task = getattr(_lp_read_local, 'task', None)
+                task = active_task.get('task_id') if isinstance(active_task, dict) else None
+            row = dict(event_at=stamp, event=event, stage=stage, cause_code=cause,
+                summary_reason=safe_reason(summary), exception_types=types,
+                owner_id=self._owner_id, scope_id=key, attempt_id=self.opaque(str(number)),
+                request_id=self.opaque(request), task_id=self.opaque(task), round_id=self.opaque(round_id))
+            row['output_continuity'] = 'unknown'
+            if isinstance(account, Mapping):
+                for field in ('read_started_at', 'read_ended_at', 'checked_at'):
+                    value = account.get(field)
+                    if type(value) is str and len(value) <= 64:
+                        try:
+                            value = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                        except ValueError:
+                            value = None
+                    if isinstance(value, datetime) and value.tzinfo is not None:
+                        row[field] = value.astimezone(UTC).isoformat()
+                generation = account.get('trade_generation')
+                if type(generation) is int and 0 <= generation <= 2**63 - 1:
+                    row['trade_generation'] = generation
+            if component in {'balance', 'open_orders', 'positions'}:
+                row['component'] = component
+            if isinstance(error_facts, Mapping) and type(error_facts.get('status')) is int and 100 <= error_facts['status'] <= 599:
+                row['status'] = error_facts['status']
+            if type(post_started) is bool:
+                row['post_started'] = post_started
+            if result in {'unknown', 'accepted', 'rejected'}:
+                row['result'] = result
+            with self._lock:
+                state = self._scopes.get(key)
+                current = state is not None and state['latest'] == number
+                row.update(current_attempt=current, continuity='incomplete' if self._evictions or state is None else 'process_local', evicted_scopes=self._evictions)
+                episode = state['episode'] if state else None
+                row['scope'] = state['scope'] if state else 'unknown'
+                if not current:
+                    # Observe a late completion without changing the new state.
+                    if episode is None:
+                        return
+                    row['episode_id'] = episode['id']
+                elif event == 'complete':
+                    if episode is None:
+                        return
+                    for field in ('request_id', 'round_id', 'task_id'):
+                        if row[field] == 'unknown':
+                            row[field] = episode['context'][field]
+                    row.update(event='recovered', first_cause_code=episode['first'],
+                        latest_cause_code=episode['cause'], first_event_at=episode['first_at'],
+                        latest_event_at=episode['latest_at'], failure_count=episode['count'],
+                        episode_id=episode['id'], first_exception_types=episode['first_types'],
+                        latest_exception_types=episode['latest_types'], first_stage=episode['first_stage'],
+                        latest_stage=episode['latest_stage'], first_attempt_id=episode['first_attempt'],
+                        latest_attempt_id=episode['latest_attempt'])
+                    state['episode'] = None
+                elif event in {'failed', 'waiting'}:
+                    signature = (event, stage, cause, tuple(types), component)
+                    if episode is None:
+                        episode = dict(first=cause, first_at=stamp, count=0, id=uuid.uuid4().hex,
+                            signature=None, last_emit=now, first_types=types, first_stage=stage,
+                            first_attempt=row['attempt_id'], repeats=0, context={field: row[field] for field in ('request_id', 'round_id', 'task_id')})
+                        state['episode'] = episode
+                    episode['count'] += 1
+                    episode.update(cause=cause, latest_at=stamp, latest_types=types, latest_stage=stage, latest_attempt=row['attempt_id'])
+                    repeated = episode['signature'] == signature
+                    episode['signature'] = signature
+                    episode['repeats'] = episode['repeats'] + 1 if repeated else 0
+                    if repeated and now - episode['last_emit'] < 60:
+                        return
+                    episode['last_emit'] = now
+                    row.update(episode_id=episode['id'], first_cause_code=episode['first'],
+                        first_event_at=episode['first_at'], latest_cause_code=cause,
+                        failure_count=episode['count'], repeat_count=episode['repeats'])
+            # Queue32 and its single existing consumer isolate every handler.
+            from .polymarket_trading import _lp_capture_read_log
+            level = logging.WARNING if row['event'] == 'failed' else logging.INFO
+            _lp_capture_read_log(lambda: logger.log(level, 'lp_diagnostic %s', json.dumps(row, separators=(',', ':'))))
+        except Exception:
+            pass

@@ -41,6 +41,7 @@ from urllib.request import ProxyHandler, Request, build_opener, urlopen
 from polymarket import BuilderApiKey, PRODUCTION, PublicClient, SecureClient
 from polymarket._internal.wallet import signature_type_for
 
+from .polymarket_lp_diagnostics import LPDiagnostics
 from .polymarket_lp_errors import LpObservationWait
 from .lp_metadata_cache import DISPLAY_FIELDS, LPMetadataCache, cache_policy
 from .lp_metadata_writer import LPMetadataWriter, empty_status, writer_policy
@@ -2199,6 +2200,7 @@ class PolymarketTradingClient:
         metadata_cache_policy: Mapping[str, int] | None = None,
     ) -> None:
         self.config = config
+        self._lp_diagnostics = LPDiagnostics()
         self._client = client
         self._urlopen_fn = urlopen_fn
         self._public_client_factory = public_client_factory or PublicClient
@@ -4524,6 +4526,8 @@ class PolymarketTradingClient:
             request: tuple[str, bool],
         ) -> tuple[str, bool, tuple[object, ...], str | None, str | None]:
             condition_id, sponsored = request
+            stage = "reward_sponsored" if sponsored else "reward_native"
+            attempt = self._lp_diagnostics.begin(stage, condition_id)
             if stop_event is not None and stop_event.is_set():
                 return condition_id, sponsored, (), "reward_read_cancelled", "cancelled"
             public = self._public_client_factory()
@@ -4531,12 +4535,16 @@ class PolymarketTradingClient:
                 reader = getattr(public, "list_market_rewards", None)
                 if not callable(reader):
                     raise ValueError("selected_reward_reader_unavailable")
-                return condition_id, sponsored, _collect(
+                rows = _collect(
                     reader(condition_id=condition_id, sponsored=sponsored), stop_event=stop_event
-                ), None, None
+                )
+                self._lp_diagnostics.record(attempt, event="complete", stage=stage, event_at=datetime.now(UTC))
+                return condition_id, sponsored, rows, None, None
             except _RewardReadCancelled:
                 return condition_id, sponsored, (), "reward_read_cancelled", "cancelled"
             except Exception as exc:
+                self._lp_diagnostics.record(attempt, event="failed", stage=stage,
+                    cause="reward_read_failed", exc=exc, event_at=datetime.now(UTC))
                 return condition_id, sponsored, (), "reward_read_failed", type(exc).__name__
             finally:
                 close_public(public)
