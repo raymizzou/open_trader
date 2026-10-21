@@ -56,6 +56,8 @@ def cloud_host_fixture(tmp_path, monkeypatch, mode, requested):
     native_resolve = Path.resolve
     monkeypatch.setattr(Path, 'resolve', lambda path, *a, **kw: release if str(path)==f'/proc/{pid}/cwd' else native_resolve(path,*a,**kw))
     native_text, native_bytes = Path.read_text, Path.read_bytes
+    # Freeze external evidence at deployment; callers cannot rewrite observed identity.
+    deployed_unit = unit.read_text()
     state = dict(active=False, health=dict(
         module='prediction_service', schema_version='open_trader.prediction_service.health.v1',
         pid=pid, git_sha='a'*40, source_state='clean', cwd=str(release), code_root=str(release/'src'),
@@ -64,6 +66,7 @@ def cloud_host_fixture(tmp_path, monkeypatch, mode, requested):
         reader_generation=2, contract_generation=2, n_leg=dict(status='paused',code='N_LEG_PAUSED')),
         lp=dict(state='ready', authenticated=True, stale=False, checked_at=datetime.now(UTC).isoformat(),
                 orders=[], positions=[], recommendations=[], market_rewards={}, preparation=None))
+    state.update(loaded_unit=deployed_unit, process_unit=deployed_unit)
     lock_info = native_stat(cfg.runtime_lock)
     def read_text(path, *a, **kw):
         if path == Path('/proc/locks'):
@@ -73,9 +76,9 @@ def cloud_host_fixture(tmp_path, monkeypatch, mode, requested):
         return native_text(path,*a,**kw)
     def read_bytes(path, *a, **kw):
         if str(path)==f'/proc/{pid}/cmdline':
-            return ('\0'.join(cloud.render_unit(cfg).split('ExecStart=',1)[1].splitlines()[0].split())+'\0').encode()
+            return ('\0'.join(deployed_unit.split('ExecStart=',1)[1].splitlines()[0].split())+'\0').encode()
         if str(path)==f'/proc/{pid}/environ':
-            return ('\0'.join(line.removeprefix('Environment=') for line in cloud.render_unit(cfg).splitlines() if line.startswith('Environment='))+'\0').encode()
+            return ('\0'.join(line.removeprefix('Environment=') for line in state['process_unit'].splitlines() if line.startswith('Environment='))+'\0').encode()
         return native_bytes(path,*a,**kw)
     monkeypatch.setattr(Path,'read_text',read_text)
     monkeypatch.setattr(Path,'read_bytes',read_bytes)
@@ -84,7 +87,7 @@ def cloud_host_fixture(tmp_path, monkeypatch, mode, requested):
     def external(command, **kwargs):
         args=list(command);commands.append(args)
         if args[:2]==['systemctl','show']:
-            env=' '.join(shlex.quote(line.removeprefix('Environment=')) for line in cloud.render_unit(cfg).splitlines() if line.startswith('Environment='))
+            env=' '.join(shlex.quote(line.removeprefix('Environment=')) for line in state['loaded_unit'].splitlines() if line.startswith('Environment='))
             output=f'LoadState=loaded\nActiveState={"active" if state["active"] else "inactive"}\nMainPID={pid if state["active"] else 0}\nFragmentPath={unit}\nDropInPaths=\nNeedDaemonReload=no\nUser=prediction\nGroup=prediction\nWorkingDirectory={release}\nEnvironment={env}\nExecMainStartTimestamp=systemd-start\n'
         elif args[0]=='ss':
             output=f'LISTEN 0 100 127.0.0.1:8769 0.0.0.0:* users:(("python",pid={pid},fd=3))' if state['active'] else ''
@@ -155,6 +158,106 @@ def test_cloud_lifecycle_binds_effective_pause(tmp_path, monkeypatch, scenario):
     with pytest.raises(ValueError,match='identity mismatch'):cloud.operate(cfg,'status')
     with pytest.raises(ValueError):cloud.operate(replace(cfg,expected_sha='b'*40),'status')
     assert all(command[0] not in {'ssh','systemd-analyze'} and command[:2] not in [['systemctl','start'],['systemctl','stop']] for command in commands)
+
+
+
+@pytest.mark.parametrize(('original_raw', 'layer'), [
+    pytest.param(0, 'record', id='zero-to-one-record'),
+    pytest.param(0, 'installed', id='zero-to-one-installed'),
+    pytest.param(0, 'loaded', id='zero-to-one-loaded'),
+    pytest.param(0, 'process', id='zero-to-one-process'),
+    pytest.param(1, 'record', id='one-to-zero-record'),
+    pytest.param(1, 'installed', id='one-to-zero-installed'),
+    pytest.param(1, 'loaded', id='one-to-zero-loaded'),
+    pytest.param(1, 'process', id='one-to-zero-process'),
+])
+def test_cloud_lifecycle_rejects_configured_pause_substitution(tmp_path, monkeypatch, original_raw, layer):
+    from dataclasses import replace
+    import open_trader.prediction_cloud as cloud
+
+    deployed, host, commands, _ = cloud_host_fixture(tmp_path, monkeypatch, 'shadow', original_raw)
+    host['active'] = True
+    original_record = json.loads(deployed.record.read_text())
+    original_unit = cloud.UNIT_PATH.read_text()
+    original_loaded = host['loaded_unit']
+    original_process = host['process_unit']
+    original_health = json.loads(json.dumps(host['health']))
+    original_config = (tmp_path/'cloud.json').read_bytes()
+    caller_raw = 1 - original_raw
+    caller = replace(deployed, n_leg_paused=caller_raw)
+    caller_unit = cloud.render_unit(caller)
+
+    def artifacts():
+        return (deployed.record.read_bytes(), cloud.UNIT_PATH.read_bytes(),
+                host['loaded_unit'], host['process_unit'], json.dumps(host['health'], sort_keys=True))
+
+    def install_evidence(record_unit, installed, loaded, process):
+        record = dict(original_record, unit_text=record_unit)
+        deployed.record.write_text(json.dumps(record))
+        cloud.UNIT_PATH.write_text(installed)
+        host.update(loaded_unit=loaded, process_unit=process)
+
+    def positive(config, raw):
+        before = artifacts()
+        for action in ('status', 'smoke'):
+            result = cloud.operate(config, action)
+            assert result['configured_n_leg_paused'] == raw
+            assert result['n_leg_paused'] == 1 and result['pid'] == 12345
+        assert artifacts() == before
+
+    def rejected(config, expected_error):
+        before = artifacts()
+        errors = []
+        for action in ('status', 'smoke'):
+            try:
+                cloud.operate(config, action)
+            except ValueError as error:
+                errors.append(str(error))
+            else:
+                errors.append(None)
+        assert artifacts() == before
+        assert all(error is not None for error in errors), (layer, errors)
+        assert all(expected_error in error for error in errors), errors
+
+    positive(deployed, original_raw)
+    # Every other identity layer matches the substituted caller. Only the selected
+    # frozen deployment artifact can reject it, so earlier checks cannot mask it.
+    selected = dict(record=caller_unit, installed=caller_unit, loaded=caller_unit, process=caller_unit)
+    selected[layer] = dict(record=original_unit, installed=original_unit,
+                           loaded=original_loaded, process=original_process)[layer]
+    install_evidence(**dict(record_unit=selected['record'], installed=selected['installed'],
+                            loaded=selected['loaded'], process=selected['process']))
+    errors = dict(record='record', installed='managed unit', loaded='loaded unit',
+                  process='running credential/runtime environment')
+    rejected(caller, errors[layer])
+
+    # The whole original deployment cannot be attested under the opposite raw value.
+    install_evidence(original_unit, original_unit, original_loaded, original_process)
+    rejected(caller, 'record')
+
+    # Legacy evidence missing this non-secret marker is ambiguous at each layer.
+    legacy_unit = ''.join(line for line in caller_unit.splitlines(keepends=True)
+                          if not line.startswith('Environment=OPEN_TRADER_CONFIGURED_NLEG_PAUSED='))
+    selected = dict(record=caller_unit, installed=caller_unit, loaded=caller_unit, process=caller_unit)
+    selected[layer] = legacy_unit
+    install_evidence(selected['record'], selected['installed'], selected['loaded'], selected['process'])
+    rejected(caller, errors[layer])
+    install_evidence(caller_unit, caller_unit, caller_unit, caller_unit)
+    positive(caller, caller_raw)
+    install_evidence(original_unit, original_unit, original_loaded, original_process)
+    positive(deployed, original_raw)
+
+    # Shape assertions follow public rejection, preserving a behavioral baseline RED.
+    assert f'Environment=OPEN_TRADER_CONFIGURED_NLEG_PAUSED={original_raw}\n' in original_unit
+    assert f'Environment=OPEN_TRADER_CONFIGURED_NLEG_PAUSED={caller_raw}\n' in caller_unit
+    assert original_unit != caller_unit
+    for unit in (original_unit, caller_unit):
+        assert 'Environment=OPEN_TRADER_NLEG_PAUSED=1\n' in unit
+        assert 'Environment=OPEN_TRADER_NLEG_PAUSED=0\n' not in unit
+    assert host['health'] == original_health and host['health']['pid'] == 12345
+    assert (tmp_path/'cloud.json').read_bytes() == original_config
+    assert all(command[0] in {'systemctl', 'ss', 'git', 'runuser', 'journalctl'} for command in commands)
+    assert all(command[:2] != ['systemctl', 'start'] and command[:2] != ['systemctl', 'stop'] for command in commands)
 
 
 @pytest.mark.parametrize('setting',['unset','zero','one'])

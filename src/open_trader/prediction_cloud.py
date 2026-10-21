@@ -187,6 +187,7 @@ def render_unit(c: CloudConfig) -> str:
             f'Environment=OPEN_TRADER_SSM_SECRET={c.secret}\n',
             f'Environment=OPEN_TRADER_SSM_VERSION={c.version}\n',
             f'Environment=OPEN_TRADER_SSM_ROLE={c.role}\n',
+            f'Environment=OPEN_TRADER_CONFIGURED_NLEG_PAUSED={c.n_leg_paused}\n',
         ])
     exclusions_env = 'Environment=OPEN_TRADER_LP_CANDIDATE_EXCLUSIONS=1\n' if c.candidate_exclusions else ''
     guarded = c.mode == 'shadow'

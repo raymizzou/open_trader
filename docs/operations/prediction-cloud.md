@@ -296,7 +296,14 @@ profile eligibility and identity. Generated units always use
 `OPEN_TRADER_NLEG_PAUSED=1`. Preflight/status/Smoke report effective
 `n_leg_paused: 1` and the original `configured_n_leg_paused` separately. Two-host
 validation binds both values; two paused services with different requested
-configuration cannot substitute for each other. Invalid credential profiles
+configuration cannot substitute for each other. SSM units also pin the non-secret
+`OPEN_TRADER_CONFIGURED_NLEG_PAUSED=0|1` marker. Exact record, installed-unit,
+loaded-environment and process-environment checks bind that requested value; the
+marker does not activate business. Older SSM units or records without the marker
+are ambiguous and cannot be attested by status/Smoke. They require the existing,
+separately authorized install/start workflow before attestation. File/disabled
+unit text is unchanged because those profiles permit only requested value 1.
+Invalid credential profiles
 remain invalid: file/disabled profiles still require requested value 1, pinned
 SSM references remain required for zero, and wallet/region checks retain their
 raw-profile requirements. This does not authorize any trading strategy.
