@@ -346,6 +346,8 @@ class LPD2LiveExecution:
         self._sealed_candidate_source = None
         self._sealed_candidate_sources = {}
         self._native_jobs = {}
+        self._native_completion_generation = 0
+        self._native_completion_consumed = 0
         self._manual_jobs = {}
         self._manual_groups = {}
         # Finite dispatch tickets for an already accepted protection trigger.
@@ -2217,6 +2219,7 @@ class LPD2LiveExecution:
             if not (owned or self._active_sends
                     or any(h._thread.is_alive() for h in self._manual_jobs.values())
                     or self._settings_future is not None or control.native_save_in_flight or control_pending
+                    or self._native_completion_generation != self._native_completion_consumed
                     or any(d<=now for d in dependencies)):
                 if dependencies:
                     wait=dict(kind='dependencies',deadline=(self._utc_now()+timedelta(seconds=min(dependencies)-now)).isoformat())
@@ -2356,7 +2359,10 @@ class LPD2LiveExecution:
                     else:
                         future.set_result(outcome)
                     finally:
-                        lease.release()
+                        try:
+                            lease.release()
+                        finally:
+                            self._publish_native_completion()
                 thread = threading.Thread(target=run, name='lp-d2-independent-cancel', daemon=False)
                 handle = NativeAttempt(identity, future, thread)
                 self._native_jobs[key] = handle
@@ -3381,7 +3387,21 @@ class LPD2LiveExecution:
                     self._protection_guard(snapshot,scope,orders,observation=True),review))
                 snapshot = self.state.snapshot()
 
+    def _publish_native_completion(self):
+        with self.state._lock:
+            self._native_completion_generation += 1
+        # The callback may run before this thread physically exits. Retain the
+        # notification until a later protection pass observes that true exit.
+        try:
+            self._read_wakeup()
+        except Exception:
+            logger.exception('prediction_lp_native_completion_wakeup_failed')
+
     def run_protection_once(self, *, timeout=2):
+        with self.state._lock:
+            completed = self._native_completion_consumed
+            if not any(h._future.done() and h._thread.is_alive() for h in self._native_jobs.values()):
+                completed = self._native_completion_generation
         self._record_protection_status(entered=True, disposition='entered')
         try:
             result = self._run_protection_once(timeout=timeout)
@@ -3390,6 +3410,9 @@ class LPD2LiveExecution:
             raise
         if self._protection_diagnostics['disposition'] == 'entered':
             self._record_protection_status(entered=True, disposition='completed')
+        with self.state._lock:
+            # A completion after this pass's capacity check remains pending.
+            self._native_completion_consumed = max(self._native_completion_consumed, completed)
         return result
 
     def _run_protection_once(self, *, timeout=2):

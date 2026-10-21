@@ -85,6 +85,12 @@ close 未排空返回 false，外层 prediction runtime 保留 client、store、
 Scheduler 检查失败保留自身配置的错误重试期限，不被读取冷却或仅等待事件替换；
 真实完成和显式命令保持原唤醒语义。到期重试本地 owner 工作不提前发起受 Retry-After 限制的 HTTP。
 
+精确保护撤单的 native 完成在释放实际 lease 后于锁外通知既有 Scheduler。
+有界标量代际保留尚未消费的完成通知；owner 的后续保护容量检查只消费进入该检查前
+已确认物理线程退出的完成。检查期间或最后容量检查后发生的完成留给下一轮，
+不能因 Future 完成或线程刚退出就进入无限事件等待。callback 失败不改原生结果或 lease 清理。
+cap2 仍按真实线程/资源生命周期计数；通知消费后不因已归属 UNKNOWN 或权限拒绝的义务持续空转。
+
 ## 验证边界
 
 20 个公开 async/source/state/live 合同覆盖真实 HTTPX loopback 断连、受控取消/退出、独立期限监督、

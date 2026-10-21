@@ -1115,3 +1115,141 @@ def test_scheduler_preserves_owner_error_retry_during_provider_cooldown(tmp_path
         assert not scheduler.run_due() and boundary.events==before
     finally:
         store.failing=False;boundary.release.set();scheduler.stop();assert live.close(4)
+
+
+def test_scheduler_wakes_deferred_read_fault_cancels_after_native_completion(tmp_path):
+    from open_trader.polymarket_lp import PolymarketLPService
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+    from tests.test_lp_d2_execution_bridge import attach
+    # Observe the approved public admission port while the real service remains
+    # its binding owner and its actual safety lease/permission remains in force.
+    class AdmissionObservedLive(LPD2LiveExecution):
+        def bind_mutation_admission(self,owner,acquire):
+            def observed(action):
+                if not admitted:return None
+                actual=acquire(action)
+                return Lease(actual) if actual is not None else None
+            return super().bind_mutation_admission(owner,observed)
+    clock=Clock();boundary=Boundary(clock);trading=Trading();store=PredictionArbitrageStore(tmp_path)
+    runtime=LPReadRuntime(boundary.factory,clock=clock,utc_now=clock.utc)
+    live=AdmissionObservedLive(store,trading,account_id='account',venue='polymarket',process_epoch='epoch',
+        policy=CalculationPolicy(Decimal(100)),read_runtime=runtime,clock=clock,utc_now=clock.utc)
+    live.initialize(ValidatedStartAdmission('epoch','offline-permit'))
+    targets={'A','B','C'}
+    boundary.orders=[wire_row('A'),wire_row('B'),wire_row('C','3')]
+    boundary.book_depth=1000  # isolate read faults from the original queue threshold
+    producer=PolymarketLPService(live.store,trading,clock=clock.utc)
+    execution=attach(live,producer,tmp_path);scheduler=LPAutoScheduler(execution,clock=clock.utc)
+    execution.set_lp_auto_scheduler(scheduler)
+    notices=[]
+    def notice():
+        state=live.read_runtime.status();scheduler.request_check();notices.append(state)
+    execution.set_lp_auto_wakeup(notice)
+    changed=threading.Condition();entered=set();finished=set();threads={}
+    releases={oid:threading.Event() for oid in targets}
+    active=0;maximum=0;admitted=False;gate=False;pair=set();deferred=None
+    owner_thread=threading.current_thread();actual_cancel=trading.cancel_orders_detailed
+    def cancel(ids):
+        nonlocal active,maximum
+        assert len(ids)==1 and ids[0] in targets
+        oid=ids[0]
+        with changed:
+            assert oid not in entered,'UNKNOWN cancel must not replay'
+            entered.add(oid);threads[oid]=threading.current_thread()
+            active+=1;maximum=max(maximum,active);changed.notify_all()
+        try:
+            assert releases[oid].wait(4),'external native cancel release watchdog'
+            return actual_cancel(ids)  # actual offline UNKNOWN result, no receipt invented
+        finally:
+            with changed:active-=1;finished.add(oid);changed.notify_all()
+    trading.cancel_orders_detailed=cancel
+    def requests():
+        return {t.order_key[3]:t.request_id for p in live.state.snapshot().progress.values()
+            for t in p.cancel_targets if t.order_key[3] in targets}
+    class Lease:
+        def __init__(self,actual):self.actual=actual
+        def allowed(self,action=None):return admitted and self.actual.allowed(action)
+        def release(self):
+            nonlocal gate,pair,deferred
+            self.actual.release()
+            if not gate or threading.current_thread() is not owner_thread:return
+            # This temporary lease belongs to the third cap2 refusal. The live
+            # state lock has exited; external returns can now complete normally.
+            gate=False
+            assert live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)>0
+            boundary.wait(lambda:len(entered)==2)
+            pair=set(entered);deferred=next(iter(targets-pair))
+            assert set(requests())==pair and live.status()['native_inflight']==2
+            for oid in pair:releases[oid].set()
+            for oid in pair:threads[oid].join(4);assert not threads[oid].is_alive()
+            assert finished==pair and live.status()['native_inflight']==0
+            assert set(requests())==pair  # no fabricated third request/attempt
+    def drive_until(predicate):
+        end=time.monotonic()+4
+        while not predicate():
+            scheduler.run_due()
+            left=end-time.monotonic();assert left>0,(live.status(),boundary.events)
+            with changed:changed.wait(min(.01,left))
+    def collect_at(stamp,dependency,faults):
+        clock.value=stamp;live.read_runtime.wake()
+        boundary.wait(lambda:any(n['observed_monotonic']==stamp and n['ready_count']==4 for n in notices))
+        assert scheduler.run_due()
+        boundary.wait(lambda:any(n['observed_monotonic']==stamp and n['ready_count']==0
+            and n['cleanup_faults']==faults and n['next_dependency_monotonic']==dependency for n in notices))
+        scheduler.run_due()  # actual post-ACK notice, not a manufactured rescue
+    try:
+        assert scheduler.run_due()
+        drive_until(lambda:len(live.state.snapshot().read_failures)==3
+            and all(y.yield_pct_per_hour.state=='known' for y in live.state.snapshot().yields.values())
+            and len(live.state.snapshot().yields)==3)
+        # Start four real held attempts at5; timeout10 and cleanup fault11
+        # preserve the original per-attempt5/6 boundaries.
+        boundary.holds={('O','balance'),*((oid,'book') for oid in targets)}
+        for key in boundary.holds:boundary.mode[key]='swallow'
+        clock.value=5;live.read_runtime.wake()
+        drive_until(lambda:all(('entered',oid,source,5) in boundary.events for oid,source in boundary.holds))
+        collect_at(10,11,0);collect_at(11,None,4)
+        state=live.read_runtime.status();snapshot=live.state.snapshot()
+        assert not snapshot.current.effective_running and snapshot.new_capacity.state=='unknown'
+        assert all('read_cleanup_fault' in f.reason_codes for f in snapshot.read_failures.values())
+        assert len(state['scopes'])==4 and all(s['active'] and s['cleanup_fault'] for s in state['scopes'])
+        assert state['next_dependency_monotonic'] is None and state['ready_count']==0 and state['waiting_for_event']
+        assert not state['new_buy_allowed'] and state['pool_count']==8
+        assert scheduler.snapshot()['next_check_at'] is None
+        assert requests()=={} and trading.cancels==[] and not entered
+        before=list(boundary.events)
+        admitted=True;gate=True
+        # One initial explicit command reflects newly granted permission. Only
+        # native completion may rescue the deferred target after this check.
+        execution.lp_auto_run_once();assert scheduler.run_due()
+        assert not gate and len(pair)==2 and deferred not in requests()
+        assert set(entered)==finished==pair and len(trading.cancels)==2
+        assert live.status()['native_inflight']==0,(live.diagnostics()['cancel_blocks'],requests(),entered,live.state.snapshot().progress)
+        state=live.read_runtime.status()
+        assert state['next_dependency_monotonic'] is None and state['ready_count']==0
+        assert len(state['scopes'])==4 and not any(s['key'][3]=='exact' for s in state['scopes'])
+        assert boundary.events==before and clock()==11
+        assert scheduler.run_due(),'native completion must wake deferred protection at the same business time'
+        boundary.wait(lambda:entered==targets)
+        assert set(requests())==targets and len(set(requests().values()))==3
+        assert clock()==11 and boundary.events==before and maximum==2
+        releases[deferred].set();threads[deferred].join(4);assert not threads[deferred].is_alive()
+        assert scheduler.run_due()  # consume actual C completion, then idle
+        drive_until(lambda:scheduler.snapshot()['next_check_at'] is None)
+        snapshot=live.state.snapshot();state=live.read_runtime.status()
+        assert sorted(trading.cancels)==[('A',),('B',),('C',)] and finished==targets
+        assert maximum==2 and live.status()['native_inflight']==0
+        partial=next(o for o in snapshot.orders if o.key[3]=='C')
+        assert (partial.original_size.value,partial.size_matched.value,partial.remaining.value)==(20,3,17)
+        assert {o.key[3] for o in snapshot.active_orders}==targets and not snapshot.openings
+        assert all(t.local_outcome=='unknown_error' for p in snapshot.progress.values() for t in p.cancel_targets)
+        assert all('read_cleanup_fault' in f.reason_codes for f in snapshot.read_failures.values())
+        assert snapshot.new_capacity.state=='unknown' and not state['new_buy_allowed']
+        assert state['next_dependency_monotonic'] is None and state['cleanup_faults']==4 and state['pool_count']==8
+        assert state['ready_count']==0 and len(state['scopes'])==4 and boundary.events==before
+        assert all(not scheduler.run_due() for _ in range(100))
+        assert len(trading.cancels)==3 and clock()==11
+    finally:
+        gate=False
+        for release in releases.values():release.set()
+        boundary.release.set();scheduler.stop();assert live.close(4)
