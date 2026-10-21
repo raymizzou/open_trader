@@ -434,6 +434,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-07
 
+- Production Smoke 失败改为明确的 `SMOKE_FAILED`，区分输入、版本身份、健康/进程、
+  N-leg/LP 契约、日志工具/日志检查、浏览器失败；云端 Smoke 同时标注失败阶段。
+  明示 `rollback_recommendation=review_required rollback_executed=false`，避免把验收失败误读为已回滚。
+  原失败条件、非零退出、真实日志拒绝和只读边界保持；定向离线回归覆盖失败原因及未执行回滚的输出。
+
 - #282 LP 历史准备在阶段结束时释放已消费的重试快照；历史批次由 SQLite 按标的及 metadata 阶段范围筛选到期重试，
   不再为每组历史请求读取全部活动重试行。保留单事务认领、所有权、截止时间/标的排序、SQLite 参数分批和代次栅栏；
   初始认领规则不变，历史派发仍拒绝无时区或无效截止时间且不消耗任何重试。

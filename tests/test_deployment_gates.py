@@ -218,9 +218,9 @@ def _run_smoke(
         "#!/bin/sh\n"
         'if [ "$1" = "-m" ] && [ "$2" = "pytest" ]; then\n'
         '  echo "python browser" >> "$FAKE_CALLS"\n'
-        "  exit 0\n"
-        "fi\n"
-        f'exec "{sys.executable}" "$@"\n',
+        + ("  exit 1\n" if failure == "python_browser" else "  exit 0\n")
+        + "fi\n"
+        + f'exec "{sys.executable}" "$@"\n',
     )
     lsof = [
         "#!/bin/bash",
@@ -583,7 +583,7 @@ def test_scoped_smoke_preserves_prediction_pause_contract(
         assert any(call == "python browser" for call in calls)
     else:
         assert result.returncode != 0
-        assert result.stdout.rstrip().endswith("ROLLBACK")
+        assert result.stdout.rstrip().endswith("SMOKE_FAILED")
 
 
 @pytest.mark.parametrize("log_content, healthy", [
@@ -615,7 +615,7 @@ def test_scoped_smoke_preserves_prediction_pause_contract(
 def test_smoke_log_checker_only_exempts_proven_healthy_null(tmp_path, log_content, healthy):
     result, calls = _run_smoke(tmp_path, services="prediction", log_content=log_content)
     assert (result.returncode == 0) is healthy, result.stdout + result.stderr
-    assert result.stdout.rstrip().endswith("HEALTHY" if healthy else "ROLLBACK")
+    assert result.stdout.rstrip().endswith("HEALTHY" if healthy else "SMOKE_FAILED")
     assert any(call.startswith("playwright ") for call in calls) is healthy
     assert "relations:TransportError" not in result.stdout + result.stderr
 
@@ -631,7 +631,7 @@ def test_smoke_timing_dict_text_keeps_full_error_check(tmp_path, details, health
         log_content=f"2026-10-01 12:00:00 WARNING prediction: lp_facts_timing outcome=failed stages={details} thread=123\n",
     )
     assert (result.returncode == 0) is healthy, result.stdout + result.stderr
-    assert result.stdout.rstrip().endswith("HEALTHY" if healthy else "ROLLBACK")
+    assert result.stdout.rstrip().endswith("HEALTHY" if healthy else "SMOKE_FAILED")
     assert any(call.startswith("playwright ") for call in calls) is healthy
 
 
@@ -639,7 +639,7 @@ def test_smoke_timing_dict_text_keeps_full_error_check(tmp_path, details, health
 def test_smoke_log_checker_read_and_tool_failures_block(tmp_path, failure):
     result, calls = _run_smoke(tmp_path, services="prediction", failure=failure)
     assert result.returncode != 0, result.stdout + result.stderr
-    assert result.stdout.rstrip().endswith("ROLLBACK")
+    assert result.stdout.rstrip().endswith("SMOKE_FAILED")
     assert not any(call.startswith("playwright ") for call in calls)
 
 
@@ -677,14 +677,14 @@ def test_scoped_smoke_preserves_selected_service_identity_guards(
     result, _ = _run_smoke(tmp_path, services=services, failure=failure)
 
     assert result.returncode != 0
-    assert result.stdout.rstrip().endswith("ROLLBACK")
+    assert result.stdout.rstrip().endswith("SMOKE_FAILED")
 
 
 def test_default_smoke_still_rejects_mixed_identities(tmp_path: Path) -> None:
     result, _ = _run_smoke(tmp_path, services=None, failure="default_mixed")
 
     assert result.returncode != 0
-    assert result.stdout.rstrip().endswith("ROLLBACK")
+    assert result.stdout.rstrip().endswith("SMOKE_FAILED")
 
 
 @pytest.mark.parametrize("target", ("host-readiness", "production-smoke"))
@@ -720,7 +720,33 @@ def test_release_scopes_reject_empty_or_unknown_services_before_probes(
     marker = "READY" if target == "host-readiness" else "HEALTHY"
     assert marker not in result.stdout
     assert result.stdout.rstrip().endswith(
-        "BLOCKED" if target == "host-readiness" else "ROLLBACK"
+        "BLOCKED" if target == "host-readiness" else "SMOKE_FAILED"
     )
     assert "RELEASE_SERVICES" in result.stdout + result.stderr
     assert not calls.exists()
+    if target == "production-smoke":
+        assert "smoke_failure reason=invalid_release_services" in result.stdout
+        assert "rollback_executed=false" in result.stdout
+
+
+@pytest.mark.parametrize("failure,reason", [
+    ("gateway_sha", "gateway_health_identity_or_contract"),
+    ("gateway_listener", "gateway_process_identity"),
+    ("python_browser", "python_browser_check_failed"),
+    ("rg_missing", "log_checker_unavailable"),
+    ("prediction_log", "log_check_failed"),
+    ("log_missing", "log_check_failed"),
+    ("browser", "browser_check_failed"),
+])
+def test_smoke_failure_reports_reason_without_claiming_rollback(tmp_path, failure, reason):
+    result, calls = _run_smoke(tmp_path, services="gateway prediction", failure=failure)
+    assert result.returncode != 0
+    assert result.stdout.rstrip().endswith("SMOKE_FAILED")
+    assert f"smoke_failure reason={reason}" in result.stdout
+    assert "rollback_recommendation=review_required rollback_executed=false" in result.stdout
+    assert "ROLLBACK" not in result.stdout
+    assert not any(call.startswith("playwright ") for call in calls) or failure == "browser"
+    if failure == "prediction_log":
+        assert "reason=log_error_signal" in result.stderr
+    elif failure == "log_missing":
+        assert "reason=log_not_regular_file" in result.stderr
