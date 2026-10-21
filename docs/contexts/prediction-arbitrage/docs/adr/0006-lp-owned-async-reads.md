@@ -22,6 +22,14 @@ manual status 和 dashboard 只发布内存快照；重启后的命名组需显�
 只共享已完成事实，30 秒到期刷新，保留原时间且不延长 60 秒可用期限。必要刷新失败即 UNKNOWN。
 provider/account 的真实 Retry-After、实际清理及 owner 未 ACK 均可延后下一轮，不能产生空失败。
 
+5 秒期限判断实际 I/O 完成时间，而非业务 owner 收集时间。期限内完整成功的结果迟收仍按成功计数；
+发布时另按原始源时间检查 freshness，book 恰好 10 秒仍可用，超过时只降为 UNKNOWN，不补造一次读取失败。
+旧身份、水位及真实超时结果仍不能恢复 known 或清除较新的失败。
+
+runtime 状态发布最近实际依赖时间：在途期限、到期后的清理宽限或下一读取起点。
+live/execution 将其接入既有 `plan_wait.dependencies`，Scheduler 不在纯读取等待期间持续执行空轮次。
+实际完成事件及显式命令仍提前唤醒，native、控制或设置工作保持即时推进；不增加固定 sleep 或改变错误退避。
+
 第 5 秒封存 UNKNOWN 并取消未完请求，第 6 秒仍未实际退出则锁存 cleanup fault，
 停止该单重试并请求 exact BUY 保护撤单。独立监督线程不依赖市场 loop 的合作。
 两个 I/O loop 分别承担市场和账户/精确保护读取；局部市场 loop 阻塞时 C/O 仍可前进。
@@ -35,9 +43,9 @@ SELL 常规市场检查为 30 秒；持仓市场估值及风险为 60 秒，同�
 ## 接纳与保护
 
 金融完整性和全局 read ticket 保持原准入。市场结果另按账户、process epoch、generation、
-exact order、terms 和 attempt 设 watermark；B 先返回不能拒掉仍在自己期限内的 A。
+exact order、terms 和 attempt 设 watermark；B 先返回不能拒掉在自己期限内实际完成的 A。
 市场结果只更新逐单收益和置信度，不重建挂单、余额、持仓或资金权限。
-book 超过原有 10 秒 freshness 时降为 UNKNOWN；迟到/旧身份结果不能恢复 known。
+book 超过原有 10 秒 freshness 时降为 UNKNOWN；实际超时或旧身份结果不能恢复 known。
 
 每次真实失败 attempt 只计一次，完整有效成功清零。第 11 次连续失败锁存精确撤单，
 后续成功不撤销意图。新理由不要求 queue baseline 或 matched=0，覆盖部分成交的剩余 BUY。

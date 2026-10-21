@@ -301,6 +301,23 @@ class LPReadRuntime:
 
     def status(self):
         with self._lock:
+            now=self.clock();dependencies=[]
+            for scope in self._scopes.values():
+                if scope.result is not None or scope.fault_pending:
+                    dependencies.append(now)
+                elif scope.active and not scope.fault:
+                    dependencies.append(scope.deadline+(1 if scope.expired or scope.retiring else 0))
+                elif not (scope.active or scope.retiring or scope.fault or scope.closed):
+                    lane=_fixed_lane(scope.demand.kind)
+                    peers=[s for s in self._scopes.values() if s is not scope and _fixed_lane(s.demand.kind)==lane]
+                    if lane is not None and (lane in self._fixed_faults or any(s.fault for s in peers)
+                            or any(s.active and (lane!='exact' or (s.demand.sources==('fills',))==
+                                (scope.demand.sources==('fills',))) for s in peers)):
+                        continue  # actual peer completion/deadline owns admission
+                    dependencies.append(scope.next_start)
+            # Newly requested fixed scopes need supervisor admission first.
+            if any(key not in self._scopes and d.kind!='buy' for key,d in self._demands.items()):
+                dependencies.append(now)
             deferred=[d for key,d in self._demands.items() if d.kind=='buy' and key not in self._scopes]
             owned=[s for s in self._scopes.values() if s.demand.kind=='buy']
             ports=[s.port for s in owned if s.port is not None and not s.closed]
@@ -311,6 +328,7 @@ class LPReadRuntime:
             faults=sum(s.fault for s in self._scopes.values())+len(self._fixed_faults)
             fixed_faults=bool(self._fixed_faults) or any(s.fault and s.demand.kind!='buy' for s in self._scopes.values())
             return freeze(dict(cache_entries=len(self._cache),cache_bytes=self._cache_size,
+                next_dependency_monotonic=min(dependencies) if dependencies else None,
                 policy=dict(buy_cap=self.buy_cap,cache_entries=self.cache_entries,cache_bytes=self.cache_bytes),
                 observed_monotonic=self._observed,cleanup_faults=faults,owned_buy_scopes=len(owned),
                 retiring_buy_scopes=sum(s.retiring for s in owned),deferred_count=len(deferred),

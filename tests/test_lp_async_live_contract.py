@@ -102,6 +102,20 @@ def test_read_failure_cancel_needs_no_queue_baseline_and_keeps_exact_guards(tmp_
         else:
             boundary.holds={(key,'book') for key in targets}
             for key in targets:boundary.mode[(key,'book')]='swallow'
+        from concurrent.futures import Future
+        changed=threading.Condition();entered=set();finished=set()
+        releases={key:threading.Event() for key in targets}
+        actual_cancel=trading.cancel_orders_detailed
+        def held_cancel(ids):
+            assert len(ids)==1 and ids[0] in targets
+            oid=ids[0]
+            with changed:entered.add(oid);changed.notify_all()
+            assert releases[oid].wait(4), 'external sender release watchdog'
+            try:return actual_cancel(ids)
+            finally:
+                with changed:finished.add(oid);changed.notify_all()
+        trading.cancel_orders_detailed=held_cancel
+        schedule=Future();controller=None
         admitted=[False]
         class Lease:
             def allowed(self,action=None):return admitted[0]
@@ -133,17 +147,53 @@ def test_read_failure_cancel_needs_no_queue_baseline_and_keeps_exact_guards(tmp_
             assert trading.cancels==[]  # no mutation permission; obligations remain pending
             assert before.current.effective_running is False
             admitted[0]=True
+            def deliver():
+                try:
+                    end=time.monotonic()+4
+                    with changed:
+                        while len(entered)<2:
+                            left=end-time.monotonic();assert left>0;changed.wait(left)
+                        assert len(entered)==2
+                        pair=tuple(sorted(entered))  # identities, never assumed arrival positions
+                    assert live.status()['native_inflight']==2
+                    releases[pair[0]].set()
+                    if trigger=='eleven':
+                        # Serial external delivery, then a third admission after
+                        # the first two real native handles have finished.
+                        with changed:
+                            while pair[0] not in finished:
+                                left=end-time.monotonic();assert left>0;changed.wait(left)
+                    releases[pair[1]].set()  # cleanup variant releases the pair concurrently
+                    with changed:
+                        while entered!=targets:
+                            left=end-time.monotonic();assert left>0;changed.wait(left)
+                    for event in releases.values():event.set()
+                except BaseException as exc:schedule.set_exception(exc)
+                else:schedule.set_result(True)
+            controller=threading.Thread(target=deliver,name='external-cancel-delivery')
+            controller.start()
             end=time.monotonic()+4
             while len(trading.cancels)<3:
-                live.run_protection_once();assert time.monotonic()<end
-                trading.cancelled.wait(.01)
+                handles=live.run_protection_once()
+                assert handles, 'pending exact target had no admitted native sender'
+                for handle in handles:
+                    left=end-time.monotonic();assert left>0
+                    handle.result(left)
+                    handle._thread.join(max(0,end-time.monotonic()))
+                    assert not handle._thread.is_alive()
+            assert schedule.result(max(0,end-time.monotonic()))
+            controller.join(max(0,end-time.monotonic()))
+            assert not controller.is_alive() and entered==finished==targets
             assert sorted(trading.cancels)==[('A',),('manual',),('partial',)],repr([(k.kind,p.reason_codes,[t.order_key[3] for t in p.cancel_targets]) for k,p in live.state.snapshot().progress.items()])
             for _ in range(3):live.run_protection_once()
             assert len(trading.cancels)==3
             partial=next(o for o in live.state.snapshot().orders if o.key[3]=='partial')
             assert partial.remaining.value==17 and partial.size_matched.value==3
             assert all('peer' not in ids and 'sell' not in ids for ids in trading.cancels)
-        finally:boundary.release.set();assert live.close(4)
+        finally:
+            for event in releases.values():event.set()
+            if controller is not None:controller.join(4)
+            boundary.release.set();assert live.close(4)
 
 def test_existing_protections_keep_their_own_thresholds_and_send_ownership(tmp_path,monkeypatch):
     clock,boundary,trading,live=live_owner(tmp_path/'async-queue')
@@ -514,7 +564,12 @@ def test_nonblocking_scheduled_checks_publish_fresh_incumbents_once(tmp_path,mon
                 while True:
                     started=time.monotonic();result=execution.lp_auto_scheduled_check()
                     assert time.monotonic()-started<1, 'scheduled owner waited for held HTTP'
-                    y=next((y for k,y in live.state.snapshot().yields.items() if k[3]=='B'),None)
+                    # The scheduled result owns the facts used for selection.
+                    # A real cancel receipt may already have removed B's yield
+                    # from fresh state before this test thread observes it.
+                    publication=result.acceptance.observation
+                    values=publication.yields if publication is not None else live.state.snapshot().yields
+                    y=next((y for k,y in values.items() if k[3]=='B'),None)
                     failure=next((f for k,f in live.state.snapshot().read_failures.items() if k[3]=='B'),None)
                     ready=y and y.evaluated_at==clock.utc() and failure and failure.last_attempt!=before
                     if ready and (case!='replace-zero' or stamp!=10 or result.rotation_outcomes):break
@@ -673,4 +728,67 @@ def test_read_failure_cancel_without_opening_collects_exact_final_quantity(tmp_p
         assert not live.state.snapshot().openings
     finally:
         boundary.release.set()
+        assert live.close(4)
+
+
+def test_scheduler_waits_for_async_dependencies_and_completion_wakes_early(tmp_path):
+    from datetime import datetime,timedelta
+    from open_trader.polymarket_lp import PolymarketLPService
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+    from tests.test_lp_d2_execution_bridge import attach
+    clock,boundary,trading,live=live_owner(tmp_path)
+    boundary.orders=[];boundary.holds={('O','balance')}
+    producer=PolymarketLPService(live.store,trading,clock=clock.utc)
+    execution=attach(live,producer,tmp_path)
+    scheduler=LPAutoScheduler(execution,clock=clock.utc)
+    execution.set_lp_auto_scheduler(scheduler)
+    woken=threading.Event()
+    def wake():woken.set();scheduler.request_check()
+    execution.set_lp_auto_wakeup(wake)
+    try:
+        assert scheduler.run_due()
+        boundary.wait(lambda:any(e[:3]==('entered','O','balance') for e in boundary.events)
+            and all(any(e[:3]==('finally_exited','O',source) for e in boundary.events) for source in ('open_orders','positions')))
+        assert woken.wait(4);woken.clear()
+        scheduler.run_due()  # consume the real startup ownership/completion notice
+        status=live.read_runtime.status()
+        assert status['ready_count']==0 and any(s['active'] for s in status['scopes'])
+        state=execution.lp_auto_state(include_intents=False)
+        assert state.get('plan_wait',{}).get('kind')=='dependencies'
+        assert datetime.fromisoformat(state['plan_wait']['deadline'])==NOW+timedelta(seconds=5)
+        assert datetime.fromisoformat(scheduler.snapshot()['next_check_at'])==clock.utc()+timedelta(seconds=5)
+        before=list(boundary.events)
+        for _ in range(100):
+            assert not scheduler.run_due()
+            execution.lp_auto_state(include_intents=False)
+        assert boundary.events==before and live.state.snapshot().observation is None
+        # Actual completion before the dependency deadline wakes the registered
+        # Scheduler and publishes financial facts without waiting until5.
+        clock.value=1;woken.clear();boundary.release.set()
+        assert woken.wait(4)
+        end=time.monotonic()+4
+        while live.state.snapshot().observation is None:
+            scheduler.run_due()
+            left=end-time.monotonic();assert left>0
+            with boundary.changed:boundary.changed.wait(min(.01,left))
+        assert live.state.snapshot().observation.components['balance'].checked_at==clock.utc()
+        assert live.state.snapshot().observation.order_view.orders_source.checked_at==NOW
+        assert live.state.snapshot().new_capacity.value==100
+        # Consume only real completion/ACK notices until the stable idle scope
+        # publishes its actual next start, rather than inventing a UI timer.
+        while datetime.fromisoformat(scheduler.snapshot()['next_check_at'])<=clock.utc():
+            assert woken.wait(max(0,end-time.monotonic()));woken.clear()
+            assert scheduler.run_due()
+        assert datetime.fromisoformat(scheduler.snapshot()['next_check_at'])==NOW+timedelta(seconds=5)
+        before=list(boundary.events)
+        for _ in range(100):assert not scheduler.run_due()
+        assert boundary.events==before
+        # Explicit public commands remain runnable while read dependencies wait.
+        assert execution.lp_auto_run_once()['state']=='scheduled'
+        assert scheduler.run_due()
+        assert boundary.events==before and trading.cancels==[]
+        assert live.state.snapshot().observation.components['balance'].checked_at==clock.utc()
+        assert live.state.snapshot().observation.order_view.orders_source.checked_at==NOW
+    finally:
+        boundary.release.set();scheduler.stop()
         assert live.close(4)

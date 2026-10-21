@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Generic, Literal, TypeVar
@@ -918,7 +918,7 @@ class CurrentLPState:
         with self._lock:
             order,error=self._market_order(result)
             if error:return error
-            if not result.complete or result.completed>=result.deadline or self._clock()>=result.deadline:
+            if not result.complete or result.completed>=result.deadline:
                 return self.invalidate_market_attempt(result)
             try:
                 value=market_value(order.key[1],result.sources)
@@ -933,10 +933,16 @@ class CurrentLPState:
                     'open_orders':SourceResult(order.source.source_id,(row,),checked_at=order.source.checked_at),
                     'market:'+order.key[1]+':'+order.key[2]:source}))
                 policy=CalculationPolicy(None)
-                prepared=prepare_current_inputs(frame,None,policy,self._utc_now())
-                calculation=calculate_current(prepared,policy,self._utc_now())
+                now=self._utc_now()
+                completed_at=now-timedelta(seconds=max(0,self._clock()-result.completed))
+                prepared=prepare_current_inputs(frame,None,policy,completed_at)
+                calculation=calculate_current(prepared,policy,completed_at)
                 rate=calculation.yields[order.key[3]]
                 if rate is None:return self.invalidate_market_attempt(result)
+                # Owner delivery delay is not an I/O failure. Apply current
+                # source freshness separately from the successful outcome.
+                if calculate_current(prepare_current_inputs(frame,None,policy,now),policy,now).yields[order.key[3]] is None:
+                    return self._invalidate_market_attempt(result,read_succeeded=True)
             except (KeyError,TypeError,ValueError):return self.invalidate_market_attempt(result)
             stamps=tuple(_stamp(s) for s in result.sources.values())
             previous=self._yields.get(order.key)
@@ -1016,6 +1022,9 @@ class CurrentLPState:
 
     def invalidate_market_attempt(self, expiry):
         """A matching expiry can only lower confidence; it has no financial power."""
+        return self._invalidate_market_attempt(expiry)
+
+    def _invalidate_market_attempt(self, expiry, *, read_succeeded=False):
         from .polymarket_lp_market_reader import SourceResult
         with self._lock:
             order,error=self._market_order(expiry)
@@ -1026,7 +1035,7 @@ class CurrentLPState:
             if since is None:since,since_at=self._clock(),self._utc_now()
             self._yields[order.key]=BuyYieldState(order.key,Fact('unknown'),(),self._utc_now(),
                 self._current.cycle_generation,since,since_at,previous.current_risk_request_id if previous else None)
-            self._record_read_attempt(order,expiry,False)
+            self._record_read_attempt(order,expiry,read_succeeded)
             self._market_attempts[order.key]=(expiry.demand.key,expiry.attempt)
             self._market_books.pop(order.key,None)
             self._publish_market_values(order.key,SourceResult('',complete=False,error=expiry.reason or 'market_incomplete'),expiry.sources.get('book'))

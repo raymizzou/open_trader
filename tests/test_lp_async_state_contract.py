@@ -82,3 +82,81 @@ def test_timeout_and_expiry_remove_known_without_promoting_financial_authority()
         owner.apply_market_attempt(healthy)
         assert owner.snapshot().new_capacity.state=='unknown'
     finally:boundary.release.set();runtime.reconcile(());assert runtime.close(4)
+
+
+def test_successful_attempt_delivered_late_keeps_real_outcome_and_source_freshness():
+    clock=Clock();owner=state(clock);boundary=Boundary(clock)
+    runtime=LPReadRuntime(boundary.factory,clock=clock,utc_now=clock.utc);runtime.start()
+    key=('account',CID,'yes','A');saved=[]
+    try:
+        financial(owner,clock,(row('A'),))
+        runtime.reconcile((demand('A'),))
+        for _ in range(11):
+            boundary.wait(lambda:runtime.status()['ready_count']==1 and not any(s['active'] for s in runtime.status()['scopes']))
+            scope=runtime.status()['scopes'][0];started=scope['started']
+            entered=len([e for e in boundary.events if e[:3]==('entered','A','book')])
+            clock.value=started+6;runtime.wake()
+            boundary.wait(lambda:runtime.status()['observed_monotonic']==clock())
+            assert len([e for e in boundary.events if e[:3]==('entered','A','book')])==entered
+            result,=runtime.drain_results()
+            assert result.complete and result.completed<result.deadline==started+5
+            assert (clock.utc()-result.sources['book'].checked_at).total_seconds()==6
+            reference_times=tuple(result.sources[n].checked_at for n in ('metadata','native_rewards','sponsored_rewards'))
+            assert financial(owner,clock,(row('A'),)).status=='accepted'
+            financial_before=owner.snapshot()
+            assert owner.apply_market_attempt(result)=='applied'
+            snapshot=owner.snapshot();failure=snapshot.read_failures[key]
+            assert failure.consecutive_failures==0 and 'read_failure_limit' not in failure.reason_codes
+            assert snapshot.yields[key].yield_pct_per_hour.state=='known'
+            assert snapshot.new_capacity==financial_before.new_capacity
+            assert tuple(result.sources[n].checked_at for n in ('metadata','native_rewards','sponsored_rewards'))==reference_times
+            saved.append(result)
+        runtime.reconcile(())
+        def retired():
+            runtime.drain_results()  # ACK any completion racing explicit retirement
+            return runtime.status()['owned_buy_scopes']==0
+        boundary.wait(retired)
+        last=saved[-1]
+        clock.value=last.started+10
+        assert owner.snapshot().yields[key].yield_pct_per_hour.state=='known'
+        clock.value=last.started+10.001
+        assert owner.snapshot().yields[key].yield_pct_per_hour.state=='unknown'
+        assert owner.snapshot().read_failures[key].consecutive_failures==0
+        # A genuinely complete next attempt delivered with an already stale book
+        # remains a read success, but cannot publish current numeric authority.
+        clock.value+=5;financial(owner,clock,(row('A'),),complete=False)
+        runtime.reconcile((demand('A'),))
+        boundary.wait(lambda:runtime.status()['ready_count']==1 and not any(s['active'] for s in runtime.status()['scopes']))
+        started=runtime.status()['scopes'][0]['started']
+        clock.value=started+10.001
+        boundary.mode[('A','book')]='failure'  # configure the next request before ACK
+        stale,=runtime.drain_results()
+        assert stale.complete and stale.completed<stale.deadline
+        assert owner.apply_market_attempt(stale)=='applied'
+        assert owner.snapshot().yields[key].yield_pct_per_hour.state=='unknown'
+        assert owner.snapshot().read_failures[key].consecutive_failures==0
+        assert owner.snapshot().new_capacity.state=='unknown'
+        # Actual HTTP failure and deadline expiry still count once; prior valid
+        # or expired results cannot reset the newer failed attempt.
+        boundary.wait(lambda:runtime.status()['ready_count']==1)
+        failed,=runtime.drain_results()
+        assert not failed.complete and owner.apply_market_attempt(failed)=='applied'
+        current=owner.snapshot()
+        assert current.read_failures[key].consecutive_failures==1
+        for old in (*saved,stale,failed):
+            assert owner.apply_market_attempt(old)=='stale'
+            assert owner.snapshot()==current
+        boundary.mode[('A','book')]='swallow';boundary.holds={('A','book')}
+        clock.value=failed.started+5;runtime.wake()
+        boundary.wait(lambda:any(e[:3]==('entered','A','book') and e[3]==clock() for e in boundary.events))
+        clock.value+=5;runtime.wake()
+        boundary.wait(lambda:runtime.status()['ready_count']==1)
+        expired,=runtime.drain_results()
+        assert not expired.complete and expired.completed>=expired.deadline
+        assert owner.apply_market_attempt(expired)=='applied'
+        assert owner.snapshot().read_failures[key].consecutive_failures==2
+        assert owner.apply_market_attempt(expired)=='stale'
+        assert owner.snapshot().read_failures[key].consecutive_failures==2
+    finally:
+        boundary.release.set();runtime.reconcile(())
+        assert runtime.close(4)

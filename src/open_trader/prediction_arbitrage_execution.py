@@ -1067,7 +1067,7 @@ class PredictionExecutionService:
                 pending_settings=policy_view(settings['requested']) if settings['pending'] else None,
                 settings_pending=settings['pending'], settings_native_inflight=settings['native_inflight'],
                 settings_error=settings['error'], effective_round_interval_seconds=None,
-                check_interval_seconds=None, cycle_mode='continuous')
+                check_interval_seconds=None, cycle_mode='continuous',plan_wait=live.status()['plan_wait'])
             result['diagnostics'] = diagnostic_view('iteration', live.diagnostics)
             result['diagnostics']['rotation'] = diagnostic_view('rotation', live.rotation_diagnostics)
             for name, fact in (('buy_reserved_usd', snapshot.buy_reserved),

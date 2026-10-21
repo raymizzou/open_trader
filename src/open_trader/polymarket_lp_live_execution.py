@@ -2204,8 +2204,18 @@ class LPD2LiveExecution:
     def status(self):
         with self.state._lock:
             owned = {h.identity.request_id for h in self._native_jobs.values() if h._thread.is_alive()}
-            return dict(read_runtime=self.read_runtime.status() if self.read_runtime is not None else None,
-                read_persistence_error=self._read_store_error,control=self.control.status(),
+            reads=self.read_runtime.status() if self.read_runtime is not None else None
+            control=self.control.status()
+            dependency=reads.get('next_dependency_monotonic') if reads else None
+            # Only pure read waiting may defer the owner. Existing native,
+            # settings and control work keeps its immediate progress path.
+            wait=None
+            if (dependency is not None and dependency>self._clock() and not (owned or self._active_sends
+                    or any(h._thread.is_alive() for h in self._manual_jobs.values())
+                    or self._settings_future is not None or control.native_save_in_flight)):
+                wait=dict(kind='dependencies',deadline=(self._utc_now()+timedelta(seconds=dependency-self._clock())).isoformat())
+            return dict(read_runtime=reads,plan_wait=wait,
+                read_persistence_error=self._read_store_error,control=control,
                 round=self.rounds.snapshot() if self.state.snapshot().current.cycle_generation else None,
                 native_inflight=len(owned | self._active_sends), writer=self.writer.status(), closed=self._closed,
                 last_preparation_rejection=self._last_preparation_rejection,
