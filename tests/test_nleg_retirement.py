@@ -128,6 +128,10 @@ def test_service_entrypoint_keeps_nleg_retired(tmp_path: Path, scenario: str) ->
             assert request(path, payload) == (409, {'error':'N_LEG_PAUSED', 'error_code':'N_LEG_PAUSED'})
         status, dashboard = request('/api/prediction-arbitrage/lp/dashboard')
         assert status == 200 and isinstance(dashboard, dict)
+        assert isinstance(dashboard['state'], str)
+        assert all(isinstance(dashboard[key], list) for key in ('orders', 'positions', 'recommendations'))
+        if scenario.startswith('shadow'):
+            assert 'auto' not in dashboard
         if scenario.startswith('production'):
             status, control = request('/api/prediction-arbitrage/lp/auto/state')
             assert status == 200 and control['effective_running'] is False
@@ -148,6 +152,13 @@ def filesystem_snapshot(root: Path):
     return {str(path.relative_to(root)): (path.stat().st_mode, path.stat().st_mtime_ns,
             path.read_bytes() if path.is_file() else None)
             for path in [root, *sorted(root.rglob('*'))]}
+
+
+@pytest.mark.parametrize('backend', ['default', 'explicit'])
+def test_shadow_service_preserves_keychain_lp_display(tmp_path: Path, backend: str) -> None:
+    # Apply the same real-service public HTTP/display/no-business/cleanup
+    # contract to both implicit and explicit Keychain selection.
+    test_service_entrypoint_keeps_nleg_retired(tmp_path, 'shadow-keychain-'+backend)
 
 
 def forbid_business_io(monkeypatch: pytest.MonkeyPatch):

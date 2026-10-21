@@ -10290,6 +10290,8 @@ def test_shadow_paused_n_leg_posts_report_pause_before_read_only(
 ) -> None:
     import open_trader.prediction_runtime as runtime_module
 
+    # This credentialless route-ordering fixture does not provide LP auth.
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "disabled")
     monkeypatch.setenv("OPEN_TRADER_NLEG_PAUSED", "1")
     runtime = runtime_module.PredictionRuntime(
         data_dir=tmp_path,

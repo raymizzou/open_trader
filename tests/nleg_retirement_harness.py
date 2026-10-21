@@ -28,6 +28,10 @@ class RetirementChild(ServiceChild):
         env.pop('OPEN_TRADER_NLEG_PAUSED', None)
         env.pop('OPEN_TRADER_DISABLE_NLEG_BACKGROUND', None)
         env['OPEN_TRADER_CREDENTIAL_BACKEND'] = 'file'
+        if scenario == 'shadow-keychain-default':
+            env.pop('OPEN_TRADER_CREDENTIAL_BACKEND')
+        elif scenario == 'shadow-keychain-explicit':
+            env['OPEN_TRADER_CREDENTIAL_BACKEND'] = 'keychain'
         if scenario.endswith('-zero'):
             env['OPEN_TRADER_NLEG_PAUSED'] = '0'
         self.process = subprocess.Popen([

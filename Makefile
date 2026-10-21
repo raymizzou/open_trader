@@ -172,6 +172,7 @@ production-smoke:
 	prediction_n_leg_status=""; prediction_n_leg_code=""; \
 	expected_sha='$(EXPECTED_SHA)'; expected_root='$(EXPECTED_ROOT)'; expected_runtime_root='$(EXPECTED_RUNTIME_ROOT)'; expected_n_leg_paused='$(N_LEG_PAUSED)'; \
 	if [ "$$expected_n_leg_paused" != 0 ] && [ "$$expected_n_leg_paused" != 1 ]; then echo "N_LEG_PAUSED must be 0 or 1"; echo ROLLBACK; exit 2; fi; \
+	expected_n_leg_paused=1; \
 	if ! printf '%s' "$$expected_sha" | grep -Eq '^[0-9a-fA-F]{40}$$'; then echo "EXPECTED_SHA must be a 40-hex Git SHA"; echo ROLLBACK; exit 2; fi; \
 	case "$$expected_root" in /*) ;; *) echo "EXPECTED_ROOT must be an absolute immutable checkout"; echo ROLLBACK; exit 2;; esac; \
 	if [ ! -d "$$expected_root" ]; then echo "EXPECTED_ROOT does not exist"; echo ROLLBACK; exit 2; fi; \

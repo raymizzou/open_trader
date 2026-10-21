@@ -5253,6 +5253,7 @@ def test_n_leg_pause_suppresses_shadow_background_requests(
 ) -> None:
     import open_trader.prediction_runtime as runtime_module
 
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "disabled")
     external_calls: list[str] = []
 
     def fail_solver() -> object:

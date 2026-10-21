@@ -15,6 +15,19 @@ control and configuration behavior, shared previews, risk/incident reads, reader
 fences, startup admission and resource ownership retain their existing contracts.
 Shadow remains display-only.
 
+Authenticated Shadow display works with supported default/explicit Keychain,
+file and SSM credentials. The disabled credentialless profile still has no LP
+reader; invalid credentials fail closed. Cloud lifecycle evidence reports
+effective `n_leg_paused: 1` and separately binds the requested
+`configured_n_leg_paused` value. Credential/profile and region eligibility still
+use the original configuration. All supported Shadow services retain bounded
+resource guards. Local Smoke accepts historical unset/0/1 inputs but always
+requires paused health and LP evidence and never requests the retired state
+endpoint. See [cloud operations](prediction-cloud.md) and
+[release deployment](../../ops/release-deployment.md) for unchanged authorization
+and identity boundaries. The retired external-position recovery CLI has no
+replacement procedure authorized by this retirement change.
+
 Store initialization preserves expired and legacy cache-hit LLM usage rows.
 Paused startup does not enroll or recheck the legacy safety policy, take its
 write transaction, downgrade legacy modes or create policy control audits.
