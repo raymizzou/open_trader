@@ -1412,8 +1412,12 @@ class LPD2LiveExecution:
             stage = 'acceptance'
             accepted = (Acceptance('partial',observation) if self.read_runtime is not None and financial is None
                 else self.state.accept(ticket, frame, calculation, evaluated_at=as_of))
-            if self.read_runtime is not None and accepted.observation is not None:
+            # Market attempts have their own exact-order identity/watermark.
+            # A rejected financial ticket must not discard already drained
+            # failures or cleanup faults for an otherwise current BUY.
+            if self.read_runtime is not None:
                 self._apply_async_market_results(markets)
+            if self.read_runtime is not None and accepted.observation is not None:
                 accepted=replace(accepted,observation=self.state.snapshot().observation)
                 frame=accepted.observation.source_frame
                 prepared=prepare_current_inputs(frame,captured_candidates,policy,as_of)
@@ -2768,11 +2772,13 @@ class LPD2LiveExecution:
             baseline, progress = snapshot.baselines.get(key), snapshot.progress.get(key)
             if tickets and baseline is not None and progress is not None:
                 deferred_anchors.update((*key.scope[:3], oid) for oid in baseline.anchor_order_ids)
+        read_failure_targets = {target.order_key for key, progress in snapshot.progress.items()
+            if key.kind == 'read_failure' for target in progress.cancel_targets}
         # These exact registered IDs have accepted pending cancel obligations,
         # independently of any current-process BUY/opening association. The same
         # Reader/deadline and canonical receipt guards own their final proof.
         for order in snapshot.orders:
-            if order.key in deferred_anchors:
+            if order.key in deferred_anchors or order.key in read_failure_targets:
                 changed |= refresh_order(order)
         for scope in tuple(self.state.snapshot().openings):
             snapshot = self.state.snapshot()

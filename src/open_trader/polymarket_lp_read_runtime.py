@@ -68,6 +68,9 @@ class LPReadRuntime:
         self.buy_cap=buy_cap;self.cache_entries=cache_entries;self.cache_bytes=cache_bytes;self._cache=OrderedDict();self._cache_size=0;self._lock=threading.RLock();self._scopes={};self._demands={}
         self._fixed_ports={};self._fixed_closing=set();self._fixed_closed=set();self._fixed_faults=set()
         self._ages={};self._age_sequence=0
+        # Runtime-lifetime identity, independent of scope retirement. One
+        # scalar avoids retaining an unbounded ledger of departed order keys.
+        self._attempt_sequence=0
         self._close_lock=threading.Lock()
         self._last_notice=None
         self._observed=-1;self._closed=False;self._started=False;self._signal=threading.Event();self._wakeup=lambda:None
@@ -148,7 +151,8 @@ class LPReadRuntime:
                             if self.clock()<not_before:
                                 scope.next_start=max(scope.next_start,not_before);continue
                         scope.completed_sources={}
-                        scope.attempt+=1;scope.started=self.clock();scope.deadline=scope.started+5
+                        self._attempt_sequence+=1;scope.attempt=self._attempt_sequence
+                        scope.started=self.clock();scope.deadline=scope.started+5
                         scope.active=True;scope.actual_end=None;scope.expired=False;scope.cancel_sent=False
                         scope.lane.submit(self._attempt(scope))
                 needed={(d.account,d.process_epoch,d.generation,d.condition_id,d.token_id,n)

@@ -204,12 +204,14 @@ def test_loopback_cancellation_closes_response_before_retry():
             while not any(e[0:2]==('entered','A') for e in events):
                 remaining=deadline-time.monotonic();assert remaining>0;changed.wait(remaining)
         clock.value=5;runtime.wake()
-        assert not next(r for r in collect(runtime,observer,lambda rows:bool(rows)) if r.demand.order_id=='A').complete
+        expired=next(r for r in collect(runtime,observer,lambda rows:bool(rows)) if r.demand.order_id=='A')
+        assert not expired.complete
         with changed:
             while not any(e[0:2]==('peer_closed','A') for e in events):
                 remaining=deadline-time.monotonic();assert remaining>0,events;changed.wait(remaining)
         retried=collect(runtime,observer,lambda rows:any(r.demand.order_id=='A' and r.complete for r in rows))
-        assert next(r for r in retried if r.demand.order_id=='A').attempt==2
+        assert next(r for r in retried if r.demand.order_id=='A').attempt>expired.attempt
+        assert sum(e[0:2]==('entered','A') for e in events)==2
         # The actual second request follows the peer's real disconnect.
         if sum(e[0:2]==('entered','A') for e in events)>1:
             first_close=next(i for i,e in enumerate(events) if e[0:2]==('peer_closed','A'))
@@ -374,3 +376,62 @@ def test_retiring_resources_mailboxes_and_cache_are_bounded():
         from open_trader.polymarket_lp_read_runtime import BUY_SCOPE_CAP,REFERENCE_CACHE_ENTRIES,REFERENCE_CACHE_BYTES
         assert (BUY_SCOPE_CAP,REFERENCE_CACHE_ENTRIES,REFERENCE_CACHE_BYTES)==(64,256,8*1024*1024)
     finally:boundary.release.set();runtime.reconcile(());runtime.drain_results();assert runtime.close(4)
+
+
+def test_recreated_buy_scope_keeps_monotonic_attempt_identity():
+    from test_lp_async_state_contract import state, financial, row
+    clock=Clock();owner=state(clock);boundary=Boundary(clock)
+    runtime=LPReadRuntime(boundary.factory,clock=clock,utc_now=clock.utc);runtime.start()
+    key=('account',CID,'yes','A');saved=[]
+    try:
+        financial(owner,clock,(row('A'),))
+        runtime.reconcile((demand('A'),))
+        for stamp in (0,5,10):
+            clock.value=stamp;runtime.wake()
+            result=collect(runtime,boundary,lambda rows:bool(rows))[0]
+            assert result.complete and owner.apply_market_attempt(result)=='applied'
+            saved.append(result)
+        clock.value=11;assert financial(owner,clock,()).status=='accepted'
+        runtime.reconcile(())
+        boundary.wait(lambda:runtime.status()['owned_buy_scopes']==0)
+        assert runtime.status()['pool_count']==0  # actual client/scope retirement
+        clock.value=15;assert financial(owner,clock,(row('A'),)).status=='accepted'
+        assert owner.snapshot().active_orders[0].terms_version==saved[-1].demand.terms_version
+        runtime.reconcile((demand('A'),))
+        returned=collect(runtime,boundary,lambda rows:bool(rows))[0]
+        assert returned.complete and returned.attempt>saved[-1].attempt
+        assert owner.apply_market_attempt(returned)=='applied'
+        assert owner.snapshot().yields[key].yield_pct_per_hour.state=='known'
+        assert owner.snapshot().read_failures[key].consecutive_failures==0
+        assert runtime.status()['owned_buy_scopes']==1<=runtime.status()['policy']['buy_cap']==64
+        clock.value=19;runtime.wake()
+        boundary.wait(lambda:runtime.status()['observed_monotonic']==19)
+        assert len([e for e in boundary.events if e[:3]==('entered','A','book')])==4
+        boundary.mode[('A','book')]='failure'
+        clock.value=20;runtime.wake()
+        failed=collect(runtime,boundary,lambda rows:bool(rows))[0]
+        assert not failed.complete and failed.started==20 and failed.attempt>returned.attempt
+        assert owner.apply_market_attempt(failed)=='applied'
+        current=owner.snapshot()
+        assert current.yields[key].yield_pct_per_hour.state=='unknown'
+        assert current.read_failures[key].consecutive_failures==1
+        for old in (*saved,returned):
+            assert owner.apply_market_attempt(old)=='stale'
+            assert owner.snapshot()==current
+        boundary.mode[('A','book')]='success'
+        clock.value=25;runtime.wake()
+        healthy=collect(runtime,boundary,lambda rows:bool(rows))[0]
+        assert healthy.complete and healthy.started==25 and healthy.attempt>failed.attempt
+        assert owner.apply_market_attempt(healthy)=='applied'
+        fresh=owner.snapshot()
+        assert fresh.read_failures[key].consecutive_failures==0
+        assert fresh.yields[key].yield_pct_per_hour.state=='known'
+        assert fresh.observation.read_ticket==current.observation.read_ticket
+        assert fresh.new_capacity==current.new_capacity  # market work grants no financial authority
+        enters=[e[3] for e in boundary.events if e[:3]==('entered','A','book')]
+        assert enters==[0,5,10,15,20,25]
+        for stamp in enters:
+            assert len([e for e in boundary.events if e[:3]==('finally_exited','A','book') and e[3]==stamp])==1
+    finally:
+        boundary.release.set();runtime.reconcile(())
+        assert runtime.close(4)

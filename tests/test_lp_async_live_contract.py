@@ -508,9 +508,9 @@ def test_nonblocking_scheduled_checks_publish_fresh_incumbents_once(tmp_path,mon
                 wake.wait(.01);wake.clear()
             rows.extend(dict(wire_row(k),market=ids[k][0],asset_id=ids[k][1],maker_address=old.account_id) for k in 'AB')
             for stamp in (5,10):
+                before=next((f.last_attempt for k,f in live.state.snapshot().read_failures.items() if k[3]=='B'),None)
                 sdk.advance(5);clock.value=stamp;live.read_runtime.wake();end=time.monotonic()+4
                 if stamp==10:qualify('F')
-                before=next((f.last_attempt for k,f in live.state.snapshot().read_failures.items() if k[3]=='B'),None)
                 while True:
                     started=time.monotonic();result=execution.lp_auto_scheduled_check()
                     assert time.monotonic()-started<1, 'scheduled owner waited for held HTTP'
@@ -518,7 +518,7 @@ def test_nonblocking_scheduled_checks_publish_fresh_incumbents_once(tmp_path,mon
                     failure=next((f for k,f in live.state.snapshot().read_failures.items() if k[3]=='B'),None)
                     ready=y and y.evaluated_at==clock.utc() and failure and failure.last_attempt!=before
                     if ready and (case!='replace-zero' or stamp!=10 or result.rotation_outcomes):break
-                    assert time.monotonic()<end
+                    assert time.monotonic()<end,(case,stamp,before,failure,y,result)
                     wake.wait(.01);wake.clear()
                 expected=None if stamp==10 and case=='failed-book' else Decimal(0) if case=='replace-zero' else Decimal('0.892857142857')
                 assert (None if y.yield_pct_per_hour.value is None else y.yield_pct_per_hour.value.quantize(Decimal('.000000000001')))==expected
@@ -535,3 +535,142 @@ def test_nonblocking_scheduled_checks_publish_fresh_incumbents_once(tmp_path,mon
             assert sdk.cancels==([('B',)] if case=='replace-zero' else [])
             assert auth and wake.wait(1)
         finally:boundary.release.set();assert live.close(4);live.trading.close()
+
+
+def test_rejected_financial_observation_keeps_independent_market_failure_and_cleanup(tmp_path):
+    from open_trader.polymarket_lp_current_state import ReceiptEvidence, TerminalProof, Fact, SourceStamp
+    for variant in ('http_failure', 'timeout_then_fault', 'co_delivered_cleanup_fault'):
+        clock,boundary,trading,live=live_owner(tmp_path/variant)
+        akey=('account',CID,'yes','A')
+        def accept_peer_terminal():
+            snapshot=live.state.snapshot();peer=next(o for o in snapshot.orders if o.key[3]=='B')
+            stamp=SourceStamp('external-B-final',checked_at=clock.utc(),complete=True,state='known')
+            proof=TerminalProof(peer.key,'CANCELED',peer.original_size,Fact('known',Decimal(0),(stamp,)),stamp,True)
+            assert live.state.accept_receipt_evidence(ReceiptEvidence('receipt-B','request-B','account','epoch',
+                snapshot.current.cycle_generation,peer.key,'BUY',peer.terms_version,terminal_proof=proof))=='applied'
+            return proof
+        try:
+            advance(live,boundary,clock,0,lambda:len(live.state.snapshot().read_failures)==2)
+            initial=live.state.snapshot()
+            assert initial.yields[akey].yield_pct_per_hour.state=='known' and count(live)==0
+            boundary.holds={('A','book'),('O','balance')}
+            boundary.mode[('A','book')]='failure' if variant=='http_failure' else 'swallow'
+            clock.value=5;live.read_runtime.wake()
+            boundary.wait(lambda:all(any(e[:3]==('entered',oid,source) and e[3]==5
+                for e in boundary.events) for oid,source in boundary.holds))
+            if variant=='http_failure':
+                proof=accept_peer_terminal()
+                clock.value=5.1;boundary.release.set()
+                boundary.wait(lambda:not any(s['active'] for s in live.read_runtime.status()['scopes'])
+                    and live.read_runtime.status()['ready_count']>=2)
+                financial_before=initial.observation.read_ticket
+            else:
+                # Attempt starts at5: timeout10 and cleanup fault11. Exercise
+                # both separate owner collections and a single co-delivery.
+                clock.value=10;live.read_runtime.wake()
+                boundary.wait(lambda:any(e[:3]==('cancel_received','A','book') for e in boundary.events)
+                    and live.read_runtime.status()['ready_count']>=2)
+                if variant=='timeout_then_fault':
+                    assert live.run_once().acceptance.status=='partial'
+                    timed_out=live.state.snapshot()
+                    assert timed_out.read_failures[akey].consecutive_failures==1
+                    assert timed_out.yields[akey].yield_pct_per_hour.state=='unknown'
+                    assert 'read_cleanup_fault' not in timed_out.read_failures[akey].reason_codes
+                    financial_before=timed_out.observation.read_ticket
+                    boundary.wait(lambda:any(e[:3]==('entered','O','balance') and e[3]==10 for e in boundary.events))
+                else:
+                    financial_before=initial.observation.read_ticket
+                proof=accept_peer_terminal()
+                clock.value=11;live.read_runtime.wake()
+                boundary.wait(lambda:bool(live.read_runtime.status()['cleanup_faults']))
+                assert any(scope['active'] and scope['cleanup_fault'] for scope in live.read_runtime.status()['scopes'])
+                if variant=='timeout_then_fault':
+                    boundary.release.set()
+                    boundary.wait(lambda:any(e[:3]==('finally_exited','O','balance') and e[3]==11 for e in boundary.events)
+                        and live.read_runtime.status()['ready_count']>=2)
+            result=live.run_once()
+            if variant=='timeout_then_fault':
+                # An old observation-ID result may already have been filtered;
+                # either disposition must still deny stale financial authority.
+                assert result.acceptance.status in ('partial','stale')
+            else:
+                assert result.acceptance.status=='stale'
+            current=live.state.snapshot()
+            assert current.read_failures[akey].consecutive_failures==1
+            assert current.read_failures[akey].last_attempt!=initial.read_failures[akey].last_attempt
+            assert current.yields[akey].yield_pct_per_hour.state=='unknown'
+            assert current.yields[akey].input_sources!=initial.yields[akey].input_sources
+            assert current.new_capacity.state=='unknown'
+            assert next(o for o in current.orders if o.key[3]=='B').terminal_proof==proof
+            assert current.observation.read_ticket==financial_before
+            if variant!='http_failure':
+                assert 'read_cleanup_fault' in current.read_failures[akey].reason_codes
+                if variant=='timeout_then_fault':
+                    assert current.read_failures[akey].last_attempt==timed_out.read_failures[akey].last_attempt
+            else:
+                assert current.yields[akey].evaluated_at==clock.utc()
+            for _ in range(3):live.run_once()
+            assert count(live)==1 and trading.cancels==[]
+        finally:
+            boundary.release.set()
+            assert live.close(4)
+
+
+def test_read_failure_cancel_without_opening_collects_exact_final_quantity(tmp_path):
+    clock,boundary,trading,live=live_owner(tmp_path)
+    boundary.orders=[wire_row('exact'),dict(wire_row('peer'),market='0x'+'2'*64,asset_id='b'),wire_row('sell',side='SELL')]
+    boundary.mode[('exact','book')]='failure';boundary.book_depth=1000
+    boundary.holds={('exact','order')}
+    def cancel(ids):
+        trading.cancels.append(ids)
+        boundary.orders=[r for r in boundary.orders if r['id'] not in ids]
+        trading.cancelled.set()
+        return {'canceled':list(ids),'not_canceled':{}}
+    trading.cancel_orders_detailed=cancel
+    key=('account',CID,'yes','exact')
+    try:
+        for number in range(1,12):
+            advance(live,boundary,clock,(number-1)*5,lambda:count(live,'exact')==number)
+        snapshot=live.state.snapshot()
+        assert not snapshot.openings
+        assert not any(k.kind=='queue_bucket' and 'exact' in b.anchor_order_ids for k,b in snapshot.baselines.items())
+        for handle in live.run_protection_once():handle.result(4)
+        assert trading.cancelled.wait(4) and trading.cancels==[('exact',)]
+        order=next(o for o in live.state.snapshot().orders if o.key==key)
+        assert order.terminal_proof is not None
+        assert order.terminal_proof.matched.state=='unknown' and order.remaining.state=='unknown'
+        # Observe the actual next financial request rather than requiring its
+        # pre-ACK ticket to be accepted after the receipt changes trade_version.
+        for stamp in (55,60):
+            clock.value=stamp;live.read_runtime.wake()
+            end=time.monotonic()+4
+            while True:
+                live.run_once();live.run_protection_once()
+                status=live.read_runtime.status()
+                exited=any(e[:3]==('finally_exited','O','open_orders') and e[3]==stamp for e in boundary.events)
+                busy=any(s['active'] and s['key'][3]!='exact' for s in status['scopes'])
+                if exited and not busy and status['ready_count']==0:break
+                left=end-time.monotonic();assert left>0,(status,boundary.events)
+                with boundary.changed:boundary.changed.wait(min(.01,left))
+        boundary.wait(lambda:any(e[:3]==('entered','exact','order') for e in boundary.events))
+        requests=[e for e in boundary.events if e[0]=='entered' and e[2]=='order']
+        assert requests and {e[1] for e in requests}=={'exact'}, (live.state.snapshot().trade_version,live.state.snapshot().observation.read_ticket.trade_version_at_start,live.state.snapshot().observation.order_view.orders_source.checked_at,[(s['key'][3],s['active']) for s in live.read_runtime.status()['scopes']])
+        order=next(o for o in live.state.snapshot().orders if o.key==key)
+        assert order.terminal_proof.matched.state=='unknown' and order.remaining.state=='unknown'
+        # The exact request entered at60 and still owns its response. Its real
+        # authoritative final proof arrives before this attempt's deadline.
+        boundary.release.set()
+        pump_live(live,boundary,lambda:next(o for o in live.state.snapshot().orders if o.key==key).remaining.state=='known')
+        final=next(o for o in live.state.snapshot().orders if o.key==key)
+        assert final.terminal_proof.status=='CANCELED'
+        assert final.original_size.value==20
+        assert final.terminal_proof.matched.state=='known' and final.terminal_proof.matched.value==3
+        assert final.remaining.value==17 and final.size_matched.value==3
+        assert not any(s['key'][3]=='buy' and s['key'][4]=='exact' for s in live.read_runtime.status()['scopes'])
+        for _ in range(3):live.run_once();live.run_protection_once()
+        assert trading.cancels==[('exact',)]
+        assert {o.key[3] for o in live.state.snapshot().active_orders}=={'peer','sell'}
+        assert not live.state.snapshot().openings
+    finally:
+        boundary.release.set()
+        assert live.close(4)
