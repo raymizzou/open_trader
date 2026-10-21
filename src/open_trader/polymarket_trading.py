@@ -4524,12 +4524,12 @@ class PolymarketTradingClient:
 
         def read_rewards(
             request: tuple[str, bool],
-        ) -> tuple[str, bool, tuple[object, ...], str | None, str | None]:
+        ) -> tuple[str, bool, tuple[object, ...], str | None, str | None, object]:
             condition_id, sponsored = request
             stage = "reward_sponsored" if sponsored else "reward_native"
             attempt = self._lp_diagnostics.begin(stage, condition_id)
             if stop_event is not None and stop_event.is_set():
-                return condition_id, sponsored, (), "reward_read_cancelled", "cancelled"
+                return condition_id, sponsored, (), "reward_read_cancelled", "cancelled", attempt
             public = self._public_client_factory()
             try:
                 reader = getattr(public, "list_market_rewards", None)
@@ -4538,26 +4538,27 @@ class PolymarketTradingClient:
                 rows = _collect(
                     reader(condition_id=condition_id, sponsored=sponsored), stop_event=stop_event
                 )
-                self._lp_diagnostics.record(attempt, event="complete", stage=stage, event_at=datetime.now(UTC))
-                return condition_id, sponsored, rows, None, None
+                return condition_id, sponsored, rows, None, None, attempt
             except _RewardReadCancelled:
-                return condition_id, sponsored, (), "reward_read_cancelled", "cancelled"
+                return condition_id, sponsored, (), "reward_read_cancelled", "cancelled", attempt
             except Exception as exc:
                 self._lp_diagnostics.record(attempt, event="failed", stage=stage,
                     cause="reward_read_failed", exc=exc, event_at=datetime.now(UTC))
-                return condition_id, sponsored, (), "reward_read_failed", type(exc).__name__
+                return condition_id, sponsored, (), "reward_read_failed", type(exc).__name__, attempt
             finally:
                 close_public(public)
 
         results: dict[tuple[str, bool], tuple[tuple[object, ...], str | None, str | None]] = {}
+        attempts = {}
         with ThreadPoolExecutor(
             max_workers=1 if serial else min(LP_REWARD_SELECTED_MAX_CONCURRENCY, len(requests)),
             thread_name_prefix="polymarket-selected-rewards",
         ) as executor:
-            for condition_id, sponsored, rows, error, error_type in executor.map(
+            for condition_id, sponsored, rows, error, error_type, attempt in executor.map(
                 read_rewards, requests
             ):
                 results[(condition_id, sponsored)] = (rows, error, error_type)
+                attempts[(condition_id, sponsored)] = attempt
 
         markets: list[dict[str, object]] = []
         known_count = 0
@@ -4578,6 +4579,7 @@ class PolymarketTradingClient:
                 "sponsored_daily_pool_usd": Decimal("0"),
             }
             reason_codes: list[str] = []
+            source_reasons: dict[bool, list[str]] = {False: [], True: []}
             row_fingerprints: dict[bool, str] = {}
             config_signatures: dict[bool, dict[str, tuple[object, ...]]] = {
                 False: {},
@@ -4589,6 +4591,10 @@ class PolymarketTradingClient:
             combined_total: Decimal | None = Decimal("0")
 
             for sponsored in (False, True):
+                def problem(code: str) -> None:
+                    reason_codes.append(code)
+                    source_reasons[sponsored].append(code)
+
                 rows, read_error, error_type = results[(condition_id, sponsored)]
                 if read_error is not None:
                     reason_codes.append(read_error)
@@ -4598,7 +4604,7 @@ class PolymarketTradingClient:
                 for reward in rows:
                     row = _model_dict(reward)
                     if row is None or row.get("condition_id") != condition_id:
-                        reason_codes.append("reward_identity_unknown")
+                        problem("reward_identity_unknown")
                         continue
                     try:
                         fingerprint = json.dumps(
@@ -4608,13 +4614,13 @@ class PolymarketTradingClient:
                             separators=(",", ":"),
                         )
                     except (TypeError, ValueError):
-                        reason_codes.append("reward_identity_unknown")
+                        problem("reward_identity_unknown")
                         continue
                     previous_fingerprint = row_fingerprints.get(sponsored)
                     if previous_fingerprint is not None:
                         if previous_fingerprint == fingerprint:
                             continue
-                        reason_codes.append("reward_identity_unknown")
+                        problem("reward_identity_unknown")
                         continue
                     row_fingerprints[sponsored] = fingerprint
 
@@ -4633,7 +4639,7 @@ class PolymarketTradingClient:
                     if not isinstance(raw_configs, Sequence) or isinstance(
                         raw_configs, (str, bytes)
                     ):
-                        reason_codes.append("reward_config_unknown")
+                        problem("reward_config_unknown")
                         continue
                     for raw_config in raw_configs:
                         normalized_parts = _normalize_lp_reward_config(
@@ -4642,7 +4648,7 @@ class PolymarketTradingClient:
                             require_id=False,
                         )
                         if normalized_parts is None:
-                            reason_codes.append("reward_config_unknown")
+                            problem("reward_config_unknown")
                             continue
                         normalized, config_identity = normalized_parts
                         config_id, asset_key, start_date, end_date = config_identity
@@ -4656,7 +4662,7 @@ class PolymarketTradingClient:
                             if previous_signature is not None:
                                 if previous_signature == signature:
                                     continue
-                                reason_codes.append("reward_identity_unknown")
+                                problem("reward_identity_unknown")
                                 continue
                             config_signatures[sponsored][config_key] = signature
                         if not start_date <= as_of <= end_date:
@@ -4672,6 +4678,7 @@ class PolymarketTradingClient:
                         active_configs += 1
                         if asset_key not in LP_REWARD_ASSET_USD_ADDRESSES:
                             unknown_asset = True
+                            source_reasons[sponsored].append("reward_asset_unknown")
                             if sponsored:
                                 combined_total = None
                             else:
@@ -4685,6 +4692,24 @@ class PolymarketTradingClient:
 
             if unknown_asset:
                 reason_codes.append("reward_asset_unknown")
+            # Only validated facts can close a source's read-failure episode.
+            # The combined endpoint includes native rewards; an inconsistent
+            # combined total invalidates that source, not a valid native read.
+            if not reason_codes:
+                if native_total is None:
+                    source_reasons[False].append("reward_total_unknown")
+                if combined_total is None:
+                    source_reasons[True].append("reward_total_unknown")
+                if native_total is not None and combined_total is not None and combined_total < native_total:
+                    source_reasons[True].append("reward_totals_inconsistent")
+            for source in (False, True):
+                if results[(condition_id, source)][1] is not None:
+                    continue  # Transport failure was already observed at read time.
+                errors = source_reasons[source]
+                self._lp_diagnostics.record(attempts[(condition_id, source)],
+                    event="failed" if errors else "complete",
+                    stage="reward_sponsored" if source else "reward_native",
+                    cause=errors[0] if errors else None, event_at=datetime.now(UTC))
             reason_codes = list(dict.fromkeys(reason_codes))
             if reason_codes:
                 market.update(

@@ -3539,7 +3539,8 @@ class LPAutoPool:
             baseline = self._account_facts_identity(prior)
             baseline_times = {key: prior.get(key) for key in ('read_started_at', 'read_ended_at', 'checked_at')} if isinstance(prior, Mapping) else {}
 
-            diagnostic_attempt = self.lp._lp_diagnostics.begin('account_planning' if planning else 'account_full')
+            diagnostic_attempt = self.lp._lp_diagnostics.begin('account_planning' if planning else 'account_full',
+                read_started_at=self._now() if not planning else None)
         diagnostic_stage = 'account_read'
 
         def failed(reason, *, waiting=False, retry_at=None, exc=None):

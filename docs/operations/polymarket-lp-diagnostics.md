@@ -10,9 +10,16 @@ has no new display for these events.
 
 - `reward_native` and `reward_sponsored` track each selected reward source
   separately. Another market or reward category cannot recover its episode.
+  Recovery requires validated identity, configuration, asset and reward totals,
+  not just a returned SDK call. Valid empty data can recover. Invalid combined
+  totals keep the sponsored source failed while a valid native source can recover.
 - `account_full` tracks full account reads and publication. `account_planning`
   tracks automatic planning. A planning success does not clear a full sync error.
   Reusing an older valid planning source does not recover the failed current read.
+  Dashboard full-read attempts start before the shared reader is called and follow
+  that call through registration. Returned source times also fence cache reuse:
+  facts read before the latest failed full-read admission cannot recover it, even
+  when a newer wrapper call returns those facts (`source_current=false`).
 - `entry` tracks one request. Its `post_started` comes from that request's durable
   send boundary. Account-read records omit this field. They say nothing about
   whether other requests were sent.
@@ -35,9 +42,12 @@ not arrival order. A late older completion can have `current_attempt=false` and
 generation accompany account records. Recovery retains the first/latest cause,
 exception classes, stages, attempts, occurrence times and `failure_count`.
 `failure_count` includes failed and waiting observations in that episode.
-Unchanged observations aggregate; `repeat_count` counts additional observations
-of the same state. A repeat summary emits at most once per 60 monotonic seconds.
-Cause or state changes emit immediately.
+Unchanged observations aggregate independently by stage and controlled component.
+`repeat_count` counts additional observations of the same state, cause and
+exception classes in that channel. Other components and publication cannot reset
+its window. A repeat summary emits at most once per 60 monotonic seconds per
+unchanged channel. Cause or state changes emit immediately. Suppressed observations
+still update the episode's count and latest context.
 
 ## Illustrative examples
 
@@ -67,7 +77,8 @@ validated status/times and opaque keyed hashes. They omit exception text, raw
 receipts, response bodies, URLs, headers, credentials and raw business identities.
 Unrecognized reason text becomes `unknown`; the business result is unchanged.
 
-Each adapter/service retains at most 256 diagnostic scopes in memory. Old scopes
+Each adapter/service retains at most 256 diagnostic scopes in memory, with at most
+32 stage/component channels per episode. Old scopes
 are evicted. Subsequent records disclose `continuity=incomplete` and
 `evicted_scopes`; success without a retained episode emits no invented recovery.
 Restarting or replacing an owner starts new opaque identities and loses episode

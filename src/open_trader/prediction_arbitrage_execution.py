@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
@@ -2767,6 +2768,13 @@ class PredictionExecutionService:
             reader = getattr(self._trading, "lp_account_snapshot_shared", None)
             if not callable(reader):
                 reader = getattr(self._trading, "lp_account_snapshot", None)
+            # Capture the full-read attempt before invoking the shared source.
+            # Its returned source times also fence cached facts at publication.
+            diagnostics = (getattr(self._lp, '_lp_diagnostics', None)
+                if self._lp_d2 is None and not getattr(self, '_display_only', False) else None)
+            diagnostic_attempt = (diagnostics.begin('account_full', read_started_at=self._lp._now())
+                if diagnostics is not None else None)
+            diagnostic_stage = 'account_read'
             try:
                 if not callable(reader):
                     raise RuntimeError("lp_account_reader_unavailable")
@@ -2798,7 +2806,11 @@ class PredictionExecutionService:
                     self._lp, "register_account_snapshot", None
                 )
                 if self._lp_d2 is None and callable(registration_reader) and not getattr(self, "_display_only", False):
-                    registration = _call(registration_reader, snapshot)
+                    diagnostic_stage = 'account_publish'
+                    association = (diagnostics.associate(diagnostic_attempt, scope='account_full')
+                        if diagnostics is not None else nullcontext())
+                    with association:
+                        registration = _call(registration_reader, snapshot)
                     if isinstance(registration, Mapping) and (
                         registration.get("reason") == "account_round_invalid"
                         or any(
@@ -3471,7 +3483,10 @@ class PredictionExecutionService:
                     reward_date, trade_condition_ids
                 )
                 return result
-            except LpAccountRoundInvalid:
+            except LpAccountRoundInvalid as exc:
+                if diagnostics is not None and diagnostic_stage == 'account_read':
+                    diagnostics.record(diagnostic_attempt, event='waiting', stage='account_read',
+                        cause='account_round_invalid', exc=exc, event_at=self._lp._now())
                 previous = self._lp_dashboard_cache or self._lp_dashboard_pending_payload()
                 self._lp_dashboard_cache = {
                     **previous,
@@ -3481,6 +3496,10 @@ class PredictionExecutionService:
                 }
                 return deepcopy(self._lp_dashboard_cache)
             except Exception as exc:
+                if diagnostics is not None and diagnostic_stage == 'account_read':
+                    diagnostics.record(diagnostic_attempt, event='failed', stage='account_read',
+                        cause='account_read_failed', summary='account_order_sync_unknown',
+                        exc=exc, event_at=self._lp._now())
                 if self._lp_account_trades_cache is not None:
                     self._lp_account_trades_cache = {**self._lp_account_trades_cache,
                         "state": "unknown", "stale": True, "reason": "account_read_failed"}

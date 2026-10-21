@@ -457,7 +457,9 @@ logger = logging.getLogger(__name__)
 _STAGES = frozenset({'reward_native', 'reward_sponsored', 'account_read',
     'account_publish', 'entry_validate', 'entry_prepare', 'entry_send', 'receipt_apply'})
 _ERROR_REASONS = frozenset({
-    'reward_read_failed', 'reward_read_cancelled', 'account_snapshot_unknown',
+    'reward_read_failed', 'reward_read_cancelled', 'reward_identity_unknown',
+    'reward_config_unknown', 'reward_asset_unknown', 'reward_total_unknown',
+    'reward_totals_inconsistent', 'account_snapshot_unknown',
     'account_snapshot_incomplete', 'account_identity_mismatch', 'account_round_invalid',
     'account_snapshot_stale', 'account_open_orders_unknown', 'account_order_identity_unknown',
     'account_raw_trades_unknown', 'account_order_sync_unknown', 'account_read_failed',
@@ -510,7 +512,7 @@ class LPDiagnostics:
             return 'unknown'
         return hmac.new(self._salt, value.encode(), hashlib.sha256).hexdigest()[:24]
 
-    def begin(self, scope, identity='scope'):
+    def begin(self, scope, identity='scope', *, read_started_at=None):
         try:
             if scope not in {'account_full', 'account_planning', 'reward_native', 'reward_sponsored', 'entry'}:
                 return None
@@ -527,6 +529,8 @@ class LPDiagnostics:
                     self._scopes[key] = dict(latest=attempt, episode=None, scope=scope)
                 state = self._scopes[key]
                 state['latest'] = attempt
+                state['read_admitted_at'] = (read_started_at.astimezone(UTC)
+                    if isinstance(read_started_at, datetime) and read_started_at.tzinfo is not None else None)
                 self._scopes.move_to_end(key)
             return (key, attempt)
         except Exception:
@@ -612,6 +616,15 @@ class LPDiagnostics:
                 row.update(current_attempt=current, continuity='incomplete' if self._evictions or state is None else 'process_local', evicted_scopes=self._evictions)
                 episode = state['episode'] if state else None
                 row['scope'] = state['scope'] if state else 'unknown'
+                if event == 'complete' and episode and row['scope'] == 'account_full':
+                    boundary = episode.get('latest_read_admitted_at')
+                    source = row.get('read_started_at')
+                    source = datetime.fromisoformat(source) if source else None
+                    source_current = boundary is None or source is not None and source >= boundary
+                    row['source_current'] = source_current
+                    if not source_current:
+                        current = False
+                        row['current_attempt'] = False
                 if not current:
                     # Observe a late completion without changing the new state.
                     if episode is None:
@@ -635,20 +648,29 @@ class LPDiagnostics:
                     signature = (event, stage, cause, tuple(types), component)
                     if episode is None:
                         episode = dict(first=cause, first_at=stamp, count=0, id=uuid.uuid4().hex,
-                            signature=None, last_emit=now, first_types=types, first_stage=stage,
-                            first_attempt=row['attempt_id'], repeats=0, context={field: row[field] for field in ('request_id', 'round_id', 'task_id')})
+                            channels={}, first_types=types, first_stage=stage,
+                            first_attempt=row['attempt_id'], context={field: row[field] for field in ('request_id', 'round_id', 'task_id')})
                         state['episode'] = episode
+                    admitted = state.get('read_admitted_at')
+                    if admitted is not None:
+                        episode['latest_read_admitted_at'] = admitted
                     episode['count'] += 1
                     episode.update(cause=cause, latest_at=stamp, latest_types=types, latest_stage=stage, latest_attempt=row['attempt_id'])
-                    repeated = episode['signature'] == signature
-                    episode['signature'] = signature
-                    episode['repeats'] = episode['repeats'] + 1 if repeated else 0
-                    if repeated and now - episode['last_emit'] < 60:
+                    # Both keys are controlled allowlists (8 stages x at most
+                    # 4 component values), so interleaving cannot defeat the
+                    # window or create an unbounded channel map.
+                    channel_key = (stage, row.get('component'))
+                    channel = episode['channels'].setdefault(channel_key,
+                        dict(signature=None, last_emit=now, repeats=0))
+                    repeated = channel['signature'] == signature
+                    channel['signature'] = signature
+                    channel['repeats'] = channel['repeats'] + 1 if repeated else 0
+                    if repeated and now - channel['last_emit'] < 60:
                         return
-                    episode['last_emit'] = now
+                    channel['last_emit'] = now
                     row.update(episode_id=episode['id'], first_cause_code=episode['first'],
                         first_event_at=episode['first_at'], latest_cause_code=cause,
-                        failure_count=episode['count'], repeat_count=episode['repeats'])
+                        failure_count=episode['count'], repeat_count=channel['repeats'])
             # Queue32 and its single existing consumer isolate every handler.
             from .polymarket_trading import _lp_capture_read_log
             level = logging.WARNING if row['event'] == 'failed' else logging.INFO

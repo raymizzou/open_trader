@@ -508,3 +508,211 @@ def test_diagnostic_sink_failure_preserves_business_outcome(tmp_path, runtime, m
         assert unknown and all(len(json.dumps(r)) < 4096 for r in unknown)
     finally:
         rewards.close()
+
+
+def test_older_dashboard_read_cannot_recover_newer_auto_failure(runtime, monkeypatch, caplog):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from tests import test_lp_order_registration_contract as sdk
+    import time as real_time
+
+    caplog.set_level(logging.INFO)
+    entered, release = Event(), Event()
+    cache_time = [100.0]
+    class CacheClock:
+        def monotonic(self):
+            return cache_time[0]
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+    monkeypatch.setattr(polymarket_trading, 'time', CacheClock())
+    class Public(sdk._SDKPublicClient):
+        def get_market(self, *, id):
+            if not entered.is_set():
+                entered.set()
+                assert release.wait(5), 'Independent old Dashboard enrichment watchdog'
+            return super().get_market(id=id)
+    original = _open_order('dashboard-existing-buy', 'BUY', price='.40', original='20')
+    store, adapter, account, lp, execution = runtime(orders=(original,), public_client=Public(runtime.clock[0]))
+    execution.lp_auto_configure({'budget_usd': '100', 'target_buy_count': 5})
+    old_started = runtime.clock[0]
+    native = account.list_account_trades
+    with ThreadPoolExecutor(1) as workers:
+        old = workers.submit(execution.refresh_lp_dashboard_snapshot)
+        try:
+            assert entered.wait(3)
+            runtime.clock[0] += timedelta(seconds=1)
+            def fail(**kwargs):
+                raise httpx.ReadTimeout(SECRET)
+            monkeypatch.setattr(account, 'list_account_trades', fail)
+            execution.lp_auto_reconcile_unknown()
+            failure, = diagnostic_events(caplog, event='failed', stage='account_read', scope='account_full')
+            assert failure['event_at'] == runtime.clock[0].isoformat()
+            assert failure['exception_types'][-1] == 'ReadTimeout'
+        finally:
+            monkeypatch.setattr(account, 'list_account_trades', native)
+            release.set()
+        old_result = old.result(timeout=3)
+    def drain_dashboard_workers():
+        for name in ('_lp_reward_refresh_thread', '_lp_orders_today_refresh_thread'):
+            thread = getattr(execution, name)
+            if thread is not None:
+                thread.join(3)
+                assert not thread.is_alive(), 'Independent Dashboard worker cleanup watchdog'
+    drain_dashboard_workers()
+    assert old_result['state'] == 'ready'
+    assert old_result['orders'][0]['order_id'] == 'dashboard-existing-buy'
+    assert not diagnostic_events(caplog, event='recovered', scope_id=failure['scope_id'])
+    old_completion, = diagnostic_events(caplog, event='complete', stage='account_publish')
+    assert old_completion['current_attempt'] is False
+    assert old_completion['attempt_id'] != failure['attempt_id']
+    assert old_completion['read_started_at'] == old_started.isoformat()
+    reads = (account.balance_reads, account.order_reads, account.trade_reads, account.position_reads)
+    runtime.clock[0] += timedelta(seconds=1)
+    cached = execution.refresh_lp_dashboard_snapshot()
+    drain_dashboard_workers()
+    assert cached['state'] == 'ready'
+    assert (account.balance_reads, account.order_reads, account.trade_reads, account.position_reads) == reads
+    assert not diagnostic_events(caplog, event='recovered', scope_id=failure['scope_id'])
+    # TTL expiry permits a genuinely newer native read; the old cache was
+    # still returned by the previous public call, without altering its API.
+    cache_time[0] += 11
+    runtime.clock[0] += timedelta(seconds=1)
+    fresh = execution.refresh_lp_dashboard_snapshot()
+    drain_dashboard_workers()
+    assert fresh['state'] == 'ready'
+    recovered, = diagnostic_events(caplog, event='recovered', scope_id=failure['scope_id'])
+    assert recovered['episode_id'] == failure['episode_id']
+    assert recovered['read_started_at'] == runtime.clock[0].isoformat()
+    assert account.balance_reads == reads[0] + 1
+    assert account.order_reads == reads[1] + 1
+    assert Decimal(execution.lp_auto_state()['funds']['buy_reserved_usd']) == 8
+    assert account.posts == account.cancels == []
+
+
+def test_reward_validation_failure_cannot_emit_recovery(caplog):
+    caplog.set_level(logging.INFO)
+    mode = ['timeout']
+    reads, closes = [], []
+    condition = 'condition-validation-301'
+    def valid(amount):
+        return {'condition_id': condition, 'rewards_config': [{
+            'id': 301, 'asset_address': '0x2791bca1f2de4661ed88a30c99a7a9449aa84174',
+            'start_date': '2020-01-01', 'end_date': '2500-12-31', 'rate_per_day': amount}]}
+    class Public:
+        def list_market_rewards(self, *, condition_id, sponsored):
+            assert condition_id == condition
+            reads.append((mode[0], sponsored))
+            if mode[0] == 'timeout':
+                raise httpx.ReadTimeout(SECRET)
+            if mode[0] == 'malformed':
+                return ({'condition_id': condition, 'rewards_config': SECRET} if sponsored else
+                        {'condition_id': SECRET, 'rewards_config': []},)
+            if mode[0] == 'inconsistent':
+                return (valid('1' if sponsored else '3'),)
+            if mode[0] == 'bad-config':
+                return ({'condition_id': condition, 'rewards_config': [{'rate_per_day': SECRET}]}
+                        if sponsored else valid('3'),)
+            assert mode[0] == 'empty'
+            return ()
+        def close(self):
+            closes.append(True)
+    adapter = PolymarketTradingClient(TradingConfig(SECRET, SECRET), FakeClient(), public_client_factory=Public)
+    try:
+        first = adapter.lp_reward_catalog(condition_ids=(condition,))
+        assert first['state'] == 'unknown' and first['complete'] is False
+        initial = diagnostic_events(caplog, event='failed')
+        assert len(initial) == 2
+        mode[0] = 'malformed'
+        malformed = adapter.lp_reward_catalog(condition_ids=(condition,))
+        assert malformed['state'] == 'unknown' and malformed['daily_pool_usd'] is None
+        assert set(malformed['markets'][0]['reason_codes']) == {'reward_identity_unknown', 'reward_config_unknown'}
+        assert not diagnostic_events(caplog, event='recovered')
+        assert len(diagnostic_events(caplog, event='failed', cause_code='reward_identity_unknown')) == 1
+        assert len(diagnostic_events(caplog, event='failed', cause_code='reward_config_unknown')) == 1
+        mode[0] = 'inconsistent'
+        inconsistent = adapter.lp_reward_catalog(condition_ids=(condition,))
+        assert inconsistent['state'] == 'unknown' and inconsistent['complete'] is False
+        assert inconsistent['markets'][0]['reason_codes'] == ['reward_totals_inconsistent']
+        assert inconsistent['daily_pool_usd'] is None
+        native, = diagnostic_events(caplog, event='recovered')
+        assert native['stage'] == 'reward_native' and native['failure_count'] == 2
+        assert native['latest_cause_code'] == 'reward_identity_unknown'
+        assert len(diagnostic_events(caplog, event='failed', cause_code='reward_totals_inconsistent', stage='reward_sponsored')) == 1
+        mode[0] = 'bad-config'
+        invalid_config = adapter.lp_reward_catalog(condition_ids=(condition,))
+        assert invalid_config['state'] == 'unknown'
+        assert invalid_config['markets'][0]['reason_codes'] == ['reward_config_unknown']
+        assert len(diagnostic_events(caplog, event='recovered')) == 1
+        mode[0] = 'empty'
+        empty = adapter.lp_reward_catalog(condition_ids=(condition,))
+        assert empty['state'] == 'known' and empty['complete'] is True and empty['daily_pool_usd'] == 0
+        assert empty['markets'][0]['reward_active'] is False
+        sponsored, = diagnostic_events(caplog, event='recovered', stage='reward_sponsored')
+        assert sponsored['failure_count'] == 4
+        assert sponsored['first_cause_code'] == 'reward_read_failed'
+        assert sponsored['latest_cause_code'] == 'reward_config_unknown'
+        assert sponsored['scope_id'] == next(r['scope_id'] for r in initial if r['stage'] == 'reward_sponsored')
+        assert len(reads) == len(closes) == 10
+    finally:
+        adapter.close()
+
+
+def test_component_repeats_obey_log_aggregation_window(runtime, monkeypatch, caplog):
+    from open_trader import polymarket_lp_diagnostics
+
+    caplog.set_level(logging.INFO)
+    monotonic_time = [0.0]
+    monkeypatch.setattr(polymarket_lp_diagnostics, 'monotonic', lambda: monotonic_time[0])
+    store, adapter, account, lp, execution = runtime()
+    native_balance, native_positions = account.get_balance_allowance, account.list_positions
+    calls = {'balance': 0, 'positions': 0}
+    def fail_balance(**kwargs):
+        calls['balance'] += 1
+        raise httpx.ReadTimeout(SECRET)
+    def fail_positions(**kwargs):
+        calls['positions'] += 1
+        raise httpx.ReadTimeout(SECRET)
+    monkeypatch.setattr(account, 'get_balance_allowance', fail_balance)
+    monkeypatch.setattr(account, 'list_positions', fail_positions)
+    for second in range(4):
+        monotonic_time[0] = float(second)
+        execution.lp_auto_run_once(round_id=f'component-cycle-{second}')
+        runtime.clock[0] += timedelta(seconds=1)
+    rows = diagnostic_events(caplog, scope='account_planning')
+    # Initial transport failures and the subsequent cached waits are distinct
+    # states. Each channel emits once; other channels cannot reset its window.
+    expected = {
+        ('balance', 'account_read', 'failed', 'account_read_failed'),
+        ('positions', 'account_read', 'failed', 'account_read_failed'),
+        ('balance', 'account_read', 'waiting', 'account_read_cooling_down'),
+        ('positions', 'account_read', 'waiting', 'account_read_cooling_down'),
+        (None, 'account_publish', 'failed', 'account_snapshot_incomplete'),
+    }
+    signatures = [(r.get('component'), r['stage'], r['event'], r['cause_code']) for r in rows]
+    assert set(signatures) == expected
+    assert len(signatures) == 5
+    assert calls == {'balance': 1, 'positions': 1}
+    assert not diagnostic_events(caplog, event='recovered')
+    monotonic_time[0] = 61
+    execution.lp_auto_run_once(round_id='component-repeat-summary')
+    summaries = diagnostic_events(caplog, scope='account_planning')[len(rows):]
+    assert len(summaries) == 3
+    assert {(r.get('component'), r['repeat_count']) for r in summaries} == {
+        ('balance', 3), ('positions', 3), (None, 4)}
+    assert summaries[-1]['failure_count'] == 15
+    assert calls == {'balance': 1, 'positions': 1}
+    monkeypatch.setattr(account, 'get_balance_allowance', native_balance)
+    monkeypatch.setattr(account, 'list_positions', native_positions)
+    runtime.clock[0] += timedelta(seconds=61)
+    monotonic_time[0] = 62
+    execution.lp_auto_run_once(round_id='component-recovery')
+    recovered, = diagnostic_events(caplog, event='recovered', scope='account_planning')
+    assert recovered['failure_count'] == 15
+    assert recovered['first_cause_code'] == 'account_read_failed'
+    assert recovered['latest_cause_code'] == 'account_snapshot_incomplete'
+    assert recovered['first_stage'] == 'account_read'
+    assert recovered['latest_stage'] == 'account_publish'
+    assert recovered['first_exception_types'][-1] == 'ReadTimeout'
+    assert account.balance_reads == account.position_reads == 1
+    assert execution.lp_auto_state()['funds']['status'] == 'known'
+    assert account.posts == account.cancels == []
