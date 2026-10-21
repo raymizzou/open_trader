@@ -217,8 +217,10 @@ The 2026-09-29 approved cloud credential exception permits only the optional
 installs it for offline SDK transport tests. Do not add other dependencies or
 weaken existing skips/xfails. Playwright remains a host-only Production Smoke
 prerequisite; ordinary backend CI and Deployment Preflight have zero browser cost. Deployment
-Preflight reuses trusted main-push evidence for the selected final GitHub `main`
-SHA when preparing an explicitly authorized deployment. It does not rerun tests.
+Preflight reuses trusted main push/manual evidence for the selected final GitHub `main`
+SHA when preparing an explicitly authorized deployment. Preflight selects the
+newest exact-SHA run across push and main-only `workflow_dispatch`; a newer
+unsuccessful run blocks older green evidence, and artifacts retain the real event. It does not rerun tests.
 
 ## Test design and stability
 
@@ -533,7 +535,7 @@ work without an owner. A broader instruction to monitor through merge retains
 that stopping condition. Separate user approval is still required for GitHub
 merge; reviews and CI do not authorize merge/auto-merge, approval on the user's
 behalf, release/tag creation, deployment, trading or repository/security changes.
-PR-head and synthetic-merge evidence never replace final-main-push deployment
+PR-head and synthetic-merge evidence never replace final-main push/manual deployment
 evidence. Existing deployment and cleanup rules remain unchanged.
 
 ### Worker lifecycle
@@ -597,7 +599,7 @@ after merge. Record the PR head, base and tested merge SHA with the Actions run.
 Inspect the exact check-run name `required` from GitHub Actions (app ID 15368),
 not only a green UI label; see [ci.md](ci.md). PR CI success never establishes
 deployment evidence for a different final SHA. Deployment Preflight requires
-successful main-push CI for the selected final SHA, retained in main history.
+successful main push/manual CI for the selected final SHA, retained in main history.
 A later tip does not erase that evidence; changing the selected release SHA does.
 It is not a PR merge gate, and merging alone never deploys or starts a preflight.
 

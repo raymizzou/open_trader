@@ -102,6 +102,7 @@ class RoutingTests(unittest.TestCase):
             for event, before, expected_paths in [
                 ('push', base, ['README.md']),
                 ('pull_request', base, ['README.md']),
+                ('workflow_dispatch', '', []),
                 ('push', '0' * 40, []),
                 ('push', '', []),
                 ('push', 'f' * 40, []),

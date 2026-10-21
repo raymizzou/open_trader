@@ -2,6 +2,8 @@
 
 `.github/workflows/ci.yml` runs on every branch push and every PR targeting
 `main`, including documentation-only changes and the final merged-main push.
+It also supports `workflow_dispatch` on `refs/heads/main` only. Manual runs
+accept no SHA input and check out the same `github.sha` as automatic runs.
 Every run selects all four existing backend services: `gateway`, `legacy`,
 `account`, and `prediction`, with `TEST_N_LEG=0`. Active backend coverage excludes
 `pressure` and `browser`; it does not include Deployment Preflight, Host Readiness
@@ -26,6 +28,9 @@ rebase or a changed base); its push receives the same active backend CI.
 Record the PR head, base, tested SHA, event and Actions run together. Any head/base
 change needs fresh applicable verification; stale or cancelled runs do not qualify.
 After authorized GitHub merge, inspect the main-push run for that exact final SHA.
+A separately authorized manual run (`gh workflow run ci.yml --ref main`) can
+provide the same evidence for the then-current main SHA when automatic CI is
+unavailable. Verify the returned run and exact SHA; dispatch alone proves nothing.
 Only the selected final main SHA is eligible for separately authorized
 predeployment identity and evidence checks; see [Deployment Preflight](deployment-preflight.md).
 Deployment no longer repeats the backend suite.

@@ -12,6 +12,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('name: CI\n', workflow)
         self.assertIn('pull_request:', workflow)
         self.assertIn('push:', workflow)
+        self.assertIn('  workflow_dispatch:\n', workflow)
+        self.assertNotIn('inputs:', workflow)
+        guard = "github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'"
+        self.assertIn('  plan:\n    if: ' + guard, workflow)
+        required = workflow.split('  required:\n', 1)[1]
+        self.assertIn('if: always() && (' + guard + ')', required)
         self.assertEqual(workflow.count('branches: [main]'), 1)
         self.assertIn("push:\n    branches: ['**']", workflow)
         self.assertIn('group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}', workflow)

@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-21
 
+- CI now supports a main-only manual run with the same four backend partitions, portable scenarios and retirement coverage. Deployment Preflight selects the newest exact-SHA push or manual run and binds artifacts to its real event; newer unsuccessful runs block older green evidence. Focused offline trust and workflow checks cover this path. No deployment in this change.
+
 - Retirement CI fixtures now separate the permanently paused service from explicit unpaused library observer diagnostics at both reader fences. Dedicated runtime-only tests retain the native writer and owner until actual shutdown completes. Offline fence, incident, startup-drain and controlled concurrent regressions preserve fail-before-write, no-replay and exact cancellation assertions; new CI remains pending. No production change or deployment.
 
 - Cloud SSM status/Smoke now bind the requested N-leg setting to the release record, installed unit, loaded environment and process environment while retaining effective pause. Old SSM evidence without the configured marker requires the existing separately authorized install/start workflow. File/disabled units remain byte-identical. Eight offline substitution regressions and affected consumers verify this identity repair; not deployed.
