@@ -647,9 +647,11 @@ def _assert_superseded_target_drain(root):
         child.process.terminate();assert child.wait_exit()==0
 
 
-def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
+def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None,check_common_rejections=True):
     """Actual manager/guard/files/flocks, with external OS ownership simulated.
 
+    Rollback covers the common rejection matrix once. Restart cases use the
+    same real setup with independent files, producer, permit and native flocks.
     This never changes host ownership or invokes systemd. Metadata returned by
     stat and account lookup, and chown's native effect, are the OS boundaries.
     """
@@ -659,6 +661,7 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
     import pytest
     from open_trader import prediction_cloud as cloud,prediction_start_guard as guard
     from open_trader.prediction_release import load_prediction_runtime_record,write_prediction_runtime_record,prepare_lp_target
+    assert check_common_rejections or restart_recovery is not None
     root=child.runtime_root;config=root/'config/prediction_arbitrage.json'
     config.parent.mkdir(mode=0o700);(root/'prediction.json').rename(config)
     root.chmod(0o700);child.data_dir.chmod(0o700)
@@ -744,33 +747,34 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
         info=actual_lstat(source);key=(info.st_dev,info.st_ino)
         actual_replace(source,destination)
         if owner_paths.get(key)==Path(source):owner_paths[key]=Path(destination)
-    # Assemble native file timestamps before the isolated ownership/stat view.
-    shutil.copytree(child.release_root,child.root/'next-compatible-release',
-        ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
-    # Controlled association oracle, not a claim that this run reused an inode.
-    # These two actual native objects differ. A foreign cached service owner
-    # cannot override the declared root release object or its native mode/type.
-    probe=child.root/'next-compatible-release/.git/objects'
-    native=actual_lstat(probe);key=(native.st_dev,native.st_ino)
-    foreign=actual_lstat(config)
-    assert key!=(foreign.st_dev,foreign.st_ino)
-    owners[key]=service;owner_paths[key]=config
-    observed=metadata(native,probe)
-    assert (observed.st_uid,observed.st_gid)==(0,0)
-    assert (observed.st_dev,observed.st_ino,observed.st_mode)==(native.st_dev,native.st_ino,native.st_mode)
-    if native.st_uid==0:
-        assert (observed.st_uid,observed.st_gid)==(native.st_uid,native.st_gid)
-    (child.root/'owner-association-proof.json').write_text(json.dumps(dict(
-        path=str(probe),foreign_path=str(config),
-        native=dict(dev=native.st_dev,ino=native.st_ino,uid=native.st_uid,gid=native.st_gid,mode=oct(native.st_mode)),
-        foreign=dict(dev=foreign.st_dev,ino=foreign.st_ino),
-        returned=dict(uid=observed.st_uid,gid=observed.st_gid,mode=oct(observed.st_mode)),
-        simulated_foreign_owner=service,actual_inode_reuse_claimed=False)))
-    # A still-associated service-owned object remains service-owned; this
-    # fixture must never turn an actually unsafe selected object into root.
-    owner_paths[key]=probe
-    assert (metadata(native,probe).st_uid,metadata(native,probe).st_gid)==service
-    owners.pop(key);owner_paths.pop(key)
+    if check_common_rejections:
+        # Assemble native file timestamps before the isolated ownership/stat view.
+        shutil.copytree(child.release_root,child.root/'next-compatible-release',
+            ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
+        # Controlled association oracle, not a claim that this run reused an inode.
+        # These two actual native objects differ. A foreign cached service owner
+        # cannot override the declared root release object or its native mode/type.
+        probe=child.root/'next-compatible-release/.git/objects'
+        native=actual_lstat(probe);key=(native.st_dev,native.st_ino)
+        foreign=actual_lstat(config)
+        assert key!=(foreign.st_dev,foreign.st_ino)
+        owners[key]=service;owner_paths[key]=config
+        observed=metadata(native,probe)
+        assert (observed.st_uid,observed.st_gid)==(0,0)
+        assert (observed.st_dev,observed.st_ino,observed.st_mode)==(native.st_dev,native.st_ino,native.st_mode)
+        if native.st_uid==0:
+            assert (observed.st_uid,observed.st_gid)==(native.st_uid,native.st_gid)
+        (child.root/'owner-association-proof.json').write_text(json.dumps(dict(
+            path=str(probe),foreign_path=str(config),
+            native=dict(dev=native.st_dev,ino=native.st_ino,uid=native.st_uid,gid=native.st_gid,mode=oct(native.st_mode)),
+            foreign=dict(dev=foreign.st_dev,ino=foreign.st_ino),
+            returned=dict(uid=observed.st_uid,gid=observed.st_gid,mode=oct(observed.st_mode)),
+            simulated_foreign_owner=service,actual_inode_reuse_claimed=False)))
+        # A still-associated service-owned object remains service-owned; this
+        # fixture must never turn an actually unsafe selected object into root.
+        owner_paths[key]=probe
+        assert (metadata(native,probe).st_uid,metadata(native,probe).st_gid)==service
+        owners.pop(key);owner_paths.pop(key)
     with monkeypatch.context() as boundary:
         boundary.setattr(os,'geteuid',lambda:actor[0]);boundary.setattr(os,'getuid',lambda:actor[0])
         boundary.setattr(os,'getegid',lambda:actor[1]);boundary.setattr(os,'getgid',lambda:actor[1])
@@ -786,75 +790,76 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
         boundary.setattr(grp,'getgrnam',lambda name:SimpleNamespace(gr_gid=service[1]) if name=='prediction' else (_ for _ in ()).throw(KeyError(name)))
         boundary.setattr(socket.socket,'connect_ex',lambda sock,address:actual_connect(sock,('127.0.0.1',child.port)) if address==('127.0.0.1',8769) else actual_connect(sock,address))
         boundary.setattr(cloud,'UNIT_PATH',unit);boundary.setattr(cloud,'OPERATION_LOCK',operation)
-        # A genuinely empty systemd record goes through the actual trusted
-        # producer. Track native root creation, rather than assuming every
-        # object under the service directory already has service ownership.
-        import contextlib,importlib.util
-        from tests.lp_d2_service_harness import offline_github_fixture
-        initial_api=offline_github_fixture(child.release_root,child.root/'initial-systemd-github')
-        captures=[]
-        def initial_external(command,*a,**kw):
-            command=list(command)
-            if len(command)>1 and command[1]==str(child.release_root/'scripts/deployment_preflight.py'):
-                captures.append(command)
-                spec=importlib.util.spec_from_file_location('actual_initial_systemd_verifier',command[1])
-                verifier=importlib.util.module_from_spec(spec);spec.loader.exec_module(verifier)
-                verifier.GitHub=lambda:initial_api
-                out,err=io.StringIO(),io.StringIO()
-                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):status=verifier.main(command[2:])
-                if kw.get('check') and status:raise subprocess.CalledProcessError(status,command,out.getvalue(),err.getvalue())
-                return subprocess.CompletedProcess(command,status,out.getvalue(),err.getvalue())
-            return root_process(command,*a,**kw)
-        assert not c.record.exists() and not c.runtime_lock.exists()
-        with operation.open('r+') as initial_operation:
-            fcntl.flock(initial_operation,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            with monkeypatch.context() as github_boundary:
-                github_boundary.setattr(subprocess,'run',initial_external)
-                prepare_lp_target(runtime_root=root,release_root=child.release_root,python=str(c.python),
-                    operation_nonce='initial-systemd-producer',manager='systemd',systemd_config=c,
-                    operation_fd=initial_operation.fileno())
-            assert len(captures)==1
-            initial=load_prediction_runtime_record(c.record)
-            assert initial['pending_lp_validation']['source_sha']==child.sha
-            assert (c.record.stat().st_uid,c.record.stat().st_gid,stat.S_IMODE(c.record.stat().st_mode))==(0,9124,0o640)
-            assert (c.runtime_lock.stat().st_uid,c.runtime_lock.stat().st_gid,
-                stat.S_IMODE(c.runtime_lock.stat().st_mode))==(9123,9124,0o600)
-            assert not child.permit_path.exists() and child.actual_posts()==0
-            with c.runtime_lock.open('r+') as native_owner:
-                fcntl.flock(native_owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            # The installed unit reserves only its exact runtime. A missing
-            # root record cannot convert that runtime to an ordinary manager.
-            parked=c.record.with_suffix('.saved');c.record.rename(parked)
-            actor[:]=service
-            ordinary={**retained,'manager':'foreground','manager_identity':'foreground:9123',
-                'candidate':{**retained['candidate'],'lp_validation':initial['pending_lp_validation']}}
-            write_prediction_runtime_record(foreground,ordinary)
-            ordinary_bytes=foreground.read_bytes();unit_bytes=unit.read_bytes()
-            from dataclasses import replace
-            unrelated=replace(c,runtime_root=child.root/'independent-systemd-runtime')
-            try:
-                unit.write_text(cloud.render_unit(unrelated))
-                independent=guard.identity_for_runtime(data_dir=child.data_dir,
-                    prediction_config_path=config,code_root=child.release_root,port=8769)
-                assert independent.manager=='foreground' and independent.runtime_root==str(root)
-                for reserved_text in (unit_bytes.decode(),
-                        unit_bytes.decode().replace('Description=OpenTrader Prediction\n',''),
-                        unit_bytes.decode().replace('ReadWritePaths='+str(root),
-                            'ReadWritePaths='+str(unrelated.runtime_root))):
-                    unit.write_text(reserved_text)
-                    with pytest.raises(guard.PredictionStartDenied,match='systemd'):
-                        guard.identity_for_runtime(data_dir=child.data_dir,
-                            prediction_config_path=config,code_root=child.release_root,port=8769)
-                assert foreground.read_bytes()==ordinary_bytes and parked.exists()
+        if check_common_rejections:
+            # A genuinely empty systemd record goes through the actual trusted
+            # producer. Track native root creation, rather than assuming every
+            # object under the service directory already has service ownership.
+            import contextlib,importlib.util
+            from tests.lp_d2_service_harness import offline_github_fixture
+            initial_api=offline_github_fixture(child.release_root,child.root/'initial-systemd-github')
+            captures=[]
+            def initial_external(command,*a,**kw):
+                command=list(command)
+                if len(command)>1 and command[1]==str(child.release_root/'scripts/deployment_preflight.py'):
+                    captures.append(command)
+                    spec=importlib.util.spec_from_file_location('actual_initial_systemd_verifier',command[1])
+                    verifier=importlib.util.module_from_spec(spec);spec.loader.exec_module(verifier)
+                    verifier.GitHub=lambda:initial_api
+                    out,err=io.StringIO(),io.StringIO()
+                    with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):status=verifier.main(command[2:])
+                    if kw.get('check') and status:raise subprocess.CalledProcessError(status,command,out.getvalue(),err.getvalue())
+                    return subprocess.CompletedProcess(command,status,out.getvalue(),err.getvalue())
+                return root_process(command,*a,**kw)
+            assert not c.record.exists() and not c.runtime_lock.exists()
+            with operation.open('r+') as initial_operation:
+                fcntl.flock(initial_operation,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                with monkeypatch.context() as github_boundary:
+                    github_boundary.setattr(subprocess,'run',initial_external)
+                    prepare_lp_target(runtime_root=root,release_root=child.release_root,python=str(c.python),
+                        operation_nonce='initial-systemd-producer',manager='systemd',systemd_config=c,
+                        operation_fd=initial_operation.fileno())
+                assert len(captures)==1
+                initial=load_prediction_runtime_record(c.record)
+                assert initial['pending_lp_validation']['source_sha']==child.sha
+                assert (c.record.stat().st_uid,c.record.stat().st_gid,stat.S_IMODE(c.record.stat().st_mode))==(0,9124,0o640)
+                assert (c.runtime_lock.stat().st_uid,c.runtime_lock.stat().st_gid,
+                    stat.S_IMODE(c.runtime_lock.stat().st_mode))==(9123,9124,0o600)
                 assert not child.permit_path.exists() and child.actual_posts()==0
-            finally:
-                foreground.unlink();parked.rename(c.record);unit.write_bytes(unit_bytes);actor[:]=[0,0]
-            # End this unclaimed disposable initial-producer phase under the
-            # actual operation lock; the retained-record phase below also
-            # independently exercises the guard's fresh owner-file creation.
-            for temporary in (c.record,c.runtime_lock):
-                info=actual_lstat(temporary);temporary.unlink();key=(info.st_dev,info.st_ino)
-                owners.pop(key,None);owner_paths.pop(key,None)
+                with c.runtime_lock.open('r+') as native_owner:
+                    fcntl.flock(native_owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                # The installed unit reserves only its exact runtime. A missing
+                # root record cannot convert that runtime to an ordinary manager.
+                parked=c.record.with_suffix('.saved');c.record.rename(parked)
+                actor[:]=service
+                ordinary={**retained,'manager':'foreground','manager_identity':'foreground:9123',
+                    'candidate':{**retained['candidate'],'lp_validation':initial['pending_lp_validation']}}
+                write_prediction_runtime_record(foreground,ordinary)
+                ordinary_bytes=foreground.read_bytes();unit_bytes=unit.read_bytes()
+                from dataclasses import replace
+                unrelated=replace(c,runtime_root=child.root/'independent-systemd-runtime')
+                try:
+                    unit.write_text(cloud.render_unit(unrelated))
+                    independent=guard.identity_for_runtime(data_dir=child.data_dir,
+                        prediction_config_path=config,code_root=child.release_root,port=8769)
+                    assert independent.manager=='foreground' and independent.runtime_root==str(root)
+                    for reserved_text in (unit_bytes.decode(),
+                            unit_bytes.decode().replace('Description=OpenTrader Prediction\n',''),
+                            unit_bytes.decode().replace('ReadWritePaths='+str(root),
+                                'ReadWritePaths='+str(unrelated.runtime_root))):
+                        unit.write_text(reserved_text)
+                        with pytest.raises(guard.PredictionStartDenied,match='systemd'):
+                            guard.identity_for_runtime(data_dir=child.data_dir,
+                                prediction_config_path=config,code_root=child.release_root,port=8769)
+                    assert foreground.read_bytes()==ordinary_bytes and parked.exists()
+                    assert not child.permit_path.exists() and child.actual_posts()==0
+                finally:
+                    foreground.unlink();parked.rename(c.record);unit.write_bytes(unit_bytes);actor[:]=[0,0]
+                # End this unclaimed disposable initial-producer phase under the
+                # actual operation lock; the retained-record phase below also
+                # independently exercises the guard's fresh owner-file creation.
+                for temporary in (c.record,c.runtime_lock):
+                    info=actual_lstat(temporary);temporary.unlink();key=(info.st_dev,info.st_ino)
+                    owners.pop(key,None);owner_paths.pop(key,None)
         # Real management publication must retain validation and publish the
         # root-write/service-read metadata before the atomic replace.
         write_prediction_runtime_record(c.record,{**retained,'manager':'systemd'},owner=(0,service[1]),mode=0o640)
@@ -866,11 +871,12 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
         assert saved['candidate']['lp_validation']==retained['candidate']['lp_validation']
         assert stat.S_IMODE(c.record.stat().st_mode)==0o640
         assert (c.record.stat().st_uid,c.record.stat().st_gid)==(0,9124)
-        with operation.open('r+') as unheld:
-            with pytest.raises(ValueError,match='retained flock'):
-                prepare_lp_target(runtime_root=root,release_root=child.release_root,python=sys.executable,
-                    operation_nonce='unlocked-descriptor',manager='systemd',systemd_config=c,
-                    operation_fd=unheld.fileno(),port=8769)
+        if check_common_rejections:
+            with operation.open('r+') as unheld:
+                with pytest.raises(ValueError,match='retained flock'):
+                    prepare_lp_target(runtime_root=root,release_root=child.release_root,python=sys.executable,
+                        operation_nonce='unlocked-descriptor',manager='systemd',systemd_config=c,
+                        operation_fd=unheld.fileno(),port=8769)
         with operation.open('r+') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
             # Retained producer adopts this actual descriptor; another open
@@ -884,12 +890,13 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
                     code_root=child.release_root,port=8769)
                 assert identity.uid==9123 and identity.gid==9124 and identity.manager=='systemd'
                 assert identity.interpreter==str(c.python)
-                for field,value in (('MainPID','999999'),('ActiveState','active')):
-                    original=manager_state[field];manager_state[field]=value
-                    with pytest.raises(guard.PredictionStartDenied):
-                        guard.arm_for_operator_start(identity,'systemd-root-operation',operation_fd=lock.fileno())
-                    assert not child.permit_path.exists()
-                    manager_state[field]=original
+                if check_common_rejections:
+                    for field,value in (('MainPID','999999'),('ActiveState','active')):
+                        original=manager_state[field];manager_state[field]=value
+                        with pytest.raises(guard.PredictionStartDenied):
+                            guard.arm_for_operator_start(identity,'systemd-root-operation',operation_fd=lock.fileno())
+                        assert not child.permit_path.exists()
+                        manager_state[field]=original
                 guard.arm_for_operator_start(identity,'systemd-root-operation',operation_fd=lock.fileno())
         permit=child.permit_path;before=c.record.read_bytes()
         assert (permit.stat().st_uid,permit.stat().st_gid,stat.S_IMODE(permit.stat().st_mode))==(9123,9124,0o600)
@@ -899,64 +906,68 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None):
         actor[:]=service
         with (child.data_dir/'prediction_arbitrage/runtime.lock').open('r+') as owner:
             fcntl.flock(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            for uid,gid in ((9125,9124),(9123,9125),(0,0)):
-                actor[:]=uid,gid
-                with pytest.raises(guard.PredictionStartDenied):guard.claim_for_start(identity,'wrong-actor')
-            actor[:]=service
-            unclaimed=permit.read_bytes()
-            with monkeypatch.context() as service_process_identity:
-                service_process_identity.setattr(sys,'executable','/external/wrong-service-python')
-                with pytest.raises(guard.PredictionStartDenied):guard.claim_for_start(identity,'wrong-interpreter')
-            assert permit.read_bytes()==unclaimed and c.record.read_bytes()==before
+            if check_common_rejections:
+                for uid,gid in ((9125,9124),(9123,9125),(0,0)):
+                    actor[:]=uid,gid
+                    with pytest.raises(guard.PredictionStartDenied):guard.claim_for_start(identity,'wrong-actor')
+                actor[:]=service
+                unclaimed=permit.read_bytes()
+                with monkeypatch.context() as service_process_identity:
+                    service_process_identity.setattr(sys,'executable','/external/wrong-service-python')
+                    with pytest.raises(guard.PredictionStartDenied):guard.claim_for_start(identity,'wrong-interpreter')
+                assert permit.read_bytes()==unclaimed and c.record.read_bytes()==before
             claim=guard.claim_for_start(identity,'actual-service-owner')
             assert json.loads(permit.read_text())['state']=='CLAIMED'
-            claimed_bytes=permit.read_bytes()
-            actual_path_lstat=Path.lstat
-            # External filesystem facts only: each stable metadata mutation
-            # remains uncertainty. The exact claimed permission and actual OS
-            # owner survive every rejected public drain attempt.
-            for index in (0,1,2,3,4,5,6,8,9):
-                calls=[0]
-                def changed_metadata(path,*a,**kw):
-                    info=actual_path_lstat(path,*a,**kw)
-                    if path==c.record:
-                        calls[0]+=1
-                        if calls[0]>=2:
-                            values=list(info);values[index]+=1
-                            return os.stat_result(values)
-                    return info
+            if check_common_rejections:
+                claimed_bytes=permit.read_bytes()
+                actual_path_lstat=Path.lstat
+                # External filesystem facts only: each stable metadata mutation
+                # remains uncertainty. The exact claimed permission and actual OS
+                # owner survive every rejected public drain attempt.
+                for index in (0,1,2,3,4,5,6,8,9):
+                    calls=[0]
+                    def changed_metadata(path,*a,**kw):
+                        info=actual_path_lstat(path,*a,**kw)
+                        if path==c.record:
+                            calls[0]+=1
+                            if calls[0]>=2:
+                                values=list(info);values[index]+=1
+                                return os.stat_result(values)
+                        return info
+                    with monkeypatch.context() as stat_boundary:
+                        stat_boundary.setattr(Path,'lstat',changed_metadata)
+                        with pytest.raises(guard.PredictionStartDenied,match='selection changed during validation'):
+                            guard.rearm_after_clean_drain(claim)
+                    assert permit.read_bytes()==claimed_bytes and c.record.read_bytes()==before
+                    with owner_path.open('r+') as independent_owner:
+                        with pytest.raises(BlockingIOError):
+                            fcntl.flock(independent_owner.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+                def unavailable_metadata(path,*a,**kw):
+                    if path==c.record:raise OSError('external management metadata unavailable')
+                    return actual_path_lstat(path,*a,**kw)
                 with monkeypatch.context() as stat_boundary:
-                    stat_boundary.setattr(Path,'lstat',changed_metadata)
-                    with pytest.raises(guard.PredictionStartDenied,match='selection changed during validation'):
+                    stat_boundary.setattr(Path,'lstat',unavailable_metadata)
+                    with pytest.raises(OSError,match='metadata unavailable'):
                         guard.rearm_after_clean_drain(claim)
                 assert permit.read_bytes()==claimed_bytes and c.record.read_bytes()==before
                 with owner_path.open('r+') as independent_owner:
                     with pytest.raises(BlockingIOError):
                         fcntl.flock(independent_owner.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
-            def unavailable_metadata(path,*a,**kw):
-                if path==c.record:raise OSError('external management metadata unavailable')
-                return actual_path_lstat(path,*a,**kw)
-            with monkeypatch.context() as stat_boundary:
-                stat_boundary.setattr(Path,'lstat',unavailable_metadata)
-                with pytest.raises(OSError,match='metadata unavailable'):
+                calls=[0]
+                def read_updates_atime(path,*a,**kw):
+                    info=actual_path_lstat(path,*a,**kw)
+                    if path==c.record:
+                        calls[0]+=1
+                        if calls[0]>=2:
+                            values=list(info);values[7]+=1
+                            return os.stat_result(values)
+                    return info
+                with monkeypatch.context() as stat_boundary:
+                    stat_boundary.setattr(Path,'lstat',read_updates_atime)
                     guard.rearm_after_clean_drain(claim)
-            assert permit.read_bytes()==claimed_bytes and c.record.read_bytes()==before
-            with owner_path.open('r+') as independent_owner:
-                with pytest.raises(BlockingIOError):
-                    fcntl.flock(independent_owner.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
-            calls=[0]
-            def read_updates_atime(path,*a,**kw):
-                info=actual_path_lstat(path,*a,**kw)
-                if path==c.record:
-                    calls[0]+=1
-                    if calls[0]>=2:
-                        values=list(info);values[7]+=1
-                        return os.stat_result(values)
-                return info
-            with monkeypatch.context() as stat_boundary:
-                stat_boundary.setattr(Path,'lstat',read_updates_atime)
+                assert calls[0]>=2
+            else:
                 guard.rearm_after_clean_drain(claim)
-            assert calls[0]>=2
             assert json.loads(permit.read_text())['state']=='ARMED'
             assert c.record.read_bytes()==before
         actor[:]=0,0

@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-21
 
+- D2 systemd 离线生命周期回归仅在 rollback 路径执行公共拒绝矩阵，减少 ready/failed restart 的重复验证；两个 restart 场景仍各自创建真实 producer、记录、启动许可和原生锁，并保留恢复与零发送断言。验证覆盖原三个测试的串行、双 worker 隔离及 actor、元数据和旧 nonce 的负向敏感性；未改生产代码，不据本机计时推断 GitHub CI 节省。
+
 - LP 慢会话隔离回归改为先等待健康市场的实际 BUY 回执，再核实轮次完成，避免同一个两秒窗口覆盖对账等待与健康发送调度。测试保持慢读取直至清理，保留精确订单、占资和禁止叠加读取断言，并回收实际原生读取与对账线程。离线验证包含受控健康市场延迟与依赖慢读取的负向故障；未改生产逻辑。
 
 ## 2026-10-20
