@@ -792,3 +792,117 @@ def test_scheduler_waits_for_async_dependencies_and_completion_wakes_early(tmp_p
     finally:
         boundary.release.set();scheduler.stop()
         assert live.close(4)
+
+
+def test_scheduler_waits_for_cleanup_fault_exit_without_busy_loop(tmp_path):
+    from datetime import datetime,timedelta
+    from open_trader.polymarket_lp import PolymarketLPService
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+    from tests.test_lp_d2_execution_bridge import attach
+    for with_buy in (False,True):
+        root=tmp_path/('with-buy' if with_buy else 'empty')
+        clock,boundary,trading,live=live_owner(root)
+        boundary.orders=[wire_row('A')] if with_buy else []
+        producer=PolymarketLPService(live.store,trading,clock=clock.utc)
+        execution=attach(live,producer,root)
+        scheduler=LPAutoScheduler(execution,clock=clock.utc)
+        execution.set_lp_auto_scheduler(scheduler)
+        notices=[];changed=threading.Condition()
+        def notice():
+            status=live.read_runtime.status()
+            scheduler.request_check()
+            with changed:notices.append(status);changed.notify_all()
+        execution.set_lp_auto_wakeup(notice)
+        def drive_until(predicate):
+            end=time.monotonic()+4
+            while not predicate():
+                scheduler.run_due()
+                left=end-time.monotonic();assert left>0,(live.status(),boundary.events)
+                with boundary.changed:boundary.changed.wait(min(.01,left))
+        def collect_at(stamp,*,faults,dependency):
+            clock.value=stamp;live.read_runtime.wake()
+            boundary.wait(lambda:live.read_runtime.status()['ready_count']>0)
+            scheduler.request_check();assert scheduler.run_due()
+            # Observe the actual post-ACK publication, then consume its wakeup.
+            boundary.wait(lambda:any(n['observed_monotonic']==stamp and n['ready_count']==0
+                and n['cleanup_faults']==faults and n['next_dependency_monotonic']==dependency for n in notices))
+            scheduler.run_due()
+        try:
+            if with_buy:
+                scheduler.run_due()
+                drive_until(lambda:('account',CID,'yes','A') in live.state.snapshot().read_failures
+                    and live.state.snapshot().yields[('account',CID,'yes','A')].yield_pct_per_hour.state=='known')
+            boundary.holds={('O','balance')};boundary.mode[('O','balance')]='swallow'
+            start=5 if with_buy else 0
+            clock.value=start;live.read_runtime.wake();scheduler.request_check();assert scheduler.run_due()
+            boundary.wait(lambda:any(e[:3]==('entered','O','balance') and e[3]==start for e in boundary.events))
+            if with_buy:
+                drive_until(lambda:live.state.snapshot().yields[('account',CID,'yes','A')].evaluated_at==clock.utc()
+                    and live.read_runtime.status()['ready_count']==0)
+            first=next(s for s in live.read_runtime.status()['scopes'] if s['key'][3]=='financial')
+            deadline=start+5;fault_at=start+6
+            if with_buy:
+                clock.value=deadline;live.read_runtime.wake()
+                boundary.wait(lambda:any(e[:3]==('finally_exited','A','book') and e[3]==deadline for e in boundary.events))
+                # HTTP finally is earlier than the complete runtime mailbox.
+                # Both A's result and O's timeout must be ready for co-delivery.
+                boundary.wait(lambda:live.read_runtime.status()['ready_count']>=2
+                    and not next(s for s in live.read_runtime.status()['scopes'] if s['key'][3]=='buy')['active'])
+            collect_at(deadline,faults=0,dependency=fault_at)
+            snapshot=live.state.snapshot()
+            assert snapshot.new_capacity.state=='unknown'
+            assert snapshot.observation.components['balance'].error_code=='timeout'
+            assert execution.lp_auto_state(include_intents=False)['plan_wait']==dict(
+                kind='dependencies',deadline=(NOW+timedelta(seconds=fault_at)).isoformat())
+            assert datetime.fromisoformat(scheduler.snapshot()['next_check_at'])==NOW+timedelta(seconds=fault_at)
+            expected_dependency=15 if with_buy else None
+            collect_at(fault_at,faults=1,dependency=expected_dependency)
+            status=live.read_runtime.status()
+            financial_scope=next(s for s in status['scopes'] if s['key'][3]=='financial')
+            assert financial_scope['active'] and financial_scope['cleanup_fault']
+            assert financial_scope['attempt']==first['attempt'] and status['ready_count']==0
+            assert not status['new_buy_allowed'] and status['pool_count']>=2
+            waiting=execution.lp_auto_state(include_intents=False)['plan_wait']
+            if with_buy:
+                assert waiting==dict(kind='dependencies',deadline=(NOW+timedelta(seconds=15)).isoformat())
+                assert datetime.fromisoformat(scheduler.snapshot()['next_check_at'])==NOW+timedelta(seconds=15)
+                assert live.state.snapshot().yields[('account',CID,'yes','A')].evaluated_at==NOW+timedelta(seconds=10)
+            else:
+                assert waiting==dict(kind='events')
+                assert scheduler.snapshot()['next_check_at'] is None
+                assert not scheduler.snapshot()['check_in_progress']
+            before=list(boundary.events)
+            assert all(not scheduler.run_due() for _ in range(100))
+            assert boundary.events==before
+            assert execution.lp_auto_run_once()['state']=='scheduled'
+            assert scheduler.run_due() and not scheduler.run_due()
+            assert boundary.events==before and live.state.snapshot().new_capacity.state=='unknown'
+            assert next(s for s in live.read_runtime.status()['scopes'] if s['key'][3]=='financial')['active']
+            if with_buy:
+                clock.value=15;live.read_runtime.wake();assert scheduler.run_due()
+                drive_until(lambda:live.state.snapshot().yields[('account',CID,'yes','A')].evaluated_at==clock.utc())
+                assert count(live)==0
+            # Actual exit is an event, not a retry or a claimed financial recovery.
+            boundary.release.set()
+            boundary.wait(lambda:any(e[:3]==('finally_exited','O','balance') and e[3]==clock() for e in boundary.events)
+                and not next(s for s in live.read_runtime.status()['scopes'] if s['key'][3]=='financial')['active'])
+            boundary.wait(lambda:any(n['cleanup_faults']==1 and not next(s for s in n['scopes'] if s['key'][3]=='financial')['active']
+                for n in notices))
+            assert scheduler.run_due()
+            status=live.read_runtime.status()
+            assert status['cleanup_faults']==1 and not status['new_buy_allowed']
+            assert status['pool_count']>=2 and live.state.snapshot().new_capacity.state=='unknown'
+            assert len([e for e in boundary.events if e[:3]==('entered','O','balance') and e[3]>=start])==1
+            assert trading.cancels==[]
+            scheduler.start()
+            def monitor_waiting():
+                monitor=scheduler.snapshot()
+                return monitor['scheduler_running'] and not monitor['check_in_progress'] and (
+                    monitor['next_check_at'] is None if not with_buy else monitor['next_check_at'] is not None
+                    and datetime.fromisoformat(monitor['next_check_at'])>clock.utc())
+            boundary.wait(monitor_waiting)
+            scheduler.stop()
+            assert not scheduler.snapshot()['scheduler_running']
+        finally:
+            boundary.release.set();scheduler.stop()
+            assert live.close(4)

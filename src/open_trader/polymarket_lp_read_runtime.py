@@ -329,6 +329,8 @@ class LPReadRuntime:
             fixed_faults=bool(self._fixed_faults) or any(s.fault and s.demand.kind!='buy' for s in self._scopes.values())
             return freeze(dict(cache_entries=len(self._cache),cache_bytes=self._cache_size,
                 next_dependency_monotonic=min(dependencies) if dependencies else None,
+                waiting_for_event=not dependencies and (bool(self._fixed_faults)
+                    or any(s.fault or s.retiring or s.closing for s in self._scopes.values())),
                 policy=dict(buy_cap=self.buy_cap,cache_entries=self.cache_entries,cache_bytes=self.cache_bytes),
                 observed_monotonic=self._observed,cleanup_faults=faults,owned_buy_scopes=len(owned),
                 retiring_buy_scopes=sum(s.retiring for s in owned),deferred_count=len(deferred),

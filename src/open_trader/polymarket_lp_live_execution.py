@@ -2210,10 +2210,13 @@ class LPD2LiveExecution:
             # Only pure read waiting may defer the owner. Existing native,
             # settings and control work keeps its immediate progress path.
             wait=None
-            if (dependency is not None and dependency>self._clock() and not (owned or self._active_sends
+            if not (owned or self._active_sends
                     or any(h._thread.is_alive() for h in self._manual_jobs.values())
-                    or self._settings_future is not None or control.native_save_in_flight)):
-                wait=dict(kind='dependencies',deadline=(self._utc_now()+timedelta(seconds=dependency-self._clock())).isoformat())
+                    or self._settings_future is not None or control.native_save_in_flight):
+                if dependency is not None and dependency>self._clock():
+                    wait=dict(kind='dependencies',deadline=(self._utc_now()+timedelta(seconds=dependency-self._clock())).isoformat())
+                elif reads and reads.get('waiting_for_event'):
+                    wait=dict(kind='events')
             return dict(read_runtime=reads,plan_wait=wait,
                 read_persistence_error=self._read_store_error,control=control,
                 round=self.rounds.snapshot() if self.state.snapshot().current.cycle_generation else None,

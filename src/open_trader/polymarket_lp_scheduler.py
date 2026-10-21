@@ -58,12 +58,14 @@ class LPAutoScheduler:
             deadline = datetime.fromisoformat(waiting['deadline'])
             if not future_only or deadline > self.clock():
                 self._next_check_at = deadline
+        elif waiting and waiting.get('kind') == 'events' and not future_only:
+            self._next_check_at = None  # no runnable work until a real wakeup
 
     def snapshot(self) -> dict[str, object]:
         with self._state:
             return {
                 "last_check_at": self._last_check_at.isoformat() if self._last_check_at else None,
-                "next_check_at": None if self._checking else (
+                "next_check_at": None if self._checking or self._next_check_at is None else (
                     self._next_check_at
                 ).isoformat(),
                 "check_in_progress": self._checking,
@@ -85,7 +87,7 @@ class LPAutoScheduler:
             return False
         try:
             with self._state:
-                if self._stop.is_set() or self.clock() < self._next_check_at:
+                if self._stop.is_set() or self._next_check_at is None or self.clock() < self._next_check_at:
                     return False
                 self._wake.clear()
                 self._checking = True
@@ -141,10 +143,11 @@ class LPAutoScheduler:
                 except Exception as exc:
                     self._state_read_failed(exc, event='prediction_lp_auto_monitor_failed')
                 with self._state:
-                    delay = max(0, (self._next_check_at - self.clock()).total_seconds())
+                    delay = (None if self._next_check_at is None else
+                        max(0, (self._next_check_at - self.clock()).total_seconds()))
                 if self._stop.is_set():
                     break
-                self._wake.wait(min(delay, 60))
+                self._wake.wait(None if delay is None else min(delay, 60))
 
         self._thread = threading.Thread(target=run, name="prediction-lp-auto", daemon=True)
         self._thread.start()
