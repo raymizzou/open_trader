@@ -31,6 +31,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-18
 
+- #149 LP 看板透传维护耗时、下次重试时间和连续失败次数；首访默认值为 null，账户读取失败时仍保留候选维护诊断。直接 pytest 验证维护诊断、空首访与候选新鲜度合同；不改变维护或交易语义。
+
 - US/HK trend protection now skips weekends and Futu calendar holidays. Calendar failures or empty/unusable 21-day calendar windows keep weekday protection active; only a usable window excluding today establishes a holiday. Abnormal diagnostics and blocker alerts include bounded, redacted exception or health-gate reasons. Offline controller/watcher regressions preserve trading-day guards and the opening alert buffer; not deployed.
 - D2 diagnostics now count completed protective SELLs and exit cancellations with their original request and observation identity. Selected and retained target counts use the accepted selection and typed order identities. Offline regressions preserve UNKNOWN outcomes, native completion, no replay and unchanged trading rules.
 - Trend allocation now converts host-local clocks to Shanghai time while preserving the instant, including daylight saving time. Aware clocks use the same conversion. Offline regressions cover allocation dates, the post-close attempt window, and status timestamps on a Los Angeles host.

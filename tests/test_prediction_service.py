@@ -7345,6 +7345,9 @@ def test_lp_dashboard_reads_come_from_background_snapshot(
     pending = service.lp_dashboard()
     assert pending["state"] == "snapshot_pending"
     assert counters["account_reads"] == 0
+    assert pending["maintenance_diagnostics"] is None
+    assert pending["maintenance_next_attempt_at"] is None
+    assert pending["maintenance_consecutive_failures"] is None
 
     first = service.refresh_lp_dashboard_snapshot()
     assert counters["account_reads"] == 1
@@ -7382,8 +7385,9 @@ def test_lp_dashboard_reads_come_from_background_snapshot(
     }
 
 
+@pytest.mark.parametrize("account_read_fails", [False, True])
 def test_lp_maintenance_publishes_diagnostics_fields(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, account_read_fails: bool
 ) -> None:
     """Issue #146 A9: the snapshot carries per-read timings, the next
     allowed attempt, and the consecutive failure count."""
@@ -7397,6 +7401,34 @@ def test_lp_maintenance_publishes_diagnostics_fields(
     clock, state, store, trading, service = _lp_adapter_service_fixture(
         tmp_path, monkeypatch, markets=[market], balance_units=50_000_000
     )
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=service,
+    )
+
+    def assert_dashboard_diagnostics(snapshot: dict[str, object]) -> None:
+        def fail_account_read() -> None:
+            raise RuntimeError("lp_account_snapshot_unknown")
+
+        with monkeypatch.context() as patch:
+            if account_read_fails:
+                patch.setattr(trading, "lp_account_snapshot_shared", fail_account_read)
+            dashboard = execution.refresh_lp_dashboard_snapshot()
+        if account_read_fails:
+            assert dashboard["state"] in {"unknown", "stale"}
+            assert dashboard["reason"] == "account_read_failed"
+        else:
+            assert dashboard["state"] == "ready"
+        for payload in (dashboard, execution.lp_dashboard()):
+            safe = prediction_service._lp_projection_safe_value(payload)
+            for key in ("maintenance_diagnostics", "maintenance_next_attempt_at",
+                        "maintenance_consecutive_failures"):
+                assert payload[key] == safe[key] == snapshot[key]
+
     monkeypatch.setattr(
         polymarket_trading_module,
         "time",
@@ -7433,6 +7465,7 @@ def test_lp_maintenance_publishes_diagnostics_fields(
         failed["maintenance_next_attempt_at"].replace("Z", "+00:00")
     )
     assert next_attempt == finished + timedelta(seconds=60)
+    assert_dashboard_diagnostics(failed)
 
     state["metadata_error"] = False
     clock["now"] = finished + timedelta(seconds=61)
@@ -7451,6 +7484,7 @@ def test_lp_maintenance_publishes_diagnostics_fields(
         recovered_diagnostics["finished_at"].replace("Z", "+00:00")
     )
     assert recovered_finished >= t0 + timedelta(seconds=92)
+    assert_dashboard_diagnostics(recovered)
 
 
 def test_lp_trial_preview_uses_same_qualification_and_selected_reads(
