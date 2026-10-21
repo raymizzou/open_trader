@@ -1461,38 +1461,101 @@ def test_slow_dashboard_does_not_block_session_and_funds_publication(tmp_path):
         dashboard.result(timeout=5)
 
 
+def _track_local_lp_workers(monkeypatch):
+    """Keep the actual threads so teardown includes work beyond round return."""
+    import threading
+    from types import SimpleNamespace
+    from open_trader import polymarket_lp, polymarket_lp_auto
+
+    threads = []
+
+    def tracked_thread(*args, **kwargs):
+        worker = Thread(*args, **kwargs)
+        threads.append(worker)
+        return worker
+
+    # Replace only these modules' view of Thread, never the shared threading
+    # module. All workers still use real native threads and unchanged targets.
+    for module in (polymarket_lp, polymarket_lp_auto):
+        monkeypatch.setattr(module, 'threading', SimpleNamespace(
+            **{**vars(threading), 'Thread': tracked_thread},
+        ))
+    return threads
+
+
 def test_slow_session_does_not_block_another_market_buy(tmp_path, monkeypatch):
+    from time import monotonic
+
     execution, exchange, lp, _ = setup(tmp_path, 2)
+    native_workers = _track_local_lp_workers(monkeypatch)
     second = lp._candidate_pool.pop('m01')
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=2))
     execution.lp_auto_set_desired_running(True)
     execution.lp_auto_run_once()
+    initial_order = dict(exchange.orders[0])
+    assert (initial_order['token_id'], initial_order['side']) == ('m00', 'BUY')
     lp._candidate_pool['m01'] = second
-    entered, release = Event(), Event()
+    entered, release, healthy_posted = Event(), Event(), Event()
     read = exchange.lp_snapshot
+    post = exchange.lp_post_order
     calls = []
+    healthy_receipts = []
 
     def delayed(request):
         if request['token_id'] == 'm00':
             calls.append('m00')
             entered.set()
-            assert release.wait(5)
+            # Only teardown releases this read. A fixture timeout must not
+            # accidentally let a dependent healthy round finish successfully.
+            release.wait()
         return read(request)
 
+    def observed_post(signed):
+        receipt = post(signed)
+        if (signed['token_id'], signed['side']) == ('m01', 'BUY'):
+            healthy_receipts.append(dict(receipt))
+            healthy_posted.set()
+        return receipt
+
     exchange.lp_snapshot = delayed
+    exchange.lp_post_order = observed_post
     advance_auto_wait(execution, monkeypatch)
-    with ThreadPoolExecutor(1) as workers:
-        result = workers.submit(execution.lp_auto_run_once)
-        try:
-            assert entered.wait(2)
-            state = result.result(timeout=2)
-            assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01']
-            assert Decimal(state['funds']['buy_reserved_usd']) >= 16
-            execution.lp_auto_run_once()
-            assert calls == ['m00'], 'do not stack reads behind the stalled session'
-        finally:
-            release.set()
-        result.result(timeout=5)
+    try:
+        with ThreadPoolExecutor(1) as workers:
+            result = workers.submit(execution.lp_auto_run_once)
+            try:
+                assert entered.wait(2)
+                # The legacy round deliberately spends up to one second on
+                # reconciliation. Give startup/post scheduling its own real
+                # watchdog, then observe receipt application/round completion.
+                assert healthy_posted.wait(5), 'm01 BUY must not depend on releasing m00'
+                state = result.result(timeout=2)
+                assert not release.is_set()
+                assert sorted((p['token_id'], p['side']) for p in exchange.posts) == [
+                    ('m00', 'BUY'), ('m01', 'BUY'),
+                ]
+                assert len(healthy_receipts) == 1
+                assert healthy_receipts[0]['order_id'] != initial_order['order_id']
+                assert sorted((o['token_id'], o['side'], o['order_id']) for o in exchange.orders) == [
+                    ('m00', 'BUY', initial_order['order_id']),
+                    ('m01', 'BUY', healthy_receipts[0]['order_id']),
+                ]
+                assert Decimal(state['funds']['buy_reserved_usd']) >= 16
+                workers.submit(execution.lp_auto_run_once).result(timeout=2)
+                assert calls == ['m00'], 'do not stack reads behind the stalled session'
+                assert len(exchange.posts) == 2, 'another round must not duplicate either BUY'
+                assert not release.is_set()
+            finally:
+                release.set()
+            result.result(timeout=5)
+    finally:
+        release.set()
+        deadline = monotonic() + 5
+        # Parent threads are recorded before their children. Joining the real
+        # parents also prevents teardown from racing a newly created child.
+        for worker in native_workers:
+            worker.join(timeout=max(0, deadline - monotonic()))
+        assert not [worker.name for worker in native_workers if worker.is_alive()]
 
 
 def test_failed_session_keeps_capital_but_allows_other_market_buy(tmp_path, monkeypatch):
