@@ -1083,6 +1083,7 @@ class PredictionExecutionService:
     def set_lp_auto_wakeup(self, wakeup):
         if self._lp_d2 is not None:
             self._lp.set_candidate_preparation_wakeup(wakeup)
+            self._lp_d2.set_read_wakeup(wakeup)
         elif self._lp is not None:
             self._lp._facts_wakeup = wakeup
 

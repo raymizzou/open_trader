@@ -814,6 +814,9 @@ class PredictionRuntime:
                 self._prediction_trading,
                 owner_lock=self._owner,
             )
+            # D2 borrows this established owner's GET capability and owns its
+            # async read pools. Scheduler wakeups collect results; close below
+            # retains these clients/store/claim until real read and send drain.
             self.lp_d2=LPD2LiveExecution(self.store,self._prediction_trading,
                 account_id=trading_config.wallet_address,venue='polymarket',
                 process_epoch=self._lp_process_epoch,policy=CalculationPolicy(None),

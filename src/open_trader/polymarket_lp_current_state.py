@@ -264,6 +264,15 @@ class BuyYieldState:
 
 
 @dataclass(frozen=True)
+class ReadFailureProtection:
+    order_key: OrderKey
+    consecutive_failures: int = 0
+    last_attempt: tuple | None = None
+    reason_codes: tuple[str, ...] = ()
+    protection_key: ProtectionKey | None = None
+
+
+@dataclass(frozen=True)
 class CurrentOrderView:
     account_id: str
     process_epoch: str
@@ -306,13 +315,13 @@ class Acceptance:
 
 @dataclass(frozen=True)
 class ProtectionKey:
-    kind: Literal['queue_bucket', 'first_seen_episode']
+    kind: Literal['queue_bucket', 'first_seen_episode', 'read_failure']
     scope: ScopeKey
     price: Decimal
     episode_id: str | None
 
     def __post_init__(self):
-        if self.kind not in ('queue_bucket', 'first_seen_episode') or (self.kind == 'first_seen_episode' and not self.episode_id):
+        if self.kind not in ('queue_bucket', 'first_seen_episode', 'read_failure') or (self.kind == 'first_seen_episode' and not self.episode_id):
             raise ValueError('invalid_protection_key')
 
 
@@ -359,7 +368,7 @@ class CancelTargetState:
 
 @dataclass(frozen=True)
 class ProtectionFailureState:
-    scope_kind: Literal['queue_group', 'first_seen_episode']
+    scope_kind: Literal['queue_group', 'first_seen_episode', 'read_attempt']
     scope_id: ScopeKey | ProtectionKey
     data_failures: int
     last_evaluation_id: str | None
@@ -576,6 +585,8 @@ class CurrentSnapshot:
     resolved_exit_attempts: Mapping[tuple[ScopeKey, str], ExitAttempt] = field(
         default_factory=lambda: MappingProxyType({}))
 
+    read_failures: Mapping = field(default_factory=lambda: MappingProxyType({}))
+
     @property
     def active_orders(self) -> tuple[CurrentOrderFact, ...]:
         return tuple(o for o in self.orders if o.presence == 'present' and o.terminal_proof is None
@@ -631,6 +642,9 @@ class CurrentLPState:
         self._orders: dict[OrderKey, CurrentOrderFact] = {}
         self._positions = ()
         self._yields = {}
+        self._market_attempts = {}
+        self._market_books = {}
+        self._read_failures = {}
         self._receipt_events = set()
         self._uncertain_buy_events = {}
         self._uncertain_buy_requests = {}
@@ -821,6 +835,7 @@ class CurrentLPState:
             yield_sources = tuple(stamp for name, stamp in stamps.items()
                 if name not in ('balance', 'positions', 'candidates'))
             yields = {}
+            invalid_market=set()
             for k, o in orders.items():
                 if o.side != 'BUY' or o.terminal_proof is not None or o.presence == 'absent' or o.remaining.value == 0:
                     continue
@@ -830,7 +845,11 @@ class CurrentLPState:
                     if previous is not None:
                         yields[k] = previous
                     continue
-                value = _fact(_decimal(calculation.yields.get(k[3])) if o.presence == 'present' else None, *yield_sources)
+                owned=self._market_books.get(k)
+                wrong_market=(owned is not None and (owned[0].demand.generation!=ticket.cycle_generation
+                    or owned[0].demand.terms_version!=o.terms_version))
+                if wrong_market:invalid_market.add(k)
+                value = _fact(_decimal(calculation.yields.get(k[3])) if o.presence == 'present' and not wrong_market else None, *yield_sources)
                 since = since_at = None
                 if value.state != 'known':
                     since = previous.unknown_since_monotonic if previous else None
@@ -840,6 +859,15 @@ class CurrentLPState:
                 yields[k] = BuyYieldState(k, value, yield_sources, evaluated_at, ticket.cycle_generation, since, since_at,
                     previous.current_risk_request_id if previous else None)
             self._yields = yields
+            if invalid_market:
+                from .polymarket_lp_market_reader import SourceResult
+                sources=dict(source_frame.sources)
+                for key in invalid_market:
+                    sources['market_order:'+key[3]]=SourceResult('',complete=False,error='market_identity_changed')
+                    self._market_books.pop(key,None)
+                source_frame=replace(source_frame,sources=MappingProxyType(sources))
+                calculation=replace(calculation,yields=MappingProxyType({**calculation.yields,
+                    **{key[3]:None for key in invalid_market}}))
             calculation_orders_valid = (orders_complete and not rejected_order_inputs
                 and self._financial_source_current(os, ticket))
             calculation_positions_valid = positions_complete and self._financial_source_current(ps, ticket)
@@ -865,6 +893,144 @@ class CurrentLPState:
             partial = (not calculation_orders_valid or not calculation_positions_valid or not calculation_balance_valid
                 or any(s.state != 'known' or not s.complete for s in stamps.values()))
             return Acceptance('partial' if partial else 'accepted', observation)
+
+    def _market_order(self, result):
+        from .polymarket_lp_read_runtime import MarketAttempt
+        if not isinstance(result, MarketAttempt):return None, 'invalid_identity'
+        d=result.demand
+        if d.account!=self.account_id or d.process_epoch!=self.process_epoch:return None,'invalid_identity'
+        if d.generation!=self._current.cycle_generation:return None,'stale'
+        key=(self.account_id,d.condition_id,d.token_id,d.order_id)
+        order=self._orders.get(key)
+        if (order is None or order.side!='BUY' or order.presence!='present' or order.terminal_proof is not None
+                or order.terms_version!=d.terms_version or order.remaining.state!='known' or order.remaining.value<=0):
+            return None,'stale'
+        old=self._market_attempts.get(key)
+        if old is not None and old[0]==d.key and result.attempt<=old[1]:return None,'stale'
+        return order,None
+
+    def apply_market_attempt(self, result):
+        """Accept one exact order's market facts, never orders or funding values."""
+        from .polymarket_lp_market_reader import MarketReader, CapturedSources, SourceResult, freeze
+        from .polymarket_lp_async_source import market_value
+        from .polymarket_lp_current_inputs import prepare_current_inputs
+        from .polymarket_lp_market_calculation import calculate_current, CalculationPolicy
+        with self._lock:
+            order,error=self._market_order(result)
+            if error:return error
+            if not result.complete or result.completed>=result.deadline or self._clock()>=result.deadline:
+                return self.invalidate_market_attempt(result)
+            try:
+                value=market_value(order.key[1],result.sources)
+                if value['rewards']['complete'] is not True:raise ValueError('rewards_unknown')
+                source=SourceResult(':'.join(map(str,(*result.demand.key,result.attempt))),value,
+                    checked_at=result.sources['book'].checked_at)
+                row=dict(account_id=self.account_id,condition_id=order.key[1],token_id=order.key[2],
+                    order_id=order.key[3],side=order.side,status=order.venue_status,price=order.price.value,
+                    original_size=order.original_size.value,size_matched=order.size_matched.value,
+                    order_type=order.order_type.value,expiration=order.expiration.value)
+                frame=MarketReader.from_captured_sources(CapturedSources(self.account_id,{
+                    'open_orders':SourceResult(order.source.source_id,(row,),checked_at=order.source.checked_at),
+                    'market:'+order.key[1]+':'+order.key[2]:source}))
+                policy=CalculationPolicy(None)
+                prepared=prepare_current_inputs(frame,None,policy,self._utc_now())
+                calculation=calculate_current(prepared,policy,self._utc_now())
+                rate=calculation.yields[order.key[3]]
+                if rate is None:return self.invalidate_market_attempt(result)
+            except (KeyError,TypeError,ValueError):return self.invalidate_market_attempt(result)
+            stamps=tuple(_stamp(s) for s in result.sources.values())
+            previous=self._yields.get(order.key)
+            self._yields[order.key]=BuyYieldState(order.key,_fact(rate,*stamps),stamps,self._utc_now(),
+                self._current.cycle_generation,current_risk_request_id=previous.current_risk_request_id if previous else None)
+            self._record_read_attempt(order,result,True)
+            self._market_attempts[order.key]=(result.demand.key,result.attempt)
+            self._market_books[order.key]=(result,source)
+            self._publish_market_values(order.key,source,result.sources.get('book'))
+            return 'applied'
+
+    def restore_read_protection(self, order_key, count, reasons):
+        """Restore committed exact-order facts, never an interrupted attempt."""
+        with self._lock:
+            order=self._orders.get(order_key)
+            if order is None or order.side!='BUY' or order_key in self._read_failures:return False
+            if type(count) is not int or count<0 or any(r not in ('read_failure_limit','read_cleanup_fault') for r in reasons):
+                raise ValueError('read_protection_invalid')
+            reasons=tuple(reasons)
+            key=None
+            if reasons:
+                key=ProtectionKey('read_failure',(*order.key[:3],self.process_epoch),order.price.value,order.key[3])
+                version=self._scope_versions.get(key,0)+1
+                self._progress[key]=ProtectionProgress(key,'triggered',Fact('unknown'),Fact('unknown'),Fact('unknown'),
+                    reasons,None,(),version,ProtectionFailureState('read_attempt',key,count,None,version))
+                self._scope_versions[key]=version
+            self._read_failures[order_key]=ReadFailureProtection(order_key,count,None,reasons,key)
+            return True
+
+    def _record_read_attempt(self,order,result,success):
+        previous=self._read_failures.get(order.key) or ReadFailureProtection(order.key)
+        identity=(result.demand.key,result.attempt)
+        if previous.last_attempt!=identity:
+            count=0 if success else previous.consecutive_failures+1
+        else:count=previous.consecutive_failures
+        reasons=previous.reason_codes
+        if count>=11 and 'read_failure_limit' not in reasons:reasons+=('read_failure_limit',)
+        if result.cleanup_fault and 'read_cleanup_fault' not in reasons:reasons+=('read_cleanup_fault',)
+        key=previous.protection_key
+        if reasons and key is None:
+            key=ProtectionKey('read_failure',(*order.key[:3],self.process_epoch),order.price.value,order.key[3])
+            version=self._scope_versions.get(key,0)+1
+            failure=ProtectionFailureState('read_attempt',key,count,str(identity),version)
+            self._progress[key]=ProtectionProgress(key,'triggered',Fact('unknown'),Fact('unknown'),Fact('unknown'),
+                reasons,None,(),version,failure)
+            self._scope_versions[key]=version
+        elif key is not None and reasons!=previous.reason_codes:
+            self._progress[key]=replace(self._progress[key],reason_codes=reasons)
+        self._read_failures[order.key]=ReadFailureProtection(order.key,count,identity,reasons,key)
+
+    def apply_read_cleanup_fault(self,result):
+        with self._lock:
+            d=result.demand
+            key=(d.account,d.condition_id,d.token_id,d.order_id)
+            order=self._orders.get(key)
+            if (not result.cleanup_fault or d.account!=self.account_id or d.process_epoch!=self.process_epoch
+                    or d.generation!=self._current.cycle_generation or order is None
+                    or order.side!='BUY' or order.terms_version!=d.terms_version):return 'stale'
+            self._record_read_attempt(order,result,False)
+            return 'applied'
+
+    def _publish_market_values(self,key,source,book_source=None):
+        self._snapshot_version+=1
+        if self._observation is not None:
+            frame=self._observation.source_frame
+            name='market_order:'+key[3]
+            sources={**frame.sources,name:source,'market:'+key[1]+':'+key[2]:source}
+            if book_source is not None:
+                from .polymarket_lp_market_reader import freeze
+                sources['market_book:'+key[1]+':'+key[2]]=replace(book_source,
+                    value=freeze(dict(book=book_source.value)) if book_source.value is not None else None)
+            frame=replace(frame,sources=MappingProxyType(sources))
+            calculation=replace(self._observation.calculation,yields=MappingProxyType({
+                k[3]:y.yield_pct_per_hour.value for k,y in self._yields.items()}))
+            self._observation=replace(self._observation,source_frame=frame,calculation=calculation,
+                yields=MappingProxyType(self._yields.copy()),snapshot_version=self._snapshot_version)
+
+    def invalidate_market_attempt(self, expiry):
+        """A matching expiry can only lower confidence; it has no financial power."""
+        from .polymarket_lp_market_reader import SourceResult
+        with self._lock:
+            order,error=self._market_order(expiry)
+            if error:return error
+            previous=self._yields.get(order.key)
+            since=previous.unknown_since_monotonic if previous else None
+            since_at=previous.unknown_since_at if previous else None
+            if since is None:since,since_at=self._clock(),self._utc_now()
+            self._yields[order.key]=BuyYieldState(order.key,Fact('unknown'),(),self._utc_now(),
+                self._current.cycle_generation,since,since_at,previous.current_risk_request_id if previous else None)
+            self._record_read_attempt(order,expiry,False)
+            self._market_attempts[order.key]=(expiry.demand.key,expiry.attempt)
+            self._market_books.pop(order.key,None)
+            self._publish_market_values(order.key,SourceResult('',complete=False,error=expiry.reason or 'market_incomplete'),expiry.sources.get('book'))
+            return 'applied'
 
     def _financial_source_current(self, source: SourceStamp, ticket: ReadTicket) -> bool:
         floor = self._financial_uncertainty_at
@@ -1434,6 +1600,18 @@ class CurrentLPState:
 
     def snapshot(self) -> CurrentSnapshot:
         with self._lock:
+            # Freshness only lowers confidence. It is not another network attempt
+            # and cannot change financial watermarks or create funding authority.
+            for key,(result,source) in tuple(self._market_books.items()):
+                previous=self._yields.get(key)
+                checked=source.value['book'].get('received_at') or source.checked_at
+                if checked is None or (self._utc_now()-checked).total_seconds()>10:
+                    self._market_books.pop(key,None)
+                    if previous is not None and previous.yield_pct_per_hour.state=='known':
+                        self._yields[key]=replace(previous,yield_pct_per_hour=Fact('unknown'),
+                            unknown_since_monotonic=self._clock(),unknown_since_at=self._utc_now())
+                        from .polymarket_lp_market_reader import SourceResult
+                        self._publish_market_values(key,SourceResult('',complete=False,error='book_expired'))
             exposure = (_fact(self._reserved.value + self._inventory.value,
                 *self._reserved.sources, *self._inventory.sources)
                 if self._reserved.state == self._inventory.state == 'known' else Fact('unknown'))
@@ -1445,4 +1623,4 @@ class CurrentLPState:
                 MappingProxyType(self._baselines.copy()), MappingProxyType(self._progress.copy()),
                 MappingProxyType(self._failures.copy()), MappingProxyType(self._openings.copy()),
                 MappingProxyType(self._sells.copy()), MappingProxyType(self._scope_versions.copy()),
-                MappingProxyType(self._resolved_exit_attempts.copy()))
+                MappingProxyType(self._resolved_exit_attempts.copy()), MappingProxyType(self._read_failures.copy()))
