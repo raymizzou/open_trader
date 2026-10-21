@@ -781,12 +781,17 @@ class _D2MutationLease:
             return
         self.released = True
         execution = self.execution
+        manual_released = False
         with execution._lp_d2_lease_lock:
             execution._lp_d2_lease_users -= 1
             if execution._lp_d2_lease_users == 0:
                 lock, execution._lp_d2_lease = execution._lp_d2_lease, None
+                manual_released = (self.action == 'MANUAL_BUY'
+                    and execution._lp_d2_manual_lease and lock is not None)
                 execution._lp_d2_manual_lease = False
                 execution._release_global_lock(lock)
+        if manual_released:
+            execution._lp_d2.notify_manual_lease_released()
 
 
 class PredictionExecutionService:

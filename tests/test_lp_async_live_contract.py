@@ -1589,3 +1589,167 @@ def test_manual_entry_capacity_completion_notifies_owner_without_status_wakes(tm
         sdk_release.set();sql_release.set()
         if caller:caller.join(4)
         assert live.close(4);live.trading.close()
+
+
+import pytest
+
+
+@pytest.mark.parametrize('variant',['rejected_post_sql_tail','missing_preview_sql_read'])
+def test_scheduler_wakes_read_fault_cancel_after_manual_lease_release(tmp_path,monkeypatch,variant):
+    import sqlite3,fcntl
+    from datetime import timedelta
+    from polymarket.models.clob.order_response import RejectedOrder
+    from tests.test_lp_d2_manual_bridge import manual_runtime,entry,OTHER_CID,OTHER_TOKEN
+    from tests.test_lp_order_registration_contract import _open_order,WALLET
+    from tests.test_lp_d2_execution_bridge import attach
+    from open_trader.polymarket_lp_scheduler import LPAutoScheduler
+    business=Clock()
+    original,old,sdk,public,utc=manual_runtime(tmp_path,monkeypatch,monotonic_clock=business)
+    assert old.close(4)
+    base=utc[0];business.utc=lambda:utc[0]
+    boundary=Boundary(business);boundary.book_depth=1000
+    boundary.orders=[dict(wire_row('C','3'),market=OTHER_CID,asset_id=OTHER_TOKEN,maker_address=WALLET)]
+    sdk.orders=(_open_order('C','BUY',price='.40',original='20',matched='3').model_copy(
+        update={'condition_id':OTHER_CID,'token_id':OTHER_TOKEN}),)
+    posted=threading.Event();post_release=threading.Event();native_returned=threading.Event()
+    sql_entered=threading.Event();sql_release=threading.Event();early_notice=threading.Event()
+    gate=False;caller=None;responses=[];errors=[];denied=[];command_threads=[];notices=[];cancelled=[];cancel_threads=[]
+    class ObservedLive(LPD2LiveExecution):
+        def bind_mutation_admission(self,owner,acquire):
+            def observe(action):
+                nonlocal gate
+                actual=acquire(action)  # unchanged real service permission/exclusive lease
+                if action=='CANCEL' and actual is None and gate:
+                    gate=False
+                    assert sql_entered.is_set() and not sql_release.is_set() and caller.is_alive()
+                    assert self.status()['native_inflight']==0 and not cancelled
+                    assert not any(t.order_key[3]=='C' for p in self.state.snapshot().progress.values() for t in p.cancel_targets)
+                    denied.append(business())
+                    sql_release.set();caller.join(4);assert not caller.is_alive(),'public command return watchdog'
+                    for thread in command_threads:thread.join(4);assert not thread.is_alive()
+                    assert errors==[]
+                return actual  # preserve the actual refusal for this protection pass
+            return super().bind_mutation_admission(owner,observe)
+    runtime=LPReadRuntime(boundary.factory,clock=business,utc_now=business.utc)
+    live=ObservedLive(old.store,old.trading,account_id=WALLET,venue='polymarket',process_epoch='p16-'+variant,
+        policy=CalculationPolicy(None),read_runtime=runtime,clock=business,utc_now=business.utc)
+    live.initialize(ValidatedStartAdmission('p16-'+variant,'offline-permit'))
+    execution=attach(live,original._lp,tmp_path);scheduler=LPAutoScheduler(execution,clock=business.utc)
+    execution.set_lp_auto_scheduler(scheduler)
+    def notice():
+        scheduler.request_check();notices.append(runtime.status())
+        if native_returned.is_set() and sql_entered.is_set() and not sql_release.is_set():early_notice.set()
+    execution.set_lp_auto_wakeup(notice)
+    real_connect=sqlite3.connect
+    class HeldSQL(sqlite3.Connection):
+        def execute(self,sql,*args,**kwargs):
+            manual=threading.current_thread().name=='lp-d2-manual-command'
+            tail=variant=='rejected_post_sql_tail' and sql=='COMMIT' and native_returned.is_set()
+            preview=variant=='missing_preview_sql_read' and sql=='SELECT * FROM previews WHERE preview_id=?'
+            if manual and (tail or preview):
+                if threading.current_thread() not in command_threads:command_threads.append(threading.current_thread())
+                sql_entered.set();assert sql_release.wait(6),'actual manual SQL release watchdog'
+            return super().execute(sql,*args,**kwargs)
+    def post(signed):
+        assert variant=='rejected_post_sql_tail'
+        assert signed['price']==Decimal('.29') and signed['size']==20 and signed['order_type']=='GTD'
+        assert signed['post_only'] is True and signed['expiration'] is not None
+        command_threads.append(threading.current_thread());posted.set()
+        assert post_release.wait(6),'actual manual post return watchdog'
+        sdk.posts.append(signed);native_returned.set()
+        return RejectedOrder(ok=False,code='post_only_would_cross',message='offline venue rejection')
+    sdk.post_order=post
+    def cancel(*,order_ids):
+        assert order_ids==('C',)
+        cancelled.append(order_ids);cancel_threads.append(threading.current_thread())
+        raise TimeoutError('offline UNKNOWN cancel')
+    sdk.cancel_orders=cancel
+    def submit():
+        try:
+            responses.append(execution.lp_submit_entry(entry(utc)) if variant=='rejected_post_sql_tail'
+                else execution.lp_start('missing-preview','p16-missing-preview'))
+        except BaseException as exc:errors.append(exc)
+    def drive_until(predicate):
+        end=time.monotonic()+4
+        while not predicate():
+            scheduler.run_due()
+            left=end-time.monotonic();assert left>0,(runtime.status(),scheduler.snapshot(),errors,responses)
+            with boundary.changed:boundary.changed.wait(min(.005,left))
+    def at(stamp):
+        business.value=stamp;utc[0]=base+timedelta(seconds=stamp);runtime.wake()
+    def collect_at(stamp,faults,dependency):
+        at(stamp)
+        boundary.wait(lambda:any(n['observed_monotonic']==stamp and n['ready_count']==2 for n in notices))
+        assert scheduler.run_due()
+        boundary.wait(lambda:any(n['observed_monotonic']==stamp and n['ready_count']==0
+            and n['cleanup_faults']==faults and n['next_dependency_monotonic']==dependency for n in notices))
+        scheduler.run_due()  # consume actual read/ACK notices while exclusive lease remains held
+    try:
+        assert scheduler.run_due()
+        drive_until(lambda:len(live.state.snapshot().read_failures)==1 and runtime.status()['ready_count']==0)
+        with monkeypatch.context() as patch:
+            patch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=HeldSQL))))
+            caller=threading.Thread(target=submit,name='public-manual-'+variant);caller.start()
+            assert (posted if variant=='rejected_post_sql_tail' else sql_entered).wait(4),(errors,responses)
+            assert caller.is_alive() and live.status()['native_inflight']==(1 if variant=='rejected_post_sql_tail' else 0)
+            with (tmp_path/'execution.lock').open('a+') as foreign:
+                with pytest.raises(BlockingIOError):fcntl.flock(foreign.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+            boundary.holds={('O','balance'),('C','book')}
+            for key in boundary.holds:boundary.mode[key]='swallow'
+            at(5);drive_until(lambda:all(('entered',oid,source,5) in boundary.events for oid,source in boundary.holds))
+            collect_at(10,0,11);collect_at(11,2,None)
+            assert cancelled==[]
+            if variant=='rejected_post_sql_tail':
+                post_release.set();assert sql_entered.wait(4),(errors,responses)
+                assert live.status()['native_inflight']==0 and caller.is_alive()
+                # P14's early notice remains required; it can precede the SQL
+                # barrier, so observe its actual owner eligibility rather than count callbacks.
+                assert scheduler.snapshot()['next_check_at'] is not None
+            state=runtime.status();snapshot=live.state.snapshot()
+            assert len(state['scopes'])==2 and all(s['active'] and s['cleanup_fault'] for s in state['scopes'])
+            assert state['ready_count']==0 and state['next_dependency_monotonic'] is None and state['waiting_for_event']
+            assert state['pool_count']==4 and not state['new_buy_allowed'] and not snapshot.openings
+            assert snapshot.new_capacity.state=='unknown'
+            assert snapshot.read_failures[(WALLET,OTHER_CID,OTHER_TOKEN,'C')].reason_codes==('read_cleanup_fault',)
+            before=list(boundary.events)
+            gate=True;assert scheduler.run_due()  # actual CANCEL refusal releases real external SQL and lease
+            assert not gate and denied==[11] and not caller.is_alive() and errors==[]
+            assert all(not thread.is_alive() for thread in command_threads)
+            assert live.status()['native_inflight']==0 and cancelled==[] and business()==11
+            assert not any(p.cancel_targets for p in live.state.snapshot().progress.values())
+            if variant=='rejected_post_sql_tail':
+                result,=responses
+                assert result['state']=='rejected' and result['reason']=='entry_submit_rejected' and result['submit_status']=='rejected'
+                assert len(sdk.posts)==1
+            else:
+                assert responses==[dict(state='rejected',reason='preview_not_found')]
+                assert sdk.posts==[] and not posted.is_set() and not native_returned.is_set()
+                assert live.store.lp_manual_command(WALLET,'p16-missing-preview') is None
+            with (tmp_path/'execution.lock').open('a+') as foreign:
+                fcntl.flock(foreign.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+                fcntl.flock(foreign.fileno(),fcntl.LOCK_UN)
+            state=runtime.status()
+            assert len(state['scopes'])==2 and state['ready_count']==0 and state['next_dependency_monotonic'] is None
+            assert not any(s['key'][3]=='exact' for s in state['scopes']) and boundary.events==before
+            assert scheduler.run_due(),'actual manual lease release must wake C without a command/time/read rescue'
+            boundary.wait(lambda:cancelled==[('C',)])
+            for thread in cancel_threads:thread.join(4);assert not thread.is_alive()
+            assert scheduler.run_due()  # consume C's actual native completion
+            drive_until(lambda:scheduler.snapshot()['next_check_at'] is None)
+            snapshot=live.state.snapshot();state=runtime.status()
+            order,=snapshot.active_orders
+            assert order.key==(WALLET,OTHER_CID,OTHER_TOKEN,'C')
+            assert (order.original_size.value,order.size_matched.value,order.remaining.value)==(20,3,17)
+            target,=[t for p in snapshot.progress.values() for t in p.cancel_targets]
+            assert target.order_key==order.key and target.request_id and target.local_outcome=='unknown_error'
+            assert snapshot.new_capacity.state=='unknown' and not state['new_buy_allowed'] and not snapshot.openings
+            assert state['cleanup_faults']==2 and state['pool_count']==4 and len(state['scopes'])==2
+            assert state['ready_count']==0 and state['next_dependency_monotonic'] is None
+            assert boundary.events==before and business()==11 and cancelled==[('C',)]
+            assert all(not scheduler.run_due() for _ in range(100))
+            assert execution.lp_submit_entry(dict(idempotency_key=''))['state']=='rejected'
+            assert all(not scheduler.run_due() for _ in range(10)) and cancelled==[('C',)]
+    finally:
+        gate=False;post_release.set();sql_release.set();boundary.release.set()
+        if caller:caller.join(4)
+        scheduler.stop();assert live.close(4);live.trading.close()

@@ -97,6 +97,12 @@ cap2 仍按真实线程/资源生命周期计数；通知消费后不因已归�
 同步 owner `_attempt` 仍由同轮保护检查接续，不额外发通知；未获 reservation 不制造完成。
 `manual_call` 不统一发送通知，因为 `lp_status` 也使用该 wrapper；纯状态查询不驱动 Scheduler 或读取。
 
+早期 native reservation 释放不等于独占 MANUAL_BUY mutation lease 已解除；可靠 SQL 仍可阻止保护准入。
+service 仅在实际持有的独占手动 lease 释放并完成全局/文件锁及 lease 协调锁清理后，
+通过窄 live 通知接口再次发布既有有界完成通知，留给后续真实保护检查消费。
+该通知与命令结果无关，覆盖拒单 SQL 尾部和没有 native reservation 的实际 preview 查询持有期；
+不通知重复 release、未获 lease、非手动 lease 或纯状态查询。早期通知、SQL 所有权、权限及不重放规则不变。
+
 ## 验证边界
 
 20 个公开 async/source/state/live 合同覆盖真实 HTTPX loopback 断连、受控取消/退出、独立期限监督、

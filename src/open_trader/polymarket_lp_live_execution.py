@@ -3394,6 +3394,10 @@ class LPD2LiveExecution:
                     self._protection_guard(snapshot,scope,orders,observation=True),review))
                 snapshot = self.state.snapshot()
 
+    def notify_manual_lease_released(self):
+        """Notify after the service releases actual exclusive manual ownership."""
+        self._publish_native_completion()
+
     def _publish_native_completion(self):
         with self.state._lock:
             self._native_completion_generation += 1

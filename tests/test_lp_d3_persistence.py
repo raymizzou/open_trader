@@ -466,6 +466,9 @@ def test_d2_routes_never_construct_or_call_legacy_mutations(tmp_path, monkeypatc
         def bind_mutation_admission(self, *args):
             pass
 
+        def notify_manual_lease_released(self):
+            pass  # routing-only protocol stub; no runtime notification machinery
+
         def manual_call(self, operation):
             manual_calls.append(operation)
             return operation()
