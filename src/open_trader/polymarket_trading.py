@@ -4589,6 +4589,7 @@ class PolymarketTradingClient:
             unknown_asset = False
             native_total: Decimal | None = Decimal("0")
             combined_total: Decimal | None = Decimal("0")
+            diagnostic_native_usd_lower_bound = Decimal("0")
 
             for sponsored in (False, True):
                 def problem(code: str) -> None:
@@ -4684,6 +4685,16 @@ class PolymarketTradingClient:
                             else:
                                 native_total = None
                             continue
+                        if not sponsored:
+                            # Nonnegative, active, identity/asset-validated USD
+                            # contributions remain a proven diagnostic lower
+                            # bound even if another config makes totals unknown.
+                            try:
+                                diagnostic_native_usd_lower_bound += rate
+                            except ArithmeticError:
+                                # Diagnostic arithmetic cannot change a public
+                                # result; either contribution is still a bound.
+                                diagnostic_native_usd_lower_bound = max(diagnostic_native_usd_lower_bound, rate)
                         if sponsored:
                             if combined_total is not None:
                                 combined_total += rate
@@ -4700,8 +4711,11 @@ class PolymarketTradingClient:
                     source_reasons[False].append("reward_total_unknown")
                 if combined_total is None:
                     source_reasons[True].append("reward_total_unknown")
-                if native_total is not None and combined_total is not None and combined_total < native_total:
-                    source_reasons[True].append("reward_totals_inconsistent")
+            if (not source_reasons[True]
+                    and results[(condition_id, True)][1] is None
+                    and combined_total is not None
+                    and combined_total < diagnostic_native_usd_lower_bound):
+                source_reasons[True].append("reward_totals_inconsistent")
             for source in (False, True):
                 if results[(condition_id, source)][1] is not None:
                     continue  # Transport failure was already observed at read time.

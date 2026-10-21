@@ -716,3 +716,104 @@ def test_component_repeats_obey_log_aggregation_window(runtime, monkeypatch, cap
     assert account.balance_reads == account.position_reads == 1
     assert execution.lp_auto_state()['funds']['status'] == 'known'
     assert account.posts == account.cancels == []
+
+
+def test_mixed_reward_errors_preserve_known_total_consistency(caplog):
+    caplog.set_level(logging.INFO)
+    condition = 'condition-mixed-reward-301'
+    for scenario, reasons in (
+        ('config', ['reward_config_unknown']),
+        ('identity', ['reward_config_unknown', 'reward_identity_unknown']),
+        ('asset', ['reward_config_unknown', 'reward_asset_unknown']),
+    ):
+        caplog.clear()
+        mode = ['timeout']
+        reads, closes = [], []
+        def config(amount, *, id=301, asset='0x2791bca1f2de4661ed88a30c99a7a9449aa84174'):
+            return {'id': id, 'asset_address': asset, 'start_date': '2020-01-01',
+                    'end_date': '2500-12-31', 'rate_per_day': amount}
+        def row(configs):
+            return {'condition_id': condition, 'rewards_config': configs}
+        class Public:
+            def list_market_rewards(self, *, condition_id, sponsored):
+                assert condition_id == condition
+                reads.append((mode[0], sponsored))
+                if mode[0] == 'timeout':
+                    raise httpx.ReadTimeout(SECRET)
+                if mode[0] == 'empty':
+                    return ()
+                if sponsored:
+                    return (row([config('1' if mode[0] == 'inconsistent' else '4')]),)
+                if mode[0] == 'valid':
+                    return (row([config('3')]),)
+                configs = [config('3'), {'rate_per_day': SECRET}]
+                if scenario == 'asset':
+                    # Unknown business total must not erase the independently
+                    # valid USD3 contribution, including a later contribution.
+                    configs = [configs[1], config('9', id=302, asset='0x' + 'a' * 40), configs[0]]
+                rows = [row(configs)]
+                if scenario == 'identity':
+                    rows.append({'condition_id': SECRET, 'rewards_config': []})
+                return tuple(rows)
+            def close(self):
+                closes.append(True)
+        client = FakeClient()
+        adapter = PolymarketTradingClient(TradingConfig(SECRET, SECRET), client,
+                                          public_client_factory=Public)
+        try:
+            first = adapter.lp_reward_catalog(condition_ids=(condition,))
+            assert first['state'] == 'unknown' and first['complete'] is False
+            assert first['daily_pool_usd'] is None
+            assert first['markets'][0]['reason_codes'] == ['reward_read_failed']
+            initial = diagnostic_events(caplog, event='failed')
+            assert {r['stage'] for r in initial} == {'reward_native', 'reward_sponsored'}
+            assert len(initial) == 2
+            mode[0] = 'inconsistent'
+            mixed = adapter.lp_reward_catalog(condition_ids=(condition,))
+            assert mixed['state'] == 'unknown' and mixed['complete'] is False
+            assert mixed['daily_pool_usd'] is None
+            assert mixed['markets'][0]['reason_codes'] == reasons
+            assert mixed['markets'][0]['native_daily_pool_usd'] == 0
+            assert not diagnostic_events(caplog, event='recovered'), scenario
+            native, = diagnostic_events(caplog, event='failed', stage='reward_native',
+                                        cause_code='reward_config_unknown')
+            sponsored, = diagnostic_events(caplog, event='failed', stage='reward_sponsored',
+                                           cause_code='reward_totals_inconsistent')
+            for failure in (native, sponsored):
+                original, = [r for r in initial if r['stage'] == failure['stage']]
+                assert failure['scope_id'] == original['scope_id']
+                assert failure['episode_id'] == original['episode_id']
+                assert failure['attempt_id'] != original['attempt_id']
+            # USD4 is consistent with the proven lower bound3. The native
+            # source is still invalid; do not invent its complete total.
+            mode[0] = 'consistent'
+            partial = adapter.lp_reward_catalog(condition_ids=(condition,))
+            assert partial['state'] == 'unknown' and partial['complete'] is False
+            assert partial['daily_pool_usd'] is None
+            assert partial['markets'][0]['reason_codes'] == reasons
+            recovered, = diagnostic_events(caplog, event='recovered')
+            assert recovered['scope_id'] == sponsored['scope_id']
+            assert recovered['episode_id'] == sponsored['episode_id']
+            assert recovered['stage'] == 'reward_sponsored' and recovered['failure_count'] == 2
+            assert recovered['latest_cause_code'] == 'reward_totals_inconsistent'
+            mode[0] = 'valid'
+            valid = adapter.lp_reward_catalog(condition_ids=(condition,))
+            assert valid['state'] == 'known' and valid['complete'] is True
+            assert valid['daily_pool_usd'] == 4 and valid['markets'][0]['reason_codes'] == []
+            native_recovery, = diagnostic_events(caplog, event='recovered', stage='reward_native')
+            assert native_recovery['scope_id'] == native['scope_id']
+            assert native_recovery['episode_id'] == native['episode_id']
+            assert native_recovery['failure_count'] == 3
+            assert native_recovery['first_cause_code'] == 'reward_read_failed'
+            assert native_recovery['latest_cause_code'] == 'reward_config_unknown'
+            mode[0] = 'empty'
+            empty = adapter.lp_reward_catalog(condition_ids=(condition,))
+            assert empty['state'] == 'known' and empty['complete'] is True
+            assert empty['daily_pool_usd'] == 0 and empty['markets'][0]['reward_active'] is False
+            assert len(diagnostic_events(caplog, event='recovered')) == 2
+            assert len(reads) == len(closes) == 10
+            assert {source: sum(sponsored == source for _, sponsored in reads)
+                    for source in (False, True)} == {False: 5, True: 5}
+            assert client.create_calls == client.post_calls == client.cancel_calls == []
+        finally:
+            adapter.close()

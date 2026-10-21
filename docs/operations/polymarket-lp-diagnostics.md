@@ -13,6 +13,11 @@ has no new display for these events.
   Recovery requires validated identity, configuration, asset and reward totals,
   not just a returned SDK call. Valid empty data can recover. Invalid combined
   totals keep the sponsored source failed while a valid native source can recover.
+  Validated active native USD contributions remain a diagnostic lower bound even
+  when other configs, rows or assets make native facts incomplete. A fully valid
+  combined total below that bound cannot recover; a consistent combined source
+  can recover independently. This does not make a partial native total complete
+  or change the public catalog's existing reason ordering or unknown totals.
 - `account_full` tracks full account reads and publication. `account_planning`
   tracks automatic planning. A planning success does not clear a full sync error.
   Reusing an older valid planning source does not recover the failed current read.
