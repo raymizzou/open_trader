@@ -4589,7 +4589,9 @@ class PolymarketTradingClient:
             unknown_asset = False
             native_total: Decimal | None = Decimal("0")
             combined_total: Decimal | None = Decimal("0")
-            diagnostic_native_usd_lower_bound = Decimal("0")
+            diagnostic_native_contributions: list[tuple[str | None, Decimal]] = []
+            diagnostic_native_conflicting_ids: set[str] = set()
+            diagnostic_native_row_ambiguous = False
 
             for sponsored in (False, True):
                 def problem(code: str) -> None:
@@ -4621,6 +4623,8 @@ class PolymarketTradingClient:
                     if previous_fingerprint is not None:
                         if previous_fingerprint == fingerprint:
                             continue
+                        if not sponsored:
+                            diagnostic_native_row_ambiguous = True
                         problem("reward_identity_unknown")
                         continue
                     row_fingerprints[sponsored] = fingerprint
@@ -4663,6 +4667,8 @@ class PolymarketTradingClient:
                             if previous_signature is not None:
                                 if previous_signature == signature:
                                     continue
+                                if not sponsored:
+                                    diagnostic_native_conflicting_ids.add(config_key)
                                 problem("reward_identity_unknown")
                                 continue
                             config_signatures[sponsored][config_key] = signature
@@ -4686,21 +4692,26 @@ class PolymarketTradingClient:
                                 native_total = None
                             continue
                         if not sponsored:
-                            # Nonnegative, active, identity/asset-validated USD
-                            # contributions remain a proven diagnostic lower
-                            # bound even if another config makes totals unknown.
-                            try:
-                                diagnostic_native_usd_lower_bound += rate
-                            except ArithmeticError:
-                                # Diagnostic arithmetic cannot change a public
-                                # result; either contribution is still a bound.
-                                diagnostic_native_usd_lower_bound = max(diagnostic_native_usd_lower_bound, rate)
+                            # Keep candidates until all identities are observed:
+                            # a later conflict invalidates earlier contributions.
+                            diagnostic_native_contributions.append((config_id, rate))
                         if sponsored:
                             if combined_total is not None:
                                 combined_total += rate
                         elif native_total is not None:
                             native_total += rate
 
+            diagnostic_native_usd_lower_bound = Decimal("0")
+            if not diagnostic_native_row_ambiguous:
+                for config_id, rate in diagnostic_native_contributions:
+                    if config_id in diagnostic_native_conflicting_ids:
+                        continue
+                    try:
+                        diagnostic_native_usd_lower_bound += rate
+                    except ArithmeticError:
+                        # Diagnostic arithmetic cannot change a public result;
+                        # either unambiguous contribution remains a lower bound.
+                        diagnostic_native_usd_lower_bound = max(diagnostic_native_usd_lower_bound, rate)
             if unknown_asset:
                 reason_codes.append("reward_asset_unknown")
             # Only validated facts can close a source's read-failure episode.

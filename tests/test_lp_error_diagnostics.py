@@ -817,3 +817,125 @@ def test_mixed_reward_errors_preserve_known_total_consistency(caplog):
             assert client.create_calls == client.post_calls == client.cancel_calls == []
         finally:
             adapter.close()
+
+
+def test_conflicting_reward_identities_cannot_drive_order_dependent_recovery(caplog):
+    caplog.set_level(logging.INFO)
+    condition = 'condition-identity-evidence-301'
+    # Fresh owners cover both starting permutations; each owner also sees its
+    # ordering reversed while the same real read-failure episodes are pending.
+    for kind, first in (('config', '3'), ('config', '1'),
+                        ('independent', '3'), ('independent', '1'),
+                        ('identical', '3'), ('row', '3'), ('row', '1')):
+        caplog.clear()
+        phase = ['timeout']
+        reads, closes = [], []
+        def config(amount, id=301):
+            return {'id': id, 'asset_address': '0x2791bca1f2de4661ed88a30c99a7a9449aa84174',
+                    'start_date': '2020-01-01', 'end_date': '2500-12-31',
+                    'rate_per_day': amount, 'description': SECRET}
+        def row(configs):
+            return {'condition_id': condition, 'rewards_config': configs}
+        class Public:
+            def list_market_rewards(self, *, condition_id, sponsored):
+                assert condition_id == condition
+                reads.append((phase[0], sponsored))
+                if phase[0] == 'timeout':
+                    raise httpx.ReadTimeout(SECRET)
+                if phase[0] == 'empty':
+                    return ()
+                if sponsored or phase[0] == 'valid':
+                    return (row([config('1')]),)
+                amount = first if phase[0] == 'forward' else '1' if first == '3' else '3'
+                other = '1' if amount == '3' else '3'
+                if kind == 'row':
+                    return (row([config(amount)]), row([config(other, 302)]))
+                if kind == 'identical':
+                    return (row([config('3'), config('3')]),)
+                if kind == 'independent':
+                    # Repeating the first signature after a conflict cannot
+                    # re-admit that ID; ID302's independent USD3 must survive.
+                    return (row([config(amount), config('3', 302), config(other), config(amount)]),)
+                return (row([config(amount), config(other)]),)
+            def close(self):
+                closes.append(True)
+        client = FakeClient()
+        adapter = PolymarketTradingClient(TradingConfig(SECRET, SECRET), client,
+                                          public_client_factory=Public)
+        try:
+            failed = adapter.lp_reward_catalog(condition_ids=(condition,))
+            assert failed['state'] == 'unknown' and failed['complete'] is False
+            assert failed['daily_pool_usd'] is None
+            assert failed['markets'][0]['reason_codes'] == ['reward_read_failed']
+            initial = diagnostic_events(caplog, event='failed')
+            assert len(initial) == 2
+            scopes = {r['stage']: r for r in initial}
+            inconsistent = kind in ('independent', 'identical')
+            for observation in ('forward', 'reverse'):
+                phase[0] = observation
+                result = adapter.lp_reward_catalog(condition_ids=(condition,))
+                assert result['state'] == 'unknown' and result['complete'] is False
+                assert result['daily_pool_usd'] is None
+                market = result['markets'][0]
+                assert market['reason_codes'] == (['reward_totals_inconsistent'] if kind == 'identical'
+                                                  else ['reward_identity_unknown'])
+                amount = first if observation == 'forward' else '1' if first == '3' else '3'
+                expected_configs = [Decimal('3')] if kind == 'identical' else [Decimal(amount)]
+                if kind == 'independent':
+                    expected_configs.append(Decimal('3'))
+                # Preserve the original public first-row/config facts even
+                # though ambiguous identities cannot prove diagnostic bounds.
+                assert [r['rate_per_day'] for r in market['native_reward_configs']] == expected_configs
+                assert market['native_daily_pool_usd'] == 0
+                sponsored_recoveries = diagnostic_events(caplog, event='recovered', stage='reward_sponsored')
+                if inconsistent:
+                    assert not sponsored_recoveries
+                    bad, = diagnostic_events(caplog, event='failed', stage='reward_sponsored',
+                                              cause_code='reward_totals_inconsistent')
+                    assert bad['episode_id'] == scopes['reward_sponsored']['episode_id']
+                else:
+                    recovered, = sponsored_recoveries
+                    assert recovered['episode_id'] == scopes['reward_sponsored']['episode_id']
+                    assert recovered['scope_id'] == scopes['reward_sponsored']['scope_id']
+                    assert recovered['failure_count'] == 1
+                    assert recovered['latest_cause_code'] == 'reward_read_failed'
+                    assert not diagnostic_events(caplog, cause_code='reward_totals_inconsistent')
+                if kind != 'identical':
+                    assert not diagnostic_events(caplog, event='recovered', stage='reward_native')
+                    invalid, = diagnostic_events(caplog, event='failed', stage='reward_native',
+                                                  cause_code='reward_identity_unknown')
+                    assert invalid['episode_id'] == scopes['reward_native']['episode_id']
+                else:
+                    native, = diagnostic_events(caplog, event='recovered', stage='reward_native')
+                    assert native['failure_count'] == 1
+            phase[0] = 'valid'
+            valid = adapter.lp_reward_catalog(condition_ids=(condition,))
+            assert valid['state'] == 'known' and valid['complete'] is True
+            assert valid['daily_pool_usd'] == 1
+            assert valid['markets'][0]['reason_codes'] == []
+            recovered = diagnostic_events(caplog, event='recovered')
+            assert len(recovered) == 2
+            for event in recovered:
+                assert event['scope_id'] == scopes[event['stage']]['scope_id']
+                assert event['episode_id'] == scopes[event['stage']]['episode_id']
+                assert event['attempt_id'] != scopes[event['stage']]['attempt_id']
+            native, = [r for r in recovered if r['stage'] == 'reward_native']
+            sponsored, = [r for r in recovered if r['stage'] == 'reward_sponsored']
+            assert native['failure_count'] == (1 if kind == 'identical' else 3)
+            assert native['latest_cause_code'] == ('reward_read_failed' if kind == 'identical'
+                                                    else 'reward_identity_unknown')
+            assert sponsored['failure_count'] == (3 if inconsistent else 1)
+            assert sponsored['latest_cause_code'] == ('reward_totals_inconsistent' if inconsistent
+                                                       else 'reward_read_failed')
+            phase[0] = 'empty'
+            empty = adapter.lp_reward_catalog(condition_ids=(condition,))
+            assert empty['state'] == 'known' and empty['complete'] is True
+            assert empty['daily_pool_usd'] == 0 and empty['markets'][0]['reward_active'] is False
+            assert len(diagnostic_events(caplog, event='recovered')) == 2
+            assert condition not in caplog.text
+            assert len(reads) == len(closes) == 10
+            assert {source: sum(sponsored == source for _, sponsored in reads)
+                    for source in (False, True)} == {False: 5, True: 5}
+            assert client.create_calls == client.post_calls == client.cancel_calls == []
+        finally:
+            adapter.close()

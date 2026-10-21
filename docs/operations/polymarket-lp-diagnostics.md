@@ -14,7 +14,12 @@ has no new display for these events.
   not just a returned SDK call. Valid empty data can recover. Invalid combined
   totals keep the sponsored source failed while a valid native source can recover.
   Validated active native USD contributions remain a diagnostic lower bound even
-  when other configs, rows or assets make native facts incomplete. A fully valid
+  when unrelated configs, foreign-condition rows or assets make native facts incomplete.
+  After the whole observation, contributions from any conflicting config ID are
+  excluded; conflicting rows for the requested condition invalidate that row's
+  evidence. Repeating an earlier signature cannot restore a conflicting ID.
+  Identical duplicates count once, and unrelated unambiguous configs remain valid.
+  A fully valid
   combined total below that bound cannot recover; a consistent combined source
   can recover independently. This does not make a partial native total complete
   or change the public catalog's existing reason ordering or unknown totals.
