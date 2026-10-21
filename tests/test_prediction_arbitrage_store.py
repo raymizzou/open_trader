@@ -2396,7 +2396,7 @@ def test_llm_usage_prune_keeps_recent_calls_only(
     assert len(rows) == 1
     assert rows[0]["kind"] == "call"
     assert rows[0]["usage_id"] != "old-call"
-    # Startup also prunes, and the memory counter starts fresh on a new instance.
+    # Explicit pruning persists; the memory counter starts fresh on reopen.
     db2 = store(tmp_path)
     assert db2.llm_usage_24h()["calls"] == 1
     assert db2.llm_usage_24h()["cache_hits"] == 0

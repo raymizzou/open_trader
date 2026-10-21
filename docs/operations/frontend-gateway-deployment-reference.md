@@ -329,8 +329,9 @@ Legacy 使用 `RELEASE_SERVICES=legacy` 和 `--mode legacy`；`gateway legacy` �
 clean immutable `<SHA>/<新发布>`，未选中的服务可以继续运行旧 release。
 
 Smoke 只检查选定服务的 health、PID/listener、代码 root 和日志，同时保留所有 scope 的
-浏览器只读写入护栏；选中 Prediction 且 `N_LEG_PAUSED=0` 时检查 N_LEG 状态契约，暂停模式
-检查暂停 health 和可读的 LP dashboard 并跳过 state 请求。运维应确认未选中服务的
+浏览器只读写入护栏；选中 Prediction 时，省略 `N_LEG_PAUSED`、0 和 1 都检查永久暂停
+health 和可读的 LP dashboard，并跳过 state 请求。running、缺失或矛盾的证据仍失败；
+历史值 0 不再恢复非 LP 业务。运维应确认未选中服务的
 PID/版本仍未变化，但不要把它们标记为本次已更新或 exact-SHA 已验收。每个 installer
 完成范围内一次 restart；不要例行追加手工 bootout/bootstrap 或 deploy-accept-redeploy
 循环。

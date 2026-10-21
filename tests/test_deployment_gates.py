@@ -90,7 +90,7 @@ def _run_smoke(
     services: str | None,
     failure: str | None = None,
     n_leg_paused: int = 0,
-    prediction_n_leg: tuple[str, str] = ("running", "N_LEG_RUNNING"),
+    prediction_n_leg: tuple[str, str] = ("paused", "N_LEG_PAUSED"),
     unselected_prediction_paused: bool = False,
     lp_payload: str = '{"state":"ready","orders":[],"positions":[],"recommendations":[]}',
     log_content: str | bytes | None = None,
@@ -531,10 +531,9 @@ def test_scoped_smoke_accepts_selected_release_with_older_unselected_services(
             assert not any(f"{url}/healthz" in call for call in calls)
             assert not any(f"tiTCP:{port}" in call for call in calls)
     assert any(call.startswith("playwright ") for call in calls)
+    assert not any("prediction-arbitrage/state" in call for call in calls)
     if "prediction" in services.split():
-        assert any("prediction-arbitrage/state" in call for call in calls)
-    else:
-        assert not any("prediction-arbitrage/state" in call for call in calls)
+        assert any("prediction-arbitrage/lp/dashboard" in call for call in calls)
 
 
 @pytest.mark.parametrize(

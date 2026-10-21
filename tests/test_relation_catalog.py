@@ -520,14 +520,9 @@ def test_cli_relation_ingest_success(tmp_path: Path, capsys: pytest.CaptureFixtu
         str(tmp_path / "data"),
     ])
     out = capsys.readouterr().out
-    assert code == 0
-    assert "version_id:" in out
-    assert "identity:" in out
-    assert "status: PENDING" in out
-
-    catalog = RelationCatalog(tmp_path / "data")
-    assert len(catalog.review_rows()) == 1
-    assert catalog.current_generation() == {}
+    assert code == 2
+    assert json.loads(out)["reason"] == "N_LEG_PAUSED"
+    assert not (tmp_path / "data").exists()
 
 
 def test_cli_relation_ingest_validation_failure(
@@ -545,7 +540,8 @@ def test_cli_relation_ingest_validation_failure(
         str(tmp_path / "data"),
     ])
     assert code == 2
-    assert "error:" in capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["reason"] == "N_LEG_PAUSED"
+    assert not (tmp_path / "data").exists()
 
 
 def test_cli_catalog_dedup_dry_run_and_apply(
@@ -555,6 +551,7 @@ def test_cli_catalog_dedup_dry_run_and_apply(
     base = threshold_relation()
     first_id = catalog.ingest_threshold_relation(base)["version_id"]
     second_id = catalog.ingest_threshold_relation(drifted_question(base))["version_id"]
+    before = catalog.review_rows()
 
     code = cli.main([
         "prediction-arb",
@@ -564,10 +561,8 @@ def test_cli_catalog_dedup_dry_run_and_apply(
         str(tmp_path / "data"),
     ])
     out = capsys.readouterr().out
-    assert code == 0
-    assert "duplicates: 1" in out
-    assert first_id in out
-    assert second_id in out
+    assert code == 2
+    assert json.loads(out)["reason"] == "N_LEG_PAUSED"
     assert catalog.pending_count() == 2  # dry-run leaves rows untouched
 
     code = cli.main([
@@ -578,15 +573,15 @@ def test_cli_catalog_dedup_dry_run_and_apply(
         str(tmp_path / "data"),
     ])
     out = capsys.readouterr().out
-    assert code == 0
-    assert "applied: 1" in out
+    assert code == 2
+    assert json.loads(out)["reason"] == "N_LEG_PAUSED"
 
-    # An externally-run CLI write is visible to a freshly opened catalog; the
-    # pre-existing handle keeps its thread-local read cache by design (#91).
+    # Rejection preserves both pending versions, including on a fresh open.
     reopened = RelationCatalog(tmp_path / "data")
-    assert reopened.pending_count() == 1
+    assert reopened.pending_count() == 2
+    assert reopened.review_rows() == before
     rows = {row["version_id"]: row for row in reopened.review_rows()}
-    assert rows[first_id]["status"] == "REJECTED"
+    assert rows[first_id]["status"] == "PENDING"
     assert rows[second_id]["status"] == "PENDING"
 
 
@@ -596,6 +591,7 @@ def test_cli_catalog_cleanup_dry_run(
     catalog = RelationCatalog(tmp_path / "data")
     incomplete_id = catalog.ingest(discovery(completeness="INCOMPLETE"))["version_id"]
     catalog.ingest(discovery())
+    before = catalog.review_rows()
 
     code = cli.main([
         "prediction-arb",
@@ -605,10 +601,10 @@ def test_cli_catalog_cleanup_dry_run(
         str(tmp_path / "data"),
     ])
     out = capsys.readouterr().out
-    assert code == 0
-    assert "matches: 1" in out
-    assert incomplete_id in out
-    assert catalog.review_rows()  # dry-run leaves rows untouched
+    assert code == 2
+    assert json.loads(out)["reason"] == "N_LEG_PAUSED"
+    assert catalog.review_rows() == before
+    assert any(row["version_id"] == incomplete_id for row in before)
 
 
 def test_cli_catalog_cleanup_apply(
@@ -616,6 +612,7 @@ def test_cli_catalog_cleanup_apply(
 ) -> None:
     catalog = RelationCatalog(tmp_path / "data")
     incomplete_id = catalog.ingest(discovery(completeness="INCOMPLETE"))["version_id"]
+    before = catalog.review_rows()
 
     code = cli.main([
         "prediction-arb",
@@ -625,13 +622,13 @@ def test_cli_catalog_cleanup_apply(
         str(tmp_path / "data"),
     ])
     out = capsys.readouterr().out
-    assert code == 0
-    assert "applied: 1" in out
-    assert "REJECTED" in out
+    assert code == 2
+    assert json.loads(out)["reason"] == "N_LEG_PAUSED"
+    assert catalog.review_rows() == before
 
     rows = {row["version_id"]: row for row in catalog.review_rows()}
-    assert rows[incomplete_id]["status"] == "REJECTED"
-    assert rows[incomplete_id]["activation"] == "REJECTED"
+    assert rows[incomplete_id]["status"] == "PENDING"
+    assert rows[incomplete_id]["activation"] == "PENDING"
 
 
 def test_concurrent_readers_on_shared_catalog_do_not_nest_transactions(
