@@ -7,6 +7,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - LP 服务日志补充选定奖励、账户读取/发布与入场发送/回执应用的脱敏诊断，区分失败、正常等待及同作用域恢复，并保留首次/最近原因和尝试关联。Dashboard 旧读取及缓存、无效奖励事实、规划快照复用或账户恢复不能清除较新失败或改写 UNKNOWN 订单；奖励来源各自验证后恢复，混合配置、身份或资产错误仍保留已验证 native USD 下界以检查 combined 一致性，业务 UNKNOWN 与原因顺序不变；交错组件按阶段独立聚合重复日志并保留被抑制计数；日志队列及进程内记录有界，溢出与重启不保证连续历史。离线定向验证覆盖发送审计、防重、不可变订单、并发顺序及阻塞/异常日志输出；Dashboard、交易规则和 JSON/CLI 不变，未部署。
 
+- Retirement CI fixtures now separate the permanently paused service from explicit unpaused library observer diagnostics at both reader fences. Dedicated runtime-only tests retain the native writer and owner until actual shutdown completes. Offline fence, incident, startup-drain and controlled concurrent regressions preserve fail-before-write, no-replay and exact cancellation assertions; new CI remains pending. No production change or deployment.
+
+- Cloud SSM status/Smoke now bind the requested N-leg setting to the release record, installed unit, loaded environment and process environment while retaining effective pause. Old SSM evidence without the configured marker requires the existing separately authorized install/start workflow. File/disabled units remain byte-identical. Eight offline substitution regressions and affected consumers verify this identity repair; not deployed.
+
+- Retirement follow-up: cloud units and lifecycle evidence now use effective N-leg pause while retaining the requested value for identity and credential/region checks. Capped Shadow and local Smoke accept historical unset/zero inputs without reactivating business; Smoke validates LP evidence. Default/explicit Keychain Shadow retains authenticated read-only LP display. The retired external-position recovery command is no longer an operator procedure; recovery needs separate scoped approval. Focused offline lifecycle, resource, HTTP and gate regressions retain identity, UNKNOWN, no-write and owner protections. Not deployed.
+
+- Supported production/shadow entrypoints now always keep non-LP business paused, even with `OPEN_TRADER_NLEG_PAUSED=0`. Startup preserves legacy LLM usage and safety-policy/control history. Retired catalog, recovery and shadow-seed CLI writers reject with exit 2 / `N_LEG_PAUSED` before external work. LP and read-only candidate diagnosis retain their contracts; explicit library and authorized offline maintenance remain available. Focused offline regressions cover startup, public HTTP, no-write CLI rejection and retained consumers; the CI retirement manifest is unchanged. Not deployed.
+
 - LP 慢会话隔离回归改为先等待健康市场的实际 BUY 回执，再核实轮次完成，避免同一个两秒窗口覆盖对账等待与健康发送调度。测试保持慢读取直至清理，保留精确订单、占资和禁止叠加读取断言，并回收实际原生读取与对账线程。离线验证包含受控健康市场延迟与依赖慢读取的负向故障；未改生产逻辑。
 
 ## 2026-10-20

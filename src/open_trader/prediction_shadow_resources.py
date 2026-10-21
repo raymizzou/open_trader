@@ -101,7 +101,9 @@ def shadow_resource_guard(mode):
         yield
         return
     maximum = int(raw)
-    if (mode != 'shadow' or os.environ.get('OPEN_TRADER_NLEG_PAUSED') != '1'
+    # Supported Shadow is always paused; historical unset/zero inputs cannot
+    # disable its resource policy. Keep invalid input and production rejected.
+    if (mode != 'shadow' or os.environ.get('OPEN_TRADER_NLEG_PAUSED') not in {None, '0', '1'}
             or not SERVICE_RESERVE < maximum):
         raise ValueError('resource guard requires explicitly capped paused Shadow')
     sample = read_resources()

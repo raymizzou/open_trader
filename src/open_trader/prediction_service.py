@@ -1618,6 +1618,9 @@ def serve_prediction_service(
         notifier=notifier,
         git_sha=str(metadata.get("git_sha", "")),
         reader_generation=None if release is None else release.reader_generation,
+        # Non-LP business is permanently retired at supported entrypoints.
+        # Explicit library diagnostics retain their own pause selection.
+        n_leg_paused=True,
         enable_n_leg_background=(
             os.environ.get("OPEN_TRADER_DISABLE_NLEG_BACKGROUND") != "1"
         ),

@@ -411,7 +411,8 @@ class PredictionArbitrageStore:
         self._lp_trade_change_listener: Callable[[str], None] | None = None
         self._lp_trade_change_listener_lock = threading.Lock()
         if initialize:
-            self.prune_llm_usage()
+            # Retired N-leg history is preserved on open; pruning is an
+            # explicit offline maintenance operation.
             self._truncate_wal()
 
     def _truncate_wal(self) -> None:

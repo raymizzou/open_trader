@@ -393,6 +393,7 @@ def test_cli_relation_candidates_dry_run_and_apply(tmp_path: Path, capsys: pytes
     assert dry_run["prepared"] == 1
     assert dry_run["version_ids"] == []
     assert RelationCatalog(data_dir).pending_count() == 0
+    before = store.load_relation_state()
 
     assert (
         cli.main(
@@ -404,12 +405,12 @@ def test_cli_relation_candidates_dry_run_and_apply(tmp_path: Path, capsys: pytes
                 "--apply",
             ]
         )
-        == 0
+        == 2
     )
     applied = json.loads(capsys.readouterr().out)
-    assert applied["status"] == "PREPARED"
-    assert len(applied["version_ids"]) == 2
-    assert RelationCatalog(data_dir).pending_count() == 2
+    assert applied["reason"] == "N_LEG_PAUSED"
+    assert RelationCatalog(data_dir).pending_count() == 0
+    assert store.load_relation_state() == before
 
 
 def test_cli_relation_candidates_dry_run_readonly_database(

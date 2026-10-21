@@ -5,6 +5,51 @@ branch push, PR candidate and merged-main push. Four backend services and
 non-LIVE portable scenarios remain required. Production code, pause state,
 tests and dependencies are retained. This policy adds no production action.
 
+## Supported entrypoints
+
+The production and shadow service entrypoints always select the existing paused
+runtime. An unset `OPEN_TRADER_NLEG_PAUSED` or a value of `0` cannot enable
+non-LP business through these entrypoints. Public health reports `N_LEG_PAUSED`,
+and N-leg HTTP requests return 409 with that code. LP order, cancellation,
+control and configuration behavior, shared previews, risk/incident reads, reader
+fences, startup admission and resource ownership retain their existing contracts.
+Shadow remains display-only.
+
+Authenticated Shadow display works with supported default/explicit Keychain,
+file and SSM credentials. The disabled credentialless profile still has no LP
+reader; invalid credentials fail closed. Cloud lifecycle evidence reports
+effective `n_leg_paused: 1` and separately binds the requested
+`configured_n_leg_paused` value. Credential/profile and region eligibility still
+use the original configuration. All supported Shadow services retain bounded
+resource guards. Local Smoke accepts historical unset/0/1 inputs but always
+requires paused health and LP evidence and never requests the retired state
+endpoint. See [cloud operations](prediction-cloud.md) and
+[release deployment](../../ops/release-deployment.md) for unchanged authorization
+and identity boundaries. The retired external-position recovery CLI has no
+replacement procedure authorized by this retirement change.
+
+Store initialization preserves expired and legacy cache-hit LLM usage rows.
+Paused startup does not enroll or recheck the legacy safety policy, take its
+write transaction, downgrade legacy modes or create policy control audits.
+
+The following standalone `prediction-arb` commands return exit 2 and JSON reason
+`N_LEG_PAUSED` before database, runtime/execution lock, credential or account/network
+work: `relation-ingest`, `catalog-cleanup`, `catalog-dedup`, `catalog-doctor`,
+`relation-candidates --apply`, and `recover-external-positions`. Catalog dry runs
+are included because their constructors can perform DDL. The genuinely read-only
+`relation-candidates --dry-run` remains available. The `prediction_shadow` module
+CLI also rejects before seeding a database or replacing a report; parser/help
+remain available.
+
+This is entrypoint retirement, not a universal database write ACL. Explicit
+Python library calls, including `PredictionRuntime(..., n_leg_paused=False)`,
+Store mutators, `prune_llm_usage` and `seed_shadow_store`, remain available for
+isolated diagnosis and separately authorized offline work. Stopped-owner cutover
+migration, whole-file restore and schema migration keep their existing contracts.
+No new maintenance protocol is introduced. Arbitrary external SQLite clients
+are outside this boundary. The 29-file retirement manifest is unchanged; the
+new `tests/test_nleg_retirement.py` regressions remain active in default CI.
+
 ## Classification
 
 The old filename wildcard matched 32 files at baseline
