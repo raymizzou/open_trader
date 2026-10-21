@@ -208,6 +208,7 @@ print(json.dumps({{
     'release_root': os.environ['GATE_RELEASE_ROOT'],
     'runtime_root': os.environ['GATE_REMOTE_RUNTIME'],
     'n_leg_paused': int(os.environ.get('GATE_REMOTE_NLEG', '1')),
+    'configured_n_leg_paused': 1,
     'credential_backend': os.environ.get('GATE_REMOTE_BACKEND', 'disabled'),
     'candidate_exclusions': json.loads(os.environ.get('GATE_REMOTE_EXCLUSIONS', 'false')),
     'status': 'PRECHECK_OK',
@@ -678,7 +679,7 @@ def test_two_host_smoke_revalidates_refresh_and_stable_identity(tmp_path, monkey
     before = dict(status='BACKEND_SMOKE_OK', pid=123, started_at='process-start',
         systemd_started_at='systemd-start', git_sha=cfg.expected_sha, mode='shadow',
         release_root=str(cfg.release_root), runtime_root=str(cfg.runtime_root),
-        n_leg_paused=1, credential_backend='file', candidate_exclusions=False, display_snapshot=dict(
+        n_leg_paused=1, configured_n_leg_paused=1, credential_backend='file', candidate_exclusions=False, display_snapshot=dict(
             account={'checked_at':datetime.now(UTC).isoformat()}, catalog={'complete':True},
             candidates={'candidate_state':'unknown'}, history=None,
             rewards={'condition':{'state':'unknown','reason':'usd_value_unknown'}}))
@@ -849,7 +850,7 @@ def test_cloud_candidate_exclusions_remote_evidence_is_required_and_strict(tmp_p
     config = CloudConfig(tmp_path/'release', tmp_path/'runtime', tmp_path/'python',
         'prediction', 'a'*40, '', '', '', '', 'shadow', 1, candidate_exclusions=enabled)
     result = dict(release_root=str(config.release_root), runtime_root=str(config.runtime_root),
-        mode='shadow', git_sha=config.expected_sha, n_leg_paused=1, credential_backend='disabled',
+        mode='shadow', git_sha=config.expected_sha, n_leg_paused=1, configured_n_leg_paused=1, credential_backend='disabled',
         status='PRECHECK_OK' if action=='preflight' else 'BACKEND_SMOKE_OK', candidate_exclusions=enabled,
         pid=321, started_at='fixture-process-start', systemd_started_at='fixture-systemd-start')
     assert gate.remote_identity(result, config, action) == result

@@ -316,12 +316,12 @@ forward-deployment wrapper, trust checks, environment limits and rollback path.
   make production-smoke EXPECTED_SHA=<40hex> EXPECTED_ROOT=<absolute immutable checkout> EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime
   ```
 
-  For a selected Prediction release with the reversible N_LEG pause enabled,
-  add `N_LEG_PAUSED=1`. Smoke then requires the selected prediction health
-  payload to report `N_LEG_PAUSED`, verifies the LP dashboard contract, and does
-  not request `/api/prediction-arbitrage/state`. The default `N_LEG_PAUSED=0`
-  keeps the normal state contract check for selected Prediction; a missing or
-  contradictory pause status blocks the gate.
+  Supported Prediction entrypoints permanently pause non-LP business.
+  Smoke accepts historical `N_LEG_PAUSED=0` and `1` inputs; unset/default, zero
+  and one all require `N_LEG_PAUSED` health plus a valid LP dashboard. It never
+  requests `/api/prediction-arbitrage/state`. Invalid input, running/missing
+  health and missing LP evidence still block the gate. Stored zero cannot
+  reactivate N-leg and does not relax credential or startup admission checks.
 
   It must end with `HEALTHY` or `ROLLBACK`. `make production-smoke` first runs
   the five marked Python browser regressions, then uses the direct cached JS
@@ -329,8 +329,8 @@ forward-deployment wrapper, trust checks, environment limits and rollback path.
   release root; both runs use that validated release root. The prediction
   error log comes from the shared runtime root. The browser blocks
   non-read-only requests before navigation. Smoke checks the selected
-  Prediction N_LEG contract before the browser run according to
-  `N_LEG_PAUSED` and never downloads a browser or starts the fixture server.
+  Prediction permanent-pause contract before the browser run. It never downloads
+  a browser or starts the fixture server.
 - `make candidate-acceptance` and `make acceptance` are compatibility aliases
   for Deployment Preflight. They read GitHub and the selected local environment;
   they never install services, build images, rerun tests or submit orders.
@@ -354,9 +354,9 @@ Smoke applies `EXPECTED_SHA` and `EXPECTED_ROOT` to selected services only;
 unselected services may remain on older clean immutable releases. Every
 selected service still needs its health, code root, process, listener, and log
 identity checks. Account is one release unit, so its API and worker health
-identities must match. Selected Prediction uses the N_LEG state probe when
-`N_LEG_PAUSED=0`; paused selected Prediction validates paused health and the LP
-dashboard instead. The browser integration check remains common to every scope. Gateway-only
+identities must match. Selected Prediction always validates paused health and the
+LP dashboard, including under historical `N_LEG_PAUSED=0`. The browser integration
+check remains common to every scope. Gateway-only
 readiness uses `--mode gateway`; gateway plus legacy uses the existing stack
 dry-run, and legacy selection retains the Trend and Futu checks.
 

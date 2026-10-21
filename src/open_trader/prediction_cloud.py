@@ -51,6 +51,12 @@ class CloudConfig:
     candidate_exclusions: bool = False
 
     @property
+    def effective_n_leg_paused(self) -> int:
+        # Supported services permanently retire N-leg. Keep the requested
+        # field intact for credential eligibility and configuration identity.
+        return 1
+
+    @property
     def record(self):
         return self.runtime_root / 'prediction-systemd-release.json'
 
@@ -181,9 +187,10 @@ def render_unit(c: CloudConfig) -> str:
             f'Environment=OPEN_TRADER_SSM_SECRET={c.secret}\n',
             f'Environment=OPEN_TRADER_SSM_VERSION={c.version}\n',
             f'Environment=OPEN_TRADER_SSM_ROLE={c.role}\n',
+            f'Environment=OPEN_TRADER_CONFIGURED_NLEG_PAUSED={c.n_leg_paused}\n',
         ])
     exclusions_env = 'Environment=OPEN_TRADER_LP_CANDIDATE_EXCLUSIONS=1\n' if c.candidate_exclusions else ''
-    guarded = c.mode == 'shadow' and c.n_leg_paused == 1
+    guarded = c.mode == 'shadow'
     resources = (f'Environment=OPEN_TRADER_SHADOW_MEMORY_MAX_BYTES={c.memory_max_bytes}\n'
                  f'MemoryAccounting=yes\nMemoryMax={c.memory_max_bytes}\n'
                  'CPUAccounting=yes\nCPUQuota=100%\nTasksAccounting=yes\nTasksMax=96\n') if guarded else ''
@@ -205,8 +212,8 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=GIT_CONFIG_COUNT=1
 Environment=GIT_CONFIG_KEY_0=safe.directory
 Environment=GIT_CONFIG_VALUE_0={c.release_root}
-{exclusions_env}{credential_env}Environment=OPEN_TRADER_NLEG_PAUSED={c.n_leg_paused}
-Environment=OPEN_TRADER_NLEG_PAUSED={c.n_leg_paused}
+{exclusions_env}{credential_env}Environment=OPEN_TRADER_NLEG_PAUSED={c.effective_n_leg_paused}
+Environment=OPEN_TRADER_NLEG_PAUSED={c.effective_n_leg_paused}
 ExecStart={c.python} -m open_trader prediction-service --mode {c.mode} --data-dir {c.runtime_root}/data --config {c.runtime_root}/config/prediction_arbitrage.json --host 127.0.0.1 --port 8769 --release-manifest {c.release_root}/ops/prediction-service-release.json
 {resources}Restart={'no' if guarded else 'on-failure'}
 RestartSec=30
@@ -905,13 +912,15 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
     if action == 'preflight':
         preflight(c)
         return {'status': 'PRECHECK_OK', 'git_sha': c.expected_sha, 'mode': c.mode,
-                'n_leg_paused': c.n_leg_paused, 'credential_backend': credential_backend(c),
+                'n_leg_paused': c.effective_n_leg_paused, 'configured_n_leg_paused': c.n_leg_paused,
+                'credential_backend': credential_backend(c),
                 'candidate_exclusions': c.candidate_exclusions}
     if action == 'status' and unit_state()['MainPID'] == '0':
         absent(c)
         installed_unit(c)
         verified_record(c, ('stopped',))
-        return {'status': 'STOPPED', 'git_sha': c.expected_sha, 'candidate_exclusions': c.candidate_exclusions}
+        return {'status': 'STOPPED', 'git_sha': c.expected_sha, 'candidate_exclusions': c.candidate_exclusions,
+                'n_leg_paused': c.effective_n_leg_paused, 'configured_n_leg_paused': c.n_leg_paused}
     if action in ('status', 'smoke'):
         verified_record(c, ('ready',))
         evidence = live_identity(c)
@@ -919,7 +928,7 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
         if action == 'smoke':
             health = read_json(8769)
             nleg = health.get('n_leg', {})
-            if c.n_leg_paused:
+            if c.effective_n_leg_paused:
                 if nleg.get('status') != 'paused' or nleg.get('code') != 'N_LEG_PAUSED':
                     raise ValueError('N-leg pause contract mismatch')
                 if c.mode == 'shadow' and credential_backend(c) != 'disabled':
@@ -949,7 +958,8 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
                 raise ValueError('runtime logs missing or contain errors')
             if live_identity(c) != evidence:
                 raise ValueError('owner changed during smoke')
-        component = {'mode': c.mode, 'n_leg_paused': c.n_leg_paused,
+        component = {'mode': c.mode, 'n_leg_paused': c.effective_n_leg_paused,
+                     'configured_n_leg_paused': c.n_leg_paused,
                      'credential_backend': credential_backend(c), 'candidate_exclusions': c.candidate_exclusions}
         return {'status': 'RUNNING' if action == 'status' else 'BACKEND_SMOKE_OK',
                 **evidence, **component, **({'display_snapshot':display_evidence} if display_evidence else {})}
@@ -1047,7 +1057,7 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
                 saved=verified_record(c,('ready','failed','stopped','maintenance'))
                 if saved['state'] in ('ready','failed'):
                     record(c,'stopped',operation_fd=lock.fileno())
-            if c.mode == 'shadow' and c.n_leg_paused == 1:
+            if c.mode == 'shadow':
                 from .prediction_shadow_resources import require_host_headroom
                 require_host_headroom(c.memory_max_bytes)
             preflight(c)

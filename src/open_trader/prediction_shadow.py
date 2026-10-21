@@ -113,13 +113,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-data-dir", type=Path, required=True)
     parser.add_argument("--shadow-data-dir", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
-    args = parser.parse_args(argv)
-    report = seed_shadow_store(
-        source_data_dir=args.source_data_dir,
-        shadow_data_dir=args.shadow_data_dir,
-    )
-    _write_report(args.report, report)
-    return 0
+    parser.parse_args(argv)
+    # The standalone business writer is retired. Explicit library/offline
+    # seeding keeps its existing source-isolation contract.
+    print(json.dumps({"state": "paused", "reason": "N_LEG_PAUSED"}))
+    return 2
 
 
 if __name__ == "__main__":

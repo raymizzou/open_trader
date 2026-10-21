@@ -793,7 +793,9 @@ class PredictionRuntime:
             from .prediction_start_guard import selected_trading_config
             trading_config = selected_trading_config(identity)
             apply_safety_policy = getattr(self.store, "apply_safety_policy", None)
-            if callable(apply_safety_policy):
+            # Paused entrypoints preserve legacy controls and audit history,
+            # including avoiding the policy check's BEGIN IMMEDIATE lock.
+            if not self._n_leg_paused and callable(apply_safety_policy):
                 apply_safety_policy(
                     _prediction_safety_policy(trading_config),
                     git_sha=self._git_sha,
@@ -1827,9 +1829,9 @@ class PredictionRuntime:
             if self._n_leg_paused:
                 self.store = PredictionArbitrageStore(self._data_dir)
                 backend = os.environ.get("OPEN_TRADER_CREDENTIAL_BACKEND", "keychain")
-                if backend in {"file", "tencent-ssm"}:
-                    # File authentication is fail-closed; never mask an invalid
-                    # credential file with an unauthenticated public reader.
+                if backend in {"keychain", "file", "tencent-ssm"}:
+                    # Supported authentication is fail-closed; never mask
+                    # invalid credentials with an unauthenticated public reader.
                     trading_config = load_trading_config(self._prediction_config_path)
                     self._prediction_trading = PolymarketTradingClient.from_keychain(
                         trading_config, read_only=True
