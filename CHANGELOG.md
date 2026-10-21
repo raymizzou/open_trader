@@ -68,6 +68,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-21
 
+- Add a branch-and-commit-marker scoped Prediction diagnostic for one six-worker run against immutable source `0ad6e77`. It retains original offline selection and test outcomes, records worker phase timelines and sampled CPU/memory in separate diagnostic artifacts, and leaves ordinary CI/deployment evidence unchanged. Focused observer contracts cover grouped/literal-`@` identities, failure/skip/subtest outcomes and incomplete streams.
+
 - CI now supports a main-only manual run with the same four backend partitions, portable scenarios and retirement coverage. Deployment Preflight selects the newest exact-SHA push or manual run and binds artifacts to its real event; newer unsuccessful runs block older green evidence. Focused offline trust and workflow checks cover this path. No deployment in this change.
 
 - LP 冷启动 UNKNOWN 依赖期限回归为受监督子进程使用测试独占的 pytest 临时命名空间，避免其清理无关历史目录；保留正常清理、原 30 秒监督和全部业务断言。受控历史目录、正常及独立并发验证不涉及生产逻辑；历史 P20 超时的确切原因仍未知，未部署。
