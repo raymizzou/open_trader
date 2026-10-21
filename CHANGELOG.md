@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-21
 
+- LP 冷启动 UNKNOWN 依赖期限回归为受监督子进程使用测试独占的 pytest 临时命名空间，避免其清理无关历史目录；保留正常清理、原 30 秒监督和全部业务断言。受控历史目录、正常及独立并发验证不涉及生产逻辑；历史 P20 超时的确切原因仍未知，未部署。
+
 - LP 手动租约完成唤醒的离线回归在推进业务时钟前，等待当前 O/C 读取的未持有源实际发布，避免把 HTTP 返回误当作 runtime publication。保留原 5/10/11 秒边界、watchdog、当前订单与 UNKNOWN/不重放断言；验证包含外部响应延迟及独立并发两变体，未改生产逻辑。
 
 - LP 手动独占 mutation lease 在可靠 SQL 与全局文件锁真实释放后补发完成通知，避免早期 native 通知先被消费后，延期保护撤单停在事件等待。保留早期容量通知、整条命令/SQL 所有权、纯状态查询及权限/UNKNOWN/不重放；离线真实 Scheduler 回归覆盖实际拒单后的 COMMIT 尾部与无 native 的缺失 preview SELECT，未部署。
