@@ -2016,6 +2016,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "prediction-arb":
+        # Reject retired business entrypoints before constructors can open a
+        # database (including dry-run DDL), acquire owners or load credentials.
+        if args.prediction_command in {
+            "relation-ingest", "catalog-cleanup", "catalog-dedup",
+            "catalog-doctor", "recover-external-positions",
+        } or (args.prediction_command == "relation-candidates" and args.apply):
+            print(json.dumps({"state": "paused", "reason": "N_LEG_PAUSED"}))
+            return 2
         if args.prediction_command == "recover-external-positions":
             from .prediction_runtime import recover_external_positions, PredictionRuntimeOwnershipError
 

@@ -92,11 +92,13 @@ def test_registration_requires_confirmation(tmp_path):
 
 
 @pytest.mark.parametrize('busy', [False, True])
-def test_offline_cli_recovers_only_without_live_runtime(tmp_path, monkeypatch, busy):
+def test_offline_cli_recovers_only_without_live_runtime(tmp_path, monkeypatch, capsys, busy):
+    import json
     from open_trader import cli
     from open_trader.prediction_runtime import _RuntimeOwnershipLock
     from open_trader import prediction_runtime
     service, trading, store, incident = setup_incident(tmp_path)
+    before = store.histories('incidents')
     monkeypatch.setattr(prediction_runtime, 'load_trading_config', lambda path: trading.config)
     calls = []
     def client(config):
@@ -112,9 +114,12 @@ def test_offline_cli_recovers_only_without_live_runtime(tmp_path, monkeypatch, b
             '--incident-id', incident['incident_id'], '--position', 'old-token=13.31',
             '--confirm', '--note', 'Confirmed migration inventory',
         ])
-        assert code == (2 if busy else 0)
-        assert len(calls) == (0 if busy else 1)
-        assert (store.unacknowledged_incident() is not None) == busy
+        assert code == 2
+        assert json.loads(capsys.readouterr().out)['reason'] == 'N_LEG_PAUSED'
+        assert calls == []
+        assert store.unacknowledged_incident() is not None
+        assert store.histories('incidents') == before
+        assert trading.batch_calls == trading.merge_calls == 0
     finally:
         lock.release()
 

@@ -793,7 +793,9 @@ class PredictionRuntime:
             from .prediction_start_guard import selected_trading_config
             trading_config = selected_trading_config(identity)
             apply_safety_policy = getattr(self.store, "apply_safety_policy", None)
-            if callable(apply_safety_policy):
+            # Paused entrypoints preserve legacy controls and audit history,
+            # including avoiding the policy check's BEGIN IMMEDIATE lock.
+            if not self._n_leg_paused and callable(apply_safety_policy):
                 apply_safety_policy(
                     _prediction_safety_policy(trading_config),
                     git_sha=self._git_sha,

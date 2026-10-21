@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-21
 
+- Supported production/shadow entrypoints now always keep non-LP business paused, even with `OPEN_TRADER_NLEG_PAUSED=0`. Startup preserves legacy LLM usage and safety-policy/control history. Retired catalog, recovery and shadow-seed CLI writers reject with exit 2 / `N_LEG_PAUSED` before external work. LP and read-only candidate diagnosis retain their contracts; explicit library and authorized offline maintenance remain available. Focused offline regressions cover startup, public HTTP, no-write CLI rejection and retained consumers; the CI retirement manifest is unchanged. Not deployed.
+
 - LP 慢会话隔离回归改为先等待健康市场的实际 BUY 回执，再核实轮次完成，避免同一个两秒窗口覆盖对账等待与健康发送调度。测试保持慢读取直至清理，保留精确订单、占资和禁止叠加读取断言，并回收实际原生读取与对账线程。离线验证包含受控健康市场延迟与依赖慢读取的负向故障；未改生产逻辑。
 
 ## 2026-10-20

@@ -577,70 +577,27 @@ def test_cli_catalog_doctor_report_and_apply(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
     catalog, seeded = _uncompilable_catalog(tmp_path)
-
-    code = cli.main(["prediction-arb", "catalog-doctor", "--data-dir", str(tmp_path)])
-    assert code == 0
-    out = capsys.readouterr().out
-    assert "conflict: action 'polymarket:condition-a:BUY_YES'" in out
-    # Issue #110: the early-settling row is fresh on its own component
-    # timeline, so the report has no stale finding and proposes only the
-    # minority conflicting holder.
-    assert "stale: " not in out
-    assert "proposed_removal: 1" in out
-    assert "remaining: 3" in out
-
-    code = cli.main(
-        [
-            "prediction-arb",
-            "catalog-doctor",
-            "--data-dir",
-            str(tmp_path),
-            "--drop",
-            seeded[1]["identity"],
-            seeded[3]["identity"],
-            "--apply",
-            "--yes",
-        ]
-    )
-    assert code == 0
-    out = capsys.readouterr().out
-    assert "dropped:" in out
-    assert "remaining: 2" in out
-    assert "status: ACTIVE" in out
-    assert len(catalog.current_generation()) == 2
+    before = catalog.review_rows()
+    generation = catalog.current_generation()
+    for extra in ([], ["--drop", seeded[1]["identity"], seeded[3]["identity"], "--apply", "--yes"]):
+        code = cli.main(["prediction-arb", "catalog-doctor", "--data-dir", str(tmp_path), *extra])
+        assert code == 2
+        assert json.loads(capsys.readouterr().out)["reason"] == "N_LEG_PAUSED"
+        assert catalog.review_rows() == before
+        assert catalog.current_generation() == generation
 
 
 def test_cli_catalog_doctor_apply_requires_yes_and_drop(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
     catalog, seeded = _uncompilable_catalog(tmp_path)
-
-    code = cli.main(
-        [
-            "prediction-arb",
-            "catalog-doctor",
-            "--data-dir",
-            str(tmp_path),
-            "--drop",
-            seeded[0]["identity"],
-            "--apply",
-        ]
-    )
-    assert code == 2
-    assert "requires --yes" in capsys.readouterr().err
-
-    code = cli.main(
-        [
-            "prediction-arb",
-            "catalog-doctor",
-            "--data-dir",
-            str(tmp_path),
-            "--apply",
-            "--yes",
-        ]
-    )
-    assert code == 2
-    assert "requires --drop" in capsys.readouterr().err
+    before = catalog.review_rows()
+    # Retirement precedes the old apply-confirmation checks as well as DDL.
+    for extra in (["--drop", seeded[0]["identity"], "--apply"], ["--apply", "--yes"]):
+        code = cli.main(["prediction-arb", "catalog-doctor", "--data-dir", str(tmp_path), *extra])
+        assert code == 2
+        assert json.loads(capsys.readouterr().out)["reason"] == "N_LEG_PAUSED"
+        assert catalog.review_rows() == before
 
 
 # -- Issue #110 review fix: cross-row attribution and its positive coverage ---
@@ -735,23 +692,17 @@ def test_doctor_cross_row_observation_key_joins_one_component(
 def test_cli_catalog_doctor_prints_component_as_of_for_cross_row_stale(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
-    """The doctor CLI prints the component timeline and the stale identity for
-    the cross-row observation-key topology (positive print assertions for the
-    #110 keys, per the current cli.py stale-line format)."""
+    """The retired CLI preserves cross-row history rather than reporting it."""
     catalog = RelationCatalog(tmp_path)
     early, late = _cross_key_payloads()
-    a = _seed(catalog, early)
+    _seed(catalog, early)
     _seed(catalog, late)
+    before = catalog.review_rows()
 
     code = cli.main(["prediction-arb", "catalog-doctor", "--data-dir", str(tmp_path)])
-    assert code == 0
-    out = capsys.readouterr().out
-    assert "compiles: True" in out
-    assert f"stale: {a['identity']} " in out
-    assert "as_of=2026-07-01T00:00:00+00:00" in out
-    assert "component_as_of=2027-01-01T00:00:00+00:00" in out
-    assert "proposed_removal: 1" in out
-    assert "remaining: 1" in out
+    assert code == 2
+    assert json.loads(capsys.readouterr().out)["reason"] == "N_LEG_PAUSED"
+    assert catalog.review_rows() == before
 
 
 def test_doctor_shared_contract_cross_row_stale_attributes_early_row(

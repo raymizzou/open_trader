@@ -304,7 +304,7 @@ def test_seed_shadow_store_rejects_hardlinked_database(tmp_path: Path) -> None:
         )
 
 
-def test_shadow_seed_cli_writes_the_report(tmp_path: Path) -> None:
+def test_shadow_seed_cli_writes_the_report(tmp_path: Path, capsys) -> None:
     source = _populated_store(tmp_path / "production")
     report_path = tmp_path / "reports" / "seed.json"
 
@@ -314,13 +314,15 @@ def test_shadow_seed_cli_writes_the_report(tmp_path: Path) -> None:
             "--shadow-data-dir", str(tmp_path / "shadow"),
             "--report", str(report_path),
         ]
-    ) == 0
+    ) == 2
 
-    assert json.loads(report_path.read_text(encoding="utf-8"))["llm_cache_rows"] == 2
+    assert json.loads(capsys.readouterr().out)["reason"] == "N_LEG_PAUSED"
+    assert not report_path.exists()
+    assert not (tmp_path / "shadow").exists()
 
 
 def test_shadow_seed_cli_replaces_report_atomically_and_preserves_on_failure(
-    tmp_path: Path,
+    tmp_path: Path, capsys,
 ) -> None:
     source = _populated_store(tmp_path / "production")
     report_path = tmp_path / "reports" / "seed.json"
@@ -333,19 +335,21 @@ def test_shadow_seed_cli_replaces_report_atomically_and_preserves_on_failure(
             "--shadow-data-dir", str(tmp_path / "shadow"),
             "--report", str(report_path),
         ]
-    ) == 0
-    assert report_path.read_text(encoding="utf-8") != "old-report"
+    ) == 2
+    assert json.loads(capsys.readouterr().out)["reason"] == "N_LEG_PAUSED"
+    assert report_path.read_text(encoding="utf-8") == "old-report"
     assert list(report_path.parent.iterdir()) == [report_path]
+    assert not (tmp_path / "shadow").exists()
 
     report_path.write_text("keep-on-failure", encoding="utf-8")
-    with pytest.raises(ValueError, match="different databases"):
-        main(
-            [
-                "--source-data-dir", str(source.data_dir),
-                "--shadow-data-dir", str(source.data_dir),
-                "--report", str(report_path),
-            ]
-        )
+    assert main(
+        [
+            "--source-data-dir", str(source.data_dir),
+            "--shadow-data-dir", str(source.data_dir),
+            "--report", str(report_path),
+        ]
+    ) == 2
+    assert json.loads(capsys.readouterr().out)["reason"] == "N_LEG_PAUSED"
     assert report_path.read_text(encoding="utf-8") == "keep-on-failure"
     assert list(report_path.parent.iterdir()) == [report_path]
 
