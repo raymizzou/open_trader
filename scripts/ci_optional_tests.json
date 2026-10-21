@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "policy": "rollback-advisory-v1",
+  "optional": [
+    "tests/test_lp_d2_service_lifecycle.py::test_supported_rollback_uses_current_api_without_disposable_record_audit"
+  ]
+}

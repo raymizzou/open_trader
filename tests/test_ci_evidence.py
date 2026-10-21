@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+OPTIONAL = ['tests/test_lp_d2_service_lifecycle.py::test_supported_rollback_uses_current_api_without_disposable_record_audit']
 
 
 def load(name):
@@ -29,16 +30,16 @@ class PartitionTests(unittest.TestCase):
                  'prediction': ['tests/test_lp_example.py::test_lp',
                                 'tests/test_prediction_runtime.py::test_paused']}
         retired = ['tests/test_prediction_solver.py::test_solver']
-        complete = sum(parts.values(), []) + retired
-        proof = module.verify_partition(complete, parts, retired, ROOT)
+        complete = sum(parts.values(), []) + retired + OPTIONAL
+        proof = module.verify_partition(complete, parts, retired, ROOT, OPTIONAL)
         self.assertEqual(proof['executed_count'], 5)
         self.assertEqual(proof['retired_count'], 1)
-        self.assertEqual(proof['complete_count'], 6)
+        self.assertEqual(proof['complete_count'], 7)
         self.assertEqual(proof['retired_status'], 'not-executed-permanent-retirement')
         nested = 'tests/nested/test_new.py::test_new'
-        self.assertRaises(ValueError, module.verify_partition, complete + [nested], parts, retired, ROOT)
+        self.assertRaises(ValueError, module.verify_partition, complete + [nested], parts, retired, ROOT, OPTIONAL)
         expanded = {**parts, 'legacy': parts['legacy'] + [nested]}
-        self.assertEqual(module.verify_partition(complete+[nested], expanded, retired, ROOT)['complete_count'], 7)
+        self.assertEqual(module.verify_partition(complete+[nested], expanded, retired, ROOT, OPTIONAL)['complete_count'], 8)
         for universe, executed, omitted in [
             (complete, {**parts, 'prediction': parts['prediction'][:-1]}, retired),
             (complete + [complete[0]], parts, retired),
@@ -48,23 +49,23 @@ class PartitionTests(unittest.TestCase):
             (complete, parts, []),
         ]:
             with self.subTest(universe=universe, executed=executed, omitted=omitted):
-                self.assertRaises(ValueError, module.verify_partition, universe, executed, omitted, ROOT)
+                self.assertRaises(ValueError, module.verify_partition, universe, executed, omitted, ROOT, OPTIONAL)
 
     def test_exact_nodeid_partition_and_fingerprints(self):
         module = load('ci_partition')
         parts = {scope: [f'tests/test_{scope}.py::test_ok'] for scope in module.SCOPES}
-        complete = sum(parts.values(), [])
-        proof = module.verify_partition(complete, parts)
+        complete = sum(parts.values(), []) + OPTIONAL
+        proof = module.verify_partition(complete, parts, optional=OPTIONAL)
         self.assertEqual(proof['status'], 'success')
-        self.assertEqual(proof['complete_count'], 4)
+        self.assertEqual(proof['complete_count'], 5)
         self.assertEqual(proof['partition_count'], 4)
-        self.assertEqual(proof['complete_sha256'], proof['partition_sha256'])
-        self.assertEqual(proof, module.verify_partition(list(reversed(complete)), parts))
+        self.assertEqual(proof['complete_sha256'], proof['coverage_sha256'])
+        self.assertEqual(proof, module.verify_partition(list(reversed(complete)), parts, optional=OPTIONAL))
 
     def test_missing_nested_extra_duplicate_and_empty_fail(self):
         module = load('ci_partition')
         parts = {scope: [f'tests/test_{scope}.py::test_ok'] for scope in module.SCOPES}
-        complete = sum(parts.values(), [])
+        complete = sum(parts.values(), []) + OPTIONAL
         for global_nodes, change in [
             (complete + ['tests/nested/test_new.py::test_new'], {}),
             (complete[:-1], {}),
@@ -74,11 +75,11 @@ class PartitionTests(unittest.TestCase):
         ]:
             with self.subTest(change=change, global_nodes=global_nodes):
                 with self.assertRaises(ValueError):
-                    module.verify_partition(global_nodes, {**parts, **change})
+                    module.verify_partition(global_nodes, {**parts, **change}, optional=OPTIONAL)
         with self.assertRaises(ValueError):
-            module.verify_partition(complete + [complete[0]], parts)
+            module.verify_partition(complete + [complete[0]], parts, optional=OPTIONAL)
         with self.assertRaises(ValueError):
-            module.verify_partition(complete, {'gateway': complete})
+            module.verify_partition(complete, {'gateway': complete}, optional=OPTIONAL)
 
     def test_global_collection_uses_configured_testpaths(self):
         module = load('ci_partition')
@@ -205,7 +206,7 @@ class EvidenceTests(unittest.TestCase):
                      'account': ['tests/test_account.py::test_ok'],
                      'prediction': ['tests/test_lp_example.py::test_lp', 'tests/test_prediction_runtime.py::test_paused']}
             retired = ['tests/test_prediction_solver.py::test_solver']
-            proof = partition.verify_partition(sum(parts.values(), [])+retired, parts, retired, ROOT)
+            proof = partition.verify_partition(sum(parts.values(), [])+retired+OPTIONAL, parts, retired, ROOT, OPTIONAL)
             (directory/'partition.json').write_text(json.dumps(proof))
             node = 'acceptance/test_prediction_arbitrage_scenarios.py::test_ok'
             metrics = dict(schema_version=1, source_sha='a'*40, workers=1, selected_nodeids=[node],
@@ -243,7 +244,8 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn('tests/test_prediction_solver_benchmark.py', module.service_partitions(ROOT,'1')['prediction'])
         for scope in module.BACKEND_SCOPES:
             self.assertEqual(module.expected_selection(scope, ROOT), {
-                'roots': parts[scope], 'marker': 'not pressure and not browser', 'keyword': ''})
+                'roots': parts[scope], 'marker': 'not pressure and not browser', 'keyword': '',
+                **({'deselect': OPTIONAL} if scope == 'prediction' else {})})
         self.assertEqual(module.expected_selection('portable', ROOT), {
             'roots': ['acceptance/test_prediction_arbitrage_scenarios.py'],
             'marker': 'not pressure and not browser', 'keyword': 'not LIVE'})
@@ -258,7 +260,7 @@ class EvidenceTests(unittest.TestCase):
             (directory / 'image.json').write_text('[{}]')
             partition=load('ci_partition')
             parts={scope:[f'tests/test_{scope}.py::test_ok'] for scope in partition.SCOPES}
-            (directory/'partition.json').write_text(json.dumps(partition.verify_partition(sum(parts.values(),[]),parts)))
+            (directory/'partition.json').write_text(json.dumps(partition.verify_partition(sum(parts.values(),[])+OPTIONAL,parts,optional=OPTIONAL)))
             node='acceptance/test_prediction_arbitrage_scenarios.py::test_ok'
             (directory/'metrics.json').write_text(json.dumps(dict(schema_version=1,source_sha='a'*40,workers=1,
                 python='3.12.14',platform='Linux/x86_64',architecture='x86_64',cpu_model='Example CPU',
