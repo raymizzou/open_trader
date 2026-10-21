@@ -68,6 +68,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-21
 
+- Prediction diagnostic summaries now reject backward, overlapping, out-of-order and invalid numeric phase bounds. Invalid streams remain available with explicit protocol errors and incomplete status; derived load/tail values and timelines are withheld. Original test exit status and experiment recording/execution stay unchanged. Focused observer contracts cover these invalid bounds.
+
 - Add a branch-and-commit-marker scoped Prediction diagnostic for one six-worker run against immutable source `0ad6e77`. It retains original offline selection and test outcomes, records worker phase timelines and sampled CPU/memory in separate diagnostic artifacts, and leaves ordinary CI/deployment evidence unchanged. Focused observer contracts cover grouped/literal-`@` identities, failure/skip/subtest outcomes and incomplete streams.
 
 - CI now supports a main-only manual run with the same four backend partitions, portable scenarios and retirement coverage. Deployment Preflight selects the newest exact-SHA push or manual run and binds artifacts to its real event; newer unsuccessful runs block older green evidence. Focused offline trust and workflow checks cover this path. No deployment in this change.

@@ -120,6 +120,37 @@ def pytest_configure(config):
     config.pluginmanager.register(Observer(), 'six-worker-diagnostic-observer')
 
 
+def interval_errors(workers):
+    """Reject invalid bounds in recorded order before any timing arithmetic."""
+    import math
+
+    def valid_bound(value):
+        try:
+            return type(value) in (int, float) and value >= 0 and math.isfinite(value)
+        except OverflowError:
+            return False
+
+    errors = []
+    for worker, stream in workers.items():
+        previous_end = None
+        for index, event in enumerate(stream):
+            if event['event'] not in ('phase_start', 'phase'):
+                continue
+            fields = ('start_ns', 'end_ns') if event['event'] == 'phase' else ('start_ns',)
+            invalid = [field for field in fields if not valid_bound(event.get(field))]
+            if invalid:
+                errors.append(f'{worker} event {index}: invalid numeric monotonic bound {invalid}')
+                continue
+            if event['event'] == 'phase':
+                start, end = event['start_ns'], event['end_ns']
+                if end < start:
+                    errors.append(f'{worker} event {index}: backward interval')
+                if previous_end is not None and start < previous_end:
+                    errors.append(f'{worker} event {index}: overlapping or out-of-order interval')
+                previous_end = end
+    return errors
+
+
 def summarize(directory, exit_status, expected_workers=WORKERS):
     """Read partial streams without discarding their usable prefix."""
     events, errors = [], []
@@ -134,11 +165,13 @@ def summarize(directory, exit_status, expected_workers=WORKERS):
         if event['worker'] in workers:
             workers[event['worker']].append(event)
     phases = [e for e in events if e['event'] == 'phase' and e['worker'] in workers]
-    first = min((e['start_ns'] for e in phases), default=None)
-    last = max((e['end_ns'] for e in phases), default=None)
+    protocol_errors = interval_errors(workers)
+    timing_valid = not protocol_errors
+    first = min((e['start_ns'] for e in phases), default=None) if timing_valid else None
+    last = max((e['end_ns'] for e in phases), default=None) if timing_valid else None
     selected = None
     report = {}
-    complete = exit_status in (0, 1) and not errors
+    complete = exit_status in (0, 1) and not errors and timing_valid
     controller = [e for e in events if e['worker'] == 'controller']
     complete &= sum(e['event'] == 'start' for e in controller) == 1
     complete &= any(e['event'] == 'finish' and e['exit_status'] == exit_status for e in controller)
@@ -148,18 +181,21 @@ def summarize(directory, exit_status, expected_workers=WORKERS):
         starts = [e for e in stream if e['event'] == 'start']
         finishes = [e for e in stream if e['event'] == 'finish']
         collections = [e['nodeids'] for e in stream if e['event'] == 'collection']
-        worker_complete = len(starts) == len(finishes) == len(collections) == 1
+        worker_complete = len(starts) == len(finishes) == len(collections) == 1 and timing_valid
         worker_complete &= all(e['exit_status'] in (0, 1) for e in finishes)
         if collections:
             if selected is None:
                 selected = collections[0]
             worker_complete &= collections == [selected]
-        rows = sorted((e for e in stream if e['event'] == 'phase'), key=lambda e: e['start_ns'])
+        # Keep recorded order: sorting would conceal a protocol violation.
+        rows = [e for e in stream if e['event'] == 'phase']
         nodes = defaultdict(dict)
         totals = dict(setup=0.0, call=0.0, teardown=0.0)
         union, gaps, end = 0, [], None
         for row in rows:
             nodes[row['nodeid']][row['when']] = row
+            if not timing_valid:
+                continue
             totals[row['when']] += (row['end_ns'] - row['start_ns']) / 1e9
             if end is None:
                 union += row['end_ns'] - row['start_ns']
@@ -169,7 +205,8 @@ def summarize(directory, exit_status, expected_workers=WORKERS):
                 union += max(0, row['end_ns'] - max(end, row['start_ns']))
             end = max(end or 0, row['end_ns'])
         key = lambda e: (e['nodeid'], e['when'], e['start_ns'])
-        worker_complete &= Counter(map(key, rows)) == Counter(key(e) for e in stream if e['event'] == 'phase_start')
+        if timing_valid:
+            worker_complete &= Counter(map(key, rows)) == Counter(key(e) for e in stream if e['event'] == 'phase_start')
         worker_complete &= len({(e['nodeid'], e['when']) for e in rows}) == len(rows)
         for node, parts in nodes.items():
             worker_complete &= 'setup' in parts and 'teardown' in parts
@@ -177,14 +214,15 @@ def summarize(directory, exit_status, expected_workers=WORKERS):
                 worker_complete &= 'call' in parts
             executed.append(node)
         durations = {node: sum((p['end_ns'] - p['start_ns']) / 1e9 for p in parts.values())
-                     for node, parts in nodes.items()}
+                     for node, parts in nodes.items()} if timing_valid else {}
         complete &= worker_complete
-        report[worker] = dict(node_count=len(nodes), phase_seconds=totals,
-                              active_union_seconds=union / 1e9, idle_gaps_seconds=gaps,
-                              first_ns=rows[0]['start_ns'] if rows else None, last_ns=end,
+        report[worker] = dict(node_count=len(nodes), phase_seconds=totals if timing_valid else None,
+                              active_union_seconds=union / 1e9 if timing_valid else None,
+                              idle_gaps_seconds=gaps if timing_valid else None,
+                              first_ns=rows[0]['start_ns'] if rows and timing_valid else None, last_ns=end,
                               idle_after_last_phase_seconds=(last-end)/1e9 if end is not None else None,
                               completion_seconds_from_first_phase=(end-first)/1e9 if end is not None else None,
-                              final_node=rows[-1]['nodeid'] if rows else None,
+                              final_node=rows[-1]['nodeid'] if rows and timing_valid else None,
                               longest_test=max(durations, key=durations.get) if durations else None,
                               longest_test_seconds=max(durations.values(), default=None),
                               complete=bool(worker_complete), phases=rows)
@@ -193,13 +231,19 @@ def summarize(directory, exit_status, expected_workers=WORKERS):
                 expected_workers=expected_workers, selected_nodeids=sorted(selected or []),
                 observed_nodeids=sorted(executed), first_ns=first, last_ns=last,
                 phase_span_seconds=(last-first)/1e9 if first is not None else None,
-                last_outstanding=sorted(phases, key=lambda e: e['end_ns'], reverse=True)[:6],
-                workers=report, stream_errors=errors, limits=LIMITS)
+                last_outstanding=sorted(phases, key=lambda e: e['end_ns'], reverse=True)[:6] if timing_valid else [],
+                workers=report, stream_errors=errors, protocol_errors=protocol_errors,
+                timing_valid=timing_valid, limits=LIMITS)
 
 
 def render_timeline(summary, output):
     """Six lanes of original node identities; raw nanosecond bounds stay in JSON."""
     import html
+    if not summary['timing_valid']:
+        Path(output).write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="80">'
+            '<text x="10" y="30">Invalid timing evidence; see protocol_errors. No load/tail timeline.</text></svg>')
+        return
     first = summary['first_ns'] or 0
     span = max(1, (summary['last_ns'] or first) - first)
     svg = ['<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="260" viewBox="0 0 1200 260">',

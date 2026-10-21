@@ -130,6 +130,73 @@ def test_crash():
     missing = harness().summarize(tmp_path/'missing', 0)
     assert not missing['complete'] and missing['selected_nodeids'] == []
 
+    # Literal independent streams make the validity contract observable without
+    # relying on a backend run or recomputing expected metrics with the harness.
+    import copy
+    valid = tmp_path/'valid-intervals'
+    valid.mkdir()
+    selected = [f'test_sample.py::test_{i}' for i in range(6)]
+    fixture = {'controller': [dict(event='start', worker='controller'),
+                              dict(event='finish', worker='controller', exit_status=1)]}
+    for i, node in enumerate(selected):
+        worker = f'gw{i}'
+        events = [dict(event='start', worker=worker),
+                  dict(event='collection', worker=worker, nodeids=selected)]
+        for phase, start, end in [('setup', 10, 20), ('call', 20, 30), ('teardown', 30, 40)]:
+            events += [dict(event='phase_start', worker=worker, nodeid=node, when=phase, start_ns=start),
+                       dict(event='phase', worker=worker, nodeid=node, when=phase,
+                            start_ns=start, end_ns=end, outcome='passed')]
+        events.append(dict(event='finish', worker=worker, exit_status=1))
+        fixture[worker] = events
+    def save(directory, data):
+        for worker, events in data.items():
+            (directory/f'{worker}.jsonl').write_text(''.join(json.dumps(event)+'\n' for event in events))
+    save(valid, fixture)
+    module = harness()
+    baseline = module.summarize(valid, 1)
+    assert baseline['complete']
+    assert baseline['workers']['gw0']['active_union_seconds'] == 30/1e9
+    assert baseline['workers']['gw0']['phase_seconds'] == dict(setup=10/1e9, call=10/1e9, teardown=10/1e9)
+    cases = [('backward', 20, 19), ('overlap', 15, 25), ('negative', -1, 30),
+             ('string', '20', 30), ('null', None, 30), ('boolean', True, 30),
+             ('nan-start', float('nan'), 30), ('infinite-end', 20, float('inf')),
+             ('negative-infinity', 20, float('-inf')), ('unrepresentable', 10**1000, 30),
+             ('list-bound', [], 30), ('start-only', '20', 30), ('missing-end', 20, 30),
+             ('out-of-order', 20, 30)]
+    for name, start, end in cases:
+        directory = tmp_path/name
+        directory.mkdir()
+        data = copy.deepcopy(fixture)
+        data['gw0'][4]['start_ns'] = start
+        if name != 'start-only':
+            data['gw0'][5].update(start_ns=start, end_ns=end)
+        if name == 'missing-end':
+            del data['gw0'][5]['end_ns']
+        if name == 'out-of-order':
+            events = data['gw0']
+            events[2:8] = events[2:4] + events[6:8] + events[4:6]
+        save(directory, data)
+        raw = {path.name: path.read_bytes() for path in directory.glob('*.jsonl')}
+        invalid = module.summarize(directory, 1)
+        assert invalid['complete'] is False, name
+        assert invalid['exit_status'] == 1, name  # Observation never changes the application result.
+        expected_error = ('backward interval' if name == 'backward' else
+                          'overlapping or out-of-order interval' if name in ('overlap', 'out-of-order') else
+                          'invalid numeric monotonic bound')
+        assert any('gw0' in error and expected_error in error for error in invalid['protocol_errors']), name
+        assert invalid['timing_valid'] is False, name
+        assert invalid['first_ns'] is None and invalid['last_ns'] is None, name
+        assert invalid['phase_span_seconds'] is None and invalid['last_outstanding'] == [], name
+        for row in invalid['workers'].values():
+            assert row['phase_seconds'] is None and row['active_union_seconds'] is None, name
+            assert row['longest_test_seconds'] is None and row['idle_after_last_phase_seconds'] is None, name
+            assert row['idle_gaps_seconds'] is None and row['completion_seconds_from_first_phase'] is None, name
+            assert row['first_ns'] is None and row['last_ns'] is None and row['final_node'] is None, name
+        assert {path.name: path.read_bytes() for path in directory.glob('*.jsonl')} == raw
+        module.render_timeline(invalid, directory/'timeline.svg')
+        assert 'Invalid timing evidence' in (directory/'timeline.svg').read_text()
+        assert '<rect x=' not in (directory/'timeline.svg').read_text()
+
 
 def test_workflow_is_scoped_and_separate_from_trusted_ci(tmp_path):
     workflow = (ROOT/'.github/workflows/ci-perf-diagnostic.yml').read_text()
