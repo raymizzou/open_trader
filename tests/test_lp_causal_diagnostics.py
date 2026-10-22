@@ -146,6 +146,13 @@ def test_causal_overflow_and_sink_failure_cannot_block_account_read(runtime, mon
         assert polymarket_trading._lp_read_log_dropped > 0
     finally:
         release.set()
+        # A drained queue can still retain failed-output counters when its
+        # last summary also hit the broken sink. Restore the external sink,
+        # then transfer/report those counters before the next test installs
+        # its own handler and measures one independent output failure.
+        monkeypatch.undo()
+        polymarket_trading._lp_causal_event('test_sink_restored')
+        wait_read_logs()
 
 
 @pytest.mark.parametrize('handoff', [False, True], ids=['same-owner', 'later-owner'])
