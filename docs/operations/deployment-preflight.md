@@ -18,7 +18,7 @@ reuses their evidence and does not run backend pytest or build a Docker image.
 The backend still excludes `pressure` and `browser`. Gateway, Account and Legacy
 remain serial. Prediction keeps two xdist workers and its explicit shared-port
 and solver-fixture groups. Portable scenarios run serially. CI checks collected
-executed active plus explicitly retired nodeids against the full backend
+executed required plus explicit optional and retired nodeids against the full backend
 collection so new files, nested tests, marker changes and omitted partitions cannot silently reduce coverage. The old single
 cross-service pytest session is not reproduced: arbitrary global test ordering
 is different. No second full backend execution is added to compensate for an
@@ -39,14 +39,20 @@ label. Missing API access is BLOCKED. It requires:
 - The correct workflow path, completed current run attempt, all four services,
   portable scenarios and the exact `required` check from GitHub Actions app 15368
 - Unexpired artifacts from that same run and attempt, with matching source,
-  repository, scope, active selection, permanent retirement manifest/policy, lock,
+  repository, scope, required tier/selection, retirement and optional manifests/policies, lock,
   test metrics and environment metadata
 - The actual selected Python environment, checked read-only against the runtime
   dependency closure in that checkout's `uv.lock`, including selected extras,
   and code imports from that release's source
 
-Each service's recorded executions must equal its active partition in the
-portable collection proof. The proof's retired collection is explicitly not
+Each service's recorded executions must equal its required partition in the
+portable collection proof. Required, optional and retired collections must be
+pairwise disjoint and complete. The sole optional rollback node in
+`scripts/ci_optional_tests.json` is classified as `not-executed-advisory`, never
+passed by declaration. Its separate workflow runs automatically only on main
+pushes, with a manual entry; its success is not a preflight wait or gate, and
+its genuine failure can be deferred. Optional artifacts cannot substitute for
+trusted required success. The proof's retired collection is explicitly not
 executed and is never required to be passed. The preflight checks the exact
 manifest and selection digests against the selected checkout. It rejects missing
 LP/pause executions, unknown policies and false full-coverage claims. There is

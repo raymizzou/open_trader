@@ -155,7 +155,8 @@ def verify_artifact(api, artifact, scope, run, root, now):
                  workers=2 if scope == 'prediction' else 1, lock_sha256=lock_hash, status='success', exit_status=0,
                  evidence_role='test-only', selection=expected_selection(scope, root),
                  selection_sha256=ci_contract(root).selection_sha256(expected_selection(scope, root)),
-                 policy=ci_contract(root).retirement_policy(root))
+                 policy=ci_contract(root).retirement_policy(root),
+                 optional_policy=ci_contract(root).optional_policy(root), test_tier='required')
     require(all(metadata.get(key) == value and type(metadata.get(key)) is type(value)
                 for key, value in fixed.items()), f'{scope} test metadata mismatch')
     require(metadata['environment'].get('runner_os') == 'Linux'
@@ -169,8 +170,7 @@ def verify_artifact(api, artifact, scope, run, root, now):
         metrics = ci_contract(root).validate_metrics(json.loads(files['metrics.json']), nodes, sha, fixed['workers'])
         ci_contract(root).validate_junit(files['junit.xml'], metrics)
         require(metadata.get('selected_nodeids') == nodes, f'{scope} selected-nodeid metadata mismatch')
-        require(all(node.split('::', 1)[0] in fixed['selection']['roots'] for node in nodes),
-                f'{scope} nodeid outside active selection')
+        ci_contract(root).validate_selected_nodes(fixed['selection'], nodes)
     except (KeyError, ValueError, TypeError) as error:
         raise PreflightError(f'{scope} incomplete test metrics') from error
     manifest = json.loads(files['dependency-manifest.json'])
@@ -196,7 +196,7 @@ def verify_artifact(api, artifact, scope, run, root, now):
         try:
             partition = ci_contract(root).validate_partition(root, json.loads(files['partition.json']))
         except (ValueError, KeyError, TypeError) as error:
-            raise PreflightError('Incomplete active/retired backend partition evidence') from error
+            raise PreflightError('Incomplete required/optional/retired backend partition evidence') from error
     return {'scope':scope, 'id':artifact['id'], 'digest':artifact['digest'],
             'selected_nodeids':nodes, 'partition':partition}
 

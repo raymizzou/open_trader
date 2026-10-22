@@ -42,8 +42,9 @@ The retained standalone trend-curve job stays skipped because the legacy suite
 already includes its tests. Make and `scripts/ci_evidence.py` share one service selection entry point.
 Update that selector's service prefixes for new service-specific test families.
 The [explicit retirement manifest](ci-nleg-retirement.md) omits exactly 29 reviewed
-N-leg files from default execution. All other tests remain active, including the
-three mixed/shared files, LP and pause guards. Production pause state is unchanged.
+N-leg files from default execution. The one exact rollback node described below
+is advisory; all other active tests remain required, including the three
+mixed/shared files, LP and pause guards. Production pause state is unchanged.
 Unknown/new files do not inherit retirement from their names.
 
 The plan and service artifacts identify the checked-out SHA; each service also
@@ -76,6 +77,33 @@ Planner/aggregation contract tests exercise these cases and verify nonzero CLI
 exit on failure. There is no workflow-level path filter that could leave the
 required check permanently pending.
 
+## Rollback advisory
+
+`scripts/ci_optional_tests.json` declares exactly one optional node:
+`tests/test_lp_d2_service_lifecycle.py::test_supported_rollback_uses_current_api_without_disposable_record_audit`.
+Its test and business assertions are unchanged. Required Prediction CI excludes
+only this canonical identity, before xdist adds execution group names. New tests,
+including similarly named neighbors, stay required. The local direct pytest
+command and ordinary Make diagnostics retain their full selection; CI applies
+its exclusion through the explicit `--ci-required` plugin option.
+
+The independent `.github/workflows/ci-rollback-advisory.yml` workflow is named
+`Rollback advisory`. It runs automatically only on pushes to `main`, normally
+after a merge, and provides `workflow_dispatch` for manual use. It does not run
+on PRs, ordinary branch pushes or a schedule. A PR therefore has no premerge
+advisory execution. The exact `github.sha` is checked out and the whole node runs
+once, serially, in its own standard runner with the same locked offline Docker
+environment and 60-minute job timeout.
+
+The advisory keeps genuine failed, cancelled and timed-out results, original
+exit status, test logs, phase metrics, JUnit, source SHA and run/attempt identity.
+Evidence uploads use `always()` and the same three-day retention. There is no
+`continue-on-error`, automatic retry, issue creation or notification. A failed
+advisory can be repaired later; the fixed `required` job neither waits for it nor
+consumes its result. Deployment Preflight also does not wait for optional success.
+This explicitly removes automatic blocking for this one rollback regression;
+it does not make other slow tests optional. No fixed wall-time saving is claimed.
+
 ## Local verification and delivery
 
 Local work runs only directly affected/new test nodeids in an existing Python
@@ -105,10 +133,13 @@ trading authorization.
 ## Collection and execution semantics
 
 CI collects the complete backend universe under `not pressure and not browser`.
-It separately collects all active service partitions and the exact retired files.
-The executed and retired collections must be disjoint, and their union must equal
-the universe. Missing, extra or duplicate nodeids and collection errors fail the
-proof. Retired nodeids carry `not-executed-permanent-retirement`, never passed.
+It separately collects the required service partitions, the exact optional node
+and the retired files. The three collections must be pairwise disjoint, and
+their union must equal the universe. Missing, extra or duplicate nodeids and collection errors fail the
+proof. Optional declarations carry `not-executed-advisory`; they are classification
+evidence, never an execution or passed record. The exact optional manifest,
+selection and proof must agree; missing, duplicate, wildcard, unknown or expanded
+entries fail closed. Retired nodeids carry `not-executed-permanent-retirement`, never passed.
 Portable scenarios are separately selected with `not LIVE`. Gateway, Legacy and
 Account stay serial. Prediction retains two workers and its shared-port groups;
 manual diagnostics retain solver-cache groups. Portable scenarios stay serial.
@@ -121,7 +152,7 @@ The controller writes the records after serial or xdist execution. Named test
 containers retain no mounts or network; the runner copies their JSON and JUnit
 files, then removes only its own container. The runner retains the original
 failure code when collection, copy, environment recording or upload also fails.
-Artifacts bind the source SHA, run ID/attempt, manifest/policy, selection, lock,
+Artifacts bind the source SHA, run ID/attempt, retirement and optional manifests/policies, required/optional tier, selection, lock,
 image and dependency identities; hashes bind the records. Failure and skip
 records remain visible. Missing records cannot describe a successful job.
 

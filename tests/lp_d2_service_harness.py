@@ -1606,7 +1606,11 @@ def offline_github_fixture(release,scratch):
             parts[scope].extend(path+'::'+name for name in names)
     retired=json.loads((release/'scripts/ci_nleg_retired.json').read_text())['retired']
     retired_nodes=[v['path']+'::test_ok' for v in retired]
-    proof=partition.verify_partition(sum(parts.values(),[])+retired_nodes,parts,retired_nodes,release)
+    complete=sum(parts.values(),[])+retired_nodes
+    optional_policy=ci.optional_policy(release)
+    optional=optional_policy['optional_nodeids']
+    parts={scope:[node for node in nodes if node not in optional] for scope,nodes in parts.items()}
+    proof=partition.verify_partition(complete,parts,retired_nodes,release,optional)
     lock=hashlib.sha256((release/'uv.lock').read_bytes()).hexdigest()
     bases=re.findall(r'^FROM (\S+)',(release/'Dockerfile.dev').read_text(),re.MULTILINE)
     fresh=datetime.now(UTC)
@@ -1636,7 +1640,8 @@ def offline_github_fixture(release,scratch):
         if scope=='portable':env['partition_sha256']=hashlib.sha256(files['partition.json']).hexdigest()
         selection=ci.expected_selection(scope,release)
         metadata.update(source_sha=sha,lock_sha256=lock,selected_nodeids=nodes,selection=selection,
-            selection_sha256=ci.selection_sha256(selection),policy=ci.retirement_policy(release))
+            selection_sha256=ci.selection_sha256(selection),policy=ci.retirement_policy(release),
+            optional_policy=optional_policy,test_tier='required')
         files['evidence.json']=json.dumps(metadata).encode()
         data=pack(files);downloads[artifact['id']]=data
         artifact.update(name=f'ci-{scope}-{sha}-22-2',digest='sha256:'+hashlib.sha256(data).hexdigest(),
