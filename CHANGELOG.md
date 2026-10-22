@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-22 — LP postreceipt test observation synchronization
+
+- LP pool regressions now follow published read deadlines when waiting for final cancel quantities or current account funds after receipts. Controlled HTTP publication gates retain the unchanged-time wake, exact-ID cancellation, manual-order capital, UNKNOWN and no-replay assertions. This repairs test synchronization only; production behavior is unchanged.
+
 ## 2026-10-22 — D2 routing test fixture protocol
 
 - 补齐两个局部 D2 路由测试替身的候选预留协议成员；如被实际调用则明确失败，不提供虚构资金权威。保留路由、真实 Store 发布、锁与清理断言；生产逻辑不变。

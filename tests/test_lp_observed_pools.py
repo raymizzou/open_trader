@@ -1269,6 +1269,27 @@ class AsyncPoolRig(PoolRig):
         self.dates[0]+=timedelta(seconds=seconds);self.now=self.utc()
         self.live.read_runtime.wake();self.scheduler.request_check()
 
+    def converge_current(self,predicate,*,timeout=4):
+        """After wake assertions, follow actual read deadlines to current proof."""
+        import time
+        end=time.monotonic()+timeout
+        while not predicate():
+            def progress():
+                status=self.live.read_runtime.status()
+                due=status['next_dependency_monotonic']
+                return (predicate() or (status['ready_count']==0
+                    and not any(scope['active'] for scope in status['scopes'])
+                    and status['observed_monotonic']>=self.seconds
+                    and due is not None and due>self.seconds))
+            self.pump(progress,timeout=max(0,end-time.monotonic()))
+            if predicate():return
+            status=self.live.read_runtime.status()
+            due=status['next_dependency_monotonic']
+            assert time.monotonic()<end,self.live.diagnostics()
+            if (status['ready_count']==0 and not any(scope['active'] for scope in status['scopes'])
+                    and due is not None and due>self.seconds):
+                self.tick(due-self.seconds)
+
     def cycle(self,*,pool=None,qualified=False):
         import time
         self.tick()
@@ -1509,7 +1530,7 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
                 assert order.terminal_proof.matched.state=='unknown'  # cancel ACK is not final fill
         assert sum(batch==('old-E',) for batch in rig.sdk.cancels)==1
         rig.tick()
-        rig.pump(lambda:next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-E').remaining.state=='known')
+        rig.converge_current(lambda:next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-E').remaining.state=='known')
         final=next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-E')
         assert final.terminal_proof.matched.value==Decimal('.5') and final.remaining.value==2
         for _ in range(3):rig.scheduler.run_due()
@@ -1626,7 +1647,7 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
         assert sum(batch==('old-E',) for batch in rig.sdk.cancels)==1
         http_release.set();rig.http_gate=None
         rig.tick()
-        rig.pump(lambda:next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-E').remaining.state=='known')
+        rig.converge_current(lambda:next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-E').remaining.state=='known')
         final=next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-E')
         assert final.terminal_proof.matched.value==Decimal('.5') and final.remaining.value==2
         for _ in range(3):rig.scheduler.run_due()
@@ -1800,7 +1821,8 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
         # Actual external account coverage, rather than a cancel ACK or pool
         # classification, keeps the manual capital and its same-market slot.
         rig.tick()
-        rig.pump(lambda:rig.live.state.snapshot().observation.components['open_orders'].checked_at==rig.utc())
+        rig.converge_current(lambda:rig.live.state.snapshot().observation.components['open_orders'].checked_at==rig.utc()
+            and rig.live.state.snapshot().observation.read_ticket.trade_version_at_start==rig.live.state.snapshot().trade_version)
         snapshot=rig.live.state.snapshot()
         assert snapshot.buy_reserved.value==Decimal('5')+sum((capital for _,capital in expected),Decimal(0))
         assert len([o for o in snapshot.active_orders if o.key[1]==rig.cid(manual_market)])==1
@@ -2052,7 +2074,7 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
         assert rig.sdk.posts==rig.sdk.market_orders==[]
         http_release.set();rig.http_gate=None
         rig.tick()
-        rig.pump(lambda:next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-J').remaining.state=='known')
+        rig.converge_current(lambda:next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-J').remaining.state=='known')
         final=next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-J')
         assert final.terminal_proof.matched.value==Decimal('.5') and final.remaining.value==2
         assert sum(batch==('old-J',) for batch in rig.sdk.cancels)==1
@@ -2157,3 +2179,81 @@ def test_observed_pool_mode_exit_preserves_trading_guard_and_versions(tmp_path,m
                 assert document['allocation_mode']==patch['allocation_mode']
                 assert document['budget_usd']=='20' and document['target_buy_count']==3
     finally:rig.close()
+
+
+@pytest.mark.parametrize('case,source',[
+    ('group','open_orders'),('early','open_orders'),('last','open_orders'),
+    ('manual-A','open_orders'),('manual-C','open_orders'),('manual-D','open_orders'),
+    ('group','order'),('early','order'),('last','order'),
+])
+def test_pool_postreceipt_observation_waits_for_external_publication(
+        tmp_path,monkeypatch,case,source,pool_async_watchdog,request):
+    """Delay actual HTTP bytes; keep the original six assertion sequences."""
+    import asyncio,sys
+    from threading import Event
+    target='old-J' if case=='last' else 'old-E'
+    rigs=[]
+    class ScheduledRig(AsyncPoolRig):
+        def __init__(self,*args,**kwargs):
+            self.proof_entered,self.proof_release=Event(),Event()
+            self.proof_checks=[]
+            super().__init__(*args,**kwargs)
+            rigs.append(self)
+
+        async def http(self,req):
+            response=await super().http(req)
+            canceled=(target in self.history and self.history[target]['status']=='CANCELED')
+            after_receipt=bool(self.sdk.posts) if case.startswith('manual-') else canceled
+            if (after_receipt and req.headers['x-lp-source']==source
+                    and (source!='order' or req.headers['x-lp-order']==target)
+                    and not self.proof_release.is_set()):
+                self.proof_entered.set()
+                assert await asyncio.get_running_loop().run_in_executor(
+                    None,self.proof_release.wait,4),'external proof publication watchdog'
+            return response
+
+        def converge_current(self,predicate,*,timeout=4):
+            stamp=self.seconds
+            self.pump(self.proof_entered.is_set)
+            snapshot=self.live.state.snapshot()
+            if source=='order':
+                partial=next(o for o in snapshot.orders if o.key[3]==target)
+                assert partial.remaining.state=='unknown'
+                assert partial.terminal_proof.matched.state=='unknown'
+            else:
+                observation=snapshot.observation
+                assert (observation.components['open_orders'].checked_at!=self.utc()
+                    or observation.read_ticket.trade_version_at_start!=snapshot.trade_version)
+                assert snapshot.new_capacity.state=='unknown'
+            assert self.seconds==stamp  # held proof cannot authorize finality/funds
+            self.proof_release.set()
+            def published_or_next_read():
+                status=self.live.read_runtime.status()
+                due=status['next_dependency_monotonic']
+                return (predicate() or (status['ready_count']==0
+                    and not any(scope['active'] for scope in status['scopes'])
+                    and status['observed_monotonic']>=self.seconds
+                    and due is not None and due>self.seconds))
+            self.pump(published_or_next_read)
+            status=self.live.read_runtime.status()
+            # If the result is stale, a fixed-clock pump has no runnable read.
+            self.proof_checks.append((source,stamp,predicate(),status['next_dependency_monotonic']))
+            super().converge_current(predicate,timeout=timeout)
+
+        def close(self):
+            self.proof_release.set()
+            super().close()
+
+    monkeypatch.setattr(sys.modules[__name__],'AsyncPoolRig',ScheduledRig)
+    if case.startswith('manual-'):
+        test_income_rebuild_preserves_unclassified_same_market_orders(
+            tmp_path,monkeypatch,case[-1],pool_async_watchdog)
+    else:
+        original={
+            'group':test_pool_group_cancel_wakes_deferred_async_protection,
+            'early':test_pool_group_completion_preserves_early_wake_until_physical_exit,
+            'last':test_last_pool_group_exit_keeps_deferred_protection_runnable,
+        }[case]
+        original(tmp_path,monkeypatch,pool_async_watchdog)
+    assert len(rigs)==1 and len(rigs[0].proof_checks)==1
+    request.node.user_properties.append(('external_proof_boundary',repr(rigs[0].proof_checks)))
