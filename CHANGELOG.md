@@ -3,6 +3,10 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-22
+
+- 完整 backend/portable CI 改为仅在最终 main push 执行，后续 main SHA 不取消较早运行。用户明确授权的无冲突 PR 经 expected-head 核对后合并，不再等待 feature/PR CI 或仅为 main 新鲜度重整分支；独立审查、反馈与缺陷修复仍由 Main 持续负责，合后修复走新 PR。服务端只移除 main required-status 规则，PR/禁止强推与删除/tag 保护已读回保留；离线定向验证覆盖事件、安全、required fail-closed、optional 独立与部署身份合同。失败 main SHA 不可部署，部署仍需该 SHA 的可信成功 CI、完整证据及独立授权；未声称线上 CI 结果、节时数或已部署。
+
 ## 2026-10-21
 
 - LP 冷启动 UNKNOWN 依赖期限回归为受监督子进程使用测试独占的 pytest 临时命名空间，避免其清理无关历史目录；保留正常清理、原 30 秒监督和全部业务断言。受控历史目录、正常及独立并发验证不涉及生产逻辑；历史 P20 超时的确切原因仍未知，未部署。

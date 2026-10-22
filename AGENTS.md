@@ -119,13 +119,16 @@ focused diagnosis and is not a prerequisite to task-branch publication.
 
 GitHub CI runs all four backend services (`gateway`, `legacy`, `account`,
 `prediction`) with `TEST_N_LEG=0` and the explicit permanent N-leg retirement
-manifest on every branch push and every PR targeting
-`main`, including the final merged-main push. Documentation-only, LP-only,
+manifest on every final GitHub `main` push. Feature pushes, PR events and tag
+pushes do not trigger this workflow. No workflow concurrency group cancels or
+replaces another main SHA's run. Documentation-only, LP-only,
 trend-only, and missing-diff cases have the same active backend coverage, excluding
-`pressure` and `browser`. Push-head and PR-merge runs intentionally test distinct
-SHA identities. Before first publication, complete applicable focused local
-checks; independent review follows publication. Inspect exact-SHA CI before
-requesting merge approval.
+`pressure` and `browser`. Before first publication, complete applicable focused
+local checks; independent review follows publication and continues alongside
+delivery. After merge, Main records the final SHA and actual CI run, attempt and
+result. Merge success is not CI success. Failed, cancelled or missing CI stays
+visible; Main diagnoses it and proposes a scoped repair/revert through a new PR.
+No automatic main write, revert, retry-until-green or deployment is authorized.
 Deployment Preflight runs only for a selected final GitHub `main` SHA during an
 explicitly authorized deployment. It reuses trusted exact-SHA main-push CI and
 checks immutable source/lock/runtime identity; it never reruns backend tests.
@@ -144,7 +147,7 @@ forward wrapper in [deployment-preflight.md](docs/operations/deployment-prefligh
 with fresh Host Readiness before installation and Production Smoke afterward.
 Missing or mismatched evidence blocks deployment; no automatic full-test retry.
 Existing authorized compatible rollback procedures remain separate.
-Exact-SHA evidence, rebase, exception, and deployment rules still apply.
+Exact-SHA evidence, conflict-resolution, exception and deployment rules still apply.
 
 ## Test design and stability
 
@@ -179,15 +182,18 @@ the exact task files. For an unpublished local-only review, stage those files
 and use `git diff --cached`. After publication, pin the base and head SHAs and review
 `git diff <base>...<head>`; read-only PR review requires no staging or file edits.
 After any post-review change, rerun relevant verification; Main stages, commits
-and pushes only the task changes to the same PR, then refresh independent review.
+and pushes only the task changes to the same open PR, then refresh independent review.
+After merge, repairs require a new isolated branch and PR, with the existing
+publication authorization and separate user authorization for that PR's merge.
 For unpublished local-only work, restage only task files and refresh staged review
 without publishing.
 Use a fresh independent reviewer for the initial review; reuse that reviewer
 for in-scope repairs against the updated published head/base. A
-new reviewer is needed when scope or architecture changes. If GitHub `main`
-advances, fetch and rebase task commits onto `origin/main`, then rerun required
-worktree checks and review. A rebase or conflict resolution that changes behavior,
-scope, risk, or architecture requires a new approved plan. Mechanical resolutions
+new reviewer is needed when scope or architecture changes. A newer GitHub `main`
+alone does not require a rebase, merge back into the task branch, push or rerun
+solely for CI freshness. Resolve actual conflicts within scope. A rebase or
+conflict resolution that changes behavior, scope, risk or architecture requires
+a new approved plan. Mechanical resolutions
 that preserve these may proceed within approved scope, with required checks and
 independent review. Under the standing 2026-10-09 user authorization scoped to
 `raymizzou/open_trader`, Main must promptly push the task branch and create a
@@ -207,8 +213,8 @@ closure, final acceptance or merge; an unavailable reviewer does not delay it.
 Report actual publication/access failures. Verify the remote PR URL and exact
 head/base, and record checks and pending review status. Publication is a review
 handoff, not approval or readiness; claim dots has started only with observed evidence.
-Immediately start a separate Herdr independent reviewer pane alongside
-CI; verify actual startup and keep review and CI status separate. Pin issue scope, PR
+Immediately start a separate Herdr independent reviewer pane after publication;
+verify actual startup and keep review and post-merge CI status separate. Pin issue scope, PR
 URL, head/base SHAs and verification; unavailable prerequisites are blockers,
 not completed reviews. Follow the
 [authorized PR delivery loop](docs/operations/agent-verification.md#authorized-pr-delivery-loop)
@@ -219,14 +225,20 @@ inline threads and conversation comments against the latest PR/head/base, with
 complete pagination and fresh CI/mergeability. Record thread resolved/unresolved
 state and comment dispositions; report outstanding feedback with URL, blocking
 decision and owner. Keep ownership until the defined handoff or recorded stopping
-condition. Review-ready handoff requires completed required
-reviews, no known unresolved blockers, fresh feedback/mergeability checks and
-successful applicable push-head and PR-merge `required` checks from GitHub Actions
-(app ID 15368). Then obtain explicit user approval
-before merging on GitHub. Do not integrate through local `main` or direct push.
+condition. Completed review and repaired blockers remain Main's responsibility;
+report unfinished review, feedback and verification accurately. After explicit
+authorization for that PR's merge, verify repository, base `main`, open state,
+expected head SHA and absence of conflicts, then merge through GitHub with the
+expected head. Unknown mergeability needs a bounded metadata refresh; an actual
+conflict needs scoped resolution. Do not wait for feature-push/PR-merge CI,
+pending independent review/dots or an old review-ready/full-acceptance label.
+These ongoing duties do not create a replacement premerge wait. Do not integrate
+through local `main` or direct push.
 See [CI identity](docs/operations/ci.md) and the
-[proposed repository protections](docs/operations/repository-protection.md);
-documented settings are not evidence that protection is enabled.
+[repository protections](docs/operations/repository-protection.md); use dated
+read-back evidence for settings. Old feature branches can still carry workflows
+that trigger extra runs during migration; do not synchronize or push solely to
+remove those runs, or wait for them.
 
 ## OpenTrader PR review publication
 
@@ -241,13 +253,16 @@ pre-publication staged reviews stay local.
 ## Delivery boundaries
 
 Task-branch commits/pushes and PR creation/updates, including in-scope repair
-commits to the same PR, have the standing authorization above. Workers and
+commits to the same open PR, have the standing authorization above. After merge,
+repairs use the new-PR route described above. Workers and
 reviewers retain their Git boundaries; Main owns publication. This grants no
 force-push, direct `main` push, automatic merge or deployment authority.
 GitHub merge, release/tag creation, and deployment remain separate actions
 requiring their applicable explicit authorization. A merged PR
 does not release or deploy. Neither PR-head checks nor GitHub's synthetic PR
 merge SHA substitute for trusted main-push CI evidence on the selected final GitHub `main` SHA.
+A failed main SHA cannot be deployed and does not change running production.
+An older main ancestor needs its own valid evidence when selected for deployment.
 
 Screenshots are optional unless requested. Clean up only after GitHub merge,
 user confirmation, and a clean worktree; never delete a dirty worktree.

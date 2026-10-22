@@ -1,91 +1,103 @@
-# Proposed repository protections (not active)
+# Repository protections and dated read-back
 
-This is the design for a separately approved settings change after the PR-first
-workflow documentation is reviewed. It does **not** enable rules, authorize a
-settings write, grant persistent access, create a tag/release, merge, or deploy.
-The documentation stage does not complete the repository-protection rollout.
+This document records settings for `raymizzou/open_trader`; it does not authorize
+settings writes, a PR merge, tag/release creation or deployment. Future changes
+need applicable settings authorization and exact read-back. The current delivery
+policy is in [AGENTS.md](../../AGENTS.md) and the
+[agent verification runbook](agent-verification.md).
 
-## Observed baseline, 2026-09-30
+## Historical baseline, 2026-09-30
 
-Read-only GitHub evidence for `raymizzou/open_trader` showed an empty repository
-ruleset list and `main` with `protected: false`. The detailed branch-protection
-GET returned 403 because this GitHub App connection has no administration
-access; that endpoint's configuration is unknown, not independently verified
-as empty. No protection-setting write capability was available. Re-read actual
-settings before implementation; this snapshot is not an ongoing guarantee.
-The immutable-release setting has not been established and is outside this stage.
+The read-only snapshot on this date showed an empty repository ruleset list and
+`main` with `protected: false`. The detailed branch-protection GET returned 403
+because that GitHub App connection lacked administration access. That endpoint
+was UNKNOWN, not independently verified as empty. This is historical evidence,
+not the current settings. Immutable-release settings have not been established
+and remain outside this change.
 
-The current [CI workflow](../../.github/workflows/ci.yml) uses workflow name `CI`
-and aggregate job `required`. The actual check-run name is exactly `required`,
-from the GitHub Actions app, ID **15368**. The UI's `CI / required` display is
-not the API context string. This identity was verified on main commit
-`0e887e5f4f3cfaa17bfd0e34e0f05174d63fb147` in the
-[successful aggregate job](https://github.com/raymizzou/open_trader/actions/runs/36725393989/job/109924939065).
+## Verified settings, 2026-10-22
 
-## Proposed main ruleset
+The three repository rulesets below were active before this change, with creation
+dates of 2026-10-02. Under the user-approved `CI-MERGE-RULES-20261022` plan, Main
+removed only the `required_status_checks` object from main ruleset **24349214**.
+Before/after snapshots and field comparison were verified at
+**2026-10-22T01:20:19Z**. All other main fields/rules and both complete tag
+rulesets were preserved. No bypass was added and no ruleset was disabled.
 
-Target only `refs/heads/main` and require:
+The removed object required context `required` from GitHub Actions app **15368**,
+with `strict_required_status_checks_policy: true` and
+`do_not_enforce_on_create: false`. Merely setting strict to false would still
+require status success; removing this object implements the approved policy of
+merging without waiting for feature-push or synthetic PR-merge CI.
 
-- A pull request before merging; no task integration through local main or
-  direct push. Keep the explicit user merge-approval boundary in the
-  [agent verification runbook](agent-verification.md)
-- Required status check context **`required`**, source **GitHub Actions**,
-  integration/app ID **15368**; require branches to be up to date before merging
-  (`strict_required_status_checks_policy: true` in a ruleset). Bind the source,
-  rather than accepting a same-named status from another app
-- **Zero mandatory second-person GitHub approvals** for this single-maintainer
-  workflow. This avoids requiring another GitHub account; it does not remove
-  fresh independent agent review of the staged diff, re-review after changes,
-  or the user's explicit merge approval
-- Block force pushes and branch deletion, with no default bypass actors or
-  administrator bypass. Do not grant a bot, app, team or user bypass merely to
-  make an otherwise blocked operation succeed
+An authenticated `gh` GET of traditional `branches/main/protection` returned
+**404, Branch not protected**. This resolves the earlier connection's 403 access
+limit for that endpoint; it does not mean repository rulesets are off. These
+are dated read-back facts, not an indefinite guarantee of future settings.
 
-Confirm the actual UI/API representation and selected enforcement mode during
-implementation. Do not require a guessed `CI / required` context or all
-individual service checks: the aggregate enforces success of all four backend
-services with `TEST_N_LEG=0` and the [permanent retirement manifest](ci-nleg-retirement.md),
-and requires the retained standalone trend-curve job
-to be skipped because legacy includes its tests. Test that stale/missing/failed
-aggregate evidence blocks merge and that an up-to-date documentation-only PR
-satisfies the aggregate only after the same active backend checks. Every branch
-push, PR-to-main merge candidate and merged-main push receives this coverage;
-push-head and PR-merge runs intentionally verify distinct SHA identities. Do not
-weaken CI coverage to satisfy a rule.
+### Main: 24349214, `main-pr-and-ci`
 
-## Proposed tag controls: creation versus immutability
+- Target `branch`, enforcement `active`, include only `refs/heads/main`, exclude
+  none; `bypass_actors=[]`.
+- Rules retained: `deletion`, `non_fast_forward` and `pull_request`. Keep the
+  PR-only route; no local-main integration, direct main push, force-push or
+  deletion. A newer main alone does not require feature-branch synchronization.
+- PR parameters retained: `required_approving_review_count=0`,
+  `dismiss_stale_reviews_on_push=false`, `required_reviewers=[]`,
+  `require_code_owner_review=false`, `require_last_push_approval=false`,
+  `required_review_thread_resolution=false`, and
+  `require_extra_approval_for_unattributed_changes=false`.
+  Allowed merge methods remain `merge`, `squash`, `rebase`.
+- No required-status rule remains in this ruleset. The name is unchanged;
+  its historical `ci` suffix does not create a current status requirement.
 
-Keep the two purposes in separate tag rulesets targeting `refs/tags/v*`:
+Zero mandatory GitHub approvals does not remove required independent agent
+review, complete feedback collection or reproducible blocker repair. Main owns
+and reports that work alongside delivery. After explicit authorization for that
+PR's merge, verify repository/base `main`, open state, expected head and absence
+of conflicts, then merge through GitHub with the expected head. Unknown
+mergeability needs a bounded metadata refresh; actual conflicts need scoped
+resolution. Do not wait for feature/PR CI, pending review/dots or an old
+review-ready/full-acceptance label. These duties do not create a replacement
+premerge waiting gate. Repairs after merge require a new isolated branch and PR,
+with separate merge authorization.
 
-1. **Immutable existing tags:** prohibit updates and deletion, with no default
-   bypass. This applies even to whoever is permitted to create a release tag
-2. **Restricted tag creation:** restrict creation to an explicitly selected
-   release creator through the applicable creation-rule allowance/bypass. The
-   user must choose that actor and approve its exact scope before activation.
-   A creation-only allowance must not bypass the separate update/delete rules
+### Tags: creation and immutability remain separate
 
-The release creator has **not** been selected. Do not silently choose the agent,
-a broad administrator role, or the repository owner, and do not activate a
-creation restriction that would leave no approved release path. Tag creation
-permission does not authorize a particular tag/release or deployment. Tags must
-identify a deliberately selected final GitHub main SHA under the release process;
-PR head or synthetic merge commits are not deployment acceptance evidence.
+Both tag rulesets remain active and target only `refs/tags/v*`, with no excludes:
 
-## Activation and verification handoff
+| ID / name | Retained rules | Retained bypass actors |
+| --- | --- | --- |
+| 24349247 / `release-tags-immutable` | `deletion`, `update` | none |
+| 24349295 / `release-tags-raymizzou-create` | `creation` | User **156103254**, mode `always` |
 
-After documentation review, present the exact main and tag rules, actor choice,
-and resulting access/merge consequences for separate user approval. If the
-current connection still cannot administer rules, have the user perform the
-settings change through an approved GitHub flow; do not expand credentials or
-permissions merely to bypass that limit. No setting is active until read-back
-confirms its target, enforcement, check context/source and bypass list.
+The creation actor is an existing observed setting, not a new selection by this
+change. Its creation-only allowance does not bypass the separate update/delete
+ruleset. Tag creation permission does not authorize any particular tag/release
+or deployment. Tags must identify a deliberately selected final GitHub main SHA
+under the release process.
 
-Verify the configured policy and observed merge eligibility without actually
-merging, force-pushing, deleting refs, or deploying as a probe. Record any checks
-that cannot be demonstrated as UNKNOWN. Record the approved recovery path before
-activation; changes to rules or exceptions require their own authorization.
-Historical plans/reports remain preserved; current delivery instructions are in
-[AGENTS.md](../../AGENTS.md) and [agent-verification.md](agent-verification.md).
+## CI and deployment evidence
+
+[CI](ci.md) now runs all four backend services plus non-LIVE portable scenarios
+on each final main push, including documentation-only and unavailable/empty diff
+cases. There are no feature/PR triggers or cross-SHA concurrency cancellation.
+Old feature branches may still carry their old workflows during migration; do
+not synchronize/push solely to remove those runs, or wait for them.
+
+The aggregate API check-run name remains exactly **`required`**, emitted by
+**GitHub Actions**, app ID **15368**; the UI display `CI / required` is not the API
+context. Main records each final SHA, run/attempt and actual result. Merge success
+is not CI success. Failed, cancelled or missing results stay visible; Main owns
+focused diagnosis and a scoped repair/revert proposal through PRs, without
+automatic main writes, revert, retry-until-green or deployment.
+
+Deployment still needs successful trusted exact-SHA main-push CI, complete
+required artifacts, source/lock/runtime verification, explicit deployment
+authorization, fresh Host Readiness and Production Smoke. A failed main SHA
+cannot be deployed and does not change running production. An older main ancestor
+needs its own valid evidence. Optional rollback advisory remains independent;
+retired classification and all other required tests remain unchanged.
 
 Official references: [available rules and source binding](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
 and [repository rules API](https://docs.github.com/en/rest/repos/rules).
