@@ -357,12 +357,23 @@ def test_position_sixty_second_cadence_retains_stop_loss_and_quantity(tmp_path,m
         scope=next(iter(live.state.snapshot().openings))
         assert live.state.snapshot().openings[scope].economics.opening_loss_usd.value==Decimal('4.94')
         boundary,clock=sdk_boundary(live,sdk,public,values)
+        initial_observation=live.state.snapshot().observation
         live.read_runtime=LPReadRuntime(boundary.factory,clock=clock,utc_now=clock.utc)
         start=clock()
         def position_ready():
             observation=live.state.snapshot().observation
-            return any(k.startswith('market_position:') and v.complete and v.checked_at==clock.utc()
-                for k,v in observation.source_frame.sources.items())
+            # Market projection alone can retain the prior financial observation.
+            return (observation is not None
+                and observation.account_id==initial_observation.account_id
+                and observation.process_epoch==initial_observation.process_epoch
+                and observation.cycle_generation==initial_observation.cycle_generation
+                and observation.observation_id!=initial_observation.observation_id
+                and all(k in observation.source_frame.sources
+                    and observation.source_frame.sources[k].complete
+                    and observation.source_frame.sources[k].checked_at==clock.utc()
+                    for k in ('balance','open_orders','positions'))
+                and any(k.startswith('market_position:') and v.complete and v.checked_at==clock.utc()
+                    for k,v in observation.source_frame.sources.items()))
         pump_live(live,boundary,lambda:position_ready() and not any(s['active'] for s in live.read_runtime.status()['scopes']))
         values[0]=start+59;public.bid=Decimal('.25');live.read_runtime.wake()
         pump_live(live,boundary,lambda:live.state.snapshot().observation.order_view.orders_source.checked_at==clock.utc()
