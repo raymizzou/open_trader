@@ -11,6 +11,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - CI now supports a main-only manual run with the same four backend partitions, portable scenarios and retirement coverage. Deployment Preflight selects the newest exact-SHA push or manual run and binds artifacts to its real event; newer unsuccessful runs block older green evidence. Focused offline trust and workflow checks cover this path. No deployment in this change.
 
+- LP 服务日志补充选定奖励、账户读取/发布与入场发送/回执应用的脱敏诊断，区分失败、正常等待及同作用域恢复，并保留首次/最近原因和尝试关联。Dashboard 旧读取及缓存、无效奖励事实、规划快照复用或账户恢复不能清除较新失败或改写 UNKNOWN 订单；奖励来源各自验证后恢复，混合配置、身份或资产错误仍保留身份无歧义的 native USD 下界以检查 combined 一致性；冲突配置 ID 和同条件整行的贡献不作证据，相同重复仍去重，顺序不再改变诊断，业务 UNKNOWN 与原因顺序不变；交错组件按阶段独立聚合重复日志并保留被抑制计数；日志队列及进程内记录有界，溢出与重启不保证连续历史。离线定向验证覆盖发送审计、防重、不可变订单、并发顺序及阻塞/异常日志输出；Dashboard、交易规则和 JSON/CLI 不变，未部署。
+
 - Retirement CI fixtures now separate the permanently paused service from explicit unpaused library observer diagnostics at both reader fences. Dedicated runtime-only tests retain the native writer and owner until actual shutdown completes. Offline fence, incident, startup-drain and controlled concurrent regressions preserve fail-before-write, no-replay and exact cancellation assertions; new CI remains pending. No production change or deployment.
 
 - Cloud SSM status/Smoke now bind the requested N-leg setting to the release record, installed unit, loaded environment and process environment while retaining effective pause. Old SSM evidence without the configured marker requires the existing separately authorized install/start workflow. File/disabled units remain byte-identical. Eight offline substitution regressions and affected consumers verify this identity repair; not deployed.
