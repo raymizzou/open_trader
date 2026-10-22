@@ -1,20 +1,16 @@
 name: CI
 
 on:
-  pull_request:
-    branches: [main]
   push:
-    branches: ['**']
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
   plan:
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -30,7 +26,7 @@ jobs:
       - name: Plan active backend checks
         id: route
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          BASE_SHA: ${{ github.event.before }}
         run: python3 scripts/ci_plan.py plan
 
   gateway:
@@ -173,7 +169,7 @@ jobs:
 
   required:
     name: required
-    if: always()
+    if: always() && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
     needs: [plan, gateway, legacy, account, prediction, portable, trend_curve]
     runs-on: ubuntu-24.04
     timeout-minutes: 5

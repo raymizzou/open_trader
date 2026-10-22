@@ -782,12 +782,17 @@ class _D2MutationLease:
             return
         self.released = True
         execution = self.execution
+        manual_released = False
         with execution._lp_d2_lease_lock:
             execution._lp_d2_lease_users -= 1
             if execution._lp_d2_lease_users == 0:
                 lock, execution._lp_d2_lease = execution._lp_d2_lease, None
+                manual_released = (self.action == 'MANUAL_BUY'
+                    and execution._lp_d2_manual_lease and lock is not None)
                 execution._lp_d2_manual_lease = False
                 execution._release_global_lock(lock)
+        if manual_released:
+            execution._lp_d2.notify_manual_lease_released()
 
 
 class PredictionExecutionService:
@@ -1071,7 +1076,7 @@ class PredictionExecutionService:
                 pending_settings=policy_view(settings['requested']) if settings['pending'] else None,
                 settings_pending=settings['pending'], settings_native_inflight=settings['native_inflight'],
                 settings_error=settings['error'], effective_round_interval_seconds=None,
-                check_interval_seconds=None, cycle_mode='continuous')
+                check_interval_seconds=None, cycle_mode='continuous',plan_wait=live.status()['plan_wait'])
             if observed_pools is not None: result['observed_pools'] = observed_pools
             result['diagnostics'] = diagnostic_view('iteration', live.diagnostics)
             result['diagnostics']['rotation'] = diagnostic_view('rotation', live.rotation_diagnostics)
@@ -1088,6 +1093,7 @@ class PredictionExecutionService:
     def set_lp_auto_wakeup(self, wakeup):
         if self._lp_d2 is not None:
             self._lp.set_candidate_preparation_wakeup(wakeup)
+            self._lp_d2.set_read_wakeup(wakeup)
         elif self._lp is not None:
             self._lp._facts_wakeup = wakeup
 

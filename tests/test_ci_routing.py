@@ -1,9 +1,11 @@
 """Portable tests for service routing and the fail-closed required check."""
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -11,6 +13,15 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('ci_plan', ROOT / 'scripts/ci_plan.py')
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
+
+
+# Independently supplied reviewed identities, not derived from ci_plan.policy().
+OPTIONAL_SUMMARY = {
+    'policy': 'release-advisory-v1',
+    'manifest_sha256': '93bfa67f74468df58c25af1062fcdbb88f809b149d2f564969ea05e3d163d485',
+    'optional_count': 224,
+    'optional_sha256': '913655864de870f8f83f9e59695840d42bee775b49c3dbc535a7105698b2c82d',
+}
 
 
 class RoutingTests(unittest.TestCase):
@@ -86,6 +97,57 @@ class RoutingTests(unittest.TestCase):
                              'src/open_trader/frontend_gateway.py', 'unknown\nfile.txt'})
             self.assertEqual(ci.route(paths)['test_n_leg'], '0')
 
+    def test_plan_output_uses_only_fingerprinted_optional_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            def git(*args):
+                return subprocess.check_output(['git', '-C', tmp, *args], text=True).strip()
+            git('init', '-q'); git('config', 'user.name', 'Test')
+            git('config', 'user.email', 'test@example.invalid')
+            (root/'README.md').write_text('base')
+            git('add', '.'); git('commit', '-qm', 'base')
+            base = git('rev-parse', 'HEAD')
+            (root/'README.md').write_text('documentation change')
+            git('add', '.'); git('commit', '-qm', 'candidate')
+            head = git('rev-parse', 'HEAD')
+            output, summary = root/'output', root/'summary'
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', GITHUB_EVENT_NAME='push',
+                       BASE_SHA=base, GITHUB_SHA=head, GITHUB_OUTPUT=str(output),
+                       GITHUB_STEP_SUMMARY=str(summary))
+            run = subprocess.run([sys.executable, '-B', str(ROOT/'scripts/ci_plan.py'), 'plan'],
+                                 cwd=root, env=env, text=True, capture_output=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            plan = json.loads(run.stdout)
+            self.assertEqual(set(plan['optional_policy']), set(OPTIONAL_SUMMARY))
+            self.assertEqual(plan['optional_policy'], OPTIONAL_SUMMARY)
+            self.assertEqual(plan['scopes'], ['gateway', 'legacy', 'account', 'prediction', 'portable'])
+            self.assertEqual(plan['test_n_leg'], '0')
+            self.assertEqual(plan['policy'], 'permanent-nleg-retirement-v1')
+            self.assertEqual(plan['retirement_reason'], 'N-leg permanently retired')
+            self.assertEqual(plan['sha'], head)
+            self.assertEqual(plan['base_sha'], base)
+            self.assertEqual(plan['changed_paths'], ['README.md'])
+            exported = output.read_text()
+            self.assertEqual(json.loads(exported.removeprefix('plan=')), plan)
+            self.assertIn(head, summary.read_text())
+            manifest = ROOT/'scripts/ci_optional_tests.json'
+            self.assertEqual(hashlib.sha256(manifest.read_bytes()).hexdigest(), OPTIONAL_SUMMARY['manifest_sha256'])
+            nodes = json.loads(manifest.read_text())['optional']
+            self.assertEqual(len(nodes), 224)
+            self.assertEqual(hashlib.sha256(json.dumps(sorted(nodes), separators=(',', ':')).encode()).hexdigest(),
+                             OPTIONAL_SUMMARY['optional_sha256'])
+            spec = importlib.util.spec_from_file_location('artifact_ci_policy', ROOT/'scripts/ci_evidence.py')
+            artifact = importlib.util.module_from_spec(spec); spec.loader.exec_module(artifact)
+            self.assertEqual(artifact.optional_policy(ROOT), {
+                'policy': 'release-advisory-v1', 'manifest_sha256': OPTIONAL_SUMMARY['manifest_sha256'],
+                'optional_nodeids': nodes})
+            # This proves the output content contract, not GitHub's hosted secret scanner.
+            for text in (run.stdout, exported):
+                self.assertNotIn('optional_nodeids', text)
+                for node in nodes:
+                    self.assertNotIn(node, text)
+                    self.assertNotIn(node.split('::', 1)[1], text)
+
     def test_plan_cli_exact_candidate_and_unavailable_diff(self):
         with tempfile.TemporaryDirectory() as tmp:
             def git(*args):
@@ -102,6 +164,7 @@ class RoutingTests(unittest.TestCase):
             for event, before, expected_paths in [
                 ('push', base, ['README.md']),
                 ('pull_request', base, ['README.md']),
+                ('workflow_dispatch', '', []),
                 ('push', '0' * 40, []),
                 ('push', '', []),
                 ('push', 'f' * 40, []),
@@ -113,7 +176,7 @@ class RoutingTests(unittest.TestCase):
                     env = dict(os.environ, GITHUB_EVENT_NAME=event, BASE_SHA=before,
                                GITHUB_SHA=head, GITHUB_OUTPUT=str(output),
                                GITHUB_STEP_SUMMARY=str(summary))
-                    run = subprocess.run(['python3', str(ROOT / 'scripts/ci_plan.py'), 'plan'],
+                    run = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/ci_plan.py'), 'plan'],
                                          cwd=tmp, env=env, text=True, capture_output=True)
                     self.assertEqual(run.returncode, 0, run.stderr)
                     plan = json.loads(run.stdout)
@@ -126,7 +189,7 @@ class RoutingTests(unittest.TestCase):
                     self.assertIn(head, summary.read_text())
             output.write_text(''); summary.write_text('')
             env['GITHUB_SHA'] = base
-            run = subprocess.run(['python3', str(ROOT / 'scripts/ci_plan.py'), 'plan'],
+            run = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/ci_plan.py'), 'plan'],
                                  cwd=tmp, env=env, text=True, capture_output=True)
             self.assertNotEqual(run.returncode, 0)
             self.assertIn('checkout SHA does not match', run.stderr)
@@ -139,6 +202,42 @@ class RequiredTests(unittest.TestCase):
         needs = {'plan': {'result': 'success', 'outputs': {'plan': json.dumps(plan)}}}
         needs.update({scope.replace('-', '_'): {'result': 'success' if scope in plan['scopes'] else 'skipped'} for scope in ci.SCOPES})
         return needs
+
+    def test_optional_plan_summary_tampering_fails_closed(self):
+        needs = self.needs([])
+        plan = json.loads(needs['plan']['outputs']['plan'])
+        self.assertEqual(plan['optional_policy'], OPTIONAL_SUMMARY)
+        self.assertTrue(ci.required(needs)[0])
+        mutations = [
+            ('policy', {**OPTIONAL_SUMMARY, 'policy': 'unreviewed'}),
+            ('manifest_hash', {**OPTIONAL_SUMMARY, 'manifest_sha256': '0'*64}),
+            ('count', {**OPTIONAL_SUMMARY, 'optional_count': 223}),
+            ('node_set_hash', {**OPTIONAL_SUMMARY, 'optional_sha256': '0'*64}),
+            ('full_nodeids', {**OPTIONAL_SUMMARY, 'optional_nodeids':
+                             json.loads((ROOT/'scripts/ci_optional_tests.json').read_text())['optional']}),
+            ('unknown_field', {**OPTIONAL_SUMMARY, 'unknown': True}),
+        ]
+        mutations.extend(('missing_'+field, {key: value for key, value in OPTIONAL_SUMMARY.items() if key != field})
+                         for field in OPTIONAL_SUMMARY)
+        for name, optional in mutations:
+            with self.subTest(mutation=name):
+                candidate = self.needs([])
+                changed = json.loads(candidate['plan']['outputs']['plan'])
+                changed['optional_policy'] = optional
+                candidate['plan']['outputs']['plan'] = json.dumps(changed)
+                self.assertFalse(ci.required(candidate)[0], name)
+        for scope in ('gateway', 'legacy', 'account', 'prediction', 'portable'):
+            for result in ('failure', 'cancelled', 'skipped'):
+                with self.subTest(scope=scope, result=result):
+                    candidate = self.needs([])
+                    candidate[scope]['result'] = result
+                    self.assertFalse(ci.required(candidate)[0])
+            candidate = self.needs([]); del candidate[scope]
+            self.assertFalse(ci.required(candidate)[0], scope)
+        candidate = self.needs([]); del candidate['plan']
+        self.assertFalse(ci.required(candidate)[0])
+        candidate = self.needs([]); del candidate['plan']['outputs']['plan']
+        self.assertFalse(ci.required(candidate)[0])
 
     def test_retired_policy_requires_every_active_job(self):
         needs = self.needs(['README.md'])
@@ -205,7 +304,7 @@ class RequiredTests(unittest.TestCase):
     def test_cli_injected_failure_returns_nonzero(self):
         needs = self.needs(['src/open_trader/account_api.py'])
         needs['account']['result'] = 'failure'
-        run = subprocess.run(['python3', str(ROOT / 'scripts/ci_plan.py'), 'required'],
+        run = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/ci_plan.py'), 'required'],
                              input=json.dumps(needs), text=True, capture_output=True)
         self.assertNotEqual(run.returncode, 0)
         self.assertIn('account', run.stdout)

@@ -148,7 +148,7 @@ def _prepare_qualified(frame, capture, policy, as_of):
 
 def _income_inputs(frame, directions, names, policy, as_of):
     """Measured entrants need current risk facts, independently of trial qualification."""
-    from .polymarket_lp_risk import evaluate_lp_entry
+    from .polymarket_lp_risk import evaluate_lp_entry, _freshness
     from .polymarket_lp_views import _next_review_at
     from .polymarket_lp import expiration_for_review
     account = _current_account(frame,as_of)
@@ -156,6 +156,13 @@ def _income_inputs(frame, directions, names, policy, as_of):
     for name in names:
         direction = directions.get(name)
         if not direction or not account.complete:
+            continue
+        try:
+            # Detached async market results retain the same book age as exact
+            # BUY results. Candidate qualification's longer inventory window
+            # cannot renew or relax this current market observation.
+            _freshness(direction['book'].get('received_at'),as_of,'book_freshness')
+        except (ValueError,TypeError):
             continue
         market = direction['market']
         token = market['token_id']
@@ -196,7 +203,7 @@ def prepare_current_inputs(frame, captured_candidates, policy, as_of, *, income_
         for n in income_sources)
     for order in (*frame.current_buys,*detached):
         condition, token = order['condition_id'], order['token_id']
-        source = frame.sources.get(f'market:{condition}:{token}')
+        source = frame.sources.get('market_order:'+order['order_id'],frame.sources.get(f'market:{condition}:{token}'))
         def dropped(code):
             failures[order['order_id']] = dict(order_id=order['order_id'],
                 account_id=frame.account, condition_id=condition, token_id=token,

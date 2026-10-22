@@ -326,4 +326,14 @@ all account BUY commitments constrain both. New income membership cancels the
 whole old group; cancellation acknowledgements do not free funds. Missing ranks
 and failed slots stay cash. UNKNOWN retains its request/hold and is never a replay
 instruction. Existing inventory, SELL, stop and protective cancellation continue.
-See [ADR 0006](../contexts/prediction-arbitrage/docs/adr/0006-lp-trial-and-income-pools.md).
+Detached results still require fresh owned async market and account facts.
+Incomplete reads, cleanup faults and expired samples grant no new BUY authority.
+Both pools share the existing read runtime, native cap2 and resource drain.
+Group cancel completion wakes deferred exact protection after its actual lease
+release. Status GET remains a memory snapshot.
+
+Only explicitly selected dual-pool configuration uses bounded pending-save
+confirmation reads. A legacy pending or unconfirmed config response stays
+`UNKNOWN` with exit2; it does not replay the write.
+
+See [ADR 0007](../contexts/prediction-arbitrage/docs/adr/0007-lp-trial-and-income-pools.md).

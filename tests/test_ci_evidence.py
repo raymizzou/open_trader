@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-OPTIONAL = ['tests/test_lp_d2_service_lifecycle.py::test_supported_rollback_uses_current_api_without_disposable_record_audit']
+OPTIONAL = json.loads((ROOT/'scripts/ci_optional_tests.json').read_text())['optional']
 
 
 def load(name):
@@ -34,12 +34,12 @@ class PartitionTests(unittest.TestCase):
         proof = module.verify_partition(complete, parts, retired, ROOT, OPTIONAL)
         self.assertEqual(proof['executed_count'], 5)
         self.assertEqual(proof['retired_count'], 1)
-        self.assertEqual(proof['complete_count'], 7)
+        self.assertEqual(proof['complete_count'], 230)
         self.assertEqual(proof['retired_status'], 'not-executed-permanent-retirement')
         nested = 'tests/nested/test_new.py::test_new'
         self.assertRaises(ValueError, module.verify_partition, complete + [nested], parts, retired, ROOT, OPTIONAL)
         expanded = {**parts, 'legacy': parts['legacy'] + [nested]}
-        self.assertEqual(module.verify_partition(complete+[nested], expanded, retired, ROOT, OPTIONAL)['complete_count'], 8)
+        self.assertEqual(module.verify_partition(complete+[nested], expanded, retired, ROOT, OPTIONAL)['complete_count'], 231)
         for universe, executed, omitted in [
             (complete, {**parts, 'prediction': parts['prediction'][:-1]}, retired),
             (complete + [complete[0]], parts, retired),
@@ -57,7 +57,7 @@ class PartitionTests(unittest.TestCase):
         complete = sum(parts.values(), []) + OPTIONAL
         proof = module.verify_partition(complete, parts, optional=OPTIONAL)
         self.assertEqual(proof['status'], 'success')
-        self.assertEqual(proof['complete_count'], 5)
+        self.assertEqual(proof['complete_count'], 228)
         self.assertEqual(proof['partition_count'], 4)
         self.assertEqual(proof['complete_sha256'], proof['coverage_sha256'])
         self.assertEqual(proof, module.verify_partition(list(reversed(complete)), parts, optional=OPTIONAL))
@@ -219,6 +219,13 @@ class EvidenceTests(unittest.TestCase):
             (directory/'selected-nodeids.json').write_text(json.dumps([node]))
             (directory/'junit.xml').write_text('<testsuites><testsuite tests="1" errors="0" failures="0" skipped="0"><testcase classname="acceptance.test_prediction_arbitrage_scenarios" name="test_ok" time="0.1"/></testsuite></testsuites>')
             evidence = module.build_evidence(ROOT, directory, 'portable', '0', 1, 0, env)
+            self.assertEqual(evidence['event_name'], 'push')
+            manual = module.build_evidence(ROOT, directory, 'portable', '0', 1, 0,
+                                           {**env, 'GITHUB_EVENT_NAME': 'workflow_dispatch'})
+            self.assertEqual(manual['event_name'], 'workflow_dispatch')
+            self.assertEqual(manual['ref'], 'refs/heads/main')
+            self.assertEqual(manual['workflow_ref'], 'raymizzou/open_trader/.github/workflows/ci.yml@refs/heads/main')
+            self.assertEqual(set(manual), set(evidence))
             self.assertEqual(evidence['policy'], module.retirement_policy(ROOT))
             self.assertEqual(evidence['policy']['manifest_sha256'], module.file_sha256(ROOT/'scripts/ci_nleg_retired.json'))
             self.assertEqual(evidence['test_n_leg'], '0')

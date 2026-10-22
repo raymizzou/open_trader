@@ -1,13 +1,56 @@
 # Changelog
 
+## 2026-10-22 — Explicit release-test advisory coverage
+
+- Export only the reviewed policy, manifest hash, count and node-set hash in the
+  cross-job CI plan. Full parameterized nodeids stay in source and artifacts;
+  required validation recomputes the summary and rejects tampering. Focused local
+  routing and stock-host verification cover the transport content contract;
+  hosted output acceptance still needs the subsequent natural push run.
+- Keep 224 reviewed release, installer and manager regression identities unchanged,
+  including the existing rollback case, and run them in Release advisory on main
+  pushes or manual invocation. New tests and parameter identities remain required.
+- Required CI and Deployment Preflight keep complete, disjoint coverage proof and
+  do not wait for advisory success. Financial/order, UNKNOWN, no-replay, current-API
+  handoff/restart, active drain, credential runtime and stopped data-recovery tests
+  remain required. Failure logs, JUnit, metrics and exact run identity are retained.
+
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
 ## 2026-10-22
 
+- LP dual-pool planning now composes with the owned async read runtime: detached samples require current market/account facts, both due pool opportunities survive read waits, and real group-cancel completion wakes exact deferred protection. Legacy unconfirmed CLI configuration remains UNKNOWN; role CAS writes use the existing database coordinator. Pool ADR moves to 0007 while async ADR 0006 is retained. Focused offline checks cover detached-source freshness, fair due work, cap2 completion, resource drain, exact protection and CLI/coordinator compatibility; exact command evidence is recorded separately. The original P214 and P301 TDD sequencing deviations remain disclosed. No production configuration, merge or deployment is implied.
+
 - LP Auto adds explicit independently budgeted trial and measured-income pools on the existing D2 account lane. Trial keeps model-ranked minimum-size entries; income compares attributable official hourly measurements for up to 120 seconds and uses fixed 50/30/20 weights. New membership rebuilds the old income group after real order release; partial failures keep successes and cash, with UNKNOWN, inventory and SELL protections retained. The dashboard and CLI expose both budgets under one pause/enable control; saving does not enable trading or choose production amounts. Offline checks cover measured identities, fair loop progress, fixed snapshots, restart/expiry, partial outcomes, native cancellation ownership, authenticated controls and affected consumers. P214 retains a disclosed initial TDD sequencing deviation; current GREEN does not supply a missing pre-change RED.
 
+- 完整 backend/portable CI 的自动触发改为仅在最终 main push 执行，保留既有独立授权的 main-only manual 入口与精确身份校验；后续 push/manual 不取消较早运行。用户明确授权的无冲突 PR 经 expected-head 核对后合并，不再等待 feature/PR CI 或仅为 main 新鲜度重整分支；独立审查、反馈与缺陷修复仍由 Main 持续负责，合后修复走新 PR。服务端只移除 main required-status 规则，PR/禁止强推与删除/tag 保护已读回保留；离线定向验证覆盖事件、安全、required fail-closed、optional 独立与 push/manual 部署身份合同。失败 main SHA 不可部署，部署仍需该 SHA 的可信成功 CI、完整证据及独立授权；未声称线上 CI 结果、节时数或已部署。
+
+- LP runtime regressions now wait for the selected risk session’s scoring publication and the first current-reader observation before checking later progress. Controlled external-boundary delays reproduce the old premature assertions; focused immediate/delayed, concurrent and negative checks preserve financial, no-write, pause and real cleanup contracts. No production behavior change or deployment.
+
 ## 2026-10-21
+
+- CI now supports a main-only manual run with the same four backend partitions, portable scenarios and retirement coverage. Deployment Preflight selects the newest exact-SHA push or manual run and binds artifacts to its real event; newer unsuccessful runs block older green evidence. Focused offline trust and workflow checks cover this path. No deployment in this change.
+
+- LP 冷启动 UNKNOWN 依赖期限回归为受监督子进程使用测试独占的 pytest 临时命名空间，避免其清理无关历史目录；保留正常清理、原 30 秒监督和全部业务断言。受控历史目录、正常及独立并发验证不涉及生产逻辑；历史 P20 超时的确切原因仍未知，未部署。
+
+- LP 手动租约完成唤醒的离线回归在推进业务时钟前，等待当前 O/C 读取的未持有源实际发布，避免把 HTTP 返回误当作 runtime publication。保留原 5/10/11 秒边界、watchdog、当前订单与 UNKNOWN/不重放断言；验证包含外部响应延迟及独立并发两变体，未改生产逻辑。
+
+- LP 手动独占 mutation lease 在可靠 SQL 与全局文件锁真实释放后补发完成通知，避免早期 native 通知先被消费后，延期保护撤单停在事件等待。保留早期容量通知、整条命令/SQL 所有权、纯状态查询及权限/UNKNOWN/不重放；离线真实 Scheduler 回归覆盖实际拒单后的 COMMIT 尾部与无 native 的缺失 preview SELECT，未部署。
+
+- LP 共享 native 容量的完成唤醒补齐手动撤单、保护 SELL/cancel_exit 和实际手动入场 reservation 释放；延期保护撤单不再依赖无关命令或读取。保留真实 cap2、UNKNOWN、不重放及整条手动命令/SQL 所有权；状态查询不产生唤醒。离线回归覆盖三类生产路径、60 数量与止损/finality、20 入场及 SQL 持有交错，未部署。
+
+- LP 精确保护撤单完成后通知既有 Scheduler，并保留有界完成代际直到 owner 完成后续保护容量检查，避免三目标 cap2 延期撤单在纯事件等待中停滞。物理线程退出前仍占容量，权限、UNKNOWN、不重放和读取故障所有权不变；离线真实 Scheduler 回归覆盖受控完成交错、同刻第三目标发送与消费后不空转，未部署。
+
+- LP 读取冷却与仅等待事件时，保留控制保存 completed+1 秒重试，并及时收集已结束的保存；owner 检查失败仍按配置的 60 秒重试，不被提供者 300 秒 Retry-After 延后。离线真实 Scheduler 回归覆盖暂停即时生效、两次保存、无提前 HTTP 和本地持久化恢复；重试/失败升级及资金门禁不变，未部署。
+
+- LP 固定读取通道清理故障且无有限期限时，明确发布仅等待事件的状态，Scheduler 不再持续空转；健康 BUY 的真实下一期限仍优先。实际退出和显式命令可立即唤醒，故障资源、资金 UNKNOWN、禁止重试及新增 BUY 的门禁不变。离线回归覆盖真实 Scheduler、5/6 秒边界、100 次无空转检查、同场健康 BUY 和停止/排空；未部署。
+
+- 修复 LP 期限内成功结果迟收时被误计失败：真实完成与当前源新鲜度分别判断，过期只降为 UNKNOWN。Scheduler 使用实际读取期限/下一起点等待，完成或显式命令可提前唤醒；精确三目标撤单测试改为等待真实发送 Future，并验证受控串行/并发完成，保持权限、部分成交和不重放断言；未部署。
+
+- 修复 LP 异步读取审查发现的三处保护缺口：金融观察过期仍接纳有效逐单失败与清理故障；订单 scope 重建保留递增尝试身份；无 opening 的读取保护撤单继续获取精确终态数量。新增离线交错、同单重新准入及 ACK 后最终成交数量回归，保留资金权限、精确身份和不重放边界；未部署。
+
+- LP 当前 BUY 改为逐单可取消异步读取：5 秒起点与整轮期限，额外 1 秒未实际清理即锁存 exact 保护；连续第 11 次失败触发同单撤单，完整成功清零。金融/精确保护独立于慢市场，SELL 市场 30 秒、持仓风险 60 秒，状态 GET 只发布快照。64 个 BUY scope 上限计入退役和故障资源，参考缓存与解压/分页均有硬上限；失败计数和发送身份沿原订单 payload 持久保存，重启不重放。新增离线 HTTPX loopback、资源所有权、逐单收益、权限/终态及生产调度回归；未部署。
 
 - LP 服务日志补充选定奖励、账户读取/发布与入场发送/回执应用的脱敏诊断，区分失败、正常等待及同作用域恢复，并保留首次/最近原因和尝试关联。Dashboard 旧读取及缓存、无效奖励事实、规划快照复用或账户恢复不能清除较新失败或改写 UNKNOWN 订单；奖励来源各自验证后恢复，混合配置、身份或资产错误仍保留身份无歧义的 native USD 下界以检查 combined 一致性；冲突配置 ID 和同条件整行的贡献不作证据，相同重复仍去重，顺序不再改变诊断，业务 UNKNOWN 与原因顺序不变；交错组件按阶段独立聚合重复日志并保留被抑制计数；日志队列及进程内记录有界，溢出与重启不保证连续历史。离线定向验证覆盖发送审计、防重、不可变订单、并发顺序及阻塞/异常日志输出；Dashboard、交易规则和 JSON/CLI 不变，未部署。
 

@@ -1,4 +1,4 @@
-"""Explicitly constructed D2 composition; no default runtime activation."""
+"""Single LP business owner with independently owned cancellable reads."""
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -20,7 +20,7 @@ from .polymarket_lp_diagnostics import (summarize_iteration, project_diagnostics
     YIELD_ROUND_LIMIT, YIELD_ROW_LIMIT)
 from .polymarket_lp_current_state import (
     AppliedControl, CommittedControl, CurrentLPState, StoredControl, ValidatedStartAdmission,
-    ControlRequestResult,
+    ControlRequestResult, Acceptance,
     ReceiptEvidence, SourceStamp, TerminalProof, CurrentOrderFact, Fact,
     BuyExecutionUncertainty,
     ProtectionKey, ProtectionGuard, ProtectionBaseline, SetBaseline,
@@ -300,7 +300,7 @@ class _StandaloneMutationLease:
 
 class LPD2LiveExecution:
     def __init__(self, store, trading, *, account_id, venue, process_epoch, policy,
-                 reader=None, writer=None, clock=time.monotonic,
+                 reader=None, writer=None, read_runtime=None, read_transport=None, clock=time.monotonic,
                  utc_now=lambda: datetime.now(UTC), load_settings_on_start=False):
         if (venue != 'polymarket' or type(account_id) is not str or not account_id
                 or account_id != trading.config.wallet_address
@@ -309,6 +309,30 @@ class LPD2LiveExecution:
         self.store, self.trading, self.account_id, self.venue = store, trading, account_id, venue
         self.process_epoch, self.policy = process_epoch, policy
         self._clock, self._utc_now = clock, utc_now
+        if read_runtime is None and reader is None:
+            factory_method=getattr(trading,'lp_async_source_factory',None)
+            factory=factory_method(clock=clock,utc_now=utc_now,transport=read_transport) if callable(factory_method) else None
+            if factory is not None:
+                from .polymarket_lp_read_runtime import LPReadRuntime
+                read_runtime=LPReadRuntime(factory,clock=clock,utc_now=utc_now)
+        self.read_runtime=read_runtime
+        self._read_store_lock=threading.RLock()
+        self._read_store_owners={}
+        self._read_store_values={}
+        self._read_store_cancels={}
+        self._read_store_error=None
+        self._async_financial_ticket=None
+        self._async_market_results=[]
+        self._async_exact_requests={}
+        self._async_exact_used={}
+        self._async_exact_results={}
+        self._async_generation=None
+        self._async_low_sources={}
+        self._async_income_demands=()
+        self._async_income_updated=False
+        self._read_wakeup=lambda:None
+        self._risk_next={}
+        self._risk_seen={}
         self._positions_full_coverage = reader is None  # owned adapter requests threshold0
         self.reader = reader if reader is not None else MarketReader(trading.lp_reader_source_port(), clock=clock)
         self.writer = writer if writer is not None else LPBusinessWriter(store)
@@ -340,6 +364,8 @@ class LPD2LiveExecution:
         self._sealed_candidate_source = None
         self._sealed_candidate_sources = {}
         self._native_jobs = {}
+        self._native_completion_generation = 0
+        self._native_completion_consumed = 0
         self._manual_jobs = {}
         self._manual_groups = {}
         # Finite dispatch tickets for an already accepted protection trigger.
@@ -362,6 +388,7 @@ class LPD2LiveExecution:
         self._cancel_blocks = freeze(dict(total=0, by_reason={}, recent=()))
         self._rotation_cancel_backoffs = {}
         self._pool_next = 'trial'
+        self._pool_pending = set()
 
     def manual_call(self, operation):
         """Own the whole explicit command, including reliable SQL, until actual end."""
@@ -530,6 +557,7 @@ class LPD2LiveExecution:
                         self._last_current_evidence=(identity.request_id,'manual_cancel',disposition)
                     future.set_result(dict(canceled=canceled,not_canceled=not_canceled))
                 except BaseException as exc:future.set_exception(exc)
+                finally:self._publish_native_completion()
             thread=threading.Thread(target=cancel,name='lp-d2-manual-cancel',daemon=False)
             handle=NativeAttempt(identity,future,thread)
             for order in selected:self._native_jobs[(self.account_id,self.venue,order.key[2],order.key[3])]=handle
@@ -585,22 +613,18 @@ class LPD2LiveExecution:
             if len(groups) != 1:
                 return dict(state='none',session_id=None,reason='session_id_required' if groups else 'session_not_found')
             session_id = groups[0]
-        try:
-            group = self.store.lp_manual_group(self.account_id,str(session_id))
-            if group is None:
-                raise ValueError('session_not_found')
-            if session_id not in self._manual_groups:
-                opening = self._bind_manual_group(group)
-            else:
-                self._manual_observe(financial=False)
-                opening = self.state.snapshot().openings[self._manual_groups[session_id][0]]
-        except ValueError as exc:
-            return dict(state='needs_attention',session_id=session_id,reason=str(exc))
+        with self.state._lock:
+            binding=self._manual_groups.get(session_id)
+            opening=self.state.snapshot().openings.get(binding[0]) if binding else None
+            if opening is None:
+                return dict(state='needs_attention',session_id=session_id,reason='session_binding_pending')
+            entry_ids=opening.entry_order_ids[:1]
+            augment_ids=opening.entry_order_ids[1:]
         def amount(fact):
             return str(fact.value) if fact.state == 'known' and fact.value is not None else None
         return dict(state={'opening':'entry_open','closed':'complete'}.get(opening.phase,opening.phase),
-            session_id=session_id,entry_order_id=next(iter(group['entry_order_ids']),None),
-            augment_order_ids=list(group['augment_order_ids']),review_at=opening.review_at.value.isoformat()
+            session_id=session_id,entry_order_id=next(iter(entry_ids),None),
+            augment_order_ids=list(augment_ids),review_at=opening.review_at.value.isoformat()
                 if opening.review_at.state == 'known' else None,
             stop_requested=opening.stop_requested,stop_loss_latched=opening.stop_loss_latched.value,
             buy_cost=amount(opening.economics.buy_cost_usd),fees=amount(opening.economics.fees_usd))
@@ -868,6 +892,8 @@ class LPD2LiveExecution:
         finally:
             with self.state._lock:
                 self._active_sends.discard(action.request_id)
+            if admitted:
+                self._publish_native_completion()
         status = ('accepted' if outcome.status == LocalStatus.ACCEPTED else 'rejected'
             if outcome.status == LocalStatus.REJECTED else 'not_sent' if outcome.status == LocalStatus.NOT_SENT else 'unknown')
         if status == 'accepted':
@@ -1204,6 +1230,195 @@ class LPD2LiveExecution:
         self.settings_status()
         return self.control.poll(self._clock())
 
+    def set_read_wakeup(self,wakeup):
+        self._read_wakeup=wakeup
+        if self.read_runtime is not None:self.read_runtime.start(wakeup)
+
+    def _reconcile_async_reads(self):
+        from .polymarket_lp_read_runtime import ReadDemand
+        snapshot=self.state.snapshot();generation=snapshot.current.cycle_generation
+        if not generation or self.read_runtime is None:return
+        self.read_runtime.start(self._read_wakeup)
+        if self._async_generation!=generation:
+            self._async_generation=generation;self._async_low_sources={}
+        if self._async_financial_ticket is not None and self._async_financial_ticket.cycle_generation!=generation:
+            self._async_financial_ticket=None
+        if self._async_financial_ticket is None:
+            self._async_financial_ticket=self.state.begin_observation(generation,('balance','open_orders','positions'))
+        ticket=self._async_financial_ticket
+        demands=[ReadDemand(self.account_id,self.process_epoch,generation,'O',snapshot.trade_version,
+            kind='financial',sources=('balance','open_orders','positions'),observation_id=ticket.observation_id)]
+        for order in snapshot.active_orders:
+            demands.append(ReadDemand(self.account_id,self.process_epoch,generation,order.key[3],order.terms_version,
+                order.key[1],order.key[2],kind='buy' if order.side=='BUY' else 'sell'))
+        for position in snapshot.positions:
+            if position.quantity.state=='known' and position.quantity.value>0:
+                demands.append(ReadDemand(self.account_id,self.process_epoch,generation,
+                    'position:'+position.condition_id+':'+position.token_id,0,position.condition_id,position.token_id,kind='position'))
+        # Detached measured candidates use the existing serialized low lane and
+        # its physical ports, deadlines, cache and cleanup owner. They never
+        # become exact BUY identities or financial observations.
+        active={(o.key[1],o.key[2]) for o in snapshot.active_orders if o.side=='BUY'}
+        for condition,token in self._async_income_demands:
+            if (condition,token) not in active:
+                demands.append(ReadDemand(self.account_id,self.process_epoch,generation,
+                    'income:'+condition+':'+token,0,condition,token,kind='income'))
+        valid={k:d for k,d in self._async_exact_requests.items() if d.generation==generation
+            and d.terms_version==snapshot.trade_version and self._clock()-self._async_exact_used.get(k,0)<=65}
+        self._async_exact_requests=valid
+        self._async_exact_used={k:v for k,v in self._async_exact_used.items() if k in valid}
+        self._async_exact_results={k:v for k,v in self._async_exact_results.items() if k in valid}
+        demands.extend(valid.values())
+        self.read_runtime.reconcile(demands)
+
+    def _collect_async_reads(self):
+        self._reconcile_async_reads()
+        financial=None;markets=[]
+        self._async_income_updated=False
+        for result in self.read_runtime.drain_results():
+            current=self.state.snapshot().current
+            if (result.demand.account!=self.account_id or result.demand.process_epoch!=self.process_epoch
+                    or result.demand.generation!=current.cycle_generation):continue
+            if result.demand.kind=='financial':
+                ticket=self._async_financial_ticket
+                if ticket is not None and result.demand.observation_id==ticket.observation_id:
+                    from .polymarket_lp_market_reader import CapturedSources
+                    sources=dict(result.sources)
+                    previous=self.state.snapshot().observation
+                    if previous is not None and previous.cycle_generation==result.demand.generation:
+                        sources.update({k:v for k,v in previous.source_frame.sources.items() if k.startswith('market')})
+                    financial=(ticket,MarketReader.from_captured_sources(CapturedSources(self.account_id,sources)))
+                    self._async_financial_ticket=None
+            elif result.demand.kind=='buy':markets.append(result)
+            elif result.demand.kind in ('sell','position','income'):
+                from .polymarket_lp_async_source import market_value,closed_position_value
+                from .polymarket_lp_market_reader import SourceResult
+                try:
+                    source=SourceResult(str(result.demand.key)+':'+str(result.attempt),
+                        (closed_position_value(result.demand.condition_id,result.demand.token_id,result.sources)
+                            if result.demand.kind=='position' else None)
+                        or (market_value(result.demand.condition_id,result.sources) if result.complete else None),
+                        complete=result.complete,checked_at=(result.sources.get('book') or result.sources.get('metadata')
+                            or SourceResult('')).checked_at,error=None if result.complete else 'market_incomplete')
+                    if result.demand.kind=='income':self._async_income_updated=True
+                    self._async_low_sources['market_'+result.demand.kind+':'+result.demand.condition_id+':'+result.demand.token_id]=source
+                    self._async_low_sources['market:'+result.demand.condition_id+':'+result.demand.token_id]=source
+                    with self.state._lock:
+                        observation=self.state.snapshot().observation
+                        if observation is not None:
+                            frame=observation.source_frame
+                            self.state._observation=replace(observation,source_frame=replace(frame,
+                                sources=MappingProxyType({**frame.sources,**self._async_low_sources})))
+                except (KeyError,TypeError,ValueError):pass
+            else:
+                self._async_exact_results[result.demand.order_id]=result
+        if financial is not None:
+            from .polymarket_lp_market_reader import CapturedSources
+            ticket,frame=financial
+            financial=(ticket,MarketReader.from_captured_sources(CapturedSources(self.account_id,
+                {**frame.sources,**self._async_low_sources})))
+        return financial,markets
+
+    def _ensure_read_persistence(self):
+        snapshot=self.state.snapshot()
+        observation=snapshot.observation
+        if observation is None or not observation.orders_complete:return
+        for order in snapshot.active_orders:
+            if order.side!='BUY' or order.key in self._read_store_owners:continue
+            raw=next((r for r in observation.source_frame.orders if r.get('order_id')==order.key[3]
+                and r.get('condition_id')==order.key[1] and r.get('token_id')==order.key[2]),None)
+            if raw is None:continue
+            try:
+                result=self.store.lp_register_exchange_orders(self.account_id,order.key[2],[raw],session=dict(
+                    account_id=self.account_id,condition_id=order.key[1],token_id=order.key[2],state='entry_open'))
+                owner=result['session']
+                if owner.get('account_id','').casefold()!=self.account_id.casefold():raise ValueError('read_owner_mismatch')
+                record=owner.get('lp_read_protection',{}).get(order.key[3])
+                if record is not None:
+                    if record.get('condition_id')!=order.key[1] or record.get('token_id')!=order.key[2]:
+                        raise ValueError('read_owner_mismatch')
+                    self.state.restore_read_protection(order.key,record['consecutive_failures'],record['reason_codes'])
+                    self._read_store_values[order.key]=record
+                    if record.get('cancel_request_id'):self._read_store_cancels[order.key]=record['cancel_request_id']
+                self._read_store_owners[order.key]=owner['session_id']
+            except Exception as exc:
+                self._read_store_error=type(exc).__name__
+                raise RuntimeError('read_protection_store_unavailable') from None
+
+    def _persist_read_protection(self, order_key=None, cancel_request_id=None):
+        with self._read_store_lock:
+            return self._persist_read_protection_locked(order_key,cancel_request_id)
+
+    def _persist_read_protection_locked(self, order_key, cancel_request_id):
+        snapshot=self.state.snapshot()
+        for key,failure in snapshot.read_failures.items():
+            if order_key is not None and key!=order_key:continue
+            owner=self._read_store_owners.get(key)
+            if owner is None:
+                self._read_store_error='read_protection_owner_pending'
+                continue
+            record=dict(condition_id=key[1],token_id=key[2],consecutive_failures=failure.consecutive_failures,
+                reason_codes=list(failure.reason_codes),cancel_request_id=cancel_request_id or self._read_store_cancels.get(key))
+            if record==self._read_store_values.get(key):continue
+            def patch(current,connection):
+                if (current.get('account_id','').casefold()!=self.account_id.casefold()
+                        or key[3] not in current.get('order_history',{})):raise ValueError('read_owner_mismatch')
+                records=dict(current.get('lp_read_protection',{}))
+                old=records.get(key[3],{})
+                if old.get('cancel_request_id'):record['cancel_request_id']=old['cancel_request_id']
+                records[key[3]]=record
+                return dict(lp_read_protection=records)
+            try:self.store.lp_update_session(owner,patch_builder=patch)
+            except Exception as exc:
+                self._read_store_error=type(exc).__name__
+                raise RuntimeError('read_protection_store_unavailable') from None
+            self._read_store_values[key]=record
+            if record['cancel_request_id']:self._read_store_cancels[key]=record['cancel_request_id']
+        self._read_store_error=None if all(k in self._read_store_owners for k in snapshot.read_failures) else 'read_protection_owner_pending'
+
+    def _clear_unsent_read_cancel(self,key,request_id):
+        # A known local refusal can retry. A failed/uncertain SQL clear retains
+        # the marker and forbids replay until evidence resolves it.
+        with self._read_store_lock:
+            owner=self._read_store_owners.get(key)
+            if owner is None:return
+            def patch(current,connection):
+                if current.get('account_id','').casefold()!=self.account_id.casefold():raise ValueError('read_owner_mismatch')
+                records=dict(current.get('lp_read_protection',{}));value=dict(records.get(key[3],{}))
+                if value.get('cancel_request_id')==request_id:value['cancel_request_id']=None
+                records[key[3]]=value
+                return dict(lp_read_protection=records)
+            try:current=self.store.lp_update_session(owner,patch_builder=patch)
+            except Exception as exc:self._read_store_error=type(exc).__name__;return
+            record=current['lp_read_protection'][key[3]]
+            self._read_store_values[key]=record
+            if not record.get('cancel_request_id'):self._read_store_cancels.pop(key,None)
+
+    def _apply_async_market_results(self,results):
+        self._ensure_read_persistence()
+        for result in results:
+            self.state.apply_market_attempt(result)
+            if result.cleanup_fault:self.state.apply_read_cleanup_fault(result)
+        self._persist_read_protection()
+        self._reconcile_async_reads()
+
+    def _dispatch_read_failure_cancels(self):
+        attempts=[];snapshot=self.state.snapshot()
+        for key,failure in snapshot.read_failures.items():
+            if key in self._read_store_cancels or key not in self._read_store_owners:continue
+            progress=snapshot.progress.get(failure.protection_key)
+            if failure.protection_key is None or progress is None or progress.cancel_targets:continue
+            # Existing queue/UNKNOWN obligations keep their exact sender ownership.
+            if any(t.order_key==key for p in snapshot.progress.values() for t in p.cancel_targets):continue
+            order=next((o for o in snapshot.active_orders if o.key==key and o.side=='BUY'),None)
+            if order is None:continue
+            try:
+                handle=self.cancel_independent(key,protection_key=failure.protection_key,
+                    reason=failure.reason_codes[0])
+            except (ValueError,RuntimeError):continue
+            if handle is not None:attempts.append(handle)
+        return tuple(attempts)
+
     def run_once(self, captured_candidates=None, *, timeout=2, attempted_at=None, capture_failed=False, pool=None):
         if self._closed:
             raise RuntimeError('d2_closed')
@@ -1217,6 +1432,7 @@ class LPD2LiveExecution:
             observed = policy.allocation_mode == 'observed_pools'
             if pool not in (None, 'trial', 'income'):
                 raise ValueError('pool_invalid')
+            requested_pool = pool
             roles = self.store.lp_load_observed_pool_roles(self._settings_account()) if observed else None
             if observed:
                 from .polymarket_lp_observed_pools import result_projection
@@ -1227,15 +1443,37 @@ class LPD2LiveExecution:
                     # Both continuously due loops receive a turn. A fresh reward
                     # timestamp cannot repeatedly preempt ordinary trial work.
                     pool = self._pool_next
-                    self._pool_next = 'trial' if pool == 'income' else 'income'
+                    if self.read_runtime is None:
+                        self._pool_next = 'trial' if pool == 'income' else 'income'
+            if observed and self.read_runtime is not None:
+                # Reuse the established bounded low demand port. Admission order
+                # follows observed rank; no new read owner or account engine.
+                self._async_income_demands=tuple((cid,row['result']['source_order']['token_id'])
+                    for cid,row in sorted(pool_results.items(),key=lambda item:(
+                        -Decimal(str(item[1]['result'].get('yield_pct_per_hour') or 0)),item[0]))
+                    if row['eligible'])[:self.read_runtime.buy_cap]
             pool = pool or 'trial'
             self.poll()
             current = self.state.snapshot().current
-            ticket = self.state.begin_observation(current.cycle_generation, ('balance', 'open_orders', 'positions'))
             income_sources = tuple(sorted({f"market:{cid}:{r['result']['source_order']['token_id']}"
-                for cid,r in pool_results.items() if r['eligible']})) if observed and pool == 'income' else ()
-            frame = self.reader.read_current(ReadScope(self.account_id,
-                ('balance','open_orders','positions',*income_sources), related_markets=True), time.monotonic()+timeout)
+                for cid,r in pool_results.items() if r['eligible']})) if observed and (pool == 'income' or self.read_runtime is not None) else ()
+            markets=[]
+            if self.read_runtime is not None:
+                financial,markets=self._collect_async_reads()
+                if observed:
+                    if financial is not None or markets or self._async_income_updated:
+                        self._pool_pending.update(('trial','income'))
+                    if requested_pool is None and pool not in self._pool_pending and self._pool_pending:
+                        pool=next(p for p in ('trial','income') if p in self._pool_pending)
+                if financial is None:
+                    self._apply_async_market_results(markets)
+                    observation=self.state.snapshot().observation
+                    if observation is None or not (markets or self._async_income_updated or observed and self._pool_pending):return RunResult(Acceptance('pending'))
+                    ticket,frame=observation.read_ticket,observation.source_frame
+                else:ticket,frame=financial
+            else:
+                ticket = self.state.begin_observation(current.cycle_generation, ('balance', 'open_orders', 'positions'))
+                frame = self.reader.read_current(ReadScope(self.account_id, ('balance','open_orders','positions',*income_sources), related_markets=True), time.monotonic()+timeout)
             as_of = self._utc_now()
             stage = 'preparation'
             prepared = prepare_current_inputs(frame, captured_candidates, policy, as_of,
@@ -1245,7 +1483,18 @@ class LPD2LiveExecution:
                 target_count=6) if observed and policy.budget is not None else policy)
             calculation = calculate_current(prepared, account_policy, as_of)
             stage = 'acceptance'
-            accepted = self.state.accept(ticket, frame, calculation, evaluated_at=as_of)
+            accepted = (Acceptance('partial',observation) if self.read_runtime is not None and financial is None
+                else self.state.accept(ticket, frame, calculation, evaluated_at=as_of))
+            # Market attempts have their own exact-order identity/watermark.
+            # A rejected financial ticket must not discard already drained
+            # failures or cleanup faults for an otherwise current BUY.
+            if self.read_runtime is not None:
+                self._apply_async_market_results(markets)
+            if self.read_runtime is not None and accepted.observation is not None:
+                accepted=replace(accepted,observation=self.state.snapshot().observation)
+                frame=accepted.observation.source_frame
+                prepared=prepare_current_inputs(frame,captured_candidates,policy,as_of,income_sources=income_sources)
+                calculation=calculate_current(prepared,account_policy,as_of)
             if accepted.observation is None:
                 self._record_iteration(ticket, prepared, calculation, accepted, None, (), None,
                     captured_candidates, as_of, attempted_at, capture_failed=capture_failed)
@@ -1284,6 +1533,9 @@ class LPD2LiveExecution:
                     if o.phase != 'closed' and o.stop_requested) if policy.allocation_shadow_enabled else ())
             plan_policy = policy
             if observed:
+                if self.read_runtime is not None:
+                    self._pool_pending.discard(pool)
+                    self._pool_next='trial' if pool=='income' else 'income'
                 prepared, selection, plan_policy, roles = self._pool_composition(pool, prepared, calculation,
                     snapshot, roles, pool_results, as_of, orders_accepted)
             fixed = self._fixed_plan(observation, prepared, selection, policy=plan_policy, pool=pool if observed else None,
@@ -1459,6 +1711,13 @@ class LPD2LiveExecution:
                 result = project_diagnostics(self._diagnostics, as_of=self._utc_now())
                 result['protection'] = {**self._protection_diagnostics,
                     'cancel_outcomes': self._diagnostic_outcomes['protection_cancel_outcomes']}
+                if self.read_runtime is not None:
+                    runtime=self.read_runtime.status()
+                    result['async_reads']=yield_diagnostic_value({k:v for k,v in runtime.items() if k!='scopes'})
+                    result['async_reads']['failures']=dict(total=len(snapshot.read_failures),
+                        recent=[dict(order_id=key[3][:96],consecutive_failures=f.consecutive_failures,reason_codes=f.reason_codes)
+                            for key,f in list(snapshot.read_failures.items())[:20]])
+                    result['async_reads']['persistence_error']=self._read_store_error
                 result['local_outcomes'] = self._diagnostic_outcomes
                 result['cancel_blocks'] = diagnostic_json_copy(self._cancel_blocks)
                 unknown = [y for key, y in snapshot.yields.items() if y.unknown_since_monotonic is not None
@@ -1645,7 +1904,8 @@ class LPD2LiveExecution:
             or self.policy.budget is not None and snapshot.inventory_cost.state == 'known'
             and snapshot.buy_reserved.state == 'known'
             and snapshot.buy_reserved.value > self.policy.budget)
-        if (self._settings_required and not self._settings_loaded
+        if (self.read_runtime is not None and (not self.read_runtime.status()['new_buy_allowed'] or self._read_store_error)
+                or self._settings_required and not self._settings_loaded
                 or not source.complete or source.error or source.value is None
                 or snapshot.new_capacity.state != 'known'):
             if (not (self._settings_required and not self._settings_loaded)
@@ -1734,11 +1994,19 @@ class LPD2LiveExecution:
             if decision is None:
                 self._remember_rotation(result)
                 return result
-            if (observation is None
-                    or observation.observation_id != decision.observation_id
-                    or self._rotation_dispatched == decision.observation_id):
+            if observation is None or observation.observation_id != decision.observation_id:
                 return result
-            self._rotation_dispatched = decision.observation_id
+            if not decision.victims:
+                self._remember_rotation(result)
+                return result
+            # Two pool opportunities may share one accepted publication. Empty
+            # work cannot consume the other's cancellation, while overlapping
+            # exact targets still have only one dispatch in that observation.
+            seen=(self._rotation_dispatched[1] if self._rotation_dispatched is not None
+                and self._rotation_dispatched[0]==decision.observation_id else frozenset())
+            keys=frozenset(order.key for order in decision.victims)
+            if not keys.isdisjoint(seen):return result
+            self._rotation_dispatched=(decision.observation_id,seen|keys)
         if self.policy.allocation_mode == 'observed_pools' and len(decision.victims) > 1:
             return self._dispatch_pool_cancels(result, observation)
         outcomes = []
@@ -1825,7 +2093,8 @@ class LPD2LiveExecution:
                                 record.session_id,record.condition_id,record.token_id,record.order_id,
                                 'accepted' if outcome.status==LocalStatus.ACCEPTED else
                                 'not_sent' if outcome.status==LocalStatus.NOT_SENT else 'unknown',self._utc_now()))
-                        lease.release()
+                        try:lease.release()
+                        finally:self._publish_native_completion()
                     future.set_result(results)
                 thread=threading.Thread(target=cancel,name='lp-pool-group-cancel',daemon=False)
                 handle=NativeAttempt(group,future,thread)
@@ -1972,7 +2241,19 @@ class LPD2LiveExecution:
             token.round_number, token.observation_id, order_type, expiration, post_only, options)
         if order_id:
             self._record_requests[(self.account_id, condition, target.token_id, order_id)] = record
-        self.writer.offer(record)
+        reliable_cancel=(isinstance(token,_IndependentContext) and token.protection_key is not None
+            and token.protection_key.kind=='read_failure')
+        if reliable_cancel:
+            # The disposable writer is not the durability boundary for a new
+            # protection. Audit first, then commit the no-replay marker; only
+            # after both writes do the existing fresh sender guards execute.
+            try:
+                if not self.store.lp_log_business_record(record):raise RuntimeError('read_cancel_audit_conflict')
+                self._persist_read_protection(order.key,action.request_id)
+            except Exception as exc:
+                self._read_store_error=type(exc).__name__
+                return LocalOutcome(action,LocalStatus.NOT_SENT,True,reason_code='control_or_native_not_current')
+        else:self.writer.offer(record)
         with self.state._lock:
             control = self._control_view()
             protection = isinstance(token, _IndependentContext) and token.protection_key is not None
@@ -2013,6 +2294,8 @@ class LPD2LiveExecution:
                 with self.state._lock:
                     self._active_sends.discard(action.request_id)
         reason = outcome.reason_code or reason
+        if reliable_cancel and outcome.status==LocalStatus.NOT_SENT:
+            self._clear_unsent_read_cancel(order.key,action.request_id)
         if isinstance(target, CancelTarget) and outcome.status == LocalStatus.NOT_SENT:
             self._record_cancel_block(reason, phase='completed', order_key=order.key,
                 request_id=action.request_id, generation=token.cycle_generation)
@@ -2093,6 +2376,8 @@ class LPD2LiveExecution:
 
     def _buy_admitted(self, token, action, record, lease, *, manual_origin=None, manual_command=None, submit_source=None):
         terms = action.target.terms
+        if self.read_runtime is not None and (not self.read_runtime.status()['new_buy_allowed'] or self._read_store_error):
+            return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         mutation = 'MANUAL_BUY' if manual_origin is not None else 'BUY'
         def current():
             return self._manual_origin_current(manual_origin) if manual_origin is not None else self._dispatch_current(token.cycle_generation, running=True)
@@ -2181,6 +2466,9 @@ class LPD2LiveExecution:
     def _cancel_admitted(self, action, observation, order, *, protection, lease, protection_key, protection_target,
                          protection_origin, rotation_origin=None):
         target = action.target
+        prior=self._read_store_cancels.get(order.key)
+        if prior is not None and prior!=action.request_id:
+            return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='protection_cancel_owned')
         if not isinstance(target, CancelTarget) or target.venue != self.venue:
             return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='independent_cancel_identity')
         if (order.key[0] != self.account_id or order.key[2:] != (target.token_id, target.existing_order_id)
@@ -2224,7 +2512,28 @@ class LPD2LiveExecution:
     def status(self):
         with self.state._lock:
             owned = {h.identity.request_id for h in self._native_jobs.values() if h._thread.is_alive()}
-            return dict(control=self.control.status(),
+            reads=self.read_runtime.status() if self.read_runtime is not None else None
+            control=self.control.status()
+            dependency=reads.get('next_dependency_monotonic') if reads else None
+            # A returned control thread can still have an uncollected Future.
+            # Its completion is runnable; retry_wait owns a separate deadline.
+            now=self._clock()
+            control_pending=control.save_state in ('pending','saving','retrying')
+            retry=control.retry_at_monotonic if control.save_state=='retry_wait' and not control.fatal else None
+            dependencies=[d for d in (dependency,retry) if d is not None]
+            wait=None
+            if not (owned or self._active_sends
+                    or any(h._thread.is_alive() for h in self._manual_jobs.values())
+                    or self._settings_future is not None or control.native_save_in_flight or control_pending
+                    or self.policy.allocation_mode=='observed_pools' and self._pool_pending
+                    or self._native_completion_generation != self._native_completion_consumed
+                    or any(d<=now for d in dependencies)):
+                if dependencies:
+                    wait=dict(kind='dependencies',deadline=(self._utc_now()+timedelta(seconds=min(dependencies)-now)).isoformat())
+                elif reads and reads.get('waiting_for_event'):
+                    wait=dict(kind='events')
+            return dict(read_runtime=reads,plan_wait=wait,
+                read_persistence_error=self._read_store_error,control=control,
                 round=self.rounds.snapshot() if self.state.snapshot().current.cycle_generation else None,
                 native_inflight=len(owned | self._active_sends), writer=self.writer.status(), closed=self._closed,
                 last_preparation_rejection=self._last_preparation_rejection,
@@ -2357,7 +2666,10 @@ class LPD2LiveExecution:
                     else:
                         future.set_result(outcome)
                     finally:
-                        lease.release()
+                        try:
+                            lease.release()
+                        finally:
+                            self._publish_native_completion()
                 thread = threading.Thread(target=run, name='lp-d2-independent-cancel', daemon=False)
                 handle = NativeAttempt(identity, future, thread)
                 self._native_jobs[key] = handle
@@ -2469,7 +2781,8 @@ class LPD2LiveExecution:
                 if not self._protection_frame_current(snapshot):
                     return attempts  # a later normal tick may validate the unchanged original tickets
                 progress = current.progress.get(key)
-                if progress is None or any(t.order_key == ticket.order.key for t in progress.cancel_targets):
+                if (progress is None or ticket.order.key in self._read_store_cancels
+                        or any(t.order_key==ticket.order.key for p in current.progress.values() for t in p.cancel_targets)):
                     continue
                 order = next((o for o in current.active_orders if o.key == ticket.order.key), None)
                 if (order is None or order.side != 'BUY' or order.remaining.state != 'known' or order.remaining.value <= 0
@@ -2645,6 +2958,26 @@ class LPD2LiveExecution:
 
     def _read_protection(self, kind, identity, deadline):
         component = self._protection_component(kind, *identity)
+        if self.read_runtime is not None:
+            from .polymarket_lp_read_runtime import ReadDemand
+            from .polymarket_lp_market_reader import SourceResult
+            snapshot=self.state.snapshot()
+            if kind=='scoring':
+                order=next((o for o in snapshot.active_orders if o.key[3]==identity[0]),None)
+                if order is None:return SourceResult(component,complete=False,error='identity_unknown')
+                condition,token,target=order.key[1:]
+            elif kind=='order':condition,token,target=identity
+            else:condition,token=identity;target=''
+            self._async_exact_used[component]=self._clock()
+            self._async_exact_requests[component]=ReadDemand(self.account_id,self.process_epoch,
+                snapshot.current.cycle_generation,component,snapshot.trade_version,condition,token,
+                kind='exact',sources=(kind,),target_order_id=target)
+            self._reconcile_async_reads()
+            result=self._async_exact_results.get(component)
+            if (result is None or result.demand.generation!=snapshot.current.cycle_generation
+                    or result.demand.terms_version!=snapshot.trade_version):
+                return SourceResult(component,complete=False,error='in_progress')
+            return result.sources.get(kind,SourceResult(component,complete=False,error='timeout'))
         return self.reader.read_current(ReadScope(self.account_id, (component,)), deadline).sources[component]
 
     @staticmethod
@@ -2770,11 +3103,13 @@ class LPD2LiveExecution:
             baseline, progress = snapshot.baselines.get(key), snapshot.progress.get(key)
             if tickets and baseline is not None and progress is not None:
                 deferred_anchors.update((*key.scope[:3], oid) for oid in baseline.anchor_order_ids)
+        read_failure_targets = {target.order_key for key, progress in snapshot.progress.items()
+            if key.kind == 'read_failure' for target in progress.cancel_targets}
         # These exact registered IDs have accepted pending cancel obligations,
         # independently of any current-process BUY/opening association. The same
         # Reader/deadline and canonical receipt guards own their final proof.
         for order in snapshot.orders:
-            if order.key in deferred_anchors:
+            if order.key in deferred_anchors or order.key in read_failure_targets:
                 changed |= refresh_order(order)
         for scope in tuple(self.state.snapshot().openings):
             snapshot = self.state.snapshot()
@@ -2877,23 +3212,60 @@ class LPD2LiveExecution:
             except ValueError:
                 book = None
         stamp = self._source_stamp(source) if source else SourceStamp('')
-        risk_input = dict(book=book, market=market)
+        risk_due=self.read_runtime is None or self._clock()>=self._risk_next.get(scope,0)
+        risk_book,risk_market=book,market
+        risk_stamp=stamp
+        if self.read_runtime is not None:
+            risk_source=observation.source_frame.sources.get(f'market_position:{scope[1]}:{scope[2]}')
+            risk_stamp=self._source_stamp(risk_source) if risk_source else SourceStamp('')
+            risk_due=risk_due or bool(risk_source and self._risk_seen.get(scope)!=risk_source.source_id)
+            risk_data=risk_source.value if risk_source and risk_source.complete and not risk_source.error else {}
+            risk_book,risk_market=risk_data.get('book'),risk_data.get('metadata')
+            if not isinstance(risk_book,Mapping):risk_book=None
+            else:
+                try:
+                    _freshness(risk_book.get('received_at'),self._utc_now(),'book_freshness')
+                    _freshness(risk_book.get('timestamp'),self._utc_now(),'book_timestamp')
+                    if (risk_book.get('condition_id'),risk_book.get('token_id'))!=scope[1:3]:risk_book=None
+                except ValueError:risk_book=None
+            sell_source=observation.source_frame.sources.get(f'market_sell:{scope[1]}:{scope[2]}')
+            if sell_source is not None:
+                sell_data=sell_source.value if sell_source.complete and not sell_source.error else {}
+                book=sell_data.get('book')
+                if isinstance(book,Mapping):
+                    try:
+                        _freshness(book.get('received_at'),self._utc_now(),'book_freshness')
+                        _freshness(book.get('timestamp'),self._utc_now(),'book_timestamp')
+                    except ValueError:book=None
+                else:book=None
+        risk_evaluate=risk_due if self.read_runtime is not None else risk_book is not None
+        risk_input = dict(book=risk_book, market=risk_market)
         fact = lambda value, sources: Fact('known', value, sources) if value is not None else Fact('unknown', sources=sources)
         own = tuple(o for o in (*buys, *sales) if o is not None)
         amounts_known = complete and all(o.notional_usd.state == 'known' for o in own)
         sources = tuple(o.source for o in own)
         cost = sum((o.notional_usd.value for o in buys if o), Decimal(0)) if amounts_known and bought else None
         revenue = sum((o.notional_usd.value for o in sales if o), Decimal(0)) if amounts_known and bought else None
-        exit_value = _executable_bid_value(risk_input, residual.value) if book and residual.state == 'known' else None
-        projected = _projected_taker_fee(risk_input, residual.value) if book and residual.state == 'known' else None
+        exit_value = _executable_bid_value(risk_input, residual.value) if risk_book and residual.state == 'known' else None
+        projected = _projected_taker_fee(risk_input, residual.value) if risk_book and residual.state == 'known' else None
         if residual.state == 'known' and residual.value == 0:
             exit_value, projected = Decimal(0), Decimal(0)
         fees = sum((o.fees_usd.value for o in own), Decimal(0))+projected if (
             complete and bought and all(o.fees_usd.state == 'known' for o in own) and projected is not None) else None
-        economics = OpeningEconomics(scope, fact(cost, sources), fact(revenue, sources), fact(fees, (*sources, stamp)),
-            fact(exit_value, (stamp,)), reconciled)
+        economics = OpeningEconomics(scope, fact(cost, sources), fact(revenue, sources), fact(fees, (*sources, risk_stamp)),
+            fact(exit_value, (risk_stamp,)), reconciled)
+        if self.read_runtime is not None and not risk_evaluate:
+            economics=replace(opening.economics,buy_cost_usd=fact(cost,sources),
+                sold_revenue_usd=fact(revenue,sources),position_reconciled=reconciled)
+            if previous_sell is not None and previous_sell.residual_quantity.value!=residual.value:
+                economics=replace(economics,residual_exit_value_usd=Fact('unknown'),fees_usd=Fact('unknown'))
         loss = economics.opening_loss_usd
-        latch = not opening.stop_loss_latched.value and loss.state == 'known' and loss.value >= STOP_LOSS
+        if self.read_runtime is not None and risk_evaluate and loss.state=='known':
+            self._risk_next[scope]=self._clock()+60
+            if risk_source is not None:self._risk_seen[scope]=risk_source.source_id
+        latch = risk_evaluate and not opening.stop_loss_latched.value and loss.state == 'known' and loss.value >= STOP_LOSS
+        if opening.stop_loss_latched.value or latch:
+            book=risk_book or book
         updated = replace(opening, buy_filled_quantity=fact(bought, sources), economics=economics,
             stop_loss_latched=Fact('known', True, loss.sources) if latch else opening.stop_loss_latched,
             stop_loss_triggered_at=self._utc_now() if latch else opening.stop_loss_triggered_at,
@@ -3121,7 +3493,11 @@ class LPD2LiveExecution:
                     except Exception:
                         pass
                 future.set_result(result)
-            finally: lease.release()
+            finally:
+                try:
+                    lease.release()
+                finally:
+                    self._publish_native_completion()
         thread = threading.Thread(target=run, name='lp-d2-protection-send', daemon=False)
         handle = NativeAttempt(identity, future, thread)
         self._native_jobs[(self.account_id, self.venue, identity.scope[2], identity.request_id)] = handle
@@ -3286,7 +3662,8 @@ class LPD2LiveExecution:
             old = next(iter(existing), None)
             key = old.key if old else ProtectionKey('first_seen_episode', (*identity, self.process_epoch),
                 price, orders[0].key[3])
-            source = observation.source_frame.sources.get(f'market:{identity[1]}:{identity[2]}')
+            source = observation.source_frame.sources.get(f'market_book:{identity[1]}:{identity[2]}',
+                observation.source_frame.sources.get(f'market:{identity[1]}:{identity[2]}'))
             book = (source.value.get('book') if source and source.complete and not source.error
                 and isinstance(source.value, Mapping) else None)
             if isinstance(book, Mapping) and (book.get('condition_id') != identity[1] or book.get('token_id') != identity[2]):
@@ -3321,7 +3698,25 @@ class LPD2LiveExecution:
                     self._protection_guard(snapshot,scope,orders,observation=True),review))
                 snapshot = self.state.snapshot()
 
+    def notify_manual_lease_released(self):
+        """Notify after the service releases actual exclusive manual ownership."""
+        self._publish_native_completion()
+
+    def _publish_native_completion(self):
+        with self.state._lock:
+            self._native_completion_generation += 1
+        # The callback may run before this thread physically exits. Retain the
+        # notification until a later protection pass observes that true exit.
+        try:
+            self._read_wakeup()
+        except Exception:
+            logger.exception('prediction_lp_native_completion_wakeup_failed')
+
     def run_protection_once(self, *, timeout=2):
+        with self.state._lock:
+            completed = self._native_completion_consumed
+            if not any(h._future.done() and h._thread.is_alive() for h in self._native_jobs.values()):
+                completed = self._native_completion_generation
         self._record_protection_status(entered=True, disposition='entered')
         try:
             result = self._run_protection_once(timeout=timeout)
@@ -3330,11 +3725,15 @@ class LPD2LiveExecution:
             raise
         if self._protection_diagnostics['disposition'] == 'entered':
             self._record_protection_status(entered=True, disposition='completed')
+        with self.state._lock:
+            # A completion after this pass's capacity check remains pending.
+            self._native_completion_consumed = max(self._native_completion_consumed, completed)
         return result
 
     def _run_protection_once(self, *, timeout=2):
         """Evaluate the accepted raw frame; protection never acquires a new book."""
         with self._protection_lock:
+            read_attempts=self._dispatch_read_failure_cancels()
             snapshot = self.state.snapshot()
             observation = snapshot.observation
             if (self._closed or snapshot.current.shutdown_requested or snapshot.current.fatal_id
@@ -3354,7 +3753,7 @@ class LPD2LiveExecution:
                 return ()  # receipts invalidate the old observation; ordinary reader supplies the next one
             self._register_first_seen(snapshot)
             snapshot = self.state.snapshot()
-            attempts = self._dispatch_protection_cancels()
+            attempts = [*read_attempts,*self._dispatch_protection_cancels()]
             if not self._protection_frame_current(snapshot):
                 return tuple(attempts)
             for key, baseline in snapshot.baselines.items():
@@ -3370,7 +3769,8 @@ class LPD2LiveExecution:
                     and handle._thread.is_alive() for o in anchors)
                 if not anchors or any(o.size_matched.value != 0 for o in anchors) or pending_anchor:
                     continue
-                source = observation.source_frame.sources.get(f'market:{key.scope[1]}:{key.scope[2]}')
+                source = observation.source_frame.sources.get(f'market_book:{key.scope[1]}:{key.scope[2]}',
+                    observation.source_frame.sources.get(f'market:{key.scope[1]}:{key.scope[2]}'))
                 book = (source.value.get('book') if source and source.complete and not source.error
                     and isinstance(source.value, Mapping) else None)
                 estimate = estimate_lp_queue_position(book, price=key.price,
@@ -3450,6 +3850,16 @@ class LPD2LiveExecution:
             self.writer.close(timeout=0)
         except TimeoutError:
             pass
+        async_done=True
+        if self.read_runtime is not None:
+            # Stop admission first. Results already committed by the owner stay
+            # durable; late retiring results cannot change a replacement owner.
+            self.read_runtime.reconcile(())
+            while True:
+                self.read_runtime.drain_results()
+                left=max(0,deadline-time.monotonic())
+                async_done=self.read_runtime.close(min(.02,left))
+                if async_done or left<=0:break
         reader_done = self.reader.close(timeout=max(0, deadline-time.monotonic()))
         control_done = self.control.close(max(0, deadline-time.monotonic())).writer_drained
         with self.state._lock:
@@ -3470,5 +3880,5 @@ class LPD2LiveExecution:
         except TimeoutError:
             return False
         settings_done = not self.settings_status()['pending']
-        return (reader_done and control_done and run_done and settings_done
+        return (async_done and reader_done and control_done and run_done and settings_done
             and all(not h._thread.is_alive() for h in handles))

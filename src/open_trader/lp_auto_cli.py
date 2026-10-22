@@ -329,7 +329,7 @@ def run(action: str, url: str, timeout: float | str, *, json_output: bool = Fals
                 allocation_settings({**previous, **payload})
             payload['expected_config_version'] = version
             state = client.write('config', payload)
-            while state.get('settings_pending') is True or state.get('settings_native_inflight') is True:
+            while dual and (state.get('settings_pending') is True or state.get('settings_native_inflight') is True):
                 remaining = client.deadline-time.monotonic()
                 if remaining <= 0: raise TimeoutError('LP configuration confirmation timed out')
                 time.sleep(min(.01,remaining))

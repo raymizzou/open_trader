@@ -97,7 +97,7 @@ def verify_partition(complete, partitions, retired=None, root=None, optional=Non
 def collect(root, paths, output, required=False):
     env = dict(os.environ, CI_COLLECTION_OUTPUT=str(output), PYTHONDONTWRITEBYTECODE='1',
                PYTHONPATH=os.pathsep.join([str(root), str(root / 'src'), str(Path(__file__).resolve().parents[1])]))
-    command = [sys.executable, '-m', 'pytest', '--collect-only', '-q', '-p', 'scripts.ci_partition',
+    command = [sys.executable, '-B', '-m', 'pytest', '-p', 'no:cacheprovider', '--collect-only', '-q', '-p', 'scripts.ci_partition',
                '-m', MARKER, '-o', 'cache_dir=/tmp/open-trader-collection-cache', *paths]
     if required:
         command += ['--ci-required']
