@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-22 — D2 candidate current-account authority
+
+- D2 候选扫描与维护只按当前账户 BUY 剩余未成交占款和当前进程实际发送／不确定结果判断资金；旧 LP 会话、历史未决动作及退役 N-leg 记录不再单独形成资金占位。当前账户身份、完整性、时效及 UNKNOWN／不重放保护保留，旧非 D2 预留逻辑不变。离线公开候选生产与真实 D2 接线回归覆盖预算 14/7、6 USDC 当前占款、SELL／持仓口径与实际在途恢复。
+
 ## 2026-10-22 — LP exact cancel test counter barrier
 
 - The LP read-failure cancel regression now waits for every exact target’s accepted failure count before advancing the test clock or allowing cancellation. Normal, delayed-response and concurrent exact-node checks preserve all cancellation guards; no production behavior changed.
