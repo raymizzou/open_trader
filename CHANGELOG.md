@@ -3,6 +3,10 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-22
+
+- LP runtime regressions now wait for the selected risk session’s scoring publication and the first current-reader observation before checking later progress. Controlled external-boundary delays reproduce the old premature assertions; focused immediate/delayed, concurrent and negative checks preserve financial, no-write, pause and real cleanup contracts. No production behavior change or deployment.
+
 ## 2026-10-21
 
 - CI now supports a main-only manual run with the same four backend partitions, portable scenarios and retirement coverage. Deployment Preflight selects the newest exact-SHA push or manual run and binds artifacts to its real event; newer unsuccessful runs block older green evidence. Focused offline trust and workflow checks cover this path. No deployment in this change.

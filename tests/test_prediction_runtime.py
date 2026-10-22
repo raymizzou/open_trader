@@ -889,12 +889,20 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         while candidate.get("state") != "ready" and time.monotonic() < deadline:
             time.sleep(0.01)
             candidate = runtime.lp.candidate_snapshot()  # type: ignore[union-attr]
+        # Candidate/reward monitors can publish before the LP tick scores this
+        # exact order. Observe the selected session's published facts as well.
         reward_deadline = time.monotonic() + 2
         risk_session = store.lp_session("lp-risk-session")
         dashboard = runtime.execution.lp_dashboard()  # type: ignore[union-attr]
         while (
             (
                 not isinstance(risk_session, dict)
+                or risk_session.get("session_id") != "lp-risk-session"
+                or risk_session.get("scoring_status") != "true"
+                or risk_session.get("scoring_order_id") != "lp-order"
+                or risk_session.get("scoring_checked_at") in (None, risk_stale_at)
+                or risk_session.get("account_checked_at") in (None, risk_stale_at)
+                or risk_session.get("book_checked_at") in (None, risk_stale_at)
                 or not isinstance(risk_session.get("reward_observation"), dict)
                 or not isinstance(dashboard.get("lp_sessions"), list)
                 or not isinstance(risk_dashboard_view(dashboard), dict)
@@ -945,8 +953,10 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         assert risk_session["state"] == "entry_open"
         assert risk_session["account_checked_at"] != risk_stale_at
         assert risk_session["book_checked_at"] != risk_stale_at
+        assert risk_session["session_id"] == "lp-risk-session"
         assert risk_session["scoring_status"] == "true"
-        assert risk_session["scoring_checked_at"] != risk_stale_at
+        assert risk_session["scoring_order_id"] == "lp-order"
+        assert risk_session["scoring_checked_at"] not in (None, risk_stale_at)
         risk_view = risk_dashboard_view(dashboard)
         assert risk_view["session_id"] == "lp-risk-session"
         assert risk_view["state"] == "entry_open"
@@ -3017,6 +3027,9 @@ def _assert_current_progress_with_blocked_optional_source(root: Path, source: st
         child.wait("optional-entered")
         child.wait("optional-runtime-started")
         assert child.request("/healthz")["runtime_state"] == "RUNNING"
+        # RUNNING is published independently of the native Reader. Establish
+        # its first observation before measuring a subsequent source read.
+        child.wait("optional-current-read-1")
         initial = len(list(child.events.glob("optional-current-read-*")))
         assert initial >= 1
         child.advance(1)
