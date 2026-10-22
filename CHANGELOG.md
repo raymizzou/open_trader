@@ -2,6 +2,11 @@
 
 ## 2026-10-22 — Explicit release-test advisory coverage
 
+- Export only the reviewed policy, manifest hash, count and node-set hash in the
+  cross-job CI plan. Full parameterized nodeids stay in source and artifacts;
+  required validation recomputes the summary and rejects tampering. Focused local
+  routing and stock-host verification cover the transport content contract;
+  hosted output acceptance still needs the subsequent natural push run.
 - Keep 224 reviewed release, installer and manager regression identities unchanged,
   including the existing rollback case, and run them in Release advisory on main
   pushes or manual invocation. New tests and parameter identities remain required.

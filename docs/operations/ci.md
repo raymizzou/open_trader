@@ -47,6 +47,17 @@ records the SHA-256 of `uv.lock`, dependency manifest, image identity and comple
 build/test log. Artifacts expire after three days. Download them from the Actions
 run; failure logs are also visible in each service job.
 
+The cross-job plan carries only four optional-policy fields: `policy`,
+`manifest_sha256`, `optional_count` and `optional_sha256`. The planner validates
+all literal identities locally before computing this summary. The aggregate
+recomputes and compares the same source-bound summary; missing, changed or extra
+summary fields fail closed. Full parameterized nodeids stay in the source
+manifest, execution artifacts and partition proof, where the deployment verifier
+checks them. They are not encoded or exported in the cross-job plan, so public
+credential-shaped negative-test parameters do not enter that job output.
+Local CLI tests verify this content contract; they do not reproduce GitHub's
+hosted output scanner. Normal subsequent push evidence verifies hosted transport.
+
 ## Execution and verdict
 
 Each service reuses `make test SERVICE=...` with `TEST_N_LEG=0` and the locked

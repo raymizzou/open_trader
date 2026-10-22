@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Full-backend CI planning, exact-SHA evidence and fail-closed verdict."""
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -20,8 +21,15 @@ def policy():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     data = module.retirement_policy(Path(__file__).resolve().parents[1])
+    optional = module.optional_policy(Path(__file__).resolve().parents[1])
+    # Cross-job metadata must not export parameter text to Actions job outputs.
+    # Full literal identities stay in the source manifest and execution artifacts.
+    nodes = optional['optional_nodeids']
+    summary = {key: optional[key] for key in ('policy', 'manifest_sha256')}
+    summary.update(optional_count=len(nodes), optional_sha256=hashlib.sha256(
+        json.dumps(sorted(nodes), separators=(',', ':')).encode()).hexdigest())
     return {**{key: data[key] for key in ("policy", "manifest_sha256", "retirement_reason")},
-            "optional_policy": module.optional_policy(Path(__file__).resolve().parents[1])}
+            "optional_policy": summary}
 
 
 
