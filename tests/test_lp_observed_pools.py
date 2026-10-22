@@ -1183,7 +1183,7 @@ class AsyncPoolRig(PoolRig):
         self.utc=lambda:self.dates[0]
         super().__init__(tmp_path,monkeypatch,trial=trial,income=income,wallet=wallet,clock=self.utc,build_owner=False)
         self.wake=threading.Event();self.release_http=threading.Event()
-        self.http_mode='ok';self.requests=[];self.failed_book_tokens=set()
+        self.http_mode='ok';self.requests=[];self.failed_book_tokens=set();self.http_gate=None
         self.sdk._ctx.environment=SimpleNamespace(gamma_url='http://127.0.0.1',
             clob_url='http://127.0.0.1',data_url='http://127.0.0.1',
             standard_exchange=self.sdk.environment.standard_exchange)
@@ -1212,6 +1212,8 @@ class AsyncPoolRig(PoolRig):
         from tests.test_lp_async_live_contract import sdk_wire
         source=req.headers['x-lp-source'];oid=req.headers['x-lp-order']
         self.requests.append((source,oid,self.seconds))
+        if self.http_gate is not None:
+            await asyncio.get_running_loop().run_in_executor(None,self.http_gate.wait)
         if source=='book' and self.http_mode in ('held','swallow'):
             try:await asyncio.get_running_loop().run_in_executor(None,self.release_http.wait)
             except asyncio.CancelledError:
@@ -1518,6 +1520,123 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
         rig.close()
 
 
+def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path,monkeypatch,pool_async_watchdog):
+    from threading import Event
+    import time
+    rig=AsyncPoolRig(tmp_path,monkeypatch)
+    group_entered,group_release,other_entered,other_release=Event(),Event(),Event(),Event()
+    notice=Event();callback_release=Event();http_release=Event();protection_entered=Event();planned=[];other=None
+    try:
+        for name in 'ABCDEF':rig.market(name)
+        for name,capital in [('A','50'),('B','30'),('C','20'),('D','10'),('E','1'),('F','1')]:
+            rig.add_order(name,capital)
+        rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
+            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n) for n in 'ABCDEF'})
+        # A partially matched BUY has no queue-baseline cancellation path;
+        # isolate the existing 11th read failure without disabling its guard.
+        rig.history['old-E']['size_matched']=Decimal('.5')
+        rig.failed_book_tokens={'tE'}
+        # Ten real failures are below the existing read-failure cancellation
+        # threshold. All current facts are owned runtime publications.
+        def failures():
+            return next((f.consecutive_failures for k,f in rig.live.state.snapshot().read_failures.items()
+                if k[3]=='old-E'),0)
+        for expected in range(1,11):
+            rig.tick()
+            rig.pump(lambda:failures()==expected)
+        assert rig.sdk.cancels==[] and failures()==10
+        partial=next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-E')
+        assert (partial.original_size.value,partial.size_matched.value,partial.remaining.value)==(Decimal('2.5'),Decimal('.5'),Decimal('2'))
+        rig.measure(dict(A='.6',B='1.0',C='.4',D='.8'))
+        actual_cancel=rig.sdk.cancel_orders
+        def cancel(*,order_ids):
+            if len(order_ids)>1:
+                assert set(order_ids)=={'old-A','old-B','old-C','old-D'}
+                group_entered.set();assert group_release.wait(8),'held group external watchdog'
+                rig.sdk.cancels.append(tuple(order_ids))
+                return dict(canceled=tuple(oid for oid in order_ids if oid!='old-C'),not_canceled={'old-C':'offline unknown'})
+            if order_ids==('old-F',):
+                other_entered.set();assert other_release.wait(8),'held peer external watchdog'
+            if order_ids==('old-E',):
+                protection_entered.set();rig.release('old-E')
+            return actual_cancel(order_ids=order_ids)
+        rig.sdk.cancel_orders=cancel
+        # Public D2 pool planning is used to retain the real group result/IDs;
+        # the subsequent protection and wakeup use the real service scheduler.
+        rig.tick()
+        end=time.monotonic()+4
+        while not planned:
+            result=rig.live.dispatch_rotation(rig.live.run_once(rig.producer.capture_qualified_pool(),pool='income'))
+            if result.rotation_outcomes:planned.append(result)
+            assert time.monotonic()<end,rig.live.rotation_diagnostics()
+            if not planned:time.sleep(.001)
+        assert group_entered.wait(2)
+        group=planned[0];handle=group.rotation_outcomes[0].handle
+        assert len(group.rotation_outcomes)==4
+        assert len({out.handle.identity.request_id for out in group.rotation_outcomes})==4
+        other=rig.live.cancel_independent((rig.live.account_id,rig.cid('F'),'tF','old-F'))
+        assert other is not None and other_entered.wait(2)
+        assert rig.live.status()['native_inflight']==2
+        assert rig.execution._lp_d2_lease_users==2
+        rig.pump(lambda:failures()==11 and
+            rig.live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)>0)
+        assert not protection_entered.is_set()
+        failure=next(f for k,f in rig.live.state.snapshot().read_failures.items() if k[3]=='old-E')
+        assert failure.consecutive_failures==11 and failure.protection_key is not None
+        # Wait for all unrelated HTTP mailboxes to be published and consumed,
+        # then observe only the held group's real physical completion.
+        rig.pump(lambda:rig.live.read_runtime.status()['ready_count']==0 and
+            not any(s['active'] for s in rig.live.read_runtime.status()['scopes']))
+        def wake():
+            rig.scheduler.request_check()
+            notice.set()
+            if __import__('threading').current_thread().name=='lp-pool-group-cancel':
+                assert callback_release.wait(8),'completion callback external watchdog'
+        rig.execution.set_lp_auto_wakeup(wake)
+        notice.clear();before=list(rig.requests);stamp=rig.seconds
+        rig.http_gate=http_release
+        assert not handle.done() and rig.live.status()['native_inflight']==2
+        group_release.set()
+        assert notice.wait(2),'actual group completion must enter registered callback'
+        assert handle._thread.is_alive()
+        assert rig.scheduler.run_due(),'drive early wake before physical thread exit'
+        assert not protection_entered.is_set()
+        assert rig.live.status()['native_inflight']==2
+        assert rig.execution._lp_d2_lease_users==1
+        callback_release.set();handle._thread.join(3)
+        assert not handle._thread.is_alive()
+        # Receipt invalidation may start current-account HTTP, but the transport
+        # gate prevents any unrelated publication/wake masking this interleaving.
+        assert rig.scheduler.run_due()
+        rig.pump(protection_entered.is_set)
+        assert rig.seconds==stamp
+        assert all(t==stamp for _,_,t in rig.requests[len(before):])
+        assert not other_release.is_set() and rig.sdk.posts==[]
+        outcomes=[out.handle.result(0) for out in group.rotation_outcomes]
+        assert {out.venue_order_id for out in outcomes}=={'old-A','old-B','old-C','old-D'}
+        assert {out.venue_order_id for out in outcomes if out.status.value=='accepted'}=={'old-A','old-B','old-D'}
+        assert next(out for out in outcomes if out.venue_order_id=='old-C').status.value=='unknown_error'
+        snapshot=rig.live.state.snapshot()
+        partial=next(o for o in snapshot.orders if o.key[3]=='old-E')
+        assert (partial.original_size.value,partial.size_matched.value)==(Decimal('2.5'),Decimal('.5'))
+        assert partial.remaining.state=='unknown'  # final quantity awaits exact venue proof
+        for order in snapshot.orders:
+            if order.key[3] in {'old-A','old-B','old-D'}:
+                assert order.terminal_proof.matched.state=='unknown'  # cancel ACK is not final fill
+        assert sum(batch==('old-E',) for batch in rig.sdk.cancels)==1
+        http_release.set();rig.http_gate=None
+        rig.tick()
+        rig.pump(lambda:next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-E').remaining.state=='known')
+        final=next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-E')
+        assert final.terminal_proof.matched.value==Decimal('.5') and final.remaining.value==2
+        for _ in range(3):rig.scheduler.run_due()
+        assert sum(batch==('old-E',) for batch in rig.sdk.cancels)==1
+    finally:
+        http_release.set();callback_release.set();group_release.set();other_release.set()
+        if other:other._thread.join(3)
+        rig.close()
+
+
 
 @pytest.mark.parametrize('native_result',['accepted','unknown'])
 def test_pool_restart_and_expiry_preserve_owned_async_holds(tmp_path,monkeypatch,native_result,pool_async_watchdog):
@@ -1648,3 +1767,296 @@ def test_async_read_protection_precedes_pool_rebuild(tmp_path,monkeypatch,pool_a
         assert after==before
         assert rig.sdk.cancels==[('old-B',)] and rig.sdk.posts==[] and not rig.sdk.market_orders
     finally:rig.close()
+
+
+@pytest.mark.parametrize('manual_market',['A','C','D'])
+def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monkeypatch,manual_market,pool_async_watchdog):
+    rig=AsyncPoolRig(tmp_path,monkeypatch)
+    try:
+        for name in 'ABCD':rig.market(name)
+        for name,capital in [('A','50'),('B','30'),('C','20'),('D','10')]:rig.add_order(name,capital)
+        rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
+            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n) for n in 'ABCD'})
+        measured=rig.measure(dict(A='.6',B='1.0',C='.4',D='.8'))
+        assert all(measured['observations'][rig.cid(n)]['pool_result']['state']=='known' for n in 'ABCD')
+        manual='manual-extra-'+manual_market
+        rig.add_order(manual_market,'5',order_id=manual)
+        planned=rig.cycle(pool='income',qualified=True);rig.finish_cancels(planned)
+        sent={oid for batch in rig.sdk.cancels for oid in batch}
+        assert manual not in sent,'pool authority must never cancel an unclassified same-market BUY'
+        assert sent=={'old-A','old-B','old-C','old-D'}
+        assert rig.sdk.posts==[]
+        snapshot=rig.live.state.snapshot()
+        assert sum((o.price.value*o.remaining.value for o in planned.acceptance.observation.orders),Decimal(0))==Decimal('115')
+        assert snapshot.buy_reserved.value==Decimal('5')
+        assert next(o for o in snapshot.active_orders if o.key[3]==manual).remaining.value==Decimal('12.5')
+        rig.release('old-A','old-B','old-C','old-D')
+        rig.cycle(pool='income',qualified=True)
+        expected=[('tB',Decimal('50')),('tD',Decimal('30')),('tA',Decimal('20'))]
+        expected=[row for row in expected if row[0]!='t'+manual_market]
+        assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts]==expected
+        assert manual in {row['id'] for row in rig.sdk.orders}
+        assert all(manual not in batch for batch in rig.sdk.cancels)
+        # Actual external account coverage, rather than a cancel ACK or pool
+        # classification, keeps the manual capital and its same-market slot.
+        rig.tick()
+        rig.pump(lambda:rig.live.state.snapshot().observation.components['open_orders'].checked_at==rig.utc())
+        snapshot=rig.live.state.snapshot()
+        assert snapshot.buy_reserved.value==Decimal('5')+sum((capital for _,capital in expected),Decimal(0))
+        assert len([o for o in snapshot.active_orders if o.key[1]==rig.cid(manual_market)])==1
+        assert rig.execution.lp_observed_pool_state()['results'][rig.cid(manual_market)]['result']==measured['observations'][rig.cid(manual_market)]['pool_result']
+        if manual_market=='D':
+            assert all(p['token_id']!='tD' for p in rig.sdk.posts)
+            rig.release(manual)
+            # A later current round may rebuild the successful partial group.
+            # Model actual venue removal for these new exact cancel IDs, rather
+            # than leaving contradictory LIVE rows after their accepted receipt.
+            rig.cancel_removes=True
+            next_round=rig.cycle(pool='income',qualified=True)
+            rig.finish_cancels(next_round)
+            if next_round.rotation_outcomes:
+                rig.cycle(pool='income',qualified=True)
+            assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts if p['token_id']=='tD']==[('tD',Decimal('30'))]
+            rig.cycle(pool='income',qualified=True)  # publish completed partial group's current account
+            assert {(row['asset_id'],row['price']*(row['original_size']-row['size_matched']))
+                for row in rig.sdk.orders}=={('tB',Decimal('50')),('tD',Decimal('30')),('tA',Decimal('20'))}
+            assert len(rig.sdk.orders)==3
+        assert all(manual not in batch for batch in rig.sdk.cancels)
+        assert not rig.sdk.market_orders
+    finally:rig.close()
+
+
+@pytest.mark.parametrize('change',['unchanged','paused','identity','denied'])
+def test_pool_group_permission_wait_keeps_current_state_responsive(tmp_path,monkeypatch,change,pool_async_watchdog):
+    import sqlite3,time,threading
+    from concurrent.futures import ThreadPoolExecutor
+    from tests.test_lp_d2_integration import settle_control
+    rig=AsyncPoolRig(tmp_path,monkeypatch)
+    sql_entered,sql_release=threading.Event(),threading.Event()
+    pool=ThreadPoolExecutor(max_workers=3);pending=None;dispatched=None
+    try:
+        for name in 'ABCD':rig.market(name)
+        for name,capital in [('A','50'),('B','30'),('C','20'),('D','10')]:rig.add_order(name,capital)
+        rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
+            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n) for n in 'ABCD'})
+        rig.measure(dict(A='.6',B='1.0',C='.4',D='.8'));rig.tick()
+        end=time.monotonic()+4
+        while True:
+            planned=rig.live.run_once(rig.producer.capture_qualified_pool(),pool='income')
+            if planned.rotation and len(planned.rotation.victims)==4:break
+            assert time.monotonic()<end,'public income decision watchdog'
+            time.sleep(.001)
+        assert rig.sdk.cancels==rig.sdk.posts==[]
+        real_connect=sqlite3.connect
+        class Boundary(sqlite3.Connection):
+            def execute(self,sql,*args,**kwargs):
+                if (threading.current_thread().name=='lp-pool-group-cancel'
+                        and 'FROM incidents WHERE acknowledged_at IS NULL' in sql):
+                    sql_entered.set()
+                    assert sql_release.wait(8),'real permission SQL external watchdog'
+                return super().execute(sql,*args,**kwargs)
+        monkeypatch.setattr(sqlite3,'connect',lambda *a,**k:real_connect(*a,**(k|dict(factory=Boundary))))
+        pending=pool.submit(rig.live.dispatch_rotation,planned)
+        assert sql_entered.wait(2),'group must reach actual Store-backed permission read'
+        visible=pool.submit(rig.live.state.snapshot)
+        snapshot=visible.result(timeout=1)
+        assert snapshot.observation is not None and not sql_release.is_set()
+        assert rig.sdk.cancels==[]
+        if change=='paused':
+            control=pool.submit(rig.execution.lp_auto_set_desired_running,False)
+            assert control.result(timeout=2)['desired_running'] is False
+            settle_control(rig.live)
+        elif change=='identity':
+            rig.release('old-A');rig.add_order('A','50',order_id='replacement-A');rig.tick()
+            def publish():
+                end=time.monotonic()+4
+                while not any(o.key[3]=='replacement-A' for o in rig.live.state.snapshot().active_orders):
+                    rig.live.run_once(rig.producer.capture_qualified_pool(),pool='income')
+                    assert time.monotonic()<end,'public replacement publication watchdog'
+                    time.sleep(.001)
+            pool.submit(publish).result(timeout=5)
+        elif change=='denied':
+            historical=rig.store.create_recovery_execution(dict(reason='offline permission gate'),idempotency_key='group-permission')
+            rig.store.open_incident(historical['execution_id'],dict(reason='offline unacknowledged incident'))
+        assert not sql_release.is_set() and rig.sdk.cancels==[]
+        sql_release.set();dispatched=pending.result(timeout=3);rig.finish_cancels(dispatched)
+        outcomes=[out.handle.result(0) for out in dispatched.rotation_outcomes]
+        assert len(outcomes)==4 and len({out.identity.request_id for out in outcomes})==4
+        if change=='unchanged':
+            assert len(rig.sdk.cancels)==1 and set(rig.sdk.cancels[0])=={'old-A','old-B','old-C','old-D'}
+            assert all(out.status.value=='accepted' for out in outcomes)
+            assert all(o.terminal_proof.matched.state=='unknown' for o in rig.live.state.snapshot().orders)
+        else:
+            assert rig.sdk.cancels==[]
+            assert all(out.status.value=='not_sent' for out in outcomes)
+        before=list(rig.sdk.cancels)
+        rig.live.dispatch_rotation(planned)
+        assert rig.sdk.cancels==before and rig.sdk.posts==rig.sdk.market_orders==[]
+        assert rig.execution._lp_d2_lease_users==0
+    finally:
+        sql_release.set()  # never join an executor/native thread behind its SQL gate
+        if pending is not None:
+            dispatched=pending.result(timeout=3)
+            rig.finish_cancels(dispatched)
+        pool.shutdown(wait=True)
+        rig.close()
+
+
+@pytest.mark.parametrize('case',['timing','mode_and_aliases'])
+def test_observed_pool_config_preserves_live_timing_and_explicit_mode_changes(tmp_path,monkeypatch,case,pool_async_watchdog):
+    from tests.test_lp_d2_integration import settle_control
+    rig=AsyncPoolRig(tmp_path,monkeypatch)
+    try:
+        def save(changes):
+            before=rig.execution.lp_auto_state()
+            rig.execution.lp_auto_configure(dict(expected_config_version=before['config_version'],**changes))
+            # The reply can precede the native save. Verify actual owner
+            # publication and the real Store CAS result, never reply alone.
+            rig.pump(lambda:rig.execution.lp_auto_state()['config_version']==before['config_version']+1
+                and not rig.execution.lp_auto_state()['settings_pending'])
+            after=rig.execution.lp_auto_state()
+            saved=rig.store.lp_load_current_settings(rig.account)
+            assert saved['config_version']==after['config_version']==before['config_version']+1
+            for key,value in changes.items():assert saved[key]==after[key]==value
+            return before,after
+        initial=rig.execution.lp_auto_state()
+        assert initial['allocation_mode']=='observed_pools'
+        assert initial['desired_running'] is initial['effective_running'] is True
+        assert initial['trial_budget_usd']==initial['budget_usd']=='20' and initial['income_budget_usd']=='100'
+        if case=='timing':
+            before,after=save(dict(api_retry_interval_seconds=30))
+            assert after['trading_config_version']==before['trading_config_version']
+            for key in ('allocation_mode','budget_usd','trial_budget_usd','income_budget_usd',
+                    'target_buy_count','trial_target_buy_count','income_target_buy_count','income_weights',
+                    'buy_price_level','order_check_interval_seconds','desired_running','effective_running'):
+                assert after[key]==before[key]
+            assert after['desired_running'] is after['effective_running'] is True
+        else:
+            rig.execution.lp_auto_set_desired_running(False);settle_control(rig.live)
+            rig.live.run_once(rig.producer.capture_qualified_pool())
+            _,minimum=save(dict(allocation_mode='minimum'))
+            assert minimum['desired_running'] is minimum['effective_running'] is False
+            _,observed=save(dict(allocation_mode='observed_pools'))
+            assert observed['budget_usd']==observed['trial_budget_usd']=='20'
+            assert observed['income_budget_usd']=='100'
+            for patch,trial,income in [(dict(budget_usd='25'),'25','100'),
+                    (dict(trial_budget_usd='30'),'30','100'),(dict(income_budget_usd='150'),'30','150')]:
+                _,state=save(patch)
+                assert state['allocation_mode']=='observed_pools'
+                assert state['budget_usd']==state['trial_budget_usd']==trial
+                assert state['income_budget_usd']==income
+                assert state['target_buy_count']==state['trial_target_buy_count']==state['income_target_buy_count']==3
+                assert state['income_weights']==['0.5','0.3','0.2']
+                assert state['desired_running'] is state['effective_running'] is False
+            # Real pool/alias writes retain the existing running trading guard.
+            rig.execution.lp_auto_set_desired_running(True);settle_control(rig.live)
+            rig.live.run_once(rig.producer.capture_qualified_pool())
+            before=rig.store.lp_load_current_settings(rig.account)
+            with pytest.raises(ValueError,match='pause_and_finish_automatic_buys_before_configuring'):
+                rig.execution.lp_auto_configure(dict(budget_usd='35',expected_config_version=before['config_version']))
+            assert rig.store.lp_load_current_settings(rig.account)==before
+        assert rig.sdk.posts==rig.sdk.cancels==rig.sdk.market_orders==[]
+    finally:rig.close()
+
+
+def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkeypatch,pool_async_watchdog):
+    from threading import Event,Lock,current_thread
+    rig=AsyncPoolRig(tmp_path,monkeypatch)
+    trial_entered,income_entered,native_release=Event(),Event(),Event()
+    callbacks_entered,callback_release,http_release=Event(),Event(),Event()
+    callback_lock=Lock();callback_count=0;groups=[];protection_entered=Event()
+    try:
+        pools=dict(A='100',B='100',C='100',D='500',E='400',F='300',G='200',H='100',J='1000')
+        capitals=dict(A='50',B='30',C='20',D='5',E='5',F='5',G='5',H='5',J='1')
+        for name in 'ABCDEFGHJ':
+            rig.market(name,minimum='1',pool=pools[name]);rig.add_order(name,capitals[name])
+        rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
+            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n) for n in 'ABCDEFGHJ'})
+        rig.measure(dict(A='.6',B='1',C='.4',D='.8',E='.7',F='.5',G='.3',H='.2'))
+        def cancel(*,order_ids):
+            ids=set(order_ids);rig.sdk.cancels.append(tuple(order_ids))
+            if ids=={'old-F','old-G','old-H'}:trial_entered.set()
+            elif ids=={'old-A','old-B','old-C','old-D','old-E'}:income_entered.set()
+            elif ids=={'old-J'}:
+                protection_entered.set();rig.release('old-J')
+                return dict(canceled=('old-J',),not_canceled={})
+            else:raise AssertionError(('unexpected cancel identity',order_ids))
+            assert native_release.wait(8),'two real group calls external watchdog'
+            return dict(canceled=(),not_canceled={oid:'offline unknown' for oid in order_ids})
+        rig.sdk.cancel_orders=cancel
+        trial=rig.cycle(pool='trial');assert trial_entered.wait(2)
+        income=rig.cycle(pool='income');assert income_entered.wait(2)
+        assert {o.key[3] for o in trial.rotation.victims}=={'old-F','old-G','old-H'}
+        assert {o.key[3] for o in income.rotation.victims}=={'old-A','old-B','old-C','old-D','old-E'}
+        groups=[trial.rotation_outcomes[0].handle.parent,income.rotation_outcomes[0].handle.parent]
+        assert rig.live.status()['native_inflight']==2 and rig.execution._lp_d2_lease_users==2
+        assert rig.sdk.posts==[]
+        # Partial matching isolates the existing eleventh read-failure guard
+        # from the unrelated queue-baseline cancellation path.
+        rig.history['old-J']['size_matched']=Decimal('.5');rig.failed_book_tokens={'tJ'}
+        def failure():
+            return next((f for k,f in rig.live.state.snapshot().read_failures.items() if k[3]=='old-J'),None)
+        for expected in range(1,12):
+            rig.tick();rig.pump(lambda:failure() is not None and failure().consecutive_failures==expected)
+        assert failure().protection_key is not None and not protection_entered.is_set()
+        rig.pump(lambda:rig.live.read_runtime.status()['ready_count']==0 and
+            not any(s['active'] for s in rig.live.read_runtime.status()['scopes']))
+        # Consume the two real public pool opportunities at the same clock.
+        # No internal pending/generation/scheduler state is replaced or edited.
+        rig.live.run_once(rig.producer.capture_qualified_pool(),pool='trial')
+        rig.live.run_once(rig.producer.capture_qualified_pool(),pool='income')
+        rig.pump(lambda:rig.live.read_runtime.status()['ready_count']==0 and
+            not any(s['active'] for s in rig.live.read_runtime.status()['scopes']))
+        partial=next(o for o in rig.live.state.snapshot().active_orders if o.key[3]=='old-J')
+        assert (partial.original_size.value,partial.size_matched.value,partial.remaining.value)==(Decimal('2.5'),Decimal('.5'),Decimal('2'))
+        def wake():
+            nonlocal callback_count
+            rig.scheduler.request_check()
+            if current_thread().name=='lp-pool-group-cancel':
+                with callback_lock:
+                    callback_count+=1
+                    if callback_count==2:callbacks_entered.set()
+                assert callback_release.wait(8),'last-owner completion callback watchdog'
+        rig.execution.set_lp_auto_wakeup(wake)
+        rig.http_gate=http_release;before_http=list(rig.requests);stamp=rig.seconds
+        native_release.set();assert callbacks_entered.wait(3)
+        assert all(h._thread.is_alive() and not h.done() for h in groups)
+        before_blocks=rig.live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)
+        # Deterministic public owner boundary: capacity is checked while both
+        # physical threads are held, then readiness is read after both exit.
+        rig.live.run_protection_once()
+        assert rig.live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)>before_blocks
+        assert not protection_entered.is_set() and rig.live.status()['native_inflight']==2
+        callback_release.set()
+        for group in groups:
+            group._thread.join(3);assert not group._thread.is_alive()
+        assert rig.execution._lp_d2_lease_users==0
+        assert rig.requests==before_http  # no unrelated HTTP publication/wake
+        status=rig.live.status()
+        assert status['native_inflight']==0
+        assert status['plan_wait'] is None,'last physical exit must keep exact deferred protection immediately runnable'
+        assert rig.scheduler.run_due(),'real service scheduler must continue at unchanged business time'
+        rig.pump(protection_entered.is_set)
+        rig.pump(lambda:rig.live.status()['native_inflight']==0)
+        assert rig.seconds==stamp
+        assert sum(batch==('old-J',) for batch in rig.sdk.cancels)==1
+        outcomes=[o.handle.result(0) for result in (trial,income) for o in result.rotation_outcomes]
+        assert len(outcomes)==8 and len({o.identity.request_id for o in outcomes})==8
+        assert all(o.status.value=='unknown_error' for o in outcomes)
+        snapshot=rig.live.state.snapshot()
+        assert all(o.terminal_proof is None and o.presence=='present' for o in snapshot.orders if o.key[3]!='old-J')
+        partial=next(o for o in snapshot.orders if o.key[3]=='old-J')
+        assert partial.remaining.state=='unknown' and partial.terminal_proof.matched.state=='unknown'
+        for _ in range(3):rig.scheduler.run_due()
+        assert sum(batch==('old-J',) for batch in rig.sdk.cancels)==1
+        assert rig.sdk.posts==rig.sdk.market_orders==[]
+        http_release.set();rig.http_gate=None
+        rig.tick()
+        rig.pump(lambda:next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-J').remaining.state=='known')
+        final=next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-J')
+        assert final.terminal_proof.matched.value==Decimal('.5') and final.remaining.value==2
+        assert sum(batch==('old-J',) for batch in rig.sdk.cancels)==1
+    finally:
+        http_release.set();callback_release.set();native_release.set()
+        for group in groups:group._thread.join(3)
+        rig.close()

@@ -1887,8 +1887,15 @@ class LPD2LiveExecution:
         for cid in members:
             if cid in sized: new_rows.append(sized[cid])
         rebuild = bool(decision['cancel_members'])
+        # Pool authority follows exact role episodes and measured trial sources.
+        # Other BUYs in the same condition remain real account commitments.
+        entrants = {cid:results[cid]['result']['source_order'] for cid in set(members)-income
+            if results.get(cid,{}).get('result')}
         victims = tuple(r['order_id'] for r in prepared.current_buys
-            if rebuild and r['condition_id'] in income or r['condition_id'] in set(members)-income)
+            if (rebuild and income_order(roles['roles'],r['condition_id'],r['order_id']))
+            or (r['condition_id'] in entrants
+                and entrants[r['condition_id']].get('order_id') == r['order_id']
+                and entrants[r['condition_id']].get('token_id') == r['token_id']))
         keys = tuple((r['condition_id'], r['token_id']) for r in new_rows if r['condition_id'] not in active_markets)
         selection = replace(calculation, new_target_keys=keys, victim_order_ids=victims,
             targets=tuple(members), target_tokens=tuple(''+r['token_id'] for r in new_rows),
@@ -2066,8 +2073,11 @@ class LPD2LiveExecution:
                 def cancel():
                     results = {}
                     try:
+                        # Store-backed permission can wait on SQLite. It must
+                        # not own the memory publication lock during that wait.
+                        permitted = lease.allowed('ROTATION_CANCEL')
                         with self.state._lock:
-                            permitted = lease.allowed('ROTATION_CANCEL') and all(self._rotation_current(decision,o) for o in victims)
+                            permitted = permitted and all(self._rotation_current(decision,o) for o in victims)
                         if permitted:
                             response = self.trading.cancel_orders_detailed(tuple(o.key[3] for o in victims))
                         else:
@@ -2094,8 +2104,11 @@ class LPD2LiveExecution:
                                 'accepted' if outcome.status==LocalStatus.ACCEPTED else
                                 'not_sent' if outcome.status==LocalStatus.NOT_SENT else 'unknown',self._utc_now()))
                         try:lease.release()
-                        finally:self._publish_native_completion()
-                    future.set_result(results)
+                        finally:
+                            # An early owner pass retains this completion while
+                            # the finished Future's native thread still exits.
+                            future.set_result(results)
+                            self._publish_native_completion()
                 thread=threading.Thread(target=cancel,name='lp-pool-group-cancel',daemon=False)
                 handle=NativeAttempt(group,future,thread)
                 for order in victims:

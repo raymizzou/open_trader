@@ -26,9 +26,10 @@ ALLOCATION_FIELDS = ('allocation_mode', 'allocation_weights', 'allocation_shadow
 def pool_settings_changes(document, changes):
     """Normalize a narrow dual-pool write before validating or committing it."""
     changes = dict(changes)
-    if (document.get('allocation_mode') == 'observed_pools'
-            or changes.get('allocation_mode') == 'observed_pools'
-            or set(changes) & set(POOL_FIELDS)):
+    mode = changes.get('allocation_mode', document.get('allocation_mode'))
+    if (changes.get('allocation_mode') == 'observed_pools'
+            or set(changes) & set(POOL_FIELDS)
+            or mode == 'observed_pools' and 'budget_usd' in changes):
         for key in ('trial_budget_usd', 'income_budget_usd', 'budget_usd'):
             if key in changes:
                 changes[key] = str(_number(changes[key], 'lp_settings_' + key + '_invalid'))
