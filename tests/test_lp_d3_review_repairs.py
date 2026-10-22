@@ -64,6 +64,8 @@ def test_publication_ports_keep_guards_free_while_metadata_business_control_queu
     # The publication calls below remain real Store/LPService operations.
     d2 = SimpleNamespace(_closed=False, store=store, trading=service.exchange,
         account_id=service.exchange.config.wallet_address,
+        candidate_current_reservations=lambda account=None: pytest.fail(
+            'routing-only D2 fixture has no candidate financial authority'),
         policy=SimpleNamespace(buy_price_level=1),
         state=SimpleNamespace(snapshot=lambda: SimpleNamespace(current=SimpleNamespace(
             shutdown_requested=False, fatal_id=None))), bind_mutation_admission=lambda *args: None)

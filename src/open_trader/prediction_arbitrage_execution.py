@@ -894,6 +894,7 @@ class PredictionExecutionService:
             self._lp._facts_attention_flusher = self._auto_pool.flush_attention
         elif self._lp is not None:
             self._lp.set_candidate_buy_price_level_reader(lambda:self._lp_d2.policy.buy_price_level)
+            self._lp.set_candidate_current_reservations_reader(lp_d2.candidate_current_reservations)
         self._threads: dict[str, threading.Thread] = {}
         self._clock = time.monotonic
         self._sleep = time.sleep

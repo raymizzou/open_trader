@@ -1419,6 +1419,27 @@ class LPD2LiveExecution:
             if handle is not None:attempts.append(handle)
         return tuple(attempts)
 
+    def candidate_current_reservations(self, account=None):
+        """Read current process authority only; account BUYs are counted by ID.
+
+        An initial unread state has no native uncertainty and must permit the
+        producer to start. Once observed, only CurrentLPState can restore
+        financial authority after a send or uncertain result.
+        """
+        if account is not None:
+            identities = (account.get('wallet_address'), account.get('account_id'))
+            if not any(identities) or any(value is not None and
+                    str(value).strip().casefold() != self.account_id.strip().casefold()
+                    for value in identities):
+                return ({'order_id': 'd2-current-account-identity', 'amount': None},)
+        with self.state._lock:
+            snapshot = self.state.snapshot()
+            owned = bool(self._active_sends) or any(
+                handle._thread.is_alive() for handle in self._native_jobs.values())
+            if owned or snapshot.new_capacity.state not in ('known', 'not_read'):
+                return ({'order_id': 'd2-current-send-or-uncertainty', 'amount': None},)
+            return ()
+
     def run_once(self, captured_candidates=None, *, timeout=2, attempted_at=None, capture_failed=False, pool=None):
         if self._closed:
             raise RuntimeError('d2_closed')

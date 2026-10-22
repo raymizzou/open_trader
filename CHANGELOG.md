@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-10-22 — D2 routing test fixture protocol
+
+- 补齐两个局部 D2 路由测试替身的候选预留协议成员；如被实际调用则明确失败，不提供虚构资金权威。保留路由、真实 Store 发布、锁与清理断言；生产逻辑不变。
+
+## 2026-10-22 — D2 candidate current-account authority
+
+- D2 候选扫描与维护只按当前账户 BUY 剩余未成交占款和当前进程实际发送／不确定结果判断资金；旧 LP 会话、历史未决动作及退役 N-leg 记录不再单独形成资金占位。当前账户身份、完整性、时效及 UNKNOWN／不重放保护保留，旧非 D2 预留逻辑不变。离线公开候选生产与真实 D2 接线回归覆盖预算 14/7、6 USDC 当前占款、SELL／持仓口径与实际在途恢复。
+
+## 2026-10-22 — LP exact cancel test counter barrier
+
+- The LP read-failure cancel regression now waits for every exact target’s accepted failure count before advancing the test clock or allowing cancellation. Normal, delayed-response and concurrent exact-node checks preserve all cancellation guards; no production behavior changed.
+
+## 2026-10-22 — LP position cadence test owner synchronization
+
+- LP 持仓 60 秒回归在推进业务时钟前，等待 owner 接纳同账户、同代际的新完整金融观察，并保留持仓就绪与读取结束条件。保留原 59/60 秒、60 份数量、止损、不重放及 4 秒限制；使用离线 HTTP 响应延迟和独立并发执行验证，未改生产逻辑。
+
 ## 2026-10-22 — Explicit release-test advisory coverage
 
 - Export only the reviewed policy, manifest hash, count and node-set hash in the
