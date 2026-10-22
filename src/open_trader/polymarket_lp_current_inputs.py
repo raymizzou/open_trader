@@ -136,7 +136,7 @@ def prepare_current_inputs(frame, captured_candidates, policy, as_of):
     directions, failures = {}, {}
     for order in frame.current_buys:
         condition, token = order['condition_id'], order['token_id']
-        source = frame.sources.get(f'market:{condition}:{token}')
+        source = frame.sources.get('market_order:'+order['order_id'],frame.sources.get(f'market:{condition}:{token}'))
         def dropped(code):
             failures[order['order_id']] = dict(order_id=order['order_id'],
                 account_id=frame.account, condition_id=condition, token_id=token,

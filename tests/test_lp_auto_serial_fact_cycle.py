@@ -1771,8 +1771,12 @@ def test_partial_account_failure_uses_current_owned_buy_quantity(request, runtim
 
 
 def test_cold_unknown_entry_waits_for_real_dependency_deadline(request, runtime, tmp_path):
-    if run_test_in_subprocess(request):
-        return
+    child_temp_root = tmp_path / 'supervised-pytest'
+    child_temp_root.mkdir(mode=0o700)
+    with pytest.MonkeyPatch.context() as child_environment:
+        child_environment.setenv('PYTEST_DEBUG_TEMPROOT', str(child_temp_root))
+        if run_test_in_subprocess(request):
+            return
     from copy import deepcopy
     from open_trader.polymarket_lp_scheduler import LPAutoScheduler
     store, adapter, account, lp, engine, public = prepare(runtime, budget='8', target=1, count=1)

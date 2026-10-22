@@ -28,7 +28,7 @@ OTHER_CID='0x'+'3'*64
 OTHER_TOKEN='0x'+'4'*64
 
 
-def manual_runtime(tmp_path,monkeypatch,*,process='manual-P1'):
+def manual_runtime(tmp_path,monkeypatch,*,process='manual-P1',monotonic_clock=time.monotonic):
     clock=[NOW]
     class ClockMeta(type):
         def __instancecheck__(cls,value):return isinstance(value,datetime)
@@ -83,7 +83,7 @@ def manual_runtime(tmp_path,monkeypatch,*,process='manual-P1'):
         checked_at=NOW,valid_until=NOW+timedelta(hours=24)))
     lp=PolymarketLPService(store,adapter,clock=lambda:clock[0])
     live=LPD2LiveExecution(store,adapter,account_id=WALLET,venue='polymarket',process_epoch=process,
-        policy=CalculationPolicy(None),utc_now=lambda:clock[0])
+        policy=CalculationPolicy(None),clock=monotonic_clock,utc_now=lambda:clock[0])
     live.initialize(ValidatedStartAdmission(process,'offline-start-permit'))
     execution=PredictionExecutionService(store=store,monitor=object(),trading=adapter,notifier=_Notifier(),
         lock_path=tmp_path/'execution.lock',lp=lp,lp_d2=live)
@@ -357,16 +357,22 @@ def test_d2_manual_restart_binding_uses_current_api_not_saved_economics(tmp_path
         assert replay['buy_cost']=='900' and replay['stop_loss_latched'] is True
         assert sdk.posts==[] and live.state.snapshot().openings=={}
         sdk.orders=()
+        assert execution.lp_augment_preview(dict(session_id=group,quantity='20',price='.28'))['state']=='rejected'
         absent=execution.lp_status(group)
         assert absent['state']=='needs_attention' and live.state.snapshot().openings=={},absent
         sdk.orders=tuple(o.model_copy(update={'maker_address':'0x'+'f'*40}) for o in saved_orders)
+        assert execution.lp_augment_preview(dict(session_id=group,quantity='20',price='.28'))['state']=='rejected'
         assert execution.lp_status(group)['state']=='needs_attention' and live.state.snapshot().openings=={}
         sdk.orders=saved_orders;sdk.positions=None
+        assert execution.lp_augment_preview(dict(session_id=group,quantity='20',price='.28'))['state']=='rejected'
         assert execution.lp_status(group)['state']=='needs_attention' and live.state.snapshot().openings=={}
         sdk.positions=()
         sdk.orders=tuple(o.model_copy(update={'price':Decimal('.26')}) if o.id=='manual-order-1' else o for o in saved_orders)
+        assert execution.lp_augment_preview(dict(session_id=group,quantity='20',price='.28'))['state']=='rejected'
         assert execution.lp_status(group)['state']=='needs_attention' and live.state.snapshot().openings=={}
         sdk.orders=saved_orders
+        # Explicit preview binds verified identities; GET only publishes them.
+        assert execution.lp_augment_preview(dict(session_id=group,quantity='20',price='.28'))['state']=='previewed'
         status=execution.lp_status(group)
         if status['state']!='entry_open':
             print('actual canonical terms',[(o.key,o.side,o.order_type.value,o.expiration.value,o.price.value,o.original_size.value,o.source==live.state.snapshot().observation.order_view.orders_source) for o in live.state.snapshot().orders])
@@ -383,7 +389,7 @@ def test_d2_manual_restart_binding_uses_current_api_not_saved_economics(tmp_path
         assert execution.lp_submit_augment(dict(session_id=group,quantity='20',price='.28',idempotency_key='restart-add'))['state']=='entry_open'
         assert len(sdk.posts)==1 and sdk.posts[0]['expiration']==int((NOW+timedelta(minutes=11)).timestamp())
         assert live.rounds.snapshot().round_number==0
-        # Named current status binds only requested identities, never the other group implicitly.
+        # Explicit named preview binds only requested identities, never the other group implicitly.
         assert len(live.state.snapshot().openings)==1
         clock[0]=NOW+timedelta(minutes=10)
         live.run_once()
