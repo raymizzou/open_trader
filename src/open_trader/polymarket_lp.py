@@ -69,6 +69,7 @@ from .prediction_arbitrage_store import (
     PredictionArbitrageStore,
 )
 from .notifications import beijing_clock, notification_delivery_episode
+from .polymarket_lp_diagnostics import LPDiagnostics
 from .polymarket_trading import (
     PolymarketTradingClient,
     LpAccountReadError,
@@ -973,6 +974,7 @@ class PolymarketLPService:
         self._facts_apply_lock = threading.Lock()
         self._first_seen_apply_lock = MemoryLock('_first_seen_apply_lock', reentrant=False)
         self._account_registration_attempt = 0
+        self._lp_diagnostics = LPDiagnostics()
         self._account_order_sync_error: str | None = None
         self._deferred_protection_notices = threading.local()
         self._protection_cancel_lock = threading.Lock()
@@ -9563,6 +9565,23 @@ class PolymarketLPService:
         )
         return result["session"]
 
+    def _diagnostic_receipt_applied(self, session):
+        try:
+            key = session.get('idempotency_key')
+            attempt = self._lp_diagnostics.pending('entry', key)
+            if (attempt is None or session.get('submit_status') != 'accepted'
+                    or not session.get('entry_order_id')):
+                return
+            audits = [a for a in self.store.lp_actions(session['session_id'])
+                if a.get('role') == 'entry' and a.get('state') == 'accepted'
+                and a.get('order_id') == session['entry_order_id']]
+            if len(audits) == 1:
+                self._lp_diagnostics.record(attempt, event='complete', stage='receipt_apply',
+                    cause='receipt_received', request=key, post_started=audits[0].get('post_started'),
+                    result='accepted', event_at=self._now())
+        except Exception:
+            pass
+
     def _register_direct_receipt(
         self,
         session: Mapping[str, object],
@@ -9892,18 +9911,75 @@ class PolymarketLPService:
     def _register_planning_account_snapshot(self, snapshot):
         """Current-only registration cannot clear or replace full-publication diagnostics."""
         _lp_causal_event('account_publish_wait', account=snapshot)
+        association = self._lp_diagnostics.associated('account_planning')
+        diagnostic_attempt = association.get('attempt') or self._lp_diagnostics.begin('account_planning')
         outcome = 'failed'
         try:
             result = self._register_account_snapshot(snapshot,
                 _planning_only=snapshot.get('trades_complete') is not True,
                 _automatic_observation=True)
             outcome = result.get('state', 'failed')
+            self._account_diagnostic_result(diagnostic_attempt, result=result,
+                allow_recovery=association.get('recovery', True), round_id=association.get('round_id'), snapshot=snapshot)
             return result
-        except LpAccountRoundInvalid:
-            outcome = 'skipped'
+        except Exception as exc:
+            if isinstance(exc, LpAccountRoundInvalid):
+                outcome = 'skipped'
+            self._account_diagnostic_result(diagnostic_attempt, exc=exc, round_id=association.get('round_id'), snapshot=snapshot)
             raise
         finally:
             _lp_causal_event('account_publish_end', account=snapshot, outcome=outcome)
+
+    def _account_diagnostic_components(self, attempt, snapshot, *, round_id=None):
+        """Observe failed current reads before any permitted old-source reuse."""
+        try:
+            components = snapshot.get('components')
+            if not isinstance(components, Mapping):
+                return True
+            healthy = True
+            for name in ('balance', 'open_orders', 'positions'):
+                component = components.get(name) or {}
+                if component.get('state') == 'known':
+                    continue
+                healthy = False
+                error = component.get('error') or {}
+                code = error.get('error_type')
+                failed_at = error.get('planning_failed_at')
+                started_at = snapshot.get('read_started_at')
+                if isinstance(failed_at, str):
+                    failed_at = _timestamp(failed_at, name='planning_failed_at')
+                if isinstance(started_at, str):
+                    started_at = _timestamp(started_at, name='read_started_at')
+                cached = isinstance(failed_at, datetime) and isinstance(started_at, datetime) and failed_at < started_at
+                waiting = code in ('account_read_in_progress', 'account_read_capacity') or cached
+                cause = code if code in ('account_read_in_progress', 'account_read_capacity') else (
+                    'account_read_cooling_down' if cached else 'account_read_failed')
+                self._lp_diagnostics.record(attempt, event='waiting' if waiting else 'failed',
+                    stage='account_read', cause=cause, summary='account_order_sync_unknown',
+                    error_facts=error, component=name, event_at=self._now(), round_id=round_id,
+                    account=snapshot)
+            return healthy
+        except Exception:
+            return False  # Unknown diagnostic provenance cannot authorize recovery.
+
+    def _account_diagnostic_result(self, attempt, *, result=None, exc=None,
+                                   allow_recovery=True, round_id=None, snapshot=None):
+        """Keep returned validation failures as specific as raised failures."""
+        try:
+            reason = result.get('reason') if isinstance(result, Mapping) else None
+            waiting = isinstance(exc, (LpAccountRoundInvalid, LpObservationWait)) or reason in (
+                'account_round_invalid', 'session_changed')
+            event = ('waiting' if waiting else 'complete' if isinstance(result, Mapping)
+                     and result.get('state') == 'registered' else 'failed')
+            if event == 'complete' and not allow_recovery:
+                return
+            self._lp_diagnostics.record(attempt, event=event, stage='account_publish',
+                cause=None if event == 'complete' else (
+                    'account_round_invalid' if isinstance(exc, LpAccountRoundInvalid) else reason or 'account_order_sync_unknown'),
+                summary='account_order_sync_unknown', exc=exc, event_at=self._now(),
+                round_id=round_id, account=snapshot)
+        except Exception:
+            pass
 
     def register_account_snapshot(
         self, snapshot: Mapping[str, object]
@@ -9911,17 +9987,21 @@ class PolymarketLPService:
         """Publish the latest completed account-registration outcome."""
 
         _lp_causal_event("account_publish_wait", account=snapshot)
+        association = self._lp_diagnostics.associated("account_full")
         with self._first_seen_apply_lock:
+            diagnostic_attempt = association.get("attempt") or self._lp_diagnostics.begin("account_full")
             self._account_registration_attempt += 1
             attempt = self._account_registration_attempt
 
         try:
             with _lp_read_task("account_registration"), _lp_read_stage("account_registration"):
                 result = self._register_account_snapshot(snapshot)
-        except LpAccountRoundInvalid:
+        except LpAccountRoundInvalid as exc:
+            self._account_diagnostic_result(diagnostic_attempt, exc=exc, round_id=association.get('round_id'), snapshot=snapshot)
             _lp_causal_event("account_publish_end", account=snapshot, outcome="skipped")
             raise
-        except Exception:
+        except Exception as exc:
+            self._account_diagnostic_result(diagnostic_attempt, exc=exc, round_id=association.get('round_id'), snapshot=snapshot)
             _lp_causal_event("account_publish_end", account=snapshot, outcome="failed")
             with self._first_seen_apply_lock:
                 if self._account_registration_attempt == attempt:
@@ -9945,6 +10025,7 @@ class PolymarketLPService:
                 else:
                     self._account_order_sync_error = "account_order_sync_unknown"
         _lp_causal_event("account_publish_end", account=snapshot, outcome=result.get("state"))
+        self._account_diagnostic_result(diagnostic_attempt, result=result, round_id=association.get('round_id'), snapshot=snapshot)
         return result
 
     def _create_sync_session(
@@ -10632,6 +10713,15 @@ class PolymarketLPService:
             raise not_sent from exc
         if release_preparation_lock is not None:
             release_preparation_lock()
+        diagnostic_attempt = self._lp_diagnostics.begin('entry', key)
+        def diagnose(event, stage, cause=None, *, exc=None, result=None):
+            try:
+                self._lp_diagnostics.record(diagnostic_attempt, event=event, stage=stage,
+                    cause=cause, exc=exc, request=key, post_started=post_started,
+                    round_id=getattr(plan_authorization, 'round_id', None), result=result, event_at=self._now())
+            except Exception:
+                pass
+
         post_started = False
         post_started_at = None
         send_receipt_base = dict(entry_action_base)
@@ -10657,6 +10747,8 @@ class PolymarketLPService:
                 "post_started": True,
                 "submit_post_started_at": boundary_at,
             }
+
+            diagnose('sent', 'entry_send')
 
         def execute_post(signed: object, *, side: str | None = None) -> object:
             if post is None:
@@ -10694,6 +10786,7 @@ class PolymarketLPService:
                     "submit_finished_at": finished_at,
                     **failure,
                 })
+            diagnose('failed', 'entry_prepare', str(exc), exc=exc, result='rejected')
             return self._status_payload(session)
         except Exception as exc:
             if not post_started:
@@ -10714,6 +10807,7 @@ class PolymarketLPService:
                         **send_receipt_base, "submit_stage": "prepare_failed",
                         "submit_finished_at": finished_at if plan_authorization is not None else _iso(self._now()), **failure,
                     })
+                diagnose('failed', 'entry_prepare', 'prepare_failed', exc=exc, result='rejected')
                 return self._status_payload(session)
             failure = _submit_failure_facts(exc)
             self.store.lp_upsert_action(
@@ -10742,6 +10836,7 @@ class PolymarketLPService:
                     **failure,
                 },
             )
+            diagnose('failed', 'entry_send', 'send_unknown', exc=exc, result='unknown')
             return self._status_payload(session)
         accepted, order_id = self._order_response(response)
         response_at = _iso(self._now())
@@ -10764,6 +10859,7 @@ class PolymarketLPService:
                 patch={"submit_status": "unknown", "resume_state": "entry_submit_pending",
                        **send_receipt_base, "submit_stage": "send_unknown",
                        "submit_finished_at": response_at})
+            diagnose('failed', 'entry_send', 'send_unknown', result='unknown')
             return self._status_payload(session)
         if not accepted:
             rejected_at = response_at
@@ -10800,6 +10896,7 @@ class PolymarketLPService:
                        "submit_finished_at": rejected_at,
                        "submit_receipt_at": rejected_at},
             )
+            diagnose('failed', 'entry_send', 'exchange_rejected', result='rejected')
             return self._status_payload(session)
         self.store.lp_upsert_action(
             session_id,
@@ -10817,6 +10914,7 @@ class PolymarketLPService:
                 "submit_receipt_at": response_at,
             },
         )
+        diagnose('sent', 'entry_send', 'receipt_received', result='accepted')
         if not order_id:
             session = self.store.lp_update_session(
                 session_id,
@@ -10830,11 +10928,13 @@ class PolymarketLPService:
                     "submit_receipt_at": response_at,
                 },
             )
+            diagnose('waiting', 'receipt_apply', 'accepted_without_order_id', result='accepted')
             return self._status_payload(session)
         receipt_lock = apply_lock[0]() if apply_lock is not None else None
         if apply_lock is not None and receipt_lock is None:
             # The accepted action above durably holds the exact venue ID.
             # Reconciliation will apply it after the existing writer finishes.
+            diagnose('waiting', 'receipt_apply', 'receipt_apply_pending', result='accepted')
             return {**self._status_payload(session), "reason": "receipt_apply_pending"}
         try:
             with self._mutex:
@@ -10890,7 +10990,11 @@ class PolymarketLPService:
                             "submit_receipt_at": response_at,
                         },
                     )
+                self._diagnostic_receipt_applied(session)
                 return self._status_payload(session)
+        except Exception as exc:
+            diagnose('waiting', 'receipt_apply', 'receipt_apply_pending', exc=exc, result='accepted')
+            raise
         finally:
             if apply_lock is not None and receipt_lock is not None:
                 apply_lock[1](receipt_lock)
@@ -10917,7 +11021,21 @@ class PolymarketLPService:
                 return session
         return None
 
-    def submit_entry(
+    def submit_entry(self, request: Mapping[str, object], idempotency_key: str | None = None) -> dict[str, object]:
+        """Submit once; diagnostics cannot change the result or replay a request."""
+        result = self._submit_entry(request, idempotency_key)
+        try:
+            if result.get('state') == 'rejected' and not result.get('session_id'):
+                key = (idempotency_key or '').strip()
+                attempt = self._lp_diagnostics.begin('entry', key)
+                self._lp_diagnostics.record(attempt, event='failed', stage='entry_validate',
+                    cause=result.get('reason'), post_started=False, result='rejected',
+                    request=key, event_at=self._now())
+        except Exception:
+            pass
+        return result
+
+    def _submit_entry(
         self,
         request: Mapping[str, object],
         idempotency_key: str | None = None,
