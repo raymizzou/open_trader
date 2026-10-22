@@ -960,6 +960,7 @@ class PolymarketLPService:
         self.owner_lock = owner_lock
         self._mutation_guard = mutation_guard
         self._candidate_buy_price_level_reader: Callable[[], int] | None = None
+        self._candidate_current_reservations_reader: Callable[[Mapping[str, object] | None], tuple[dict[str, object], ...]] | None = None
         listener = getattr(store, "set_lp_trade_change_listener", None)
         if callable(listener):
             listener(self._invalidate_lp_account_round)
@@ -2575,6 +2576,23 @@ class PolymarketLPService:
     def set_candidate_buy_price_level_reader(self, reader: Callable[[], int]) -> None:
         """Use the effective persisted Auto quote level for strategy estimates."""
         self._candidate_buy_price_level_reader = reader
+
+    def set_candidate_current_reservations_reader(
+        self, reader: Callable[[Mapping[str, object] | None], tuple[dict[str, object], ...]]
+    ) -> None:
+        """Bind candidate-only current authority from the actual D2 owner."""
+        self._candidate_current_reservations_reader = reader
+
+    def _candidate_producer_reservations(
+        self, account: Mapping[str, object] | None = None
+    ) -> tuple[dict[str, object], ...]:
+        reader = self._candidate_current_reservations_reader
+        if reader is None:
+            return self._candidate_reservations()
+        try:
+            return reader(account)
+        except Exception:
+            return ({"order_id": "d2-current-authority-unavailable", "amount": None},)
 
     def _candidate_buy_price_level(self) -> int | None:
         reader = self._candidate_buy_price_level_reader
@@ -5171,7 +5189,7 @@ class PolymarketLPService:
         # reservation signature joins the cache key: a new active
         # reservation invalidates the cached queues.
         self._evict_excluded_candidates()
-        reservations = self._candidate_reservations()
+        reservations = self._candidate_producer_reservations()
         reservation_signature = tuple(
             (str(entry.get("order_id")), str(entry.get("amount")))
             for entry in reservations
@@ -5410,7 +5428,7 @@ class PolymarketLPService:
         available_facts: dict[str, object] = {}
         if account is not None:
             adjusted_account = _account_after_reservations(
-                account, self._candidate_reservations()
+                account, self._candidate_producer_reservations(account)
             )
             if isinstance(adjusted_account, Mapping):
                 adjusted_balance = _maybe_decimal(
@@ -6395,7 +6413,7 @@ class PolymarketLPService:
             # and publication — so a publication that interleaves here with
             # a later judgment time wins the one-line write protection.
             evaluation_now = self._now()
-            reservations = self._candidate_reservations()
+            reservations = self._candidate_producer_reservations(evaluation_account)
             totals = deepcopy(self._candidate_funnel_totals)
             queue_funnel = deepcopy(
                 queue_state.get("queue_funnel") or {}
@@ -7176,7 +7194,7 @@ class PolymarketLPService:
                 else:
                     books_failed = True
 
-            reservations = self._candidate_reservations()
+            reservations = self._candidate_producer_reservations(account)
             # Account uncertainty remains account-wide. Market source gaps
             # retain only that market's old facts and its own retry deadline.
             round_failed = account_error is not None or books_failed
