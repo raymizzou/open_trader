@@ -29,7 +29,7 @@ def route(paths):
     # Paths are diagnostic only. Active/shared coverage stays mandatory.
     return {'scopes': list(REQUIRED_SCOPES), 'test_n_leg': '0',
             **policy(),
-            'reason': 'all required backend and portable coverage; one exact rollback node advisory'}
+            'reason': 'all required backend and portable coverage; reviewed exact release nodes advisory'}
 
 
 def changed_paths(base, head, cwd=None):
@@ -53,7 +53,7 @@ def required(needs):
             expected = 'success' if scope in scopes else 'skipped'
             if result != expected:
                 return False, f'{scope}: expected {expected}, got {result}'
-        return True, 'all required backend and portable checks succeeded; rollback advisory not awaited; N-leg permanently retired'
+        return True, 'all required backend and portable checks succeeded; release advisory not awaited; N-leg permanently retired'
     except (KeyError, TypeError, ValueError):
         return False, 'missing or malformed plan/job results'
 

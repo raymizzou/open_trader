@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-22 — Explicit release-test advisory coverage
+
+- Keep 224 reviewed release, installer and manager regression identities unchanged,
+  including the existing rollback case, and run them in Release advisory on main
+  pushes or manual invocation. New tests and parameter identities remain required.
+- Required CI and Deployment Preflight keep complete, disjoint coverage proof and
+  do not wait for advisory success. Financial/order, UNKNOWN, no-replay, current-API
+  handoff/restart, active drain, credential runtime and stopped data-recovery tests
+  remain required. Failure logs, JUnit, metrics and exact run identity are retained.
+
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 

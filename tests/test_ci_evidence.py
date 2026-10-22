@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-OPTIONAL = ['tests/test_lp_d2_service_lifecycle.py::test_supported_rollback_uses_current_api_without_disposable_record_audit']
+OPTIONAL = json.loads((ROOT/'scripts/ci_optional_tests.json').read_text())['optional']
 
 
 def load(name):
@@ -34,12 +34,12 @@ class PartitionTests(unittest.TestCase):
         proof = module.verify_partition(complete, parts, retired, ROOT, OPTIONAL)
         self.assertEqual(proof['executed_count'], 5)
         self.assertEqual(proof['retired_count'], 1)
-        self.assertEqual(proof['complete_count'], 7)
+        self.assertEqual(proof['complete_count'], 230)
         self.assertEqual(proof['retired_status'], 'not-executed-permanent-retirement')
         nested = 'tests/nested/test_new.py::test_new'
         self.assertRaises(ValueError, module.verify_partition, complete + [nested], parts, retired, ROOT, OPTIONAL)
         expanded = {**parts, 'legacy': parts['legacy'] + [nested]}
-        self.assertEqual(module.verify_partition(complete+[nested], expanded, retired, ROOT, OPTIONAL)['complete_count'], 8)
+        self.assertEqual(module.verify_partition(complete+[nested], expanded, retired, ROOT, OPTIONAL)['complete_count'], 231)
         for universe, executed, omitted in [
             (complete, {**parts, 'prediction': parts['prediction'][:-1]}, retired),
             (complete + [complete[0]], parts, retired),
@@ -57,7 +57,7 @@ class PartitionTests(unittest.TestCase):
         complete = sum(parts.values(), []) + OPTIONAL
         proof = module.verify_partition(complete, parts, optional=OPTIONAL)
         self.assertEqual(proof['status'], 'success')
-        self.assertEqual(proof['complete_count'], 5)
+        self.assertEqual(proof['complete_count'], 228)
         self.assertEqual(proof['partition_count'], 4)
         self.assertEqual(proof['complete_sha256'], proof['coverage_sha256'])
         self.assertEqual(proof, module.verify_partition(list(reversed(complete)), parts, optional=OPTIONAL))

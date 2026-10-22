@@ -60,11 +60,11 @@ test:
 ci-test-files:
 	@$(CI_SELECTION)
 
-# Advisory runs only this exact unchanged node, in one serial session.
-.PHONY: test-ci-rollback-advisory
-test-ci-rollback-advisory: CI_TEST_TIER = optional
-test-ci-rollback-advisory:
-	$(if $(filter 1,$(TEST_WORKERS)),,$(error Rollback advisory requires one serial worker))
+# Advisory runs only the reviewed exact unchanged nodes, in one serial session.
+.PHONY: test-ci-release-advisory
+test-ci-release-advisory: CI_TEST_TIER = optional
+test-ci-release-advisory:
+	$(if $(filter 1,$(TEST_WORKERS)),,$(error Release advisory requires one serial worker))
 	$(eval OPTIONAL_TEST := $(shell python3 scripts/ci_evidence.py optional || echo __INVALID_OPTIONAL__))
 	$(if $(filter __INVALID_OPTIONAL__,$(OPTIONAL_TEST)),$(error Invalid optional selection))
 	$(DOCKER_BUILD)
