@@ -49,6 +49,12 @@ def pool_settings_changes(document, changes):
             income_budget_usd=changes.get('income_budget_usd', document.get('income_budget_usd', '0')),
             target_buy_count=3, trial_target_buy_count=3, income_target_buy_count=3,
             income_weights=['0.5', '0.3', '0.2'])
+    if (document.get('allocation_mode') == 'observed_pools'
+            and changes.get('allocation_mode') == 'minimum'):
+        # Effective mode exits change trading behavior. Carry current sizing
+        # through the existing guard and version path for D2 and Store callers.
+        changes.setdefault('budget_usd', document.get('budget_usd'))
+        changes.setdefault('target_buy_count', document.get('target_buy_count', 0))
     return changes
 
 

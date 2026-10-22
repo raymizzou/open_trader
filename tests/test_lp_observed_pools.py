@@ -2060,3 +2060,100 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
         http_release.set();callback_release.set();native_release.set()
         for group in groups:group._thread.join(3)
         rig.close()
+
+
+@pytest.mark.parametrize('case',['running_with_income','paused_with_income','paused_unknown_facts','paused_clear'])
+def test_observed_pool_mode_exit_preserves_trading_guard_and_versions(tmp_path,monkeypatch,case,pool_async_watchdog):
+    from tests.test_lp_d2_integration import settle_control
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    rig=AsyncPoolRig(tmp_path,monkeypatch)
+    try:
+        with_income=case in ('running_with_income','paused_with_income')
+        if with_income:
+            for name,capital in [('A','50'),('B','30'),('C','20')]:
+                rig.market(name);rig.add_order(name,capital)
+            rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
+                roles={rig.cid(n):dict(pool='income',episode='old-'+n) for n in 'ABC'})
+        if case!='running_with_income':
+            rig.execution.lp_auto_set_desired_running(False);settle_control(rig.live)
+        rig.cycle(pool='income',qualified=True)
+        if case=='paused_unknown_facts':
+            failures=[]
+            def unavailable(**kwargs):
+                failures.append(rig.seconds)
+                raise OSError('offline current balance unavailable')
+            rig.sdk.get_balance_allowance=unavailable
+            rig.tick()
+            rig.pump(lambda:failures and rig.live.state.snapshot().observation.accepted_at==rig.utc()
+                and not rig.live.state.snapshot().observation.source_frame.sources['balance'].complete
+                and rig.execution.lp_auto_state()['new_capacity_usd'] is None)
+        before=rig.execution.lp_auto_state();saved=rig.store.lp_load_current_settings(rig.account)
+        snapshot=rig.live.state.snapshot()
+        assert before['allocation_mode']=='observed_pools'
+        assert before['budget_usd']==before['trial_budget_usd']=='20' and before['income_budget_usd']=='100'
+        assert before['desired_running'] is before['effective_running'] is (case=='running_with_income')
+        assert rig.live.status()['native_inflight']==0 and snapshot.openings=={}
+        assert {o.key[3] for o in snapshot.active_orders}==({'old-A','old-B','old-C'} if with_income else set())
+        assert Decimal(before['buy_reserved_usd'])==snapshot.buy_reserved.value
+        assert snapshot.buy_reserved.value==Decimal('100' if with_income else '0')
+        assert snapshot.new_capacity.state==('unknown' if case=='paused_unknown_facts' else 'known')
+        orders=tuple(dict(o) for o in rig.sdk.orders)
+        protected_keys=('config_version','trading_config_version','allocation_mode','budget_usd','trial_budget_usd',
+            'income_budget_usd','target_buy_count','trial_target_buy_count','income_target_buy_count','income_weights',
+            'desired_running','effective_running','requested_control_version','saved_control_version',
+            'buy_reserved_usd','inventory_cost_usd','current_exposure_usd','new_capacity_usd')
+        if case!='paused_clear':
+            reason='financial_facts_unknown' if case=='paused_unknown_facts' else 'pause_and_finish_automatic_buys_before_configuring'
+            with pytest.raises(ValueError,match=reason):
+                rig.execution.lp_auto_configure(dict(allocation_mode='minimum',expected_config_version=before['config_version']))
+            after=rig.execution.lp_auto_state()
+            assert not after['settings_pending'] and not after['settings_native_inflight']
+            assert rig.store.lp_load_current_settings(rig.account)==saved
+            for key in protected_keys:assert after[key]==before[key]
+            assert tuple(dict(o) for o in rig.sdk.orders)==orders
+            assert rig.sdk.posts==rig.sdk.cancels==rig.sdk.market_orders==[]
+            if case=='running_with_income':
+                # An actual subsequent ordinary cycle must keep the income100
+                # obligations, rather than cancel them under legacy budget20.
+                rig.tick();rig.pump(lambda:rig.live.state.snapshot().observation.accepted_at==rig.utc())
+                state=rig.execution.lp_auto_state()
+                assert state['allocation_mode']=='observed_pools' and Decimal(state['buy_reserved_usd'])==100
+                assert tuple(dict(o) for o in rig.sdk.orders)==orders
+                assert rig.sdk.posts==rig.sdk.cancels==rig.sdk.market_orders==[]
+        else:
+            assert snapshot.inventory_cost.value==snapshot.current_exposure.value==0
+            def publish(mode,trading_delta):
+                old=rig.execution.lp_auto_state()
+                rig.execution.lp_auto_configure(dict(allocation_mode=mode,expected_config_version=old['config_version']))
+                rig.pump(lambda:rig.execution.lp_auto_state()['config_version']==old['config_version']+1
+                    and not rig.execution.lp_auto_state()['settings_pending'])
+                current=rig.execution.lp_auto_state();document=rig.store.lp_load_current_settings(rig.account)
+                assert current['allocation_mode']==document['allocation_mode']==mode
+                assert current['config_version']==document['config_version']==old['config_version']+1
+                assert current['trading_config_version']==document['trading_config_version']==old['trading_config_version']+trading_delta
+                for key in protected_keys:
+                    if key not in ('config_version','trading_config_version','allocation_mode','new_capacity_usd'):
+                        assert current[key]==old[key]
+                for _ in range(3):
+                    observed=rig.execution.lp_auto_state()
+                    assert (observed['config_version'],observed['trading_config_version'])==(current['config_version'],current['trading_config_version'])
+                assert current['desired_running'] is current['effective_running'] is False
+                assert rig.sdk.posts==rig.sdk.cancels==rig.sdk.market_orders==[]
+            publish('minimum',1)
+            publish('minimum',0)
+            publish('observed_pools',1)
+            # Direct Store callers receive the same effective-mode version
+            # classification, including legacy absence and same-mode writes.
+            store=PredictionArbitrageStore(tmp_path/'direct-store');account='b'*64
+            document=store.lp_save_current_settings(account,expected_config_version=0,changes=dict(budget_usd='20',target_buy_count=3))
+            assert document['config_version']==document['trading_config_version']==1
+            for patch,trading_version in [(dict(allocation_mode='minimum'),1),
+                    (dict(allocation_mode='minimum',allocation_shadow_enabled=True,allocation_weights=['0.5','0.3','0.2']),1),
+                    (dict(allocation_mode='observed_pools',income_budget_usd='100'),2),
+                    (dict(allocation_mode='minimum'),3),(dict(allocation_mode='minimum'),3)]:
+                version=document['config_version']
+                document=store.lp_save_current_settings(account,expected_config_version=version,changes=patch)
+                assert document['config_version']==version+1 and document['trading_config_version']==trading_version
+                assert document['allocation_mode']==patch['allocation_mode']
+                assert document['budget_usd']=='20' and document['target_buy_count']==3
+    finally:rig.close()
