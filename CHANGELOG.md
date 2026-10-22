@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-22 — LP position cadence test owner synchronization
+
+- LP 持仓 60 秒回归在推进业务时钟前，等待 owner 接纳同账户、同代际的新完整金融观察，并保留持仓就绪与读取结束条件。保留原 59/60 秒、60 份数量、止损、不重放及 4 秒限制；使用离线 HTTP 响应延迟和独立并发执行验证，未改生产逻辑。
+
 ## 2026-10-22 — Explicit release-test advisory coverage
 
 - Export only the reviewed policy, manifest hash, count and node-set hash in the
