@@ -463,6 +463,9 @@ def test_d2_routes_never_construct_or_call_legacy_mutations(tmp_path, monkeypatc
         state = SimpleNamespace(snapshot=lambda: SimpleNamespace(current=SimpleNamespace(
             shutdown_requested=False, fatal_id=None)))
 
+        def candidate_current_reservations(self, account=None):
+            pytest.fail('routing-only D2 fixture has no candidate financial authority')
+
         def bind_mutation_admission(self, *args):
             pass
 
