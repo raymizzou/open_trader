@@ -220,7 +220,7 @@ Saving a new target count with existing weights requires a matching weight list.
 advance the settings CAS version, preserve the trading version and do not enable
 or resize orders. Budget, count and price changes retain their existing pause
 and current-facts gates. Pending saves retain the previous effective settings;
-the CLI reports an unconfirmed save as UNKNOWN without retrying it.
+the CLI reads current state while a save is pending and reports an unconfirmed save as UNKNOWN. It never repeats the write.
 
 **C1 cannot activate live `rank_weights`:** saving or loading that mode fails
 with `rank_weights_requires_c2`. A stored invalid allocation is reported through
@@ -279,3 +279,61 @@ U2/cooldown dispatch or guarantee signing, acceptance, fills or net rewards.
 Live enablement remains gated by separate C2 work and operator approval: verify
 protective cancellation and U2 cancel-all for a full reward day in minimum mode,
 then shadow, then an approved trial budget of at most $30.
+
+
+## Independent trial and measured-income pools
+
+A reviewed service with D2 supports explicit `observed_pools`. The dashboard
+labels the old budget as trial funds and adds a separate income budget. Editing
+or polling does not discard either unsaved value or its original config version.
+Saving the two-budget form selects this mode and keeps Auto paused. An unset
+income budget saves as zero. Code installation alone does not change mode or
+choose a live budget.
+
+The public CLI accepts `--trial-budget` and `--income-budget`. Both must be finite
+and nonnegative. In this mode `--budget` is an alias for trial funds; conflicting
+aliases fail atomically. The service fixes counts at three per pool and income
+weights at 50% / 30% / 20%. Do not supply a different count or weights. Existing
+minimum/C1 commands remain available; `rank_weights` remains gated separately.
+A legacy automatic executor refuses `observed_pools_requires_d2` before enabling
+or executing this configuration.
+
+After the operator has selected and authorized both amounts, use the existing
+loopback service and existing CLI. These placeholders are not budget defaults:
+
+```sh
+open-trader prediction-arb lp-auto config \
+  --trial-budget "$TRIAL_USD" --income-budget "$INCOME_USD" --json
+open-trader prediction-arb lp-auto status --json
+```
+
+This saves configuration only. Enabling/resuming is a separate existing control
+action. A save uses one CAS write; pending settings may be confirmed with state
+reads under the same deadline. Missing values, stale versions, mismatched budget
+confirmation, credentials, redirects and non-loopback destinations remain errors.
+Do not repeat an UNKNOWN write automatically; inspect status first.
+
+Trial uses model ranking and minimum size. Income uses attributable official
+hourly rewards divided by measured remaining BUY capital. The first valid sample
+is enough; it expires after 120 seconds without renewal on reads or restart.
+The status `observed_pools` projection separates role, original source order,
+measurement amount/time and current eligibility. The dashboard keeps model
+estimates, current exposure yield and detached measured results distinct.
+
+The loops share enable/pause and alternate business opportunities through one
+account lane. Each budget stays independent, while actual wallet/allowance and
+all account BUY commitments constrain both. New income membership cancels the
+whole old group; cancellation acknowledgements do not free funds. Missing ranks
+and failed slots stay cash. UNKNOWN retains its request/hold and is never a replay
+instruction. Existing inventory, SELL, stop and protective cancellation continue.
+Detached results still require fresh owned async market and account facts.
+Incomplete reads, cleanup faults and expired samples grant no new BUY authority.
+Both pools share the existing read runtime, native cap2 and resource drain.
+Group cancel completion wakes deferred exact protection after its actual lease
+release. Status GET remains a memory snapshot.
+
+Only explicitly selected dual-pool configuration uses bounded pending-save
+confirmation reads. A legacy pending or unconfirmed config response stays
+`UNKNOWN` with exit2; it does not replay the write.
+
+See [ADR 0007](../contexts/prediction-arbitrage/docs/adr/0007-lp-trial-and-income-pools.md).

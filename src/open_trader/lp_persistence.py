@@ -179,6 +179,7 @@ LP_WRITE_OPERATIONS = frozenset({
     'lp_publish_account_financial_facts', 'lp_publish_facts', 'lp_register_fenced_actions',
     'lp_claim_attention_notification', 'lp_finalize_attention_notification_batch',
     'lp_finish_attention_notification', 'lp_save_current_settings', 'lp_save_current_control',
+    'lp_save_observed_pool_roles',
     'lp_log_business_record', 'lp_upsert_action', 'lp_finish_cancel', 'lp_reject_pending_cancel',
 })
 

@@ -3393,7 +3393,7 @@ function lpDashboardYieldCell(observation) {
   const actualTone = yieldKnown ? "" : " class=\"pm-lp-unknown\"";
   return "<div class=\"num\">推荐 <strong>" + escapeHtml(recommended)
     + "</strong> → 实际 <strong" + actualTone + ">" + escapeHtml(actual)
-    + "</strong>" + note + "</div>";
+    + "</strong>" + note + "<span class=\"sub\">模型估算 → 当前实测</span></div>";
 }
 
 // LP-TR-1: 当天委托表「今日奖励(累计 · $/小时)」格。累计行与结算卡
@@ -4606,6 +4606,22 @@ function lpAutoControlSaved(auto) {
     && auto.control_save_state === "saved" && auto.control_native_inflight === false && auto.fatal === null;
 }
 
+function lpAutoConfigDraft(auto) {
+  return {budget_usd: auto.trial_budget_usd ?? auto.budget_usd ?? "",
+    income_budget_usd: auto.income_budget_usd ?? "", expected_config_version: auto.config_version};
+}
+
+function lpAutoResultMarkup(auto) {
+  const pools = auto.observed_pools || {};
+  const rows = Object.entries(pools.results || {}).slice(0, 20).map(([cid, value]) => {
+    const sample = value.result || {};
+    const role = pools.roles?.[cid] || {};
+    const status = role.pool === "income" && !role.evicted ? "收益池" : role.promotion_pending ? "等待原单离场" : "试挂池";
+    return `<p class="sub">${escapeHtml(cid)} · ${status} · 实测结果 ${escapeHtml(lpDashboardRate(sample.yield_pct_per_hour))} · 测量 BUY 本金 ${escapeHtml(lpDashboardMoney(sample.buy_capital_usd))} · 来源 ${escapeHtml(sample.source_order?.order_id || "UNKNOWN")} · 采样 ${escapeHtml(predictionHktTimestamp(sample.measured_at))} · ${value.eligible === true ? "120 秒内可比较" : "已过期，等待新测量"}</p>`;
+  });
+  return rows.join("");
+}
+
 function predictionLpAutoControls(auto, stale) {
   if (!auto || typeof auto !== "object") return "<p class=\"sub\">自动补位状态 UNKNOWN</p>";
   const prediction = state.predictionMarket;
@@ -4618,7 +4634,7 @@ function predictionLpAutoControls(auto, stale) {
   const serviceBlocked = predictionWritesBlocked();
   const busy = prediction.lpAutoBusy || !prediction.csrfToken || serviceBlocked;
   const blocked = Array.isArray(auto.block_reasons) ? auto.block_reasons : [];
-  const draft = prediction.lpAutoDraft || auto;
+  const draft = prediction.lpAutoDraft || lpAutoConfigDraft(auto);
   const locked = busy || stale || running || auto.pause_confirmed !== true
     || (currentControl ? pending || fatal || auto.effective_running !== false : auto.slots?.occupied !== 0);
   const action = running ? "pause" : auto.ever_enabled ? "resume" : "enable";
@@ -4628,12 +4644,14 @@ function predictionLpAutoControls(auto, stale) {
   return `<section aria-label="自动补位控制"><h3>自动补位 · ${status}</h3>
     <p>人工意愿：${running ? "运行" : "暂停"}${reasons}${stale ? " · 状态已过期" : ""}</p>
     ${currentControl ? `<p>有效状态：${auto.effective_running === true ? "运行" : auto.effective_running === false ? "暂停" : "UNKNOWN"} · 请求版本 ${escapeHtml(String(auto.requested_control_version ?? "UNKNOWN"))} · 已保存版本 ${escapeHtml(String(auto.saved_control_version ?? "UNKNOWN"))} · ${fatal ? "故障停机" : pending ? "保存待确认" : "已可靠保存"}${auto.control_error ? ` · ${escapeHtml(auto.control_error)}` : ""}</p>` : ""}
-    <p class="sub">每分钟检查，跨日持续。暂停保留 BUY；挂单保护、库存退出和在途核对继续。</p>
+    <p class="sub">试挂与收益循环共用启停，持续核对。暂停保留 BUY；挂单保护、库存退出和在途核对继续。</p>
     <button type="button" class="pm-button" data-lp-auto-action="${action}"${busy || (!running && (stale || !schedulerRunning || pending || fatal || (currentControl && auto.effective_running !== false))) ? " disabled" : ""}>${actionLabel}</button>
-    <div class="pm-check"><label>策略总资金（USDC） <input data-lp-auto-field="budget_usd" aria-label="策略总资金" type="number" min="0" step="0.01" value="${escapeHtml(String(draft.budget_usd ?? ""))}"${locked ? " disabled" : ""}></label>
-    <label>目标 BUY 数 <input data-lp-auto-field="target_buy_count" aria-label="目标 BUY 数" type="number" min="0" step="1" value="${escapeHtml(String(draft.target_buy_count ?? 0))}"${locked ? " disabled" : ""}></label>
+    <div class="pm-check"><label>试挂资金（USDC） <input data-lp-auto-field="budget_usd" aria-label="试挂资金" type="number" min="0" step="0.01" value="${escapeHtml(String(draft.budget_usd ?? ""))}"${locked ? " disabled" : ""}></label>
+    <label>收益资金（USDC，另配） <input data-lp-auto-field="income_budget_usd" aria-label="收益资金" type="number" min="0" step="0.01" value="${escapeHtml(String(draft.income_budget_usd ?? ""))}"${locked ? " disabled" : ""}></label>
     <button type="button" class="pm-button" data-lp-auto-action="config"${locked ? " disabled" : ""}>保存配置</button></div>
-    <p class="sub">保存不交易。修改前须人工暂停，且自动 BUY（含撤单中）和未决提交全部终结。0 不撤单。</p>
+    <p class="sub">双池配置：试挂 3 BUY，按模型估算排序、最小量试挂；收益 3 BUY，按有效实测结果比较，固定 50% / 30% / 20%。预算独立，空位留现金。</p>
+    <p class="sub">保存不交易。修改前须人工暂停并核清未决提交。未设置收益资金按 0 保存。0 不撤单。</p>
+    ${lpAutoResultMarkup(auto)}
     <p class="sub">最近检查 ${escapeHtml(predictionHktTimestamp(auto.last_check_at, "尚未检查"))} · 下次 ${escapeHtml(predictionHktTimestamp(auto.next_check_at, "等待本轮结束"))}${auto.check_in_progress ? " · 检查中" : ""}${auto.last_check_error ? ` · 检查失败：${escapeHtml(auto.last_check_error)}` : ""}</p>
     <p role="status">${escapeHtml(prediction.lpAutoMessage)}</p></section>`;
 }
@@ -4644,7 +4662,7 @@ function handleLpAutoInput(event) {
   const prediction = state.predictionMarket;
   if (!prediction.lpAutoDraft) {
     const auto = predictionLpAutoState() || {};
-    prediction.lpAutoDraft = {budget_usd: auto.budget_usd ?? "", target_buy_count: auto.target_buy_count ?? 0, expected_config_version: auto.config_version};
+    prediction.lpAutoDraft = lpAutoConfigDraft(auto);
   }
   prediction.lpAutoDraft[field.dataset.lpAutoField] = field.value;
 }
@@ -4657,8 +4675,9 @@ async function controlLpAuto(action) {
   let body = {confirm: true};
   if (action === "config") {
     const auto = predictionLpAutoState() || {};
-    const draft = prediction.lpAutoDraft || {budget_usd: auto.budget_usd, target_buy_count: auto.target_buy_count, expected_config_version: auto.config_version};
-    body = {...draft, target_buy_count: Number(draft.target_buy_count)};
+    const draft = prediction.lpAutoDraft || lpAutoConfigDraft(auto);
+    body = {trial_budget_usd: draft.budget_usd, income_budget_usd: draft.income_budget_usd || "0",
+      allocation_mode: "observed_pools", expected_config_version: draft.expected_config_version};
   }
   renderPredictionMarket();
   try {
@@ -4677,7 +4696,14 @@ async function controlLpAuto(action) {
         || result.settings_pending === true || result.settings_native_inflight === true)))) throw new Error("运行意愿未获可靠确认");
     if (action === "config" && (result.settings_pending === true || result.settings_native_inflight === true
       || result.settings_error != null || result.fatal != null)) throw new Error("配置未获可靠确认");
-    if (action === "config") prediction.lpAutoDraft = null;
+    if (action === "config") {
+      if (result.desired_running !== false || result.pause_confirmed !== true
+        || result.allocation_mode !== "observed_pools" || result.config_version !== body.expected_config_version + 1
+        || result.trial_budget_usd !== body.trial_budget_usd || result.income_budget_usd !== body.income_budget_usd) {
+        throw new Error("双池配置值未获确认；保留草稿，请核对服务状态");
+      }
+      prediction.lpAutoDraft = null;
+    }
     prediction.lpAutoMessage = action === "pause" ? "新增已暂停；已有挂单和仓位继续保护。" : action === "config" ? "配置已保存，未触发交易。" : "运行意愿已保存，立即核对；系统受阻时等待核清。";
   } catch (error) {
     prediction.lpAutoMessage = `操作未确认：${error instanceof Error ? error.message : String(error)}`;

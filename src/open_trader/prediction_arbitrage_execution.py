@@ -1033,7 +1033,7 @@ class PredictionExecutionService:
                 api_retry_interval_seconds=policy.api_retry_interval_seconds,
                 order_check_interval_seconds=policy.order_check_interval_seconds,
                 round_interval_seconds=policy.round_interval_seconds)
-            result.update({key: list(policy.allocation_weights) if key == 'allocation_weights'
+            result.update({key: list(getattr(policy, key)) if key in ('allocation_weights', 'income_weights')
                 else getattr(policy, key) for key in policy.allocation_fields})
             return result
         def json_value(value):
@@ -1054,6 +1054,9 @@ class PredictionExecutionService:
                 logger.exception('prediction_lp_diagnostics_failed component=%s', name)
                 return dict(available=False, error='diagnostics_unavailable',
                     **{'selection_state' if name == 'rotation' else 'state': 'UNKNOWN'})
+        observed_pools = (diagnostic_view('observed_pools', lambda: dict(
+            roles=self._store.lp_load_observed_pool_roles(self._lp_account_id())['roles'],
+            **self.lp_observed_pool_state())) if live.policy.allocation_mode == 'observed_pools' else None)
         with live.state._lock:
             status = live.control.status()
             snapshot = live.state.snapshot()
@@ -1075,6 +1078,7 @@ class PredictionExecutionService:
                 settings_pending=settings['pending'], settings_native_inflight=settings['native_inflight'],
                 settings_error=settings['error'], effective_round_interval_seconds=None,
                 check_interval_seconds=None, cycle_mode='continuous',plan_wait=live.status()['plan_wait'])
+            if observed_pools is not None: result['observed_pools'] = observed_pools
             result['diagnostics'] = diagnostic_view('iteration', live.diagnostics)
             result['diagnostics']['rotation'] = diagnostic_view('rotation', live.rotation_diagnostics)
             for name, fact in (('buy_reserved_usd', snapshot.buy_reserved),
@@ -3695,6 +3699,11 @@ class PredictionExecutionService:
         finally:
             self._lp_dashboard_lock.release()
 
+    def lp_observed_pool_state(self, *, as_of=None):
+        from .polymarket_lp_observed_pools import result_projection
+        account = self._lp_account_id()
+        return dict(results=result_projection(self._store.lp_observations(account), account, as_of or _utc_now()))
+
     def refresh_lp_observations(
         self, *, stop_event: threading.Event | None = None
     ) -> dict[str, object]:
@@ -4186,6 +4195,10 @@ class PredictionExecutionService:
                 "last_success_at": now if rate_pct is not None else previous_market.get("last_success_at"),
                 "last_attempt_at": now,
             }
+            from .polymarket_lp_observed_pools import measured_result
+            observation['pool_result'] = measured_result(account_id, condition_id, market_orders,
+                hourly_reward, reward_known=reward_known, measured_at=now,
+                reward_checked_at=rates_checked_at, account_checked_at=account_checked_at)
             result[condition_id] = save_observation(account_id, condition_id, observation)
 
         return {"state": "ready", "checked_at": _timestamp(now), "observations": result}
