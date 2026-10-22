@@ -80,8 +80,10 @@ under the release process.
 ## CI and deployment evidence
 
 [CI](ci.md) now runs all four backend services plus non-LIVE portable scenarios
-on each final main push, including documentation-only and unavailable/empty diff
-cases. There are no feature/PR triggers or cross-SHA concurrency cancellation.
+automatically on each final main push, including documentation-only and
+unavailable/empty diff cases. Preserve the existing separately authorized
+main-only manual workflow with no inputs, exact-SHA checkout and plan/required
+main-ref guards. There are no feature/PR triggers or cross-SHA concurrency cancellation.
 Old feature branches may still carry their old workflows during migration; do
 not synchronize/push solely to remove those runs, or wait for them.
 
@@ -92,7 +94,10 @@ is not CI success. Failed, cancelled or missing results stay visible; Main owns
 focused diagnosis and a scoped repair/revert proposal through PRs, without
 automatic main writes, revert, retry-until-green or deployment.
 
-Deployment still needs successful trusted exact-SHA main-push CI, complete
+Deployment still needs successful trusted exact-SHA main CI (push or the existing
+main-only manual workflow), selecting the newest run across both events and its
+latest attempt with artifacts bound to the real event. Newer unsuccessful runs
+block older green evidence. Deployment also needs complete
 required artifacts, source/lock/runtime verification, explicit deployment
 authorization, fresh Host Readiness and Production Smoke. A failed main SHA
 cannot be deployed and does not change running production. An older main ancestor

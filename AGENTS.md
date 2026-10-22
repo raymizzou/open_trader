@@ -119,9 +119,12 @@ focused diagnosis and is not a prerequisite to task-branch publication.
 
 GitHub CI runs all four backend services (`gateway`, `legacy`, `account`,
 `prediction`) with `TEST_N_LEG=0` and the explicit permanent N-leg retirement
-manifest on every final GitHub `main` push. Feature pushes, PR events and tag
-pushes do not trigger this workflow. No workflow concurrency group cancels or
-replaces another main SHA's run. Documentation-only, LP-only,
+manifest automatically on every final GitHub `main` push. Feature pushes, PR
+events and tag pushes do not trigger it. Preserve the existing main-only
+`workflow_dispatch` with no inputs and exact `github.sha` checkout; plan and
+required jobs guard `refs/heads/main`. Manual fallback requires separate
+authorization. No workflow concurrency group cancels or replaces another run.
+Documentation-only, LP-only,
 trend-only, and missing-diff cases have the same active backend coverage, excluding
 `pressure` and `browser`. Before first publication, complete applicable focused
 local checks; independent review follows publication and continues alongside
@@ -130,8 +133,11 @@ result. Merge success is not CI success. Failed, cancelled or missing CI stays
 visible; Main diagnoses it and proposes a scoped repair/revert through a new PR.
 No automatic main write, revert, retry-until-green or deployment is authorized.
 Deployment Preflight runs only for a selected final GitHub `main` SHA during an
-explicitly authorized deployment. It reuses trusted exact-SHA main-push CI and
-checks immutable source/lock/runtime identity; it never reruns backend tests.
+explicitly authorized deployment. It selects the newest exact-SHA main CI run
+across push and the existing main-only manual workflow, then verifies its latest
+attempt and artifacts bound to the real event. A newer unsuccessful run blocks
+older green evidence. It checks immutable source/lock/runtime identity and never
+reruns backend tests.
 CI also runs the non-LIVE portable prediction scenarios and proves that executed
 required nodeids plus the explicit optional collection and declared retired nodeids
 cover the complete backend collection without overlap. The sole optional node is
@@ -260,7 +266,8 @@ force-push, direct `main` push, automatic merge or deployment authority.
 GitHub merge, release/tag creation, and deployment remain separate actions
 requiring their applicable explicit authorization. A merged PR
 does not release or deploy. Neither PR-head checks nor GitHub's synthetic PR
-merge SHA substitute for trusted main-push CI evidence on the selected final GitHub `main` SHA.
+merge SHA substitute for trusted main CI (push or the existing main-only manual
+workflow) evidence on the selected final GitHub `main` SHA.
 A failed main SHA cannot be deployed and does not change running production.
 An older main ancestor needs its own valid evidence when selected for deployment.
 

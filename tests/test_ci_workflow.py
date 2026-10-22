@@ -11,9 +11,14 @@ class WorkflowTests(unittest.TestCase):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         self.assertIn('name: CI\n', workflow)
         events = workflow.split('\non:\n', 1)[1].split('\npermissions:', 1)[0]
-        self.assertEqual(events, '  push:\n    branches: [main]\n')
+        self.assertEqual(events, '  push:\n    branches: [main]\n  workflow_dispatch:\n')
         self.assertNotIn('pull_request:', workflow)
         self.assertNotIn('concurrency:', workflow)
+        self.assertNotIn('inputs:', workflow)
+        guard = "github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'"
+        self.assertIn('  plan:\n    if: ' + guard, workflow)
+        required = workflow.split('  required:\n', 1)[1]
+        self.assertIn('if: always() && (' + guard + ')', required)
         self.assertNotIn('paths:', workflow)
         self.assertNotIn('pull_request_target', workflow)
         self.assertNotIn('secrets.', workflow)

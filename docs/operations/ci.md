@@ -1,8 +1,10 @@
 # Active backend CI and focused local verification
 
-`.github/workflows/ci.yml` runs only on pushes to GitHub `main`, including
-documentation-only changes and each final merged-main SHA. Feature pushes,
-PR events and tag pushes do not trigger it.
+`.github/workflows/ci.yml` runs automatically only on pushes to GitHub `main`,
+including documentation-only changes and each final merged-main SHA. Feature
+pushes, PR events and tag pushes do not trigger it. Preserve the existing
+`workflow_dispatch` with no inputs: plan and required jobs guard
+`refs/heads/main`, and all checkouts use the exact `github.sha`.
 Every run selects all four existing backend services: `gateway`, `legacy`,
 `account`, and `prediction`, with `TEST_N_LEG=0`. Active backend coverage excludes
 `pressure` and `browser`; it does not include Deployment Preflight, Host Readiness
@@ -19,18 +21,27 @@ protections and the separately approved removal of the main required-status rule
 
 ## Identity and coverage
 
-Jobs check out `github.sha`, the exact pushed main SHA. Record the PR head/base,
-final merge SHA, event, Actions run ID, attempt and actual result. The final main
+Jobs check out `github.sha`, the exact main SHA for the push or manual run. Record
+the PR head/base, final merge SHA, event, Actions run ID, attempt and actual result. The final main
 commit can differ from a PR head or historical synthetic merge SHA; evidence
 does not transfer between them. After authorized GitHub merge, inspect the
 main-push run for that exact final SHA. Failed, cancelled or missing results
 remain visible; merge success is not CI success.
 
+A separately authorized manual run (`gh workflow run ci.yml --ref main`) can
+provide the same evidence for the then-current main SHA when automatic CI is
+unavailable. It accepts no arbitrary SHA input. Verify the resulting run and
+exact SHA; dispatch alone proves nothing. Deployment Preflight selects the
+newest exact-SHA run across push and main-only `workflow_dispatch`, verifies its
+latest attempt and binds artifacts to the real event. A newer failed, cancelled
+or pending run blocks reuse of older green evidence.
+
 Main owns focused diagnosis and a scoped repair/revert proposal through PRs.
 There is no automatic main write, revert, retry-until-green or deployment.
 A failed main SHA cannot be deployed and does not change running production.
-Successful trusted exact-SHA main-push CI and complete artifacts are required
-for separately authorized [Deployment Preflight](deployment-preflight.md),
+Successful trusted exact-SHA main CI (push or the existing main-only manual
+workflow) and complete artifacts are required for separately authorized
+[Deployment Preflight](deployment-preflight.md),
 source/lock/runtime checks, fresh Host Readiness and Production Smoke. An older
 main ancestor can be selected only with its own valid evidence. Deployment does
 not repeat the backend suite.
@@ -65,9 +76,9 @@ Deployment Preflight, host readiness or production Smoke steps.
 The workflow uses standard `ubuntu-24.04` runners, `contents: read`, commit-pinned
 Actions and checkouts without persisted credentials. Each service times out after
 60 minutes; planner/aggregate after five. There is no workflow concurrency group:
-a later main push does not cancel or replace an earlier main SHA's run, including
-a pending run. Cancellation is not success; inspect the selected SHA's actual
-run and latest attempt.
+a later push or manual dispatch does not cancel or replace an earlier run,
+including a pending run. Cancellation is not success; inspect the selected SHA's
+actual run and latest attempt.
 
 The aggregate always evaluates the planner and all fixed job results. All
 four backend services and the portable scenario job must succeed; the retained

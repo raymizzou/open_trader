@@ -30,7 +30,12 @@ do-not-publish/draft 覆盖指令仍适用。本地 `main` 只同步远端，不
 直接推送绕过 PR。
 PR head、GitHub 合成 PR merge commit、最终 GitHub `main` commit 是不同身份；
 发布选定最后一种完整 SHA，核对其 CI 后，在明确授权的部署准备中运行 Candidate
-Acceptance。PR CI 不能代替该 SHA 的 Candidate `PASS`，合并不自动运行验收或部署。
+Acceptance。可接受该 SHA 的 main `push` 或仅限 `refs/heads/main` 的
+`workflow_dispatch` CI；取两种事件中最新的 exact-SHA run。较新的 pending、failed 或
+cancelled run 阻止复用旧绿色结果，artifact 必须保留并匹配实际事件。自动 CI 缺失时，
+在相应授权下执行 `gh workflow run ci.yml --ref main`，核对实际 SHA 并等待完整可信证据；
+手动入口不接受任意 SHA。四个后端分区、portable、app 15368 的 `required`、当前 attempt、
+artifact、retirement policy、lock 与 runtime 身份检查不变。PR CI 不能代替该 SHA 的 Candidate `PASS`，合并不自动运行验收或部署。
 
 验收失败时先审计全部错误及下游影响，范围内修复走独立分支、检查、任务分支/PR
 更新、独立审查、CI 与反馈门禁、用户批准合并，再对新的最终 main SHA 验收；

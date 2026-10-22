@@ -164,7 +164,7 @@ not passing evidence. Keep TDD, relevant stability checks and independent review
 Docker is not a prerequisite to task-branch publication. Optional focused Docker
 diagnosis can use `make test TEST='tests/path.py::test_name'`; local development
 does not require whole-service or full-backend suites. GitHub CI owns required backend coverage and the explicit optional
-classification on every final GitHub `main` push: `gateway`, `legacy`, `account`, and
+classification automatically on every final GitHub `main` push: `gateway`, `legacy`, `account`, and
 `prediction`, with `TEST_N_LEG=0` and the permanent retirement manifest, excluding
 `pressure` and `browser`. The sole optional rollback node is declared in
 `scripts/ci_optional_tests.json`; see [Rollback advisory](ci.md#rollback-advisory).
@@ -174,8 +174,11 @@ required CI and Deployment Preflight do not wait for it. This is the only active
 node exempt from required execution.
 Documentation-only, LP-only, trend-only and unavailable/empty diff cases all run
 that same coverage. Feature pushes, PR events and tag pushes do not trigger this
-workflow. Each run checks out the exact pushed main SHA. There is no workflow
-concurrency group, so later main pushes do not cancel or replace earlier runs.
+workflow. Preserve its existing main-only `workflow_dispatch` with no inputs,
+plan and required main-ref guards and exact `github.sha` checkout. A manual
+fallback needs separate authorization; dispatch alone is not successful evidence.
+There is no workflow concurrency group, so later pushes or manual dispatches do
+not cancel or replace earlier runs, including pending runs.
 See [CI identity and execution](ci.md). CI also runs the non-LIVE portable prediction scenarios. It does not run
 Deployment Preflight, Host Readiness or Production Smoke.
 
@@ -226,8 +229,10 @@ The 2026-09-29 approved cloud credential exception permits only the optional
 installs it for offline SDK transport tests. Do not add other dependencies or
 weaken existing skips/xfails. Playwright remains a host-only Production Smoke
 prerequisite; ordinary backend CI and Deployment Preflight have zero browser cost. Deployment
-Preflight reuses trusted main-push evidence for the selected final GitHub `main`
-SHA when preparing an explicitly authorized deployment. It does not rerun tests.
+Preflight reuses trusted main push/manual evidence for the selected final GitHub `main`
+SHA when preparing an explicitly authorized deployment. Preflight selects the
+newest exact-SHA run across push and main-only `workflow_dispatch`; a newer
+unsuccessful run blocks older green evidence, and artifacts retain the real event. It does not rerun tests.
 
 ## Test design and stability
 
@@ -560,7 +565,7 @@ work without an owner. A broader instruction to monitor through merge retains
 that stopping condition. Separate user approval is still required for GitHub
 merge; reviews and CI do not authorize merge/auto-merge, approval on the user's
 behalf, release/tag creation, deployment, trading or repository/security changes.
-PR-head and synthetic-merge evidence never replace final-main-push deployment
+PR-head and synthetic-merge evidence never replace final-main push/manual deployment
 evidence. Existing deployment and cleanup rules remain unchanged.
 
 ### Worker lifecycle
@@ -598,7 +603,7 @@ Feedback: retrieval time, latest PR/head/base, complete paginated collections:
 Threads/comments: URL, resolved/unresolved state or disposition, blocking decision/owner:
 Repairs: fix commits, checks, independent review, update/reply evidence:
 Merge: authorization, expected head, state/base/conflict check/time, final SHA:
-CI: final main-push SHA, run/attempt, required/app 15368 actual result/artifacts:
+CI: final main SHA, push/manual event, newest run/attempt, required/app 15368 actual result/artifacts:
 Pending decisions/blockers; next action and owner; monitoring stop reason:
 Workers: saved work, exclusive duties/new owner, accepted handoff, lifecycle status:
 ```
@@ -625,7 +630,7 @@ The PR head/base and final GitHub `main` commit after merge are distinct
 identities. Historical feature-push and synthetic PR-merge checks do not transfer
 evidence to the final main SHA. Main records that SHA, its Actions run/attempt and
 actual result. No workflow concurrency group cancels/replaces an older main run
-when a newer main SHA is pushed. Inspect the exact check-run name `required` from
+when a newer main SHA is pushed or a manual run is dispatched. Inspect the exact check-run name `required` from
 GitHub Actions (app ID 15368), not only a green UI label; see [ci.md](ci.md).
 Merge success is not CI success. Failed, cancelled or missing CI remains visible;
 Main owns diagnosis and a scoped repair/revert proposal through PRs. No automatic
@@ -634,8 +639,11 @@ repairs require a new isolated branch and PR with separate merge authorization.
 Independent review, feedback collection and reproducible blocker repair continue
 until completed or durably handed off; merging does not complete them.
 
-Deployment Preflight requires successful main-push CI for the selected final SHA,
-retained in main history.
+Deployment Preflight requires successful trusted main CI for the selected final
+SHA, retained in main history, from push or the existing main-only manual workflow.
+It selects the newest exact-SHA run across those events and verifies its latest
+attempt and artifacts bound to the real event. A newer unsuccessful run blocks
+older green evidence; manual fallback needs separate authorization.
 A later tip does not erase that evidence; changing the selected release SHA needs
 its own valid evidence. A failed main SHA cannot be deployed and does not change
 running production.

@@ -1,6 +1,6 @@
 # Reuse CI before a source release
 
-The supported forward path is: successful exact-SHA main-push CI → fresh Host
+The supported forward path is: successful exact-SHA main CI (push or main-only manual) → fresh Host
 Readiness → `scripts/deploy_release.py` → Production Smoke. The wrapper checks
 CI and source/runtime identity immediately before calling one existing installer.
 Deployment still requires explicit authorization. Neither CI nor this preflight
@@ -35,7 +35,7 @@ not create credentials, accept caller-supplied proof JSON, or trust a green UI
 label. Missing API access is BLOCKED. It requires:
 
 - The selected 40-character SHA in a clean detached checkout, still in GitHub
-  main history, with a successful main-push CI run for that exact SHA
+  main history, with a successful main push/manual CI run for that exact SHA
 - The correct workflow path, completed current run attempt, all four services,
   portable scenarios and the exact `required` check from GitHub Actions app 15368
 - Unexpired artifacts from that same run and attempt, with matching source,
@@ -59,8 +59,19 @@ LP/pause executions, unknown policies and false full-coverage claims. There is
 no fixed `TEST_N_LEG=1` requirement and no periodic N-leg full regression.
 See [the permanent retirement policy](ci-nleg-retirement.md).
 
+Preflight fetches both `push` and `workflow_dispatch` candidates and selects the
+newest exact-SHA run across that union. A newer pending, failed or cancelled run
+blocks reuse of older green evidence. Manual runs must be on `refs/heads/main`;
+artifact `event_name` must match the selected run’s actual event. Manual evidence
+is never relabelled as push. Workflow, repository, SHA, current attempt, check
+suite/app, artifact, partition, lock and runtime guards remain required.
+
+If automatic CI is unavailable, a separately authorized operator can run
+`gh workflow run ci.yml --ref main`, then verify the run’s exact main SHA and
+wait for its complete trusted evidence. There is no arbitrary SHA input.
+
 A later main commit does not invalidate a selected release that has its own
-successful main-push evidence and remains in main history. PR-head and synthetic
+successful main push/manual evidence and remains in main history. PR-head and synthetic
 PR-merge checks are different identities and cannot substitute.
 
 Artifacts expire after three days. Missing, stale, cancelled, mismatched or
