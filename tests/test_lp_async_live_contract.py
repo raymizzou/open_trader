@@ -124,7 +124,7 @@ def test_read_failure_cancel_needs_no_queue_baseline_and_keeps_exact_guards(tmp_
         try:
             if trigger=='eleven':
                 for number in range(1,12):
-                    advance(live,boundary,clock,(number-1)*5,lambda:count(live)==number)
+                    advance(live,boundary,clock,(number-1)*5,lambda:all(count(live,key)==number for key in targets))
             else:
                 live.run_once()
                 end=time.monotonic()+4
