@@ -3,6 +3,10 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-22
+
+- LP Auto adds explicit independently budgeted trial and measured-income pools on the existing D2 account lane. Trial keeps model-ranked minimum-size entries; income compares attributable official hourly measurements for up to 120 seconds and uses fixed 50/30/20 weights. New membership rebuilds the old income group after real order release; partial failures keep successes and cash, with UNKNOWN, inventory and SELL protections retained. The dashboard and CLI expose both budgets under one pause/enable control; saving does not enable trading or choose production amounts. Offline checks cover measured identities, fair loop progress, fixed snapshots, restart/expiry, partial outcomes, native cancellation ownership, authenticated controls and affected consumers. P214 retains a disclosed initial TDD sequencing deviation; current GREEN does not supply a missing pre-change RED.
+
 ## 2026-10-21
 
 - LP 服务日志补充选定奖励、账户读取/发布与入场发送/回执应用的脱敏诊断，区分失败、正常等待及同作用域恢复，并保留首次/最近原因和尝试关联。Dashboard 旧读取及缓存、无效奖励事实、规划快照复用或账户恢复不能清除较新失败或改写 UNKNOWN 订单；奖励来源各自验证后恢复，混合配置、身份或资产错误仍保留身份无歧义的 native USD 下界以检查 combined 一致性；冲突配置 ID 和同条件整行的贡献不作证据，相同重复仍去重，顺序不再改变诊断，业务 UNKNOWN 与原因顺序不变；交错组件按阶段独立聚合重复日志并保留被抑制计数；日志队列及进程内记录有界，溢出与重启不保证连续历史。离线定向验证覆盖发送审计、防重、不可变订单、并发顺序及阻塞/异常日志输出；Dashboard、交易规则和 JSON/CLI 不变，未部署。

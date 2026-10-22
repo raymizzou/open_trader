@@ -1087,6 +1087,8 @@ class LPAutoPool:
         return self.state()
 
     def set_desired_running(self, running, *, audit=None):
+        if running and self._read().get('allocation_mode') == 'observed_pools':
+            raise ValueError('observed_pools_requires_d2')
         if not isinstance(running,bool):
             raise ValueError('desired_running_invalid')
         def apply(d):
@@ -4236,6 +4238,8 @@ class LPAutoPool:
     def _run_once(self, *, round_id=None, reuse_facts=False):
         from .polymarket_lp import LpAccountRoundInvalid
         d = self._read()
+        if d.get('allocation_mode') == 'observed_pools':
+            raise ValueError('observed_pools_requires_d2')
         self._cycle_wait = None
         plan = d.get('active_plan')
         if plan is not None:

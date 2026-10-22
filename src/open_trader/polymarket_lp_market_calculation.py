@@ -22,6 +22,11 @@ class CalculationPolicy:
     allocation_weights: tuple[str, ...] = ()
     allocation_shadow_enabled: bool = False
     allocation_fields: tuple[str, ...] = ()  # Preserve absent fields in legacy state JSON.
+    trial_budget_usd: str | None = None
+    income_budget_usd: str = '0'
+    trial_target_buy_count: int = 3
+    income_target_buy_count: int = 3
+    income_weights: tuple[str, ...] = ('0.5', '0.3', '0.2')
 
 
 @dataclass(frozen=True)

@@ -1544,10 +1544,12 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--timeout", default=15.0)
         command.add_argument("--json", action="store_true")
         if action == "config":
-            command.add_argument("--budget")
+            command.add_argument("--budget", help="Legacy alias for trial budget")
+            command.add_argument("--trial-budget")
+            command.add_argument("--income-budget")
             command.add_argument("--target-buys")
             command.add_argument("--bid-level")
-            command.add_argument("--allocation-mode", choices=("minimum", "rank_weights"))
+            command.add_argument("--allocation-mode", choices=("minimum", "rank_weights", "observed_pools"))
             command.add_argument("--allocation-weights", help="Comma-separated Decimal strings; no normalization")
             command.add_argument("--allocation-shadow-enabled", choices=("true", "false"))
             for option in ('round-interval-seconds', 'api-retry-interval-seconds', 'order-check-interval-seconds'):
@@ -2049,6 +2051,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_lp_auto(args.lp_auto_command, args.url, args.timeout,
                                json_output=getattr(args, "json", False),
                                budget=getattr(args, "budget", None),
+                               trial_budget=getattr(args, "trial_budget", None),
+                               income_budget=getattr(args, "income_budget", None),
                                target_buys=getattr(args, "target_buys", None),
                                bid_level=getattr(args, "bid_level", None),
                                allocation_mode=getattr(args, "allocation_mode", None),
