@@ -20,6 +20,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-22
 
+- 完整 backend/portable CI 的自动触发改为仅在最终 main push 执行，保留既有独立授权的 main-only manual 入口与精确身份校验；后续 push/manual 不取消较早运行。用户明确授权的无冲突 PR 经 expected-head 核对后合并，不再等待 feature/PR CI 或仅为 main 新鲜度重整分支；独立审查、反馈与缺陷修复仍由 Main 持续负责，合后修复走新 PR。服务端只移除 main required-status 规则，PR/禁止强推与删除/tag 保护已读回保留；离线定向验证覆盖事件、安全、required fail-closed、optional 独立与 push/manual 部署身份合同。失败 main SHA 不可部署，部署仍需该 SHA 的可信成功 CI、完整证据及独立授权；未声称线上 CI 结果、节时数或已部署。
+
 - LP runtime regressions now wait for the selected risk session’s scoring publication and the first current-reader observation before checking later progress. Controlled external-boundary delays reproduce the old premature assertions; focused immediate/delayed, concurrent and negative checks preserve financial, no-write, pause and real cleanup contracts. No production behavior change or deployment.
 
 ## 2026-10-21

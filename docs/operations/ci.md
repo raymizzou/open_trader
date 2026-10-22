@@ -1,9 +1,10 @@
 # Active backend CI and focused local verification
 
-`.github/workflows/ci.yml` runs on every branch push and every PR targeting
-`main`, including documentation-only changes and the final merged-main push.
-It also supports `workflow_dispatch` on `refs/heads/main` only. Manual runs
-accept no SHA input and check out the same `github.sha` as automatic runs.
+`.github/workflows/ci.yml` runs automatically only on pushes to GitHub `main`,
+including documentation-only changes and each final merged-main SHA. Feature
+pushes, PR events and tag pushes do not trigger it. Preserve the existing
+`workflow_dispatch` with no inputs: plan and required jobs guard
+`refs/heads/main`, and all checkouts use the exact `github.sha`.
 Every run selects all four existing backend services: `gateway`, `legacy`,
 `account`, and `prediction`, with `TEST_N_LEG=0`. Active backend coverage excludes
 `pressure` and `browser`; it does not include Deployment Preflight, Host Readiness
@@ -12,28 +13,38 @@ serial job and are required by the aggregate.
 
 The stable aggregate appears as **CI / required** in the UI (workflow `CI`, job
 `required`), but its exact API check-run/context name is **`required`**, emitted
-by **GitHub Actions**, app ID **15368**. A future required-check rule must bind
-that exact name and source, not the display string or an arbitrary same-named
-status. No repository settings are changed by this workflow. The
-[repository protection design](repository-protection.md) is proposed, not active.
+by **GitHub Actions**, app ID **15368**. Deployment evidence must bind that exact
+name and source, not the display string or an arbitrary same-named status.
+It is not a premerge gate. No repository settings are changed by this workflow;
+the [dated settings read-back](repository-protection.md) records active PR/tag
+protections and the separately approved removal of the main required-status rule.
 
 ## Identity and coverage
 
-Push jobs check out `github.sha`, the exact pushed branch head. PR jobs check out
-`github.sha`, GitHub's synthetic candidate merge commit, to test integration with
-the PR base. A feature branch with an open PR intentionally has separate push-head
-and PR-merge runs: these verify distinct SHA identities and are not deduplicated.
-The final GitHub `main` commit after merge may differ from both (including squash,
-rebase or a changed base); its push receives the same active backend CI.
-Record the PR head, base, tested SHA, event and Actions run together. Any head/base
-change needs fresh applicable verification; stale or cancelled runs do not qualify.
-After authorized GitHub merge, inspect the main-push run for that exact final SHA.
+Jobs check out `github.sha`, the exact main SHA for the push or manual run. Record
+the PR head/base, final merge SHA, event, Actions run ID, attempt and actual result. The final main
+commit can differ from a PR head or historical synthetic merge SHA; evidence
+does not transfer between them. After authorized GitHub merge, inspect the
+main-push run for that exact final SHA. Failed, cancelled or missing results
+remain visible; merge success is not CI success.
+
 A separately authorized manual run (`gh workflow run ci.yml --ref main`) can
 provide the same evidence for the then-current main SHA when automatic CI is
-unavailable. Verify the returned run and exact SHA; dispatch alone proves nothing.
-Only the selected final main SHA is eligible for separately authorized
-predeployment identity and evidence checks; see [Deployment Preflight](deployment-preflight.md).
-Deployment no longer repeats the backend suite.
+unavailable. It accepts no arbitrary SHA input. Verify the resulting run and
+exact SHA; dispatch alone proves nothing. Deployment Preflight selects the
+newest exact-SHA run across push and main-only `workflow_dispatch`, verifies its
+latest attempt and binds artifacts to the real event. A newer failed, cancelled
+or pending run blocks reuse of older green evidence.
+
+Main owns focused diagnosis and a scoped repair/revert proposal through PRs.
+There is no automatic main write, revert, retry-until-green or deployment.
+A failed main SHA cannot be deployed and does not change running production.
+Successful trusted exact-SHA main CI (push or the existing main-only manual
+workflow) and complete artifacts are required for separately authorized
+[Deployment Preflight](deployment-preflight.md),
+source/lock/runtime checks, fresh Host Readiness and Production Smoke. An older
+main ancestor can be selected only with its own valid evidence. Deployment does
+not repeat the backend suite.
 
 Changed paths and diff availability do not narrow CI. Documentation-only, isolated
 LP, standalone trend-curve, shared, unknown, deleted/renamed, empty-diff and
@@ -75,9 +86,10 @@ Deployment Preflight, host readiness or production Smoke steps.
 
 The workflow uses standard `ubuntu-24.04` runners, `contents: read`, commit-pinned
 Actions and checkouts without persisted credentials. Each service times out after
-60 minutes; planner/aggregate after five. New commits cancel older checks for the
-same PR or branch; push and PR concurrency groups remain separate. Cancellation
-is not success; inspect the latest exact-SHA run.
+60 minutes; planner/aggregate after five. There is no workflow concurrency group:
+a later push or manual dispatch does not cancel or replace an earlier run,
+including a pending run. Cancellation is not success; inspect the selected SHA's
+actual run and latest attempt.
 
 The aggregate always evaluates the planner and all fixed job results. All
 four backend services and the portable scenario job must succeed; the retained
@@ -140,11 +152,22 @@ focused checks honestly; Docker is not a prerequisite to task-branch publication
 
 Follow the [PR-first verification runbook](agent-verification.md#first-reviewable-implementation):
 applicable development/security checks, Main's task-only stage/commit/push and
-normal PR under standing authorization, then independent review and CI.
+normal PR under standing authorization, then independent review alongside delivery.
 No additional push/PR permission question is needed; the runbook's explicit
 local-only/no-push/do-not-publish/draft overrides apply. Publish in-scope repairs
-to the same PR before refreshed review. Final review, feedback and exact-SHA
-`required` success precede explicit user approval for GitHub merge.
+to the same open PR before refreshed review. After merge, repairs use a new
+isolated branch and PR with separate merge authorization. Focused verification,
+independent review, complete feedback collection and reproducible blocker repairs
+remain Main-owned duties; report them accurately and continue unfinished work.
+
+After explicit authorization for that PR's merge, Main checks repository, base
+`main`, open state, expected head and absence of conflicts, then merges through
+GitHub with the expected head SHA. Unknown mergeability needs a bounded refresh;
+actual conflicts need scoped resolution. Do not wait for feature/PR CI, pending
+review/dots or an old review-ready/full-acceptance label. A newer main alone does
+not require a rebase, branch synchronization, push or rerun for CI freshness.
+During migration, old feature-branch workflows can still trigger extra runs;
+do not synchronize/push solely to remove them, or wait for them.
 Local main only synchronizes the remote. Merge remains separate from release/tag
 creation, Deployment Preflight and deployment; no CI job grants production or
 trading authorization.
