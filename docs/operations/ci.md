@@ -42,8 +42,8 @@ The retained standalone trend-curve job stays skipped because the legacy suite
 already includes its tests. Make and `scripts/ci_evidence.py` share one service selection entry point.
 Update that selector's service prefixes for new service-specific test families.
 The [explicit retirement manifest](ci-nleg-retirement.md) omits exactly 29 reviewed
-N-leg files from default execution. The one exact rollback node described below
-is advisory; all other active tests remain required, including the three
+N-leg files from default execution. The 224 exact release-test identities described below
+are advisory; all other active tests remain required, including the three
 mixed/shared files, LP and pause guards. Production pause state is unchanged.
 Unknown/new files do not inherit retirement from their names.
 
@@ -51,6 +51,17 @@ The plan and service artifacts identify the checked-out SHA; each service also
 records the SHA-256 of `uv.lock`, dependency manifest, image identity and complete
 build/test log. Artifacts expire after three days. Download them from the Actions
 run; failure logs are also visible in each service job.
+
+The cross-job plan carries only four optional-policy fields: `policy`,
+`manifest_sha256`, `optional_count` and `optional_sha256`. The planner validates
+all literal identities locally before computing this summary. The aggregate
+recomputes and compares the same source-bound summary; missing, changed or extra
+summary fields fail closed. Full parameterized nodeids stay in the source
+manifest, execution artifacts and partition proof, where the deployment verifier
+checks them. They are not encoded or exported in the cross-job plan, so public
+credential-shaped negative-test parameters do not enter that job output.
+Local CLI tests verify this content contract; they do not reproduce GitHub's
+hosted output scanner. Normal subsequent push evidence verifies hosted transport.
 
 ## Execution and verdict
 
@@ -77,32 +88,40 @@ Planner/aggregation contract tests exercise these cases and verify nonzero CLI
 exit on failure. There is no workflow-level path filter that could leave the
 required check permanently pending.
 
-## Rollback advisory
+## Release advisory
 
-`scripts/ci_optional_tests.json` declares exactly one optional node:
-`tests/test_lp_d2_service_lifecycle.py::test_supported_rollback_uses_current_api_without_disposable_record_audit`.
-Its test and business assertions are unchanged. Required Prediction CI excludes
-only this canonical identity, before xdist adds execution group names. New tests,
-including similarly named neighbors, stay required. The local direct pytest
-command and ordinary Make diagnostics retain their full selection; CI applies
-its exclusion through the explicit `--ci-required` plugin option.
+`scripts/ci_optional_tests.json` declares 224 reviewed full nodeids under
+`release-advisory-v1`: the existing rollback regression plus 223 release,
+installer and manager cases across seven files. The selector pins the sorted
+literal set to SHA-256
+`913655864de870f8f83f9e59695840d42bee775b49c3dbc535a7105698b2c82d`.
+Tests and business assertions stay unchanged. Required Prediction CI excludes
+only these canonical identities, before xdist adds execution group names.
+New names and new parameter identities stay required; no file, function prefix
+or wildcard grants an exemption. Financial/order, UNKNOWN, no-replay,
+current-API owner handoff/restart, active-service drain, credential SSM runtime
+and stopped data-recovery transaction tests remain required.
+The local direct pytest command and ordinary Make diagnostics retain their full
+selection; CI applies its exclusion through the explicit `--ci-required` option.
 
-The independent `.github/workflows/ci-rollback-advisory.yml` workflow is named
-`Rollback advisory`. It runs automatically only on pushes to `main`, normally
-after a merge, and provides `workflow_dispatch` for manual use. It does not run
-on PRs, ordinary branch pushes or a schedule. A PR therefore has no premerge
-advisory execution. The exact `github.sha` is checked out and the whole node runs
-once, serially, in its own standard runner with the same locked offline Docker
-environment and 60-minute job timeout.
+The independent `.github/workflows/ci-rollback-advisory.yml` keeps its workflow
+path and history. Its visible name is `Release advisory`; its job, runner scope
+and Make target use `release-advisory`. It runs automatically only on pushes to
+`main`, normally after a merge, and provides `workflow_dispatch` for manual use.
+It does not run on PRs, ordinary branch pushes or a schedule. A PR therefore
+has no premerge advisory execution. The exact `github.sha` is checked out and
+all declared cases run unchanged in one serial session, with the same locked,
+offline Docker environment and 60-minute job timeout. Parameter IDs are quoted
+as whole command arguments.
 
-The advisory keeps genuine failed, cancelled and timed-out results, original
-exit status, test logs, phase metrics, JUnit, source SHA and run/attempt identity.
-Evidence uploads use `always()` and the same three-day retention. There is no
-`continue-on-error`, automatic retry, issue creation or notification. A failed
-advisory can be repaired later; the fixed `required` job neither waits for it nor
-consumes its result. Deployment Preflight also does not wait for optional success.
-This explicitly removes automatic blocking for this one rollback regression;
-it does not make other slow tests optional. No fixed wall-time saving is claimed.
+The advisory keeps genuine failed, partial, cancelled and timed-out results,
+original exit status, test logs, phase metrics, JUnit, source SHA and run/attempt
+identity. Evidence uploads use `always()` and the same three-day retention.
+There is no `continue-on-error`, automatic retry, issue creation or notification.
+A failed advisory can be repaired later; the fixed `required` job neither waits
+for it nor consumes its result. Deployment Preflight also does not wait for
+optional success. Other slow tests remain required. No fixed wall-time saving
+is claimed.
 
 ## Local verification and delivery
 
@@ -133,7 +152,7 @@ trading authorization.
 ## Collection and execution semantics
 
 CI collects the complete backend universe under `not pressure and not browser`.
-It separately collects the required service partitions, the exact optional node
+It separately collects the required service partitions, the exact optional nodes
 and the retired files. The three collections must be pairwise disjoint, and
 their union must equal the universe. Missing, extra or duplicate nodeids and collection errors fail the
 proof. Optional declarations carry `not-executed-advisory`; they are classification

@@ -167,12 +167,14 @@ does not require whole-service or full-backend suites. GitHub CI owns required b
 classification on every branch push and every PR targeting `main`,
 including the final merged-main push: `gateway`, `legacy`, `account`, and
 `prediction`, with `TEST_N_LEG=0` and the permanent retirement manifest, excluding
-`pressure` and `browser`. The sole optional rollback node is declared in
-`scripts/ci_optional_tests.json`; see [Rollback advisory](ci.md#rollback-advisory).
-Its unchanged whole regression runs serially in a separate workflow, automatically
+`pressure` and `browser`. The 224 exact reviewed release-test identities are declared in
+`scripts/ci_optional_tests.json` under `release-advisory-v1`; see
+[Release advisory](ci.md#release-advisory). Their unchanged whole cases run serially in a separate workflow, automatically
 only on main pushes, with a manual entry. Genuine failures can be deferred;
-required CI and Deployment Preflight do not wait for it. This is the only active
-node exempt from required execution.
+required CI and Deployment Preflight do not wait for it. Only the literal reviewed set is exempt from required execution. New names
+and new parameter identities remain required. Financial/order, UNKNOWN, no-replay,
+current-API handoff/restart, active drain, credential SSM runtime and stopped
+data-recovery transaction tests remain required.
 Documentation-only, LP-only, trend-only and unavailable/empty diff cases all run
 that same coverage. Push CI tests the branch head; PR CI tests the synthetic merge
 candidate. These intentionally separate runs cover distinct SHA identities.
@@ -191,7 +193,7 @@ job is not selected because legacy already includes its tests.
 
 Makefile and CI use `TEST_N_LEG=0`: only the 29 reviewed files in
 `scripts/ci_nleg_retired.json` are omitted from execution because N-leg is
-permanently retired. CI separately excludes the one exact advisory rollback node;
+permanently retired. CI separately excludes the 224 exact reviewed release-advisory identities;
 ordinary local direct pytest remains unchanged. The three mixed/shared files
 remain active, as do LP,
 service/runtime and pause guards. Unknown/new files default to active coverage.

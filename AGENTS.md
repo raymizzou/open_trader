@@ -132,12 +132,15 @@ explicitly authorized deployment. It reuses trusted exact-SHA main CI (push or m
 checks immutable source/lock/runtime identity; it never reruns backend tests.
 CI also runs the non-LIVE portable prediction scenarios and proves that executed
 required nodeids plus the explicit optional collection and declared retired nodeids
-cover the complete backend collection without overlap. The sole optional node is
-`tests/test_lp_d2_service_lifecycle.py::test_supported_rollback_uses_current_api_without_disposable_record_audit`,
-declared in `scripts/ci_optional_tests.json`. Its unchanged regression runs serially
-in `Rollback advisory`, automatically only on main pushes, with a manual entry.
-Its genuine failure can be deferred; required CI and Deployment Preflight do not
-wait for it. Optional classification is not execution or success. Other active
+cover the complete backend collection without overlap. The 224 exact reviewed release-test identities are declared in
+`scripts/ci_optional_tests.json` under `release-advisory-v1`. Their unchanged
+cases run serially in `Release advisory`, automatically only on main pushes,
+with a manual entry. Only full literal nodeids, including parameter identities,
+are exempt; new names and new parameters stay required. Financial/order,
+UNKNOWN, no-replay, current-API owner handoff/restart, active-service drain,
+credential SSM runtime and stopped data-recovery transaction tests stay required.
+Genuine advisory failures can be deferred; required CI and Deployment Preflight
+do not wait for them. Optional classification is not execution or success. Other active
 tests remain required. Retired tests are recorded as not executed, never passed. See
 [the retirement policy](docs/operations/ci-nleg-retirement.md). `candidate-acceptance` and `acceptance` are compatibility
 aliases for this lightweight check, not another test stage. Use the supported

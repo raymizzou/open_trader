@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Full-backend CI planning, exact-SHA evidence and fail-closed verdict."""
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -20,8 +21,15 @@ def policy():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     data = module.retirement_policy(Path(__file__).resolve().parents[1])
+    optional = module.optional_policy(Path(__file__).resolve().parents[1])
+    # Cross-job metadata must not export parameter text to Actions job outputs.
+    # Full literal identities stay in the source manifest and execution artifacts.
+    nodes = optional['optional_nodeids']
+    summary = {key: optional[key] for key in ('policy', 'manifest_sha256')}
+    summary.update(optional_count=len(nodes), optional_sha256=hashlib.sha256(
+        json.dumps(sorted(nodes), separators=(',', ':')).encode()).hexdigest())
     return {**{key: data[key] for key in ("policy", "manifest_sha256", "retirement_reason")},
-            "optional_policy": module.optional_policy(Path(__file__).resolve().parents[1])}
+            "optional_policy": summary}
 
 
 
@@ -29,7 +37,7 @@ def route(paths):
     # Paths are diagnostic only. Active/shared coverage stays mandatory.
     return {'scopes': list(REQUIRED_SCOPES), 'test_n_leg': '0',
             **policy(),
-            'reason': 'all required backend and portable coverage; one exact rollback node advisory'}
+            'reason': 'all required backend and portable coverage; reviewed exact release nodes advisory'}
 
 
 def changed_paths(base, head, cwd=None):
@@ -53,7 +61,7 @@ def required(needs):
             expected = 'success' if scope in scopes else 'skipped'
             if result != expected:
                 return False, f'{scope}: expected {expected}, got {result}'
-        return True, 'all required backend and portable checks succeeded; rollback advisory not awaited; N-leg permanently retired'
+        return True, 'all required backend and portable checks succeeded; release advisory not awaited; N-leg permanently retired'
     except (KeyError, TypeError, ValueError):
         return False, 'missing or malformed plan/job results'
 

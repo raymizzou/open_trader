@@ -47,9 +47,9 @@ label. Missing API access is BLOCKED. It requires:
 
 Each service's recorded executions must equal its required partition in the
 portable collection proof. Required, optional and retired collections must be
-pairwise disjoint and complete. The sole optional rollback node in
-`scripts/ci_optional_tests.json` is classified as `not-executed-advisory`, never
-passed by declaration. Its separate workflow runs automatically only on main
+pairwise disjoint and complete. The 224 exact reviewed release-test identities in
+`scripts/ci_optional_tests.json` (`release-advisory-v1`) are classified as `not-executed-advisory`, never
+passed by declaration. Their separate Release advisory workflow runs automatically only on main
 pushes, with a manual entry; its success is not a preflight wait or gate, and
 its genuine failure can be deferred. Optional artifacts cannot substitute for
 trusted required success. The proof's retired collection is explicitly not

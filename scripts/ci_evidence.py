@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import xml.etree.ElementTree as ET
 
 BACKEND_SCOPES = ('gateway', 'legacy', 'account', 'prediction')
@@ -17,10 +18,11 @@ def file_sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-OPTIONAL_POLICY = 'rollback-advisory-v1'
-OPTIONAL_NODEIDS = (
-    'tests/test_lp_d2_service_lifecycle.py::test_supported_rollback_uses_current_api_without_disposable_record_audit',
-)
+OPTIONAL_POLICY = 'release-advisory-v1'
+# Reviewed full parameterized identities, pinned independently of manifest bytes.
+# A new function or parameter instance stays required until explicitly reviewed.
+OPTIONAL_COUNT = 224
+OPTIONAL_NODEIDS_SHA256 = '913655864de870f8f83f9e59695840d42bee775b49c3dbc535a7105698b2c82d'
 
 
 def optional_policy(root):
@@ -28,7 +30,12 @@ def optional_policy(root):
     data = json.loads(path.read_text())
     if (not isinstance(data, dict) or set(data) != {'schema_version', 'policy', 'optional'}
             or type(data['schema_version']) is not int or data['schema_version'] != 1
-            or data['policy'] != OPTIONAL_POLICY or data['optional'] != list(OPTIONAL_NODEIDS)):
+            or data['policy'] != OPTIONAL_POLICY or not isinstance(data['optional'], list)
+            or len(data['optional']) != OPTIONAL_COUNT
+            or any(not isinstance(node, str) for node in data['optional'])
+            or data['optional'] != sorted(set(data['optional']))
+            or hashlib.sha256(json.dumps(data['optional'], separators=(',', ':')).encode()).hexdigest()
+                != OPTIONAL_NODEIDS_SHA256):
         raise ValueError('invalid or unreviewed optional policy')
     for node in data['optional']:
         source = Path(root)/node.split('::', 1)[0]
@@ -36,7 +43,7 @@ def optional_policy(root):
                 or not source.resolve().is_relative_to(Path(root).resolve())):
             raise ValueError('missing or unsafe optional test file')
     return {'policy': OPTIONAL_POLICY, 'manifest_sha256': file_sha256(path),
-            'optional_nodeids': list(OPTIONAL_NODEIDS)}
+            'optional_nodeids': data['optional']}
 
 
 POLICY = 'permanent-nleg-retirement-v1'
@@ -129,8 +136,8 @@ def service_partitions(root, nleg='0', manifest=None):
 
 
 def expected_selection(scope, root):
-    if scope == 'rollback-advisory':
-        roots = [node.split('::', 1)[0] for node in optional_policy(root)['optional_nodeids']]
+    if scope == 'release-advisory':
+        roots = sorted({node.split('::', 1)[0] for node in optional_policy(root)['optional_nodeids']})
     elif scope == 'portable':
         roots = ['acceptance/test_prediction_arbitrage_scenarios.py']
     elif scope == 'trend-curve':
@@ -143,7 +150,7 @@ def expected_selection(scope, root):
     selection = {'roots': roots, 'marker': MARKER, 'keyword': 'not LIVE' if scope == 'portable' else ''}
     if scope == 'prediction':
         selection['deselect'] = optional_policy(root)['optional_nodeids']
-    if scope == 'rollback-advisory':
+    if scope == 'release-advisory':
         selection['nodeids'] = optional_policy(root)['optional_nodeids']
     return selection
 
@@ -372,7 +379,7 @@ def build_evidence(root, directory, scope, nleg, workers, status, env):
         'status': 'success' if status == 0 else 'failure', 'exit_status': status,
         'selection': selection, 'selection_sha256': selection_sha256(selection),
         'policy': retirement_policy(root), 'optional_policy': optional_policy(root),
-        'test_tier': 'optional' if scope == 'rollback-advisory' else 'required',
+        'test_tier': 'optional' if scope == 'release-advisory' else 'required',
         'selected_nodeids': nodes, 'environment': environment,
     }
 
@@ -383,7 +390,7 @@ def main():
         parser.add_argument('command')
         parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
         args = parser.parse_args()
-        print(' '.join(optional_policy(args.root)['optional_nodeids']))
+        print(shlex.join(optional_policy(args.root)['optional_nodeids']))
         return
     if len(os.sys.argv) > 1 and os.sys.argv[1] == 'select':
         parser.add_argument('command')

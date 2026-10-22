@@ -1597,18 +1597,25 @@ def offline_github_fixture(release,scratch):
     ci=importlib.util.module_from_spec(spec);spec.loader.exec_module(ci)
     spec=importlib.util.spec_from_file_location('actual_fixture_partition',release/'scripts/ci_partition.py')
     partition=importlib.util.module_from_spec(spec);spec.loader.exec_module(partition)
+    optional_policy=ci.optional_policy(release)
+    optional=optional_policy['optional_nodeids']
+    # External fixture proof only: expand reviewed canonical bases to their
+    # literal parameter identities. AST names alone lose [ready]/[failed].
+    # Real backend collection is independently checked by CI's portable job.
+    optional_by_base={}
+    for node in optional:optional_by_base.setdefault(node.split('[',1)[0],[]).append(node)
     parts={}
     for scope,paths in ci.service_partitions(release).items():
         parts[scope]=[]
         for path in paths:
             tree=ast.parse((release/path).read_text())
             names=[n.name for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name.startswith('test_')]
-            parts[scope].extend(path+'::'+name for name in names)
+            for name in names:
+                base=path+'::'+name
+                parts[scope].extend(optional_by_base.get(base,[base]))
     retired=json.loads((release/'scripts/ci_nleg_retired.json').read_text())['retired']
     retired_nodes=[v['path']+'::test_ok' for v in retired]
     complete=sum(parts.values(),[])+retired_nodes
-    optional_policy=ci.optional_policy(release)
-    optional=optional_policy['optional_nodeids']
     parts={scope:[node for node in nodes if node not in optional] for scope,nodes in parts.items()}
     proof=partition.verify_partition(complete,parts,retired_nodes,release,optional)
     lock=hashlib.sha256((release/'uv.lock').read_bytes()).hexdigest()

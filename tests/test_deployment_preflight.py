@@ -101,12 +101,30 @@ def evidence(tmp_path):
         shutil.copy(project/'scripts'/name,tmp_path/'scripts'/name)
     (tmp_path/'tests').mkdir()
     retired=json.loads((tmp_path/'scripts/ci_nleg_retired.json').read_text())['retired']
+    optional=json.loads((tmp_path/'scripts/ci_optional_tests.json').read_text())['optional']
     for path in [item['path'] for item in retired] + [
             'tests/test_frontend_gateway.py', 'tests/test_dashboard_web.py','tests/test_account_api.py',
             'tests/test_lp_example.py', 'tests/test_prediction_runtime.py','tests/test_prediction_service.py',
             'tests/test_prediction_monitor_selection_driver.py','tests/test_prediction_n_leg_cutover.py',
-            'tests/test_run_nleg_cutover.py', 'tests/test_lp_d2_service_lifecycle.py']:
+            'tests/test_run_nleg_cutover.py', 'tests/test_lp_d2_service_lifecycle.py'] + sorted({
+                node.split('::', 1)[0] for node in optional}):
         (tmp_path/path).write_text('def test_ok(): pass\n')
+    # This is controlled external evidence, not a backend execution. Scaffold
+    # the declared source functions too, so disposable releases retain the exact
+    # optional parameter identities without running collection in every fixture.
+    optional_functions={}
+    for node in optional:
+        path,identity=node.split('::',1)
+        name,separator,parameter=identity.partition('[')
+        optional_functions.setdefault(path,{}).setdefault(name,[]).append(parameter[:-1] if separator else None)
+    for path,functions in optional_functions.items():
+        source=['import pytest\n','def test_ok(): pass\n']
+        for name,parameters in functions.items():
+            if parameters==[None]:source.append(f'def {name}(): pass\n')
+            else:
+                source.append(f'@pytest.mark.parametrize("_case", range({len(parameters)}), ids={parameters!r})\n'
+                              f'def {name}(_case): pass\n')
+        (tmp_path/path).write_text(''.join(source))
     runtime=['test_n_leg_pause_keeps_lp_running_without_n_leg_requests',
              'test_n_leg_pause_suppresses_shadow_background_requests']
     service=['test_paused_n_leg_routes_reject_before_business_work',
@@ -127,7 +145,6 @@ def evidence(tmp_path):
     plain='tests/test_prediction_monitor_selection_driver.py::test_ok'
     parts['prediction'][parts['prediction'].index(plain)] = plain+'[literal@parameter]'
     retired_nodes=[item['path']+'::test_ok' for item in retired]
-    optional=['tests/test_lp_d2_service_lifecycle.py::test_supported_rollback_uses_current_api_without_disposable_record_audit']
     proof=partition.verify_partition(sum(parts.values(),[])+retired_nodes+optional,parts,retired_nodes,tmp_path,optional)
     lock = hashlib.sha256((tmp_path/'uv.lock').read_bytes()).hexdigest()
     for i, scope in enumerate(preflight.SCOPES):
@@ -245,8 +262,8 @@ def test_trusted_main_active_coverage_is_accepted(evidence):
         proof=json.loads(archive.read('partition.json'))
     assert proof['retired_status']=='not-executed-permanent-retirement'
     assert proof['retired_count']==29
-    assert proof['executed_count']+29+1==proof['complete_count']
-    assert proof['optional_count']==1
+    assert proof['executed_count']+29+224==proof['complete_count']
+    assert proof['optional_count']==224
     assert proof['optional_status']=='not-executed-advisory'
     assert proof['retired'] and not set(proof['retired']) & set(sum(proof['partitions'].values(),[]))
 
