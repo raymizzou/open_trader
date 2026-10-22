@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-22 — LP manual-order candidate publication test synchronization
+
+- The manual-D income rebuild regression waits for current D market proof and its BUY in a receipt-current account after the manual order is removed. A finite external HTTP gate covers account data arriving before D market publication; exact D30, final B50/D30/A20, manual capital and no-replay assertions remain. Test synchronization only; production behavior is unchanged.
+
 ## 2026-10-22 — LP postreceipt test observation synchronization
 
 - LP pool regressions now follow published read deadlines when waiting for final cancel quantities or current account funds after receipts. Controlled HTTP publication gates retain the unchanged-time wake, exact-ID cancellation, manual-order capital, UNKNOWN and no-replay assertions. This repairs test synchronization only; production behavior is unchanged.

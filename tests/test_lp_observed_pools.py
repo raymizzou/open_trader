@@ -1290,6 +1290,36 @@ class AsyncPoolRig(PoolRig):
                     and due is not None and due>self.seconds):
                 self.tick(due-self.seconds)
 
+    def finish_income_rebuild(self,condition,token,*,after,timeout=4):
+        """Wait for candidate proof and its BUY in a receipt-current account."""
+        import time
+        end=time.monotonic()+timeout;candidate_seen=False
+        self.tick()
+        while True:
+            result=self.live.dispatch_rotation(self.live.run_once(
+                self.producer.capture_qualified_pool(),pool='income'))
+            self.finish_cancels(result)
+            snapshot=self.live.state.snapshot();observation=snapshot.observation
+            if observation is not None:
+                source=observation.source_frame.sources.get('market_income:'+condition+':'+token)
+                candidate_seen=candidate_seen or (source is not None and source.complete
+                    and source.error is None and source.checked_at is not None
+                    and source.checked_at>=after
+                    and 0<=(self.utc()-source.checked_at).total_seconds()<=10)
+                if (candidate_seen and observation.orders_complete
+                        and observation.components['open_orders'].checked_at>after
+                        and observation.read_ticket.trade_version_at_start==snapshot.trade_version
+                        and any(o.key[1:3]==(condition,token) for o in observation.orders)
+                        and self.live.status()['native_inflight']==0):return
+            assert time.monotonic()<end,(self.live.status(),self.live.rotation_diagnostics())
+            status=self.live.read_runtime.status();due=status['next_dependency_monotonic']
+            if (status['ready_count']==0 and not any(scope['active'] for scope in status['scopes'])
+                    and status['observed_monotonic']>=self.seconds
+                    and self.live.status()['native_inflight']==0
+                    and due is not None and due>self.seconds):
+                self.tick(due-self.seconds)
+            self.wake.wait(.01);self.wake.clear()
+
     def cycle(self,*,pool=None,qualified=False):
         import time
         self.tick()
@@ -1834,10 +1864,7 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
             # Model actual venue removal for these new exact cancel IDs, rather
             # than leaving contradictory LIVE rows after their accepted receipt.
             rig.cancel_removes=True
-            next_round=rig.cycle(pool='income',qualified=True)
-            rig.finish_cancels(next_round)
-            if next_round.rotation_outcomes:
-                rig.cycle(pool='income',qualified=True)
+            rig.finish_income_rebuild(rig.cid('D'),'tD',after=rig.utc())
             assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts if p['token_id']=='tD']==[('tD',Decimal('30'))]
             rig.cycle(pool='income',qualified=True)  # publish completed partial group's current account
             assert {(row['asset_id'],row['price']*(row['original_size']-row['size_matched']))
@@ -2257,3 +2284,65 @@ def test_pool_postreceipt_observation_waits_for_external_publication(
         original(tmp_path,monkeypatch,pool_async_watchdog)
     assert len(rigs)==1 and len(rigs[0].proof_checks)==1
     request.node.user_properties.append(('external_proof_boundary',repr(rigs[0].proof_checks)))
+
+
+def test_manual_income_rebuild_waits_for_candidate_publication(tmp_path,monkeypatch,pool_async_watchdog,request):
+    """Current account alone cannot replace an unpublished D candidate book."""
+    import asyncio,sys,time
+    from threading import Event,Thread
+    rigs=[]
+    class CandidateRig(AsyncPoolRig):
+        def __init__(self,*args,**kwargs):
+            self.candidate_entered,self.account_ready,self.candidate_release=Event(),Event(),Event()
+            self.removed_at=None;self.observer=None;self.observer_errors=[]
+            self.account_capture=None;self.boundaries=[]
+            super().__init__(*args,**kwargs);rigs.append(self)
+
+        def release(self,*ids):
+            super().release(*ids)
+            if 'manual-extra-D' not in ids:return
+            self.removed_at=self.utc()
+            def release_candidate_after_account():
+                end=time.monotonic()+4
+                try:
+                    assert self.candidate_entered.wait(max(0,end-time.monotonic())),'D-candidate admission watchdog'
+                    assert self.account_ready.wait(max(0,end-time.monotonic())),'current-account response watchdog'
+                    assert not self.candidate_release.is_set()
+                    assert all(p['token_id']!='tD' for p in self.sdk.posts)
+                    published=self.live.state.snapshot().observation.source_frame.sources.get(
+                        'market_income:'+self.cid('D')+':tD')
+                    assert published is None or published.checked_at<self.removed_at
+                    self.boundaries.append((self.account_capture,self.seconds,
+                        str(published.checked_at if published else None)))
+                except BaseException as exc:self.observer_errors.append(exc)
+                finally:self.candidate_release.set()
+            self.observer=Thread(target=release_candidate_after_account,name='test-D-candidate-publication')
+            self.observer.start()
+
+        async def http(self,req):
+            response=await super().http(req)
+            if self.removed_at is None:return response
+            source=req.headers['x-lp-source']
+            if (source=='open_orders' and not self.account_ready.is_set() and self.utc()>self.removed_at
+                    and all(row['id']!='manual-extra-D' for row in response.json()['data'])):
+                self.account_capture=(self.seconds,tuple(row['id'] for row in response.json()['data']))
+                self.account_ready.set()
+            if (source=='book' and req.headers['x-lp-order'].startswith('income:')
+                    and req.url.params['token_id']=='tD' and not self.candidate_release.is_set()):
+                self.candidate_entered.set()
+                assert await asyncio.get_running_loop().run_in_executor(
+                    None,self.candidate_release.wait,4),'external D-candidate publication watchdog'
+            return response
+
+        def close(self):
+            self.candidate_entered.set();self.account_ready.set()
+            if self.observer is not None:
+                self.observer.join(3);assert not self.observer.is_alive()
+            self.candidate_release.set()
+            super().close()
+
+    monkeypatch.setattr(sys.modules[__name__],'AsyncPoolRig',CandidateRig)
+    test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monkeypatch,'D',pool_async_watchdog)
+    assert rigs[0].observer_errors==[]
+    assert len(rigs)==1 and len(rigs[0].boundaries)==1
+    request.node.user_properties.append(('account_before_D_candidate',repr(rigs[0].boundaries)))
