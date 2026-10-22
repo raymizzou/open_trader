@@ -3,7 +3,13 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-22
+
+- LP runtime regressions now wait for the selected risk session’s scoring publication and the first current-reader observation before checking later progress. Controlled external-boundary delays reproduce the old premature assertions; focused immediate/delayed, concurrent and negative checks preserve financial, no-write, pause and real cleanup contracts. No production behavior change or deployment.
+
 ## 2026-10-21
+
+- CI now supports a main-only manual run with the same four backend partitions, portable scenarios and retirement coverage. Deployment Preflight selects the newest exact-SHA push or manual run and binds artifacts to its real event; newer unsuccessful runs block older green evidence. Focused offline trust and workflow checks cover this path. No deployment in this change.
 
 - LP 冷启动 UNKNOWN 依赖期限回归为受监督子进程使用测试独占的 pytest 临时命名空间，避免其清理无关历史目录；保留正常清理、原 30 秒监督和全部业务断言。受控历史目录、正常及独立并发验证不涉及生产逻辑；历史 P20 超时的确切原因仍未知，未部署。
 

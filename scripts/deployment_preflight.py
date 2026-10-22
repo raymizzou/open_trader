@@ -150,7 +150,7 @@ def verify_artifact(api, artifact, scope, run, root, now):
     metadata = json.loads(files['evidence.json'])
     lock_hash = sha256((root/'uv.lock').read_bytes())
     fixed = dict(schema_version=2, source_sha=sha, repository=REPOSITORY,
-                 workflow_ref=f'{REPOSITORY}/{WORKFLOW}@refs/heads/main', event_name='push', ref='refs/heads/main',
+                 workflow_ref=f'{REPOSITORY}/{WORKFLOW}@refs/heads/main', event_name=run['event'], ref='refs/heads/main',
                  run_id=str(run['id']), run_attempt=str(run['run_attempt']), scope=scope, test_n_leg='0',
                  workers=2 if scope == 'prediction' else 1, lock_sha256=lock_hash, status='success', exit_status=0,
                  evidence_role='test-only', selection=expected_selection(scope, root),
@@ -216,14 +216,19 @@ def verify_ci(api, sha, root, now):
     verify_main_membership(api, sha)
     workflow = api.json(f'{prefix}/actions/workflows/ci.yml')
     require(workflow['path'] == WORKFLOW and workflow['state'] == 'active', 'Trusted CI workflow unavailable')
-    runs_path = f'{prefix}/actions/workflows/{workflow["id"]}/runs?branch=main&event=push&head_sha={sha}'
-    runs = api.items(runs_path, 'workflow_runs')
-    require(bool(runs), 'No trusted CI main-push run for selected SHA')
+    runs_path = f'{prefix}/actions/workflows/{workflow["id"]}/runs?branch=main&head_sha={sha}'
+    def candidates():
+        return [run for event in ('push', 'workflow_dispatch')
+                for run in api.items(f'{runs_path}&event={event}', 'workflow_runs')]
+    runs = candidates()
+    require(bool(runs), 'No trusted CI main push/manual run for selected SHA')
     run = max(runs, key=lambda item:(item['run_number'], item['id']))
     require(run.get('status') == 'completed' and run.get('conclusion') == 'success',
-            'Latest main-push CI run has not completed successfully')
+            'Latest main push/manual CI run has not completed successfully')
+    event = run.get('event')
+    require(event in ('push', 'workflow_dispatch'), 'CI run event mismatch')
     run = api.json(f'{prefix}/actions/runs/{run["id"]}')
-    for key, value in dict(workflow_id=workflow['id'], path=WORKFLOW, event='push', head_branch='main',
+    for key, value in dict(workflow_id=workflow['id'], path=WORKFLOW, event=event, head_branch='main',
                            head_sha=sha, status='completed', conclusion='success').items():
         require(run.get(key) == value, f'CI run {key} mismatch')
     require(run['repository']['full_name'] == REPOSITORY and run['head_repository']['full_name'] == REPOSITORY,
@@ -262,7 +267,7 @@ def verify_ci(api, sha, root, now):
                 for item in evidence]
     # Close the obvious mutable-run and main-reference race before returning.
     require(api.json(f'{prefix}/actions/runs/{run["id"]}') == run, 'CI run changed during verification')
-    latest = max(api.items(runs_path, 'workflow_runs'), key=lambda item:(item['run_number'], item['id']))
+    latest = max(candidates(), key=lambda item:(item['run_number'], item['id']))
     require(latest['id'] == run['id'] and latest['run_attempt'] == run['run_attempt'], 'A newer CI run/attempt appeared')
     verify_main_membership(api, sha)
     return {'run_id':run['id'], 'run_attempt':run['run_attempt'], 'artifact_role':'test-only',

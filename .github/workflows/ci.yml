@@ -5,6 +5,7 @@ on:
     branches: [main]
   push:
     branches: ['**']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,6 +16,7 @@ concurrency:
 
 jobs:
   plan:
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -173,7 +175,7 @@ jobs:
 
   required:
     name: required
-    if: always()
+    if: always() && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
     needs: [plan, gateway, legacy, account, prediction, portable, trend_curve]
     runs-on: ubuntu-24.04
     timeout-minutes: 5

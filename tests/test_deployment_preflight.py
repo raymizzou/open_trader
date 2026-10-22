@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import shutil
 import zipfile
+from urllib.parse import parse_qs, urlsplit
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -67,13 +68,20 @@ class FakeAPI:
             return {'status':'ahead', 'merge_base_commit':{'sha': SHA}}
         if path.endswith('/actions/workflows/ci.yml'):
             return {'id':11, 'path':preflight.WORKFLOW, 'state':'active'}
-        if path.endswith('/actions/runs/22'):
-            return copy.deepcopy(self.run)
+        if '/actions/runs/' in path:
+            run_id = int(path.rsplit('/', 1)[1])
+            return copy.deepcopy(next(run for run in self.runs if run['id'] == run_id))
         raise AssertionError(path)
 
     def items(self, path, key):
         self.calls.append(path)
-        return copy.deepcopy({'workflow_runs':self.runs, 'jobs':self.jobs,
+        if key == 'workflow_runs':
+            query = parse_qs(urlsplit(path).query)
+            return copy.deepcopy([run for run in self.runs if all(
+                run[field] == query[param][0] for param, field in
+                [('event', 'event'), ('branch', 'head_branch'), ('head_sha', 'head_sha')]
+                if param in query)])
+        return copy.deepcopy({'jobs':self.jobs,
                               'check_runs':self.checks, 'artifacts':self.artifacts}[key])
 
     def download(self, artifact_id):
@@ -168,6 +176,63 @@ def evidence(tmp_path):
         api.artifacts.append(artifact)
         api.downloads[i+1] = archive
     return tmp_path, api
+
+
+def manual_evidence(api):
+    """Literal GitHub manual-main event, with matching archives for all scopes."""
+    api.run['event'] = 'workflow_dispatch'
+    for artifact in api.artifacts:
+        artifact_id = artifact['id']
+        with zipfile.ZipFile(io.BytesIO(api.downloads[artifact_id])) as archive:
+            files = {name: archive.read(name) for name in archive.namelist()}
+        metadata = json.loads(files['evidence.json'])
+        metadata['event_name'] = 'workflow_dispatch'
+        files['evidence.json'] = metadata
+        api.downloads[artifact_id] = pack(files)
+        artifact['digest'] = 'sha256:' + hashlib.sha256(api.downloads[artifact_id]).hexdigest()
+
+
+@pytest.mark.parametrize('mutation', [
+    'run-branch', 'run-sha', 'run-workflow', 'artifact-event',
+    'artifact-ref', 'artifact-workflow', 'required-app', 'expired',
+])
+def test_manual_main_identity_is_not_interchangeable(evidence, mutation):
+    root, api = evidence
+    manual_evidence(api)
+    if mutation == 'run-branch': api.run['head_branch'] = 'feature'
+    elif mutation == 'run-sha': api.run['head_sha'] = 'b' * 40
+    elif mutation == 'run-workflow': api.run['path'] = '.github/workflows/other.yml'
+    elif mutation == 'artifact-event': mutate_metadata(api, lambda m: m.update(event_name='push'))
+    elif mutation == 'artifact-ref': mutate_metadata(api, lambda m: m.update(ref='refs/heads/feature'))
+    elif mutation == 'artifact-workflow':
+        mutate_metadata(api, lambda m: m.update(workflow_ref='raymizzou/open_trader/.github/workflows/other.yml@refs/heads/main'))
+    elif mutation == 'required-app': api.checks[-1]['app']['id'] = 1
+    else: api.artifacts[0]['expired'] = True
+    with pytest.raises(preflight.PreflightError):
+        preflight.verify_ci(api, SHA, root, NOW)
+
+
+def test_newer_failed_manual_run_blocks_older_successful_push(evidence):
+    root, api = evidence
+    api.runs.append(dict(api.run, id=23, run_number=5, event='workflow_dispatch', conclusion='failure'))
+    with pytest.raises(preflight.PreflightError):
+        preflight.verify_ci(api, SHA, root, NOW)
+
+
+def test_trusted_main_manual_run_is_accepted_with_bound_artifacts(evidence):
+    root, api = evidence
+    manual_evidence(api)
+    report = preflight.verify_ci(api, SHA, root, NOW)
+    assert report['run_id'] == 22
+    assert report['run_attempt'] == 2
+    assert len(report['artifacts']) == 5
+    assert api.run['event'] == 'workflow_dispatch'
+    for artifact in api.artifacts:
+        with zipfile.ZipFile(io.BytesIO(api.downloads[artifact['id']])) as archive:
+            metadata = json.loads(archive.read('evidence.json'))
+        assert metadata['event_name'] == 'workflow_dispatch'
+        assert metadata['ref'] == 'refs/heads/main'
+        assert metadata['workflow_ref'] == 'raymizzou/open_trader/.github/workflows/ci.yml@refs/heads/main'
 
 
 def test_trusted_main_active_coverage_is_accepted(evidence):

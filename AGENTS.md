@@ -120,14 +120,15 @@ focused diagnosis and is not a prerequisite to task-branch publication.
 GitHub CI runs all four backend services (`gateway`, `legacy`, `account`,
 `prediction`) with `TEST_N_LEG=0` and the explicit permanent N-leg retirement
 manifest on every branch push and every PR targeting
-`main`, including the final merged-main push. Documentation-only, LP-only,
+`main`, including the final merged-main push. Main-only `workflow_dispatch`
+uses the same coverage and exact `github.sha`, with no SHA input. Documentation-only, LP-only,
 trend-only, and missing-diff cases have the same active backend coverage, excluding
 `pressure` and `browser`. Push-head and PR-merge runs intentionally test distinct
 SHA identities. Before first publication, complete applicable focused local
 checks; independent review follows publication. Inspect exact-SHA CI before
 requesting merge approval.
 Deployment Preflight runs only for a selected final GitHub `main` SHA during an
-explicitly authorized deployment. It reuses trusted exact-SHA main-push CI and
+explicitly authorized deployment. It reuses trusted exact-SHA main CI (push or main-only manual) and
 checks immutable source/lock/runtime identity; it never reruns backend tests.
 CI also runs the non-LIVE portable prediction scenarios and proves that executed
 required nodeids plus the explicit optional collection and declared retired nodeids
@@ -247,7 +248,7 @@ force-push, direct `main` push, automatic merge or deployment authority.
 GitHub merge, release/tag creation, and deployment remain separate actions
 requiring their applicable explicit authorization. A merged PR
 does not release or deploy. Neither PR-head checks nor GitHub's synthetic PR
-merge SHA substitute for trusted main-push CI evidence on the selected final GitHub `main` SHA.
+merge SHA substitute for trusted main CI (push or main-only manual) evidence on the selected final GitHub `main` SHA.
 
 Screenshots are optional unless requested. Clean up only after GitHub merge,
 user confirmation, and a clean worktree; never delete a dirty worktree.
