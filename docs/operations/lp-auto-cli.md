@@ -74,6 +74,7 @@ select the target.
 # Read-only; this does not enable Auto or change orders.
 ~/.local/bin/lpauto status --json
 
+# Legacy single-pool sizing example; not the D2 dual-pool sequence.
 # These control examples require their own trading authorization.
 ~/.local/bin/lpauto config --budget 100.00 --target-buys 5 --bid-level 2
 ~/.local/bin/lpauto on
@@ -89,18 +90,144 @@ the verified listener URL. A supplied URL must use HTTP, a loopback IP and the
 same managed endpoint, with no credentials, query, fragment or extra path.
 The deployed CLI continues to own config validation, cookies/CSRF,
 confirmation, secret redaction and the one-write-attempt contract. See the
-[LP manual SOP](polymarket-lp-manual-sop.md#22-lp-auto-cli) for control semantics.
+[LP manual SOP](polymarket-lp-manual-sop.md#23-lp-auto-cli) for legacy control details;
+use the [D2 sequence below](#d2-dual-pool-start-sequence) for dual pools.
 
 Spell the target option in full: `--url` or `--url=<value>`. The stable launcher
 rejects `--u`, `--ur` and their `=<value>` forms before delegation. A shortened
 option after a verified full URL cannot select another service.
 
-Config saves parameters without enabling Auto. `on` uses saved parameters;
+Config saves parameters without automatically pausing or enabling Auto. `on` uses saved parameters;
 `off` and `pause` retain existing orders and exit protection. Help, version,
 init and status make no control POST. An UNKNOWN write result can mean the
 service accepted the command but the reply was lost. Read status before any
 separately authorized next action. The launcher never retries a mutation or
 automatically pauses, rolls back or repairs the service.
+
+## D2 dual-pool start sequence
+
+Use this sequence for the current D2 `observed_pools` mode after the operator
+has authorized the operation and selected both amounts. Trial and income share
+one on/pause switch, have independent budgets and each have exactly **3 BUY
+slots**. Income weights are fixed at **50% / 30% / 20%**; missing candidates leave
+cash. These budgets limit new BUY allocation. They do not use the legacy
+`budget minus inventory cost` definition. Existing inventory, SELL, stop and
+protective cancellation retain their management and guards. Actual wallet funds,
+allowance and all current account BUY commitments still constrain new entries.
+
+1. **Read the current managed endpoint.** Use the stable absolute command so
+   the launcher verifies the deployed source, interpreter and endpoint:
+
+   ```sh
+   ~/.local/bin/lpauto status --json
+   ```
+
+   `result: STATUS` means the read succeeded, not that trading is enabled or
+   safe. Record `config_version` before the save. Status GET is a memory snapshot;
+   account freshness and completeness still need confirmation. Keep any explicit `--url` on this same managed
+   endpoint for all subsequent commands and readbacks.
+
+2. **Confirm a saved pause before config.** If running, separately pause:
+
+   ```sh
+   ~/.local/bin/lpauto pause
+   ~/.local/bin/lpauto status --json
+   ```
+
+   `off` is an alias for pause. If already paused, verify the same conditions
+   without another write. In fresh JSON `state`, require
+   `desired_running=false`, `effective_running=false`, `pause_confirmed=true`,
+   `control_save_state="saved"`, equal integer `requested_control_version` and
+   `saved_control_version`, `control_native_inflight=false`, and an explicitly
+   present `fatal=null`. Also require `settings_pending=false`,
+   `settings_native_inflight=false`, `pending_settings=null` and
+   `settings_error=null`. Missing fields do not confirm these conditions.
+
+   Pause leaves existing BUY/SELL and protection intact. Before changing trading
+   config, existing BUYs, pending native submissions/obligations and the relevant
+   opening lifecycles must finish or have the service's accepted resolution
+   proof. The operator handles relevant existing BUYs in the venue/UI and then
+   waits for fresh complete current account facts and actual release. A cancel
+   ACK is not final release. Do not cancel all account orders or sell inventory
+   as a shortcut. Visible no-BUY is necessary but insufficient: active work,
+   unresolved openings or unknown financial facts still block config. This
+   checklist cannot bypass server guards.
+
+3. **Save the explicitly chosen budgets.** In the 2026-10-23 session the user
+   chose 100 USDC for each pool, total 200 USDC. This is a worked example, not a
+   default or a recommendation for another session:
+
+   ```sh
+   ~/.local/bin/lpauto config --trial-budget 100 --income-budget 100
+   ~/.local/bin/lpauto status --json
+   ```
+
+   Prefer the human command for this simple save. Omitted `--bid-level` retains
+   the prior bid level; do not change it incidentally. The dual flags select
+   `observed_pools` and normalize both counts to 3. Do not add
+   `--target-buys 5`. The old `--budget` / `--target-buys` pair belongs to legacy
+   sizing; it is not required for dual flags or every allocation/timing save.
+   In dual mode `--budget` aliases trial funds, not the combined 200 USDC.
+
+   Require `result: CONFIGURED`. For this example, require fresh JSON evidence of
+   `allocation_mode="observed_pools"`, `trial_budget_usd="100"`,
+   `income_budget_usd="100"`, `trial_target_buy_count=3`,
+   `income_target_buy_count=3` and `income_weights=["0.5","0.3","0.2"]`.
+   For other authorized amounts, compare against those chosen amounts instead;
+   Decimal budget strings can have equivalent formatting. Confirm
+   `config_version` is the pre-save version plus one, the effective settings
+   match, no settings remain pending/inflight, and the saved pause conditions
+   above still hold. The CLI reads the current version and submits one CAS write;
+   it does not automatically pause, clear orders or enable Auto. Only explicit
+   dual-pool config has bounded pending-save confirmation reads within the
+   command deadline; this does not replay the write.
+
+4. **Enable separately, then confirm current state.** Only after configuration
+   confirmation, use the already authorized enable action:
+
+   ```sh
+   ~/.local/bin/lpauto on
+   ~/.local/bin/lpauto status --json
+   ```
+
+   In fresh JSON `state`, require `desired_running=true`,
+   `effective_running=true`, `pause_confirmed=false`,
+   `control_save_state="saved"`, equal integer `requested_control_version` and
+   `saved_control_version`, `control_native_inflight=false`,
+   `settings_pending=false`, `settings_native_inflight=false`,
+   `pending_settings=null`, `settings_error=null` and **explicit `fatal=null`**.
+   Recheck the saved mode, budgets, counts and config version. Missing `fatal`
+   in a mutation response is not null and cannot prove safety. A confirmed
+   running control does not guarantee candidate eligibility, filled slots,
+   execution, profit or rewards.
+
+Current `on`/`pause`/`off` can return `UNKNOWN` (exit 2) while saving or because a
+POST response lacks confirmation fields. UNKNOWN is not definitive failure and
+must never be blindly retried. Read `status --json` on the same managed endpoint
+and evaluate the conditions above; if still unconfirmed, investigate and keep
+new writes stopped. If config is UNKNOWN, compare the current settings and
+version before considering any separately authorized next step; do not enable
+from an unconfirmed config.
+
+Today's human output still includes verbose legacy-shaped fields such as
+`runtime_state`, nested slots/funds and last-round fields. D2 can omit these,
+so their human values can be `UNKNOWN` even when a save is confirmed. Use the
+top-level result and fresh D2 JSON evidence together. Do not interpret a missing
+legacy display field as a failed write, or missing safety evidence as success.
+This documents current behavior; a new `--verbose` option or automatic control
+confirmation polling is not available as part of this procedure.
+
+| Result or reason | Safe next action |
+| --- | --- |
+| `pause_and_finish_automatic_buys_before_configuring` | Read status; confirm the saved pause, then investigate relevant existing BUYs, native obligations and opening lifecycles. Let actual release and fresh facts become visible before reassessing config. |
+| `financial_facts_unknown` | Read status and inspect current account identity, completeness, freshness and financial-read blockers. No new write until the facts are confirmed. |
+| `config_version_changed` / `settings_save_pending` | Read current settings/version and pending-save state. Reconcile the intended values; do not replay an old CAS write. |
+| `LP enable result is unconfirmed` / `LP pause result is unconfirmed` | Read status on the same endpoint and check the full saved control conditions. Do not repeat the control POST blindly. |
+| Transport timeout / `UNKNOWN` | The write may have been accepted. Read status and investigate; preserve UNKNOWN and no-replay protections. |
+
+These outcomes are not instructions to restart, reinstall or run automatic
+repair. The commands do not withdraw/deposit funds or guarantee fills/rewards;
+`on` does not change budgets, and pause does not clear inventory.
 
 ## Verification and failure handling
 
@@ -196,6 +323,10 @@ authorization. Repository delivery follows
 
 ## C1 allocation observation settings
 
+This section describes the legacy `minimum` allocation shadow, not D2
+`observed_pools` budgets or its enable sequence. The inventory-cost envelope and
+C2 trial guidance below belong to that separate C1/C2 path.
+
 C1 adds optional settings to the current D2 settings CAS, HTTP config/state and
 public CLI. Missing fields retain `minimum`, no weights and shadow disabled;
 legacy default state and estimator payloads keep their existing shape. Requests
@@ -286,9 +417,11 @@ then shadow, then an approved trial budget of at most $30.
 A reviewed service with D2 supports explicit `observed_pools`. The dashboard
 labels the old budget as trial funds and adds a separate income budget. Editing
 or polling does not discard either unsaved value or its original config version.
-Saving the two-budget form selects this mode and keeps Auto paused. An unset
+Saving the two-budget form selects this mode and requires an already confirmed
+pause for a trading config change. An unset
 income budget saves as zero. Code installation alone does not change mode or
-choose a live budget.
+choose a live budget. Saving does not automatically pause a running service;
+the operator must first satisfy the [D2 sequence](#d2-dual-pool-start-sequence).
 
 The public CLI accepts `--trial-budget` and `--income-budget`. Both must be finite
 and nonnegative. In this mode `--budget` is an alias for trial funds; conflicting
@@ -298,20 +431,10 @@ minimum/C1 commands remain available; `rank_weights` remains gated separately.
 A legacy automatic executor refuses `observed_pools_requires_d2` before enabling
 or executing this configuration.
 
-After the operator has selected and authorized both amounts, use the existing
-loopback service and existing CLI. These placeholders are not budget defaults:
-
-```sh
-open-trader prediction-arb lp-auto config \
-  --trial-budget "$TRIAL_USD" --income-budget "$INCOME_USD" --json
-open-trader prediction-arb lp-auto status --json
-```
-
-This saves configuration only. Enabling/resuming is a separate existing control
-action. A save uses one CAS write; pending settings may be confirmed with state
-reads under the same deadline. Missing values, stale versions, mismatched budget
-confirmation, credentials, redirects and non-loopback destinations remain errors.
-Do not repeat an UNKNOWN write automatically; inspect status first.
+The [D2 start sequence](#d2-dual-pool-start-sequence) is the operator procedure
+for pause, prerequisites, explicit budgets, configuration confirmation and
+separate enable. Missing values, stale versions, mismatched budget confirmation,
+credentials, redirects and non-loopback destinations remain errors.
 
 Trial uses model ranking and minimum size. Income uses attributable official
 hourly rewards divided by measured remaining BUY capital. The first valid sample
