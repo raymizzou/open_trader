@@ -843,3 +843,81 @@ def test_lp_auto_entrypoints_share_argument_contract(service, capsys):
         else:
             assert observed[0][0] == 0
     assert service.orders == [{'id': 'buy-1', 'side': 'BUY'}, {'id': 'sell-1', 'side': 'SELL'}]
+
+
+@pytest.mark.parametrize('outcome', ['confirmed', 'pending', 'origin-rejected'])
+def test_peer_rejection_does_not_override_originating_control(service, capsys, monkeypatch, outcome):
+    from concurrent.futures import ThreadPoolExecutor
+    import time
+    from open_trader import lp_auto_cli
+
+    pending = {**d2_receipt(False), 'control_save_state': 'pending',
+        'saved_control_version': 7, 'control_native_inflight': True,
+        'pause_confirmed': False, 'control_request_status': 'accepted',
+        'control_request_reason': None}
+    peer = {**(d2_receipt(False) if outcome == 'confirmed' else pending),
+        'control_request_status': 'rejected', 'control_request_reason': 'control_save_pending'}
+    orders = deepcopy(service.orders)
+    clock = [100.0]
+    # Only the CLI business clock changes. HTTP synchronization and the
+    # independent real-time watchdog retain their real clock.
+    monkeypatch.setattr(lp_auto_cli, 'time', SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=lambda _: None))
+    for json_output in (False, True):
+        clock[0] = 100.0
+        service.requests.clear()
+        service.entered.clear()
+        observed = threading.Event()
+        watchdog = time.monotonic() + 5
+        service.reply = peer if outcome == 'origin-rejected' else pending
+
+        def read_peer_attempt():
+            assert service.entered.wait(5), 'confirmation must follow the original accepted write'
+            assert time.monotonic() < watchdog, 'independent confirmation watchdog'
+            clock[0] += .1  # External reads consume the same original command budget.
+            observed.set()
+            return peer
+
+        service.read_state = read_peer_attempt
+        with ThreadPoolExecutor(1) as worker:
+            result = worker.submit(invoke, service, 'pause', '--timeout', '.25',
+                                   *(['--json'] if json_output else []))
+            code = result.result(timeout=5)
+        captured = capsys.readouterr()
+        assert captured.err == ''
+        if outcome == 'confirmed':
+            assert code == 0
+            assert observed.wait(5), 'success must follow the exact-version saved proof'
+            if json_output:
+                assert json.loads(captured.out) == {'result': 'PAUSED', 'state': peer,
+                    'reason': None, 'next_action': None}
+            else:
+                assert 'result: PAUSED' in captured.out and 'FAILED' not in captured.out
+                assert 'existing orders and protection remain' in captured.out
+            assert clock[0] == pytest.approx(100.1)
+        else:
+            assert code == 2 and 'result: PAUSED' not in captured.out
+            if json_output:
+                document = json.loads(captured.out)
+                assert document['result'] == 'UNKNOWN' and 'status' in document['next_action']
+                assert document['state'] == peer
+                reason = document['reason']
+            else:
+                assert len(captured.out.splitlines()) <= 3
+                assert ('result: FAILED' if outcome == 'origin-rejected'
+                        else 'result: UNKNOWN (UNCONFIRMED)') in captured.out
+                reason = captured.out
+            if outcome == 'pending':
+                assert observed.wait(5)
+                assert 'confirmation timed out' in reason
+                assert 'FAILED' not in captured.out
+                assert clock[0] == pytest.approx(100.3)  # Original .25s deadline, never renewed.
+            else:
+                assert 'control_save_pending' in reason
+                assert not observed.is_set()
+                assert clock[0] == 100.0
+        assert posts(service) == [(ROOT + 'pause', {'confirm': True})]
+        assert sum(method == 'GET' and path == ROOT + 'state'
+                   for method, path, _, _ in service.requests) == {
+                       'confirmed': 1, 'pending': 3, 'origin-rejected': 0}[outcome]
+        assert service.orders == orders

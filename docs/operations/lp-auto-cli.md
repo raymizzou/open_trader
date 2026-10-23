@@ -130,7 +130,9 @@ bounded state GETs inside the original command deadline. Success requires the
 original requested control version and desired action, the same saved version,
 strict effective/pause state, no native control/settings save in flight and
 explicit `fatal=null`. A newer peer intent/version, missing proof, fatal,
-rejection or expiry cannot produce success. Legacy unconfirmed receipts stay
+originating POST rejection or expiry cannot produce success. A later state GET
+can contain rejection metadata from another caller; it does not override the
+original accepted version/action or its saved proof. Legacy unconfirmed receipts stay
 UNKNOWN without confirmation polling. LP auto HTTP receipts use the same safe
 null-preserving projection as status; omitted safety facts are never filled in.
 

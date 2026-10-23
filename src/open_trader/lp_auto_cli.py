@@ -497,11 +497,14 @@ def run(action: str, url: str, timeout: float | str, *, json_output: bool = Fals
             running = action == 'on'
             state = client.write('enable' if running else 'pause', {'confirm': True})
             version = state.get('requested_control_version')
+            # GET exposes shared last-attempt metadata, which can belong to a
+            # peer. Only this POST receipt can reject the originating request.
+            origin_rejected = state.get('control_request_status') == 'rejected'
             label = 'enable' if running else 'pause'
             while True:
                 if time.monotonic() >= client.deadline:
                     raise TimeoutError(f'LP {label} confirmation timed out')
-                if state.get('control_request_status') == 'rejected':
+                if origin_rejected:
                     client.rejected = True
                     raise ValueError(f'LP service rejected control: {state.get("control_request_reason") or "UNKNOWN"}')
                 if _control_confirmed(state, running):
