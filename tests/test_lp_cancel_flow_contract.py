@@ -809,16 +809,24 @@ def test_gtd_cancel_from_real_parsed_facts_uses_epoch_expiration(tmp_path, monke
     from datetime import UTC, datetime, timedelta
     from dataclasses import replace
     from threading import Event
-    import time, httpx
+    import time, httpx, asyncio
     from tests.test_lp_observed_pools import AsyncPoolRig
     from tests.test_lp_async_live_contract import sdk_wire
     from tests.test_lp_order_registration_contract import _open_order
     actual_http = AsyncPoolRig.http
+    book_entered, book_release = Event(), Event()
     epoch = 1924992000  # independently fixed: 2031-01-01T00:00:00Z
     expiry = datetime(2031, 1, 1, tzinfo=UTC)
     assert int(expiry.timestamp()) == epoch
     async def sdk_http(self, req):
         source = req.headers['x-lp-source']
+        if source == 'book' and not book_release.is_set():
+            book_entered.set()
+            try:
+                assert await asyncio.to_thread(book_release.wait, 4), 'external GTD book watchdog'
+            except asyncio.CancelledError:
+                assert await asyncio.to_thread(book_release.wait, 4), 'external GTD cleanup watchdog'
+
         if source in ('open_orders', 'order'):
             self.requests.append((source, req.headers['x-lp-order'], self.seconds))
             objects = self.sdk.orders if source == 'open_orders' else [self.history[req.url.path.rsplit('/', 1)[-1]]]
@@ -840,6 +848,22 @@ def test_gtd_cancel_from_real_parsed_facts_uses_epoch_expiration(tmp_path, monke
             rig.live.run_once()
             assert time.monotonic()<deadline, rig.live.diagnostics()
             Event().wait(.001)
+    def idle():
+        status = rig.live.read_runtime.status()
+        return (status['ready_count'] == 0 and status['observed_monotonic'] >= rig.seconds
+            and not any(scope['active'] for scope in status['scopes']))
+    def next_read(predicate):
+        # Advance only after actual mailbox consumption and physical read completion.
+        deadline = time.monotonic()+4
+        while not (predicate() and idle()):
+            rig.live.run_once()
+            status = rig.live.read_runtime.status()
+            due = status['next_dependency_monotonic']
+            assert status['cleanup_faults'] == 0
+            assert time.monotonic()<deadline, rig.live.diagnostics()
+            if not predicate() and idle() and due is not None and due > rig.seconds:
+                rig.tick(due-rig.seconds)
+            Event().wait(.001)
     try:
         for name in names:
             rig.market(name)
@@ -850,6 +874,16 @@ def test_gtd_cancel_from_real_parsed_facts_uses_epoch_expiration(tmp_path, monke
         rig.tick()
         observe(lambda: len(rig.live.state.snapshot().active_orders)==len(names)
             and all(o.key in rig.live.state.snapshot().yields for o in rig.live.state.snapshot().active_orders))
+        assert book_entered.wait(2)
+        assert any(scope['active'] and scope['key'][3]=='buy'
+            for scope in rig.live.read_runtime.status()['scopes'])
+        # The previous key-presence condition deliberately succeeds while this
+        # actual HTTP read is held. Release and drain before any business jump.
+        book_release.set()
+        observe(idle)
+        assert rig.live.read_runtime.status()['cleanup_faults'] == 0
+        assert all(row.yield_pct_per_hour.state=='known'
+            for row in rig.live.state.snapshot().yields.values())
         snapshot = rig.live.state.snapshot()
         assert all(isinstance(o.expiration.value, datetime) and o.expiration.value==expiry for o in snapshot.active_orders)
         observation = snapshot.observation
@@ -866,10 +900,10 @@ def test_gtd_cancel_from_real_parsed_facts_uses_epoch_expiration(tmp_path, monke
                 book=actual_book(**kwargs)
                 return book.model_copy(update={'bids':(book.bids[0].model_copy(update={'size':Decimal('40')}),)})
             rig.public.get_order_book=low_book
-            rig.tick(10)
-            observe(lambda:rig.live.state.snapshot().observation.accepted_at==rig.utc()
-                and (source:=rig.live.state.snapshot().observation.source_frame.sources.get('market_book:'+rig.cid('A')+':tA')) is not None
-                and source.checked_at==rig.utc())
+            previous = rig.utc()
+            next_read(lambda:(source:=rig.live.state.snapshot().observation.source_frame.sources.get(
+                'market_book:'+rig.cid('A')+':tA')) is not None and source.complete
+                and source.checked_at>previous)
         before = list(rig.requests)
         def cancel(*,order_ids):
             rig.sdk.cancels.append(tuple(order_ids))
@@ -896,13 +930,14 @@ def test_gtd_cancel_from_real_parsed_facts_uses_epoch_expiration(tmp_path, monke
         settle_control(rig.live)
         if kind=='single_protection':
             rig.sdk.orders=tuple(o.model_copy(update={'expires_at':expiry+timedelta(seconds=60)}) for o in rig.sdk.orders)
-            rig.tick(5)
-            observe(lambda:any(o.key[3]=='A' and o.expiration.value==expiry+timedelta(seconds=60)
+            observe(idle)
+            next_read(lambda:any(o.key[3]=='A' and o.expiration.value==expiry+timedelta(seconds=60)
                 for o in rig.live.state.snapshot().active_orders))
             assert rig.live.run_protection_once()==()
             drained(rig.live.writer)
             assert len(rig.sdk.cancels)==1
             assert len([r for r in action_rows(rig.store) if r['kind']=='CANCEL'])==1
+        observe(idle)
         rig.sdk.orders=()
         for name in names:
             rig.history[name]=rig.history[name].model_copy(update={'status':'CANCELED', 'size_matched':Decimal('3')})
@@ -916,7 +951,9 @@ def test_gtd_cancel_from_real_parsed_facts_uses_epoch_expiration(tmp_path, monke
             assert row['receipt']==receipts[row['request_id']]
             assert (row['progress']['size_matched'],row['progress']['remaining'],row['progress']['reserved_usd'])==('3','17','0')
         assert live_status_ok(drained(rig.live.writer))
-    finally:rig.close()
+    finally:
+        book_release.set()
+        rig.close()
 
 
 @pytest.mark.parametrize('kind', ['register', 'not_sent_cleanup'])

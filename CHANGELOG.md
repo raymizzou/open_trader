@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-23 — LP cancellation diagnostic compatibility and consumer checks
+
+- Restore ISO datetime strings in rotation diagnostics while retaining exact integer GTD expiration in request audits and terms checks. Diagnostic reads remain isolated and perform no trading or account I/O.
+- Align deferred-origin, partial-fill, protection priority and restart/expiry checks with independent CANCEL capacity and every actual request lifetime. GTD checks hold real HTTP reads and drain them before advancing business time; financial, identity, UNKNOWN and no-replay guards remain.
+
 ## 2026-10-23 — LP cancellation follows fresh account facts
 
 - Triggered protection persists until its exact BUY leaves the open-order view. Each new valid source can create one new request per ID, including while an older CANCEL is pending; repeated source consumption never replays a request.

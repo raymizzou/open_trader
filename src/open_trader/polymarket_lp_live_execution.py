@@ -2333,7 +2333,7 @@ class LPD2LiveExecution:
                 victims=bounded(dict(order_key=list(order.key), terms_version=order.terms_version,
                     price=str(order.price.value), remaining=str(order.remaining.value),
                     original_size=str(order.original_size.value), order_type=order.order_type.value,
-                    expiration=_audit_expiration(order.expiration.value))
+                    expiration=order.expiration.value)
                     for order in decision.victims) if decision else bounded(()), outcomes=outcomes)
             with self.state._lock:
                 try:

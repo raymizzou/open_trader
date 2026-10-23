@@ -62,3 +62,6 @@ LPCANCEL-C3 澄清：SDK/异步 parser 的 GTD 到期 datetime 在审计与条�
 仍拒绝无时区或不能无损表示为整秒的值，不放宽 RequestRecord 的整数校验，不改变真实到期含义。
 原生请求登记、确定未发送清理及保护读取使用同一既有短锁维护当前审计关联/水位并取得快照；
 快照处理、writer offer、SDK/网络与 SQLite 等待不持有该锁，旧请求清理不得删除后来请求的关联。
+
+LPCANCEL-C4 兼容性澄清：审计及条款边界使用整数 epoch，不改变轮换诊断 JSON 的既有表示；
+诊断中的 datetime 到期值仍输出 ISO 字符串，并保留值拷贝隔离与零 I/O。

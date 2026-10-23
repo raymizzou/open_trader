@@ -1703,7 +1703,7 @@ def test_d2_deferred_cancel_revalidates_original_trigger_after_admission_io(tmp_
     live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch, submit=False)
     producer = PolymarketLPService(live.store, live.trading)
     execution = attach(live, producer, tmp_path)
-    releases = {oid: Event() for oid in ('occupied-X', 'occupied-Y', 'entry-A')}
+    releases = {oid: Event() for oid in ('entry-A',)}
     entered = {oid: Event() for oid in releases}
     sql_entered, sql_release = Event(), Event()
     terminal, exact_reads, handles, outcomes, errors = {}, [], {}, [], []
@@ -1731,20 +1731,14 @@ def test_d2_deferred_cancel_revalidates_original_trigger_after_admission_io(tmp_
         tick()
         baseline = next(b for b in live.state.snapshot().baselines.values() if b.key.episode_id == 'entry-A')
         assert baseline.anchor_order_ids == ('entry-A',) and live.state.snapshot().openings == {}
-        sdk.orders += (_open_order('occupied-X', 'BUY', price='.29', original='20'),
-            _open_order('occupied-Y', 'BUY', price='.28', original='20'))
-        live.run_once()
-        for oid in ('occupied-X', 'occupied-Y'):
-            handles[oid] = live.cancel_independent((WALLET, CONDITION_ID, TOKEN_ID, oid))
-            assert entered[oid].wait(2)
+        execution._breaker_open = True  # real incident admission fence; no native slot fixture
         sdk.orders += (_open_order('retained-B', 'BUY', price='.30', original='500'),)
         public.level, clock[0] = Decimal('5000'), 1
         assert tick() == ()
         progress = live.state.snapshot().progress[baseline.key]
         assert progress.state == 'triggered' and progress.ratio.value == Decimal('.50') and progress.cancel_targets == ()
-        for oid in ('occupied-X', 'occupied-Y'):
-            releases[oid].set(); handles[oid].result(timeout=3); handles[oid]._thread.join(2)
-            assert handles[oid].done()
+        assert sdk.cancels == [] and live.status()['native_inflight'] == 0
+        execution._breaker_open = False
         clock[0] += 1; live.run_once()
         handles['entry-A'] = live.cancel_independent((WALLET, CONDITION_ID, TOKEN_ID, 'entry-A'))
         assert entered['entry-A'].wait(2)
@@ -2007,7 +2001,7 @@ def test_d2_deferred_target_partial_fill_uses_fresh_attempt_revision(tmp_path, m
     from tests.test_lp_order_registration_contract import _open_order
     live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch, submit=False)
     execution = attach(live, PolymarketLPService(live.store, live.trading), tmp_path)
-    releases = {oid: Event() for oid in ('occupied-X', 'occupied-Y', 'entry-A')}
+    releases = {oid: Event() for oid in ('entry-A',)}
     entered = {oid: Event() for oid in releases}
     sql_entered, sql_release = Event(), Event()
     terminal, exact_reads, handles, old_attempts, errors = {}, [], {}, [], []
@@ -2044,31 +2038,29 @@ def test_d2_deferred_target_partial_fill_uses_fresh_attempt_revision(tmp_path, m
         sdk.orders = (_open_order('entry-A', 'BUY', price='.30', original='2000'),)
         assert tick() == ()
         baseline = next(b for b in live.state.snapshot().baselines.values() if b.key.episode_id == 'entry-A')
-        sdk.orders += (_open_order('occupied-X', 'BUY', price='.29', original='20'),
-            _open_order('occupied-Y', 'BUY', price='.28', original='20'))
-        live.run_once()
-        for oid in ('occupied-X', 'occupied-Y'):
-            handles[oid] = live.cancel_independent((WALLET, CONDITION_ID, TOKEN_ID, oid))
-            assert entered[oid].wait(2)
+        execution._breaker_open = True  # real external admission blocks never-started tickets
         sdk.orders += (_open_order('original-B', 'BUY', price='.30', original='10'),)
         public.level = Decimal('4000')
-        assert tick() == ()  # both slots occupied; original A/B tickets accepted
+        assert tick() == ()  # original A/B tickets accepted, no native request admitted
         original = next(o for o in live.state.snapshot().orders if o.key[3] == 'original-B')
         assert original.original_size.value == original.remaining.value == 10 and original.size_matched.value == 0
         assert live.state.snapshot().progress[baseline.key].cancel_targets == ()
-        releases['occupied-X'].set(); finish((handles['occupied-X'],))
-        handles['entry-A'], = tick()
+        assert sdk.cancels == [] and live.status()['native_inflight'] == 0
+        execution._breaker_open = False
+        handles['entry-A'] = live.cancel_independent(
+            (WALLET, CONDITION_ID, TOKEN_ID, 'entry-A'), protection_key=baseline.key, reason='queue')
         assert entered['entry-A'].wait(2)
         progress = live.state.snapshot().progress[baseline.key]
         assert {t.order_key[3] for t in progress.cancel_targets} == {'entry-A'}
-        assert live.status()['native_inflight'] == 2 and ('original-B',) not in sdk.cancels
-        # Original registered A makes the bucket ineligible for silent replanning.
-        for oid in ('entry-A', 'occupied-Y'):
-            releases[oid].set(); finish((handles[oid],))
+        assert live.status()['native_inflight'] == 1 and ('original-B',) not in sdk.cancels
+        # Keep B never-started while the real A request drains and exact final0 arrives.
+        execution._breaker_open = True
+        releases['entry-A'].set(); finish((handles['entry-A'],))
         assert tick() == ()  # actual Reader obtains A's authoritative final0
         anchor = next(o for o in live.state.snapshot().orders if o.key[3] == 'entry-A')
         assert anchor.terminal_proof.identity_verified and anchor.terminal_proof.matched.value == 0
         assert exact_reads and set(exact_reads) == {'entry-A'}
+        execution._breaker_open = False
         if change == 'partial_before_new_attempt':
             partial_fill()
         else:
@@ -2867,7 +2859,8 @@ def test_d2_protection_precedes_rotation_native_slots(tmp_path, monkeypatch, cas
     from tests.test_lp_d2_integration import _d2_filled_opening
     from tests.test_lp_order_registration_contract import _open_order
     live, sdk, public, clock = _d2_filled_opening(tmp_path,monkeypatch,manual_sale=False)
-    sell_entered, cancel_entered, release = Event(), Event(), Event()
+    sell_entered, release = Event(), Event()
+    cancel_entered = {oid: Event() for oid in ('C', 'D')}
     try:
         producer = PolymarketLPService(live.store,live.trading,clock=live._utc_now)
         execution = attach(live,producer,tmp_path)
@@ -2882,24 +2875,26 @@ def test_d2_protection_precedes_rotation_native_slots(tmp_path, monkeypatch, cas
             return post(signed)
         def held_cancel(*, order_ids):
             assert order_ids[0] in {'C','D'}
-            cancel_entered.set(); assert release.wait(5), 'rotation native watchdog'
+            cancel_entered[order_ids[0]].set(); assert release.wait(5), 'rotation native watchdog'
             return cancel(order_ids=order_ids)
         sdk.post_order, sdk.cancel_orders = held_post, held_cancel
         clock[0] += 1
         result = execution.lp_auto_scheduled_check()
-        assert sell_entered.wait(2) and cancel_entered.wait(2)
-        assert live.status()['native_inflight'] == 2
+        assert sell_entered.wait(2) and all(event.wait(2) for event in cancel_entered.values())
+        assert live.status()['native_inflight'] == 3
         assert {o.order_key[3] for o in result.rotation_outcomes} == {'C','D'}
         pending = [o for o in result.rotation_outcomes if o.handle]
-        refused = [o for o in result.rotation_outcomes if not o.handle]
-        assert len(pending) == len(refused) == 1
-        assert refused[0].status == 'not_sent' and refused[0].reason == 'native_capacity'
+        assert len(pending) == 2
+        assert len({o.handle.identity.request_id for o in pending}) == 2
+        assert {o.handle.identity.target.existing_order_id for o in pending} == {'C', 'D'}
         assert sdk.posts == [sdk.posts[0]] and sdk.cancels == []
         release.set()
-        assert pending[0].handle.result(timeout=3).status.value == 'accepted'
+        for action in pending:
+            assert action.handle.result(timeout=3).status.value == 'accepted'
+            action.handle._thread.join(2)
         wait_rotation_idle(live)
         assert len(sdk.posts) == 2 and sdk.posts[-1]['side'] == 'SELL'
-        assert len(sdk.cancels) == 1
+        assert sorted(sdk.cancels) == [('C',), ('D',)]
     finally:
         release.set()
         assert live.close(timeout=3)
@@ -2908,7 +2903,7 @@ def test_d2_protection_precedes_rotation_native_slots(tmp_path, monkeypatch, cas
 
 def rotation_unknown_due_capacity(tmp_path, monkeypatch):
     live, execution, sdk, ids, pools, order, qualify = rotation_runtime(tmp_path,monkeypatch)
-    entered = {key:Event() for key in ('protection','rotation')}
+    entered = {key:Event() for key in ('U', 'E', 'F')}
     release = Event()
     try:
         pools['U'] = None
@@ -2918,20 +2913,19 @@ def rotation_unknown_due_capacity(tmp_path, monkeypatch):
         sdk.advance(600)
         cancel = sdk.cancel_orders
         def held(*,order_ids):
-            entered['protection' if order_ids==('U',) else 'rotation'].set()
+            entered[order_ids[0]].set()
             assert release.wait(5), 'protection-first native watchdog'
             return cancel(order_ids=order_ids)
         sdk.cancel_orders = held
         result = execution.lp_auto_scheduled_check()
-        assert entered['protection'].wait(2) and entered['rotation'].wait(2)
-        assert live.status()['native_inflight'] == 2
+        assert all(event.wait(2) for event in entered.values())
+        assert live.status()['native_inflight'] == 3
         assert {o.order_key[3] for o in result.rotation_outcomes} == {'E','F'}
-        assert sum(o.handle is not None for o in result.rotation_outcomes) == 1
-        refusal, = (o for o in result.rotation_outcomes if o.handle is None)
-        assert refusal.reason == 'native_capacity' and refusal.status == 'not_sent'
+        assert all(o.handle is not None for o in result.rotation_outcomes)
+        assert len({o.handle.identity.request_id for o in result.rotation_outcomes}) == 2
         assert sdk.cancels == [] and sdk.posts == []
         release.set(); wait_rotation_idle(live)
-        assert ('U',) in sdk.cancels and len(sdk.cancels) == 2 and sdk.posts == []
+        assert sorted(sdk.cancels) == [('E',), ('F',), ('U',)] and sdk.posts == []
     finally:
         release.set()
         assert live.close(timeout=3)
@@ -3113,7 +3107,7 @@ def test_d2_rotation_diagnostics_are_bounded_and_read_only(tmp_path, monkeypatch
         def held(*,order_ids):
             with calls_lock:
                 calls.append(order_ids)
-                if len(calls)==2: entered.set()
+                if len(calls)==21: entered.set()
             assert release.wait(5), 'diagnostic native watchdog'
             return dict(canceled=(),not_canceled={order_ids[0]:'ERROR_SENTINEL_TOKEN_secret'})
         sdk.cancel_orders = held
@@ -3133,8 +3127,9 @@ def test_d2_rotation_diagnostics_are_bounded_and_read_only(tmp_path, monkeypatch
         assert all(row['terms_version'] for row in rotation['victims']['samples'])
         outcomes = rotation['outcomes']
         assert outcomes['total'] == 21 and len(outcomes['samples']) == 20 and outcomes['omitted'] == 1
-        assert outcomes['counts'] == {'pending':2,'not_sent':19}
-        assert outcomes['reason_counts'] == {'native_capacity':19}
+        assert outcomes['counts'] == {'pending':21}
+        assert len(calls) == 21 and len({ids for ids in calls}) == 21
+        assert outcomes['reason_counts'] == {}
         assert len(outcomes['reason_counts']) <= 21
         assert 'ERROR_SENTINEL' not in json.dumps(payload)
         before = (sdk.balance_reads,sdk.order_reads,sdk.position_reads,len(sdk.posts),tuple(calls))
@@ -3152,7 +3147,7 @@ def test_d2_rotation_diagnostics_are_bounded_and_read_only(tmp_path, monkeypatch
             if action.handle: assert action.handle.result(timeout=3).status.value == 'rejected'
         wait_rotation_idle(live)
         current = execution.lp_auto_state(include_intents=False)['diagnostics']['rotation']
-        assert current['outcomes']['counts'] == {'rejected':2,'not_sent':19}
+        assert current['outcomes']['counts'] == {'rejected':21}
         assert 'ERROR_SENTINEL' not in json.dumps(current)
         assert payload['effective_settings']['target_buy_count'] == 5
         assert payload['effective_running'] is True
