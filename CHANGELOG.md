@@ -4,6 +4,12 @@
 
 - Wait for the exact posted D BUY in a receipt-current account and its valid market observation before the next income comparison. Observation passes forbid BUY and cancellation work; the original fixed result, exact next-cycle victims and no-replay assertions remain. Test synchronization only; production behavior is unchanged.
 
+## 2026-10-24 — Issue acceptance after delivery
+
+- Keep the original task Main responsible for criterion-by-criterion issue acceptance after merge and applicable authorized deployment. Publish current criteria, evidence, exact identities and limits; CI/deployment/Smoke success alone does not prove business acceptance.
+- Bring gaps to visible chat. Record explicitly accepted deviations separately from PASS; a follow-up does not itself permit original issue closure. Avoid closing keywords while acceptance is pending, verify CLOSED after evidence publication, and keep the board wip/blocked until acceptance and closure are complete.
+- Preserve documentation/configuration/test-only deployment exemptions, external review, main-only CI and separate merge/deploy authority. Verify documentation with diff/link checks and five acceptance decision paths; no code, runtime or production changes.
+
 ## 2026-10-23 — LP cancellation diagnostic compatibility and consumer checks
 
 - Restore ISO datetime strings in rotation diagnostics while retaining exact integer GTD expiration in request audits and terms checks. Diagnostic reads remain isolated and perform no trading or account I/O.

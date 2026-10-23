@@ -11,7 +11,7 @@ Use the `gh` CLI inside this repository.
 - Comment: `gh issue comment <number> --body-file <file>`
 - Apply labels: `gh issue edit <number> --add-label "..."`
 - Remove labels: `gh issue edit <number> --remove-label "..."`
-- Close: `gh issue close <number>`
+- Close after [issue acceptance](../operations/agent-verification.md#postdelivery-issue-acceptance): `gh issue close <number>`
 
 For multiline bodies, write the exact Markdown to a temporary file
 and pass it with `--body-file`.
@@ -19,6 +19,17 @@ and pass it with `--body-file`.
 “Publish to the issue tracker” means create a GitHub issue.
 “Fetch the relevant ticket” means read the issue and its comments.
 Follow the session's authorization rules for external writes.
+
+## Acceptance and closure
+
+The existing task Main records criterion-specific acceptance on the current issue
+after merge and applicable authorized deployment. Follow the authoritative
+[postdelivery issue acceptance procedure](../operations/agent-verification.md#postdelivery-issue-acceptance)
+for the checklist, evidence, visible-chat discrepancy decisions and closure readback.
+Use `Refs`/`Related` in PR descriptions and commit messages while acceptance is
+pending. Opening/linking a follow-up does not itself permit closing the original;
+keep its board item wip/blocked until acceptance and issue closure are complete.
+Nondeployable changes record deployment N/A and receive applicable acceptance.
 
 ## Pull requests as a triage surface
 
@@ -75,5 +86,6 @@ resolve with `gh pr view <number>`, falling back to `gh issue view`.
 - Frontier: choose the first open, unassigned child in map order
   with no open blockers.
 - Claim: `gh issue edit <number> --add-assignee @me`.
-- Resolve: record the answer, close the child, and link its result
-  in the map's Decisions-so-far.
+- Resolve: record the answer and applicable acceptance evidence, close the child
+  only under the acceptance procedure above, and link its result in the map's
+  Decisions-so-far.
