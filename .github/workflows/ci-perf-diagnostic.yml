@@ -1,0 +1,37 @@
+name: Prediction six-worker diagnostic
+
+on:
+  push:
+    branches: [codex/ci-perf-six-20261021-s7o7ql]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    if: contains(github.event.head_commit.message, '[ci-perf-six-run]') && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout diagnostic harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: harness
+          persist-credentials: false
+      - name: Checkout immutable measured source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 0ad6e77fd0dbbc937dfc3e660bc7ae37d9ae89b1
+          path: measured-source
+          persist-credentials: false
+      - name: Run one offline Prediction diagnostic
+        run: python3 harness/scripts/ci_perf_diagnostic.py run --source measured-source --output "${{ runner.temp }}/prediction-six-diagnostic"
+      - name: Preserve diagnostic artifacts including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: diagnostic-prediction-six-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/prediction-six-diagnostic
+          retention-days: 3
+          if-no-files-found: error

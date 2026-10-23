@@ -68,7 +68,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-21
 
+- Prediction diagnostic summaries now reject backward, overlapping, out-of-order and invalid numeric phase bounds. Invalid streams remain available with explicit protocol errors and incomplete status; derived load/tail values and timelines are withheld. Original test exit status and experiment recording/execution stay unchanged. Focused observer contracts cover these invalid bounds.
+
+- Add a branch-and-commit-marker scoped Prediction diagnostic for one six-worker run against immutable source `0ad6e77`. It retains original offline selection and test outcomes, records worker phase timelines and sampled CPU/memory in separate diagnostic artifacts, and leaves ordinary CI/deployment evidence unchanged. Focused observer contracts cover grouped/literal-`@` identities, failure/skip/subtest outcomes and incomplete streams.
+
 - D2 systemd 离线生命周期回归仅在 rollback 路径执行公共拒绝矩阵，减少 ready/failed restart 的重复验证；两个 restart 场景仍各自创建真实 producer、记录、启动许可和原生锁，并保留恢复与零发送断言。验证覆盖原三个测试的串行、双 worker 隔离及 actor、元数据和旧 nonce 的负向敏感性；未改生产代码，不据本机计时推断 GitHub CI 节省。
+
 - CI now supports a main-only manual run with the same four backend partitions, portable scenarios and retirement coverage. Deployment Preflight selects the newest exact-SHA push or manual run and binds artifacts to its real event; newer unsuccessful runs block older green evidence. Focused offline trust and workflow checks cover this path. No deployment in this change.
 
 - LP 冷启动 UNKNOWN 依赖期限回归为受监督子进程使用测试独占的 pytest 临时命名空间，避免其清理无关历史目录；保留正常清理、原 30 秒监督和全部业务断言。受控历史目录、正常及独立并发验证不涉及生产逻辑；历史 P20 超时的确切原因仍未知，未部署。
