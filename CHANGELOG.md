@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-23 — LP CLI startup and outcome confirmation
+
+- Route LP help/status/controls through a lightweight shared argument parser. Default human output shows at most three outcome/state/budget lines; `--verbose` exposes D2 and legacy diagnostics. JSON shape, result tokens, redaction and exits remain compatible.
+- Preserve explicit safe nulls on LP auto HTTP receipts. Accepted D2 controls use only bounded confirmation GETs under the original deadline and original control version; missing proof, peer intent changes, rejection, fatal state and expiry stay unconfirmed. No control POST replay, live state change or deployment is performed by this change.
+
 ## 2026-10-23 — LP cancellation follows fresh account facts
 
 - Triggered protection persists until its exact BUY leaves the open-order view. Each new valid source can create one new request per ID, including while an older CANCEL is pending; repeated source consumption never replays a request.

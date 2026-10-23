@@ -158,7 +158,9 @@ def test_cli_pause_waits_for_service_confirmation_and_fails_when_unreachable(tmp
         assert runtime.execution.state["desired_running"] is False
     assert cli.main(["prediction-arb", "lp-auto", "pause", "--url", base, "--timeout", "0.2"]) == 2
     output = capsys.readouterr().out
-    assert "PAUSED" not in output and "UNKNOWN" in output
+    assert "PAUSED" not in output and "FAILED" in output
+    assert cli.main(["prediction-arb", "lp-auto", "pause", "--url", base, "--timeout", "0.2", "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["result"] == "UNKNOWN"
 
 
 def test_unconfirmed_pause_is_never_acknowledged(tmp_path, capsys):
@@ -394,3 +396,33 @@ def test_cli_loopback_pause_does_not_use_environment_proxy(tmp_path, monkeypatch
     with _server(runtime) as base:
         assert cli.main(["prediction-arb", "lp-auto", "pause", "--url", base]) == 0
     assert "PAUSED" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('action', ['enable', 'pause', 'config'])
+def test_d2_auto_http_receipt_preserves_null_and_redacts_secrets(tmp_path, action):
+    runtime = runtime_for(tmp_path)
+    runtime.execution.state.update(
+        effective_running=False, control_save_state='saved',
+        requested_control_version=4, saved_control_version=4,
+        control_native_inflight=False, settings_pending=False,
+        settings_native_inflight=False, fatal=None, settings_error=None,
+        control_error=None, diagnostics={'known': 'safe', 'unknown': None,
+            'api_key': 'api-canary', 'private_key': 'private-canary',
+            'raw_payload': 'raw-canary'})
+    root = '/api/prediction-arbitrage/lp/auto/'
+    payload = ({'budget_usd': '100', 'target_buy_count': 3,
+                'expected_config_version': 0} if action == 'config' else {'confirm': True})
+    with _server(runtime, session_token='session-token', csrf_token='csrf-token') as base:
+        status, receipt = _response(_production_request(base, root + action, json.dumps(payload).encode()))
+        get_status, state = _response(base + root + 'state')
+    assert status == get_status == 200
+    for key in ('fatal', 'settings_error', 'control_error'):
+        assert key in receipt and receipt[key] is None
+        assert key in state and state[key] is None
+    assert receipt['diagnostics'] == state['diagnostics'] == {'known': 'safe', 'unknown': None}
+    for key in ('desired_running', 'pause_confirmed', 'requested_control_version',
+                'saved_control_version', 'control_native_inflight', 'settings_pending'):
+        assert receipt[key] == state[key]
+    assert len(runtime.execution.calls) == 1
+    assert not any(secret in json.dumps(receipt) + json.dumps(state)
+                   for secret in ('api-canary', 'private-canary', 'raw-canary'))

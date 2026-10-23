@@ -1418,7 +1418,7 @@ def create_prediction_server(
                     status = HTTPStatus.CONFLICT
                 safe_result = (
                     _lp_projection_safe_value(result)
-                    if path == lp_auto_prefix + "reservations/release"
+                    if path in lp_auto_paths
                     else _prediction_safe_value(result)
                 )
                 if not isinstance(safe_result, Mapping):
