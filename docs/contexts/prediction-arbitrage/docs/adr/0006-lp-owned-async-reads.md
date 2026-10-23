@@ -33,7 +33,20 @@ live/execution 将其接入既有 `plan_wait.dependencies`，Scheduler 不在纯
 清理故障/退役资源没有可运行结果或有限下一期限时，明确发布 `plan_wait.kind=events`，不编造未来日期。
 Scheduler 此时无定时检查期限，仅等待真实完成、显式命令或停止事件；既有错误退避保持。
 若健康 BUY 等仍有有限下一期限，则继续优先使用该期限，不被故障通道的事件等待遮挡。
-实际 I/O 退出会唤醒 owner，但不撤销已锁存故障、不重试该故障操作，也不提前释放池或恢复资金权限。
+实际 I/O 退出会唤醒 owner；BUY、exact、低频通道及端口关闭失败仍保留原锁存故障语义，
+不提前释放池或恢复资金权限。
+
+2026-10-23，LP-CANCEL-20261023 / LPCANCEL-FINANCIAL-P2：仅 financial 的延迟取消清理故障，
+在全部子读取（含响应 `aclose`）实际结束后解除当前阻塞，复用原客户端与连接池。
+发送 cancel、Future 返回或清理宽限到期均不是恢复边界。未收集的 timeout/fault 通知保持原 attempt
+和观察身份，只交付一次；原通知未收集前同 scope 不开始新 attempt，迟到旧结果不能成为当前事实。
+下一次读取仍服从原起点节奏、provider/account Retry-After 和当前需求；shutdown 或无有效需求不触发恢复读取。
+新 attempt 的完整账户事实仍须经过原金融接纳，解除阻塞本身不授予资金或发送权限。
+
+纯内存 status 将当前 `cleanup_faults` 与 financial 历史分开：`financial_cleanup_faults` 为累计次数，
+`last_financial_cleanup_fault` 只保留最近 attempt、未结束 source 名称、故障及实际结束的 monotonic 时间。
+历史固定大小，不含账户、订单、凭证或响应内容，scope 退役后仍可观察；查询不驱动网络或状态变更。
+本修订不重建端口、不增加撤单前查询，不改变 UNKNOWN、不重放、重启或其他通道的合同。
 
 第 5 秒封存 UNKNOWN 并取消未完请求，第 6 秒仍未实际退出则锁存 cleanup fault，
 停止该单重试并请求 exact BUY 保护撤单。独立监督线程不依赖市场 loop 的合作。
