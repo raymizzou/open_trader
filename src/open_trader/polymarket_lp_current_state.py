@@ -1104,6 +1104,11 @@ class CurrentLPState:
                         or (previous.native_state == 'ended' and update.target.native_state != 'ended')
                         or (previous.venue_terminal is not None and update.target.venue_terminal != previous.venue_terminal)):
                     return 'invalid_identity'
+                if previous is None:
+                    # Completed request history lives in audit records. Keep the
+                    # latest intent and every target still needed by a native callback.
+                    targets = {request_id: target for request_id, target in targets.items()
+                        if target.order_key != update.target.order_key or target.native_state != 'ended'}
                 targets[update.target.request_id] = update.target
                 self._progress[g.scope] = replace(p, cancel_targets=tuple(targets.values()), scope_version=version)
             elif isinstance(update, OpeningProtectionUpdate):

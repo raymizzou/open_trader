@@ -6,7 +6,7 @@ status: accepted
 
 2026-10-21，LP-SLOW-READ-20261021。本决定替代 [ADR 0005](0005-lp-serial-fact-cycle.md)
 的全市场串行网络读取和市场共享小槽位。金融接纳、计划、轮次、保护和发送仍由同一个业务 owner 决定。
-预算、数学、权限、原生发送并发 2、ACK 与终态区别及 UNKNOWN 防重保持原合同。
+预算、数学、权限、BUY/SELL 下单并发 2、ACK 与终态区别及同请求 UNKNOWN 防重保持原合同。
 
 ## 生产入口与时间
 
@@ -68,7 +68,7 @@ book 超过原有 10 秒 freshness 时降为 UNKNOWN；实际超时或旧身份�
 每次真实失败 attempt 只计一次，完整有效成功清零。第 11 次连续失败锁存精确撤单，
 后续成功不撤销意图。新理由不要求 queue baseline 或 matched=0，覆盖部分成交的剩余 BUY。
 原 queue 10 次、UNKNOWN 600 秒及 scoring 5/15/60 秒规则可先触发；相同 exact 义务共享发送所有权。
-权限、身份或容量不足时保持 pending，ACK 不证明最终成交数量，UNKNOWN 请求不重发。
+权限或身份不足时保留未发送意图；BUY/SELL 下单容量不限制 CANCEL。ACK 不证明最终成交数量，原 UNKNOWN 请求不重发；新的有效挂单来源可以形成新的独立撤单请求。
 
 已确认的连续失败数、触发原因和发送前的 cancel request ID 写入现有 canonical order 所属会话 payload
 的 `lp_read_protection[order_id]`，不增加表或 schema。重启只恢复已提交事实，
@@ -102,7 +102,7 @@ Scheduler 检查失败保留自身配置的错误重试期限，不被读取冷�
 有界标量代际保留尚未消费的完成通知；owner 的后续保护容量检查只消费进入该检查前
 已确认物理线程退出的完成。检查期间或最后容量检查后发生的完成留给下一轮，
 不能因 Future 完成或线程刚退出就进入无限事件等待。callback 失败不改原生结果或 lease 清理。
-cap2 仍按真实线程/资源生命周期计数；通知消费后不因已归属 UNKNOWN 或权限拒绝的义务持续空转。
+BUY/SELL 下单的 cap2 仍按真实线程/资源生命周期计数；CANCEL 单独保留全部实际句柄，不占下单槽位。通知消费后不因历史 UNKNOWN 或纯等待的 CANCEL 持续空转。
 
 同一有界完成通知还覆盖手动撤单、保护 SELL/cancel_exit 的真实 native 结束，
 以及手动入场实际持有的 `_active_sends` reservation 释放。它们复用既有 owner 唤醒和保护检查消费；
@@ -123,3 +123,11 @@ service 仅在实际持有的独占手动 lease 释放并完成全局/文件锁�
 测试用业务时钟和外部事件控制调度，原生独立 watchdog 覆盖 status/close/cleanup 锁等待。
 直接消费者按影响清单运行，保留原断言；每次记录原命令、变更身份、真实 exit 和日志。
 本决定不是独立 review、CI、发布、合并或部署完成证明。
+
+2026-10-23，LPCANCEL-FLOW-P2：账户事实由两池共享，每个 BUY 的市场读取仍并行进行。
+保护意图与某次 request 的历史结果分开：后续读取成功不撤销已触发保护，新合法挂单来源仍为 LIVE 时
+可以发送新 request，允许与同 ID 的旧 CANCEL 重叠。重复原始来源不新增发送资格。
+沿用 SDK 的实际网络超时，不主动终止 CANCEL，不在进入撤单后追加账户、book、exact 或 fills GET。
+正常 exact/终态事实更新每次原请求的审计；旧 receipt 不改写、旧 progress 不覆盖新事实。
+启动恢复保护事实和原审计，但不重放旧 request，只有新接纳账户事实可产生新决定。
+本规则只改变撤单流程；读取五秒期限、清理所有权、BUY 不确定性、金融接纳和手动/SELL 安全边界保留。

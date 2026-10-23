@@ -8383,6 +8383,11 @@ class PredictionArbitrageStore:
                         or Decimal(original['quantity']) != record.original_size
                         or Decimal(original['price']) != record.price):
                     return False
+                previous = original.get('progress')
+                if previous and (record.checked_at < datetime.fromisoformat(previous['checked_at'])
+                        or record.size_matched < Decimal(previous['size_matched'])
+                        or previous['status'] in TERMINAL_ORDER_STATES and record.status not in TERMINAL_ORDER_STATES):
+                    return True  # accepted no-op: old evidence cannot regress current progress
                 remaining = record.original_size - record.size_matched
                 values['remaining'] = remaining
                 values['reserved_usd'] = remaining * record.price if record.status in CURRENT_ORDER_STATES else Decimal(0)
