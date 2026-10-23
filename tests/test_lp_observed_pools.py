@@ -742,6 +742,7 @@ def test_two_business_loops_share_switch_and_progress_independently(tmp_path,mon
 def test_income_cycle_consumes_one_result_snapshot_and_next_cycle_gets_updates(tmp_path,monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
+    from time import monotonic
     rig=AsyncPoolRig(tmp_path,monkeypatch)
     entered,release=Event(),Event()
     try:
@@ -766,6 +767,39 @@ def test_income_cycle_consumes_one_result_snapshot_and_next_cycle_gets_updates(t
         assert len(fixed.outcomes)==1
         assert rig.sdk.posts[0]['token_id']=='tD'
         assert rig.sdk.posts[0]['price']*rig.sdk.posts[0]['size']==50
+        assert rig.execution.lp_observed_pool_state()['results'][rig.cid('D')]['result']==old
+        # The BUY receipt does not publish a current account observation. A
+        # partial income opportunity can already cancel E while D's read is
+        # pending. Observe without trial candidates or cancellation dispatch
+        # before asking the next income cycle to compare the exact current set.
+        posted_d=fixed.outcomes[0].venue_order_id
+        posted_at=rig.utc()
+        rig.tick()
+        end=monotonic()+4
+        while True:
+            observed=rig.live.run_once(pool='trial')
+            assert not observed.outcomes
+            assert observed.rotation is None or not observed.rotation.victims
+            assert len(rig.sdk.posts)==1 and rig.sdk.cancels==[('old-D',)]
+            snapshot=rig.live.state.snapshot()
+            observation=snapshot.observation
+            account=observation.components['open_orders']
+            market=observation.source_frame.sources.get('market_order:'+posted_d)
+            if (observation.orders_complete and account.checked_at>posted_at
+                    and observation.read_ticket.trade_version_at_start==snapshot.trade_version
+                    and any(o.key[3]==posted_d for o in observation.order_view.open_orders)
+                    and market is not None and market.complete and market.error is None
+                    and market.checked_at is not None and market.checked_at>=posted_at
+                    and 0<=(rig.utc()-market.checked_at).total_seconds()<=10):
+                break
+            status=rig.live.read_runtime.status()
+            due=status['next_dependency_monotonic']
+            assert monotonic()<end,(rig.live.status(),rig.live.diagnostics())
+            if (status['ready_count']==0 and not any(scope['active'] for scope in status['scopes'])
+                    and status['observed_monotonic']>=rig.seconds
+                    and due is not None and due>rig.seconds):
+                rig.tick(due-rig.seconds)
+            rig.wake.wait(.01);rig.wake.clear()
         assert rig.execution.lp_observed_pool_state()['results'][rig.cid('D')]['result']==old
         following=rig.cycle(pool='income');rig.finish_cancels(following)
         assert following.selection.targets==(rig.cid('E'),rig.cid('D'))

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-24 — LP income snapshot test observation synchronization
+
+- Wait for the exact posted D BUY in a receipt-current account and its valid market observation before the next income comparison. Observation passes forbid BUY and cancellation work; the original fixed result, exact next-cycle victims and no-replay assertions remain. Test synchronization only; production behavior is unchanged.
+
 ## 2026-10-23 — LP cancellation diagnostic compatibility and consumer checks
 
 - Restore ISO datetime strings in rotation diagnostics while retaining exact integer GTD expiration in request audits and terms checks. Diagnostic reads remain isolated and perform no trading or account I/O.
