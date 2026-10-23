@@ -140,7 +140,10 @@ def test_explicit_systemd_restart_recovers_absent_ready_or_failed_record(tmp_pat
             assert current['candidate']['lp_validation']['operation_nonce']==starts[0]
             assert 'pending_lp_validation' not in current
             assert child.actual_posts()==0
-        _assert_systemd_service_identity(child,monkeypatch,restart_recovery=restart)
+        # Rollback owns the complete common rejection matrix. This scenario
+        # still builds its own real systemd producer/guard/record/permit state.
+        _assert_systemd_service_identity(child,monkeypatch,restart_recovery=restart,
+            check_common_rejections=False)
 
 
 def test_foreground_operator_from_other_cwd_remains_manageable(tmp_path):
