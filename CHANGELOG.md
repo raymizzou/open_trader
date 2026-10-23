@@ -1,11 +1,107 @@
 # Changelog
 
+## 2026-10-23 — Managed launchd failed-start recovery
+
+- Normal Prediction Host Readiness requires explicit verified managed identity from preflight. Empty-host installability still reports READY, but requires `FIRST_DEPLOY=1` and its fresh-host ownership checks.
+- Failed restart also inspects the process table after removing the launchd job. A late startup that survives without a listener or lock, or an unavailable process inventory, blocks new startup permission.
+- Preserve the selected tracked release manifest in runtime records and same-release refreshes, including custom manifests used by early launchd self-context verification.
+- Selected Prediction Host Readiness consumes the verified manager preflight and accepts READY/RECOVERABLE without requiring the failed old service to listen on 8769. Other service, wallet, browser, storage and first-deploy checks remain.
+- Read-only preflight can identify a fully verified failed loaded service as recoverable. Explicit `--restart` rechecks its exact release, config, consumed permit and manager identity, stops only that label, and requires complete resource absence before one new startup permission. Unknown identities, held resources, saved pause and no-replay protections remain enforced.
+
+## 2026-10-23 — LP exact-proof request admission test synchronization
+
+- LP postreceipt controls now follow published read deadlines until the external exact-order response is actually held, then check UNKNOWN finality at unchanged business time. Three controls defer successful proof admission with one unavailable external response and the normal five-second read cadence. Original immediate-wake, exact cancellation, manual funds and no-replay assertions remain. Test synchronization only; production behavior is unchanged.
+
+## 2026-10-22 — LP manual-order candidate publication test synchronization
+
+- The manual-D income rebuild regression waits for current D market proof and its BUY in a receipt-current account after the manual order is removed. A finite external HTTP gate covers account data arriving before D market publication; exact D30, final B50/D30/A20, manual capital and no-replay assertions remain. Test synchronization only; production behavior is unchanged.
+
+## 2026-10-22 — LP postreceipt test observation synchronization
+
+- LP pool regressions now follow published read deadlines when waiting for final cancel quantities or current account funds after receipts. Controlled HTTP publication gates retain the unchanged-time wake, exact-ID cancellation, manual-order capital, UNKNOWN and no-replay assertions. This repairs test synchronization only; production behavior is unchanged.
+
+## 2026-10-22 — D2 routing test fixture protocol
+
+- 补齐两个局部 D2 路由测试替身的候选预留协议成员；如被实际调用则明确失败，不提供虚构资金权威。保留路由、真实 Store 发布、锁与清理断言；生产逻辑不变。
+
+## 2026-10-22 — D2 candidate current-account authority
+
+- D2 候选扫描与维护只按当前账户 BUY 剩余未成交占款和当前进程实际发送／不确定结果判断资金；旧 LP 会话、历史未决动作及退役 N-leg 记录不再单独形成资金占位。当前账户身份、完整性、时效及 UNKNOWN／不重放保护保留，旧非 D2 预留逻辑不变。离线公开候选生产与真实 D2 接线回归覆盖预算 14/7、6 USDC 当前占款、SELL／持仓口径与实际在途恢复。
+
+## 2026-10-22 — LP exact cancel test counter barrier
+
+- The LP read-failure cancel regression now waits for every exact target’s accepted failure count before advancing the test clock or allowing cancellation. Normal, delayed-response and concurrent exact-node checks preserve all cancellation guards; no production behavior changed.
+
+## 2026-10-22 — LP position cadence test owner synchronization
+
+- LP 持仓 60 秒回归在推进业务时钟前，等待 owner 接纳同账户、同代际的新完整金融观察，并保留持仓就绪与读取结束条件。保留原 59/60 秒、60 份数量、止损、不重放及 4 秒限制；使用离线 HTTP 响应延迟和独立并发执行验证，未改生产逻辑。
+
+## 2026-10-22 — Explicit release-test advisory coverage
+
+- Export only the reviewed policy, manifest hash, count and node-set hash in the
+  cross-job CI plan. Full parameterized nodeids stay in source and artifacts;
+  required validation recomputes the summary and rejects tampering. Focused local
+  routing and stock-host verification cover the transport content contract;
+  hosted output acceptance still needs the subsequent natural push run.
+- Keep 224 reviewed release, installer and manager regression identities unchanged,
+  including the existing rollback case, and run them in Release advisory on main
+  pushes or manual invocation. New tests and parameter identities remain required.
+- Required CI and Deployment Preflight keep complete, disjoint coverage proof and
+  do not wait for advisory success. Financial/order, UNKNOWN, no-replay, current-API
+  handoff/restart, active drain, credential runtime and stopped data-recovery tests
+  remain required. Failure logs, JUnit, metrics and exact run identity are retained.
+
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
+
+## 2026-10-22
+
+- LP income rebuilds cancel only exact pool-role or measured-source orders; manual BUYs remain account commitments and block duplicate market entries. Group permission waits no longer hold the current-state lock, and rechecks reject paused or replaced decisions. Observed-pool settings preserve live timing changes, explicit minimum mode and budget aliases. Effective mode exits use the existing pause, obligation and current-fact checks and advance the trading version once; timing and same-effective minimum writes stay configuration-only. Group outcomes now publish before the completion wake so exact deferred protection remains runnable after the last native owners exit. Offline regressions cover these boundaries; R401 remains the original unchanged-source invariant with a live peer, and R405 supplies the separate last-owner RED/GREEN evidence.
+
+- LP dual-pool planning now composes with the owned async read runtime: detached samples require current market/account facts, both due pool opportunities survive read waits, and real group-cancel completion wakes exact deferred protection. Legacy unconfirmed CLI configuration remains UNKNOWN; role CAS writes use the existing database coordinator. Pool ADR moves to 0007 while async ADR 0006 is retained. Focused offline checks cover detached-source freshness, fair due work, cap2 completion, resource drain, exact protection and CLI/coordinator compatibility; exact command evidence is recorded separately. The original P214 and P301 TDD sequencing deviations remain disclosed. No production configuration, merge or deployment is implied.
+
+- LP Auto adds explicit independently budgeted trial and measured-income pools on the existing D2 account lane. Trial keeps model-ranked minimum-size entries; income compares attributable official hourly measurements for up to 120 seconds and uses fixed 50/30/20 weights. New membership rebuilds the old income group after real order release; partial failures keep successes and cash, with UNKNOWN, inventory and SELL protections retained. The dashboard and CLI expose both budgets under one pause/enable control; saving does not enable trading or choose production amounts. Offline checks cover measured identities, fair loop progress, fixed snapshots, restart/expiry, partial outcomes, native cancellation ownership, authenticated controls and affected consumers. P214 retains a disclosed initial TDD sequencing deviation; current GREEN does not supply a missing pre-change RED.
+
+- 完整 backend/portable CI 的自动触发改为仅在最终 main push 执行，保留既有独立授权的 main-only manual 入口与精确身份校验；后续 push/manual 不取消较早运行。用户明确授权的无冲突 PR 经 expected-head 核对后合并，不再等待 feature/PR CI 或仅为 main 新鲜度重整分支；独立审查、反馈与缺陷修复仍由 Main 持续负责，合后修复走新 PR。服务端只移除 main required-status 规则，PR/禁止强推与删除/tag 保护已读回保留；离线定向验证覆盖事件、安全、required fail-closed、optional 独立与 push/manual 部署身份合同。失败 main SHA 不可部署，部署仍需该 SHA 的可信成功 CI、完整证据及独立授权；未声称线上 CI 结果、节时数或已部署。
+
+- LP runtime regressions now wait for the selected risk session’s scoring publication and the first current-reader observation before checking later progress. Controlled external-boundary delays reproduce the old premature assertions; focused immediate/delayed, concurrent and negative checks preserve financial, no-write, pause and real cleanup contracts. No production behavior change or deployment.
 
 ## 2026-10-21
 
 - D2 systemd 离线生命周期回归仅在 rollback 路径执行公共拒绝矩阵，减少 ready/failed restart 的重复验证；两个 restart 场景仍各自创建真实 producer、记录、启动许可和原生锁，并保留恢复与零发送断言。验证覆盖原三个测试的串行、双 worker 隔离及 actor、元数据和旧 nonce 的负向敏感性；未改生产代码，不据本机计时推断 GitHub CI 节省。
+- CI now supports a main-only manual run with the same four backend partitions, portable scenarios and retirement coverage. Deployment Preflight selects the newest exact-SHA push or manual run and binds artifacts to its real event; newer unsuccessful runs block older green evidence. Focused offline trust and workflow checks cover this path. No deployment in this change.
+
+- LP 冷启动 UNKNOWN 依赖期限回归为受监督子进程使用测试独占的 pytest 临时命名空间，避免其清理无关历史目录；保留正常清理、原 30 秒监督和全部业务断言。受控历史目录、正常及独立并发验证不涉及生产逻辑；历史 P20 超时的确切原因仍未知，未部署。
+
+- LP 手动租约完成唤醒的离线回归在推进业务时钟前，等待当前 O/C 读取的未持有源实际发布，避免把 HTTP 返回误当作 runtime publication。保留原 5/10/11 秒边界、watchdog、当前订单与 UNKNOWN/不重放断言；验证包含外部响应延迟及独立并发两变体，未改生产逻辑。
+
+- LP 手动独占 mutation lease 在可靠 SQL 与全局文件锁真实释放后补发完成通知，避免早期 native 通知先被消费后，延期保护撤单停在事件等待。保留早期容量通知、整条命令/SQL 所有权、纯状态查询及权限/UNKNOWN/不重放；离线真实 Scheduler 回归覆盖实际拒单后的 COMMIT 尾部与无 native 的缺失 preview SELECT，未部署。
+
+- LP 共享 native 容量的完成唤醒补齐手动撤单、保护 SELL/cancel_exit 和实际手动入场 reservation 释放；延期保护撤单不再依赖无关命令或读取。保留真实 cap2、UNKNOWN、不重放及整条手动命令/SQL 所有权；状态查询不产生唤醒。离线回归覆盖三类生产路径、60 数量与止损/finality、20 入场及 SQL 持有交错，未部署。
+
+- LP 精确保护撤单完成后通知既有 Scheduler，并保留有界完成代际直到 owner 完成后续保护容量检查，避免三目标 cap2 延期撤单在纯事件等待中停滞。物理线程退出前仍占容量，权限、UNKNOWN、不重放和读取故障所有权不变；离线真实 Scheduler 回归覆盖受控完成交错、同刻第三目标发送与消费后不空转，未部署。
+
+- LP 读取冷却与仅等待事件时，保留控制保存 completed+1 秒重试，并及时收集已结束的保存；owner 检查失败仍按配置的 60 秒重试，不被提供者 300 秒 Retry-After 延后。离线真实 Scheduler 回归覆盖暂停即时生效、两次保存、无提前 HTTP 和本地持久化恢复；重试/失败升级及资金门禁不变，未部署。
+
+- LP 固定读取通道清理故障且无有限期限时，明确发布仅等待事件的状态，Scheduler 不再持续空转；健康 BUY 的真实下一期限仍优先。实际退出和显式命令可立即唤醒，故障资源、资金 UNKNOWN、禁止重试及新增 BUY 的门禁不变。离线回归覆盖真实 Scheduler、5/6 秒边界、100 次无空转检查、同场健康 BUY 和停止/排空；未部署。
+
+- 修复 LP 期限内成功结果迟收时被误计失败：真实完成与当前源新鲜度分别判断，过期只降为 UNKNOWN。Scheduler 使用实际读取期限/下一起点等待，完成或显式命令可提前唤醒；精确三目标撤单测试改为等待真实发送 Future，并验证受控串行/并发完成，保持权限、部分成交和不重放断言；未部署。
+
+- 修复 LP 异步读取审查发现的三处保护缺口：金融观察过期仍接纳有效逐单失败与清理故障；订单 scope 重建保留递增尝试身份；无 opening 的读取保护撤单继续获取精确终态数量。新增离线交错、同单重新准入及 ACK 后最终成交数量回归，保留资金权限、精确身份和不重放边界；未部署。
+
+- LP 当前 BUY 改为逐单可取消异步读取：5 秒起点与整轮期限，额外 1 秒未实际清理即锁存 exact 保护；连续第 11 次失败触发同单撤单，完整成功清零。金融/精确保护独立于慢市场，SELL 市场 30 秒、持仓风险 60 秒，状态 GET 只发布快照。64 个 BUY scope 上限计入退役和故障资源，参考缓存与解压/分页均有硬上限；失败计数和发送身份沿原订单 payload 持久保存，重启不重放。新增离线 HTTPX loopback、资源所有权、逐单收益、权限/终态及生产调度回归；未部署。
+
+- LP 服务日志补充选定奖励、账户读取/发布与入场发送/回执应用的脱敏诊断，区分失败、正常等待及同作用域恢复，并保留首次/最近原因和尝试关联。Dashboard 旧读取及缓存、无效奖励事实、规划快照复用或账户恢复不能清除较新失败或改写 UNKNOWN 订单；奖励来源各自验证后恢复，混合配置、身份或资产错误仍保留身份无歧义的 native USD 下界以检查 combined 一致性；冲突配置 ID 和同条件整行的贡献不作证据，相同重复仍去重，顺序不再改变诊断，业务 UNKNOWN 与原因顺序不变；交错组件按阶段独立聚合重复日志并保留被抑制计数；日志队列及进程内记录有界，溢出与重启不保证连续历史。离线定向验证覆盖发送审计、防重、不可变订单、并发顺序及阻塞/异常日志输出；Dashboard、交易规则和 JSON/CLI 不变，未部署。
+
+- Retirement CI fixtures now separate the permanently paused service from explicit unpaused library observer diagnostics at both reader fences. Dedicated runtime-only tests retain the native writer and owner until actual shutdown completes. Offline fence, incident, startup-drain and controlled concurrent regressions preserve fail-before-write, no-replay and exact cancellation assertions; new CI remains pending. No production change or deployment.
+
+- Cloud SSM status/Smoke now bind the requested N-leg setting to the release record, installed unit, loaded environment and process environment while retaining effective pause. Old SSM evidence without the configured marker requires the existing separately authorized install/start workflow. File/disabled units remain byte-identical. Eight offline substitution regressions and affected consumers verify this identity repair; not deployed.
+
+- Retirement follow-up: cloud units and lifecycle evidence now use effective N-leg pause while retaining the requested value for identity and credential/region checks. Capped Shadow and local Smoke accept historical unset/zero inputs without reactivating business; Smoke validates LP evidence. Default/explicit Keychain Shadow retains authenticated read-only LP display. The retired external-position recovery command is no longer an operator procedure; recovery needs separate scoped approval. Focused offline lifecycle, resource, HTTP and gate regressions retain identity, UNKNOWN, no-write and owner protections. Not deployed.
+
+- Supported production/shadow entrypoints now always keep non-LP business paused, even with `OPEN_TRADER_NLEG_PAUSED=0`. Startup preserves legacy LLM usage and safety-policy/control history. Retired catalog, recovery and shadow-seed CLI writers reject with exit 2 / `N_LEG_PAUSED` before external work. LP and read-only candidate diagnosis retain their contracts; explicit library and authorized offline maintenance remain available. Focused offline regressions cover startup, public HTTP, no-write CLI rejection and retained consumers; the CI retirement manifest is unchanged. Not deployed.
+
+- CI makes only the supported D2 rollback regression advisory. Its unchanged whole test runs serially in a separate workflow, automatically only after main updates, with a manual entry. A genuine failure can be deferred without blocking required CI or Deployment Preflight. Exact required/optional/retired collection and trusted-artifact checks preserve all other gates; focused offline policy and fixture verification is recorded in task evidence. No fixed runtime saving or live advisory result is claimed.
 
 - LP 慢会话隔离回归改为先等待健康市场的实际 BUY 回执，再核实轮次完成，避免同一个两秒窗口覆盖对账等待与健康发送调度。测试保持慢读取直至清理，保留精确订单、占资和禁止叠加读取断言，并回收实际原生读取与对账线程。离线验证包含受控健康市场延迟与依赖慢读取的负向故障；未改生产逻辑。
 

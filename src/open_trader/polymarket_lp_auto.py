@@ -1087,6 +1087,8 @@ class LPAutoPool:
         return self.state()
 
     def set_desired_running(self, running, *, audit=None):
+        if running and self._read().get('allocation_mode') == 'observed_pools':
+            raise ValueError('observed_pools_requires_d2')
         if not isinstance(running,bool):
             raise ValueError('desired_running_invalid')
         def apply(d):
@@ -3154,6 +3156,7 @@ class LPAutoPool:
                                               error=error if row else 'session_missing')
             # Never wait on notification channels while a facts worker or the
             # ledger write is occupied; the durable due flag wakes the LP lane.
+            self.lp._diagnostic_receipt_applied(current)
             self.lp._schedule_session_attention(str(current['session_id']))
             return result
         def apply(d):
@@ -3525,7 +3528,7 @@ class LPAutoPool:
         intent=updated['intents'][intent['intent_id']]
         return restored or not error and before != identity(intent)
 
-    def _refresh_account_facts(self, *, account_round=None, planning=False):
+    def _refresh_account_facts(self, *, account_round=None, planning=False, diagnostic_round=None):
         from .polymarket_lp import LpAccountReadError, LpAccountRoundInvalid, LpObservationWait
         reader = getattr(self.lp.exchange, 'lp_account_snapshot_shared', None)
         if not callable(reader):
@@ -3538,7 +3541,19 @@ class LPAutoPool:
             baseline = self._account_facts_identity(prior)
             baseline_times = {key: prior.get(key) for key in ('read_started_at', 'read_ended_at', 'checked_at')} if isinstance(prior, Mapping) else {}
 
-        def failed(reason, *, waiting=False, retry_at=None):
+            diagnostic_attempt = self.lp._lp_diagnostics.begin('account_planning' if planning else 'account_full',
+                read_started_at=self._now() if not planning else None)
+        diagnostic_stage = 'account_read'
+
+        def failed(reason, *, waiting=False, retry_at=None, exc=None):
+            if diagnostic_stage == 'account_read':
+                try:
+                    self.lp._lp_diagnostics.record(diagnostic_attempt,
+                        event='waiting' if waiting else 'failed', stage=diagnostic_stage,
+                        cause=reason, summary='account_order_sync_unknown',
+                        exc=exc, event_at=self._now(), round_id=diagnostic_round)
+                except Exception:
+                    pass
             with self._account_refresh_lock:
                 if attempt == self._account_refresh_attempt:
                     self._current_account = None
@@ -3567,6 +3582,8 @@ class LPAutoPool:
                         self.lp.exchange.lp_account_snapshot(account_round=account_round)
                         if account_round is not None else
                         reader(max_age_seconds=0, trade_generation_provider=self.store.lp_trade_generation))
+            diagnostic_recovery = self.lp._account_diagnostic_components(
+                diagnostic_attempt, snapshot, round_id=diagnostic_round)
             with self._account_refresh_lock:
                 if attempt != self._account_refresh_attempt:
                     return False
@@ -3599,8 +3616,12 @@ class LPAutoPool:
                                 snapshot = deepcopy(previous)
                 # Serialize publication with attempt admission, not the account
                 # read. A late old read cannot publish over a newer wait.
-                result = (self.lp._register_planning_account_snapshot(snapshot) if planning
-                          else self.lp.register_account_snapshot(snapshot))
+                diagnostic_stage = 'account_publish'
+                with self.lp._lp_diagnostics.associate(diagnostic_attempt,
+                        scope='account_planning' if planning else 'account_full',
+                        recovery=diagnostic_recovery, round_id=diagnostic_round):
+                    result = (self.lp._register_planning_account_snapshot(snapshot) if planning
+                              else self.lp.register_account_snapshot(snapshot))
                 if result.get('state') != 'registered':
                     reason = result.get('reason') or 'account_order_sync_unknown'
                     return failed(reason, waiting=reason in ('account_round_invalid', 'session_changed'))
@@ -3628,14 +3649,14 @@ class LPAutoPool:
             if planning and exc.retry_at is not None:
                 self._update(lambda doc: doc.update(account_reader_wait=dict(
                     reason=str(exc), retry_at=exc.retry_at, error=getattr(exc, 'planning_error', None))))
-            return failed(str(exc), waiting=True, retry_at=exc.retry_at)
+            return failed(str(exc), waiting=True, retry_at=exc.retry_at, exc=exc)
         except (LpAccountRoundInvalid, LpObservationWait) as exc:
             # The next scheduled read or a newer valid dashboard publication
             # owns recovery. Never retry internal invalidation in this round.
             reason = 'account_round_invalid' if isinstance(exc, LpAccountRoundInvalid) else str(exc)
-            return failed(reason, waiting=True)
-        except Exception:
-            return failed('account_order_sync_unknown')
+            return failed(reason, waiting=True, exc=exc)
+        except Exception as exc:
+            return failed('account_order_sync_unknown', exc=exc)
 
     def _reconcile_unknown(self, *, reuse=False, bounded=False):
         lease = self._begin_account_round()
@@ -4217,6 +4238,8 @@ class LPAutoPool:
     def _run_once(self, *, round_id=None, reuse_facts=False):
         from .polymarket_lp import LpAccountRoundInvalid
         d = self._read()
+        if d.get('allocation_mode') == 'observed_pools':
+            raise ValueError('observed_pools_requires_d2')
         self._cycle_wait = None
         plan = d.get('active_plan')
         if plan is not None:
@@ -4230,7 +4253,7 @@ class LPAutoPool:
             self._save_plan(plan, reason='cycle_ended')
             plan = None
         if callable(getattr(self.lp.exchange, 'lp_account_snapshot_shared', None)):
-            refreshed = self._refresh_account_facts(planning=True)
+            refreshed = self._refresh_account_facts(planning=True, diagnostic_round=round_id)
         else:
             self._reconcile_unknown(reuse=reuse_facts, bounded=True)
             refreshed = None

@@ -5,7 +5,7 @@ cd "$(git rev-parse --show-toplevel)"
 scope=${1:?scope required}
 nleg=${2:?TEST_N_LEG required}
 evidence=${3:?evidence directory required}
-case "$scope" in gateway|legacy|account|prediction|portable|trend-curve) ;; *) exit 2;; esac
+case "$scope" in gateway|legacy|account|prediction|portable|trend-curve|release-advisory) ;; *) exit 2;; esac
 case "$nleg" in 0) ;; *) exit 2;; esac
 [[ -z "$(git status --porcelain --untracked-files=all)" ]] || { echo 'Clean checkout required' >&2; exit 1; }
 sha=$(git rev-parse HEAD)
@@ -23,7 +23,9 @@ container="open-trader-ci-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}-$scope"
 # Preserve Makefile serial defaults outside Prediction; SDK imports share state.
 workers=1
 [[ "$scope" != prediction ]] || workers=2
-if [[ "$scope" == portable ]]; then
+if [[ "$scope" == release-advisory ]]; then
+  make test-ci-release-advisory TEST_WORKERS="$workers" CI_TEST_ARTIFACTS=1 CI_TEST_CONTAINER="$container" DOCKER_IMAGE="$image" 2>&1 | tee "$evidence/test.log" || status=$?
+elif [[ "$scope" == portable ]]; then
   make test-ci-portable TEST_WORKERS="$workers" CI_TEST_ARTIFACTS=1 CI_TEST_CONTAINER="$container" DOCKER_IMAGE="$image" 2>&1 | tee "$evidence/test.log" || status=$?
 elif [[ "$scope" == trend-curve ]]; then
   make test-trend-curve CI_TEST_ARTIFACTS=1 CI_TEST_CONTAINER="$container" DOCKER_IMAGE="$image" TEST_WORKERS="$workers" 2>&1 | tee "$evidence/test.log" || status=$?

@@ -675,6 +675,10 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None,c
     unit=child.root/'installed.service';unit.write_text(cloud.render_unit(c));unit.chmod(0o644)
     operation=child.root/'systemd-operation.lock';operation.touch(mode=0o600)
     actor=[0,0];owners={};owner_paths={};actual_stat=os.stat;actual_lstat=os.lstat;actual_fstat=os.fstat
+    # The external host model supplies a trusted interpreter, independent of
+    # workstation package-manager modes (e.g. group-writable Homebrew Cellar).
+    interpreter = c.python.resolve(strict=True)
+    interpreter_paths = {interpreter, *interpreter.parents}
     actual_connect=socket.socket.connect_ex;actual_open=os.open;actual_mkdir=os.mkdir;actual_replace=os.replace
     base_process=subprocess.run;native_io_open=io.open
     manager_state=dict(LoadState='loaded',ActiveState='inactive',SubState='dead',MainPID='0',
@@ -704,6 +708,8 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None,c
             uid,gid=((0,service[1]) if Path(path)==c.record else service)
         else:uid,gid=0,0
         values=list(info);values[4]=uid;values[5]=gid
+        if path is not None and Path(path) in interpreter_paths:
+            values[0]=info.st_mode & ~0o022
         if path is not None and Path(path)==Path(sys.executable).parent.parent/'.lock':
             values[0]=(info.st_mode & ~0o777)|0o600
         result=os.stat_result(values)

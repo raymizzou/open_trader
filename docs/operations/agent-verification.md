@@ -163,14 +163,24 @@ not passing evidence. Keep TDD, relevant stability checks and independent review
 
 Docker is not a prerequisite to task-branch publication. Optional focused Docker
 diagnosis can use `make test TEST='tests/path.py::test_name'`; local development
-does not require whole-service or full-backend suites. GitHub CI owns the complete active
-backend test suite on every branch push and every PR targeting `main`,
-including the final merged-main push: `gateway`, `legacy`, `account`, and
+does not require whole-service or full-backend suites. GitHub CI owns required backend coverage and the explicit optional
+classification automatically on every final GitHub `main` push: `gateway`, `legacy`, `account`, and
 `prediction`, with `TEST_N_LEG=0` and the permanent retirement manifest, excluding
-`pressure` and `browser`.
+`pressure` and `browser`. The 224 exact reviewed release-test identities are declared in
+`scripts/ci_optional_tests.json` under `release-advisory-v1`; see
+[Release advisory](ci.md#release-advisory). Their unchanged whole cases run serially in a separate workflow, automatically
+only on main pushes, with a manual entry. Genuine failures can be deferred;
+required CI and Deployment Preflight do not wait for it. Only the literal reviewed set is exempt from required execution. New names
+and new parameter identities remain required. Financial/order, UNKNOWN, no-replay,
+current-API handoff/restart, active drain, credential SSM runtime and stopped
+data-recovery transaction tests remain required.
 Documentation-only, LP-only, trend-only and unavailable/empty diff cases all run
-that same coverage. Push CI tests the branch head; PR CI tests the synthetic merge
-candidate. These intentionally separate runs cover distinct SHA identities.
+that same coverage. Feature pushes, PR events and tag pushes do not trigger this
+workflow. Preserve its existing main-only `workflow_dispatch` with no inputs,
+plan and required main-ref guards and exact `github.sha` checkout. A manual
+fallback needs separate authorization; dispatch alone is not successful evidence.
+There is no workflow concurrency group, so later pushes or manual dispatches do
+not cancel or replace earlier runs, including pending runs.
 See [CI identity and execution](ci.md). CI also runs the non-LIVE portable prediction scenarios. It does not run
 Deployment Preflight, Host Readiness or Production Smoke.
 
@@ -186,7 +196,9 @@ job is not selected because legacy already includes its tests.
 
 Makefile and CI use `TEST_N_LEG=0`: only the 29 reviewed files in
 `scripts/ci_nleg_retired.json` are omitted from execution because N-leg is
-permanently retired. The three mixed/shared files remain active, as do LP,
+permanently retired. CI separately excludes the 224 exact reviewed release-advisory identities;
+ordinary local direct pytest remains unchanged. The three mixed/shared files
+remain active, as do LP,
 service/runtime and pause guards. Unknown/new files default to active coverage.
 The shared validation fixture file stays importable. `TEST_N_LEG=1` and explicit
 `TEST=...` remain manual diagnostic entries; no scheduled full N-leg regression
@@ -203,8 +215,10 @@ this to two workers for Prediction. `TEST_WORKERS=4` can reduce busy-host load a
 `TEST=...` selections default to serial, and also accept `TEST_WORKERS`.
 Portable scenarios run serially in CI. Known Prediction shared-port and cached
 fixture groups retain their xdist grouping; global cross-service serial ordering
-is not a separate deployment requirement. CI proves complete backend collection equals executed active nodeids plus
-declared retired nodeids, with no gaps or overlap. Each job retains selected
+is not a separate deployment requirement. CI proves complete backend collection equals executed required nodeids plus
+the explicit optional collection and declared retired nodeids, with no gaps or
+overlap. Optional classification means `not-executed-advisory`, never passed;
+it does not retire the test or weaken other active coverage. Each job retains selected
 nodeids, phase durations, outcomes, JUnit and wall time, including failed runs.
 The development image includes Node and `procps`, but excludes npm, Python/JS
 Playwright and Chromium/browser assets. Test containers have no host mounts,
@@ -217,8 +231,10 @@ The 2026-09-29 approved cloud credential exception permits only the optional
 installs it for offline SDK transport tests. Do not add other dependencies or
 weaken existing skips/xfails. Playwright remains a host-only Production Smoke
 prerequisite; ordinary backend CI and Deployment Preflight have zero browser cost. Deployment
-Preflight reuses trusted main-push evidence for the selected final GitHub `main`
-SHA when preparing an explicitly authorized deployment. It does not rerun tests.
+Preflight reuses trusted main push/manual evidence for the selected final GitHub `main`
+SHA when preparing an explicitly authorized deployment. Preflight selects the
+newest exact-SHA run across push and main-only `workflow_dispatch`; a newer
+unsuccessful run blocks older green evidence, and artifacts retain the real event. It does not rerun tests.
 
 ## Test design and stability
 
@@ -283,7 +299,7 @@ they do not change the scope-specific verification routes above.
    Main stages/commits only the exact changes and publishes the task update, then
    obtains refreshed independent review of the published head/base. For unpublished
    local-only work, restage task files and review `git diff --cached` without
-   publishing. Existing exact-SHA, rebase, CI,
+   publishing. Existing exact-SHA, conflict-resolution, CI,
    and approval requirements still apply.
 
 ## Verification and deployment boundaries
@@ -302,7 +318,13 @@ forward-deployment wrapper, trust checks, environment limits and rollback path.
   listener, use `FIRST_DEPLOY=1`. This checks that no managed agent or selected
   listener exists, skips only the old Account status probe, and retains the
   installer, wallet, browser, storage, and Futu checks. The default mode still
-  requires running selected-service listeners and Account status.
+  requires running selected Gateway/Legacy/Account listeners and Account status.
+  Selected Prediction instead requires the supported manager's read-only
+  `--preflight` to exit zero with the exact preflight schema and `READY` or
+  `RECOVERABLE`. It passes the selected checkout, runtime, Python and private
+  config. A verified failed managed startup can pass without an old 8769
+  listener; missing listeners alone or unknown/malformed/blocked manager proof
+  cannot pass. First-deploy absence checks and post-install Smoke remain unchanged.
   It performs read-only macOS checks of system Chrome for the five marked
   Python browser regressions and checks the installed repository Playwright
   runner with cached Chromium. A missing host runner or browser is `BLOCKED`.
@@ -316,12 +338,12 @@ forward-deployment wrapper, trust checks, environment limits and rollback path.
   make production-smoke EXPECTED_SHA=<40hex> EXPECTED_ROOT=<absolute immutable checkout> EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime
   ```
 
-  For a selected Prediction release with the reversible N_LEG pause enabled,
-  add `N_LEG_PAUSED=1`. Smoke then requires the selected prediction health
-  payload to report `N_LEG_PAUSED`, verifies the LP dashboard contract, and does
-  not request `/api/prediction-arbitrage/state`. The default `N_LEG_PAUSED=0`
-  keeps the normal state contract check for selected Prediction; a missing or
-  contradictory pause status blocks the gate.
+  Supported Prediction entrypoints permanently pause non-LP business.
+  Smoke accepts historical `N_LEG_PAUSED=0` and `1` inputs; unset/default, zero
+  and one all require `N_LEG_PAUSED` health plus a valid LP dashboard. It never
+  requests `/api/prediction-arbitrage/state`. Invalid input, running/missing
+  health and missing LP evidence still block the gate. Stored zero cannot
+  reactivate N-leg and does not relax credential or startup admission checks.
 
   It must end with `HEALTHY` or `ROLLBACK`. `make production-smoke` first runs
   the five marked Python browser regressions, then uses the direct cached JS
@@ -329,8 +351,8 @@ forward-deployment wrapper, trust checks, environment limits and rollback path.
   release root; both runs use that validated release root. The prediction
   error log comes from the shared runtime root. The browser blocks
   non-read-only requests before navigation. Smoke checks the selected
-  Prediction N_LEG contract before the browser run according to
-  `N_LEG_PAUSED` and never downloads a browser or starts the fixture server.
+  Prediction permanent-pause contract before the browser run. It never downloads
+  a browser or starts the fixture server.
 - `make candidate-acceptance` and `make acceptance` are compatibility aliases
   for Deployment Preflight. They read GitHub and the selected local environment;
   they never install services, build images, rerun tests or submit orders.
@@ -354,9 +376,9 @@ Smoke applies `EXPECTED_SHA` and `EXPECTED_ROOT` to selected services only;
 unselected services may remain on older clean immutable releases. Every
 selected service still needs its health, code root, process, listener, and log
 identity checks. Account is one release unit, so its API and worker health
-identities must match. Selected Prediction uses the N_LEG state probe when
-`N_LEG_PAUSED=0`; paused selected Prediction validates paused health and the LP
-dashboard instead. The browser integration check remains common to every scope. Gateway-only
+identities must match. Selected Prediction always validates paused health and the
+LP dashboard, including under historical `N_LEG_PAUSED=0`. The browser integration
+check remains common to every scope. Gateway-only
 readiness uses `--mode gateway`; gateway plus legacy uses the existing stack
 dry-run, and legacy selection retains the Trend and Futu checks.
 
@@ -398,7 +420,10 @@ task files, push the task branch and open a normal (non-draft) PR targeting
 `main`, or update its existing PR. Do not ask again for push or PR permission.
 Explicit local-only, no-push, do-not-publish or draft instructions override this
 default. Workers never publish. This authorization also covers Main's task-local
-repair commits/pushes to the same PR without repeated permission; it grants no
+repair commits/pushes to the same open PR without repeated permission. After
+merge, use a new isolated repair branch and PR with the same publication authority
+and separate merge authorization; a closed PR cannot receive the repair. This
+publication authority grants no
 force-push, direct `main` push, automatic merge, release/tag or deployment authority.
 This standing authorization supersedes older requirements for completed review
 before publication or separate push/PR permission.
@@ -416,19 +441,23 @@ limits, unverified work, pending review and CI. Report actual Git, authenticatio
 network or PR access/publication failures; do not label standing authorization
 as pending permission. Claim dots has started only with observed evidence.
 
-### Parallel post-publication review and CI
+### Parallel post-publication review and delivery
 
 Immediately after publication, start a distinct independent Herdr
-reviewer pane alongside remote CI. Use a fresh reviewer for the initial
-independent review; reuse it for this target's in-scope repairs. An explicitly
+reviewer pane alongside delivery. Full CI follows the final main push. Use a
+fresh reviewer for the initial independent review; reuse it for this target's
+in-scope repairs. An explicitly
 local-only unpublished review uses the staged diff; published reviews use the
-exact PR head/base range. Required final independent review remains a merge gate.
+exact PR head/base range. Required independent review remains Main-owned work;
+pending review/dots does not delay an explicitly authorized conflict-free merge.
 Give the reviewer the issue requirements, repository/worktree, PR URL, immutable
 published head/base SHAs, applicable checks and verification limits. Review
 `git diff <base>...<head>` against that scope. Record actual startup evidence;
 opening the PR or issuing a launch command does not prove review started.
-Track independent review and CI separately. A changed head or base requires refreshed
-applicable reviews and CI; an old review comment is not evidence for a new SHA.
+Track independent review and post-merge CI separately. A changed head or base
+requires refreshed applicable review evidence; an old review comment is not
+evidence for a new target. This does not require a branch push or premerge CI
+solely because main advanced.
 
 Before creating the reviewer, resolve the owning task's current workspace, tab,
 and pane from live Herdr state and corroborate its task/session identity with
@@ -473,7 +502,9 @@ can finish without waiting for merge.
 Keep per-head delivery evidence in the PR and durable handoff record. A CLI
 connection check alone does not prove a reviewer pane started or a PR review was
 delivered. Old-head review and CI evidence does not transfer to an updated head;
-refresh applicable evidence when the head or base changes.
+refresh applicable evidence when the head or base changes. Report unfinished
+review and fixes after merge with Main as owner; do not declare them complete
+because the merge succeeded.
 
 ### Feedback, CI and conflict repair
 
@@ -500,10 +531,13 @@ disappear for review-ready status. Valid unresolved blockers prevent claiming
 review-ready.
 
 For valid in-scope blockers: diagnose, repair with the assigned worker,
-run affected checks, have Main stage/commit/push only task changes to the same PR
-under the standing authorization, then refresh independent review and CI evidence.
-Reuse the assigned reviewer for in-scope repairs. Follow the existing rebase
-rules when the base advances; preserve other workers' commits and test intent.
+run affected checks, have Main stage/commit/push only task changes to the same
+open PR under the standing authorization, then refresh independent review.
+After merge, use a new isolated repair branch and PR; its merge needs separate
+user authorization. Reuse the assigned reviewer for in-scope repairs. A newer
+main alone does not require rebasing, merging it into the feature branch,
+pushing or rerunning solely for CI freshness. Resolve actual conflicts within
+scope; preserve other workers' commits and test intent.
 After verifying a repair, make an authorized reply in the relevant thread with
 the solution, fix commit and verification evidence, then fetch feedback again.
 Do not falsely mark a thread resolved or treat a reviewer result as approval.
@@ -515,25 +549,31 @@ Do not claim review-ready while a known blocker remains unresolved. Nonblocking
 findings are reported without expanding the approved task or delaying first PR
 publication for polish.
 
-### Review-ready handoff and stopping conditions
+### Review completion, authorized merge and stopping conditions
 
-A review-ready handoff requires successful current applicable push-head and
-PR-merge `required` checks from GitHub Actions (app ID 15368), completed required
-independent review of the current published target, no known unresolved
-blockers, and fresh feedback and
-mergeability checks. Record the PR head/base, synthetic merge SHA and Actions
-run/check identities; see [CI identity](ci.md). Unknown, pending, cancelled, failed
-or mismatched evidence is not success. A base/head change invalidates applicable
-evidence; refresh it before handoff or merge.
+A completed review handoff records required independent review of the current
+published target, known blockers, fresh complete feedback and their dispositions.
+Do not claim review-ready while a known blocker remains unresolved. Record
+unfinished verification, review and repair work with Main as owner. These duties
+continue alongside delivery; neither a review-ready/full-acceptance label nor
+pending independent review/dots is a replacement premerge waiting gate.
 
-Main monitors until the authorized completion or accepted review-ready handoff,
+After explicit user authorization for that PR's GitHub merge, Main verifies the
+repository, base `main`, open state, expected head SHA and absence of conflicts,
+then merges through GitHub with the expected head. Unknown mergeability needs
+a bounded metadata refresh; an actual conflict needs scoped resolution. Do not
+wait for feature-push CI or synthetic PR-merge CI, or rebase/synchronize solely
+because main advanced. Keep fresh feedback and mergeability evidence without
+waiting for pending feedback to finish. See [CI identity](ci.md).
+
+Main monitors until the authorized completion or accepted handoff,
 cancellation/closure, or a specific external/authorization blocker. Record that
 stop reason, remaining responsibilities and their owner. Never abandon unresolved
 work without an owner. A broader instruction to monitor through merge retains
 that stopping condition. Separate user approval is still required for GitHub
 merge; reviews and CI do not authorize merge/auto-merge, approval on the user's
 behalf, release/tag creation, deployment, trading or repository/security changes.
-PR-head and synthetic-merge evidence never replace final-main-push deployment
+PR-head and synthetic-merge evidence never replace final-main push/manual deployment
 evidence. Existing deployment and cleanup rules remain unchanged.
 
 ### Worker lifecycle
@@ -562,7 +602,7 @@ This is a format, not an executed delivery:
 ```text
 Task/approved scope; delivery owner; publication/reply authority:
 Worktree/branch/SHA; dirty or unsaved edits; active commands/handles; session/pane:
-PR URL; immutable head/base; synthetic merge SHA; Actions run/check IDs/URLs:
+PR URL; immutable head/base; final main SHA; Actions run/attempt/check IDs/URLs:
 Local focused/security checks: command, environment, identity, result, limits:
 Independent review: published head/base (or unpublished local-only staged tree), result/evidence:
 Reviewer: pane, actual model/reasoning/profile/provider, status, PR/head/base:
@@ -570,7 +610,8 @@ Reviewer comment: URL, verified author/body/identities, Main's accepted handoff:
 Feedback: retrieval time, latest PR/head/base, complete paginated collections:
 Threads/comments: URL, resolved/unresolved state or disposition, blocking decision/owner:
 Repairs: fix commits, checks, independent review, update/reply evidence:
-CI: push-head and PR-merge required/app 15368 results; mergeability check/time:
+Merge: authorization, expected head, state/base/conflict check/time, final SHA:
+CI: final main SHA, push/manual event, newest run/attempt, required/app 15368 actual result/artifacts:
 Pending decisions/blockers; next action and owner; monitoring stop reason:
 Workers: saved work, exclusive duties/new owner, accepted handoff, lifecycle status:
 ```
@@ -580,30 +621,49 @@ Workers: saved work, exclusive duties/new owner, accepted handoff, lifecycle sta
 The delivery path is isolated branch/worktree from freshly fetched
 `origin/main` → focused local development/security checks and dated `CHANGELOG.md`
 entry → Main stages/commits task-only files → prompt task-branch push/normal PR
-→ parallel independent review and CI → feedback/repair loop → review-ready handoff
-→ explicit user approval → GitHub merge. Follow the
+→ independent review and feedback/repair work alongside delivery
+→ explicit authorization for that PR + current no-conflict/expected-head checks
+→ GitHub merge → final-main-push CI. Follow the
 [delivery procedure](#authorized-pr-delivery-loop). Local `main` is
 only a synchronized copy of GitHub `main`, never an integration or repair path.
-When the base advances, fetch/rebase, rerun focused checks and independent
-review, and inspect fresh CI. Rebase and conflict-resolution approval follows
+Do not rebase, merge main into the task branch, push or rerun solely because the
+base advanced. Resolve actual conflicts within the approved scope; material
+changes need renewed approval. Rebase and conflict-resolution approval follows
 [AGENTS.md](../../AGENTS.md#review-and-merge). Never force-push `main`.
 A branch rewrite requires its own applicable authorization; the standing
 publication authorization does not grant force-push. Do not discard
 another worker's commits.
 
-There are three distinct identities: the reviewed PR head; GitHub's synthetic
-PR merge commit (`github.sha` for PR CI); and the final GitHub `main` commit
-after merge. Record the PR head, base and tested merge SHA with the Actions run.
-Inspect the exact check-run name `required` from GitHub Actions (app ID 15368),
-not only a green UI label; see [ci.md](ci.md). PR CI success never establishes
-deployment evidence for a different final SHA. Deployment Preflight requires
-successful main-push CI for the selected final SHA, retained in main history.
-A later tip does not erase that evidence; changing the selected release SHA does.
+The PR head/base and final GitHub `main` commit after merge are distinct
+identities. Historical feature-push and synthetic PR-merge checks do not transfer
+evidence to the final main SHA. Main records that SHA, its Actions run/attempt and
+actual result. No workflow concurrency group cancels/replaces an older main run
+when a newer main SHA is pushed or a manual run is dispatched. Inspect the exact check-run name `required` from
+GitHub Actions (app ID 15368), not only a green UI label; see [ci.md](ci.md).
+Merge success is not CI success. Failed, cancelled or missing CI remains visible;
+Main owns diagnosis and a scoped repair/revert proposal through PRs. No automatic
+main write, revert, retry-until-green or deployment is authorized. After merge,
+repairs require a new isolated branch and PR with separate merge authorization.
+Independent review, feedback collection and reproducible blocker repair continue
+until completed or durably handed off; merging does not complete them.
+
+Deployment Preflight requires successful trusted main CI for the selected final
+SHA, retained in main history, from push or the existing main-only manual workflow.
+It selects the newest exact-SHA run across those events and verifies its latest
+attempt and artifacts bound to the real event. A newer unsuccessful run blocks
+older green evidence; manual fallback needs separate authorization.
+A later tip does not erase that evidence; changing the selected release SHA needs
+its own valid evidence. A failed main SHA cannot be deployed and does not change
+running production.
 It is not a PR merge gate, and merging alone never deploys or starts a preflight.
 
 Branch/tag settings in [repository-protection.md](repository-protection.md)
-are a proposed, separately approved next stage, not active enforcement. Older
-dated plans, reports and changelog entries describing local-main-first delivery
+have dated active read-back evidence. The 2026-10-22 approved change removed only
+the main required-status object, retaining PR, deletion/non-fast-forward and tag
+protections. Future settings changes need applicable authorization and exact
+read-back. Old feature branches can still carry workflows that trigger extra
+runs during migration; do not synchronize or push solely to remove them, or wait
+for those runs. Older dated plans, reports and changelog entries describing local-main-first delivery
 are historical evidence; this runbook supersedes their delivery instructions.
 Host Readiness is separate and read-only; it does not mutate launchd, data, or
 production.

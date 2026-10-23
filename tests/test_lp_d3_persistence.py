@@ -463,8 +463,14 @@ def test_d2_routes_never_construct_or_call_legacy_mutations(tmp_path, monkeypatc
         state = SimpleNamespace(snapshot=lambda: SimpleNamespace(current=SimpleNamespace(
             shutdown_requested=False, fatal_id=None)))
 
+        def candidate_current_reservations(self, account=None):
+            pytest.fail('routing-only D2 fixture has no candidate financial authority')
+
         def bind_mutation_admission(self, *args):
             pass
+
+        def notify_manual_lease_released(self):
+            pass  # routing-only protocol stub; no runtime notification machinery
 
         def manual_call(self, operation):
             manual_calls.append(operation)
@@ -616,6 +622,24 @@ def test_all_lp_write_ports_use_one_resolved_database_coordinator(tmp_path):
     peer = PredictionArbitrageStore(tmp_path, initialize=False)
     owner = LPWriteCoordinator(store.path)
     assert LPWriteCoordinator(peer.path.resolve()) is owner
+    # The new public role CAS must queue behind the same actual owner. A
+    # completed Future here means the port bypassed admission, even if SQLite
+    # happened to serialize some other operation on this machine.
+    account='a'*64
+    store.lp_save_current_settings(account, expected_config_version=0,
+        changes=dict(trial_budget_usd='20', income_budget_usd='100'))
+    role=dict(pool='trial',episode='source-D')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with owner.acquire():
+            pending=pool.submit(peer.lp_save_observed_pool_roles,account,expected_revision=0,roles={'D':role})
+            wait_for(owner.status,lambda state:state['waiting']==1 or pending.done())
+            if pending.done():pending.result()
+            assert owner.status()['waiting']==1
+            assert store.lp_load_observed_pool_roles(account)==dict(revision=0,roles={})
+        assert pending.result(timeout=3)==dict(revision=1,roles={'D':role})
+    assert store.lp_load_observed_pool_roles(account)==dict(revision=1,roles={'D':role})
+    assert store.lp_load_current_settings(account)['trial_budget_usd']=='20'
+    assert store.lp_load_current_settings(account)['income_budget_usd']=='100'
     # Independent static SQL inventory, including helpers that reuse a supplied
     # transaction. The generic preview table also needs explicit LP tagging.
     module = ast.parse(inspect.getsource(__import__('open_trader.prediction_arbitrage_store', fromlist=['x'])))

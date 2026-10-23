@@ -18,14 +18,51 @@ from .polymarket_trading import _lp_maker_order_is_self, _lp_trade, _model_dict
 
 ZERO = Decimal('0')
 
-ALLOCATION_FIELDS = ('allocation_mode', 'allocation_weights', 'allocation_shadow_enabled')
+POOL_FIELDS = ('trial_budget_usd', 'income_budget_usd', 'trial_target_buy_count',
+    'income_target_buy_count', 'income_weights')
+ALLOCATION_FIELDS = ('allocation_mode', 'allocation_weights', 'allocation_shadow_enabled', *POOL_FIELDS)
+
+
+def pool_settings_changes(document, changes):
+    """Normalize a narrow dual-pool write before validating or committing it."""
+    changes = dict(changes)
+    mode = changes.get('allocation_mode', document.get('allocation_mode'))
+    if (changes.get('allocation_mode') == 'observed_pools'
+            or set(changes) & set(POOL_FIELDS)
+            or mode == 'observed_pools' and 'budget_usd' in changes):
+        for key in ('trial_budget_usd', 'income_budget_usd', 'budget_usd'):
+            if key in changes:
+                changes[key] = str(_number(changes[key], 'lp_settings_' + key + '_invalid'))
+        if ('trial_budget_usd' in changes and 'budget_usd' in changes
+                and Decimal(changes['trial_budget_usd']) != Decimal(changes['budget_usd'])):
+            raise ValueError('pool_budget_alias_conflict')
+        trial = changes.get('trial_budget_usd', changes.get('budget_usd',
+            document.get('trial_budget_usd', document.get('budget_usd'))))
+        if trial is None:
+            raise ValueError('trial_budget_required')
+        for key in ('target_buy_count', 'trial_target_buy_count', 'income_target_buy_count'):
+            if key in changes and (type(changes[key]) is not int or changes[key] != 3):
+                raise ValueError('observed_pool_counts_fixed')
+        if 'income_weights' in changes and changes['income_weights'] != ['0.5', '0.3', '0.2']:
+            raise ValueError('observed_pool_weights_fixed')
+        changes.update(allocation_mode='observed_pools', budget_usd=str(trial), trial_budget_usd=str(trial),
+            income_budget_usd=changes.get('income_budget_usd', document.get('income_budget_usd', '0')),
+            target_buy_count=3, trial_target_buy_count=3, income_target_buy_count=3,
+            income_weights=['0.5', '0.3', '0.2'])
+    if (document.get('allocation_mode') == 'observed_pools'
+            and changes.get('allocation_mode') == 'minimum'):
+        # Effective mode exits change trading behavior. Carry current sizing
+        # through the existing guard and version path for D2 and Store callers.
+        changes.setdefault('budget_usd', document.get('budget_usd'))
+        changes.setdefault('target_buy_count', document.get('target_buy_count', 0))
+    return changes
 
 
 def allocation_settings(document):
     """Validate C1 settings without adding defaults to legacy documents."""
     from decimal import Inexact, localcontext
     mode = document.get('allocation_mode', 'minimum')
-    if mode not in ('minimum', 'rank_weights'):
+    if mode not in ('minimum', 'rank_weights', 'observed_pools'):
         raise ValueError('allocation_mode_invalid')
     if mode == 'rank_weights':
         raise ValueError('rank_weights_requires_c2')
@@ -51,7 +88,11 @@ def allocation_settings(document):
                     raise ValueError
         except (InvalidOperation, Inexact, ValueError):
             raise ValueError('allocation_weights_invalid') from None
-    return {key: list(document[key]) if key == 'allocation_weights' else document[key]
+    if mode == 'observed_pools':
+        normalized = pool_settings_changes(document, document)
+        if any(document.get(key) != normalized[key] for key in POOL_FIELDS):
+            raise ValueError('observed_pool_settings_invalid')
+    return {key: list(document[key]) if key in ('allocation_weights', 'income_weights') else document[key]
         for key in ALLOCATION_FIELDS if key in document}
 
 

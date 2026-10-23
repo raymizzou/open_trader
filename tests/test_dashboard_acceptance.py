@@ -1340,17 +1340,20 @@ def test_production_smoke_validates_paused_n_leg_without_state_request(tmp_path:
     assert not any(path.endswith("/api/prediction-arbitrage/state") for path in paused_calls)
 
     running = run_smoke("0", "running", "N_LEG_RUNNING")
-    assert running.returncode == 0, running.stdout + running.stderr
+    assert running.returncode != 0
+    assert "n-leg state: BLOCKED" in running.stdout
     running_calls = calls.read_text(encoding="utf-8").splitlines()
-    assert any(path.endswith("/api/prediction-arbitrage/state") for path in running_calls)
+    assert not any(path.endswith("/api/prediction-arbitrage/state") for path in running_calls)
 
     normal_missing_n_leg = run_smoke("0", "", "", missing_n_leg=True)
     assert normal_missing_n_leg.returncode != 0
     assert "n-leg state: BLOCKED" in normal_missing_n_leg.stdout
 
     normal_paused_n_leg = run_smoke("0", "paused", "N_LEG_PAUSED")
-    assert normal_paused_n_leg.returncode != 0
-    assert "n-leg state: BLOCKED" in normal_paused_n_leg.stdout
+    assert normal_paused_n_leg.returncode == 0, normal_paused_n_leg.stdout + normal_paused_n_leg.stderr
+    assert "n-leg state: PAUSED" in normal_paused_n_leg.stdout
+    assert any(path.endswith("/api/prediction-arbitrage/lp/dashboard") for path in calls.read_text().splitlines())
+    assert not any(path.endswith("/api/prediction-arbitrage/state") for path in calls.read_text().splitlines())
 
     contradictory = run_smoke("1", "running", "N_LEG_RUNNING")
     assert contradictory.returncode != 0

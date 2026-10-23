@@ -871,7 +871,7 @@ def test_fence1_state_endpoint_keeps_legacy_monitor_rows() -> None:
 
 
 def test_fence2_runtime_runs_without_wiring_the_legacy_auto_eat_observer(tmp_path, monkeypatch) -> None:
-    with _observer_wiring_runtime(monkeypatch,tmp_path,fence=2) as (child,events,observed):
+    with _observer_wiring_runtime(monkeypatch,tmp_path,fence=2,entrypoint='library') as (child,events,observed):
         assert observed['state'] == 'RUNNING'
         assert observed['legacy_retired'] is True
         assert 'auto_eat.bind' not in events
@@ -881,8 +881,34 @@ def test_fence2_runtime_runs_without_wiring_the_legacy_auto_eat_observer(tmp_pat
         assert child.actual_posts()==0
 
 
-def _observer_wiring_runtime(monkeypatch, tmp_path, *, fence, incompatible=False):
-    """Actual clean selected release, persisted fence, and call-through observations."""
+@pytest.mark.parametrize('fence', [pytest.param(1, id='fence-one'), pytest.param(2, id='fence-two')])
+def test_supported_service_keeps_reader_fences_paused(tmp_path, monkeypatch, fence):
+    from open_trader.prediction_arbitrage_store import read_minimum_reader_generation
+    from open_trader.prediction_release import load_prediction_release_manifest
+    with _observer_wiring_runtime(monkeypatch, tmp_path, fence=fence) as (child, events, observed):
+        assert observed['state'] == 'RUNNING'
+        assert observed['n_leg_paused'] is True and observed['production_owner'] is True
+        assert observed['legacy_retired'] is (fence == 2)
+        assert observed['reader_generation'] == fence
+        assert read_minimum_reader_generation(child.data_dir) == fence
+        assert load_prediction_release_manifest(child.release_root/'ops/prediction-service-release.json').reader_generation == fence
+        assert events.count('fence.read') == 1
+        assert not any(kind+'.bind' in events for kind in ('ready', 'observation', 'auto_eat', 'failure'))
+        health = child.request('/healthz')
+        assert health['runtime_state'] == 'RUNNING'
+        assert health['n_leg'] == dict(status='paused', code='N_LEG_PAUSED')
+        state = child.state()
+        assert state['desired_running'] is False and state['effective_running'] is False
+        dashboard = child.request('/api/prediction-arbitrage/lp/dashboard')
+        assert all(isinstance(dashboard[name], list) for name in ('orders', 'positions', 'recommendations'))
+        child.assert_owned()
+        assert child.actual_posts() == 0
+    assert child.actual_posts() == 0
+    child.assert_owner_available()
+
+
+def _observer_wiring_runtime(monkeypatch, tmp_path, *, fence, incompatible=False, entrypoint='service'):
+    """Select the real service or explicit library seam, with persisted fences."""
     from contextlib import contextmanager
     import os, subprocess, sys
     from tests.lp_d2_service_harness import ServiceChild
@@ -909,7 +935,10 @@ def _observer_wiring_runtime(monkeypatch, tmp_path, *, fence, incompatible=False
             if expected_running is not None:self.wait_state(lambda state:state.get('effective_running') is expected_running)
     @contextmanager
     def observed():
-        scenario='consumer-ci-fence-incompatible' if incompatible else 'consumer-ci-fence-'+str(fence)
+        assert entrypoint in {'service', 'library'}
+        assert not incompatible or entrypoint == 'service'
+        scenario=('consumer-ci-fence-incompatible' if incompatible else
+                  'consumer-ci-fence-'+('library-' if entrypoint == 'library' else '')+str(fence))
         with FenceChild(tmp_path,scenario=scenario) as child:
             child.release('metadata');child.start(expected_running=None if incompatible else False)
             if incompatible:assert child.wait_exit()==78,child.output.read_text()
@@ -924,7 +953,7 @@ def _observer_wiring_runtime(monkeypatch, tmp_path, *, fence, incompatible=False
 
 
 def test_fence2_runtime_runs_without_wiring_the_legacy_notification_observers(tmp_path, monkeypatch) -> None:
-    with _observer_wiring_runtime(monkeypatch,tmp_path,fence=2) as (child,events,observed):
+    with _observer_wiring_runtime(monkeypatch,tmp_path,fence=2,entrypoint='library') as (child,events,observed):
         assert observed['state'] == 'RUNNING'
         assert observed['legacy_retired'] is True
         assert 'ready.bind' not in events
@@ -938,7 +967,7 @@ def test_fence2_runtime_runs_without_wiring_the_legacy_notification_observers(tm
 
 
 def test_fence1_runtime_still_wires_all_three_legacy_observers(tmp_path, monkeypatch) -> None:
-    with _observer_wiring_runtime(monkeypatch,tmp_path,fence=1) as (child,events,observed):
+    with _observer_wiring_runtime(monkeypatch,tmp_path,fence=1,entrypoint='library') as (child,events,observed):
         assert observed['state'] == 'RUNNING'
         assert observed['legacy_retired'] is False
         assert events.count('ready.bind') == 1

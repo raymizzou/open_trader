@@ -54,7 +54,7 @@ def _prepare_qualified(frame, capture, policy, as_of):
         'balance': account.value['balance'] + frame.buy_reserved,
         'allowance': account.value['allowance'] + frame.buy_reserved}
         if account.complete else None)
-    rows, sources, eligibility = [], {}, {}
+    rows, income_rows, sources, eligibility = [], [], {}, {}
     for cid, source in capture.rows.items():
         if not source.complete or source.error:
             eligibility[cid] = dict(state='unknown', reason_codes=(source.error or 'qualification_unknown',))
@@ -81,6 +81,14 @@ def _prepare_qualified(frame, capture, policy, as_of):
                 evaluate_lp_entry(direction, account=selection_account, now=as_of, reservations=(),
                     candidate=True, bid_level=policy.buy_price_level))
             eligibility[key] = evaluated
+            income_evaluated = None
+            if policy.allocation_mode == 'observed_pools' and not reason and selection_account:
+                # Qualification for a possible replacement is value-only.
+                # Actual same-market release and cash are checked at sealing.
+                income_evaluated = evaluate_lp_entry(direction, account={**selection_account,
+                    'open_orders': tuple(o for o in selection_account['open_orders']
+                        if o.get('condition_id') != cid)}, now=as_of, reservations=(),
+                    candidate=True, bid_level=policy.buy_price_level)
             guide = evaluated.get('guidance')
             if evaluated.get('state') == 'eligible' and isinstance(guide, Mapping):
                 review = _next_review_at(as_of)
@@ -95,6 +103,15 @@ def _prepare_qualified(frame, capture, policy, as_of):
                     direction=direction, evaluation_at=as_of, policy_version=policy.config_version,
                     review_at=review, order_type='GTD', expiration=expiration, post_only=True,
                     send_options=direction.get('send_options', source.value['row'].get('send_options', ()))))
+            if income_evaluated and income_evaluated.get('state') == 'eligible':
+                income_guide = income_evaluated['guidance']
+                review = _next_review_at(as_of)
+                income_rows.append(dict(account_id=frame.account,venue='polymarket',condition_id=cid,
+                    token_id=token,market_id=market.get('market_id'),outcome=market.get('outcome'),
+                    price=income_guide['price'],quantity=income_guide['quantity'],direction=direction,
+                    evaluation_at=as_of,policy_version=policy.config_version,review_at=review,
+                    order_type='GTD',expiration=expiration_for_review(review,now=as_of),post_only=True,
+                    send_options=direction.get('send_options',source.value['row'].get('send_options',()))))
     values = dict(current_account=account,
         candidate_inventory=SourceResult(capture.capture_id, tuple(capture.rows),
             complete=capture.inventory_complete, checked_at=capture.captured_at, error=capture.error),
@@ -102,6 +119,9 @@ def _prepare_qualified(frame, capture, policy, as_of):
         candidate_eligibility=SourceResult('', freeze(eligibility)),
         candidates=SourceResult(capture.capture_id, freeze(rows), complete=capture.inventory_complete,
             error=capture.error))
+    if policy.allocation_mode == 'observed_pools':
+        values['income_candidates'] = SourceResult(capture.capture_id,freeze(income_rows),
+            complete=capture.inventory_complete,error=capture.error,checked_at=capture.captured_at)
     if policy.allocation_shadow_enabled:
         try:
             # Keep funding-rejected ranks; native minimum candidates remain unchanged.
@@ -125,7 +145,52 @@ def _prepare_qualified(frame, capture, policy, as_of):
     return values
 
 
-def prepare_current_inputs(frame, captured_candidates, policy, as_of):
+
+def _income_inputs(frame, directions, names, policy, as_of):
+    """Measured entrants need current risk facts, independently of trial qualification."""
+    from .polymarket_lp_risk import evaluate_lp_entry, _freshness
+    from .polymarket_lp_views import _next_review_at
+    from .polymarket_lp import expiration_for_review
+    account = _current_account(frame,as_of)
+    rows = []
+    for name in names:
+        direction = directions.get(name)
+        if not direction or not account.complete:
+            continue
+        try:
+            # Detached async market results retain the same book age as exact
+            # BUY results. Candidate qualification's longer inventory window
+            # cannot renew or relax this current market observation.
+            _freshness(direction['book'].get('received_at'),as_of,'book_freshness')
+        except (ValueError,TypeError):
+            continue
+        market = direction['market']
+        token = market['token_id']
+        outcomes = [v for v in market.get('outcomes',{}).values() if v.get('token_id') == token]
+        if len(outcomes) != 1:
+            continue
+        direction = {**direction,'reward_active':True,
+            'market':{**market,'outcome':str(outcomes[0]['label']).upper()}}
+        cid = market['condition_id']
+        evaluation = evaluate_lp_entry(direction,account={**account.value,
+            'balance':account.value['balance']+frame.buy_reserved,
+            'allowance':account.value['allowance']+frame.buy_reserved,
+            'open_orders':tuple(o for o in account.value['open_orders'] if o['condition_id'] != cid)},
+            now=as_of,reservations=(),candidate=True,bid_level=policy.buy_price_level)
+        if evaluation['state'] != 'eligible':
+            continue
+        guide = evaluation['guidance']
+        review = _next_review_at(as_of)
+        rows.append(dict(account_id=frame.account,venue='polymarket',condition_id=cid,token_id=token,
+            market_id=market.get('market_id'),outcome=direction['market']['outcome'],price=guide['price'],
+            quantity=guide['quantity'],direction=direction,evaluation_at=as_of,policy_version=policy.config_version,
+            review_at=review,order_type='GTD',expiration=expiration_for_review(review,now=as_of),
+            post_only=True,send_options=()))
+    return SourceResult('income-current-facts',freeze(rows),checked_at=as_of,
+        complete=account.complete,error=account.error)
+
+
+def prepare_current_inputs(frame, captured_candidates, policy, as_of, *, income_sources=()):
     """Return immutable calculation inputs, preserving every captured source.
 
     Candidates are an already captured SourceResult, or None for UNKNOWN.
@@ -134,9 +199,11 @@ def prepare_current_inputs(frame, captured_candidates, policy, as_of):
     in the original market SourceResults alongside the derived values.
     """
     directions, failures = {}, {}
-    for order in frame.current_buys:
+    detached = tuple(dict(condition_id=n.split(':',2)[1],token_id=n.split(':',2)[2],order_id=n)
+        for n in income_sources)
+    for order in (*frame.current_buys,*detached):
         condition, token = order['condition_id'], order['token_id']
-        source = frame.sources.get(f'market:{condition}:{token}')
+        source = frame.sources.get('market_order:'+order['order_id'],frame.sources.get(f'market:{condition}:{token}'))
         def dropped(code):
             failures[order['order_id']] = dict(order_id=order['order_id'],
                 account_id=frame.account, condition_id=condition, token_id=token,
@@ -183,6 +250,8 @@ def prepare_current_inputs(frame, captured_candidates, policy, as_of):
         )
     if type(captured_candidates) is QualifiedPoolCapture:
         values = _prepare_qualified(frame, captured_candidates, policy, as_of)
+        if income_sources:
+            values['income_candidates'] = _income_inputs(frame, directions, income_sources, policy, as_of)
         return replace(frame, sources=MappingProxyType({**frame.sources, **values,
             'directions': SourceResult('', freeze(directions)),
             'direction_failures': SourceResult('', freeze(failures))}))

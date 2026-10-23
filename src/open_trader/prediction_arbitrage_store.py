@@ -411,7 +411,8 @@ class PredictionArbitrageStore:
         self._lp_trade_change_listener: Callable[[str], None] | None = None
         self._lp_trade_change_listener_lock = threading.Lock()
         if initialize:
-            self.prune_llm_usage()
+            # Retired N-leg history is preserved on open; pruning is an
+            # explicit offline maintenance operation.
             self._truncate_wal()
 
     def _truncate_wal(self) -> None:
@@ -5367,7 +5368,7 @@ class PredictionArbitrageStore:
         market_key = str(condition_id).strip()
         if not account_key or not market_key:
             raise ValueError("LP observation identity is required")
-        encoded = _dump_payload(payload)
+        encoded = _dump_execution_payload(payload)
         updated_at = _utc_now()
         with self._transaction() as connection:
             current = connection.execute(
@@ -5376,6 +5377,18 @@ class PredictionArbitrageStore:
             ).fetchone()
             if current is not None:
                 previous = _load_payload(str(current["payload"]))
+                previous_result = previous.get('pool_result')
+                incoming_result = payload.get('pool_result')
+                if isinstance(previous_result, Mapping) and previous_result.get('state') == 'known':
+                    def measured(value):
+                        try:
+                            return datetime.fromisoformat(str(value.get('measured_at')).replace('Z', '+00:00'))
+                        except (ValueError, TypeError):
+                            return datetime.min.replace(tzinfo=timezone.utc)
+                    if (not isinstance(incoming_result, Mapping) or incoming_result.get('state') != 'known'
+                            or measured(incoming_result) <= measured(previous_result)):
+                        payload = {**payload, 'pool_result': previous_result}
+                        encoded = _dump_execution_payload(payload)
                 previous_share = previous.get("share_alert")
                 if isinstance(previous_share, Mapping):
                     # Observation publishers may have read an older selection
@@ -5385,7 +5398,7 @@ class PredictionArbitrageStore:
                     # merges the latest row in its own short transaction.
                     merged_payload = dict(payload)
                     merged_payload["share_alert"] = dict(previous_share)
-                    encoded = _dump_payload(merged_payload)
+                    encoded = _dump_execution_payload(merged_payload)
             connection.execute(
                 """
                 INSERT INTO lp_market_observations(account_id, condition_id, payload, updated_at)
@@ -5437,7 +5450,7 @@ class PredictionArbitrageStore:
                     merged[str(key)] = {**old_value, **value}
                 else:
                     merged[str(key)] = value
-            encoded = _dump_payload(merged)
+            encoded = _dump_execution_payload(merged)
             updated_at = _utc_now()
             connection.execute(
                 """
@@ -8180,6 +8193,35 @@ class PredictionArbitrageStore:
                 raise ValueError('lp_settings_timing_invalid')
         return MappingProxyType(dict(account_id=account_id, **values, **(allocation_settings(document) if validate_allocation else {})))
 
+    def lp_load_observed_pool_roles(self, account_id):
+        with self._read_connection() as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+        document = json.loads(row['payload']) if row else {}
+        if document.get('account_id') != account_id:
+            raise ValueError('pool_account_identity')
+        return document.get('observed_pool_roles', dict(revision=0, roles={}))
+
+    def lp_save_observed_pool_roles(self, account_id, *, expected_revision, roles):
+        """CAS affiliation facts; these are never a resumable BUY plan."""
+        if (not isinstance(roles, Mapping) or any(not isinstance(cid, str) or not cid
+                or not isinstance(role, Mapping) or role.get('pool') not in ('trial', 'income')
+                or not isinstance(role.get('episode'), str) or not role['episode']
+                for cid, role in roles.items())):
+            raise ValueError('pool_role_invalid')
+        with self._transaction() as connection:
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+            document = json.loads(row['payload']) if row else {}
+            if document.get('account_id') != account_id:
+                raise ValueError('pool_account_identity')
+            current = document.get('observed_pool_roles', dict(revision=0, roles={}))
+            if current['revision'] != expected_revision:
+                raise ValueError('pool_revision_changed')
+            saved = dict(revision=expected_revision+1, roles=dict(roles))
+            document['observed_pool_roles'] = saved
+            connection.execute('UPDATE lp_auto_pool SET payload=? WHERE singleton=1',
+                (json.dumps(document),))
+        return saved
+
     def lp_load_current_settings(self, account_id: str, *, validate_allocation=True):
         """Read policy only; never reconstruct financial or send authority."""
         from .polymarket_lp_accounting import default_account_pool_document
@@ -8192,7 +8234,7 @@ class PredictionArbitrageStore:
     def lp_save_current_settings(self, account_id: str, *, expected_config_version, changes, actor=None):
         """CAS a narrow settings merge, returning only after actual commit."""
         from .polymarket_lp_accounting import default_account_pool_document
-        from .polymarket_lp_accounting import ALLOCATION_FIELDS
+        from .polymarket_lp_accounting import ALLOCATION_FIELDS, pool_settings_changes
         fields = {'budget_usd', 'target_buy_count', 'buy_price_level',
                   'api_retry_interval_seconds', 'order_check_interval_seconds'}
         if (not isinstance(changes, Mapping) or not changes or set(changes) - fields - set(ALLOCATION_FIELDS)
@@ -8207,6 +8249,7 @@ class PredictionArbitrageStore:
             current = self._lp_current_settings_values(document, account_id, validate_allocation=False)
             if current['config_version'] != expected_config_version:
                 raise ValueError('config_version_changed')
+            changes = pool_settings_changes(document, changes)
             trading = bool(set(changes) & {'budget_usd', 'target_buy_count', 'buy_price_level'})
             proposed = {**document, **changes, 'config_version': current['config_version'] + 1,
                         'trading_config_version': current['trading_config_version'] + int(trading)}

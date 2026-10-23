@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import shutil
 import zipfile
+from urllib.parse import parse_qs, urlsplit
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -67,13 +68,20 @@ class FakeAPI:
             return {'status':'ahead', 'merge_base_commit':{'sha': SHA}}
         if path.endswith('/actions/workflows/ci.yml'):
             return {'id':11, 'path':preflight.WORKFLOW, 'state':'active'}
-        if path.endswith('/actions/runs/22'):
-            return copy.deepcopy(self.run)
+        if '/actions/runs/' in path:
+            run_id = int(path.rsplit('/', 1)[1])
+            return copy.deepcopy(next(run for run in self.runs if run['id'] == run_id))
         raise AssertionError(path)
 
     def items(self, path, key):
         self.calls.append(path)
-        return copy.deepcopy({'workflow_runs':self.runs, 'jobs':self.jobs,
+        if key == 'workflow_runs':
+            query = parse_qs(urlsplit(path).query)
+            return copy.deepcopy([run for run in self.runs if all(
+                run[field] == query[param][0] for param, field in
+                [('event', 'event'), ('branch', 'head_branch'), ('head_sha', 'head_sha')]
+                if param in query)])
+        return copy.deepcopy({'jobs':self.jobs,
                               'check_runs':self.checks, 'artifacts':self.artifacts}[key])
 
     def download(self, artifact_id):
@@ -89,16 +97,34 @@ def evidence(tmp_path):
     api = FakeAPI(run, jobs, checks)
     project = Path(__file__).resolve().parents[1]
     (tmp_path/'scripts').mkdir()
-    for name in ('ci_evidence.py','ci_partition.py','ci_nleg_retired.json'):
+    for name in ('ci_evidence.py','ci_partition.py','ci_nleg_retired.json','ci_optional_tests.json'):
         shutil.copy(project/'scripts'/name,tmp_path/'scripts'/name)
     (tmp_path/'tests').mkdir()
     retired=json.loads((tmp_path/'scripts/ci_nleg_retired.json').read_text())['retired']
+    optional=json.loads((tmp_path/'scripts/ci_optional_tests.json').read_text())['optional']
     for path in [item['path'] for item in retired] + [
             'tests/test_frontend_gateway.py', 'tests/test_dashboard_web.py','tests/test_account_api.py',
             'tests/test_lp_example.py', 'tests/test_prediction_runtime.py','tests/test_prediction_service.py',
             'tests/test_prediction_monitor_selection_driver.py','tests/test_prediction_n_leg_cutover.py',
-            'tests/test_run_nleg_cutover.py']:
+            'tests/test_run_nleg_cutover.py', 'tests/test_lp_d2_service_lifecycle.py'] + sorted({
+                node.split('::', 1)[0] for node in optional}):
         (tmp_path/path).write_text('def test_ok(): pass\n')
+    # This is controlled external evidence, not a backend execution. Scaffold
+    # the declared source functions too, so disposable releases retain the exact
+    # optional parameter identities without running collection in every fixture.
+    optional_functions={}
+    for node in optional:
+        path,identity=node.split('::',1)
+        name,separator,parameter=identity.partition('[')
+        optional_functions.setdefault(path,{}).setdefault(name,[]).append(parameter[:-1] if separator else None)
+    for path,functions in optional_functions.items():
+        source=['import pytest\n','def test_ok(): pass\n']
+        for name,parameters in functions.items():
+            if parameters==[None]:source.append(f'def {name}(): pass\n')
+            else:
+                source.append(f'@pytest.mark.parametrize("_case", range({len(parameters)}), ids={parameters!r})\n'
+                              f'def {name}(_case): pass\n')
+        (tmp_path/path).write_text(''.join(source))
     runtime=['test_n_leg_pause_keeps_lp_running_without_n_leg_requests',
              'test_n_leg_pause_suppresses_shadow_background_requests']
     service=['test_paused_n_leg_routes_reject_before_business_work',
@@ -119,7 +145,7 @@ def evidence(tmp_path):
     plain='tests/test_prediction_monitor_selection_driver.py::test_ok'
     parts['prediction'][parts['prediction'].index(plain)] = plain+'[literal@parameter]'
     retired_nodes=[item['path']+'::test_ok' for item in retired]
-    proof=partition.verify_partition(sum(parts.values(),[])+retired_nodes,parts,retired_nodes,tmp_path)
+    proof=partition.verify_partition(sum(parts.values(),[])+retired_nodes+optional,parts,retired_nodes,tmp_path,optional)
     lock = hashlib.sha256((tmp_path/'uv.lock').read_bytes()).hexdigest()
     for i, scope in enumerate(preflight.SCOPES):
         selection=ci.expected_selection(scope,tmp_path)
@@ -157,6 +183,7 @@ def evidence(tmp_path):
             ref='refs/heads/main', run_id='22', run_attempt='2', scope=scope, test_n_leg='0',
             workers=2 if scope=='prediction' else 1, lock_sha256=lock, status='success', exit_status=0,
             selection=selection,selection_sha256=ci.selection_sha256(selection),policy=ci.retirement_policy(tmp_path),
+            optional_policy=ci.optional_policy(tmp_path),test_tier='required',
             selected_nodeids=nodes,environment=env,evidence_role='test-only')
         archive = pack(files)
         artifact = dict(id=i+1, name=f'ci-{scope}-{SHA}-22-2', expired=False,
@@ -166,6 +193,63 @@ def evidence(tmp_path):
         api.artifacts.append(artifact)
         api.downloads[i+1] = archive
     return tmp_path, api
+
+
+def manual_evidence(api):
+    """Literal GitHub manual-main event, with matching archives for all scopes."""
+    api.run['event'] = 'workflow_dispatch'
+    for artifact in api.artifacts:
+        artifact_id = artifact['id']
+        with zipfile.ZipFile(io.BytesIO(api.downloads[artifact_id])) as archive:
+            files = {name: archive.read(name) for name in archive.namelist()}
+        metadata = json.loads(files['evidence.json'])
+        metadata['event_name'] = 'workflow_dispatch'
+        files['evidence.json'] = metadata
+        api.downloads[artifact_id] = pack(files)
+        artifact['digest'] = 'sha256:' + hashlib.sha256(api.downloads[artifact_id]).hexdigest()
+
+
+@pytest.mark.parametrize('mutation', [
+    'run-branch', 'run-sha', 'run-workflow', 'artifact-event',
+    'artifact-ref', 'artifact-workflow', 'required-app', 'expired',
+])
+def test_manual_main_identity_is_not_interchangeable(evidence, mutation):
+    root, api = evidence
+    manual_evidence(api)
+    if mutation == 'run-branch': api.run['head_branch'] = 'feature'
+    elif mutation == 'run-sha': api.run['head_sha'] = 'b' * 40
+    elif mutation == 'run-workflow': api.run['path'] = '.github/workflows/other.yml'
+    elif mutation == 'artifact-event': mutate_metadata(api, lambda m: m.update(event_name='push'))
+    elif mutation == 'artifact-ref': mutate_metadata(api, lambda m: m.update(ref='refs/heads/feature'))
+    elif mutation == 'artifact-workflow':
+        mutate_metadata(api, lambda m: m.update(workflow_ref='raymizzou/open_trader/.github/workflows/other.yml@refs/heads/main'))
+    elif mutation == 'required-app': api.checks[-1]['app']['id'] = 1
+    else: api.artifacts[0]['expired'] = True
+    with pytest.raises(preflight.PreflightError):
+        preflight.verify_ci(api, SHA, root, NOW)
+
+
+def test_newer_failed_manual_run_blocks_older_successful_push(evidence):
+    root, api = evidence
+    api.runs.append(dict(api.run, id=23, run_number=5, event='workflow_dispatch', conclusion='failure'))
+    with pytest.raises(preflight.PreflightError):
+        preflight.verify_ci(api, SHA, root, NOW)
+
+
+def test_trusted_main_manual_run_is_accepted_with_bound_artifacts(evidence):
+    root, api = evidence
+    manual_evidence(api)
+    report = preflight.verify_ci(api, SHA, root, NOW)
+    assert report['run_id'] == 22
+    assert report['run_attempt'] == 2
+    assert len(report['artifacts']) == 5
+    assert api.run['event'] == 'workflow_dispatch'
+    for artifact in api.artifacts:
+        with zipfile.ZipFile(io.BytesIO(api.downloads[artifact['id']])) as archive:
+            metadata = json.loads(archive.read('evidence.json'))
+        assert metadata['event_name'] == 'workflow_dispatch'
+        assert metadata['ref'] == 'refs/heads/main'
+        assert metadata['workflow_ref'] == 'raymizzou/open_trader/.github/workflows/ci.yml@refs/heads/main'
 
 
 def test_trusted_main_active_coverage_is_accepted(evidence):
@@ -178,7 +262,9 @@ def test_trusted_main_active_coverage_is_accepted(evidence):
         proof=json.loads(archive.read('partition.json'))
     assert proof['retired_status']=='not-executed-permanent-retirement'
     assert proof['retired_count']==29
-    assert proof['executed_count']+29==proof['complete_count']
+    assert proof['executed_count']+29+224==proof['complete_count']
+    assert proof['optional_count']==224
+    assert proof['optional_status']=='not-executed-advisory'
     assert proof['retired'] and not set(proof['retired']) & set(sum(proof['partitions'].values(),[]))
 
 

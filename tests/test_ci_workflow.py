@@ -10,25 +10,29 @@ class WorkflowTests(unittest.TestCase):
     def test_events_security_and_exact_candidate(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         self.assertIn('name: CI\n', workflow)
-        self.assertIn('pull_request:', workflow)
-        self.assertIn('push:', workflow)
-        self.assertEqual(workflow.count('branches: [main]'), 1)
-        self.assertIn("push:\n    branches: ['**']", workflow)
-        self.assertIn('group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}', workflow)
+        events = workflow.split('\non:\n', 1)[1].split('\npermissions:', 1)[0]
+        self.assertEqual(events, '  push:\n    branches: [main]\n  workflow_dispatch:\n')
+        self.assertNotIn('pull_request:', workflow)
+        self.assertNotIn('concurrency:', workflow)
+        self.assertNotIn('inputs:', workflow)
+        guard = "github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'"
+        self.assertIn('  plan:\n    if: ' + guard, workflow)
+        required = workflow.split('  required:\n', 1)[1]
+        self.assertIn('if: always() && (' + guard + ')', required)
         self.assertNotIn('paths:', workflow)
         self.assertNotIn('pull_request_target', workflow)
         self.assertNotIn('secrets.', workflow)
         self.assertNotIn('self-hosted', workflow)
         self.assertIn('contents: read', workflow)
-        self.assertIn('cancel-in-progress: true', workflow)
+        self.assertNotIn('cancel-in-progress:', workflow)
         for ref in re.findall(r'uses: (\S+)', workflow):
             self.assertRegex(ref, r'^[\w-]+/[\w-]+@[0-9a-f]{40}$')
         self.assertEqual(workflow.count('persist-credentials: false'), 8)
         self.assertEqual(workflow.count('ref: ${{ github.sha }}'), 8)
         self.assertEqual(workflow.count('runs-on: ubuntu-24.04'), 8)
         self.assertEqual(workflow.count('timeout-minutes:'), 8)
-        self.assertIn('github.event.pull_request.base.sha', workflow)
-        self.assertIn('github.event.before', workflow)
+        self.assertNotIn('github.event.pull_request.base.sha', workflow)
+        self.assertIn('BASE_SHA: ${{ github.event.before }}', workflow)
         self.assertIn('Plan active backend checks', workflow)
 
     def test_fixed_required_check_and_all_service_results(self):

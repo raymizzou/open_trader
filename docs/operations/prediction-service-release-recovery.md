@@ -28,6 +28,15 @@ The command is read-only. Its stdout is JSON with schema
 record, plist, logs, and data and investigate the stated reason. `--dry-run`
 is separate and only renders the launchd plist.
 
+The boolean `managed_identity_verified` is true only when preflight independently
+verifies an existing healthy managed owner or the failed managed startup described
+below. An empty host can return `READY` for first-install availability with this
+field false. Normal `make host-readiness` requires this field to be exactly true
+as well as `READY` or `RECOVERABLE`; it does not require the old 8769 listener.
+For a completely empty host, select `FIRST_DEPLOY=1` to run the fresh-host ownership
+and listener-absence checks. Missing, false or non-boolean proof cannot satisfy
+normal managed readiness. Preflight's schema and status meanings are unchanged.
+
 The runtime record is evidence, not authority by itself. Recovery requires the
 current clean checkout and independently observed launchd plist path,
 arguments, process cwd/PID, loopback listener, health response, and the unique
@@ -35,7 +44,19 @@ owner of `data/prediction_arbitrage/runtime.lock`. A valid but outdated saved
 record is recoverable when the current live release is independently verified
 and the old bytes are archived first. Malformed, unproven, or concurrently
 changed record/live evidence is fail-closed. A changed PID/start time alone is
-recoverable when the release identity remains verified.
+recoverable when the release identity remains verified. The runtime record keeps
+the canonical tracked manifest path, including a selected custom manifest, across
+READY and refresh publication. This path also binds early launchd self-context
+verification before the service has health evidence.
+
+A loaded label with no working health endpoint can report `RECOVERABLE` as a
+verified failed startup. This requires a private retained release/config binding,
+an exact consumed permit whose claimed PID is absent, the matching installed and
+loaded plist/arguments, a clean tracked release, no listener, and an available
+native runtime lock. A transient startup PID must have the exact service UID,
+arguments and cwd. Missing health or a missing PID alone is insufficient. Unknown
+inspection, a reused claimed PID, an unexpected process, or held resources stays
+`BLOCKED`. Preflight does not change the record, permit, plist or data.
 
 For a verified managed service, `RECOVERABLE` preflight output includes
 sanitized evidence values: `recorded_release` contains only the saved
@@ -106,7 +127,14 @@ Do not force-kill, delete the permit, edit its state, or infer native completion
 from a request or Future result.
 
 After investigating the failure, use an explicitly authorized management
-operation. The launchd installer accepts `--restart`; systemd accepts the
+operation. The launchd installer accepts `--restart`. A verified failed loaded service
+requires this explicit option; an ordinary install or record refresh does not
+restart it. The manager rechecks retained identity and config before stopping
+only that label, then proves label/process/listener/native-owner absence before
+arming once. A startup PID may exit during observation; a different PID or changed
+static identity blocks recovery. Incomplete teardown leaves failure evidence and
+never bootstraps a candidate. The existing running-service health and handoff
+guards remain in force. Systemd accepts the
 `restart` action. The foreground entry accepts `--operator-start` or
 `--operator-restart` with the actual selected data directory, private config,
 loopback endpoint and tracked release manifest. It validates under the existing

@@ -269,6 +269,171 @@ def managed_release_identity_error(facts: Mapping[str, object]) -> str | None:
     return None
 
 
+def observe_failed_launchd_service(*, record, runtime_root, config_path, python,
+        plist_path, launchctl, lsof, ps, expected_record, require_absent=False):
+    """Prove a failed managed selection without treating missing health as absence.
+
+    This is a separate recovery admission path. Running-owner validation stays
+    unchanged. The caller retains this observation and rechecks it under the
+    release operation lock before stop; the ordinary arm boundary still proves
+    complete teardown before issuing a new single-use permission.
+    """
+    import errno, fcntl, hashlib, plistlib, shlex, socket
+    from .prediction_start_guard import StartIdentity, _read
+
+    def private(path, mode=None, directory=False):
+        path=Path(path).absolute()
+        if any(item.is_symlink() for item in (path,*path.parents)):
+            raise ValueError('failed managed path contains a symlink')
+        info=path.lstat()
+        if (info.st_uid!=os.getuid() or info.st_mode & 0o022
+                or (mode is not None and stat.S_IMODE(info.st_mode)!=mode)
+                or not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
+                or (not directory and info.st_nlink!=1)):
+            raise ValueError('failed managed metadata invalid')
+        return path
+
+    root=private(runtime_root,directory=True)
+    data=private(root/'data',directory=True)
+    record_path=private(root/'prediction-service-runtime.json',0o600)
+    if load_prediction_runtime_record(record_path)!=expected_record:
+        raise ValueError('failed managed record changed during observation')
+    if not isinstance(record,dict) or record.get('manager')!='launchd' or record.get('manager_identity')!=str(plist_path):
+        raise ValueError('failed managed record identity missing')
+    candidate=record.get('candidate')
+    if not isinstance(candidate,dict):raise ValueError('failed managed candidate missing')
+    binding=validate_lp_validation(candidate.get('lp_validation'),
+        release_root=candidate.get('checkout'),runtime_root=root,python=python,config_path=config_path)
+    plist=private(plist_path)
+    lp_launchd_operation_lock(str(plist),uid=os.getuid())
+    raw=plist.read_bytes(); payload=plistlib.loads(raw)
+    args=payload.get('ProgramArguments')
+    if type(args) is not list or any(type(a) is not str for a in args) or args[:4]!=[python,'-m','open_trader','prediction-service']:
+        raise ValueError('failed managed arguments invalid')
+    flags={}
+    for index in range(4,len(args),2):
+        if index+1>=len(args) or args[index] in flags:raise ValueError('failed managed arguments ambiguous')
+        flags[args[index]]=args[index+1]
+    manifest=flags.get('--release-manifest')
+    source=inspect_prediction_release_checkout(Path(binding['release_root']),Path(manifest) if manifest else None)
+    if (not manifest or manifest!=source['manifest']
+            or {k:v for k,v in candidate.items() if k not in ('lp_validation','manifest')}!={k:v for k,v in source.items() if k!='manifest'}
+            or candidate.get('manifest',manifest)!=manifest):
+        raise ValueError('failed managed source identity changed')
+    expected={'--mode':'production','--data-dir':str(data),'--config':str(Path(config_path).resolve()),
+        '--host':'127.0.0.1','--port':'8769','--release-manifest':manifest}
+    if (any(flags.get(k)!=v for k,v in expected.items()) or set(flags)-set(expected)-{'--notifier-config'}
+            or payload.get('Label')!='com.open-trader.prediction-service'
+            or payload.get('WorkingDirectory')!=source['checkout']
+            or payload.get('RunAtLoad') is not True
+            or payload.get('KeepAlive')!={'SuccessfulExit':False}
+            or type(payload.get('ExitTimeOut')) is not int or payload['ExitTimeOut']!=0
+            or payload.get('EnvironmentVariables',{}).get('PYTHONPATH')!=str(Path(source['checkout'])/'src')):
+        raise ValueError('failed managed plist identity changed')
+    identity=StartIdentity(str(root),str(data),source['checkout'],source['git_sha'],
+        binding['capability_digest'],'launchd',str(plist),os.getuid(),os.getgid(),python,
+        expected['--config'],binding['config_selection']['sha256'],'127.0.0.1',8769)
+    permit=_read(identity)
+    permit_bytes=(root/'lp-start-guard/permit.json').read_bytes()
+    if permit['state']!='CLAIMED' or permit['operation_nonce']!=binding['operation_nonce']:
+        raise ValueError('failed managed claim missing or changed')
+    # A consumed pre-reboot PID may not be reused by an unrelated process.
+    try:os.kill(permit['pid'],0)
+    except ProcessLookupError:pass
+    else:raise ValueError('failed managed claimed PID remains alive')
+
+    def run(command):
+        return subprocess.run(command,capture_output=True,text=True,timeout=5)
+    loaded=run([launchctl,'print',f"gui/{os.getuid()}/{payload['Label']}"])
+    pid=0
+    if require_absent:
+        if loaded.returncode==0 or 'Could not find service' not in loaded.stdout+loaded.stderr:
+            raise ValueError('failed managed label absence unproved')
+        # A job can start after the last loaded-label sample, leaving its PID
+        # unknown to the installer. Only inspect the process table after bootout
+        # has removed the job, so launchd cannot create another such startup.
+        processes=run([ps,'-axww','-o','pid=,uid=,command='])
+        if processes.returncode or processes.stderr or not processes.stdout.strip():
+            raise ValueError('failed managed process absence inspection unavailable')
+        for line in processes.stdout.splitlines():
+            values=line.split(None,2)
+            if (len(values)!=3 or not values[0].isdecimal()
+                    or not values[1].isdecimal()):
+                raise ValueError('failed managed process inventory malformed')
+            if values[2] in (' '.join(args),shlex.join(args)):
+                raise ValueError('failed managed startup process survives bootout')
+            # Do not parse arbitrary unrelated command strings as shell input.
+            # The installed startup has this literal module/subcommand prefix.
+            prefix=values[2].split(None,4)
+            if prefix[1:4]!=['-m','open_trader','prediction-service']:
+                continue
+            command=shlex.split(values[2])
+            selections=[command[index+1] for index,flag in enumerate(command[:-1])
+                if flag=='--data-dir']
+            if len(selections)!=1 or command[-1]=='--data-dir':
+                raise ValueError('failed managed startup runtime identity uncertain')
+            if Path(selections[0]).resolve()==data:
+                raise ValueError('failed managed startup process survives bootout')
+    else:
+        if loaded.returncode:raise ValueError('failed managed label inspection unavailable')
+        facts={};loaded_args=None;inside=False
+        for line in loaded.stdout.splitlines():
+            line=line.strip()
+            if line=='arguments = {':
+                if loaded_args is not None:raise ValueError('failed managed loaded arguments ambiguous')
+                loaded_args=[];inside=True
+            elif inside:
+                if line=='}':inside=False
+                elif line:loaded_args.append(line.strip('"'))
+            elif ' = ' in line:
+                key,value=line.split(' = ',1)
+                if key in ('path','working directory','pid'):
+                    if key in facts:raise ValueError('failed managed loaded identity ambiguous')
+                    facts[key]=value.strip('"')
+        if (inside or facts.get('path')!=str(plist) or facts.get('working directory')!=source['checkout'] or loaded_args!=args):
+            raise ValueError('failed managed loaded identity changed')
+        pid=facts.get('pid','0')
+        if not pid.isdecimal():raise ValueError('failed managed PID invalid')
+        pid=int(pid)
+        if pid:
+            process=run([ps,'-p',str(pid),'-o','pid=,uid=,command='])
+            values=process.stdout.strip().split(None,2)
+            if (process.returncode or len(values)!=3 or values[:2]!=[str(pid),str(os.getuid())]
+                    or shlex.split(values[2])!=args):
+                raise ValueError('failed managed startup PID is not verified')
+            cwd=run([lsof,'-a','-p',str(pid),'-d','cwd','-Fn'])
+            if cwd.returncode or [line[1:] for line in cwd.stdout.splitlines() if line.startswith('n')]!=[source['checkout']]:
+                raise ValueError('failed managed startup cwd is not verified')
+    listener=run([lsof,'-nP','-iTCP:8769','-sTCP:LISTEN','-Fn'])
+    if listener.returncode!=1 or listener.stdout or listener.stderr:
+        raise ValueError('failed managed listener absence unproved')
+    with socket.socket() as probe:
+        probe.settimeout(1)
+        if probe.connect_ex(('127.0.0.1',8769))!=errno.ECONNREFUSED:
+            raise ValueError('failed managed native listener absence unproved')
+    lock=private(data/'prediction_arbitrage/runtime.lock')
+    # Observe other openers before opening our own descriptor. Otherwise lsof
+    # truthfully reports this observer and every real recovery rejects itself.
+    holders=run([lsof,'-nP','-Fpkfn',str(lock)])
+    if holders.returncode!=1 or holders.stdout or holders.stderr:
+        raise ValueError('failed managed owner inspection uncertain')
+    with lock.open('rb') as owner:
+        # The kernel flock independently closes the opener-inspection race.
+        fcntl.flock(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        opened=os.fstat(owner.fileno());named=lock.lstat()
+        if (opened.st_dev,opened.st_ino)!=(named.st_dev,named.st_ino):raise ValueError('failed managed owner changed')
+    validate_lp_validation(binding,release_root=source['checkout'],runtime_root=root,
+        python=python,config_path=config_path)
+    if (_read(identity)!=permit or (root/'lp-start-guard/permit.json').read_bytes()!=permit_bytes
+            or load_prediction_runtime_record(record_path)!=expected_record):
+        raise ValueError('failed managed selection changed during observation')
+    if plist.read_bytes()!=raw:raise ValueError('failed managed plist changed during observation')
+    # Static evidence must remain exact across the stop boundary. A verified
+    # startup PID may exit, but cannot turn into a different unobserved process.
+    return dict(release=source,pid=pid,permit=permit,permit_sha256=hashlib.sha256(permit_bytes).hexdigest(),
+        plist_sha256=hashlib.sha256(raw).hexdigest())
+
+
 def ready_evidence_from_health(
     health: Mapping[str, object], *, pid: int, cwd: str, listener: str,
     stdout: str, stderr: str,

@@ -285,12 +285,28 @@ automatically, and selecting another mode requires the matching stopped-owner,
 credential, readiness and authorization gates. The helper also accepts simple
 alphanumeric/dash/underscore SSM references and absolute paths without spaces or
 systemd specifiers. Use those names when creating the dedicated credential.
-Production and non-paused Shadow continue to require those four SSM references.
+Production and Shadow profiles requesting legacy `n_leg_paused: 0` continue
+to require those four SSM references.
 Credentialless paused Shadow requires them to be omitted, pins
 `OPEN_TRADER_CREDENTIAL_BACKEND=disabled`, and never touches Keychain, SSM or
 instance metadata.
-Retain the prior N-leg pause policy explicitly; this example does not authorize
-enabling any trading strategy.
+Supported production and Shadow entrypoints always pause non-LP business.
+The config field `n_leg_paused` retains the requested historical 0/1 value for
+profile eligibility and identity. Generated units always use
+`OPEN_TRADER_NLEG_PAUSED=1`. Preflight/status/Smoke report effective
+`n_leg_paused: 1` and the original `configured_n_leg_paused` separately. Two-host
+validation binds both values; two paused services with different requested
+configuration cannot substitute for each other. SSM units also pin the non-secret
+`OPEN_TRADER_CONFIGURED_NLEG_PAUSED=0|1` marker. Exact record, installed-unit,
+loaded-environment and process-environment checks bind that requested value; the
+marker does not activate business. Older SSM units or records without the marker
+are ambiguous and cannot be attested by status/Smoke. They require the existing,
+separately authorized install/start workflow before attestation. File/disabled
+unit text is unchanged because those profiles permit only requested value 1.
+Invalid credential profiles
+remain invalid: file/disabled profiles still require requested value 1, pinned
+SSM references remain required for zero, and wallet/region checks retain their
+raw-profile requirements. This does not authorize any trading strategy.
 
 For #202, supply only the same-wallet non-secret
 `config/prediction_arbitrage.json` in the independent runtime; do not copy
@@ -324,9 +340,10 @@ without credentials skips the wallet read. A credentialed profile runs
 `wallet read-auth` as the service user, separating GET-only credential
 derivation from complete authenticated account reads. The installed SDK's
 ordinary `create()` can create credentials or deploy a wallet, so it is not
-used by this read-only probe. Production and non-paused SSM Shadow preflight
-also passes `--require-trading-region`, retaining the existing geoblock gate;
-paused Shadow API probes omit the trading-region requirement.
+used by this read-only probe. Production and SSM Shadow profiles requesting
+legacy zero still pass `--require-trading-region`, retaining the existing geoblock
+gate even though the service is effectively paused. Shadow profiles requesting
+one omit the trading-region requirement.
 
 Using the accepted release's Python and non-secret runtime config as the
 `prediction` user, run `prediction-arb wallet read-auth --config <runtime-config>`
@@ -384,8 +401,10 @@ The client requires explicit `mode: "production"` or `"mode": "shadow"` and
 verifies the same mode in health. Production must report
 `production_owner=true` and `mutations=enabled`; Shadow must report the reverse
 and a null `first_violation`. A standalone Shadow UI is labeled read-only. Credentialless paused Shadow
-keeps its existing no-reader/LP-503 contract; explicit file credentials enable
-background LP display reads even with N-leg paused. All Shadow views
+keeps its existing no-reader/LP-503 contract; supported authenticated backends
+(file/SSM in cloud, default or explicit Keychain on the local service) enable
+read-only background LP display. Invalid credentials fail closed without an
+unauthenticated fallback. All Shadow views
 disable order, augment, cancel and automatic controls while retaining
 read-model rows and details. If an already identified service or a
 Prediction-only view cannot refresh its venues identity, the UI fails closed as
@@ -524,7 +543,9 @@ the remaining cgroup budget plus 350 MiB before starting the runtime.
 A kernel memory limit above the configured maximum blocks startup, including
 the numeric cgroup v1 unlimited sentinel; cgroup v2 `memory.max=max` is invalid.
 Missing/contradictory resource evidence blocks startup. These settings apply to
-paused Shadow only; existing production ownership and restart policy remain.
+every supported Shadow service, including a valid
+SSM profile requesting legacy zero. Production never enters the Shadow stop
+policy; existing production ownership and restart policy remain.
 
 For example, a 2 GiB budget is `memory_max_bytes: 2147483648`. Use it only through
 an authorized exact-SHA deployment with fresh checks of actual host headroom
@@ -706,7 +727,8 @@ locations/timestamps. Production requires `old_owner_stopped`,
 requires `resources_reviewed` and an exact `independent_runtime_root`;
 SSM-backed Shadow additionally requires `metadata_isolation_verified`.
 The gate separately rejects a remote component
-whose mode, pause policy or credential backend differs. These are manual
+whose mode, effective pause, configured pause or credential backend differs.
+These are manual
 handoff/security/resource evidence, not claims manufactured by the gate. Review
 shared-host memory headroom under real load; 2 GiB total memory alone does not
 prove capacity. Never mark these true without the underlying observations.
@@ -737,9 +759,10 @@ BLOCKED or ROLLBACK. Client, service and remote evidence modes must match; a
 Shadow guard violation or unavailable backend cannot pass.
 In split mode the browser checks cloud `/venues` and a fresh read-only LP
 snapshot, while `/execution/identity` supplies Air's production identity and
-N-leg pause/running state. Both remote smoke observations validate the display
+permanent N-leg pause state. Both remote smoke observations validate the display
 evidence; only `display_snapshot` may change between them. Release, process,
-start time, roots, mode, pause and credential profile must remain identical.
+start time, roots, mode, effective/configured pause and credential profile must
+remain identical.
 For credentialless paused Shadow, smoke also verifies the actual unit/process
 environment remains disabled and read-only; do not manufacture an owner-stop
 attestation or stop an unrelated local production process.

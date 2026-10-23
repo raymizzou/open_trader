@@ -24,10 +24,13 @@ def checked(command, *, cwd=None, env=None):
 def remote_identity(result, cloud, action):
     """Validate each remote observation; only display snapshots may move."""
     expected = dict(release_root=str(cloud.release_root), runtime_root=str(cloud.runtime_root),
-        mode=cloud.mode, git_sha=cloud.expected_sha, n_leg_paused=cloud.n_leg_paused,
+        mode=cloud.mode, git_sha=cloud.expected_sha, n_leg_paused=cloud.effective_n_leg_paused,
+        configured_n_leg_paused=cloud.n_leg_paused,
         credential_backend=credential_backend(cloud), candidate_exclusions=cloud.candidate_exclusions,
         status='PRECHECK_OK' if action == 'preflight' else 'BACKEND_SMOKE_OK')
     if (type(result.get('candidate_exclusions')) is not bool
+        or type(result.get('n_leg_paused')) is not int
+        or type(result.get('configured_n_leg_paused')) is not int
         or any(key not in result or result[key] != value for key, value in expected.items())):
         raise ValueError('remote gate evidence mismatch')
     if action == 'smoke':
@@ -35,7 +38,7 @@ def remote_identity(result, cloud, action):
             or any(not isinstance(result.get(key), str) or not result[key]
                    for key in ('started_at', 'systemd_started_at'))):
             raise ValueError('remote process identity missing')
-        if cloud.mode == 'shadow' and cloud.n_leg_paused and credential_backend(cloud) != 'disabled':
+        if cloud.mode == 'shadow' and cloud.effective_n_leg_paused and credential_backend(cloud) != 'disabled':
             from datetime import UTC, datetime
             from decimal import Decimal
             from open_trader.polymarket_lp_risk import _freshness

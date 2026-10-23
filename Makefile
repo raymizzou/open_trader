@@ -19,10 +19,12 @@ CI_TEST_ARTIFACTS ?= 0
 CI_TEST_CONTAINER ?= open-trader-test-records
 ifeq ($(CI_TEST_ARTIFACTS),1)
 DOCKER_RUN = $(DOCKER) run --name "$(CI_TEST_CONTAINER)" --init --network none --cap-drop ALL --security-opt no-new-privileges "$(DOCKER_IMAGE)"
+CI_TEST_TIER ?= required
+CI_PYTEST_SELECTION = $(if $(filter optional,$(CI_TEST_TIER)),,-p scripts.ci_partition --ci-required)
 CI_PYTEST_RECORDS = -p scripts.ci_test_metrics --junitxml=/tmp/open-trader-ci-evidence/junit.xml
 CI_PYTEST_ENV = CI_TEST_METRICS=/tmp/open-trader-ci-evidence/metrics.json CI_TEST_SOURCE_SHA=$(SOURCE_SHA) CI_TEST_WORKERS=$(TEST_WORKERS)
 endif
-BACKEND_PYTEST = env $(CI_PYTEST_ENV) PYTHONSAFEPATH=1 PYTHONPATH=/workspace:/workspace/src PYTHONDONTWRITEBYTECODE= PYTHONPYCACHEPREFIX=/tmp/open-trader-bytecache pytest -q $(CI_PYTEST_RECORDS) -m "not pressure and not browser" -o cache_dir=/tmp/open-trader-pytest-cache --basetemp=/tmp/open-trader-pytest
+BACKEND_PYTEST = env $(CI_PYTEST_ENV) PYTHONSAFEPATH=1 PYTHONPATH=/workspace:/workspace/src PYTHONDONTWRITEBYTECODE= PYTHONPYCACHEPREFIX=/tmp/open-trader-bytecache pytest -q $(CI_PYTEST_RECORDS) $(CI_PYTEST_SELECTION) -m "not pressure and not browser" -o cache_dir=/tmp/open-trader-pytest-cache --basetemp=/tmp/open-trader-pytest
 TEST_WORKERS ?= $(if $(filter prediction,$(SERVICE)),6,1)
 TEST_N_LEG ?= 0
 # The reviewed manifest is the sole retirement selection source.
@@ -57,6 +59,16 @@ test:
 .PHONY: ci-test-files test-ci-portable
 ci-test-files:
 	@$(CI_SELECTION)
+
+# Advisory runs only the reviewed exact unchanged nodes, in one serial session.
+.PHONY: test-ci-release-advisory
+test-ci-release-advisory: CI_TEST_TIER = optional
+test-ci-release-advisory:
+	$(if $(filter 1,$(TEST_WORKERS)),,$(error Release advisory requires one serial worker))
+	$(eval OPTIONAL_TEST := $(shell python3 scripts/ci_evidence.py optional || echo __INVALID_OPTIONAL__))
+	$(if $(filter __INVALID_OPTIONAL__,$(OPTIONAL_TEST)),$(error Invalid optional selection))
+	$(DOCKER_BUILD)
+	$(DOCKER_RUN) $(BACKEND_PYTEST) $(OPTIONAL_TEST)
 
 # Preserve one serial session for the portable scenarios; LIVE alone is excluded.
 test-ci-portable:
@@ -136,6 +148,11 @@ host-readiness:
 			| "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); ok=(p.get("replay") or {}).get("status")=="PASS" and (p.get("live") or {}).get("reason")=="LIVE_CATALOG_UNAVAILABLE"; raise SystemExit(0 if ok else 1)'; \
 	}; \
 	if [ $$account_selected -eq 1 ] && [ "$$first_deploy" = 0 ]; then check "account status" "$(PYTHON_BIN)" -m open_trader account-sync-status --account-url "$(ACCOUNT_API_URL)" --json; fi; \
+	prediction_manager_ready() { \
+		manager_payload="$$("$(WORKTREE_ROOT)/scripts/install_prediction_service_launchd.sh" --mode production --preflight --repo-root "$(WORKTREE_ROOT)" --runtime-root "$(REPOSITORY_ROOT)" --python "$(PYTHON_BIN)" --config "$(PREDICTION_CONFIG)")" || return 1; \
+		printf '%s' "$$manager_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); raise SystemExit(0 if isinstance(p,dict) and p.get("schema_version")=="open_trader.prediction_service.preflight.v1" and p.get("status") in ("READY","RECOVERABLE") and p.get("managed_identity_verified") is True else 1)'; \
+	}; \
+	if [ $$prediction_selected -eq 1 ] && [ "$$first_deploy" = 0 ]; then check "prediction managed recovery" prediction_manager_ready; fi; \
 	if [ $$prediction_selected -eq 1 ]; then \
 		check "prediction wallet" "$(PYTHON_BIN)" -m open_trader prediction-arb wallet status --config "$(PREDICTION_CONFIG)"; \
 		if nleg_replay_passes >/dev/null 2>&1; then echo "prediction n-leg replay validation: PASS"; else echo "prediction n-leg replay validation: BLOCKED"; status=1; fi; \
@@ -146,10 +163,10 @@ host-readiness:
 	if [ $$gateway_selected -eq 1 ]; then listener_ports="$$listener_ports 8766"; fi; \
 	if [ $$legacy_selected -eq 1 ]; then listener_ports="$$listener_ports 8767"; fi; \
 	if [ $$account_selected -eq 1 ]; then listener_ports="$$listener_ports 8768"; fi; \
-	if [ $$prediction_selected -eq 1 ]; then listener_ports="$$listener_ports 8769"; fi; \
+	if [ $$prediction_selected -eq 1 ] && [ "$$first_deploy" = 1 ]; then listener_ports="$$listener_ports 8769"; fi; \
 	if [ "$$first_deploy" = 1 ]; then \
 		check "loopback listeners absent" sh -c 'command -v lsof >/dev/null || exit 1; for port do if lsof -nP -iTCP:"$$port" -sTCP:LISTEN >/dev/null 2>&1; then exit 1; fi; done' sh $$listener_ports; \
-	else \
+	elif [ -n "$$listener_ports" ]; then \
 		check "loopback listeners" sh -c 'command -v lsof >/dev/null && for port do lsof -nP -iTCP:"$$port" -sTCP:LISTEN >/dev/null || exit 1; done' sh $$listener_ports; \
 	fi; \
 	check "storage" df -P "$(REPOSITORY_ROOT)"; \
@@ -172,6 +189,7 @@ production-smoke:
 	prediction_n_leg_status=""; prediction_n_leg_code=""; \
 	expected_sha='$(EXPECTED_SHA)'; expected_root='$(EXPECTED_ROOT)'; expected_runtime_root='$(EXPECTED_RUNTIME_ROOT)'; expected_n_leg_paused='$(N_LEG_PAUSED)'; \
 	if [ "$$expected_n_leg_paused" != 0 ] && [ "$$expected_n_leg_paused" != 1 ]; then echo "N_LEG_PAUSED must be 0 or 1"; echo ROLLBACK; exit 2; fi; \
+	expected_n_leg_paused=1; \
 	if ! printf '%s' "$$expected_sha" | grep -Eq '^[0-9a-fA-F]{40}$$'; then echo "EXPECTED_SHA must be a 40-hex Git SHA"; echo ROLLBACK; exit 2; fi; \
 	case "$$expected_root" in /*) ;; *) echo "EXPECTED_ROOT must be an absolute immutable checkout"; echo ROLLBACK; exit 2;; esac; \
 	if [ ! -d "$$expected_root" ]; then echo "EXPECTED_ROOT does not exist"; echo ROLLBACK; exit 2; fi; \

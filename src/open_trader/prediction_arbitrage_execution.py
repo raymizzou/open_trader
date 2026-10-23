@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
@@ -781,12 +782,17 @@ class _D2MutationLease:
             return
         self.released = True
         execution = self.execution
+        manual_released = False
         with execution._lp_d2_lease_lock:
             execution._lp_d2_lease_users -= 1
             if execution._lp_d2_lease_users == 0:
                 lock, execution._lp_d2_lease = execution._lp_d2_lease, None
+                manual_released = (self.action == 'MANUAL_BUY'
+                    and execution._lp_d2_manual_lease and lock is not None)
                 execution._lp_d2_manual_lease = False
                 execution._release_global_lock(lock)
+        if manual_released:
+            execution._lp_d2.notify_manual_lease_released()
 
 
 class PredictionExecutionService:
@@ -888,6 +894,7 @@ class PredictionExecutionService:
             self._lp._facts_attention_flusher = self._auto_pool.flush_attention
         elif self._lp is not None:
             self._lp.set_candidate_buy_price_level_reader(lambda:self._lp_d2.policy.buy_price_level)
+            self._lp.set_candidate_current_reservations_reader(lp_d2.candidate_current_reservations)
         self._threads: dict[str, threading.Thread] = {}
         self._clock = time.monotonic
         self._sleep = time.sleep
@@ -1026,7 +1033,7 @@ class PredictionExecutionService:
                 api_retry_interval_seconds=policy.api_retry_interval_seconds,
                 order_check_interval_seconds=policy.order_check_interval_seconds,
                 round_interval_seconds=policy.round_interval_seconds)
-            result.update({key: list(policy.allocation_weights) if key == 'allocation_weights'
+            result.update({key: list(getattr(policy, key)) if key in ('allocation_weights', 'income_weights')
                 else getattr(policy, key) for key in policy.allocation_fields})
             return result
         def json_value(value):
@@ -1047,6 +1054,9 @@ class PredictionExecutionService:
                 logger.exception('prediction_lp_diagnostics_failed component=%s', name)
                 return dict(available=False, error='diagnostics_unavailable',
                     **{'selection_state' if name == 'rotation' else 'state': 'UNKNOWN'})
+        observed_pools = (diagnostic_view('observed_pools', lambda: dict(
+            roles=self._store.lp_load_observed_pool_roles(self._lp_account_id())['roles'],
+            **self.lp_observed_pool_state())) if live.policy.allocation_mode == 'observed_pools' else None)
         with live.state._lock:
             status = live.control.status()
             snapshot = live.state.snapshot()
@@ -1067,7 +1077,8 @@ class PredictionExecutionService:
                 pending_settings=policy_view(settings['requested']) if settings['pending'] else None,
                 settings_pending=settings['pending'], settings_native_inflight=settings['native_inflight'],
                 settings_error=settings['error'], effective_round_interval_seconds=None,
-                check_interval_seconds=None, cycle_mode='continuous')
+                check_interval_seconds=None, cycle_mode='continuous',plan_wait=live.status()['plan_wait'])
+            if observed_pools is not None: result['observed_pools'] = observed_pools
             result['diagnostics'] = diagnostic_view('iteration', live.diagnostics)
             result['diagnostics']['rotation'] = diagnostic_view('rotation', live.rotation_diagnostics)
             for name, fact in (('buy_reserved_usd', snapshot.buy_reserved),
@@ -1083,6 +1094,7 @@ class PredictionExecutionService:
     def set_lp_auto_wakeup(self, wakeup):
         if self._lp_d2 is not None:
             self._lp.set_candidate_preparation_wakeup(wakeup)
+            self._lp_d2.set_read_wakeup(wakeup)
         elif self._lp is not None:
             self._lp._facts_wakeup = wakeup
 
@@ -2767,6 +2779,13 @@ class PredictionExecutionService:
             reader = getattr(self._trading, "lp_account_snapshot_shared", None)
             if not callable(reader):
                 reader = getattr(self._trading, "lp_account_snapshot", None)
+            # Capture the full-read attempt before invoking the shared source.
+            # Its returned source times also fence cached facts at publication.
+            diagnostics = (getattr(self._lp, '_lp_diagnostics', None)
+                if self._lp_d2 is None and not getattr(self, '_display_only', False) else None)
+            diagnostic_attempt = (diagnostics.begin('account_full', read_started_at=self._lp._now())
+                if diagnostics is not None else None)
+            diagnostic_stage = 'account_read'
             try:
                 if not callable(reader):
                     raise RuntimeError("lp_account_reader_unavailable")
@@ -2798,7 +2817,11 @@ class PredictionExecutionService:
                     self._lp, "register_account_snapshot", None
                 )
                 if self._lp_d2 is None and callable(registration_reader) and not getattr(self, "_display_only", False):
-                    registration = _call(registration_reader, snapshot)
+                    diagnostic_stage = 'account_publish'
+                    association = (diagnostics.associate(diagnostic_attempt, scope='account_full')
+                        if diagnostics is not None else nullcontext())
+                    with association:
+                        registration = _call(registration_reader, snapshot)
                     if isinstance(registration, Mapping) and (
                         registration.get("reason") == "account_round_invalid"
                         or any(
@@ -3471,7 +3494,10 @@ class PredictionExecutionService:
                     reward_date, trade_condition_ids
                 )
                 return result
-            except LpAccountRoundInvalid:
+            except LpAccountRoundInvalid as exc:
+                if diagnostics is not None and diagnostic_stage == 'account_read':
+                    diagnostics.record(diagnostic_attempt, event='waiting', stage='account_read',
+                        cause='account_round_invalid', exc=exc, event_at=self._lp._now())
                 previous = self._lp_dashboard_cache or self._lp_dashboard_pending_payload()
                 self._lp_dashboard_cache = {
                     **previous,
@@ -3481,6 +3507,10 @@ class PredictionExecutionService:
                 }
                 return deepcopy(self._lp_dashboard_cache)
             except Exception as exc:
+                if diagnostics is not None and diagnostic_stage == 'account_read':
+                    diagnostics.record(diagnostic_attempt, event='failed', stage='account_read',
+                        cause='account_read_failed', summary='account_order_sync_unknown',
+                        exc=exc, event_at=self._lp._now())
                 if self._lp_account_trades_cache is not None:
                     self._lp_account_trades_cache = {**self._lp_account_trades_cache,
                         "state": "unknown", "stale": True, "reason": "account_read_failed"}
@@ -3668,6 +3698,11 @@ class PredictionExecutionService:
 
         finally:
             self._lp_dashboard_lock.release()
+
+    def lp_observed_pool_state(self, *, as_of=None):
+        from .polymarket_lp_observed_pools import result_projection
+        account = self._lp_account_id()
+        return dict(results=result_projection(self._store.lp_observations(account), account, as_of or _utc_now()))
 
     def refresh_lp_observations(
         self, *, stop_event: threading.Event | None = None
@@ -4160,6 +4195,10 @@ class PredictionExecutionService:
                 "last_success_at": now if rate_pct is not None else previous_market.get("last_success_at"),
                 "last_attempt_at": now,
             }
+            from .polymarket_lp_observed_pools import measured_result
+            observation['pool_result'] = measured_result(account_id, condition_id, market_orders,
+                hourly_reward, reward_known=reward_known, measured_at=now,
+                reward_checked_at=rates_checked_at, account_checked_at=account_checked_at)
             result[condition_id] = save_observation(account_id, condition_id, observation)
 
         return {"state": "ready", "checked_at": _timestamp(now), "observations": result}

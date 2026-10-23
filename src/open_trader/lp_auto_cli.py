@@ -149,7 +149,8 @@ def _emit(result: str, state: dict[str, object] | None, reason: str | None, json
         if value is None and key in state and key in ('reason', 'last_check_error'):
             value = 'NONE'
         print(f'{key}: {value if value is not None else "UNKNOWN"}')
-    for key in ('allocation_mode', 'allocation_weights', 'allocation_shadow_enabled'):
+    for key in ('allocation_mode', 'allocation_weights', 'allocation_shadow_enabled',
+            'trial_budget_usd','income_budget_usd','trial_target_buy_count','income_target_buy_count','income_weights'):
         if key in state:
             print(f'{key}: {state[key]}')
     checking = state.get('check_in_progress')
@@ -252,6 +253,7 @@ def _config_confirmed(state: dict[str, object], payload: dict[str, object], prev
 
 
 def run(action: str, url: str, timeout: float | str, *, json_output: bool = False,
+        trial_budget: str | None = None, income_budget: str | None = None,
         budget: str | None = None, target_buys: str | None = None, bid_level: str | None = None,
         round_interval_seconds: str | None = None, api_retry_interval_seconds: str | None = None,
         order_check_interval_seconds: str | None = None,
@@ -268,8 +270,23 @@ def run(action: str, url: str, timeout: float | str, *, json_output: bool = Fals
         if action == 'config':
             if round_interval_seconds is not None:
                 raise ValueError('round_interval_seconds_retired_in_continuous_mode')
-            payload = _config_payload(budget, target_buys, bid_level) if any(
-                value is not None for value in (budget, target_buys, bid_level)) else {}
+            dual = trial_budget is not None or income_budget is not None or allocation_mode == 'observed_pools'
+            if dual:
+                payload = {}
+                for key,value in dict(budget_usd=budget,trial_budget_usd=trial_budget,income_budget_usd=income_budget).items():
+                    if value is not None:
+                        try:
+                            amount = Decimal(value)
+                        except InvalidOperation as exc:
+                            raise ValueError('pool budget must be finite and nonnegative') from exc
+                        if not amount.is_finite() or amount < 0:
+                            raise ValueError('pool budget must be finite and nonnegative')
+                        payload[key] = str(amount)
+                if target_buys is not None: payload['target_buy_count'] = int(target_buys)
+                if bid_level is not None: payload['buy_price_level'] = int(bid_level)
+            else:
+                payload = _config_payload(budget, target_buys, bid_level) if any(
+                    value is not None for value in (budget, target_buys, bid_level)) else {}
             for key, value in dict(round_interval_seconds=round_interval_seconds,
                     api_retry_interval_seconds=api_retry_interval_seconds,
                     order_check_interval_seconds=order_check_interval_seconds).items():
@@ -293,7 +310,7 @@ def run(action: str, url: str, timeout: float | str, *, json_output: bool = Fals
                 payload['allocation_shadow_enabled'] = allocation_shadow_enabled == 'true'
             # Validate intrinsic values before transport; validate N after reading saved settings.
             intrinsic = {key: payload[key] for key in ALLOCATION_FIELDS if key in payload}
-            if intrinsic:
+            if intrinsic and not dual:
                 allocation_settings({**intrinsic, 'target_buy_count': payload.get('target_buy_count', len(intrinsic.get('allocation_weights', []))),
                     'allocation_shadow_enabled': False if allocation_weights is None else intrinsic.get('allocation_shadow_enabled', False)})
             if not payload:
@@ -305,10 +322,18 @@ def run(action: str, url: str, timeout: float | str, *, json_output: bool = Fals
             version = previous.get('config_version')
             if type(version) is not int or version < 0:
                 raise ValueError('LP configuration version is unknown; no write was sent')
+            if dual:
+                from .polymarket_lp_accounting import pool_settings_changes
+                payload = pool_settings_changes(previous,payload)
             if any(key in payload for key in ALLOCATION_FIELDS):
                 allocation_settings({**previous, **payload})
             payload['expected_config_version'] = version
             state = client.write('config', payload)
+            while dual and (state.get('settings_pending') is True or state.get('settings_native_inflight') is True):
+                remaining = client.deadline-time.monotonic()
+                if remaining <= 0: raise TimeoutError('LP configuration confirmation timed out')
+                time.sleep(min(.01,remaining))
+                state = client.request(ROOT+'state')
             if not _config_confirmed(state, payload, previous):
                 raise ValueError('LP configuration result is unconfirmed')
             result = 'CONFIGURED'

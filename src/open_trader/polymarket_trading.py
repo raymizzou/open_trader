@@ -41,6 +41,7 @@ from urllib.request import ProxyHandler, Request, build_opener, urlopen
 from polymarket import BuilderApiKey, PRODUCTION, PublicClient, SecureClient
 from polymarket._internal.wallet import signature_type_for
 
+from .polymarket_lp_diagnostics import LPDiagnostics
 from .polymarket_lp_errors import LpObservationWait
 from .lp_metadata_cache import DISPLAY_FIELDS, LPMetadataCache, cache_policy
 from .lp_metadata_writer import LPMetadataWriter, empty_status, writer_policy
@@ -2199,6 +2200,7 @@ class PolymarketTradingClient:
         metadata_cache_policy: Mapping[str, int] | None = None,
     ) -> None:
         self.config = config
+        self._lp_diagnostics = LPDiagnostics()
         self._client = client
         self._urlopen_fn = urlopen_fn
         self._public_client_factory = public_client_factory or PublicClient
@@ -2627,6 +2629,39 @@ class PolymarketTradingClient:
             return isinstance(payload, dict) and payload.get("blocked") is False
         except Exception:
             return False
+
+    def lp_async_source_factory(self, *, clock=time.monotonic, utc_now=lambda: datetime.now(UTC), transport=None):
+        """Borrow the established GET signing capability; own only LP HTTP pools.
+
+        Legacy injected SDK doubles have no secure context. A real context with
+        missing signing capability fails closed instead of invoking bootstrap.
+        """
+        context=getattr(self._client,'_ctx',None)
+        if context is None:return None
+        from .polymarket_lp_async_source import LPAsyncSourcePort, ProviderLimits
+        from polymarket._internal.wallet import signature_type_for
+        import httpx
+        resolver=getattr(context.secure_clob,'_header_resolver',None)
+        if not callable(resolver):raise ValueError('lp_read_auth_unavailable')
+        environment=context.environment
+        signature=signature_type_for(context.wallet_type)
+        limits=ProviderLimits()
+        wallet=self.config.wallet_address
+        def auth(method,path,body):
+            if (method!='GET' or body is not None or not (path in ('/balance-allowance','/data/orders','/data/trades','/order-scoring')
+                    or re.fullmatch(r'/data/order/[A-Za-z0-9_-]+',path))):raise ValueError('lp_read_auth_scope')
+            return resolver(method,path,body)
+        def factory(demand):
+            if demand.account.casefold()!=wallet.casefold():raise ValueError('lp_read_account_mismatch')
+            sizes=({'clob':2,'data':1} if demand.kind=='financial' else {'clob':2}
+                if demand.kind=='exact' else {'gamma':1,'clob':3})
+            clients={service:httpx.AsyncClient(base_url=getattr(environment,service+'_url'),
+                limits=httpx.Limits(max_connections=size,max_keepalive_connections=size),
+                timeout=None,transport=transport,follow_redirects=False) for service,size in sizes.items()}
+            return LPAsyncSourcePort(clients,clock=clock,utc_now=utc_now,provider_limits=limits,
+                auth_resolver=auth,signature_type=signature,spender=environment.standard_exchange)
+        factory.not_before=limits.not_before
+        return factory
 
     def lp_reader_source_port(self):
         """Opt-in current read port. The automatic loop never calls this port."""
@@ -4159,114 +4194,8 @@ class PolymarketTradingClient:
                             event_failures.pop(event_id, None)
                     elif error is not None:
                         mark_event_failure((event_id,), error)
-        result: dict[str, dict[str, object]] = {}
-        for value in rows:
-            row = _model_dict(value)
-            if row is None:
-                continue
-            condition_id = row.get("condition_id", row.get("conditionId"))
-            if not isinstance(condition_id, str) or condition_id not in requested:
-                continue
-            slug = None if planning_only else row.get("slug")
-            market_url = None if planning_only else row.get("market_url", row.get("url"))
-            state = _model_dict(row.get("state")) or {}
-            trading = _model_dict(row.get("trading")) or {}
-            rewards = _model_dict(row.get("rewards")) or {}
-            fee_schedule = _model_dict(trading.get("fee_schedule")) or {}
-            raw_spread = _lp_decimal(
-                rewards.get("rewards_max_spread", row.get("rewards_max_spread"))
-            )
-            fees_enabled = trading.get("fees_enabled")
-            taker_rate = _lp_decimal(
-                fee_schedule.get("rate", row.get("taker_fee_rate"))
-            )
-            raw_outcomes = _model_dict(row.get("outcomes")) or {}
-            outcomes: dict[str, dict[str, object]] = {}
-            for key, raw_outcome in raw_outcomes.items():
-                outcome = _model_dict(raw_outcome)
-                if outcome is None:
-                    continue
-                token_id = outcome.get("token_id", outcome.get("tokenId"))
-                if token_id is None:
-                    continue
-                outcome_key = str(key).strip().lower()
-                outcomes[outcome_key] = {
-                    "label": outcome.get("label", key),
-                    "token_id": str(token_id),
-                }
-            events = tuple(
-                event
-                for raw_event in _collect(row.get("events"))
-                if (event := _model_dict(raw_event)) is not None
-            )
-            event_reference = events[0] if len(events) == 1 else None
-            event_id = event_reference.get("id") if event_reference else None
-            event_key = str(event_id).strip() if event_id is not None else ""
-            event = event_facts.get(event_key) if event_key else None
-            if event_key in event_failures:
-                failed_ids.setdefault(condition_id, event_failures[event_key])
-            sports = _model_dict(row.get("sports")) or {}
-            event_state = _model_dict(event.get("state")) or {} if event else {}
-            event_schedule = _model_dict(event.get("schedule")) or {} if event else {}
-            prices = {} if planning_only else (_model_dict(row.get("prices")) or {})
-            one_day_price_change = _lp_decimal(prices.get("one_day_price_change"))
-            event_slug = (
-                event.get("slug")
-                if event is not None
-                else event_reference.get("slug") if event_reference else None
-            )
-            if not market_url and isinstance(slug, str) and slug.strip():
-                market_slug = slug.strip()
-                if (
-                    isinstance(event_slug, str)
-                    and event_slug.strip()
-                    and event_slug.strip() != market_slug
-                ):
-                    market_url = (
-                        f"https://polymarket.com/event/{event_slug.strip()}/{market_slug}"
-                    )
-                else:
-                    market_url = f"https://polymarket.com/event/{market_slug}"
-            result[condition_id] = {
-                "market_id": row.get("id", row.get("market_id")),
-                "condition_id": condition_id,
-                "metadata_checked_at": metadata_checked_at,
-                "fees_checked_at": metadata_checked_at,
-                "event_id": event_id,
-                "game_id": sports.get("game_id"),
-                "game_start_time": sports.get("game_start_time"),
-                "event_start_time": event_schedule.get("start_time"),
-                "event_ended": event_state.get("ended"),
-                "event_finished_at": event_schedule.get("finished_at"),
-                "accepting_orders": state.get("accepting_orders"),
-                "closed": state.get("closed"),
-                "resolved": state.get("resolved"),
-                "exchange_type": "CLOB",
-                "tick_size": _lp_decimal(trading.get("minimum_tick_size")),
-                "minimum_order_size": _lp_decimal(
-                    trading.get("minimum_order_size")
-                ),
-                "fee": (
-                    Decimal("0")
-                    if fees_enabled is False or fee_schedule.get("taker_only") is True
-                    else None
-                ),
-                "fees_enabled": fees_enabled,
-                "fee_exponent": _lp_decimal(fee_schedule.get("exponent", 1)),
-                "taker_fee_rate": taker_rate,
-                "reward_min_size": _lp_decimal(
-                    rewards.get("rewards_min_size", row.get("rewards_min_size"))
-                ),
-                "reward_max_spread": (
-                    None if raw_spread is None else raw_spread / Decimal("100")
-                ),
-                "outcomes": outcomes,
-            }
-            if not planning_only:
-                result[condition_id].update(market_title=row.get("question", row.get("title")),
-                    market_url=market_url, price_change_24h=one_day_price_change,
-                    price_change_24h_source=("polymarket.prices.one_day_price_change"
-                        if one_day_price_change is not None else None))
+        result = project_lp_market_metadata(rows, requested, event_facts, event_failures,
+            failed_ids, metadata_checked_at, planning_only=planning_only)
         confirmed_absent_ids = frozenset(
             condition_id
             for condition_id in completed_market_ids
@@ -4522,34 +4451,41 @@ class PolymarketTradingClient:
 
         def read_rewards(
             request: tuple[str, bool],
-        ) -> tuple[str, bool, tuple[object, ...], str | None, str | None]:
+        ) -> tuple[str, bool, tuple[object, ...], str | None, str | None, object]:
             condition_id, sponsored = request
+            stage = "reward_sponsored" if sponsored else "reward_native"
+            attempt = self._lp_diagnostics.begin(stage, condition_id)
             if stop_event is not None and stop_event.is_set():
-                return condition_id, sponsored, (), "reward_read_cancelled", "cancelled"
+                return condition_id, sponsored, (), "reward_read_cancelled", "cancelled", attempt
             public = self._public_client_factory()
             try:
                 reader = getattr(public, "list_market_rewards", None)
                 if not callable(reader):
                     raise ValueError("selected_reward_reader_unavailable")
-                return condition_id, sponsored, _collect(
+                rows = _collect(
                     reader(condition_id=condition_id, sponsored=sponsored), stop_event=stop_event
-                ), None, None
+                )
+                return condition_id, sponsored, rows, None, None, attempt
             except _RewardReadCancelled:
-                return condition_id, sponsored, (), "reward_read_cancelled", "cancelled"
+                return condition_id, sponsored, (), "reward_read_cancelled", "cancelled", attempt
             except Exception as exc:
-                return condition_id, sponsored, (), "reward_read_failed", type(exc).__name__
+                self._lp_diagnostics.record(attempt, event="failed", stage=stage,
+                    cause="reward_read_failed", exc=exc, event_at=datetime.now(UTC))
+                return condition_id, sponsored, (), "reward_read_failed", type(exc).__name__, attempt
             finally:
                 close_public(public)
 
         results: dict[tuple[str, bool], tuple[tuple[object, ...], str | None, str | None]] = {}
+        attempts = {}
         with ThreadPoolExecutor(
             max_workers=1 if serial else min(LP_REWARD_SELECTED_MAX_CONCURRENCY, len(requests)),
             thread_name_prefix="polymarket-selected-rewards",
         ) as executor:
-            for condition_id, sponsored, rows, error, error_type in executor.map(
+            for condition_id, sponsored, rows, error, error_type, attempt in executor.map(
                 read_rewards, requests
             ):
                 results[(condition_id, sponsored)] = (rows, error, error_type)
+                attempts[(condition_id, sponsored)] = attempt
 
         markets: list[dict[str, object]] = []
         known_count = 0
@@ -4570,6 +4506,7 @@ class PolymarketTradingClient:
                 "sponsored_daily_pool_usd": Decimal("0"),
             }
             reason_codes: list[str] = []
+            source_reasons: dict[bool, list[str]] = {False: [], True: []}
             row_fingerprints: dict[bool, str] = {}
             config_signatures: dict[bool, dict[str, tuple[object, ...]]] = {
                 False: {},
@@ -4579,8 +4516,15 @@ class PolymarketTradingClient:
             unknown_asset = False
             native_total: Decimal | None = Decimal("0")
             combined_total: Decimal | None = Decimal("0")
+            diagnostic_native_contributions: list[tuple[str | None, Decimal]] = []
+            diagnostic_native_conflicting_ids: set[str] = set()
+            diagnostic_native_row_ambiguous = False
 
             for sponsored in (False, True):
+                def problem(code: str) -> None:
+                    reason_codes.append(code)
+                    source_reasons[sponsored].append(code)
+
                 rows, read_error, error_type = results[(condition_id, sponsored)]
                 if read_error is not None:
                     reason_codes.append(read_error)
@@ -4590,7 +4534,7 @@ class PolymarketTradingClient:
                 for reward in rows:
                     row = _model_dict(reward)
                     if row is None or row.get("condition_id") != condition_id:
-                        reason_codes.append("reward_identity_unknown")
+                        problem("reward_identity_unknown")
                         continue
                     try:
                         fingerprint = json.dumps(
@@ -4600,13 +4544,15 @@ class PolymarketTradingClient:
                             separators=(",", ":"),
                         )
                     except (TypeError, ValueError):
-                        reason_codes.append("reward_identity_unknown")
+                        problem("reward_identity_unknown")
                         continue
                     previous_fingerprint = row_fingerprints.get(sponsored)
                     if previous_fingerprint is not None:
                         if previous_fingerprint == fingerprint:
                             continue
-                        reason_codes.append("reward_identity_unknown")
+                        if not sponsored:
+                            diagnostic_native_row_ambiguous = True
+                        problem("reward_identity_unknown")
                         continue
                     row_fingerprints[sponsored] = fingerprint
 
@@ -4625,7 +4571,7 @@ class PolymarketTradingClient:
                     if not isinstance(raw_configs, Sequence) or isinstance(
                         raw_configs, (str, bytes)
                     ):
-                        reason_codes.append("reward_config_unknown")
+                        problem("reward_config_unknown")
                         continue
                     for raw_config in raw_configs:
                         normalized_parts = _normalize_lp_reward_config(
@@ -4634,7 +4580,7 @@ class PolymarketTradingClient:
                             require_id=False,
                         )
                         if normalized_parts is None:
-                            reason_codes.append("reward_config_unknown")
+                            problem("reward_config_unknown")
                             continue
                         normalized, config_identity = normalized_parts
                         config_id, asset_key, start_date, end_date = config_identity
@@ -4648,7 +4594,9 @@ class PolymarketTradingClient:
                             if previous_signature is not None:
                                 if previous_signature == signature:
                                     continue
-                                reason_codes.append("reward_identity_unknown")
+                                if not sponsored:
+                                    diagnostic_native_conflicting_ids.add(config_key)
+                                problem("reward_identity_unknown")
                                 continue
                             config_signatures[sponsored][config_key] = signature
                         if not start_date <= as_of <= end_date:
@@ -4664,19 +4612,56 @@ class PolymarketTradingClient:
                         active_configs += 1
                         if asset_key not in LP_REWARD_ASSET_USD_ADDRESSES:
                             unknown_asset = True
+                            source_reasons[sponsored].append("reward_asset_unknown")
                             if sponsored:
                                 combined_total = None
                             else:
                                 native_total = None
                             continue
+                        if not sponsored:
+                            # Keep candidates until all identities are observed:
+                            # a later conflict invalidates earlier contributions.
+                            diagnostic_native_contributions.append((config_id, rate))
                         if sponsored:
                             if combined_total is not None:
                                 combined_total += rate
                         elif native_total is not None:
                             native_total += rate
 
+            diagnostic_native_usd_lower_bound = Decimal("0")
+            if not diagnostic_native_row_ambiguous:
+                for config_id, rate in diagnostic_native_contributions:
+                    if config_id in diagnostic_native_conflicting_ids:
+                        continue
+                    try:
+                        diagnostic_native_usd_lower_bound += rate
+                    except ArithmeticError:
+                        # Diagnostic arithmetic cannot change a public result;
+                        # either unambiguous contribution remains a lower bound.
+                        diagnostic_native_usd_lower_bound = max(diagnostic_native_usd_lower_bound, rate)
             if unknown_asset:
                 reason_codes.append("reward_asset_unknown")
+            # Only validated facts can close a source's read-failure episode.
+            # The combined endpoint includes native rewards; an inconsistent
+            # combined total invalidates that source, not a valid native read.
+            if not reason_codes:
+                if native_total is None:
+                    source_reasons[False].append("reward_total_unknown")
+                if combined_total is None:
+                    source_reasons[True].append("reward_total_unknown")
+            if (not source_reasons[True]
+                    and results[(condition_id, True)][1] is None
+                    and combined_total is not None
+                    and combined_total < diagnostic_native_usd_lower_bound):
+                source_reasons[True].append("reward_totals_inconsistent")
+            for source in (False, True):
+                if results[(condition_id, source)][1] is not None:
+                    continue  # Transport failure was already observed at read time.
+                errors = source_reasons[source]
+                self._lp_diagnostics.record(attempts[(condition_id, source)],
+                    event="failed" if errors else "complete",
+                    stage="reward_sponsored" if source else "reward_native",
+                    cause=errors[0] if errors else None, event_at=datetime.now(UTC))
             reason_codes = list(dict.fromkeys(reason_codes))
             if reason_codes:
                 market.update(
@@ -8460,3 +8445,317 @@ __all__ = [
     "store_keychain_secret",
     "store_predict_api_key",
 ]
+
+
+def project_lp_selected_rewards(requested, results, checked_at):
+    """Normalize completed native/combined reward facts without I/O."""
+    markets: list[dict[str, object]] = []
+    known_count = 0
+    total = Decimal("0")
+    total_known = True
+    as_of = checked_at.date()
+    for condition_id in requested:
+        market: dict[str, object] = {
+            "condition_id": condition_id,
+            "checked_at": checked_at,
+            "reward_checked_at": checked_at,
+            "rewards_max_spread": None,
+            "rewards_min_size": None,
+            "native_reward_configs": [],
+            "combined_reward_configs": [],
+            "sponsored_reward_configs": [],
+            "native_daily_pool_usd": Decimal("0"),
+            "sponsored_daily_pool_usd": Decimal("0"),
+        }
+        reason_codes: list[str] = []
+        row_fingerprints: dict[bool, str] = {}
+        config_signatures: dict[bool, dict[str, tuple[object, ...]]] = {
+            False: {},
+            True: {},
+        }
+        active_configs = 0
+        unknown_asset = False
+        native_total: Decimal | None = Decimal("0")
+        combined_total: Decimal | None = Decimal("0")
+
+        for sponsored in (False, True):
+            rows, read_error, error_type = results[(condition_id, sponsored)]
+            if read_error is not None:
+                reason_codes.append(read_error)
+                if error_type is not None:
+                    market.setdefault("error_type", error_type)
+                continue
+            for reward in rows:
+                row = _model_dict(reward)
+                if row is None or row.get("condition_id") != condition_id:
+                    reason_codes.append("reward_identity_unknown")
+                    continue
+                try:
+                    fingerprint = json.dumps(
+                        row,
+                        sort_keys=True,
+                        default=str,
+                        separators=(",", ":"),
+                    )
+                except (TypeError, ValueError):
+                    reason_codes.append("reward_identity_unknown")
+                    continue
+                previous_fingerprint = row_fingerprints.get(sponsored)
+                if previous_fingerprint is not None:
+                    if previous_fingerprint == fingerprint:
+                        continue
+                    reason_codes.append("reward_identity_unknown")
+                    continue
+                row_fingerprints[sponsored] = fingerprint
+
+                if sponsored:
+                    combined_spread = _lp_decimal(
+                        row.get("rewards_max_spread")
+                    )
+                    combined_min_size = _lp_decimal(
+                        row.get("rewards_min_size")
+                    )
+                    if combined_spread is not None:
+                        market["rewards_max_spread"] = combined_spread
+                    if combined_min_size is not None:
+                        market["rewards_min_size"] = combined_min_size
+                raw_configs = row.get("rewards_config")
+                if not isinstance(raw_configs, Sequence) or isinstance(
+                    raw_configs, (str, bytes)
+                ):
+                    reason_codes.append("reward_config_unknown")
+                    continue
+                for raw_config in raw_configs:
+                    normalized_parts = _normalize_lp_reward_config(
+                        raw_config,
+                        sponsored=sponsored,
+                        require_id=False,
+                    )
+                    if normalized_parts is None:
+                        reason_codes.append("reward_config_unknown")
+                        continue
+                    normalized, config_identity = normalized_parts
+                    config_id, asset_key, start_date, end_date = config_identity
+                    rate = cast(Decimal, normalized["rate_per_day"])
+                    if config_id is not None:
+                        config_key = str(config_id)
+                        signature = (asset_key, start_date, end_date, rate)
+                        previous_signature = config_signatures[sponsored].get(
+                            config_key
+                        )
+                        if previous_signature is not None:
+                            if previous_signature == signature:
+                                continue
+                            reason_codes.append("reward_identity_unknown")
+                            continue
+                        config_signatures[sponsored][config_key] = signature
+                    if not start_date <= as_of <= end_date:
+                        continue
+                    configs_key = (
+                        "combined_reward_configs"
+                        if sponsored
+                        else "native_reward_configs"
+                    )
+                    cast(list[dict[str, object]], market[configs_key]).append(
+                        normalized
+                    )
+                    active_configs += 1
+                    if asset_key not in LP_REWARD_ASSET_USD_ADDRESSES:
+                        unknown_asset = True
+                        if sponsored:
+                            combined_total = None
+                        else:
+                            native_total = None
+                        continue
+                    if sponsored:
+                        if combined_total is not None:
+                            combined_total += rate
+                    elif native_total is not None:
+                        native_total += rate
+
+        if unknown_asset:
+            reason_codes.append("reward_asset_unknown")
+        reason_codes = list(dict.fromkeys(reason_codes))
+        if reason_codes:
+            market.update(
+                {
+                    "state": "unknown",
+                    "complete": False,
+                    "reward_active": None,
+                    "daily_pool_usd": None,
+                    "reason_codes": reason_codes,
+                }
+            )
+            total_known = False
+        else:
+            native = native_total
+            combined = combined_total
+            if native is None or combined is None:
+                market.update(
+                    {
+                        "state": "unknown",
+                        "complete": False,
+                        "reward_active": None,
+                        "daily_pool_usd": None,
+                        "reason_codes": ["reward_total_unknown"],
+                    }
+                )
+                total_known = False
+                markets.append(market)
+                continue
+            if combined < native:
+                market.update(
+                    {
+                        "state": "unknown",
+                        "complete": False,
+                        "reward_active": None,
+                        "daily_pool_usd": None,
+                        "sponsored_daily_pool_usd": None,
+                        "reason_codes": ["reward_totals_inconsistent"],
+                    }
+                )
+                total_known = False
+                markets.append(market)
+                continue
+            sponsored = combined - native
+            daily_pool = combined
+            market["native_daily_pool_usd"] = native
+            market["sponsored_daily_pool_usd"] = sponsored
+            market.update(
+                {
+                    "state": "known",
+                    "complete": True,
+                    "reward_active": active_configs > 0,
+                    "daily_pool_usd": daily_pool,
+                    "reason_codes": [],
+                }
+            )
+            known_count += 1
+            total += daily_pool
+        markets.append(market)
+
+    complete = known_count == len(requested)
+    return {
+        "state": "known"
+        if complete
+        else "partial"
+        if known_count
+        else "unknown",
+        "complete": complete,
+        "checked_at": checked_at,
+        "daily_pool_usd": total if total_known else None,
+        "markets": tuple(markets),
+    }
+
+
+def project_lp_market_metadata(rows, requested, event_facts, event_failures, failed_ids, metadata_checked_at, *, planning_only=False):
+    """Project captured SDK market/event values; no reads or time renewal."""
+    result: dict[str, dict[str, object]] = {}
+    for value in rows:
+        row = _model_dict(value)
+        if row is None:
+            continue
+        condition_id = row.get("condition_id", row.get("conditionId"))
+        if not isinstance(condition_id, str) or condition_id not in requested:
+            continue
+        slug = None if planning_only else row.get("slug")
+        market_url = None if planning_only else row.get("market_url", row.get("url"))
+        state = _model_dict(row.get("state")) or {}
+        trading = _model_dict(row.get("trading")) or {}
+        rewards = _model_dict(row.get("rewards")) or {}
+        fee_schedule = _model_dict(trading.get("fee_schedule")) or {}
+        raw_spread = _lp_decimal(
+            rewards.get("rewards_max_spread", row.get("rewards_max_spread"))
+        )
+        fees_enabled = trading.get("fees_enabled")
+        taker_rate = _lp_decimal(
+            fee_schedule.get("rate", row.get("taker_fee_rate"))
+        )
+        raw_outcomes = _model_dict(row.get("outcomes")) or {}
+        outcomes: dict[str, dict[str, object]] = {}
+        for key, raw_outcome in raw_outcomes.items():
+            outcome = _model_dict(raw_outcome)
+            if outcome is None:
+                continue
+            token_id = outcome.get("token_id", outcome.get("tokenId"))
+            if token_id is None:
+                continue
+            outcome_key = str(key).strip().lower()
+            outcomes[outcome_key] = {
+                "label": outcome.get("label", key),
+                "token_id": str(token_id),
+            }
+        events = tuple(
+            event
+            for raw_event in _collect(row.get("events"))
+            if (event := _model_dict(raw_event)) is not None
+        )
+        event_reference = events[0] if len(events) == 1 else None
+        event_id = event_reference.get("id") if event_reference else None
+        event_key = str(event_id).strip() if event_id is not None else ""
+        event = event_facts.get(event_key) if event_key else None
+        if event_key in event_failures:
+            failed_ids.setdefault(condition_id, event_failures[event_key])
+        sports = _model_dict(row.get("sports")) or {}
+        event_state = _model_dict(event.get("state")) or {} if event else {}
+        event_schedule = _model_dict(event.get("schedule")) or {} if event else {}
+        prices = {} if planning_only else (_model_dict(row.get("prices")) or {})
+        one_day_price_change = _lp_decimal(prices.get("one_day_price_change"))
+        event_slug = (
+            event.get("slug")
+            if event is not None
+            else event_reference.get("slug") if event_reference else None
+        )
+        if not market_url and isinstance(slug, str) and slug.strip():
+            market_slug = slug.strip()
+            if (
+                isinstance(event_slug, str)
+                and event_slug.strip()
+                and event_slug.strip() != market_slug
+            ):
+                market_url = (
+                    f"https://polymarket.com/event/{event_slug.strip()}/{market_slug}"
+                )
+            else:
+                market_url = f"https://polymarket.com/event/{market_slug}"
+        result[condition_id] = {
+            "market_id": row.get("id", row.get("market_id")),
+            "condition_id": condition_id,
+            "metadata_checked_at": metadata_checked_at,
+            "fees_checked_at": metadata_checked_at,
+            "event_id": event_id,
+            "game_id": sports.get("game_id"),
+            "game_start_time": sports.get("game_start_time"),
+            "event_start_time": event_schedule.get("start_time"),
+            "event_ended": event_state.get("ended"),
+            "event_finished_at": event_schedule.get("finished_at"),
+            "accepting_orders": state.get("accepting_orders"),
+            "closed": state.get("closed"),
+            "resolved": state.get("resolved"),
+            "exchange_type": "CLOB",
+            "tick_size": _lp_decimal(trading.get("minimum_tick_size")),
+            "minimum_order_size": _lp_decimal(
+                trading.get("minimum_order_size")
+            ),
+            "fee": (
+                Decimal("0")
+                if fees_enabled is False or fee_schedule.get("taker_only") is True
+                else None
+            ),
+            "fees_enabled": fees_enabled,
+            "fee_exponent": _lp_decimal(fee_schedule.get("exponent", 1)),
+            "taker_fee_rate": taker_rate,
+            "reward_min_size": _lp_decimal(
+                rewards.get("rewards_min_size", row.get("rewards_min_size"))
+            ),
+            "reward_max_spread": (
+                None if raw_spread is None else raw_spread / Decimal("100")
+            ),
+            "outcomes": outcomes,
+        }
+        if not planning_only:
+            result[condition_id].update(market_title=row.get("question", row.get("title")),
+                market_url=market_url, price_change_24h=one_day_price_change,
+                price_change_24h_source=("polymarket.prices.one_day_price_change"
+                    if one_day_price_change is not None else None))
+    return result

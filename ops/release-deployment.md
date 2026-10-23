@@ -30,7 +30,12 @@ do-not-publish/draft 覆盖指令仍适用。本地 `main` 只同步远端，不
 直接推送绕过 PR。
 PR head、GitHub 合成 PR merge commit、最终 GitHub `main` commit 是不同身份；
 发布选定最后一种完整 SHA，核对其 CI 后，在明确授权的部署准备中运行 Candidate
-Acceptance。PR CI 不能代替该 SHA 的 Candidate `PASS`，合并不自动运行验收或部署。
+Acceptance。可接受该 SHA 的 main `push` 或仅限 `refs/heads/main` 的
+`workflow_dispatch` CI；取两种事件中最新的 exact-SHA run。较新的 pending、failed 或
+cancelled run 阻止复用旧绿色结果，artifact 必须保留并匹配实际事件。自动 CI 缺失时，
+在相应授权下执行 `gh workflow run ci.yml --ref main`，核对实际 SHA 并等待完整可信证据；
+手动入口不接受任意 SHA。四个后端分区、portable、app 15368 的 `required`、当前 attempt、
+artifact、retirement policy、lock 与 runtime 身份检查不变。PR CI 不能代替该 SHA 的 Candidate `PASS`，合并不自动运行验收或部署。
 
 验收失败时先审计全部错误及下游影响，范围内修复走独立分支、检查、任务分支/PR
 更新、独立审查、CI 与反馈门禁、用户批准合并，再对新的最终 main SHA 验收；
@@ -189,18 +194,16 @@ make production-smoke \
   EXPECTED_RUNTIME_ROOT=<运行时根>
 ```
 
-若本次发布要保持 N_LEG 暂停，在同一条命令增加 `N_LEG_PAUSED=1`。Smoke
-会要求 Prediction Service 的 health 返回 `N_LEG_PAUSED`，核对 LP dashboard
-仍可读，并跳过 `/api/prediction-arbitrage/state`；默认 `N_LEG_PAUSED=0`
-继续核对正常 N_LEG state。暂停值由
-`scripts/install_prediction_service_launchd.sh --n-leg-paused 1` 写入
-launchd 环境；后续安装省略参数时保留已有值，恢复必须明确指定
-`--n-leg-paused 0`。
+受支持的 Prediction 生产和 Shadow 入口永久暂停非 LP 业务。Smoke 的
+`N_LEG_PAUSED` 接受历史值 0 或 1；省略、0 和 1 都要求 health 返回
+`N_LEG_PAUSED`，核对可读的 LP dashboard，并跳过
+`/api/prediction-arbitrage/state`。非法输入仍拒绝。
+installer 可以保留历史原始配置，但 `--n-leg-paused 0` 不再恢复非 LP 业务。
+这不改变部署、凭据、启动准入或交易授权边界。
 
 必须以 `HEALTHY` 收尾。冒烟只核对 `RELEASE_SERVICES` 选定服务的 `/healthz`、进程、监听器
-和日志。选中 Prediction 时，`N_LEG_PAUSED=1` 必须同时满足暂停 health 和可读的 LP
-dashboard，且跳过 N-Leg state 请求；`N_LEG_PAUSED=0` 必须满足 running health 和现有
-N-Leg state 契约。除既有的
+和日志。选中 Prediction 时，所有兼容暂停配置都必须满足暂停 health 和可读的 LP
+dashboard，且跳过 N-Leg state 请求。running、缺失或矛盾的暂停证据仍阻断。除既有的
 `cwd`/`git_sha` 外,还要求 `code_root`(account 另有 `worker_code_root`)存在且
 位于 `EXPECTED_ROOT` 之下——这是防止"服务加载旧发布代码"的关键断言
 (#110/#113)。未选定服务可以保持较旧版本；应独立确认其 PID/版本未变化，但不把它们
@@ -213,26 +216,13 @@ N-Leg state 契约。除既有的
 
 ## 迁移前存量持仓恢复
 
-旧主机状态库无法恢复、启动因 `unknown_external_state` 阻断时，先由操作者明确
-确认哪些持仓属于自行管理的迁移前存量。不要删除事故或伪造策略执行记录。
-生产服务停止且发布版本通过部署门禁后，在该发布的源码环境执行：
+`prediction-arb recover-external-positions` 已退役，返回退出码 2 和
+`N_LEG_PAUSED`，不会取得运行时/执行锁、读取凭据或登记事故确认。
+此处不再提供可执行的恢复命令，也没有已授权的替代运维流程。
 
-```bash
-PYTHONPATH=<新发布>/src <运行时根>/.venv/bin/python -m open_trader prediction-arb recover-external-positions \
-  --config <运行时根>/config/prediction_arbitrage.json --data-dir <运行时根>/data \
-  --incident-id <事故ID> --position <token_id>=<当前数量> \
-  --note '操作者已确认迁移前存量由其自行管理' --confirm
-```
-
-`--position` 可重复；必须精确匹配事故及最新账户的正持仓，钱包身份必须一致，
-且没有活动策略执行或 LP 会话。默认拒绝任何挂单；若操作者确认原样保留旧仓的
-现有卖单，可重复传入 `--external-sell-order-id <订单ID>`。完整挂单集合必须与确认
-ID 一致，且最新认证快照证明全部为该钱包上述存量的 SELL、剩余数量合计不超过
-存量；任何 BUY、未确认订单、不完整快照或变化均拒绝。不会撤单或修改卖单。
-命令持有运行时所有权锁及执行锁，拒绝在
-生产运行期间登记。登记保存在原事故的 acknowledgement 中，保留事故原始证据；
-不下单、撤单、卖出、发送通知或自动启用策略。随后按正常生产安装流程启动。
-
-登记仅允许同钱包、同 token 且不超过确认数量的存量通过启动/事故恢复校验；
-新 token 或超过确认数量上限仍阻断。原始持仓仍显示在账户中、仍排除同市场 LP 新买入，
-不进入自动策略资金或库存账本。其余 readiness 和交易门禁照常执行。
+遇到 `unknown_external_state` 时，保留事故、账户身份、持仓、精确订单 ID 和
+UNKNOWN 原始证据，停止依赖该恢复步骤的操作。不要删除事故、清空数据库、伪造
+执行记录或通过手工 SQL 解除门禁。先只读审计并提出明确的离线恢复范围；取得
+单独批准后，才可制定并验证停机 owner、备份、账户/订单身份和数量边界的恢复方案。
+显式 Python 库接口仍用于隔离诊断，但其存在不授权操作生产数据。既有切换迁移、
+整库恢复及其他已授权维护继续遵守各自的合同；本节不引入新维护协议。

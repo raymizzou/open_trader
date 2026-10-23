@@ -228,7 +228,8 @@ console.log(JSON.stringify({before, draft, running, unconfirmed, calls, d2Paused
     assert 'value="120"' in result["draft"]
     assert "暂停新增" in result["running"]
     assert "操作未确认" in result["unconfirmed"]
-    assert result["calls"][1]["body"] == {"budget_usd": "120", "target_buy_count": 3, "expected_config_version": 7}
+    assert result["calls"][1]["body"] == {"trial_budget_usd": "120", "income_budget_usd": "0",
+        "allocation_mode": "observed_pools", "expected_config_version": 7}
     assert 'data-lp-auto-field="budget_usd"' in result['d2Paused']
     assert 'value="100" disabled' not in result['d2Paused']
     assert '有效状态：暂停' in result['d2Paused']
