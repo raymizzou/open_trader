@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-23 — External PR review and bounded worker recovery
+
+- Use external dots/Opus GitHub reviews and comments for independent PR review. Main monitors complete paginated feedback and exact-SHA checks with a durable wake/check owner and next check; no automatic local reviewer fallback. Keep pending review and CI distinct from merge success.
+- Batch routine scoped repairs with the existing worker. Main replies with published fix/check evidence and resolves only verified addressed threads; expanded or uncertain-contract changes still need the user's decision. Merge/deploy authority and main-only CI remain unchanged.
+- Recover settled transient worker-capacity errors in the same session/model: verify no active or queued command, then retry once and at most twice more after 60 and 120 seconds. Stop on actual progress; report three exhausted retries or ten minutes without progress. Preserve saved work, user-selected settings and the ban on duplicate commands.
+
 ## 2026-10-23 — LP CLI startup and outcome confirmation
 
 - Route LP help/status/controls through a lightweight shared argument parser. Default human output shows at most three outcome/state/budget lines; `--verbose` exposes D2 and legacy diagnostics. JSON shape, result tokens, redaction and exits remain compatible.
