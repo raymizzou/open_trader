@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-23 — LP CLI startup and outcome confirmation
+
+- Route LP help/status/controls through a lightweight shared argument parser. Default human output shows at most three outcome/state/budget lines; `--verbose` exposes D2 and legacy diagnostics. JSON shape, result tokens, redaction and exits remain compatible.
+- Preserve explicit safe nulls on LP auto HTTP receipts. Accepted D2 controls use only bounded confirmation GETs under the original deadline and original control version; missing proof, peer intent changes, rejection, fatal state and expiry stay unconfirmed. No control POST replay, live state change or deployment is performed by this change.
+
 ## 2026-10-23 — D2 dual-pool operator SOP
 
 - Document the current shared pause/enable switch, independent trial/income budgets and fixed three BUY slots per pool. The 100/100 USDC command is the user's session example, not a default; legacy inventory-budget guidance is labelled separately.

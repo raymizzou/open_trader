@@ -28,7 +28,7 @@ def service():
             'last_check_at': '2026-10-08T01:02:03+00:00', 'last_check_error': None,
         },
         orders=[{'id': 'buy-1', 'side': 'BUY'}, {'id': 'sell-1', 'side': 'SELL'}],
-        requests=[], rejection=None, reply=None, fault=None,
+        requests=[], rejection=None, reply=None, fault=None, read_state=None, read_rejection=None,
         csrf='fixture-csrf-secret', cookie='fixture-cookie-secret',
         entered=threading.Event(), release=threading.Event(),
     )
@@ -57,7 +57,10 @@ def service():
             elif self.path.endswith('/venues'):
                 self.respond(200, {'csrf_token': control.csrf})
             elif self.path == ROOT + 'state':
-                self.respond(200, control.state)
+                if control.read_rejection:
+                    self.respond(control.read_rejection[0], {'error': control.read_rejection[1]})
+                else:
+                    self.respond(200, control.read_state() if control.read_state else control.state)
             else:
                 self.respond(404, {'error': 'unexpected_path'})
 
@@ -127,7 +130,7 @@ def posts(service):
 def test_status_reports_service_state_without_mutation(service, capsys):
     service.state.update(desired_running=True, runtime_state='blocked', pause_confirmed=False)
     before = deepcopy(service.state)
-    assert invoke(service, 'status') == 0
+    assert invoke(service, 'status', '--verbose') == 0
     output = capsys.readouterr().out
     for literal in ('desired_running: ON', 'runtime_state: BLOCKED', 'budget_usd: 100',
                     'target_buy_count: 5', 'buy_price_level: 2', 'active: 2', 'pending: 1',
@@ -144,14 +147,14 @@ def test_status_reports_service_state_without_mutation(service, capsys):
     assert posts(service) == []
     assert service.state == before
     service.state = {'desired_running': False, 'runtime_state': 'paused'}
-    assert invoke(service, 'status') == 0
+    assert invoke(service, 'status', '--verbose') == 0
     output = capsys.readouterr().out
     assert 'budget_usd: UNKNOWN' in output and 'active: UNKNOWN' in output
     assert 'desired_running: OFF' in output and 'runtime_state: PAUSED' in output
     service.state = dict(desired_running=False, effective_running=False,
         control_save_state='pending', requested_control_version=3, saved_control_version=2,
         control_native_inflight=True, settings_pending=True, fatal={'origin': 'control_save'})
-    assert invoke(service, 'status') == 0
+    assert invoke(service, 'status', '--verbose') == 0
     output = capsys.readouterr().out
     for literal in ('effective_running: OFF', 'control_save_state: pending',
             'requested_control_version: 3', 'saved_control_version: 2',
@@ -171,7 +174,7 @@ def test_human_status_distinguishes_absent_null_and_error(service, capsys, field
     service.state.pop('last_check_error', None)
     service.state.update(fields)
     before, orders = deepcopy(service.state), deepcopy(service.orders)
-    assert invoke(service, 'status') == 0
+    assert invoke(service, 'status', '--verbose') == 0
     human = capsys.readouterr()
     assert human.err == ''
     assert service.state == before and service.orders == orders
@@ -209,7 +212,7 @@ def test_human_status_reports_active_buy_progress(service, capsys, slots, config
     service.state.pop('target_buy_count', None)
     service.state.update(configuration)
     before, orders = deepcopy(service.state), deepcopy(service.orders)
-    assert invoke(service, 'status') == 0
+    assert invoke(service, 'status', '--verbose') == 0
     human = capsys.readouterr()
     assert human.err == ''
     assert service.state == before and service.orders == orders
@@ -265,7 +268,7 @@ def test_human_status_reports_round_context_without_overriding_runtime(service, 
     service.state.update(desired_running=True, pause_confirmed=False, runtime_state='running')
     service.state.update(context)
     before, orders = deepcopy(service.state), deepcopy(service.orders)
-    assert invoke(service, 'status') == 0
+    assert invoke(service, 'status', '--verbose') == 0
     human = capsys.readouterr()
     assert human.err == ''
     assert service.state == before and service.orders == orders
@@ -328,7 +331,7 @@ def test_timing_parameters_can_be_configured_independently(service, capsys, fiel
         assert result['state'][key] == (value if key == field else before[key])
     for key in ('budget_usd', 'target_buy_count', 'buy_price_level', 'desired_running'):
         assert result['state'][key] == before[key]
-    assert invoke(service, 'status') == 0
+    assert invoke(service, 'status', '--verbose') == 0
     output = capsys.readouterr().out
     for key in ('api_retry_interval_seconds', 'order_check_interval_seconds'):
         assert f'{key}: {value if key == field else before[key]}' in output.splitlines()
@@ -421,7 +424,7 @@ def test_on_confirms_saved_mode_and_reports_blocked_state(service, capsys):
     before, orders = deepcopy(service.state), deepcopy(service.orders)
     assert invoke(service, 'on') == 0
     output = capsys.readouterr().out
-    assert 'result: ON' in output and 'runtime_state: BLOCKED' in output
+    assert 'result: ON' in output and 'state: BLOCKED' in output
     assert 'financial_facts_unknown' in output
     assert 'filled' not in output.lower() and 'LIVE' not in output
     assert posts(service) == [(ROOT + 'enable', {'confirm': True})]
@@ -611,3 +614,232 @@ def test_unknown_lp_arguments_use_json_error_contract(service, capsys, action):
     assert 'usage:' not in captured.err and 'Traceback' not in captured.err
     assert service.requests == []
     assert service.state == before and service.orders == orders
+
+
+def d2_receipt(running, **changes):
+    return dict(desired_running=running, effective_running=running,
+        pause_confirmed=not running, runtime_state='blocked' if running else 'paused',
+        control_save_state='saved', requested_control_version=8, saved_control_version=8,
+        control_native_inflight=False, settings_pending=False,
+        settings_native_inflight=False, fatal=None, **changes)
+
+
+@pytest.mark.parametrize('action', ['on', 'off', 'pause'])
+def test_control_confirms_saved_version_with_one_write(service, capsys, action):
+    running = action == 'on'
+    saved = d2_receipt(running)
+    pending = {**saved, 'control_save_state': 'pending', 'saved_control_version': 7,
+               'control_native_inflight': True, 'pause_confirmed': False}
+    service.reply = pending
+    committed = threading.Event()
+    orders = deepcopy(service.orders)
+
+    def finish_save():
+        assert service.entered.wait(5), 'GET must follow the accepted write'
+        service.state = deepcopy(saved)
+        committed.set()
+        return service.state
+
+    service.read_state = finish_save
+    assert invoke(service, action, '--timeout', '2', '--json') == 0
+    document = json.loads(capsys.readouterr().out)
+    assert committed.wait(5), 'success requires an observed save completion'
+    assert document == {'result': 'ON' if running else 'PAUSED', 'state': saved,
+                        'reason': None, 'next_action': None}
+    assert [(method, path) for method, path, _, _ in service.requests] == [
+        ('GET', '/api/prediction-arbitrage/venues'),
+        ('POST', ROOT + ('enable' if running else 'pause')), ('GET', ROOT + 'state')]
+    assert posts(service) == [(ROOT + ('enable' if running else 'pause'), {'confirm': True})]
+    assert service.orders == orders
+
+
+@pytest.mark.parametrize('fault', ['missing-fatal', 'version-changed', 'fatal', 'deadline'])
+def test_control_confirmation_preserves_unproven_outcomes(service, capsys, fault):
+    pending = {**d2_receipt(True), 'control_save_state': 'pending',
+               'saved_control_version': 7, 'control_native_inflight': True}
+    final = d2_receipt(True)
+    if fault == 'missing-fatal':
+        pending.pop('fatal')
+        final.pop('fatal')
+    elif fault == 'version-changed':
+        final.update(requested_control_version=9, saved_control_version=9)
+    elif fault == 'fatal':
+        final['fatal'] = {'origin': 'control_save'}
+    else:
+        final = deepcopy(pending)
+    service.reply = pending
+    service.read_state = lambda: final
+    orders = deepcopy(service.orders)
+    assert invoke(service, 'on', '--timeout', '.25') == 2
+    output = capsys.readouterr().out
+    assert 'UNKNOWN' in output and 'status' in output
+    assert 'result: ON' not in output
+    assert posts(service) == [(ROOT + 'enable', {'confirm': True})]
+    assert service.orders == orders
+
+
+@pytest.mark.parametrize('action', ['status', 'config', 'on', 'off', 'pause'])
+def test_default_text_reports_only_outcome_and_relevant_values(service, capsys, action):
+    service.state.update(d2_receipt(False), allocation_mode='observed_pools',
+        trial_budget_usd='100', income_budget_usd='100', target_buy_count=3,
+        trial_target_buy_count=3, income_target_buy_count=3, income_weights=['0.5', '0.3', '0.2'])
+    if action in ('status', 'on'):
+        service.state.update(d2_receipt(True))
+    orders = deepcopy(service.orders)
+    args = ('--trial-budget', '100', '--income-budget', '100') if action == 'config' else ()
+    assert invoke(service, action, *args) == 0
+    captured = capsys.readouterr()
+    expected = {'status': 'STATUS', 'config': 'CONFIGURED', 'on': 'ON', 'off': 'PAUSED', 'pause': 'PAUSED'}[action]
+    assert captured.err == ''
+    assert len(captured.out.splitlines()) <= 3
+    assert f'result: {expected}' in captured.out
+    assert 'trial_budget_usd: 100' in captured.out and 'income_budget_usd: 100' in captured.out
+    if action in ('status', 'on'):
+        assert 'BLOCKED' in captured.out and 'financial_facts_unknown' in captured.out
+    if action == 'config':
+        assert service.state['desired_running'] is False
+        assert posts(service)[0][1]['expected_config_version'] == 7
+    if action in ('off', 'pause'):
+        assert 'existing orders and protection remain' in captured.out
+    assert 'UNKNOWN' not in captured.out and 'slots' not in captured.out
+    assert service.csrf not in captured.out and service.cookie not in captured.out
+    assert service.orders == orders
+
+
+@pytest.mark.parametrize('outcome', ['rejected', 'invalid-argument', 'transport-unknown'])
+def test_default_text_distinguishes_failure_from_unknown(service, capsys, outcome):
+    args = ()
+    action = 'on'
+    if outcome == 'rejected':
+        service.rejection = (409, f'settings_save_pending {service.csrf} {service.cookie}')
+    elif outcome == 'invalid-argument':
+        action = 'config'
+        args = ('--budget=-1', '--target-buys', '3')
+    else:
+        service.fault = 'disconnect'
+    orders = deepcopy(service.orders)
+    assert invoke(service, action, *args) == 2
+    captured = capsys.readouterr()
+    assert captured.err == '' and len(captured.out.splitlines()) <= 3
+    if outcome == 'transport-unknown':
+        assert 'UNCONFIRMED' in captured.out and 'UNKNOWN' in captured.out
+        assert 'FAILED' not in captured.out and 'status' in captured.out
+    else:
+        assert 'FAILED' in captured.out and 'UNCONFIRMED' not in captured.out
+        assert 'settings_save_pending' in captured.out if outcome == 'rejected' else 'budget' in captured.out
+        assert 'Next:' in captured.out
+    assert 'ValueError:' not in captured.out and 'RemoteDisconnected' not in captured.out
+    assert service.csrf not in captured.out and service.cookie not in captured.out
+    assert len(posts(service)) == (0 if outcome == 'invalid-argument' else 1)
+    assert service.orders == orders
+
+    if outcome == 'transport-unknown':
+        # An accepted write stays uncertain when the read-only confirmation
+        # endpoint fails. That GET is not a rejection of the original POST.
+        service.fault = None
+        service.requests.clear()
+        service.reply = {**d2_receipt(True), 'control_save_state': 'pending',
+                         'saved_control_version': 7, 'control_native_inflight': True}
+        service.read_rejection = (503, 'state_temporarily_unavailable')
+        assert invoke(service, 'on') == 2
+        output = capsys.readouterr().out
+        assert 'UNKNOWN (UNCONFIRMED)' in output and 'FAILED' not in output
+        assert 'status' in output and len(output.splitlines()) <= 3
+        assert posts(service) == [(ROOT + 'enable', {'confirm': True})]
+        assert service.orders == orders
+
+
+@pytest.mark.parametrize('mode', ['verbose', 'json'])
+def test_detailed_output_is_explicit_and_redacted(service, capsys, mode):
+    service.state = {**d2_receipt(True), 'current_phase': 'reading',
+        'buy_reserved_usd': '30', 'inventory_cost_usd': '20', 'new_capacity_usd': None,
+        'round': {'number': 4, 'state': 'waiting'}, 'settings_error': None,
+        'last_check_error': 'account_read_failed', 'csrf_token': service.csrf, 'cookie': service.cookie}
+    before = deepcopy(service.state)
+    assert invoke(service, 'status', '--' + mode) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ''
+    assert service.csrf not in captured.out and service.cookie not in captured.out
+    if mode == 'json':
+        document = json.loads(captured.out)
+        assert document == {'result': 'STATUS', 'state': {**before,
+            'csrf_token': '[REDACTED]', 'cookie': '[REDACTED]'}, 'reason': None, 'next_action': None}
+        assert 'slots' not in document['state'] and document['state']['fatal'] is None
+    else:
+        for literal in ('current_phase: reading', 'buy_reserved_usd: 30',
+                        'inventory_cost_usd: 20', 'new_capacity_usd: NONE',
+                        'fatal: NONE', 'settings_error: NONE', 'round:'):
+            assert literal in captured.out
+    assert service.state == before and posts(service) == []
+
+
+def test_lp_auto_module_entrypoint_avoids_unrelated_imports(service):
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    script = '''
+import json, runpy, sys
+sys.argv = ['open-trader', *json.loads(sys.argv[1])]
+try:
+    runpy.run_module('open_trader', run_name='__main__')
+except SystemExit as exc:
+    code = exc.code
+else:
+    code = 0
+for name in sys.modules:
+    assert not any(name == prefix or name.startswith(prefix + '.') for prefix in (
+        'open_trader.cli', 'open_trader.dashboard_web', 'open_trader.adapters',
+        'open_trader.prediction_arbitrage_execution')), 'unrelated import: ' + name
+raise SystemExit(code)
+'''
+    orders = deepcopy(service.orders)
+    root = Path(__file__).resolve().parents[1]
+    for tail in (['--help'], *([action, '--url', service.url, '--json']
+                              for action in ('status', 'on', 'off', 'pause'))):
+        result = subprocess.run([sys.executable, '-B', '-c', script,
+            json.dumps(['prediction-arb', 'lp-auto', *tail])], cwd=root,
+            env={**os.environ, 'PYTHONPATH': str(root / 'src')},
+            text=True, capture_output=True, timeout=15)
+        assert result.returncode == 0, result.stderr
+        if tail == ['--help']:
+            assert 'status' in result.stdout and 'config' in result.stdout
+        else:
+            assert json.loads(result.stdout)['result'] in ('STATUS', 'ON', 'PAUSED')
+    assert service.orders == orders
+    assert len(posts(service)) == 3
+
+
+def test_lp_auto_entrypoints_share_argument_contract(service, capsys):
+    from open_trader.__main__ import main as package_main
+
+    initial = deepcopy(service.state)
+    cases = [(action, ['--json']) for action in ('status', 'on', 'off', 'pause')]
+    cases += [('config', ['--budget', '100', '--trial-budget', '100', '--income-budget', '100',
+        '--target-buys', '3', '--bid-level', '2', '--allocation-mode', 'observed_pools',
+        '--allocation-weights', '0.5,0.3,0.2', '--allocation-shadow-enabled', 'false',
+        '--api-retry-interval-seconds', '30', '--order-check-interval-seconds', '5', '--json']),
+        ('config', ['--round-interval-seconds', '30', '--json'])]
+    cases += [(action, ['--json', '--invalid-option']) for action in ('status', 'config', 'on', 'off', 'pause')]
+    for action, options in cases:
+        observed = []
+        for entry in (cli.main, package_main):
+            service.state = deepcopy(initial)
+            service.requests.clear()
+            try:
+                code = entry(['prediction-arb', 'lp-auto', action, '--url', service.url,
+                              '--timeout', '2', *options])
+            except SystemExit as exc:
+                code = exc.code
+            captured = capsys.readouterr()
+            assert captured.err == ''
+            observed.append((code, json.loads(captured.out),
+                [(method, path, body) for method, path, body, _ in service.requests]))
+        assert observed[0] == observed[1]
+        if '--invalid-option' in options or '--round-interval-seconds' in options:
+            assert observed[0][0] == 2 and observed[0][1]['result'] == 'UNKNOWN'
+            assert observed[0][2] == []
+        else:
+            assert observed[0][0] == 0
+    assert service.orders == [{'id': 'buy-1', 'side': 'BUY'}, {'id': 'sell-1', 'side': 'SELL'}]
