@@ -826,12 +826,15 @@ def test_scheduler_waits_for_async_dependencies_and_completion_wakes_early(tmp_p
 
 def test_scheduler_waits_for_cleanup_fault_exit_without_busy_loop(tmp_path):
     from datetime import datetime,timedelta
+    from test_lp_financial_read_recovery import FinancialBoundary
     from open_trader.polymarket_lp import PolymarketLPService
     from open_trader.polymarket_lp_scheduler import LPAutoScheduler
     from tests.test_lp_d2_execution_bridge import attach
     for with_buy in (False,True):
         root=tmp_path/('with-buy' if with_buy else 'empty')
-        clock,boundary,trading,live=live_owner(root)
+        clock,_,trading,live=live_owner(root)
+        boundary=FinancialBoundary(clock)
+        live.read_runtime=LPReadRuntime(boundary.factory,clock=clock,utc_now=clock.utc)
         boundary.orders=[wire_row('A')] if with_buy else []
         producer=PolymarketLPService(live.store,trading,clock=clock.utc)
         execution=attach(live,producer,root)
@@ -862,7 +865,7 @@ def test_scheduler_waits_for_cleanup_fault_exit_without_busy_loop(tmp_path):
                 scheduler.run_due()
                 drive_until(lambda:('account',CID,'yes','A') in live.state.snapshot().read_failures
                     and live.state.snapshot().yields[('account',CID,'yes','A')].yield_pct_per_hour.state=='known')
-            boundary.holds={('O','balance')};boundary.mode[('O','balance')]='swallow'
+            boundary.hold_source='balance'
             start=5 if with_buy else 0
             clock.value=start;live.read_runtime.wake();scheduler.request_check();assert scheduler.run_due()
             boundary.wait(lambda:any(e[:3]==('entered','O','balance') and e[3]==start for e in boundary.events))
@@ -912,29 +915,32 @@ def test_scheduler_waits_for_cleanup_fault_exit_without_busy_loop(tmp_path):
                 clock.value=15;live.read_runtime.wake();assert scheduler.run_due()
                 drive_until(lambda:live.state.snapshot().yields[('account',CID,'yes','A')].evaluated_at==clock.utc())
                 assert count(live)==0
-            # Actual exit is an event, not a retry or a claimed financial recovery.
-            boundary.release.set()
-            boundary.wait(lambda:any(e[:3]==('finally_exited','O','balance') and e[3]==clock() for e in boundary.events)
-                and not next(s for s in live.read_runtime.status()['scopes'] if s['key'][3]=='financial')['active'])
-            boundary.wait(lambda:any(n['cleanup_faults']==1 and not next(s for s in n['scopes'] if s['key'][3]=='financial')['active']
-                for n in notices))
-            assert scheduler.run_due()
+            # Actual response close releases only the financial delay blocker.
+            # Its original notification was collected above; fresh facts need a new attempt.
+            assert boundary.close_entered.is_set() and not boundary.close_exited.is_set()
+            boundary.close_release.set()
+            assert boundary.close_exited.wait(4)
+            boundary.wait(lambda:live.read_runtime.status()['last_financial_cleanup_fault']['ended_monotonic']==clock())
+            drive_until(lambda:live.state.snapshot().observation.orders_complete
+                and live.state.snapshot().observation.components['balance'].checked_at==clock.utc())
             status=live.read_runtime.status()
-            assert status['cleanup_faults']==1 and not status['new_buy_allowed']
-            assert status['pool_count']>=2 and live.state.snapshot().new_capacity.state=='unknown'
-            assert len([e for e in boundary.events if e[:3]==('entered','O','balance') and e[3]>=start])==1
+            assert status['cleanup_faults']==0 and status['new_buy_allowed']
+            assert status['financial_cleanup_faults']==1
+            assert status['pool_count']>=2 and live.state.snapshot().new_capacity.state=='known'
+            assert len([e for e in boundary.events if e[:3]==('entered','O','balance') and e[3]>=start])==2
+            assert len(boundary.clients)==2 and len(boundary.ports)==1
             assert trading.cancels==[]
             scheduler.start()
             def monitor_waiting():
                 monitor=scheduler.snapshot()
                 return monitor['scheduler_running'] and not monitor['check_in_progress'] and (
-                    monitor['next_check_at'] is None if not with_buy else monitor['next_check_at'] is not None
+                    monitor['next_check_at'] is not None
                     and datetime.fromisoformat(monitor['next_check_at'])>clock.utc())
             boundary.wait(monitor_waiting)
             scheduler.stop()
             assert not scheduler.snapshot()['scheduler_running']
         finally:
-            boundary.release.set();scheduler.stop()
+            boundary.close_release.set();boundary.release.set();scheduler.stop()
             assert live.close(4)
 
 

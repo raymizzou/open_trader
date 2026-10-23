@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-23 — LP financial read recovery after actual cleanup
+
+- Financial reads resume through the existing HTTP clients after delayed cancellation cleanup actually ends. Held responses still block overlap; unread timeout/fault notices, the original cadence and provider/account Retry-After remain enforced.
+- Runtime status separates current cleanup blockers from a bounded financial fault count and latest completion record. Recovery still requires fresh complete account facts and preserves UNKNOWN, request identity and no-replay guards. BUY, exact, low-frequency and port-close fault behavior is unchanged.
+
 ## 2026-10-23 — Managed launchd failed-start recovery
 
 - Normal Prediction Host Readiness requires explicit verified managed identity from preflight. Empty-host installability still reports READY, but requires `FIRST_DEPLOY=1` and its fresh-host ownership checks.

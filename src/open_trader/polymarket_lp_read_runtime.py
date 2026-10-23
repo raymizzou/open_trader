@@ -60,6 +60,7 @@ class _Scope:
         self.port=None;self.tasks=();self.completed_sources={};self.active=False;self.closing=False;self.closed=False
         self.retiring=False;self.attempt=0;self.next_start=0;self.result=None
         self.started=self.deadline=0;self.actual_end=None;self.expired=False;self.cancel_sent=False;self.fault=False;self.fault_pending=False
+        self.financial_cleanup_delayed=False
 
 class LPReadRuntime:
     def __init__(self, source_factory, *, clock=time.monotonic, utc_now=lambda:datetime.now(UTC), buy_cap=BUY_SCOPE_CAP,
@@ -71,6 +72,7 @@ class LPReadRuntime:
         # Runtime-lifetime identity, independent of scope retirement. One
         # scalar avoids retaining an unbounded ledger of departed order keys.
         self._attempt_sequence=0
+        self._financial_cleanup_faults=0;self._last_financial_cleanup_fault=None
         self._close_lock=threading.Lock()
         self._last_notice=None
         self._observed=-1;self._closed=False;self._started=False;self._signal=threading.Event();self._wakeup=lambda:None
@@ -118,6 +120,15 @@ class LPReadRuntime:
                             scope.lane.loop.call_soon_threadsafe(self._cancel_children,scope)
                     if scope.active and scope.cancel_sent and self.clock()>=scope.deadline+1 and not scope.fault:
                         scope.fault=True;scope.fault_pending=True
+                        if scope.result is not None:
+                            scope.result=replace(scope.result,cleanup_fault=True)
+                        if scope.demand.kind=='financial':
+                            scope.financial_cleanup_delayed=True
+                            self._financial_cleanup_faults+=1
+                            self._last_financial_cleanup_fault=dict(attempt=scope.attempt,
+                                sources=tuple(name for name,task in zip(scope.demand.sources,scope.tasks)
+                                    if name in ('balance','open_orders','positions') and not task.done())[:3],
+                                fault_monotonic=self.clock(),ended_monotonic=None)
                     if scope.retiring and not scope.active and not scope.closing and not scope.closed:
                         scope.closing=True;scope.lane.submit(self._close_scope(scope))
                     if scope.closed and scope.result is None and not scope.fault_pending:
@@ -132,9 +143,12 @@ class LPReadRuntime:
                 for scope in sorted(self._scopes.values(),key=lambda s:(s.next_start,
                         0 if s.demand.kind=='position' else 1,self._ages.get(s.demand.key,0))):
                     updated=self._demands.get(scope.demand.key)
-                    if updated is not None and not scope.active and scope.result is None:
+                    if (updated is not None and not scope.active and scope.result is None
+                            and not (scope.demand.kind=='financial' and scope.fault_pending)):
                         scope.demand=updated
-                    if not scope.retiring and not scope.fault and not scope.active and scope.result is None and self.clock()>=scope.next_start:
+                    if (not scope.retiring and not scope.fault and not scope.active and scope.result is None
+                            and not (scope.demand.kind=='financial' and scope.fault_pending)
+                            and self.clock()>=scope.next_start):
                         kind=scope.demand.kind
                         lane=_fixed_lane(kind)
                         if lane is not None:
@@ -265,6 +279,15 @@ class LPReadRuntime:
 
     def _ended(self,scope,sources):
         scope.active=False;scope.actual_end=self.clock()
+        # gather has collected the actual children, including response.aclose.
+        # Financial delay faults block only while that ownership remains live;
+        # their mailbox and bounded history survive until the owner collects.
+        # Port-close failures and other lanes retain their existing semantics.
+        if scope.financial_cleanup_delayed:
+            scope.fault=False;scope.financial_cleanup_delayed=False
+            if self._last_financial_cleanup_fault['attempt']==scope.attempt:
+                self._last_financial_cleanup_fault=dict(self._last_financial_cleanup_fault,
+                    ended_monotonic=scope.actual_end)
         scope.next_start=max(scope.started+({'sell':30,'position':60}.get(scope.demand.kind,5)),
             scope.actual_end,*(s.retry_at or 0 for s in sources.values()))
 
@@ -290,7 +313,7 @@ class LPReadRuntime:
             result=[]
             for scope in self._scopes.values():
                 if scope.result is not None:
-                    result.append(replace(scope.result,cleanup_fault=scope.fault))
+                    result.append(replace(scope.result,cleanup_fault=scope.result.cleanup_fault or scope.fault))
                     scope.result=None;scope.fault_pending=False
                 elif scope.fault_pending:
                     result.append(MarketAttempt(scope.demand,scope.attempt,scope.started,scope.deadline,
@@ -333,6 +356,8 @@ class LPReadRuntime:
                     or any(s.fault or s.retiring or s.closing for s in self._scopes.values())),
                 policy=dict(buy_cap=self.buy_cap,cache_entries=self.cache_entries,cache_bytes=self.cache_bytes),
                 observed_monotonic=self._observed,cleanup_faults=faults,owned_buy_scopes=len(owned),
+                financial_cleanup_faults=self._financial_cleanup_faults,
+                last_financial_cleanup_fault=self._last_financial_cleanup_fault,
                 retiring_buy_scopes=sum(s.retiring for s in owned),deferred_count=len(deferred),
                 deferred_order_ids=tuple(d.order_id for d in deferred[:64]),new_buy_allowed=len(owned)<self.buy_cap and not deferred and not fixed_faults,
                 ready_buy_count=sum(s.result is not None or s.fault_pending for s in owned),
