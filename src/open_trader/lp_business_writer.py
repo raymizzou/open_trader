@@ -120,6 +120,22 @@ class ProgressRecord:
             raise ValueError('record_progress_invalid')
 
 
+@dataclass(frozen=True)
+class CancelTerminalRecord:
+    """One terminal fact for exact matching durable cancel request parents."""
+    progress: ProgressRecord
+    venue: str
+    order_type: str
+    expiration: int | None
+
+    def __post_init__(self):
+        if (type(self.progress) is not ProgressRecord
+                or type(self.venue) is not str or not self.venue
+                or type(self.order_type) is not str or not self.order_type
+                or self.expiration is not None and (type(self.expiration) is not int or self.expiration < 0)):
+            raise ValueError('cancel_terminal_record_invalid')
+
+
 def _validate_evidence(record, timestamp):
     for value in (record.account_id, record.process_epoch, record.request_id, record.session_id,
                   record.condition_id, record.token_id):
@@ -156,7 +172,7 @@ class LPBusinessWriter:
         self._thread.start()
 
     def offer(self, record):
-        if type(record) not in (RequestRecord, ReceiptRecord, ProgressRecord):
+        if type(record) not in (RequestRecord, ReceiptRecord, ProgressRecord, CancelTerminalRecord):
             raise TypeError('closed_business_record_required')
         encoded = json.dumps(asdict(record), ensure_ascii=False, separators=(',', ':'), default=_encode_scalar)
         size = len(encoded.encode('utf-8'))

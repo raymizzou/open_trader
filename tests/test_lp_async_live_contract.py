@@ -1303,9 +1303,10 @@ def test_scheduler_wakes_deferred_read_fault_cancel_after_manual_cancel_completi
     execution.set_lp_auto_wakeup(notice)
     changed=threading.Condition();entered=set();finished=set();threads={}
     releases={oid:threading.Event() for oid in targets}
-    active=0;maximum=0;admitted=False;gate=False;pair=set();deferred=None
+    protection_release=threading.Event();native_calls=set()
+    active=0;maximum=0;admitted=False
     manual_phase=False;manual_calls=[];callers={};responses={};errors=[]
-    owner_thread=threading.current_thread();actual_cancel=trading.cancel_orders_detailed
+    actual_cancel=trading.cancel_orders_detailed
     def cancel(ids):
         nonlocal active,maximum
         assert len(ids)==1 and ids[0] in targets
@@ -1313,17 +1314,18 @@ def test_scheduler_wakes_deferred_read_fault_cancel_after_manual_cancel_completi
         manual=threading.current_thread().name=='lp-d2-manual-cancel'
         if not manual_phase:return actual_cancel(ids)  # separately recorded setup protection ownership
         with changed:
-            assert oid not in entered,'manual or UNKNOWN cancel must not replay'
-            entered.add(oid);threads[oid]=threading.current_thread()
+            assert (manual,oid) not in native_calls,'same request/source must not replay'
+            native_calls.add((manual,oid))
+            entered.add(oid);threads[(manual,oid)]=threading.current_thread()
             active+=1;maximum=max(maximum,active);changed.notify_all()
         try:
-            assert releases[oid].wait(4),'external native cancel release watchdog'
+            assert (releases[oid] if manual else protection_release).wait(4),'external native cancel release watchdog'
             if manual:
                 manual_calls.append(ids)
                 return dict(canceled=[],not_canceled={oid:'UNKNOWN'})
             return actual_cancel(ids)
         finally:
-            with changed:active-=1;finished.add(oid);changed.notify_all()
+            with changed:active-=1;finished.add((manual,oid));changed.notify_all()
     trading.cancel_orders_detailed=cancel
     def requests():
         return {t.order_key[3]:t.request_id for p in live.state.snapshot().progress.values()
@@ -1332,23 +1334,7 @@ def test_scheduler_wakes_deferred_read_fault_cancel_after_manual_cancel_completi
         def __init__(self,actual):self.actual=actual
         def allowed(self,action=None):return admitted and self.actual.allowed(action)
         def release(self):
-            nonlocal gate,pair,deferred
             self.actual.release()
-            if not gate or threading.current_thread() is not owner_thread:return
-            # This temporary lease belongs to the third cap2 refusal. The live
-            # state lock has exited; external returns can now complete normally.
-            gate=False
-            assert live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)>0
-            boundary.wait(lambda:len(entered)==2)
-            pair=set(entered);deferred=next(iter(targets-pair))
-            assert pair=={'A','B'} and deferred=='C'
-            assert set(requests())==pair and live.status()['native_inflight']==2
-            for oid in pair:releases[oid].set()
-            for oid in pair:threads[oid].join(4);assert not threads[oid].is_alive()
-            for oid in pair:callers[oid].join(4);assert not callers[oid].is_alive()
-            assert errors==[] and set(responses)==pair
-            assert finished==pair and live.status()['native_inflight']==0
-            assert set(requests())==pair  # no fabricated third request/attempt
     def drive_until(predicate):
         end=time.monotonic()+4
         while not predicate():
@@ -1382,6 +1368,7 @@ def test_scheduler_wakes_deferred_read_fault_cancel_after_manual_cancel_completi
         assert not state['new_buy_allowed'] and state['pool_count']==8
         assert scheduler.snapshot()['next_check_at'] is None
         assert requests()=={} and trading.cancels==[] and not entered
+        setup_source=snapshot.observation.order_view.orders_source
         captured_orders.extend(snapshot.observation.source_frame.orders)
         # Real public protection requests establish A/B UNKNOWN ownership before
         # the reported manual interleaving; no private cancel markers injected.
@@ -1406,34 +1393,52 @@ def test_scheduler_wakes_deferred_read_fault_cancel_after_manual_cancel_completi
             callers[oid].start();boundary.wait(lambda:oid in entered)
         assert live.status()['native_inflight']==2 and all(t.is_alive() for t in callers.values())
         assert requests()==setup_ids
+        current_source=live.state.snapshot().observation.order_view.orders_source
+        assert (current_source.source_id,current_source.checked_at)!=(setup_source.source_id,setup_source.checked_at)
         before=list(boundary.events);reads_before=list(manual_reads)
-        admitted=True;gate=True
-        # This initial public command starts C's capacity check. Only actual
-        # manual-native completion may rescue C after that check defers it.
+        admitted=True
+        # Manual reads accepted a new raw source: A/B get distinct protection
+        # requests while their manual calls remain held; C enters independently.
         execution.lp_auto_run_once();assert scheduler.run_due()
-        assert not gate and len(pair)==2 and deferred not in requests()
-        assert set(entered)==finished==pair and manual_calls==[('A',),('B',)] or (
-            set(entered)==finished==pair and manual_calls==[('B',),('A',)])
-        assert trading.cancels==[('A',),('B',)]
+        boundary.wait(lambda:native_calls=={(True,'A'),(True,'B'),*( (False,oid) for oid in targets)})
+        assert set(requests())==targets and len(set(requests().values()))==3
+        assert all(requests()[oid]!=setup_ids[oid] for oid in ('A','B'))
+        assert live.status()['native_inflight']==5 and maximum==5
+        assert all(t.is_alive() for t in callers.values()) and not finished
+        assert manual_calls==[] and trading.cancels==[('A',),('B',)]
+        assert live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)==0
+        assert boundary.events==before and manual_reads==reads_before and clock()==11
+        pair={'A','B'};deferred='C'
+        for oid in pair:releases[oid].set()
+        for oid in pair:threads[(True,oid)].join(4);assert not threads[(True,oid)].is_alive()
+        for oid in pair:callers[oid].join(4);assert not callers[oid].is_alive()
+        assert errors==[] and set(responses)==pair and finished=={(True,oid) for oid in pair}
+        assert sorted(manual_calls)==[('A',),('B',)]
         assert all(responses[oid]==dict(requested=1,canceled=[],not_canceled={oid:'UNKNOWN'},skipped=[]) for oid in pair)
-        assert requests()==setup_ids
-        assert live.status()['native_inflight']==0,(live.diagnostics()['cancel_blocks'],requests(),entered,live.state.snapshot().progress)
+        assert live.status()['native_inflight']==3 and not protection_release.is_set()
         state=live.read_runtime.status()
         assert state['next_dependency_monotonic'] is None and state['ready_count']==0
         assert len(state['scopes'])==4 and not any(s['key'][3]=='exact' for s in state['scopes'])
         assert boundary.events==before and manual_reads==reads_before and clock()==11
-        assert scheduler.run_due(),'native completion must wake deferred protection at the same business time'
-        boundary.wait(lambda:entered==targets)
-        assert set(requests())==targets and len(set(requests().values()))==3
-        assert clock()==11 and boundary.events==before and maximum==2
-        releases[deferred].set();threads[deferred].join(4);assert not threads[deferred].is_alive()
+        assert scheduler.run_due(),'actual manual lease/native completion must wake protection at the same business time'
+        assert live.status()['native_inflight']==3 and set(requests())==targets
+        protection_release.set()
+        for oid in targets:
+            threads[(False,oid)].join(4);assert not threads[(False,oid)].is_alive()
         assert scheduler.run_due()  # consume actual C completion, then idle
         drive_until(lambda:scheduler.snapshot()['next_check_at'] is None)
         snapshot=live.state.snapshot();state=live.read_runtime.status()
-        assert trading.cancels==[('A',),('B',),('C',)] and finished==targets
-        assert requests()['A']==setup_ids['A'] and requests()['B']==setup_ids['B']
+        assert sorted(trading.cancels)==[('A',),('A',),('B',),('B',),('C',)]
+        assert finished=={(True,'A'),(True,'B'),*((False,oid) for oid in targets)}
+        assert all(requests()[oid]!=setup_ids[oid] for oid in ('A','B'))
+        from tests.test_lp_cancel_lock_regressions import drained, action_rows
+        drained(live.writer)
+        audit={row['request_id']:row for row in action_rows(store)}
+        for oid,request_id in setup_ids.items():
+            assert audit[request_id]['order_id']==oid and audit[request_id]['receipt']['outcome']=='unknown'
+        assert len({requests()[oid] for oid in targets}|set(setup_ids.values()))==5
         assert sorted(manual_calls)==[('A',),('B',)] and manual_reads==reads_before
-        assert maximum==2 and live.status()['native_inflight']==0
+        assert maximum==5 and live.status()['native_inflight']==0
         partial=next(o for o in snapshot.orders if o.key[3]=='C')
         assert (partial.original_size.value,partial.size_matched.value,partial.remaining.value)==(20,3,17)
         assert {o.key[3] for o in snapshot.active_orders}==targets and not snapshot.openings
@@ -1443,9 +1448,9 @@ def test_scheduler_wakes_deferred_read_fault_cancel_after_manual_cancel_completi
         assert state['next_dependency_monotonic'] is None and state['cleanup_faults']==4 and state['pool_count']==8
         assert state['ready_count']==0 and len(state['scopes'])==4 and boundary.events==before
         assert all(not scheduler.run_due() for _ in range(100))
-        assert len(trading.cancels)==3 and clock()==11
+        assert len(trading.cancels)==5 and clock()==11
     finally:
-        gate=False
+        protection_release.set()
         for release in releases.values():release.set()
         for caller in callers.values():caller.join(4)
         boundary.release.set();scheduler.stop();assert live.close(4)
