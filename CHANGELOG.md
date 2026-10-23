@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-23 — LP exact-proof request admission test synchronization
+
+- LP postreceipt controls now follow published read deadlines until the external exact-order response is actually held, then check UNKNOWN finality at unchanged business time. Three controls defer successful proof admission with one unavailable external response and the normal five-second read cadence. Original immediate-wake, exact cancellation, manual funds and no-replay assertions remain. Test synchronization only; production behavior is unchanged.
+
 ## 2026-10-22 — LP manual-order candidate publication test synchronization
 
 - The manual-D income rebuild regression waits for current D market proof and its BUY in a receipt-current account after the manual order is removed. A finite external HTTP gate covers account data arriving before D market publication; exact D30, final B50/D30/A20, manual capital and no-replay assertions remain. Test synchronization only; production behavior is unchanged.

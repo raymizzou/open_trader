@@ -2215,14 +2215,27 @@ def test_observed_pool_mode_exit_preserves_trading_guard_and_versions(tmp_path,m
 ])
 def test_pool_postreceipt_observation_waits_for_external_publication(
         tmp_path,monkeypatch,case,source,pool_async_watchdog,request):
+    _exercise_postreceipt_publication(tmp_path,monkeypatch,case,source,pool_async_watchdog,request)
+
+
+@pytest.mark.parametrize('case',['group','early','last'])
+def test_pool_exact_proof_gate_waits_for_request_admission(
+        tmp_path,monkeypatch,case,pool_async_watchdog,request):
+    _exercise_postreceipt_publication(tmp_path,monkeypatch,case,'order',pool_async_watchdog,
+        request,defer_admission=True)
+
+
+def _exercise_postreceipt_publication(
+        tmp_path,monkeypatch,case,source,pool_async_watchdog,request,*,defer_admission=False):
     """Delay actual HTTP bytes; keep the original six assertion sequences."""
-    import asyncio,sys
+    import asyncio,httpx,sys,time
     from threading import Event
     target='old-J' if case=='last' else 'old-E'
     rigs=[]
     class ScheduledRig(AsyncPoolRig):
         def __init__(self,*args,**kwargs):
             self.proof_entered,self.proof_release=Event(),Event()
+            self.proof_deferred=Event();self.deferred_at=None;self.admission_checks=[]
             self.proof_checks=[]
             super().__init__(*args,**kwargs)
             rigs.append(self)
@@ -2234,14 +2247,41 @@ def test_pool_postreceipt_observation_waits_for_external_publication(
             if (after_receipt and req.headers['x-lp-source']==source
                     and (source!='order' or req.headers['x-lp-order']==target)
                     and not self.proof_release.is_set()):
+                if defer_admission and not self.proof_deferred.is_set():
+                    # One unavailable external response leaves the exact scope
+                    # on its normal five-second cadence, without final proof.
+                    self.deferred_at=self.seconds;self.proof_deferred.set()
+                    return httpx.Response(503)
                 self.proof_entered.set()
                 assert await asyncio.get_running_loop().run_in_executor(
                     None,self.proof_release.wait,4),'external proof publication watchdog'
             return response
 
         def converge_current(self,predicate,*,timeout=4):
+            end=time.monotonic()+timeout
+            if defer_admission:
+                def deferred_until_next_read():
+                    status=self.live.read_runtime.status()
+                    due=status['next_dependency_monotonic']
+                    return (self.proof_deferred.is_set() and status['ready_count']==0
+                        and not any(scope['active'] for scope in status['scopes'])
+                        and status['observed_monotonic']>=self.seconds
+                        and due is not None and due>self.seconds)
+                super().converge_current(deferred_until_next_read,timeout=max(0,end-time.monotonic()))
+                assert not self.proof_entered.is_set() and not self.proof_release.is_set()
+                partial=next(o for o in self.live.state.snapshot().orders if o.key[3]==target)
+                assert partial.remaining.state=='unknown'
+                assert partial.terminal_proof.matched.state=='unknown'
+                due=self.live.read_runtime.status()['next_dependency_monotonic']
+                self.admission_checks.append((self.seconds,due))
+            # Original wake assertions have already completed at their original
+            # stamp. Admission may need a later published read deadline; only an
+            # actually held HTTP response starts the unchanged-time proof phase.
+            super().converge_current(self.proof_entered.is_set,timeout=max(0,end-time.monotonic()))
+            assert self.proof_entered.is_set() and not self.proof_release.is_set()
             stamp=self.seconds
-            self.pump(self.proof_entered.is_set)
+            if defer_admission:
+                assert stamp>self.deferred_at
             snapshot=self.live.state.snapshot()
             if source=='order':
                 partial=next(o for o in snapshot.orders if o.key[3]==target)
@@ -2261,11 +2301,11 @@ def test_pool_postreceipt_observation_waits_for_external_publication(
                     and not any(scope['active'] for scope in status['scopes'])
                     and status['observed_monotonic']>=self.seconds
                     and due is not None and due>self.seconds))
-            self.pump(published_or_next_read)
+            self.pump(published_or_next_read,timeout=max(0,end-time.monotonic()))
             status=self.live.read_runtime.status()
             # If the result is stale, a fixed-clock pump has no runnable read.
             self.proof_checks.append((source,stamp,predicate(),status['next_dependency_monotonic']))
-            super().converge_current(predicate,timeout=timeout)
+            super().converge_current(predicate,timeout=max(0,end-time.monotonic()))
 
         def close(self):
             self.proof_release.set()
@@ -2284,6 +2324,9 @@ def test_pool_postreceipt_observation_waits_for_external_publication(
         original(tmp_path,monkeypatch,pool_async_watchdog)
     assert len(rigs)==1 and len(rigs[0].proof_checks)==1
     request.node.user_properties.append(('external_proof_boundary',repr(rigs[0].proof_checks)))
+    if defer_admission:
+        assert len(rigs[0].admission_checks)==1
+        request.node.user_properties.append(('deferred_proof_admission',repr(rigs[0].admission_checks)))
 
 
 def test_manual_income_rebuild_waits_for_candidate_publication(tmp_path,monkeypatch,pool_async_watchdog,request):
