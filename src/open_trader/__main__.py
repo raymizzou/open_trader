@@ -5,6 +5,10 @@ import sys
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
+    if args[:2] == ["prediction-arb", "lp-auto"]:
+        from .lp_auto_cli import main as lp_auto_main
+
+        return lp_auto_main(args[2:])
     if args[:1] == ["frontend-gateway"]:
         from .frontend_gateway import main as frontend_gateway_main
 
