@@ -5,6 +5,17 @@
 - Restore ISO datetime strings in rotation diagnostics while retaining exact integer GTD expiration in request audits and terms checks. Diagnostic reads remain isolated and perform no trading or account I/O.
 - Align deferred-origin, partial-fill, protection priority and restart/expiry checks with independent CANCEL capacity and every actual request lifetime. GTD checks hold real HTTP reads and drain them before advancing business time; financial, identity, UNKNOWN and no-replay guards remain.
 
+## 2026-10-23 — External PR review and bounded worker recovery
+
+- Use external dots/Opus GitHub reviews and comments for independent PR review. Main monitors complete paginated feedback and exact-SHA checks with a durable wake/check owner and next check; no automatic local reviewer fallback. Keep pending review and CI distinct from merge success.
+- Batch routine scoped repairs with the existing worker. Main replies with published fix/check evidence and resolves only verified addressed threads; expanded or uncertain-contract changes still need the user's decision. Merge/deploy authority and main-only CI remain unchanged.
+- Recover settled transient worker-capacity errors in the same session/model: verify no active or queued command, then retry once and at most twice more after 60 and 120 seconds. Stop on actual progress; report three exhausted retries or ten minutes without progress. Preserve saved work, user-selected settings and the ban on duplicate commands.
+
+## 2026-10-23 — LP CLI startup and outcome confirmation
+
+- Route LP help/status/controls through a lightweight shared argument parser. Default human output shows at most three outcome/state/budget lines; `--verbose` exposes D2 and legacy diagnostics. JSON shape, result tokens, redaction and exits remain compatible.
+- Preserve explicit safe nulls on LP auto HTTP receipts. Accepted D2 controls use only bounded confirmation GETs under the original deadline and original control version; missing proof, peer intent changes, rejection, fatal state and expiry stay unconfirmed. No control POST replay, live state change or deployment is performed by this change.
+
 ## 2026-10-23 — LP cancellation follows fresh account facts
 
 - Triggered protection persists until its exact BUY leaves the open-order view. Each new valid source can create one new request per ID, including while an older CANCEL is pending; repeated source consumption never replays a request.

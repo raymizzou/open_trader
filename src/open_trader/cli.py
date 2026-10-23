@@ -20,7 +20,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from .lp_auto_cli import LPArgumentParser, run as run_lp_auto
+from .lp_auto_cli import (
+    add_arguments as add_lp_auto_arguments,
+    run_namespace as run_lp_auto_namespace,
+)
 
 from .a_share_trend import (
     _process_version,
@@ -1529,33 +1532,7 @@ def build_parser() -> argparse.ArgumentParser:
     lp_auto_parser = prediction_commands.add_parser(
         "lp-auto", help="Inspect and control LP Auto through the running service"
     )
-    lp_auto_commands = lp_auto_parser.add_subparsers(
-        dest="lp_auto_command", required=True, parser_class=LPArgumentParser
-    )
-    for action, description in (
-        ("status", "Read actual LP Auto service state"),
-        ("config", "Save configuration without enabling Auto"),
-        ("on", "Enable Auto with saved configuration; report actual runtime state"),
-        ("off", "Pause new automatic BUYs; existing orders and protection remain"),
-        ("pause", "Persist pause and wait for service confirmation; existing orders remain"),
-    ):
-        command = lp_auto_commands.add_parser(action, help=description)
-        command.add_argument("--url", default="http://127.0.0.1:8769")
-        command.add_argument("--timeout", default=15.0)
-        command.add_argument("--json", action="store_true")
-        if action == "config":
-            command.add_argument("--budget", help="Legacy alias for trial budget")
-            command.add_argument("--trial-budget")
-            command.add_argument("--income-budget")
-            command.add_argument("--target-buys")
-            command.add_argument("--bid-level")
-            command.add_argument("--allocation-mode", choices=("minimum", "rank_weights", "observed_pools"))
-            command.add_argument("--allocation-weights", help="Comma-separated Decimal strings; no normalization")
-            command.add_argument("--allocation-shadow-enabled", choices=("true", "false"))
-            for option in ('round-interval-seconds', 'api-retry-interval-seconds', 'order-check-interval-seconds'):
-                command.add_argument('--' + option, help=(
-                    'Retired in continuous mode; setting this option returns an error'
-                    if option == 'round-interval-seconds' else 'Dependency retry/check seconds'))
+    add_lp_auto_arguments(lp_auto_parser)
 
     cross_auto_parser = prediction_commands.add_parser(
         "cross-auto", help="Inspect Service-owned cross-venue execution state"
@@ -2048,19 +2025,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({"state": "locked", "reason": getattr(exc, "error_code", type(exc).__name__)}))
                 return 2
         if args.prediction_command == "lp-auto":
-            return run_lp_auto(args.lp_auto_command, args.url, args.timeout,
-                               json_output=getattr(args, "json", False),
-                               budget=getattr(args, "budget", None),
-                               trial_budget=getattr(args, "trial_budget", None),
-                               income_budget=getattr(args, "income_budget", None),
-                               target_buys=getattr(args, "target_buys", None),
-                               bid_level=getattr(args, "bid_level", None),
-                               allocation_mode=getattr(args, "allocation_mode", None),
-                               allocation_weights=getattr(args, "allocation_weights", None),
-                               allocation_shadow_enabled=getattr(args, "allocation_shadow_enabled", None),
-                               round_interval_seconds=getattr(args, 'round_interval_seconds', None),
-                               api_retry_interval_seconds=getattr(args, 'api_retry_interval_seconds', None),
-                               order_check_interval_seconds=getattr(args, 'order_check_interval_seconds', None))
+            return run_lp_auto_namespace(args)
         if args.prediction_command == "cross-auto":
             if args.cross_auto_command == "status":
                 try:

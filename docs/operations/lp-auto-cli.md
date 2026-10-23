@@ -104,6 +104,43 @@ service accepted the command but the reply was lost. Read status before any
 separately authorized next action. The launcher never retries a mutation or
 automatically pauses, rolls back or repairs the service.
 
+## Output and confirmation
+
+The deployed CLI prints at most three final lines by default: the command
+outcome, actual running/paused/blocked state and relevant saved budgets. A
+successful status read does not prove trading readiness. `ON` confirms the
+saved control, not filled BUY slots, eligibility, rewards or profit.
+
+Use `status --verbose` for control versions, save/error fields, D2 phase,
+round, top-level financial facts and diagnostics. Legacy slots/funds and
+last-round fields remain available there. Explicit safe nulls stay distinct
+from absent fields; an absent legacy display field does not prove a failed
+write. `--json` still emits one document with the existing `result`, `state`,
+`reason` and `next_action` keys, preserves absent versus null state fields and
+uses exits 0/2. When both flags are present, JSON takes precedence.
+
+Human `FAILED` means an invalid argument, a failure before the write attempt,
+or an explicit service rejection. `UNKNOWN (UNCONFIRMED)` means the write
+outcome is uncertain. Both exit 2; JSON retains `result: UNKNOWN` for these
+errors. Read status on the same endpoint before any separately authorized next
+write. The CLI never replays a control POST.
+
+For an accepted D2 `on`, `off` or `pause`, the CLI follows a pending save with
+bounded state GETs inside the original command deadline. Success requires the
+original requested control version and desired action, the same saved version,
+strict effective/pause state, no native control/settings save in flight and
+explicit `fatal=null`. A newer peer intent/version, missing proof, fatal,
+rejection or expiry cannot produce success. Legacy unconfirmed receipts stay
+UNKNOWN without confirmation polling. LP auto HTTP receipts use the same safe
+null-preserving projection as status; omitted safety facts are never filled in.
+
+The public module and installed application entrypoint route LP help, status
+and controls through a lightweight parser shared with the general CLI. They
+avoid unrelated application imports. Config validation still imports its
+existing domain validators. The stable launcher keeps all deployment identity,
+lock and endpoint checks; this repository change does not upgrade a deployed
+service or remove those checks.
+
 ## D2 dual-pool start sequence
 
 Use this sequence for the current D2 `observed_pools` mode after the operator
@@ -178,8 +215,8 @@ allowance and all current account BUY commitments still constrain new entries.
    `config_version` is the pre-save version plus one, the effective settings
    match, no settings remain pending/inflight, and the saved pause conditions
    above still hold. The CLI reads the current version and submits one CAS write;
-   it does not automatically pause, clear orders or enable Auto. Only explicit
-   dual-pool config has bounded pending-save confirmation reads within the
+   it does not automatically pause, clear orders or enable Auto. Explicit
+   dual-pool config retains bounded pending-save confirmation reads within the
    command deadline; this does not replay the write.
 
 4. **Enable separately, then confirm current state.** Only after configuration
@@ -201,21 +238,17 @@ allowance and all current account BUY commitments still constrain new entries.
    running control does not guarantee candidate eligibility, filled slots,
    execution, profit or rewards.
 
-Current `on`/`pause`/`off` can return `UNKNOWN` (exit 2) while saving or because a
-POST response lacks confirmation fields. UNKNOWN is not definitive failure and
-must never be blindly retried. Read `status --json` on the same managed endpoint
-and evaluate the conditions above; if still unconfirmed, investigate and keep
-new writes stopped. If config is UNKNOWN, compare the current settings and
-version before considering any separately authorized next step; do not enable
-from an unconfirmed config.
+`on`/`pause`/`off` wait for the original accepted D2 save as described above.
+They can still return `UNKNOWN` (exit 2) when confirmation expires, fields are
+missing or the outcome is uncertain. Do not retry blindly. Read `status --json`
+on the same managed endpoint and evaluate the conditions above. If still
+unconfirmed, investigate and keep new writes stopped. If config is UNKNOWN,
+compare current settings and version before considering any separately
+authorized next step; do not enable from an unconfirmed config.
 
-Today's human output still includes verbose legacy-shaped fields such as
-`runtime_state`, nested slots/funds and last-round fields. D2 can omit these,
-so their human values can be `UNKNOWN` even when a save is confirmed. Use the
-top-level result and fresh D2 JSON evidence together. Do not interpret a missing
-legacy display field as a failed write, or missing safety evidence as success.
-This documents current behavior; a new `--verbose` option or automatic control
-confirmation polling is not available as part of this procedure.
+Default human output is concise. Use `--verbose` for detailed D2/legacy fields,
+or fresh JSON for exact proof. Missing legacy fields do not imply failed saves;
+missing safety evidence never implies success.
 
 | Result or reason | Safe next action |
 | --- | --- |
@@ -455,8 +488,9 @@ Both pools share the existing read runtime, native cap2 and resource drain.
 Group cancel completion wakes deferred exact protection after its actual lease
 release. Status GET remains a memory snapshot.
 
-Only explicitly selected dual-pool configuration uses bounded pending-save
-confirmation reads. A legacy pending or unconfirmed config response stays
+Explicitly selected dual-pool configuration uses bounded pending-save
+confirmation reads, separately from D2 control confirmation. A legacy pending
+or unconfirmed config response stays
 `UNKNOWN` with exit2; it does not replay the write.
 
 See [ADR 0007](../contexts/prediction-arbitrage/docs/adr/0007-lp-trial-and-income-pools.md).
