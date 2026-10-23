@@ -318,7 +318,13 @@ forward-deployment wrapper, trust checks, environment limits and rollback path.
   listener, use `FIRST_DEPLOY=1`. This checks that no managed agent or selected
   listener exists, skips only the old Account status probe, and retains the
   installer, wallet, browser, storage, and Futu checks. The default mode still
-  requires running selected-service listeners and Account status.
+  requires running selected Gateway/Legacy/Account listeners and Account status.
+  Selected Prediction instead requires the supported manager's read-only
+  `--preflight` to exit zero with the exact preflight schema and `READY` or
+  `RECOVERABLE`. It passes the selected checkout, runtime, Python and private
+  config. A verified failed managed startup can pass without an old 8769
+  listener; missing listeners alone or unknown/malformed/blocked manager proof
+  cannot pass. First-deploy absence checks and post-install Smoke remain unchanged.
   It performs read-only macOS checks of system Chrome for the five marked
   Python browser regressions and checks the installed repository Playwright
   runner with cached Chromium. A missing host runner or browser is `BLOCKED`.

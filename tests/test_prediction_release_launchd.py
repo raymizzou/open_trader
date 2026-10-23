@@ -761,6 +761,7 @@ def test_production_first_install_records_only_observed_ready_evidence(
     binding = record["candidate"]["lp_validation"]
     assert record["candidate"] == {
         "lp_validation": binding,
+        "manifest": str(release_harness.manifest.resolve()),
         "checkout": str(release_harness.candidate.path),
         "git_sha": release_harness.sha,
         "source_state": "clean",
@@ -2395,6 +2396,7 @@ def test_release_preflight_reports_without_mutation(
     assert result.returncode == expected_code
     assert payload["schema_version"] == "open_trader.prediction_service.preflight.v1"
     assert payload["status"] == expected_status
+    assert payload["managed_identity_verified"] is (case in {"ready", "restart", "stale"})
     assert payload["reason"]
     if case in {"restart", "stale"}:
         assert set(payload["recorded_release"]) == {

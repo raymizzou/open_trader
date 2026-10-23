@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-23 — Managed launchd failed-start recovery
+
+- Normal Prediction Host Readiness requires explicit verified managed identity from preflight. Empty-host installability still reports READY, but requires `FIRST_DEPLOY=1` and its fresh-host ownership checks.
+- Failed restart also inspects the process table after removing the launchd job. A late startup that survives without a listener or lock, or an unavailable process inventory, blocks new startup permission.
+- Preserve the selected tracked release manifest in runtime records and same-release refreshes, including custom manifests used by early launchd self-context verification.
+- Selected Prediction Host Readiness consumes the verified manager preflight and accepts READY/RECOVERABLE without requiring the failed old service to listen on 8769. Other service, wallet, browser, storage and first-deploy checks remain.
+- Read-only preflight can identify a fully verified failed loaded service as recoverable. Explicit `--restart` rechecks its exact release, config, consumed permit and manager identity, stops only that label, and requires complete resource absence before one new startup permission. Unknown identities, held resources, saved pause and no-replay protections remain enforced.
+
 ## 2026-10-23 — LP exact-proof request admission test synchronization
 
 - LP postreceipt controls now follow published read deadlines until the external exact-order response is actually held, then check UNKNOWN finality at unchanged business time. Three controls defer successful proof admission with one unavailable external response and the normal five-second read cadence. Original immediate-wake, exact cancellation, manual funds and no-replay assertions remain. Test synchronization only; production behavior is unchanged.
