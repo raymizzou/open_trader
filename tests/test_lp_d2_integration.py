@@ -330,16 +330,16 @@ def test_independent_cancel_preserves_native_inflight_lifetime(tmp_path):
         settle_control(live)
         assert live.rounds.snapshot().round_number == 0
         assert live.state.snapshot().current.cycle_generation != old_generation
-        assert live.cancel_independent(key) is attempt  # no second native request after logical resume
-        cleanup = live.run_once()
-        assert cleanup.outcomes[0].status.value == 'not_sent'
-        assert calls == [('ordinary-A',)]
+        with pytest.raises(ValueError,match='independent_cancel_not_current'):
+            live.cancel_independent(key)  # logical resume supplies no new current facts
         assert not attempt.done() and live.status()['native_inflight'] == 1
         assert live.close(timeout=0) is False
         assert live.status()['native_inflight'] == 1
         release.set()
         outcome = attempt.result(timeout=3)
         assert outcome.identity is attempt.identity and outcome.status.value == 'accepted'
+        attempt._thread.join(3);assert attempt.done()
+        assert calls == [('ordinary-A',)]
         assert live.close(timeout=3) is True
         assert live.status()['native_inflight'] == 0
         assert calls == [('ordinary-A',)] and len(sdk.posts) == 2
@@ -889,14 +889,27 @@ def test_d2_unknown_yield_protection_cancels_at_600_without_replay(tmp_path, mon
         clock[0] = 1101
         live.run_once(candidates)
         attempts = live.run_protection_once()
-        for attempt in attempts: attempt.result(timeout=3)
+        for attempt in attempts:
+            attempt.result(timeout=3)
+            attempt._thread.join(3)
+            assert attempt.done()
         assert sdk.cancels == [('unknown-risk',)]  # new UNKNOWN +600, even while autoBUY paused
         assert sdk.posts == [] and sdk.market_orders == []
         assert next(o for o in live.state.snapshot().orders if o.key == key).terminal_proof is None
         assert next(o for o in live.state.snapshot().orders if o.key == key).remaining.value == 10
+        assert live.run_protection_once() == ()
+        assert sdk.cancels == [('unknown-risk',)]  # the consumed source grants no replay
+        clock[0] += 1
         live.run_once()
-        live.run_protection_once()
-        assert sdk.cancels == [('unknown-risk',)]  # uncertain result grants no replay
+        fresh, = live.run_protection_once()
+        assert fresh.identity.request_id != attempts[0].identity.request_id
+        assert fresh.result(timeout=3).status.value == 'unknown_error'
+        fresh._thread.join(3)
+        assert fresh.done() and sdk.cancels == [('unknown-risk',), ('unknown-risk',)]
+        assert live.run_protection_once() == ()
+        assert sdk.posts == [] and sdk.market_orders == []
+        assert next(o for o in live.state.snapshot().orders if o.key == key).terminal_proof is None
+        assert next(o for o in live.state.snapshot().orders if o.key == key).remaining.value == 10
         assert live.close(timeout=3)
         before = (sdk.order_reads, public.book_reads, len(sdk.cancels))
         assert live.run_protection_once() == ()
@@ -1394,13 +1407,13 @@ def test_d2_queue_cancel_capacity_defers_only_unattempted_targets(tmp_path, monk
         clock[0] = 1
         live.run_once()
         handles = list(live.run_protection_once(timeout=.02))
-        with changed: assert changed.wait_for(lambda: len(sent()) == (1 if occupied_slot else 2), timeout=2)
-        assert live.status()['native_inflight'] == 2
+        with changed: assert changed.wait_for(lambda: len(sent()) == 3, timeout=2)
+        assert live.status()['native_inflight'] == (4 if occupied_slot else 3)
         initial = set(sent())
         snap = live.state.snapshot()
         requested = {t.order_key[3] for p in snap.progress.values() for t in p.cancel_targets}
         assert requested == initial  # deferred IDs are not fabricated attempted requests
-        assert requested < targets
+        assert requested == targets
         live.run_protection_once(timeout=.02)
         assert set(sent()) == initial and len(sent()) == len(initial)
         if occupied_slot:
@@ -1413,16 +1426,19 @@ def test_d2_queue_cancel_capacity_defers_only_unattempted_targets(tmp_path, monk
         assert live.run_protection_once(timeout=.02) == ()  # old frame is not current after resume
         assert set(sent()) == initial
         release.set()
-        for h in handles: h.result(timeout=3)
-        if occupant: occupant.result(timeout=3)
+        for h in handles:
+            h.result(timeout=3);h._thread.join(3)
+        if occupant:
+            occupant.result(timeout=3);occupant._thread.join(3)
         # Real completion restores capacity; resume cleanup must not replay
         # an attempted UNKNOWN or steal an unattempted protected target.
         clock[0] = 2
         live.run_once()
         more = live.run_protection_once()
-        for h in more: h.result(timeout=3)
-        wanted = {'entry-A', 'queue-B'} if occupied_slot else targets
-        assert set(sent()) == wanted and len(sent()) == len(wanted)
+        for h in more:
+            h.result(timeout=3);h._thread.join(3)
+        wanted = targets
+        assert set(sent()) == wanted and sent().count('entry-A')==2 and all(sent().count(oid)==1 for oid in wanted-{'entry-A'})
         snap = live.state.snapshot()
         requested = [t for p in snap.progress.values() for t in p.cancel_targets]
         assert {t.order_key[3] for t in requested} == wanted
@@ -1435,8 +1451,11 @@ def test_d2_queue_cancel_capacity_defers_only_unattempted_targets(tmp_path, monk
         public.level = Decimal('10000')
         clock[0] = 3
         live.run_once()
-        live.run_protection_once()
-        assert set(sent()) == wanted and len(sent()) == len(wanted)
+        latest=live.run_protection_once()
+        for h in latest:
+            h.result(timeout=3);h._thread.join(3)
+        assert set(sent()) == wanted and sent().count('entry-A')==3
+        assert all(sent().count(oid)==1 for oid in wanted-{'entry-A'})
         assert all(oid in wanted | {'occupied-native'} for ids in sdk.cancels for oid in ids)
     finally:
         release.set()
@@ -1909,7 +1928,7 @@ def test_d2_deferred_queue_cancel_survives_successful_anchor_removal(tmp_path, m
         sdk.list_account_trades = account_trades
         sdk.orders = (_open_order('entry-A', 'BUY', price='.30', original='2000'),)
         assert live.state.snapshot().openings == {} and sdk.posts == []
-    releases = {oid: Event() for oid in ('entry-A', 'success-B')}
+    releases = {oid: Event() for oid in ('entry-A', 'success-B', 'deferred-C')}
     changed, terminal, exact_reads = Condition(), {}, []
     allow_final = [False]
     handles = {}
@@ -1927,7 +1946,6 @@ def test_d2_deferred_queue_cancel_survives_successful_anchor_removal(tmp_path, m
         return dict(canceled=order_ids, not_canceled={})  # exact ID ACK has no final quantity
     def exact(*, order_id):
         exact_reads.append(order_id)
-        assert order_id == 'entry-A'
         return terminal.get(order_id) if allow_final[0] else None
     sdk.cancel_orders, sdk.get_order = cancel, exact
     def sent(): return [oid for ids in sdk.cancels for oid in ids]
@@ -1946,44 +1964,47 @@ def test_d2_deferred_queue_cancel_survives_successful_anchor_removal(tmp_path, m
         live.run_once()
         attempts = live.run_protection_once()
         handles = {h.identity.target.existing_order_id: h for h in attempts}
-        with changed: assert changed.wait_for(lambda: set(sent()) == {'entry-A', 'success-B'}, timeout=2)
-        assert len(attempts) == 2 and live.status()['native_inflight'] == 2
-        assert {t.order_key[3] for t in live.state.snapshot().progress[baseline.key].cancel_targets} == {'entry-A', 'success-B'}
+        with changed: assert changed.wait_for(lambda: set(sent()) == {'entry-A', 'success-B', 'deferred-C'}, timeout=2)
+        assert len(attempts) == 3
+        releases['deferred-C'].set()
+        handles['deferred-C']._thread.join(2)
+        assert handles['deferred-C'].done() and live.status()['native_inflight'] == 2
+        assert {t.order_key[3] for t in live.state.snapshot().progress[baseline.key].cancel_targets} == {'entry-A', 'success-B', 'deferred-C'}
         releases['entry-A'].set()
         assert handles['entry-A'].result(timeout=3).status.value == 'accepted'
         handles['entry-A']._thread.join(timeout=2)
         assert handles['entry-A'].done() and not handles['success-B'].done()
-        assert live.status()['native_inflight'] == 1  # capacity exists; UNKNOWN is the remaining blocker
-        live.run_once()
+        assert live.status()['native_inflight'] == 1
+        # A receipt invalidates its source observation; it grants no fresh send.
         assert live.run_protection_once() == ()
-        snapshot = live.state.snapshot()
-        anchor = next(o for o in snapshot.orders if o.key[3] == 'entry-A')
-        assert anchor not in snapshot.active_orders and anchor.presence == 'absent'
-        assert anchor.terminal_proof.matched.state == 'unknown'
-        unknown_source = anchor.terminal_proof.matched.sources
-        assert unknown_source and anchor.size_matched.value == 0  # observed lower bound is not final0
-        assert sent() == ['entry-A', 'success-B'] or sent() == ['success-B', 'entry-A']
-        assert {t.order_key[3] for t in snapshot.progress[baseline.key].cancel_targets} == {'entry-A', 'success-B'}
         releases['success-B'].set()
         handles['success-B'].result(timeout=3)
         handles['success-B']._thread.join(timeout=2)
         assert all(h.done() for h in handles.values()) and live.status()['native_inflight'] == 0
         live.run_once()
         assert live.run_protection_once() == ()
-        assert set(sent()) == {'entry-A', 'success-B'} and len(sent()) == 2
+        assert set(sent()) == {'entry-A', 'success-B', 'deferred-C'} and len(sent()) == 3
+        snapshot = live.state.snapshot()
+        anchor = next(o for o in snapshot.orders if o.key[3] == 'entry-A')
+        assert anchor not in snapshot.active_orders and anchor.presence == 'absent'
+        assert anchor.terminal_proof.matched.state == 'unknown'
+        unknown_source = anchor.terminal_proof.matched.sources
+        assert unknown_source and anchor.size_matched.value == 0  # observed lower bound is not final0
+        assert set(sent()) == {'entry-A', 'success-B', 'deferred-C'} and len(sent())==3
+        assert {t.order_key[3] for t in snapshot.progress[baseline.key].cancel_targets} == {'entry-A', 'success-B', 'deferred-C'}
         allow_final[0] = True
         clock[0] += 61  # reader source retry deadline; no source proof is re-stamped by this test
         live.run_once()
         before_proof = live.state.snapshot()
         assert live.run_protection_once() == ()  # real exact final receipt fences old observation
         proven = live.state.snapshot()
-        assert exact_reads and set(exact_reads) == {'entry-A'}, 'accepted deferred manual anchor needs its exact Reader proof without an opening'
+        assert exact_reads and set(exact_reads) == {'entry-A','success-B','deferred-C'}, 'accepted deferred manual anchor needs its exact Reader proof without an opening'
         anchor = next(o for o in proven.orders if o.key[3] == 'entry-A')
         assert anchor.terminal_proof.identity_verified and anchor.terminal_proof.matched.value == Decimal(final_matched)
         assert anchor.terminal_proof.matched.sources != unknown_source
         assert proven.trade_version > before_proof.trade_version and anchor not in proven.active_orders
         assert live.run_protection_once() == ()  # no dispatch from the now-stale ordinary frame
-        assert len(sent()) == 2
+        assert len(sent()) == 3
         clock[0] += 1
         live.run_once()
         remaining = live.run_protection_once()
@@ -1991,7 +2012,7 @@ def test_d2_deferred_queue_cancel_survives_successful_anchor_removal(tmp_path, m
             h.result(timeout=3)
             h._thread.join(timeout=2)
             assert h.done()
-        wanted = {'entry-A', 'success-B', 'deferred-C'} if final_matched == '0' else {'entry-A', 'success-B'}
+        wanted = {'entry-A', 'success-B', 'deferred-C'}
         assert set(sent()) == wanted and len(sent()) == len(wanted), 'final0 anchor cancellation must preserve the original deferred target'
         snapshot = live.state.snapshot()
         assert {t.order_key[3] for t in snapshot.progress[baseline.key].cancel_targets} == wanted
@@ -2005,7 +2026,7 @@ def test_d2_deferred_queue_cancel_survives_successful_anchor_removal(tmp_path, m
             assert extra == (), tuple((p.key.kind, p.key.episode_id, p.reason_codes, p.ratio.value, tuple(t.order_key[3] for t in p.cancel_targets))
                 for p in live.state.snapshot().progress.values())
         assert set(sent()) == wanted and len(sent()) == len(wanted)
-        assert set(exact_reads) == {'entry-A'} and live.status()['native_inflight'] == 0
+        assert set(exact_reads) == {'entry-A','success-B','deferred-C'} and live.status()['native_inflight'] == 0
         assert len(sdk.posts) == (1 if anchor_origin == 'submitted' else 0)
         if anchor_origin == 'manual':
             assert live.state.snapshot().openings == {} and live.state.snapshot().own_fills == {}
@@ -2018,8 +2039,11 @@ def test_d2_deferred_queue_cancel_survives_successful_anchor_removal(tmp_path, m
 
 def test_d2_deferred_manual_anchor_proof_is_not_gated_by_prior_dispatch(tmp_path, monkeypatch):
     from threading import Event, Condition
+    from tests.test_lp_cancel_lock_regressions import PermissionPort
     from tests.test_lp_order_registration_contract import _open_order, CONDITION_ID, TOKEN_ID
     live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch, submit=False)
+    permission = PermissionPort()
+    live.bind_mutation_admission(permission, permission.acquire)
     releases = {oid: Event() for oid in ('unrelated-X', 'unrelated-Y')}
     changed, exact_reads, terminal, trade_queries = Condition(), [], {}, []
     allow_final = [False]
@@ -2044,11 +2068,13 @@ def test_d2_deferred_manual_anchor_proof_is_not_gated_by_prior_dispatch(tmp_path
             assert b_entered.wait(5), 'original first native target entry watchdog'
             c_entered.set()
         with changed:
+            original = next(o for o in sdk.orders if o.id == oid)
+            terminal[oid] = original.model_copy(update={'status': 'CANCELED'})
             sdk.orders = tuple(o for o in sdk.orders if o.id != oid)
         return dict(canceled=order_ids, not_canceled={})
     def exact(*, order_id):
         exact_reads.append(order_id)
-        assert order_id == 'entry-A'
+        assert order_id in {'entry-A', 'success-B', 'deferred-C', 'unrelated-X', 'unrelated-Y'}
         return terminal.get(order_id) if allow_final[0] else None
     sdk.cancel_orders, sdk.get_order = cancel, exact
     def sent(): return [oid for ids in sdk.cancels for oid in ids]
@@ -2065,6 +2091,7 @@ def test_d2_deferred_manual_anchor_proof_is_not_gated_by_prior_dispatch(tmp_path
         handles = {oid: live.cancel_independent((WALLET, CONDITION_ID, TOKEN_ID, oid)) for oid in releases}
         with changed: assert changed.wait_for(lambda: set(sent()) == set(releases), timeout=2)
         assert live.status()['native_inflight'] == 2 and all(not h.done() for h in handles.values())
+        permission.admit = False
         sdk.orders += (_open_order('success-B', 'BUY', price='.30', original='600', matched='100'),
             _open_order('deferred-C', 'BUY', price='.30', original='100'))
         public.level, clock[0] = Decimal('4000'), 1
@@ -2099,33 +2126,34 @@ def test_d2_deferred_manual_anchor_proof_is_not_gated_by_prior_dispatch(tmp_path
         assert proven.progress[baseline.key].cancel_targets == ()
         assert live.run_protection_once() == ()  # receipt invalidated the old ordinary frame
         live.run_once()
-        assert live.run_protection_once() == ()  # fresh proof cannot release occupied native capacity
+        assert live.run_protection_once() == ()  # external admission still denies mutation
         assert live.state.snapshot().progress[baseline.key].cancel_targets == ()
         assert set(sent()) == set(releases) and all(not h.done() for h in handles.values())
+        permission.admit = True
+        attempts = live.run_protection_once()
+        assert {h.identity.target.existing_order_id for h in attempts} == {'success-B', 'deferred-C'}
+        for handle in attempts:
+            assert handle.result(timeout=3).status.value == 'accepted'
+            handle._thread.join(timeout=2)
+            assert handle.done()
+        assert all(not h.done() for h in handles.values()), 'pending cancels cannot consume placement capacity'
+        assert live.status()['native_inflight'] == 2
+        assert {t.order_key[3] for t in live.state.snapshot().progress[baseline.key].cancel_targets} == {'success-B', 'deferred-C'}
         for oid, handle in handles.items():
             releases[oid].set()
             assert handle.result(timeout=3).status.value == 'accepted'
             handle._thread.join(timeout=2)
             assert handle.done()
         assert live.status()['native_inflight'] == 0
-        assert live.run_protection_once() == ()  # native receipts also require a fresh ordinary frame
-        clock[0] += 1
-        live.run_once()
-        attempts = live.run_protection_once()
-        assert {h.identity.target.existing_order_id for h in attempts} == {'success-B', 'deferred-C'}
-        for handle in attempts:
-            handle.result(timeout=3)
-            handle._thread.join(timeout=2)
-            assert handle.done()
         assert set(sent()) == {'unrelated-X', 'unrelated-Y', 'success-B', 'deferred-C'} and len(sent()) == 4
-        assert {t.order_key[3] for t in live.state.snapshot().progress[baseline.key].cancel_targets} == {'success-B', 'deferred-C'}
         sdk.orders += (_open_order('new-healthy-after-anchor', 'BUY', price='.30', original='100'),)
         for _ in range(2):
             clock[0] += 1
             live.run_once()
             assert live.run_protection_once() == ()
         assert set(sent()) == {'unrelated-X', 'unrelated-Y', 'success-B', 'deferred-C'} and len(sent()) == 4
-        assert set(exact_reads) == {'entry-A'} and live.status()['native_inflight'] == 0
+        assert set(exact_reads) == {'entry-A', 'success-B', 'deferred-C', 'unrelated-X', 'unrelated-Y'}
+        assert live.status()['native_inflight'] == 0
         assert live.state.snapshot().openings == {} and live.state.snapshot().own_fills == {}
         assert sdk.posts == [] and trade_queries == []
     finally:

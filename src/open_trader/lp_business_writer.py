@@ -89,7 +89,7 @@ class ReceiptRecord:
                 'independent_cancel_identity', 'independent_cancel_not_current',
                 'independent_cancel_inflight', 'rotation_not_current',
                 'protection_cancel_owned', 'protection_cancel_not_current',
-                'protection_evidence_not_current', 'native_capacity'}):
+                'protection_evidence_not_current', 'native_capacity', 'cancel_rejected'}):
             raise ValueError('record_reason_code_invalid')
         if self.outcome not in ('accepted', 'rejected', 'unknown', 'not_sent'):
             raise ValueError('record_outcome_invalid')

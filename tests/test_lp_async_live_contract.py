@@ -85,8 +85,12 @@ def test_eleventh_failure_latches_exact_cancel_and_success_resets_before_latch(t
             assert trading.cancels==[('A',)]
             boundary.mode[('A','native_rewards')]='success'
             advance(live,boundary,clock,start+10,lambda:count(live)==0)
-            for _ in range(3):live.run_once();live.run_protection_once()
-            assert trading.cancels==[('A',)]
+            handles=live.run_protection_once()
+            for handle in handles:
+                handle.result(4);handle._thread.join(4);assert handle.done()
+            assert trading.cancels==[('A',),('A',)]
+            for _ in range(3):live.run_once();assert live.run_protection_once()==()
+            assert trading.cancels==[('A',),('A',)]
             read=live.state.snapshot().read_failures[('account',CID,'yes','A')]
             assert 'read_failure_limit' in read.reason_codes
         finally:boundary.release.set();assert live.close(4)
@@ -151,23 +155,17 @@ def test_read_failure_cancel_needs_no_queue_baseline_and_keeps_exact_guards(tmp_
                 try:
                     end=time.monotonic()+4
                     with changed:
-                        while len(entered)<2:
-                            left=end-time.monotonic();assert left>0;changed.wait(left)
-                        assert len(entered)==2
-                        pair=tuple(sorted(entered))  # identities, never assumed arrival positions
-                    assert live.status()['native_inflight']==2
-                    releases[pair[0]].set()
-                    if trigger=='eleven':
-                        # Serial external delivery, then a third admission after
-                        # the first two real native handles have finished.
-                        with changed:
-                            while pair[0] not in finished:
-                                left=end-time.monotonic();assert left>0;changed.wait(left)
-                    releases[pair[1]].set()  # cleanup variant releases the pair concurrently
-                    with changed:
                         while entered!=targets:
                             left=end-time.monotonic();assert left>0;changed.wait(left)
-                    for event in releases.values():event.set()
+                    assert live.status()['native_inflight']==3
+                    if trigger=='eleven':
+                        for oid in sorted(targets):
+                            releases[oid].set()
+                            with changed:
+                                while oid not in finished:
+                                    left=end-time.monotonic();assert left>0;changed.wait(left)
+                    else:
+                        for event in releases.values():event.set()
                 except BaseException as exc:schedule.set_exception(exc)
                 else:schedule.set_result(True)
             controller=threading.Thread(target=deliver,name='external-cancel-delivery')
@@ -1187,20 +1185,7 @@ def test_scheduler_wakes_deferred_read_fault_cancels_after_native_completion(tmp
         def __init__(self,actual):self.actual=actual
         def allowed(self,action=None):return admitted and self.actual.allowed(action)
         def release(self):
-            nonlocal gate,pair,deferred
             self.actual.release()
-            if not gate or threading.current_thread() is not owner_thread:return
-            # This temporary lease belongs to the third cap2 refusal. The live
-            # state lock has exited; external returns can now complete normally.
-            gate=False
-            assert live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)>0
-            boundary.wait(lambda:len(entered)==2)
-            pair=set(entered);deferred=next(iter(targets-pair))
-            assert set(requests())==pair and live.status()['native_inflight']==2
-            for oid in pair:releases[oid].set()
-            for oid in pair:threads[oid].join(4);assert not threads[oid].is_alive()
-            assert finished==pair and live.status()['native_inflight']==0
-            assert set(requests())==pair  # no fabricated third request/attempt
     def drive_until(predicate):
         end=time.monotonic()+4
         while not predicate():
@@ -1235,27 +1220,24 @@ def test_scheduler_wakes_deferred_read_fault_cancels_after_native_completion(tmp
         assert scheduler.snapshot()['next_check_at'] is None
         assert requests()=={} and trading.cancels==[] and not entered
         before=list(boundary.events)
-        admitted=True;gate=True
-        # One initial explicit command reflects newly granted permission. Only
-        # native completion may rescue the deferred target after this check.
-        execution.lp_auto_run_once();assert scheduler.run_due()
-        assert not gate and len(pair)==2 and deferred not in requests()
-        assert set(entered)==finished==pair and len(trading.cancels)==2
-        assert live.status()['native_inflight']==0,(live.diagnostics()['cancel_blocks'],requests(),entered,live.state.snapshot().progress)
-        state=live.read_runtime.status()
-        assert state['next_dependency_monotonic'] is None and state['ready_count']==0
-        assert len(state['scopes'])==4 and not any(s['key'][3]=='exact' for s in state['scopes'])
-        assert boundary.events==before and clock()==11
-        assert scheduler.run_due(),'native completion must wake deferred protection at the same business time'
+        admitted=True
+        execution.lp_auto_run_once();scheduler.run_due()
         boundary.wait(lambda:entered==targets)
         assert set(requests())==targets and len(set(requests().values()))==3
-        assert clock()==11 and boundary.events==before and maximum==2
+        assert live.status()['native_inflight']==3 and maximum==3
+        assert boundary.events==before and clock()==11
+        pair=set(sorted(targets)[:2]);deferred=next(iter(targets-pair))
+        for oid in pair:releases[oid].set()
+        for oid in pair:threads[oid].join(4);assert not threads[oid].is_alive()
+        assert scheduler.run_due(),'actual native completion must wake the existing owner'
+        assert live.status()['native_inflight']==1 and not releases[deferred].is_set()
+        assert set(requests())==targets and len(trading.cancels)==2
         releases[deferred].set();threads[deferred].join(4);assert not threads[deferred].is_alive()
-        assert scheduler.run_due()  # consume actual C completion, then idle
+        assert scheduler.run_due()
         drive_until(lambda:scheduler.snapshot()['next_check_at'] is None)
         snapshot=live.state.snapshot();state=live.read_runtime.status()
         assert sorted(trading.cancels)==[('A',),('B',),('C',)] and finished==targets
-        assert maximum==2 and live.status()['native_inflight']==0
+        assert maximum==3 and live.status()['native_inflight']==0
         partial=next(o for o in snapshot.orders if o.key[3]=='C')
         assert (partial.original_size.value,partial.size_matched.value,partial.remaining.value)==(20,3,17)
         assert {o.key[3] for o in snapshot.active_orders}==targets and not snapshot.openings

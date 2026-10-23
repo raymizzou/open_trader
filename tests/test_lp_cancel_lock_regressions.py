@@ -204,6 +204,18 @@ def test_unattempted_cancel_deferral_has_reason_without_fabricated_request(tmp_p
                 assert entered[oid].wait(3)
         else:
             live.run_once()  # a different accepted observation invalidates the old origin
+        if gate == 'capacity':
+            # Existing CANCEL requests no longer occupy the two placement slots.
+            sdk.cancel_orders = lambda *,order_ids: (sdk.cancels.append(order_ids) or dict(canceled=order_ids,not_canceled={}))
+            handle=live.cancel_independent(key)
+            assert finished(handle).status.value=='accepted'
+            assert live.status()['native_inflight']==2
+            assert set(sdk.cancels)=={('A',),('B',),('C',)}
+            drained(live.writer)
+            rows=[r for r in action_rows(live.store) if r['kind']=='CANCEL']
+            assert len(rows)==3 and len({r['request_id'] for r in rows})==3
+            assert live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)==0
+            return
         drained(live.writer)
         before = action_rows(live.store)
         before_native = live.status()['native_inflight']
@@ -262,7 +274,7 @@ def test_unknown_cancel_is_not_a_never_sent_backoff_retry(tmp_path, monkeypatch,
         original_id = handle.identity.request_id
         sdk.advance(11)
         if case == 'native_pending':
-            assert live.cancel_independent(outcome.order_key) is handle
+            assert live.cancel_independent(outcome.order_key) is None  # same raw source adds no new request
             assert not handle.done()
         release.set()
         assert finished(handle).status.value == 'unknown_error'

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-23 — LP cancellation follows fresh account facts
+
+- Triggered protection persists until its exact BUY leaves the open-order view. Each new valid source can create one new request per ID, including while an older CANCEL is pending; repeated source consumption never replays a request.
+- CANCEL no longer consumes the two BUY/SELL placement slots. Every actual single/group call remains tracked until physical exit, and pending cancels wait for reads or completion events. Existing SDK transport, timeouts, permissions and financial guards remain.
+- Per-ID responses distinguish accepted, rejected and UNKNOWN. Final venue facts update each original audit without replacing its receipt or regressing newer progress. Fresh complete account balances and orders govern replenishment; pending CANCEL alone is no unknown BUY reservation.
+
 ## 2026-10-23 — LP financial read recovery after actual cleanup
 
 - Financial reads resume through the existing HTTP clients after delayed cancellation cleanup actually ends. Held responses still block overlap; unread timeout/fault notices, the original cadence and provider/account Retry-After remain enforced.
