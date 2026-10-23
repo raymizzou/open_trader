@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-23 — D2 dual-pool operator SOP
+
+- Document the current shared pause/enable switch, independent trial/income budgets and fixed three BUY slots per pool. The 100/100 USDC command is the user's session example, not a default; legacy inventory-budget guidance is labelled separately.
+- Require saved pause, actual BUY/obligation release and fresh account facts before config, then separate enable and JSON version/control confirmation. Explain UNKNOWN/no-replay handling and current verbose legacy fields. Verified against current source, local documentation links and `git diff --check`; no CLI behavior or live state changed.
+
 ## 2026-10-23 — LP financial read recovery after actual cleanup
 
 - Financial reads resume through the existing HTTP clients after delayed cancellation cleanup actually ends. Held responses still block overlap; unread timeout/fault notices, the original cadence and provider/account Retry-After remain enforced.
