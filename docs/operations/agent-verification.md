@@ -114,8 +114,9 @@ Keep isolated task worktrees and essential evidence in durable directories,
 never only in `/tmp`. Unique briefs can use `mktemp -d` under a persistent parent.
 Maintain one compact task-state record: task and owner, completed work, pending
 issues, branch/SHA, unsaved or uncommitted edits, active commands/handles, live
-session/pane identity, next action and owner. Update it after a batch or commit;
-do not add a manual handoff after each tool call.
+session/pane identity, next action and owner. Keep issue acceptance owner/status
+and evidence distinct from publication, review, CI and deployment. Update it after
+a batch or commit; do not add a manual handoff after each tool call.
 
 Keep append-only execution evidence. Record each execution once with command,
 test scope, code identity (including uncommitted changes where applicable),
@@ -413,8 +414,10 @@ readiness uses `--mode gateway`; gateway plus legacy uses the existing stack
 dry-run, and legacy selection retains the Trend and Futu checks.
 
 Pure documentation, configuration, test-only, and unrelated changes remain
-exempt from the acceptance and deployment gates; test-only changes still
-receive any development validation relevant to their own scope.
+exempt from Deployment Preflight and deployment gates; test-only changes still
+receive any development validation relevant to their own scope. Apply
+[issue acceptance](#postdelivery-issue-acceptance) to their deliverables and record
+deployment N/A with a reason; this does not add backend or runtime checks.
 
 ## Authorized PR delivery loop
 
@@ -572,8 +575,11 @@ waiting for pending feedback to finish. See [CI identity](ci.md).
 Main monitors until the authorized completion or accepted handoff,
 cancellation/closure, or a specific external/authorization blocker. Record that
 stop reason, remaining responsibilities and their owner. Never abandon unresolved
-work without an owner. A broader instruction to monitor through merge retains
-that stopping condition. Separate user approval is still required for GitHub
+work without an owner. Merge/deployment completion does not imply issue acceptance;
+record its separate owner, evidence, pending criteria and next check under
+[postdelivery issue acceptance](#postdelivery-issue-acceptance). A broader instruction
+to monitor through merge retains that stopping condition and hands off later
+acceptance explicitly. Separate user approval is still required for GitHub
 merge; reviews and CI do not authorize merge/auto-merge, approval on the user's
 behalf, release/tag creation, deployment, trading or repository/security changes.
 PR-head and synthetic-merge evidence never replace final-main push/manual deployment
@@ -615,6 +621,9 @@ Threads/comments: URL, resolved/unresolved state or disposition, blocking decisi
 Repairs: fix commits, checks, independent review, update/reply evidence:
 Merge: authorization, expected head, state/base/conflict check/time, final SHA:
 CI: final main SHA, push/manual event, newest run/attempt, required/app 15368 actual result/artifacts:
+Deployment: selected/deployed SHA, environment/time, authorization/gate evidence or N/A reason:
+Issue acceptance: issue/current criteria, owner/status, criterion evidence/decisions, gaps/next check:
+Issue closure/board: evidence and decision publication, latest issue readback/state, board status:
 Pending decisions/blockers; next action and owner; monitoring stop reason:
 Monitoring: durable wake/check mechanism/handle, owner, last retrieval, next check:
 Worker recovery: batch/session, attempts/delays/results, last actual progress:
@@ -705,6 +714,95 @@ Existing authorized rollback uses the recorded compatible release and retained
 environment; it is not blocked by expired forward CI artifacts. Low-level helpers
 retain their rollback semantics and are not a substitute for the supported
 forward-deployment wrapper.
+
+## Postdelivery issue acceptance
+
+After PR merge and completion of any applicable authorized deployment, the
+existing task Main evaluates the associated issue criterion by criterion. Read
+the **current** GitHub issue body and relevant approved changes/comments; preserve
+all original criteria and approved additions. Do not substitute an old spec or
+silently reduce scope. Respect the original task/tab and acceptance owner: a
+workflow-documentation task does not take over another task's live verification.
+CI, Deployment Preflight, deployment and Production Smoke each prove their own
+scope; their success alone is not business acceptance.
+
+This is a postdelivery step, not a premerge waiting gate, another backend suite,
+or the `acceptance`/`candidate-acceptance` Deployment Preflight aliases. Keep
+focused verification, main-only exact-SHA CI, external dots/Opus review without a
+local fallback, and separate merge/deploy authority. For nondeployable
+documentation, configuration or test-only changes, perform applicable deliverable
+acceptance and record deployment **N/A with a reason**; do not require deployment
+or invent backend/runtime checks.
+
+### Record evidence on the issue
+
+Update a clear current acceptance section in the issue body, or publish an
+acceptance comment and link it from that section. Keep a checklist with stable
+criterion IDs and the original wording. For each criterion, record expected and
+observed outcomes, result, supporting evidence link or durable reference **and a
+short evidence summary**, exact tested/deployed SHA as relevant, environment/time,
+limits and owner. Evidence must support that criterion. Distinguish local/CI proof
+from operational or long-running proof; a short Smoke check cannot prove a
+long-running requirement. Missing or conflicting evidence remains **UNKNOWN /
+pending**, never PASS. Preserve failures and prior evidence when adding results.
+
+Use a compact record such as:
+
+```text
+Acceptance owner; issue revision/read time; PR; tested/deployed SHA(s); deployment or N/A reason:
+- [ ] AC-1 — <original criterion>
+  Expected: ...; observed: ...; result: PASS | FAIL | UNKNOWN | USER_ACCEPTED | N/A
+  Evidence: <link/durable reference> — <summary>; SHA: ...; environment/time: ...
+  Limits/owner: ...; N/A basis or accepted deviation/decision reference: ...
+Remaining gaps; next action/owner/check time; closure disposition/readback:
+```
+
+Use N/A only with an applicability reason justified by the approved scope; it is
+not a way to drop a criterion. Preserve the original wording and record the
+approved change when scope alters applicability. Checklist completion does not
+turn an accepted deviation into a passing result.
+
+### Discrepancies and user decisions
+
+Bring every mismatch, unknown result or unclear acceptance requirement to the
+user in ordinary visible chat. Separate a confirmed problem from missing or
+conflicting proof. If the user expressly accepts ignoring a particular deviation,
+record **USER_ACCEPTED / accepted deviation**, what was accepted, why, its scope
+and time limits, and the decision reference. Never relabel it PASS. Acceptance of
+a deviation does not waive independent deployment, trading or security gates,
+financial/identity/UNKNOWN/no-replay protections, or authorize production mutations.
+
+Otherwise ask whether to continue in the original issue or open/link a follow-up.
+Check for an existing matching issue before proposing a new one; do not create a
+follow-up automatically. User approval to open/link a follow-up is separate from
+permission to close the original. Keep the original **OPEN** unless its acceptance
+is fulfilled or an explicit scoped acceptance/closure disposition covers every
+remaining gap. A follow-up link alone does not satisfy the original criterion.
+
+### Closure and board state
+
+While acceptance is pending, use `Refs #...` or `Related to #...` in PR descriptions
+and commit messages instead of `Fixes`, `Closes` or `Resolves`. Do not add automation
+or change repository settings. If closing keywords or another actor already closed
+the issue, CLOSED is not acceptance evidence: report premature closure and restore
+OPEN under applicable authority, or seek authorized correction.
+
+Close only when every criterion is accounted for by evidenced PASS, justified
+N/A under the approved scope, or an explicitly user-accepted deviation. Every
+remaining gap must have that explicit scoped user disposition. When all criteria
+genuinely pass, this policy permits closure without another blanket approval request; external writes still follow the assigned role
+and applicable authority. Immediately before publication/closure, re-read the
+latest issue and relevant comments to preserve concurrent changes and reassess any
+new requirements. Publish the evidence and user decisions **before** closing, then
+verify the issue's CLOSED state by readback. Record closure separately from PR
+merge, CI, deployment and review completion; none stands in for another.
+
+Keep the board **wip**, or **blocked** with a concrete question, until the issue is
+closed and all criteria have passed or been explicitly dispositioned as above.
+Every board item maps to an issue. If no issue exists, do not declare finished/done;
+keep wip/blocked and await the user's disposition. Hand off any pending acceptance
+with the issue/evidence links, gaps, named owner and next check; do not infer task
+completion from merge or deployment alone.
 
 ## Prediction-only Linux cloud topology
 
