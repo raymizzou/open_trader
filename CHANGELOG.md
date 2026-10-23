@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-24 — LP income snapshot test observation synchronization
+
+- Wait for the exact posted D BUY in a receipt-current account and its valid market observation before the next income comparison. Observation passes forbid BUY and cancellation work; the original fixed result, exact next-cycle victims and no-replay assertions remain. Test synchronization only; production behavior is unchanged.
+
 ## 2026-10-24 — Issue acceptance after delivery
 
 - Keep the original task Main responsible for criterion-by-criterion issue acceptance after merge and applicable authorized deployment. Publish current criteria, evidence, exact identities and limits; CI/deployment/Smoke success alone does not prove business acceptance.
