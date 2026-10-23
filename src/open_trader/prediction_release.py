@@ -349,6 +349,31 @@ def observe_failed_launchd_service(*, record, runtime_root, config_path, python,
     if require_absent:
         if loaded.returncode==0 or 'Could not find service' not in loaded.stdout+loaded.stderr:
             raise ValueError('failed managed label absence unproved')
+        # A job can start after the last loaded-label sample, leaving its PID
+        # unknown to the installer. Only inspect the process table after bootout
+        # has removed the job, so launchd cannot create another such startup.
+        processes=run([ps,'-axww','-o','pid=,uid=,command='])
+        if processes.returncode or processes.stderr or not processes.stdout.strip():
+            raise ValueError('failed managed process absence inspection unavailable')
+        for line in processes.stdout.splitlines():
+            values=line.split(None,2)
+            if (len(values)!=3 or not values[0].isdecimal()
+                    or not values[1].isdecimal()):
+                raise ValueError('failed managed process inventory malformed')
+            if values[2] in (' '.join(args),shlex.join(args)):
+                raise ValueError('failed managed startup process survives bootout')
+            # Do not parse arbitrary unrelated command strings as shell input.
+            # The installed startup has this literal module/subcommand prefix.
+            prefix=values[2].split(None,4)
+            if prefix[1:4]!=['-m','open_trader','prediction-service']:
+                continue
+            command=shlex.split(values[2])
+            selections=[command[index+1] for index,flag in enumerate(command[:-1])
+                if flag=='--data-dir']
+            if len(selections)!=1 or command[-1]=='--data-dir':
+                raise ValueError('failed managed startup runtime identity uncertain')
+            if Path(selections[0]).resolve()==data:
+                raise ValueError('failed managed startup process survives bootout')
     else:
         if loaded.returncode:raise ValueError('failed managed label inspection unavailable')
         facts={};loaded_args=None;inside=False

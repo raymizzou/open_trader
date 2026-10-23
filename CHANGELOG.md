@@ -2,6 +2,7 @@
 
 ## 2026-10-23 — Managed launchd failed-start recovery
 
+- Failed restart also inspects the process table after removing the launchd job. A late startup that survives without a listener or lock, or an unavailable process inventory, blocks new startup permission.
 - Preserve the selected tracked release manifest in runtime records and same-release refreshes, including custom manifests used by early launchd self-context verification.
 - Selected Prediction Host Readiness consumes the verified manager preflight and accepts READY/RECOVERABLE without requiring the failed old service to listen on 8769. Other service, wallet, browser, storage and first-deploy checks remain.
 - Read-only preflight can identify a fully verified failed loaded service as recoverable. Explicit `--restart` rechecks its exact release, config, consumed permit and manager identity, stops only that label, and requires complete resource absence before one new startup permission. Unknown identities, held resources, saved pause and no-replay protections remain enforced.

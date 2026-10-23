@@ -136,6 +136,7 @@ with (Path(root)/'data/prediction_arbitrage/runtime.lock').open('a+') as owner:
         record=json.loads(record_path.read_text())
         record['candidate'].pop('manifest')
         record_path.write_text(json.dumps(record))
+    install_process_inventory(harness)
     harness.calls.clear()
     return harness
 
@@ -428,3 +429,125 @@ def test_failed_restart_never_rearms_before_complete_teardown(tmp_path, resource
             assert harness.runtime_record['failure_reason'] in {
                 'candidate_cleanup_not_proven','failed_managed_evidence_changed_before_arm'}
         assert not any('kill ' in call for call in harness.calls.all())
+
+
+
+def install_process_inventory(harness):
+    """Model only the external whole-process observation for failed recovery."""
+    dispatcher = harness.fake_bin/'fake-command'
+    dispatcher.write_text(dispatcher.read_text().replace('if command == "ps":', r'''if command == "ps" and "-axww" in sys.argv:
+    import shlex
+    assert state.get('bootout_seen') and not state['loaded']
+    if state.get('late_variant') == 'exited':
+        Path(state['inventory_marker']).touch()
+        deadline=time.monotonic()+20
+        while not Path(state['inventory_release']).exists():
+            if time.monotonic()>deadline: raise RuntimeError('inventory watchdog')
+            time.sleep(.01)
+        state=json.loads(state_path.read_text())
+    state.setdefault('process_inventory', []).append({'late_alive':state.get('late_alive',False),
+        'permit':json.loads((Path(os.environ['FAKE_DATA_DIR']).parent/'lp-start-guard/permit.json').read_text())})
+    save()
+    if state.get('late_variant') == 'inspection_unknown':
+        print('unavailable process inventory',file=sys.stderr)
+        raise SystemExit(2)
+    print('1 0 /sbin/launchd')
+    if state.get('late_alive'):
+        print('6363 '+str(os.getuid())+' '+shlex.join(state['late_arguments']))
+    raise SystemExit(0)
+if command == "ps":'''))
+
+
+@pytest.mark.parametrize('variant', ['survives', 'exited', 'inspection_unknown'])
+def test_failed_restart_checks_process_started_after_final_observation(tmp_path, variant):
+    import hashlib
+    import time
+    from datetime import datetime, UTC
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    harness=failed_service(tmp_path)
+    permit=harness.runtime_root/'lp-start-guard/permit.json'
+    original=permit.read_bytes()
+    account=hashlib.sha256(('0x'+'a'*40).encode()).hexdigest()
+    store=PredictionArbitrageStore(harness.runtime_root/'data')
+    store.lp_save_current_control(dict(account_id=account,process_epoch='operator',request_id='pause',
+        request_version=1,desired_running=False,requested_at=datetime(2026,10,16,12,tzinfo=UTC),actor='operator'))
+    saved=store.lp_load_current_control(account)
+    data_before=harness.database.read_bytes()
+    boot_marker,boot_release=tmp_path/'bootout-entered',tmp_path/'bootout-continue'
+    inventory_marker,inventory_release=tmp_path/'inventory-entered',tmp_path/'inventory-continue'
+    state=harness.state
+    # Independent literal startup arguments and PID (6363), distinct from the
+    # removed label's PID, listener, and native owner facts.
+    late_arguments=[sys.executable,'-m','open_trader','prediction-service',
+        '--mode','production','--data-dir',str(harness.runtime_root/'data'),
+        '--config',str(harness.config),'--host','127.0.0.1','--port','8769',
+        '--notifier-config',str(harness.runtime_root/'config/daily_premarket.env'),
+        '--release-manifest',str(harness.manifest)]
+    assert state['arguments']==late_arguments
+    state.update(late_variant=variant,late_arguments=late_arguments,late_alive=False,
+        boot_marker=str(boot_marker),boot_release=str(boot_release),
+        inventory_marker=str(inventory_marker),inventory_release=str(inventory_release))
+    harness.state_path.write_text(json.dumps(state))
+    dispatcher=harness.fake_bin/'fake-command'
+    dispatcher.write_text(dispatcher.read_text().replace('    if action == "bootout":', r'''    if action == "bootout":
+        # This external boundary is strictly after every pre-stop observation.
+        assert state['pid']==0 and not state['listener'] and not state['lock_owner_pids']
+        Path(state['boot_marker']).touch()
+        deadline=time.monotonic()+20
+        while not Path(state['boot_release']).exists():
+            if time.monotonic()>deadline: raise RuntimeError('bootout watchdog')
+            time.sleep(.01)
+        state=json.loads(state_path.read_text())
+        assert state['late_alive']
+''').replace('    if action == "bootstrap":', '''    if action == "bootstrap":
+        state['at_bootstrap']={'late_alive':state.get('late_alive'),
+            'inventories':state.get('process_inventory',[]),
+            'permit':json.loads((Path(os.environ['FAKE_DATA_DIR']).parent/'lp-start-guard/permit.json').read_text())}
+        save()
+'''))
+    process=subprocess.Popen(manager_command(harness,'--restart'),env=harness._env(harness.candidate),
+        stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+    try:
+        deadline=time.monotonic()+30
+        while not boot_marker.exists() and process.poll() is None and time.monotonic()<deadline:time.sleep(.01)
+        assert boot_marker.exists(),'manager did not reach bootout boundary'
+        assert permit.read_bytes()==original
+        assert not any(call.startswith('launchctl bootstrap') for call in harness.calls.all())
+        state=harness.state
+        state['late_alive']=True
+        harness.state_path.write_text(json.dumps(state))
+        boot_release.touch()
+        if variant=='exited':
+            while not inventory_marker.exists() and process.poll() is None and time.monotonic()<deadline:time.sleep(.01)
+            assert inventory_marker.exists(),'late process never observed after label removal'
+            assert permit.read_bytes()==original
+            state=harness.state
+            assert state['late_alive'] and not state['loaded'] and not state['listener'] and not state['lock_owner_pids']
+            state['late_alive']=False
+            harness.state_path.write_text(json.dumps(state));inventory_release.touch()
+        out,err=process.communicate(timeout=15)
+        result=subprocess.CompletedProcess(process.args,process.returncode,out,err)
+    finally:
+        boot_release.touch();inventory_release.touch()
+        if process.poll() is None:process.terminate();process.wait(timeout=5)
+    bootstrap=[call for call in harness.calls.all() if call.startswith('launchctl bootstrap')]
+    if variant=='exited':
+        assert result.returncode==0,result.stdout+result.stderr
+        assert len(bootstrap)==1
+        assert json.loads(permit.read_text())['operation_nonce']!=json.loads(original)['operation_nonce']
+        assert harness.runtime_record['state']=='ready'
+        observed=harness.state['at_bootstrap']
+        assert observed['late_alive'] is False
+        assert observed['inventories'] and observed['inventories'][-1]['late_alive'] is False
+        assert observed['inventories'][-1]['permit']==json.loads(original)
+        assert observed['permit']['operation_nonce']==json.loads(permit.read_text())['operation_nonce']
+    else:
+        assert result.returncode!=0,result.stdout+result.stderr
+        assert permit.read_bytes()==original
+        assert not bootstrap
+        assert harness.runtime_record['state']=='failed'
+        assert harness.runtime_record['failure_reason']=='failed_managed_evidence_changed_before_arm'
+        assert harness.state['late_alive'] is True
+    assert not any('kill ' in call for call in harness.calls.all())
+    assert harness.database.read_bytes()==data_before
+    assert store.lp_load_current_control(account)==saved
