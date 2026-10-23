@@ -294,14 +294,16 @@ PY
 preflight_json() {
   local status="$1" reason="$2" differences_json="${3:-[]}" observed_json="${4:-null}"
   local recorded_json="${5:-null}" observed_ready_json="${6:-null}"
+  local managed_verified="${7:-0}"
   "$PYTHON_BIN" - "$status" "$reason" "$differences_json" "$observed_json" \
-    "$recorded_json" "$observed_ready_json" <<'PY'
+    "$recorded_json" "$observed_ready_json" "$managed_verified" <<'PY'
 import json
 import sys
-status, reason, differences, observed, recorded, observed_ready = sys.argv[1:]
+status, reason, differences, observed, recorded, observed_ready, managed_verified = sys.argv[1:]
 payload = {
     "schema_version": "open_trader.prediction_service.preflight.v1",
     "status": status,
+    "managed_identity_verified": managed_verified == "1",
     "reason": reason,
     "differences": json.loads(differences),
 }
@@ -953,7 +955,8 @@ PY
   else
     if FAILED_OBSERVATION="$(observe_failed_managed "$CURRENT_RECORD_JSON" 2>/dev/null)"; then
       if [[ "$PREFLIGHT" -eq 1 ]]; then
-        preflight_json "RECOVERABLE" "verified failed managed startup requires explicit restart"
+        preflight_json "RECOVERABLE" "verified failed managed startup requires explicit restart" \
+          "[]" "null" "null" "null" 1
         exit 0
       fi
       [[ "$RESTART" -eq 1 ]] || fail "verified failed managed startup requires explicit --restart"
@@ -1056,7 +1059,7 @@ fi
 if [[ "$PREFLIGHT" -eq 1 ]]; then
   preflight_json "$PREFLIGHT_STATUS" "$PREFLIGHT_REASON" \
     "$PREFLIGHT_DIFFERENCES" "$OBSERVED_RELEASE_JSON" \
-    "$CURRENT_RECORD_JSON" "$OBSERVED_READY_JSON"
+    "$CURRENT_RECORD_JSON" "$OBSERVED_READY_JSON" "$MANAGED_OLD"
   [[ "$PREFLIGHT_STATUS" != "BLOCKED" ]]
   exit 0
 fi

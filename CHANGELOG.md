@@ -2,6 +2,7 @@
 
 ## 2026-10-23 — Managed launchd failed-start recovery
 
+- Normal Prediction Host Readiness requires explicit verified managed identity from preflight. Empty-host installability still reports READY, but requires `FIRST_DEPLOY=1` and its fresh-host ownership checks.
 - Failed restart also inspects the process table after removing the launchd job. A late startup that survives without a listener or lock, or an unavailable process inventory, blocks new startup permission.
 - Preserve the selected tracked release manifest in runtime records and same-release refreshes, including custom manifests used by early launchd self-context verification.
 - Selected Prediction Host Readiness consumes the verified manager preflight and accepts READY/RECOVERABLE without requiring the failed old service to listen on 8769. Other service, wallet, browser, storage and first-deploy checks remain.

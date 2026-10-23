@@ -150,7 +150,7 @@ host-readiness:
 	if [ $$account_selected -eq 1 ] && [ "$$first_deploy" = 0 ]; then check "account status" "$(PYTHON_BIN)" -m open_trader account-sync-status --account-url "$(ACCOUNT_API_URL)" --json; fi; \
 	prediction_manager_ready() { \
 		manager_payload="$$("$(WORKTREE_ROOT)/scripts/install_prediction_service_launchd.sh" --mode production --preflight --repo-root "$(WORKTREE_ROOT)" --runtime-root "$(REPOSITORY_ROOT)" --python "$(PYTHON_BIN)" --config "$(PREDICTION_CONFIG)")" || return 1; \
-		printf '%s' "$$manager_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); raise SystemExit(0 if isinstance(p,dict) and p.get("schema_version")=="open_trader.prediction_service.preflight.v1" and p.get("status") in ("READY","RECOVERABLE") else 1)'; \
+		printf '%s' "$$manager_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); raise SystemExit(0 if isinstance(p,dict) and p.get("schema_version")=="open_trader.prediction_service.preflight.v1" and p.get("status") in ("READY","RECOVERABLE") and p.get("managed_identity_verified") is True else 1)'; \
 	}; \
 	if [ $$prediction_selected -eq 1 ] && [ "$$first_deploy" = 0 ]; then check "prediction managed recovery" prediction_manager_ready; fi; \
 	if [ $$prediction_selected -eq 1 ]; then \

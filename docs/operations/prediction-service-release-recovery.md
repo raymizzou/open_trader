@@ -28,6 +28,15 @@ The command is read-only. Its stdout is JSON with schema
 record, plist, logs, and data and investigate the stated reason. `--dry-run`
 is separate and only renders the launchd plist.
 
+The boolean `managed_identity_verified` is true only when preflight independently
+verifies an existing healthy managed owner or the failed managed startup described
+below. An empty host can return `READY` for first-install availability with this
+field false. Normal `make host-readiness` requires this field to be exactly true
+as well as `READY` or `RECOVERABLE`; it does not require the old 8769 listener.
+For a completely empty host, select `FIRST_DEPLOY=1` to run the fresh-host ownership
+and listener-absence checks. Missing, false or non-boolean proof cannot satisfy
+normal managed readiness. Preflight's schema and status meanings are unchanged.
+
 The runtime record is evidence, not authority by itself. Recovery requires the
 current clean checkout and independently observed launchd plist path,
 arguments, process cwd/PID, loopback listener, health response, and the unique

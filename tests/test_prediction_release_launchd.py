@@ -2396,6 +2396,7 @@ def test_release_preflight_reports_without_mutation(
     assert result.returncode == expected_code
     assert payload["schema_version"] == "open_trader.prediction_service.preflight.v1"
     assert payload["status"] == expected_status
+    assert payload["managed_identity_verified"] is (case in {"ready", "restart", "stale"})
     assert payload["reason"]
     if case in {"restart", "stale"}:
         assert set(payload["recorded_release"]) == {

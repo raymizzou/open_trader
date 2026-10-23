@@ -330,7 +330,8 @@ exit 0
     )
     manager_response=tmp_path/"manager-response.json"
     manager_response.write_text(manager_payload if manager_payload is not None else json.dumps({
-        "schema_version":"open_trader.prediction_service.preflight.v1","status":manager_status}))
+        "schema_version":"open_trader.prediction_service.preflight.v1","status":manager_status,
+        "managed_identity_verified":True}))
     # The supported manager CLI is the external boundary for this Make consumer.
     # The manager itself is exercised by the separate real installer regressions.
     _write_executable(fake_bin/"bash", f"""#!/bin/sh
@@ -439,12 +440,19 @@ def test_prediction_recovery_readiness_uses_verified_manager_without_old_listene
 
 
 @pytest.mark.parametrize(("payload","exit_status"), [
-    ('{"schema_version":"open_trader.prediction_service.preflight.v1","status":"BLOCKED"}',0),
-    ('{"schema_version":"open_trader.prediction_service.preflight.v1","status":"READY"}',1),
-    ('{"schema_version":"open_trader.prediction_service.preflight.v1","status":"RECOVERABLE"}',127),
-    ('{"schema_version":"unknown","status":"READY"}',0),
-    ('{"schema_version":"open_trader.prediction_service.preflight.v1","status":"UNKNOWN"}',0),
-    ('{',0), ('[]',0), ('null',0),
+    pytest.param('{"schema_version":"open_trader.prediction_service.preflight.v1","status":"BLOCKED","managed_identity_verified":true}',0,id='blocked-status'),
+    pytest.param('{"schema_version":"open_trader.prediction_service.preflight.v1","status":"READY","managed_identity_verified":true}',1,id='producer-nonzero'),
+    pytest.param('{"schema_version":"open_trader.prediction_service.preflight.v1","status":"RECOVERABLE","managed_identity_verified":true}',127,id='producer-unavailable'),
+    pytest.param('{"schema_version":"unknown","status":"READY","managed_identity_verified":true}',0,id='unknown-schema'),
+    pytest.param('{"schema_version":"open_trader.prediction_service.preflight.v1","status":"UNKNOWN","managed_identity_verified":true}',0,id='unknown-status'),
+    pytest.param('{',0,id='malformed-json'),
+    pytest.param('[]',0,id='array'),
+    pytest.param('null',0,id='null'),
+    pytest.param('{"schema_version":"open_trader.prediction_service.preflight.v1","status":"READY"}',0,id='missing-proof'),
+    *[pytest.param(json.dumps({"schema_version":"open_trader.prediction_service.preflight.v1",
+        "status":"RECOVERABLE","managed_identity_verified":proof}),0,id=name)
+      for name,proof in [('false-proof',False),('integer-proof',1),('string-proof','true'),
+        ('array-proof',[True]),('object-proof',{'verified':True}),('null-proof',None)]],
 ])
 def test_prediction_recovery_readiness_refuses_unverified_manager(tmp_path,payload,exit_status):
     result=_run_host_readiness(tmp_path,browser_available=True,services="prediction",
@@ -785,3 +793,67 @@ def test_release_scopes_reject_empty_or_unknown_services_before_probes(
     )
     assert "RELEASE_SERVICES" in result.stdout + result.stderr
     assert not calls.exists()
+
+
+@pytest.mark.parametrize("state", ["absent", "running", "failed"])
+def test_normal_readiness_requires_actual_managed_prediction_proof(tmp_path, state):
+    from tests.test_prediction_release_launchd import ReleaseHarness
+    from tests.test_lp410_launchd_recovery import failed_service
+    producer_root=tmp_path/"producer"
+    producer_root.mkdir()
+    harness=failed_service(producer_root) if state=="failed" else ReleaseHarness(producer_root)
+    if state=="running":
+        installed=harness.install(check=True)
+        assert installed.returncode==0,installed.stdout+installed.stderr
+    if state=="absent":
+        assert not harness.state['loaded'] and harness.state['pid']==0
+        assert not harness.state['listener'] and harness.state['owner_available']
+        assert not harness.plist.exists() and not harness.runtime_root.exists()
+    else:
+        assert harness.state['loaded']
+        assert harness.state['listener'] is (state=="running")
+
+    def protected():
+        return (harness.runtime_root.exists(),
+            {str(path):path.read_bytes() for base in (harness.runtime_root,harness.agents)
+             for path in base.rglob('*') if path.is_file()},harness.config.read_bytes())
+    before=protected()
+    harness.calls.clear()
+    producer=harness.install(preflight=True,owner_probe=state=="running")
+    # Keep the exact public producer output/exit, rather than fabricating its
+    # JSON as a consumer expectation. All OS boundaries remain disposable.
+    (tmp_path/'producer-result.json').write_text(json.dumps(dict(command=producer.args,
+        exit=producer.returncode,stdout=producer.stdout,stderr=producer.stderr),indent=2))
+    assert producer.returncode==0,producer.stdout+producer.stderr
+    payload=json.loads(producer.stdout)
+    assert payload['schema_version']=='open_trader.prediction_service.preflight.v1'
+    assert payload['status']==('RECOVERABLE' if state=='failed' else 'READY')
+    assert protected()==before
+    assert not any(' bootout ' in f' {call} ' or ' bootstrap ' in f' {call} '
+                   for call in harness.calls.all())
+    consumer_root=tmp_path/'normal-host'
+    consumer=_run_host_readiness(consumer_root,browser_available=True,services='prediction',
+        prediction_listener=False,manager_payload=producer.stdout,manager_exit=producer.returncode)
+    (tmp_path/'consumer-result.json').write_text(json.dumps(dict(command=consumer.args,
+        exit=consumer.returncode,stdout=consumer.stdout,stderr=consumer.stderr),indent=2))
+    assert (consumer_root/'manager-response.json').read_text()==producer.stdout
+    if state=='absent':
+        assert consumer.returncode!=0,consumer.stdout+consumer.stderr
+        assert consumer.stdout.rstrip().endswith('BLOCKED')
+        assert 'prediction managed recovery: BLOCKED' in consumer.stdout
+        first=_run_host_readiness(tmp_path/'first-host',browser_available=True,
+            services='prediction',prediction_listener=False,first_deploy=True,
+            manager_payload=producer.stdout,manager_exit=producer.returncode)
+        assert first.returncode==0,first.stdout+first.stderr
+        assert 'fresh host ownership: PASS' in first.stdout
+        assert 'loopback listeners absent: PASS' in first.stdout
+        assert first.stdout.rstrip().endswith('READY')
+    else:
+        assert consumer.returncode==0,consumer.stdout+consumer.stderr
+        assert consumer.stdout.rstrip().endswith('READY')
+        assert 'prediction managed recovery: PASS' in consumer.stdout
+    assert payload['managed_identity_verified'] is (state!='absent')
+    calls=(consumer_root/'calls').read_text().splitlines()
+    assert not any(call.startswith('lsof ') and '8769' in call for call in calls)
+    assert not any('--restart' in call or '--prepare-target' in call for call in calls)
+    assert protected()==before
