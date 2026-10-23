@@ -191,11 +191,13 @@ def test_terminal_progress_reaches_original_cancel_audit(tmp_path, monkeypatch, 
 
 def test_new_request_and_late_facts_preserve_original_audit_identity(tmp_path,monkeypatch):
     from datetime import timedelta
+    from threading import Event
     from open_trader.lp_business_writer import ProgressRecord, ReceiptRecord
     from tests.test_lp_d2_integration import _d2_protection_runtime
     from tests.test_lp_order_registration_contract import WALLET,CONDITION_ID,TOKEN_ID,_open_order
     live,sdk,public,clock=_d2_protection_runtime(tmp_path,monkeypatch,quantity='20')
     key=(WALLET,CONDITION_ID,TOKEN_ID,'entry-A')
+    delayed_entered, delayed_release = Event(), Event()
     try:
         live.run_once();drained(live.writer)
         buy=next(r for r in action_rows(live.store) if r['kind']=='BUY')
@@ -205,7 +207,16 @@ def test_new_request_and_late_facts_preserve_original_audit_identity(tmp_path,mo
         clock[0]=1;live.run_once()
         b=finished(live.cancel_independent(key))
         assert a.identity.request_id!=b.identity.request_id
-        clock[0]=2
+        clock[0]=2;live.run_once()
+        def delayed_old_ack(*, order_ids):
+            sdk.cancels.append(order_ids)
+            delayed_entered.set()
+            assert delayed_release.wait(5), 'delayed original-ID receipt watchdog'
+            return dict(canceled=order_ids, not_canceled={})
+        sdk.cancel_orders=delayed_old_ack
+        delayed=live.cancel_independent(key)
+        assert delayed_entered.wait(2) and not delayed.done()
+        clock[0]=4
         sdk.orders=(_open_order('entry-A','BUY',price='.30',original='20',matched='3').model_copy(update={'status':'CANCELED'}),)
         live.run_once();live.run_protection_once();drained(live.writer)
         rows={r['request_id']:r for r in action_rows(live.store)}
@@ -223,12 +234,40 @@ def test_new_request_and_late_facts_preserve_original_audit_identity(tmp_path,mo
         assert latest[a.identity.request_id]['progress']==original['progress']
         assert latest[buy['request_id']]['kind']=='BUY'
         assert latest[buy['request_id']]['receipt']==buy['receipt']
-        clock[0]=3
+        clock[0]=5
         sdk.orders=(_open_order('replacement','BUY',price='.30',original='20'),)
         live.run_once()
-        assert any(o.key[3]=='replacement' for o in live.state.snapshot().active_orders)
-        assert all(r['order_id']=='entry-A' for r in latest.values() if r['kind']=='CANCEL')
-    finally:assert live.close(5);live.trading.close()
+        replacement=next(o for o in live.state.snapshot().active_orders if o.key[3]=='replacement')
+        before_replacement_audit={r['request_id']:r for r in action_rows(live.store) if r['order_id']=='replacement'}
+        # Deliver a real delayed SDK ACK only AFTER the replacement exists.
+        delayed_release.set()
+        assert finished(delayed).status.value=='accepted'
+        # Also publish late original-parent receipt/progress through the writer.
+        live.writer.offer(ProgressRecord(WALLET,live.process_epoch,a.identity.request_id,
+            original['session_id'],CONDITION_ID,TOKEN_ID,'entry-A',Decimal(20),Decimal(0),Decimal('.30'),'LIVE',late_at))
+        live.writer.offer(ReceiptRecord(WALLET,live.process_epoch,a.identity.request_id,
+            original['session_id'],CONDITION_ID,TOKEN_ID,'entry-A','unknown',live._utc_now()))
+        drained(live.writer)
+        current=live.state.snapshot()
+        assert next(o for o in current.active_orders if o.key[3]=='replacement')==replacement
+        old=next(o for o in current.orders if o.key==key)
+        assert old.terminal_proof.matched.value==3 and old.remaining.value==17
+        refreshed={r['request_id']:r for r in action_rows(live.store)}
+        assert {k:r for k,r in refreshed.items() if r['order_id']=='replacement'}==before_replacement_audit
+        cancels=[r for r in refreshed.values() if r['kind']=='CANCEL']
+        assert len(cancels)==3 and all(r['order_id']=='entry-A' for r in cancels)
+        assert refreshed[a.identity.request_id]['progress']==original['progress']
+        for row in cancels:
+            assert row['receipt']['order_id']=='entry-A'
+            assert row['progress']['order_id']=='entry-A'
+            assert (row['progress']['size_matched'],row['progress']['remaining'],row['progress']['reserved_usd'])==('3','17','0')
+        assert refreshed[a.identity.request_id]['receipt']['outcome']=='unknown'
+        assert refreshed[b.identity.request_id]['receipt']==latest[b.identity.request_id]['receipt']
+        assert refreshed[delayed.identity.request_id]['receipt']['outcome']=='accepted'
+        assert refreshed[buy['request_id']]==latest[buy['request_id']]
+    finally:
+        delayed_release.set()
+        assert live.close(5);live.trading.close()
 
 
 @pytest.mark.parametrize('state', ['live','absent','partial_fill'])
@@ -633,4 +672,382 @@ def test_pending_cancels_wait_for_new_facts_or_completion_without_busy_loop(tmp_
     finally:
         release.set()
         if handle is not None:handle._thread.join(3)
+        rig.close()
+
+
+@pytest.mark.parametrize('kind', ['single_rejected', 'single_unknown', 'group_mixed'])
+def test_completed_cancel_history_has_bounded_runtime_and_live_writes(tmp_path, monkeypatch, kind):
+    from dataclasses import replace
+    from datetime import UTC, datetime, timedelta
+    from threading import Event
+    rig = CancelRig(tmp_path, monkeypatch)
+    rig.date[0] = max(rig.date[0], datetime.now(UTC)) + timedelta(seconds=1)
+    from open_trader import polymarket_trading, polymarket_lp_market_reader
+    class ClockMeta(type):
+        def __instancecheck__(cls, value): return isinstance(value, datetime)
+    class SourceDateTime(datetime, metaclass=ClockMeta):
+        @classmethod
+        def now(cls, tz=None):
+            return rig.date[0] if tz is not None else rig.date[0].replace(tzinfo=None)
+    monkeypatch.setattr(polymarket_trading, 'datetime', SourceDateTime)
+    monkeypatch.setattr(polymarket_lp_market_reader, 'datetime', SourceDateTime)
+    names = 'AB' if kind == 'group_mixed' else 'A'
+    entered, release = Event(), Event()
+    held = []
+    calls = [0]
+    def cancel(*, order_ids):
+        calls[0] += 1
+        rig.sdk.cancels.append(tuple(order_ids))
+        if calls[0] == 1:
+            entered.set()
+            assert release.wait(8), 'actual overlapping owner completion watchdog'
+        if kind == 'single_unknown':
+            raise TimeoutError('offline unknown')
+        return dict(canceled=(), not_canceled={'A': 'safe fixture rejection'})
+    def fresh():
+        rig.date[0] += timedelta(seconds=1)
+        rig.seconds[0] += 1
+        rig.now = rig.date[0]
+        rig.live.run_once()
+    def dispatch():
+        if kind == 'group_mixed':
+            return [o.handle for o in group_request(rig, names).rotation_outcomes]
+        key = next(o.key for o in rig.live.state.snapshot().active_orders if o.key[3] == 'A')
+        return [rig.live.cancel_independent(key)]
+    try:
+        for name in names:
+            rig.market(name)
+            rig.add_order(name, '8', order_id=name)
+        fresh()
+        rig.sdk.cancel_orders = cancel
+        held = dispatch()
+        assert entered.wait(2)
+        assert rig.live.status()['native_inflight'] == 1
+        work, cardinalities = [], []
+        for attempt in range(1, 10):
+            fresh()
+            for handle in dispatch():
+                finished(handle)
+            drained(rig.live.writer)
+            if attempt in (3, 9):
+                before = rig.live.writer.status()['saved_entries']
+                fresh()  # equal normal LIVE observation, no new dispatch
+                after = drained(rig.live.writer)['saved_entries']
+                work.append(after - before)
+                cardinalities.append((len(rig.live._cancel_records), len(rig.live._cancel_progress_sources)))
+        assert all(delta <= len(names) for delta in work), work
+        assert cardinalities[1] == cardinalities[0], cardinalities
+        assert all(max(counts) <= 2 * len(names) for counts in cardinalities), cardinalities
+        assert rig.live.status()['native_inflight'] == 1 and all(not h.done() for h in held)
+        records = [r for r in action_rows(rig.store) if r['kind'] == 'CANCEL']
+        assert len(records) == 10 * len(names)
+        receipts = {r['request_id']: r.get('receipt') for r in records}
+        # Seed unrelated durable audit parents through the real writer. They
+        # must not receive a terminal broadcast even when some terms overlap.
+        reference = next(r for r in rig.live._cancel_records.values() if r.order_id == 'A')
+        bad = [dict(account_id='other-account'), dict(process_epoch='other-epoch'),
+            dict(order_id='replacement'), dict(condition_id='other-condition'), dict(token_id='other-token'),
+            dict(kind='BUY'), dict(quantity=Decimal(21)), dict(price=Decimal('.41')),
+            dict(order_type='GTD'), dict(expiration=1), dict(venue='other-venue'), dict(), dict(), dict()]
+        for index, changes in enumerate(bad):
+            rig.live.writer.offer(replace(reference, request_id='unrelated-'+str(index),
+                session_id='unrelated-session-'+str(index), **changes))
+        drained(rig.live.writer)
+        # Corrupt only the isolated final parent fixture to test the original
+        # session root guard; the writer/store must never fan out through it.
+        import json
+        with rig.store._transaction() as connection:
+            row = connection.execute('SELECT payload FROM lp_sessions WHERE session_id=?',
+                ('unrelated-session-11',)).fetchone()
+            parent = json.loads(row['payload']); parent['process_epoch'] = 'wrong-root-epoch'
+            connection.execute('UPDATE lp_sessions SET payload=? WHERE session_id=?',
+                (json.dumps(parent), 'unrelated-session-11'))
+            for index, field, value in ((12, 'session_id', 'wrong-session'), (13, 'request_id', 'wrong-request')):
+                row = connection.execute('SELECT payload FROM lp_actions WHERE action_key=?',
+                    ('unrelated-'+str(index),)).fetchone()
+                audit = json.loads(row['payload']); audit[field] = value
+                connection.execute('UPDATE lp_actions SET payload=? WHERE action_key=?',
+                    (json.dumps(audit), 'unrelated-'+str(index)))
+        unrelated = {r['session_id']: r for r in action_rows(rig.store) if r['request_id'].startswith('unrelated-') or r['request_id']=='wrong-request'}
+        rig.release(*names)
+        for name in names:
+            rig.history[name] = {**rig.history[name], 'size_matched': Decimal('3' if name == 'A' else '5')}
+        fresh()
+        rig.live.run_protection_once()
+        drained(rig.live.writer)
+        rows = {r['request_id']: r for r in action_rows(rig.store)}
+        for original in records:
+            row = rows[original['request_id']]
+            assert row['order_id'] == original['order_id']
+            assert row.get('receipt') == receipts[row['request_id']]
+            progress = row['progress']
+            assert progress['request_id'] == row['request_id'] and progress['session_id'] == row['session_id']
+            assert (progress['size_matched'], progress['remaining'], progress['reserved_usd'], progress['status']) == (
+                ('3', '17', '0', 'CANCELED') if row['order_id'] == 'A' else ('5', '15', '0', 'CANCELED'))
+        assert {r['session_id']: r for r in action_rows(rig.store) if r['session_id'] in unrelated} == unrelated
+        assert live_status_ok(drained(rig.live.writer))
+        assert rig.live.close(timeout=0) is False
+        assert rig.live.status()['native_inflight'] == 1
+        release.set()
+        for handle in held:
+            finished(handle)
+        drained(rig.live.writer)
+        assert rig.live.close(timeout=3)
+        assert rig.live.status()['native_inflight'] == 0
+    finally:
+        release.set()
+        rig.close()
+
+
+def live_status_ok(status):
+    return all(status[key] == 0 for key in ('failed_entries', 'unknown_outcome_entries', 'dropped_parent',
+        'dropped_overflow', 'dropped_inflight_capacity', 'dropped_oversize', 'dropped_shutdown', 'dropped_closed'))
+
+
+@pytest.mark.parametrize('kind', ['single_protection', 'group_rotation'])
+def test_gtd_cancel_from_real_parsed_facts_uses_epoch_expiration(tmp_path, monkeypatch, kind):
+    from datetime import UTC, datetime, timedelta
+    from dataclasses import replace
+    from threading import Event
+    import time, httpx, asyncio
+    from tests.test_lp_observed_pools import AsyncPoolRig
+    from tests.test_lp_async_live_contract import sdk_wire
+    from tests.test_lp_order_registration_contract import _open_order
+    actual_http = AsyncPoolRig.http
+    book_entered, book_release = Event(), Event()
+    epoch = 1924992000  # independently fixed: 2031-01-01T00:00:00Z
+    expiry = datetime(2031, 1, 1, tzinfo=UTC)
+    assert int(expiry.timestamp()) == epoch
+    async def sdk_http(self, req):
+        source = req.headers['x-lp-source']
+        if source == 'book' and not book_release.is_set():
+            book_entered.set()
+            try:
+                assert await asyncio.to_thread(book_release.wait, 4), 'external GTD book watchdog'
+            except asyncio.CancelledError:
+                assert await asyncio.to_thread(book_release.wait, 4), 'external GTD cleanup watchdog'
+
+        if source in ('open_orders', 'order'):
+            self.requests.append((source, req.headers['x-lp-order'], self.seconds))
+            objects = self.sdk.orders if source == 'open_orders' else [self.history[req.url.path.rsplit('/', 1)[-1]]]
+            rows = []
+            for obj in objects:
+                row = sdk_wire(obj)
+                expiration = obj.expires_at
+                row['expiration'] = str(int(expiration.timestamp())) if expiration is not None else '0'
+                row['created_at'] = int(self.utc().timestamp())
+                rows.append(row)
+            return httpx.Response(200, json=dict(data=rows, next_cursor='LTE=') if source=='open_orders' else rows[0])
+        return await actual_http(self, req)
+    monkeypatch.setattr(AsyncPoolRig, 'http', sdk_http)
+    rig = AsyncPoolRig(tmp_path, monkeypatch)
+    names = 'A' if kind == 'single_protection' else 'AB'
+    def observe(predicate):
+        deadline = time.monotonic()+4
+        while not predicate():
+            rig.live.run_once()
+            assert time.monotonic()<deadline, rig.live.diagnostics()
+            Event().wait(.001)
+    def idle():
+        status = rig.live.read_runtime.status()
+        return (status['ready_count'] == 0 and status['observed_monotonic'] >= rig.seconds
+            and not any(scope['active'] for scope in status['scopes']))
+    def next_read(predicate):
+        # Advance only after actual mailbox consumption and physical read completion.
+        deadline = time.monotonic()+4
+        while not (predicate() and idle()):
+            rig.live.run_once()
+            status = rig.live.read_runtime.status()
+            due = status['next_dependency_monotonic']
+            assert status['cleanup_faults'] == 0
+            assert time.monotonic()<deadline, rig.live.diagnostics()
+            if not predicate() and idle() and due is not None and due > rig.seconds:
+                rig.tick(due-rig.seconds)
+            Event().wait(.001)
+    try:
+        for name in names:
+            rig.market(name)
+        rig.sdk.orders = tuple(_open_order(name, 'BUY', price='.4', original='20', order_type='GTD',
+            expiration=epoch, token_id='t'+name).model_copy(update={'condition_id':rig.cid(name)}) for name in names)
+        assert all(o.expires_at == expiry for o in rig.sdk.orders)
+        rig.history = {o.id:o for o in rig.sdk.orders}
+        rig.tick()
+        observe(lambda: len(rig.live.state.snapshot().active_orders)==len(names)
+            and all(o.key in rig.live.state.snapshot().yields for o in rig.live.state.snapshot().active_orders))
+        assert book_entered.wait(2)
+        assert any(scope['active'] and scope['key'][3]=='buy'
+            for scope in rig.live.read_runtime.status()['scopes'])
+        # The previous key-presence condition deliberately succeeds while this
+        # actual HTTP read is held. Release and drain before any business jump.
+        book_release.set()
+        observe(idle)
+        assert rig.live.read_runtime.status()['cleanup_faults'] == 0
+        assert all(row.yield_pct_per_hour.state=='known'
+            for row in rig.live.state.snapshot().yields.values())
+        snapshot = rig.live.state.snapshot()
+        assert all(isinstance(o.expiration.value, datetime) and o.expiration.value==expiry for o in snapshot.active_orders)
+        observation = snapshot.observation
+        decision = RotationDecision(rig.live.account_id, observation.cycle_generation,
+            observation.observation_id, snapshot.active_orders)
+        wrong = replace(snapshot.active_orders[0], key=(*snapshot.active_orders[0].key[:3], 'wrong-ID'))
+        denied=rig.live.dispatch_rotation(RunResult(None, rotation=replace(decision, victims=(wrong,)))).rotation_outcomes
+        assert denied and all(o.status=='not_sent' and o.handle is None for o in denied)
+        assert rig.sdk.cancels == []
+        assert rig.live.run_protection_once()==()
+        if kind=='single_protection':
+            actual_book = rig.public.get_order_book
+            def low_book(**kwargs):
+                book=actual_book(**kwargs)
+                return book.model_copy(update={'bids':(book.bids[0].model_copy(update={'size':Decimal('40')}),)})
+            rig.public.get_order_book=low_book
+            previous = rig.utc()
+            next_read(lambda:(source:=rig.live.state.snapshot().observation.source_frame.sources.get(
+                'market_book:'+rig.cid('A')+':tA')) is not None and source.complete
+                and source.checked_at>previous)
+        before = list(rig.requests)
+        def cancel(*,order_ids):
+            rig.sdk.cancels.append(tuple(order_ids))
+            if kind=='single_protection':raise TimeoutError('offline unknown native result')
+            return dict(canceled=['A'], not_canceled={})
+        rig.sdk.cancel_orders=cancel
+        if kind=='single_protection':
+            handles=list(rig.live.run_protection_once())
+        else:
+            handles=[o.handle for o in rig.live.dispatch_rotation(RunResult(None,rotation=decision)).rotation_outcomes]
+        assert len(handles)==len(names)
+        results={h.identity.target.existing_order_id:finished(h).status.value for h in handles}
+        assert results==({'A':'unknown_error'} if kind=='single_protection' else {'A':'accepted','B':'unknown_error'})
+        assert rig.requests==before  # entering cancel adds no GET
+        drained(rig.live.writer)
+        rows=[r for r in action_rows(rig.store) if r['kind']=='CANCEL']
+        assert len(rows)==len(names) and all(type(r['expiration']) is int and r['expiration']==epoch for r in rows)
+        assert set(r['order_id'] for r in rows)==set(names)
+        receipts={r['request_id']:r['receipt'] for r in rows}
+        assert len(rig.sdk.cancels)==1
+        assert rig.live.run_protection_once()==()
+        from tests.test_lp_d2_integration import settle_control
+        rig.live.request_running(False)
+        settle_control(rig.live)
+        if kind=='single_protection':
+            rig.sdk.orders=tuple(o.model_copy(update={'expires_at':expiry+timedelta(seconds=60)}) for o in rig.sdk.orders)
+            observe(idle)
+            next_read(lambda:any(o.key[3]=='A' and o.expiration.value==expiry+timedelta(seconds=60)
+                for o in rig.live.state.snapshot().active_orders))
+            assert rig.live.run_protection_once()==()
+            drained(rig.live.writer)
+            assert len(rig.sdk.cancels)==1
+            assert len([r for r in action_rows(rig.store) if r['kind']=='CANCEL'])==1
+        observe(idle)
+        rig.sdk.orders=()
+        for name in names:
+            rig.history[name]=rig.history[name].model_copy(update={'status':'CANCELED', 'size_matched':Decimal('3')})
+        rig.tick()
+        rig.converge_current(lambda:all(any(r['request_id']==old['request_id'] and r.get('progress',{}).get('status')=='CANCELED'
+            for r in action_rows(rig.store)) for old in rows))
+        drained(rig.live.writer)
+        final={r['request_id']:r for r in action_rows(rig.store)}
+        for old in rows:
+            row=final[old['request_id']]
+            assert row['receipt']==receipts[row['request_id']]
+            assert (row['progress']['size_matched'],row['progress']['remaining'],row['progress']['reserved_usd'])==('3','17','0')
+        assert live_status_ok(drained(rig.live.writer))
+    finally:
+        book_release.set()
+        rig.close()
+
+
+@pytest.mark.parametrize('kind', ['register', 'not_sent_cleanup'])
+def test_native_cancel_registration_cannot_interrupt_protection(tmp_path, monkeypatch, kind):
+    import inspect, threading, sys
+    from open_trader.lp_business_writer import RequestRecord
+    owner=threading.current_thread()
+    native_gate, native_entered, observed = threading.Event(), threading.Event(), threading.Event()
+    arm_clock=[False]
+    pending=None
+    class ClockValues(list):
+        def __getitem__(self,index):
+            if arm_clock[0] and threading.current_thread().name=='lp-d2-independent-cancel':
+                arm_clock[0]=False
+                native_entered.set()
+                assert native_gate.wait(4), 'native registration clock gate watchdog'
+            return super().__getitem__(index)
+    deny=[False]
+    class ObservedLive(LPD2LiveExecution):
+        def bind_mutation_admission(self,owner,acquire):
+            def observed_acquire(kind):
+                actual=acquire(kind)
+                if actual is None:return None
+                class Lease:
+                    def allowed(self,action=None):
+                        if deny[0] and threading.current_thread().name=='lp-d2-independent-cancel':
+                            native_entered.set()
+                            assert native_gate.wait(4), 'actual final admission cleanup gate watchdog'
+                            return False
+                        return actual.allowed(action)
+                    def release(self):actual.release()
+                return Lease()
+            return super().bind_mutation_admission(owner,observed_acquire)
+    monkeypatch.setattr(sys.modules[__name__], 'LPD2LiveExecution', ObservedLive)
+    rig=CancelRig(tmp_path,monkeypatch)
+    rig.date=ClockValues(rig.date)
+    read_attribute=RequestRecord.__getattribute__
+    def observation_gate(record,name):
+        frame=inspect.currentframe().f_back
+        if (name=='account_id' and threading.current_thread() is owner and not observed.is_set()
+                and (frame.f_code.co_name=='_refresh_protection_evidence' or
+                    frame.f_code.co_name=='<setcomp>' and frame.f_back is not None
+                    and frame.f_back.f_code.co_name=='_refresh_protection_evidence')):
+            # This diagnostic pauses a real immutable value read, never changes
+            # a dictionary or a fact, and never creates a second business owner.
+            observed.set()
+            native_gate.set()
+            finished(pending)  # actual native registration/removal and callback finish
+        return read_attribute(record,name)
+    try:
+        for name in 'AB':
+            rig.market(name);rig.add_order(name,'8',order_id=name)
+        rig.live.run_once()
+        def unknown(*,order_ids):
+            rig.sdk.cancels.append(tuple(order_ids));raise TimeoutError('offline unknown')
+        rig.sdk.cancel_orders=unknown
+        keys={o.key[3]:o.key for o in rig.live.state.snapshot().active_orders}
+        first=finished(rig.live.cancel_independent(keys['A']))
+        if kind=='register':arm_clock[0]=True
+        else:deny[0]=True
+        pending=rig.live.cancel_independent(keys['B'])
+        assert native_entered.wait(2)
+        assert not pending.done()
+        monkeypatch.setattr(RequestRecord,'__getattribute__',observation_gate)
+        rig.live.run_protection_once()
+        assert observed.is_set() and pending.done()
+        result=pending.result(0)
+        assert result.status.value==('unknown_error' if kind=='register' else 'not_sent')
+        assert rig.live.status()['native_inflight']==0
+        if kind=='not_sent_cleanup':
+            assert rig.sdk.cancels==[('A',)]
+            deny[0]=False
+            retry=rig.live.cancel_independent(keys['B'])
+            assert retry.identity.request_id!=pending.identity.request_id
+            assert finished(retry).status.value=='unknown_error'
+        assert rig.sdk.cancels==[('A',),('B',)]
+        assert rig.live.run_protection_once()==()
+        assert rig.sdk.cancels==[('A',),('B',)]  # consumed source cannot replay
+        # Later normal facts still drive both exact protection targets.
+        actual_book=rig.public.get_order_book
+        def low_book(**kwargs):
+            book=actual_book(**kwargs)
+            return book.model_copy(update={'bids':(book.bids[0].model_copy(update={'size':Decimal('40')}),)})
+        rig.public.get_order_book=low_book
+        rig.live.run_once()
+        handles=rig.live.run_protection_once()
+        assert {h.identity.target.existing_order_id for h in handles}=={'A','B'}
+        for handle in handles:assert finished(handle).status.value=='unknown_error'
+        drained(rig.live.writer)
+        rows=[r for r in action_rows(rig.store) if r['kind']=='CANCEL']
+        assert len({r['request_id'] for r in rows})==len(rows)==(5 if kind=='not_sent_cleanup' else 4)
+        assert all(r['receipt']['request_id']==r['request_id'] and r['receipt']['order_id']==r['order_id'] for r in rows)
+        assert next(r for r in rows if r['request_id']==first.identity.request_id)['receipt']['outcome']=='unknown'
+        assert live_status_ok(drained(rig.live.writer))
+    finally:
+        native_gate.set()
         rig.close()

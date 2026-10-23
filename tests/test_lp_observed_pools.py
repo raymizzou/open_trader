@@ -1698,6 +1698,8 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
 @pytest.mark.parametrize('native_result',['accepted','unknown'])
 def test_pool_restart_and_expiry_preserve_owned_async_holds(tmp_path,monkeypatch,native_result,pool_async_watchdog):
     import httpx
+    import threading
+    from tests.test_lp_cancel_lock_regressions import drained, action_rows
     from threading import Event
     from open_trader.polymarket_lp import PolymarketLPService
     from open_trader.polymarket_lp_current_state import ValidatedStartAdmission
@@ -1706,14 +1708,22 @@ def test_pool_restart_and_expiry_preserve_owned_async_holds(tmp_path,monkeypatch
     from open_trader.polymarket_lp_scheduler import LPAutoScheduler
     from tests.test_lp_d2_execution_bridge import attach
     rig=AsyncPoolRig(tmp_path,monkeypatch)
-    entered,release=Event(),Event()
+    entered=Event()
+    calls, gates, calls_lock = [], {}, threading.Lock()
+    hold_old_owner = [True]
     try:
         rig.market('D');rig.add_order('D','1');rig.measure(dict(D='.8'))
         sample=rig.execution.lp_observed_pool_state()['results'][rig.cid('D')]['result']
         actual_cancel=rig.sdk.cancel_orders
         def held(*,order_ids):
             assert order_ids==('old-D',)
-            entered.set();assert release.wait(8),'restart native external watchdog'
+            if hold_old_owner[0]:
+                with calls_lock:
+                    thread = threading.current_thread()
+                    calls.append(thread)
+                    gate = gates[thread] = Event()
+                    entered.set()
+                assert gate.wait(8),'restart native external watchdog'
             if native_result=='unknown':
                 rig.sdk.cancels.append(tuple(order_ids));raise TimeoutError('offline unknown cancel result')
             rig.release('old-D')
@@ -1721,31 +1731,67 @@ def test_pool_restart_and_expiry_preserve_owned_async_holds(tmp_path,monkeypatch
         rig.sdk.cancel_orders=held
         rig.tick()
         rig.pump(entered.is_set)
+        drained(rig.live.writer)
+        first, = [row for row in action_rows(rig.store) if row['kind']=='CANCEL']
+        first_source = rig.live.state.snapshot().observation.order_view.orders_source
+        assert first['order_id']=='old-D'
+        for _ in range(3): rig.scheduler.run_due()
+        assert len(calls)==1  # repeating the accepted source cannot duplicate the request
         rig.http_mode='swallow';rig.tick()
         rig.pump(lambda:any(source=='book' and oid=='old-D' and stamp==rig.seconds
             for source,oid,stamp in rig.requests))
-        assert rig.sdk.posts==[] and rig.live.status()['native_inflight']==1
+        rig.pump(lambda:len(calls)==2)
+        drained(rig.live.writer)
+        requests = [row for row in action_rows(rig.store) if row['kind']=='CANCEL']
+        assert len(requests)==2 and {row['order_id'] for row in requests}=={'old-D'}
+        assert len({row['request_id'] for row in requests})==2
+        assert len({row['observation_id'] for row in requests})==2
+        source = rig.live.state.snapshot().observation.order_view.orders_source
+        assert (source.source_id, source.checked_at)!=(first_source.source_id, first_source.checked_at)
+        for _ in range(3): rig.scheduler.run_due()
+        assert len(calls)==2 and len(set(calls))==2 and all(thread.is_alive() for thread in calls)
+        assert rig.sdk.posts==[] and rig.live.status()['native_inflight']==2
         assert rig.store.lp_load_observed_pool_roles(rig.account)['roles'][rig.cid('D')]['promotion_pending']
         rig.tick(6)
         rig.pump(lambda:rig.live.read_runtime.status()['cleanup_faults']>0)
+        rig.pump(lambda:len(calls)==3)
+        drained(rig.live.writer)
+        all_requests = [row for row in action_rows(rig.store) if row['kind']=='CANCEL']
+        assert len(all_requests)==3 and {row['order_id'] for row in all_requests}=={'old-D'}
+        assert len({row['request_id'] for row in all_requests})==3
+        assert len({row['observation_id'] for row in all_requests})==3
+        last_source = rig.live.state.snapshot().observation.order_view.orders_source
+        assert (last_source.source_id, last_source.checked_at)!=(source.source_id, source.checked_at)
+        for _ in range(3): rig.scheduler.run_due()
+        assert len(calls)==3 and len(set(calls))==3 and all(thread.is_alive() for thread in calls)
         old=rig.live
         assert old.close(timeout=0) is False
         state=old.status()
-        assert state['native_inflight']==1
+        assert state['native_inflight']==3
         assert state['read_runtime']['owned_buy_scopes']==1
         assert state['read_runtime']['cleanup_faults']>0
-        assert rig.execution._lp_d2_lease_users==1
+        assert rig.execution._lp_d2_lease_users==3
         rig.tick(121)
         original=rig.execution.lp_observed_pool_state()['results'][rig.cid('D')]
         assert original['result']==sample and not original['eligible']
-        assert rig.sdk.posts==[] and old.status()['native_inflight']==1
-        release.set();rig.release_http.set()
+        assert rig.sdk.posts==[] and old.status()['native_inflight']==3
+        assert len(calls)==3 and all(thread.is_alive() for thread in calls)
+        assert old.close(timeout=0) is False
+        for remaining, thread in zip((2, 1, 0), calls):
+            gates[thread].set()
+            thread.join(3); assert not thread.is_alive()
+            assert old.status()['native_inflight']==remaining
+            assert rig.execution._lp_d2_lease_users==remaining
+            # Even after the final native exit, the swallowed real read owns resources.
+            assert old.close(timeout=0) is False
+        rig.release_http.set()
         assert old.close(timeout=3)
         assert rig.execution._lp_d2_lease_users==0
         assert rig.store.lp_observations(rig.account)[rig.cid('D')]['pool_result']==sample
         # Only real resource drain permits a replacement owner. It starts from
         # current Store facts, never from an old income group/BUY request plan.
         rig.http_mode='ok'
+        hold_old_owner[0] = False
         rig.live=LPD2LiveExecution(rig.store,rig.adapter,account_id=old.account_id,venue='polymarket',
             process_epoch='async-pool-restart',policy=CalculationPolicy(None),load_settings_on_start=True,
             clock=lambda:rig.seconds,utc_now=rig.utc,read_transport=httpx.MockTransport(rig.http))
@@ -1769,7 +1815,8 @@ def test_pool_restart_and_expiry_preserve_owned_async_holds(tmp_path,monkeypatch
         assert rig.execution.lp_observed_pool_state()['results'][rig.cid('D')]['result']==sample
         assert not rig.execution.lp_observed_pool_state()['results'][rig.cid('D')]['eligible']
     finally:
-        release.set();rig.release_http.set();rig.close()
+        for gate in gates.values(): gate.set()
+        rig.release_http.set();rig.close()
 
 
 

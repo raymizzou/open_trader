@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-23 — LP cancellation diagnostic compatibility and consumer checks
+
+- Restore ISO datetime strings in rotation diagnostics while retaining exact integer GTD expiration in request audits and terms checks. Diagnostic reads remain isolated and perform no trading or account I/O.
+- Align deferred-origin, partial-fill, protection priority and restart/expiry checks with independent CANCEL capacity and every actual request lifetime. GTD checks hold real HTTP reads and drain them before advancing business time; financial, identity, UNKNOWN and no-replay guards remain.
+
 ## 2026-10-23 — External PR review and bounded worker recovery
 
 - Use external dots/Opus GitHub reviews and comments for independent PR review. Main monitors complete paginated feedback and exact-SHA checks with a durable wake/check owner and next check; no automatic local reviewer fallback. Keep pending review and CI distinct from merge success.
@@ -16,6 +21,8 @@
 - Triggered protection persists until its exact BUY leaves the open-order view. Each new valid source can create one new request per ID, including while an older CANCEL is pending; repeated source consumption never replays a request.
 - CANCEL no longer consumes the two BUY/SELL placement slots. Every actual single/group call remains tracked until physical exit, and pending cancels wait for reads or completion events. Existing SDK transport, timeouts, permissions and financial guards remain.
 - Per-ID responses distinguish accepted, rejected and UNKNOWN. Final venue facts update each original audit without replacing its receipt or regressing newer progress. Fresh complete account balances and orders govern replenishment; pending CANCEL alone is no unknown BUY reservation.
+- Completed cancel history stays in durable audit. Runtime keeps one current association per exact order; normal LIVE reads do bounded current progress work, and terminal facts update matching original request parents in the background writer.
+- Parsed GTD expirations use exact UTC epoch seconds at audit and terms boundaries. Native cancellation registration and cleanup share short locked registry snapshots with protection; SDK and database waits remain outside those sections.
 
 ## 2026-10-23 — D2 dual-pool operator SOP
 

@@ -12,7 +12,7 @@ from concurrent.futures import Future
 from uuid import uuid4
 from types import MappingProxyType
 
-from .lp_business_writer import LPBusinessWriter, RequestRecord, ReceiptRecord, ProgressRecord
+from .lp_business_writer import LPBusinessWriter, RequestRecord, ReceiptRecord, ProgressRecord, CancelTerminalRecord
 from .polymarket_lp_control import LPControlOwner
 from .polymarket_lp_current_inputs import prepare_current_inputs
 from .polymarket_lp_diagnostics import (summarize_iteration, project_diagnostics, append_outcome,
@@ -298,6 +298,15 @@ class _StandaloneMutationLease:
     def release(self): pass
 
 
+def _audit_expiration(value):
+    """Keep exact UTC seconds at integer-only audit/terms boundaries."""
+    if isinstance(value, datetime):
+        if value.utcoffset() is None or value.astimezone(UTC).microsecond:
+            raise ValueError('sealed_record_terms_invalid')
+        return int(value.timestamp())
+    return value
+
+
 def _cancel_result(response, order_id):
     """Exact per-ID venue evidence; never retain arbitrary rejection payloads."""
     accepted = order_id in response.get('canceled', ())
@@ -362,7 +371,7 @@ class LPD2LiveExecution:
         self._closed = False
         self._admission = None
         self._record_requests = {}
-        self._cancel_records = {}
+        self._cancel_records = {}  # one latest audit/terms association per exact order, never request history
         self._cancel_progress_sources = {}
         self._yield_rounds = ()
         self._yield_rounds_total = 0
@@ -596,8 +605,7 @@ class LPD2LiveExecution:
                         or order.source != observation.order_view.orders_source
                         or association is not None and association.scope != scope
                         or any(f.state != 'known' for f in (order.price,order.original_size,order.size_matched,order.remaining,order.order_type,order.expiration))
-                        or order.order_type.value != 'GTD' or (order.expiration.value.timestamp()
-                            if isinstance(order.expiration.value,datetime) else order.expiration.value) != original['expiration']):
+                        or order.order_type.value != 'GTD' or _audit_expiration(order.expiration.value) != original['expiration']):
                     raise ValueError('manual_order_identity_unknown')
                 if order.key[3] in group['entry_order_ids'] and (
                         order.price.value != Decimal(original['price']) or order.original_size.value != Decimal(original['quantity'])):
@@ -1866,12 +1874,15 @@ class LPD2LiveExecution:
         self._record_requests = retained
         self._offer_cancel_progress()
         active = {o.key for o in self.state.snapshot().active_orders}
-        self._cancel_sources = {key: source for key, source in self._cancel_sources.items()
-            if key in active or self._native_for_order((key[0], self.venue, key[2], key[3])) is not None}
+        with self.state._lock:
+            self._cancel_sources = {key: source for key, source in self._cancel_sources.items()
+                if key in active or self._native_for_order((key[0], self.venue, key[2], key[3])) is not None}
 
     def _offer_cancel_progress(self):
         snapshot = self.state.snapshot()
-        for request_id, record in tuple(self._cancel_records.items()):
+        with self.state._lock:
+            records = tuple(self._cancel_records.items())
+        for key, record in records:
             key = (record.account_id, record.condition_id, record.token_id, record.order_id)
             order = next((o for o in snapshot.orders if o.key == key), None)
             if (order is None or order.price.value != record.price
@@ -1888,17 +1899,33 @@ class LPD2LiveExecution:
                 continue  # disappearance alone proves neither cancellation nor final fill
             if stamp.checked_at is None or stamp.checked_at < record.requested_at:
                 continue
-            identity = (stamp.source_id, stamp.checked_at, size, status)
-            if self._cancel_progress_sources.get(request_id) != identity:
-                self.writer.offer(ProgressRecord(record.account_id, record.process_epoch, request_id,
+            identity = (record.request_id, stamp.source_id, stamp.checked_at, size, status)
+            with self.state._lock:
+                publish = self._cancel_progress_sources.get(key) != identity
+            if publish:
+                progress = ProgressRecord(record.account_id, record.process_epoch, record.request_id,
                     record.session_id, record.condition_id, record.token_id, record.order_id,
-                    record.quantity, size, record.price, status, stamp.checked_at))
-                self._cancel_progress_sources[request_id] = identity
-            if proof is not None and not any(h._thread.is_alive() and (
-                    h.identity.request_id == request_id or isinstance(h.identity, _ManualCancelIdentity)
-                    and key in h.identity.order_keys) for h in self._native_jobs.values()):
-                self._cancel_records.pop(request_id, None)
-                self._cancel_progress_sources.pop(request_id, None)
+                    record.quantity, size, record.price, status, stamp.checked_at)
+                self.writer.offer(CancelTerminalRecord(progress, record.venue, record.order_type, record.expiration)
+                    if proof is not None else progress)
+                with self.state._lock:
+                    if self._cancel_records.get(key) == record:
+                        self._cancel_progress_sources[key] = identity
+            with self.state._lock:
+                if (proof is not None and self._cancel_records.get(key) == record
+                        and self._native_for_order((key[0], self.venue, key[2], key[3])) is None):
+                    self._cancel_records.pop(key, None)
+                    self._cancel_progress_sources.pop(key, None)
+
+    def _forget_cancel_record(self, record, previous=None):
+        key = (record.account_id, record.condition_id, record.token_id, record.order_id)
+        with self.state._lock:
+            if self._cancel_records.get(key) == record:
+                if previous is None:
+                    self._cancel_records.pop(key, None)
+                else:
+                    self._cancel_records[key] = previous
+                self._cancel_progress_sources.pop(key, None)
 
     def _control_view(self):
         current = self.state.snapshot().current
@@ -2185,12 +2212,13 @@ class LPD2LiveExecution:
                 records = tuple(RequestRecord(self.account_id,self.process_epoch,a.request_id,
                     'd2:'+a.request_id,o.key[1],o.key[2],'CANCEL',o.price.value,o.original_size.value,
                     self._utc_now(),o.key[3],self.venue,decision.cycle_generation,'independent:'+group.request_id,
-                    self.rounds.snapshot().round_number,observation.observation_id,o.order_type.value,o.expiration.value,None,())
+                    self.rounds.snapshot().round_number,observation.observation_id,o.order_type.value,_audit_expiration(o.expiration.value),None,())
                     for a,o in zip(actions,victims))
                 for action, order in zip(actions, victims):
                     self._cancel_sources[order.key] = (*consumed, action.request_id)
-                for record in records:
-                    self._cancel_records[record.request_id] = record
+                previous_records = {o.key: self._cancel_records.get(o.key) for o in victims}
+                for order, record in zip(victims, records):
+                    self._cancel_records[order.key] = record
                     self.writer.offer(record)
                 future = Future()
                 def cancel():
@@ -2227,7 +2255,7 @@ class LPD2LiveExecution:
                                     key = (record.account_id, record.condition_id, record.token_id, record.order_id)
                                     if self._cancel_sources.get(key) == (*consumed, action.request_id):
                                         self._cancel_sources.pop(key, None)
-                                    self._cancel_records.pop(action.request_id, None)
+                                    self._forget_cancel_record(record, previous_records[key])
                             self.writer.offer(ReceiptRecord(self.account_id,self.process_epoch,action.request_id,
                                 record.session_id,record.condition_id,record.token_id,record.order_id,
                                 'accepted' if outcome.status==LocalStatus.ACCEPTED else
@@ -2371,7 +2399,7 @@ class LPD2LiveExecution:
                 and o.key[2] == target.token_id)
             condition, price, quantity = order.key[1], order.price.value, order.original_size.value
             order_id, kind = order.key[3], 'CANCEL'
-            order_type, expiration, post_only, options = order.order_type.value, order.expiration.value, None, ()
+            order_type, expiration, post_only, options = order.order_type.value, _audit_expiration(order.expiration.value), None, ()
         else:
             candidate = self._sealed_candidates[(token.batch_id, action.request_id)]
             condition, price, quantity = candidate['condition_id'], target.terms.price, target.terms.quantity
@@ -2382,8 +2410,10 @@ class LPD2LiveExecution:
             'd2:' + action.request_id, condition, target.token_id, kind, price, quantity,
             self._utc_now(), order_id, target.venue, token.cycle_generation, token.batch_id,
             token.round_number, token.observation_id, order_type, expiration, post_only, options)
-        if order_id:
-            self._cancel_records[record.request_id] = record
+        with self.state._lock:
+            previous_record = self._cancel_records.get(order.key) if order_id else None
+            if order_id:
+                self._cancel_records[order.key] = record
         reliable_cancel=(isinstance(token,_IndependentContext) and token.protection_key is not None
             and token.protection_key.kind=='read_failure')
         if reliable_cancel:
@@ -2396,7 +2426,7 @@ class LPD2LiveExecution:
             except Exception as exc:
                 self._read_store_error=type(exc).__name__
                 with self.state._lock:
-                    self._cancel_records.pop(action.request_id, None)
+                    self._forget_cancel_record(record, previous_record)
                     source = observation.order_view.orders_source
                     if self._cancel_sources.get(order.key) == (source.source_id, source.checked_at, action.request_id):
                         self._cancel_sources.pop(order.key, None)
@@ -2449,7 +2479,7 @@ class LPD2LiveExecution:
                     self._cancel_sends.discard(action.request_id)
         reason = outcome.reason_code or reason
         if isinstance(target, CancelTarget) and outcome.status==LocalStatus.NOT_SENT:
-            self._cancel_records.pop(action.request_id, None)
+            self._forget_cancel_record(record, previous_record)
             with self.state._lock:
                 source = observation.order_view.orders_source
                 if self._cancel_sources.get(order.key) == (source.source_id, source.checked_at, action.request_id):
@@ -2782,13 +2812,11 @@ class LPD2LiveExecution:
                 protection = (protection_key in snapshot.progress
                     and protection_key.scope[:3] == order_key[:3]) if protection_key is not None else False
                 if protection:
-                    prior = next((self._cancel_records[t.request_id]
-                        for t in reversed(snapshot.progress[protection_key].cancel_targets)
-                        if t.order_key == order_key and t.request_id in self._cancel_records), None)
+                    prior = self._cancel_records.get(order_key)
                     reference = self._record_requests.get(order_key) or prior
                     protection = bool(current_order is not None and current_order.price.value == protection_key.price
                         and (reference is None or (current_order.price.value, current_order.original_size.value,
-                            current_order.order_type.value, current_order.expiration.value) == (reference.price, reference.quantity,
+                            current_order.order_type.value, _audit_expiration(current_order.expiration.value)) == (reference.price, reference.quantity,
                             reference.order_type, reference.expiration)))
                 if protection_key is not None and not protection:
                     self._record_cancel_block('protection_cancel_not_current', phase='before_request', order_key=order_key)
@@ -3264,8 +3292,10 @@ class LPD2LiveExecution:
             baseline, progress = snapshot.baselines.get(key), snapshot.progress.get(key)
             if tickets and baseline is not None and progress is not None:
                 deferred_anchors.update((*key.scope[:3], oid) for oid in baseline.anchor_order_ids)
+        with self.state._lock:
+            cancel_records = tuple(self._cancel_records.values())
         cancel_keys = {(r.account_id, r.condition_id, r.token_id, r.order_id)
-            for r in self._cancel_records.values()}
+            for r in cancel_records}
         read_failure_targets = {target.order_key for key, progress in snapshot.progress.items()
             if key.kind == 'read_failure' for target in progress.cancel_targets}
         # These exact registered IDs have accepted pending cancel obligations,
@@ -3751,7 +3781,7 @@ class LPD2LiveExecution:
                     scope[1], scope[2], 'CANCEL', attempt.price.value, attempt.submit_quantity.value, self._utc_now(),
                     attempt.order_key[3], self.venue, snapshot.current.cycle_generation, 'protection:'+identity.request_id,
                     self.rounds.snapshot().round_number, snapshot.observation.observation_id,
-                    attempt.order_type.value, attempt.expiration.value, None, ())
+                    attempt.order_type.value, _audit_expiration(attempt.expiration.value), None, ())
                 self.writer.offer(record)
                 def cancel():
                     outcome = 'unknown'

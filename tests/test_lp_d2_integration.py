@@ -2746,6 +2746,7 @@ def test_persistently_invalid_incumbent_qualification_preserves_existing_protect
         template = deepcopy(direction)
         previous_observation_id = None
         previous_read_sequence = None
+        cancel_requests = set()
         for second in (0, 599, 600, 601, 1200):
             clock[0] = second
             current = origin + timedelta(seconds=second)
@@ -2779,6 +2780,10 @@ def test_persistently_invalid_incumbent_qualification_preserves_existing_protect
             attempts = live.run_protection_once()
             for attempt in attempts:
                 attempt.result(timeout=3)
+                attempt._thread.join(3)
+                assert attempt.done() and attempt.identity.request_id not in cancel_requests
+                cancel_requests.add(attempt.identity.request_id)
+            assert live.run_protection_once()==()  # no new request from the consumed raw source
             assert result.outcomes == ()
             observation = result.acceptance.observation
             assert observation is not None
@@ -2830,7 +2835,8 @@ def test_persistently_invalid_incumbent_qualification_preserves_existing_protect
             else:
                 assert yield_state.unknown_since_monotonic == 0
                 assert yield_state.unknown_deadline_monotonic == 600
-                assert sdk.cancels == [('entry-A',)]
+                expected = {600:1,601:2,1200:3}[second]
+                assert sdk.cancels == [('entry-A',)]*expected and len(cancel_requests)==expected
                 timeout_reasons = tuple(
                     target.reason for progress in snapshot.progress.values()
                     for target in progress.cancel_targets

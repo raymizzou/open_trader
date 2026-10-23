@@ -8321,10 +8321,13 @@ class PredictionArbitrageStore:
         Receipt/progress parents are checked in their own actual transaction;
         an uncertain prior commit is never retried or fabricated here.
         """
-        from dataclasses import asdict
-        from .lp_business_writer import RequestRecord, ReceiptRecord, ProgressRecord, _encode_scalar
+        from dataclasses import asdict, replace
+        from .lp_business_writer import RequestRecord, ReceiptRecord, ProgressRecord, CancelTerminalRecord, _encode_scalar
         from .polymarket_lp_market_reader import CURRENT_ORDER_STATES
         from .polymarket_lp_risk import TERMINAL_ORDER_STATES
+        terminal = record if type(record) is CancelTerminalRecord else None
+        if terminal is not None:
+            record = terminal.progress
         if type(record) not in (RequestRecord, ReceiptRecord, ProgressRecord):
             raise TypeError('closed_business_record_required')
         def encode(value):
@@ -8373,6 +8376,48 @@ class PredictionArbitrageStore:
             known_order = original.get('order_id') or (original.get('receipt') or {}).get('order_id')
             if known_order is not None and record.order_id != known_order:
                 return False
+            if terminal is not None:
+                # Only a validated current terminal fact may visit historical
+                # parents, on the existing bounded background writer thread.
+                terms = dict(venue=terminal.venue, order_type=terminal.order_type, expiration=terminal.expiration)
+                if (record.status not in TERMINAL_ORDER_STATES
+                        or record.status in {'FILLED', 'MATCHED'} and record.size_matched != record.original_size
+                        or original.get('kind') != 'CANCEL'
+                        or any(original.get(k) != value for k, value in terms.items())
+                        or Decimal(original['quantity']) != record.original_size
+                        or Decimal(original['price']) != record.price):
+                    return False
+                rows = connection.execute('SELECT a.action_key,a.session_id,a.payload,s.state AS parent_state,'
+                    's.payload AS parent_payload FROM lp_actions a JOIN lp_sessions s ON s.session_id=a.session_id '
+                    "WHERE json_extract(a.payload,'$.kind')='CANCEL' "
+                    "AND json_extract(a.payload,'$.account_id')=? AND json_extract(a.payload,'$.process_epoch')=? "
+                    "AND json_extract(a.payload,'$.condition_id')=? AND json_extract(a.payload,'$.token_id')=? "
+                    "AND json_extract(a.payload,'$.order_id')=?",
+                    (record.account_id, record.process_epoch, record.condition_id, record.token_id, record.order_id))
+                for target in rows:
+                    audit = json.loads(target['payload'])
+                    parent = json.loads(target['parent_payload'])
+                    if (target['parent_state'] != 'complete' or parent.get('d2_audit_only') is not True
+                            or set(parent) != set(identity) | {'d2_audit_only'}
+                            or any(parent.get(k) != value for k, value in identity.items())
+                            or audit.get('d2_record') != 'request'
+                            or audit.get('request_id') != target['action_key']
+                            or audit.get('session_id') != target['session_id']
+                            or any(audit.get(k) != value for k, value in terms.items())
+                            or Decimal(audit['quantity']) != record.original_size
+                            or Decimal(audit['price']) != record.price
+                            or datetime.fromisoformat(audit['requested_at']) > record.checked_at):
+                        continue
+                    previous = audit.get('progress')
+                    if previous and (record.checked_at < datetime.fromisoformat(previous['checked_at'])
+                            or record.size_matched < Decimal(previous['size_matched'])):
+                        continue
+                    progress = asdict(replace(record, request_id=audit['request_id'], session_id=target['session_id']))
+                    progress.update(remaining=record.original_size-record.size_matched, reserved_usd=Decimal(0))
+                    audit['progress'] = progress
+                    connection.execute('UPDATE lp_actions SET payload=?,updated_at=? WHERE action_key=? AND session_id=?',
+                        (encode(audit), record.checked_at.isoformat(), target['action_key'], target['session_id']))
+                return True
             if type(record) is ReceiptRecord:
                 original['receipt'] = values
                 stamp = record.received_at.isoformat()
