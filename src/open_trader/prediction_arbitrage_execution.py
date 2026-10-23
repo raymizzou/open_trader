@@ -1078,7 +1078,13 @@ class PredictionExecutionService:
                 settings_pending=settings['pending'], settings_native_inflight=settings['native_inflight'],
                 settings_error=settings['error'], effective_round_interval_seconds=None,
                 check_interval_seconds=None, cycle_mode='continuous',plan_wait=live.status()['plan_wait'])
-            if observed_pools is not None: result['observed_pools'] = observed_pools
+            if observed_pools is not None:
+                from .polymarket_lp_observed_pools import current_membership
+                observed_pools['current_membership'] = json_value(current_membership(
+                    snapshot, observed_pools.get('roles', {}), dict(live._pool_transfers),
+                    account_id=live.account_id, settings_account=self._lp_account_id(),
+                    epoch=live.process_epoch, as_of=live._utc_now()))
+                result['observed_pools'] = observed_pools
             result['diagnostics'] = diagnostic_view('iteration', live.diagnostics)
             result['diagnostics']['rotation'] = diagnostic_view('rotation', live.rotation_diagnostics)
             for name, fact in (('buy_reserved_usd', snapshot.buy_reserved),
@@ -2955,6 +2961,7 @@ class PredictionExecutionService:
                     orders.append(
                         {
                             "order_id": order_id,
+                            "account_id": raw_order.get("account_id") or (snapshot.get("account") or {}).get("wallet_address"),
                             "market_id": raw_order.get("market_id"),
                             "condition_id": raw_order.get("condition_id", raw_order.get("market")),
                             "market_title": raw_order.get("market_title", raw_order.get("title")),

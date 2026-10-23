@@ -7064,7 +7064,7 @@ const details = orderTable.match(/<details[\s\S]*?<\/details>/g) || [];
 const yieldCells = orderTable.split("data-label=\"LP 收益率(推荐 → 实际)\"").slice(1)
   .map((segment) => segment.split("</td>")[0]);
 console.log(JSON.stringify({
-      headers: [...orderTable.matchAll(/<th\b[^>]*>([\s\S]*?)<\/th>/g)].map((m) => m[1]),
+      headers: [...orderTable.matchAll(/<th scope="col">([\s\S]*?)<\/th>/g)].map((m) => m[1]),
   current: yieldCells.some((cell) => cell.includes("推荐 <strong>0.25%</strong>") && cell.includes("实际 <strong>0.18%</strong>")),
   baseline: orderTable.includes("试挂基准 0.25%／小时"),
       addRoom: orderTable.includes("加单空间 无") && orderTable.includes("风险已触线"),
@@ -7085,7 +7085,7 @@ console.log(JSON.stringify({
       alertTextEscaped: orderTable.includes("飞书与语音原文：LP 风险警告 &lt;stored&gt;") && orderTable.includes("当前风险 &lt;10% &amp; 未成交买单"),
       pressureExplanation: orderTable.includes("压力估算：实际持仓＋未成交买单余量；未成交部分按假设成交估算，不是已发生亏损。"),
       notificationHours: orderTable.includes("通知时段：飞书全天；语音北京时间 23:00–08:00 静音。"),
-      shortNote: html.includes("预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；「试挂/正式」由委托数量对比最小计分数量自动标注"),
+      shortNote: html.includes("预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；分区依据当前精确订单归属"),
       marketLink: orderTable.includes('href="https://polymarket.com/event/tracked"'),
   marketRows: marketRows.length,
 }));
@@ -7495,7 +7495,7 @@ const marketARow = rowFor("condition-a");
 const marketBRow = rowFor("condition-b");
 const count = (value, needle) => value.split(needle).length - 1;
 console.log(JSON.stringify({
-  headers: [...orderTable.matchAll(/<th\b[^>]*>([\s\S]*?)<\/th>/g)].map((m) => m[1]),
+  headers: [...orderTable.matchAll(/<th scope="col">([\s\S]*?)<\/th>/g)].map((m) => m[1]),
   rowCount: rowSegments.length,
   unifiedHeadline: marketARow.includes("23¢ × 合计 1,000 份"),
   fillLine: marketARow.includes("已成交 0 · 剩余 1,000"),
@@ -7596,12 +7596,12 @@ const dashboard = {
 };
 const html = predictionLpCard({lp_dashboard: dashboard});
 const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
-const marketRow = (orderTable.split("<tr data-lp-today-market=")[1] || "");
+const marketRow = orderTable;
 const count = (value, needle) => value.split(needle).length - 1;
 console.log(JSON.stringify({
-  headline: marketRow.includes("合计 750 份 · 买入 650 · 卖出 100"),
-  buyLine: marketRow.includes("650 份 @ 23¢ · 买入"),
-  sellLine: marketRow.includes("100 份 @ 30¢ · 卖出"),
+  headline: !marketRow.includes("合计 750 份") && marketRow.includes("23¢ × 650 份") && marketRow.includes("30¢ × 100 份"),
+  buyLine: marketRow.includes('data-lp-section="trial"') && marketRow.includes("23¢ × 650 份"),
+  sellLine: marketRow.includes('data-lp-section="sell"') && marketRow.includes("30¢ × 100 份"),
   cancelButtons: count(marketRow, 'lp-cancel"'),
   cancelAll: count(marketRow, "lp-cancel-all"),
 }));
@@ -7643,13 +7643,13 @@ const dashboard = {
 };
 const html = predictionLpCard({lp_dashboard: dashboard});
 const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
-const marketRow = (orderTable.split("<tr data-lp-today-market=")[1] || "");
+const marketRow = orderTable;
 const count = (value, needle) => value.split(needle).length - 1;
 console.log(JSON.stringify({
-  total: marketRow.includes("合计 140 份"),
-  fillLine: marketRow.includes("已成交 100 · 剩余 40"),
-  openLine: marketRow.includes("80 份 @ 50¢ · 正式 · 已成交 40"),
-  filledLine: marketRow.includes("60 份 @ 45¢ · 已成交"),
+  total: marketRow.includes("50¢ × 80 份") && marketRow.includes("合计 60 份") && !marketRow.includes("合计 140 份"),
+  fillLine: marketRow.includes("已成交 40 · 剩余 40") && marketRow.includes("已成交 60 · 剩余 0"),
+  openLine: marketRow.includes("50¢ × 80 份 · 正式") && marketRow.includes("部分成交 40/80"),
+  filledLine: marketRow.includes("完全成交 60/60"),
   cancelButtons: count(marketRow, 'lp-cancel"'),
   cancelAll: count(marketRow, "lp-cancel-all"),
 }));
@@ -7771,7 +7771,7 @@ console.log(JSON.stringify({
   firstIncreasing: increasing(first),
   second,
   secondIncreasing: increasing(second),
-  subtitleNew: html.includes("活跃在前 · 已完结沉底 · 各按当前小时奖励率降序 · 一标的一行"),
+  subtitleNew: html.includes("试挂 / 收益 / 卖单 / 已结束 · 区内按当前小时奖励率降序 · 区内一标的一行"),
   subtitleOldGone: !html.includes("· 按当前小时奖励率降序 ·"),
 }));
 """)
@@ -7837,6 +7837,7 @@ const fullRow = rowFor("condition-full");
 const partialDoneRow = rowFor("condition-partial-done");
 const zeroDoneRow = rowFor("condition-zero-done");
 const multiRow = rowFor("condition-multi");
+const multiDoneRow = orderTable.split('<tbody data-lp-section="finished">')[1] || "";
 console.log(JSON.stringify({
   openPill: openRow.includes("<span class=\"pm-pill\">挂单中 · 已成交 0</span>"),
   openPillNeutral: !openRow.includes("pm-pill status-"),
@@ -7850,10 +7851,10 @@ console.log(JSON.stringify({
   partialDoneDone: partialDoneRow.includes("lp-today-done"),
   zeroDonePill: zeroDoneRow.includes("<span class=\"pm-pill\">已完结 · 未成交</span>"),
   zeroDoneDone: zeroDoneRow.includes("lp-today-done"),
-  multiFilledPill: multiRow.includes("<span class=\"pm-pill status-ok\">已成交</span>"),
-  multiRestingPill: multiRow.includes("<span class=\"pm-pill\">挂单中</span>"),
-  multiFilledTextKept: multiRow.includes("已成交") && multiRow.includes("500 份 @"),
-  multiRestingTextKept: multiRow.includes("40 份 @"),
+  multiFilledPill: multiDoneRow.includes("<span class=\"pm-pill status-ok\">完全成交 500/500</span>"),
+  multiRestingPill: multiRow.includes("<span class=\"pm-pill\">挂单中 · 已成交 0</span>"),
+  multiFilledTextKept: multiDoneRow.includes("已成交 500 · 剩余 0") && multiDoneRow.includes("合计 500 份"),
+  multiRestingTextKept: multiRow.includes("20¢ × 40 份"),
 }));
 """)
     rendered = json.loads(output)
@@ -7926,7 +7927,7 @@ const capitalCell = (conditionId) => {
   return (row.split("<td data-label=\"实际占用资金\" class=\"num\">")[1] || "").split("</td>")[0];
 };
 console.log(JSON.stringify({
-  headers: [...orderTable.matchAll(/<th\b[^>]*>([\s\S]*?)<\/th>/g)].map((m) => m[1]),
+  headers: [...orderTable.matchAll(/<th scope="col">([\s\S]*?)<\/th>/g)].map((m) => m[1]),
   knownCell: capitalCell("condition-obs-known"),
   knownMoney: capitalCell("condition-obs-known").includes("$26.40"),
   knownSub: capitalCell("condition-obs-known").includes("持仓均成本 + 在挂买单"),
@@ -8055,7 +8056,7 @@ console.log(JSON.stringify({
   marketRows: (orderTable.match(/<tr[^>]*data-lp-today-market=/g) || []).length,
   footnote: html.includes("账户另有 9 行非 LP 订单/持仓，不在本表展示。"),
   emptyState: emptyHtml
-    .includes("<td colspan=\"7\" class=\"pm-observation-empty\">当天暂无 LP 委托。从上方待试挂候选点「挂单」登记第一笔，提交即受位置保护。</td>"),
+    .includes("<td colspan=\"7\" class=\"pm-observation-empty\">本区暂无委托 · 当天暂无 LP 委托。从上方待试挂候选点「挂单」登记第一笔，提交即受位置保护。</td>"),
   legacyEmptyState: legacyHtml.includes("当天暂无 LP 委托。"),
   legacyNoFootnote: !legacyHtml.includes("非 LP 订单/持仓"),
 }));
@@ -22926,7 +22927,7 @@ console.log(JSON.stringify({
 }));
 ''')
     rendered = json.loads(output)
-    assert rendered["fedRows"] == 1
+    assert rendered["fedRows"] == 2
     assert rendered["stopATriggered"] is True
     assert rendered["stopBHealthy"] is True
     assert rendered["noAugmentButton"] is True
@@ -24523,3 +24524,114 @@ def test_dashboard_js_watchdog_reclaims_nonterminating_harness(body: str) -> Non
     with pytest.raises(subprocess.TimeoutExpired) as error:
         run_dashboard_js('console.log("watchdog-fixture-entered");' + body, timeout=1)
     assert b"watchdog-fixture-entered" in (error.value.stdout or b"")
+
+
+def test_lp_controls_remove_observed_result_log() -> None:
+    rendered=json.loads(run_dashboard_js(r'''
+state.predictionMarket.csrfToken="offline";
+state.predictionMarket.lpAutoDraft={budget_usd:"42",income_budget_usd:"101"};
+state.predictionMarket.lpAutoMessage="配置已保存";
+const auto={desired_running:false,scheduler_running:true,pause_confirmed:true,
+  slots:{occupied:0},config_version:1,observed_pools:{results:{history:{eligible:true,
+    result:{yield_pct_per_hour:"9",buy_capital_usd:"20",source_order:{order_id:"history-source"}}}}}};
+console.log(JSON.stringify(predictionLpAutoControls(auto,false)));
+'''))
+    assert 'history-source' not in rendered
+    assert '· 实测结果' not in rendered
+    assert 'value="42"' in rendered and 'value="101"' in rendered
+    assert 'data-lp-auto-action="enable"' in rendered
+    assert 'data-lp-auto-action="config"' in rendered and '配置已保存' in rendered
+    assert '保存不交易' in rendered and '50% / 30% / 20%' in rendered
+
+
+def _lp430_order(oid, *, side='BUY', condition='same-market', status='LIVE', quantity='10', **extra):
+    return dict(account_id='offline-account',condition_id=condition,token_id='token-'+oid,
+        order_id=oid,side=side,status=status,state='open',price='.4',quantity=quantity,
+        remaining_quantity=quantity,filled_quantity='0',market_title=oid,**extra)
+
+
+def _lp430_card(rows, members=(), **extra):
+    dashboard=dict(state='ready',stale=False,lp_orders_today=rows,lp_observations={},
+        market_rewards={},reward_shares={},lp_sessions=[],lp_session=dict(state='none'),
+        auto=dict(observed_pools=dict(current_membership=dict(state='known',account_id='offline-account',
+            orders=list(members),pending_promotions=extra.pop('promotions',[])))))
+    dashboard.update(extra)
+    html=json.loads(run_dashboard_js('console.log(JSON.stringify(predictionLpCard({lp_dashboard:'+
+        json.dumps(dashboard)+'})));'))
+    table=re.search(r'<table class="pm-table pm-lp-order-table">[\s\S]*?</table>',html)[0]
+    return html,{key:body for key,body in re.findall(r'<tbody data-lp-section="([^"]+)">([\s\S]*?)</tbody>',table)}
+
+
+def test_lp_today_has_trial_income_sell_finished_sections() -> None:
+    rows=[_lp430_order('trial'),_lp430_order('income'),_lp430_order('sell',side='SELL'),
+        _lp430_order('finished',status='CANCELED')]
+    member={**rows[1],'pool':'income'}
+    html,sections=_lp430_card(rows,[member])
+    assert list(sections)==['trial','income','sell','finished']
+    for region,title,oid in [('trial','试挂区','trial'),('income','收益区','income'),
+            ('sell','卖单区','sell'),('finished','已结束','finished')]:
+        assert title in sections[region] and '1 笔' in sections[region]
+        assert f'data-lp-order-id="{oid}"' in sections[region]
+        assert sections[region].count('data-lp-today-market=')==1
+    _,empty=_lp430_card([])
+    assert list(empty)==['trial','income','sell','finished']
+    assert all('0 笔' in body and '本区暂无委托' in body for body in empty.values())
+
+
+def test_lp_sections_use_identity_not_order_size_or_historical_role() -> None:
+    rows=[_lp430_order('small-income',quantity='1'),_lp430_order('large-trial',quantity='10000'),
+        _lp430_order('manual'),_lp430_order('source')]
+    members=[{**rows[0],'pool':'income'},{**rows[1],'pool':'trial'},
+        {**rows[2],'order_id':'old-manual','pool':'income'},{**rows[3],'pool':'promotion'}]
+    _,sections=_lp430_card(rows,members)
+    assert 'data-lp-order-id="small-income"' in sections['income']
+    assert 'data-lp-order-id="large-trial"' in sections['trial']
+    assert 'data-lp-order-id="manual"' in sections['trial']
+    assert 'data-lp-order-id="source"' in sections['income'] and '转入中' in sections['income']
+    assert '归属待核对' in sections['trial']
+    _,pending=_lp430_card([],[],promotions=[{**rows[3]}])
+    assert '0 笔' in pending['income'] and '转入中 1' in pending['income']
+    assert 'data-lp-order-id=' not in pending['income']
+
+
+def test_lp_sections_keep_unknown_orders_out_of_finished() -> None:
+    rows=[_lp430_order('unknown',quantity=None),_lp430_order('sell',side='SELL'),
+        _lp430_order('partial',quantity='10'),_lp430_order('canceled',status='CANCELED'),
+        _lp430_order('filled',status='FILLED'),_lp430_order('expired',status='EXPIRED')]
+    rows[2].update(remaining_quantity='6',filled_quantity='4')
+    _,sections=_lp430_card(rows)
+    for oid in ('unknown','partial'):
+        assert f'data-lp-order-id="{oid}"' in sections['trial']
+        assert f'data-lp-order-id="{oid}"' not in sections['finished']
+    assert 'data-lp-order-id="sell"' in sections['sell']
+    for oid in ('canceled','filled','expired'):
+        assert f'data-lp-order-id="{oid}"' in sections['finished']
+    _,unknown=_lp430_card([rows[0]],stale=True)
+    assert 'lp-today-done' not in unknown['trial']
+    assert '已完结 · 未成交' not in unknown['trial']
+    assert '状态待核对' in unknown['trial']
+
+
+def test_lp_section_totals_and_sessions_preserve_order_identity() -> None:
+    rows=[_lp430_order('trial',quantity='10',session_id='trial-session'),
+        _lp430_order('income',quantity='20',session_id='income-session'),
+        _lp430_order('sell',quantity='30',side='SELL',session_id='income-session'),
+        _lp430_order('finished',quantity='40',status='CANCELED',session_id='income-session')]
+    sessions=[dict(session_id=sid,condition_id='same-market',state='entry_open',
+        entry_order_id=oid,token_id='token-'+oid) for sid,oid in
+        [('trial-session','trial'),('income-session','income')]]
+    html,sections=_lp430_card([*rows,rows[0]],[{**rows[0],'pool':'trial'},{**rows[1],'pool':'income'}],
+        lp_sessions=sessions)
+    for region,qty in [('trial','10'),('income','20'),('sell','30'),('finished','40')]:
+        assert f'{qty} 份' in sections[region]
+        assert '1 笔' in sections[region]
+        assert sections[region].count('data-lp-order-id=')==1
+        assert '市场共享' in sections[region]
+    assert 'data-action="lp-augment-entry"' not in sections['trial']
+    assert 'data-action="lp-augment-entry"' not in sections['income']
+    _,single=_lp430_card([rows[0]],[{**rows[0],'pool':'trial'}],lp_sessions=[sessions[0]])
+    assert 'data-session-id="trial-session"' in single['trial']
+    assert 'data-action="lp-augment-entry"' not in sections['sell']
+    assert 'data-action="lp-augment-entry"' not in sections['finished']
+    assert 'data-action="lp-cancel-all"' in html  # global all-order action stays intact
+    assert 'data-action="lp-cancel-order" data-order-id="sell"' in sections['sell']

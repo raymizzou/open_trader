@@ -306,6 +306,24 @@ class PoolRig:
             self.history[oid]={**self.history[oid],'status':'CANCELED'}
 
     def measure(self,rates):
+        # These default old-* orders represent fixture-managed trial episodes.
+        # Explicit manual IDs never acquire authority from missing roles.
+        saved = self.store.lp_load_observed_pool_roles(self.account)
+        roles = dict(saved['roles'])
+        for name in rates:
+            cid = self.cid(name)
+            if cid not in roles and any(o['id'] == 'old-'+name and o['market'] == cid
+                    for o in self.sdk.orders):
+                roles[cid] = dict(pool='trial', episode='old-'+name)
+        if hasattr(self,'observe_initial_measurement') and not getattr(self,'_measurement_primed',False):
+            self.observe_initial_measurement(rates)
+            self._measurement_primed=True
+        # Management is seeded against the published exact current account,
+        # after any startup ticket captured before the fixture orders existed.
+        current_roles=self.store.lp_load_observed_pool_roles(self.account)
+        if roles != current_roles['roles']:
+            self.store.lp_save_observed_pool_roles(self.account,
+                expected_revision=current_roles['revision'], roles=roles)
         for name,rate in rates.items():
             capital=sum((o['price']*(o['original_size']-o['size_matched']) for o in self.sdk.orders
                 if o['market']==self.cid(name) and o['side']=='BUY'),Decimal(0))
@@ -414,6 +432,10 @@ def test_income_bootstrap_leaves_empty_weights_and_filters_final_minimum(tmp_pat
                 rig.market(name,minimum=minimum)
                 rig.add_order(name,minimum)
             rig.measure({n:r for n,r in zip(names,('1','.8','.6'))})
+            admission=rig.cycle(pool='income');rig.finish_cancels(admission)
+            expected_sources={'old-'+n for n in names if not (scenario=='minimum' and n=='B')}
+            assert {o.key[3] for o in admission.rotation.victims}==expected_sources
+            rig.sdk.cancels.clear()
             rig.release(*('old-'+n for n in names))
             bought=rig.cycle(pool='income')
             assert all(o.status.value=='accepted' for o in bought.outcomes)
@@ -449,7 +471,18 @@ def test_next_income_cycle_reselects_after_cancels_without_locked_group(tmp_path
         assert rig.sdk.posts==[]
         rig.market('E');rig.add_order('E','1')
         rig.measure(dict(E='1.2'))
-        rig.release('old-A','old-B','old-C','old-D','old-E')
+        observed_e=rig.cycle(pool='trial',qualified=True);rig.finish_cancels(observed_e)
+        rig.converge_current(lambda:any(o.key[3]=='old-E' for o in rig.live.state.snapshot().active_orders)
+            and rig.live.state.snapshot().observation.source_frame.sources.get('market_order:old-E') is not None)
+        rig.allowance=Decimal('1')  # E retains the only currently permitted USDC until actual release
+        rig.release('old-A','old-B','old-C','old-D')  # earlier exact sources really departed; E stays current
+        reselection=rig.cycle(pool='income',qualified=True);rig.finish_cancels(reselection)
+        rig.converge_current(lambda:any(p['order_id']=='old-E' for p in
+            rig.execution.lp_auto_state()['observed_pools']['current_membership']['pending_promotions']))
+        pending=rig.execution.lp_auto_state()['observed_pools']['current_membership']['pending_promotions']
+        assert {p['order_id'] for p in pending}=={'old-E','old-B','old-D'}
+        assert rig.sdk.posts==[]
+        rig.release('old-E');rig.allowance=Decimal('200')
         # The next income business opportunity uses a fresh qualified capture.
         # Automatic trial fairness is covered independently by P214-progress.
         second=rig.cycle(pool='income',qualified=True)
@@ -569,6 +602,11 @@ def test_partial_income_submission_keeps_successes_and_unknown_identity(tmp_path
                 rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
                     roles={rig.cid('A'):dict(pool='income',episode='old-A')})
             rig.measure(dict(B='1',D='.8',A='.6'))
+            admission=rig.cycle(pool='income');rig.finish_cancels(admission)
+            rig.converge_current(lambda: {'old-B','old-D','old-A'} <=
+                {p['order_id'] for p in rig.execution.lp_auto_state()['observed_pools']['current_membership']['pending_promotions']})
+            assert {oid for batch in rig.sdk.cancels for oid in batch}=={'old-B','old-D','old-A'}
+            rig.sdk.cancels.clear()
             rig.release('old-B','old-D','old-A')
             original_post=rig.sdk.post_order
             def partial(signed):
@@ -699,6 +737,16 @@ def test_two_business_loops_share_switch_and_progress_independently(tmp_path,mon
         rig.execution.lp_auto_set_desired_running(True);settle_control(rig.live)
         rig.tick();rig.pump(lambda:rig.live.rounds.snapshot().round_number>0)  # real async resume round-zero
         assert rig.sdk.posts==[]
+        rig.add_order('D','1',order_id='requalified-D')
+        saved=rig.store.lp_load_observed_pool_roles(rig.account)
+        rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=saved['revision'],
+            roles={rig.cid('D'):dict(pool='trial',episode='requalified-D')})
+        rig.measure(dict(D='.8'))  # a true new current source requalifies in this generation
+        readmitted=rig.cycle(pool='income');rig.finish_cancels(readmitted)
+        rig.converge_current(lambda:any(p['order_id']=='requalified-D' for p in
+            rig.execution.lp_auto_state()['observed_pools']['current_membership']['pending_promotions']))
+        assert rig.sdk.posts==[]
+        rig.release('requalified-D')
         post=rig.sdk.post_order
         def held(signed):
             entered.set()
@@ -734,7 +782,9 @@ def test_two_business_loops_share_switch_and_progress_independently(tmp_path,mon
         for _ in range(2):
             scheduler.request_check();assert scheduler.run_due()
         assert len(rig.sdk.posts)==1
-        assert rig.sdk.cancels==[('old-D',)]  # startup cleanup is not repeated per pool
+        assert {oid for batch in rig.sdk.cancels for oid in batch}=={'old-D','requalified-D'}
+        assert sum(batch.count('old-D') for batch in rig.sdk.cancels)==1
+        assert rig.live.rounds.snapshot().round_number>1  # no per-pool round-zero
     finally:
         release.set();rig.close()
 
@@ -748,6 +798,10 @@ def test_income_cycle_consumes_one_result_snapshot_and_next_cycle_gets_updates(t
     try:
         for n in 'DE':rig.market(n)
         rig.add_order('D','1');rig.add_order('E','1')
+        saved=rig.store.lp_load_observed_pool_roles(rig.account)
+        rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=saved['revision'],
+            roles={rig.cid('D'):dict(pool='trial',episode='old-D'),
+                rig.cid('E'):dict(pool='trial',episode='old-E')})
         old=rig.measure(dict(D='.8'))['observations'][rig.cid('D')]['pool_result']
         canceled=rig.cycle(pool='income');rig.finish_cancels(canceled);rig.release('old-D')
         post=rig.sdk.post_order
@@ -1168,8 +1222,8 @@ console.log(JSON.stringify({initial,poll,calls,saved,dual,measured,draft:state.p
         'trial_budget_usd':'45','income_budget_usd':'100','allocation_mode':'observed_pools','expected_config_version':7}}]
     assert result['saved']['desired_running'] is False and result['draft'] is None
     assert '试挂 3' in result['dual'] and '收益 3' in result['dual'] and '50% / 30% / 20%' in result['dual']
-    assert '实测结果' in result['dual'] and '收益池' in result['dual'] and 'trial-D' in result['dual']
-    assert '采样' in result['dual'] and '20:00:00' in result['dual']
+    assert 'trial-D' not in result['dual'] and '· 实测结果' not in result['dual']
+    assert '采样' not in result['dual'] and '20:00:00' not in result['dual']
     assert '模型估算' in result['measured'] and '当前实测' in result['measured']
 
 
@@ -1232,6 +1286,32 @@ class AsyncPoolRig(PoolRig):
         self.live.initialize(ValidatedStartAdmission('async-pools','offline-permit'))
         self.scheduler=LPAutoScheduler(self.execution,clock=self.utc)
         self.pump(lambda:self.live.rounds.snapshot().round_number>0)
+
+    def observe_initial_measurement(self, rates):
+        """Publish initial exact current sources without admitting BUY or dispatching CANCEL."""
+        import time
+        expected_account={o['id'] for o in self.sdk.orders if o['side']=='BUY'}
+        expected = {o['id']:(o['market'],o['asset_id']) for o in self.sdk.orders
+            if self.name(o['market']) in rates and o['side']=='BUY'}
+        end=time.monotonic()+4
+        while True:
+            observed=self.live.run_once(pool='trial')
+            assert not observed.outcomes
+            observation=self.live.state.snapshot().observation
+            if observation is not None and observation.orders_complete:
+                current={r['order_id'] for r in observation.source_frame.current_buys}
+                sources=observation.source_frame.sources
+                if (current == expected_account
+                        and observation.components['open_orders'].checked_at >= self.utc()) and all(
+                    sources.get('market_order:'+oid) is not None
+                    or sources.get('market:'+cid+':'+token) is not None
+                    for oid,(cid,token) in expected.items()):return
+            assert time.monotonic()<end,(self.live.status(),self.live.diagnostics())
+            status=self.live.read_runtime.status();due=status['next_dependency_monotonic']
+            if (status['ready_count']==0 and not any(scope['active'] for scope in status['scopes'])
+                    and status['observed_monotonic']>=self.seconds and due is not None and due>self.seconds):
+                self.tick(due-self.seconds)
+            self.wake.wait(.01);self.wake.clear()
 
     @property
     def seconds(self):return (self.utc()-self.origin).total_seconds()
@@ -1402,11 +1482,14 @@ def test_observed_pools_use_owned_async_current_reads(tmp_path,monkeypatch,sourc
         assert Decimal(sample['buy_capital_usd'])==1
         assert rig.live.rounds.snapshot().round_number>0
         assert rig.live.state.snapshot().current.effective_running
+        admission=rig.cycle(pool='income');rig.finish_cancels(admission)
+        assert {o.key[3] for o in admission.rotation.victims}=={'old-D'}
+        rig.sdk.cancels.clear()
         rig.release('old-D')
         rig.execution._lp=PolymarketLPService(rig.store,rig.adapter,clock=rig.utc)
         assert not rig.execution._lp.capture_qualified_pool().rows
         if source_state=='expired':
-            rig.tick(121)
+            rig.tick(121-float((rig.utc()-__import__('datetime').datetime.fromisoformat(sample['measured_at'])).total_seconds()))
             rig.pump(lambda:rig.live.state.snapshot().observation.components['open_orders'].checked_at==rig.utc())
             view=rig.execution.lp_observed_pool_state()['results'][rig.cid('D')]
             assert view['age_seconds']==121 and not view['eligible']
@@ -2110,7 +2193,8 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
         for name in 'ABCDEFGHJ':
             rig.market(name,minimum='1',pool=pools[name]);rig.add_order(name,capitals[name])
         rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
-            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n) for n in 'ABCDEFGHJ'})
+            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n,
+                **({'evicted':True} if n in 'FGH' else {})) for n in 'ABCDEFGHJ'})
         rig.measure(dict(A='.6',B='1',C='.4',D='.8',E='.7',F='.5',G='.3',H='.2'))
         def cancel(*,order_ids):
             ids=set(order_ids);rig.sdk.cancels.append(tuple(order_ids))

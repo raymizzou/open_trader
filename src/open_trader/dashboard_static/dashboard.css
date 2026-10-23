@@ -6975,3 +6975,22 @@ button { cursor: pointer; }
   color: #6b4a11;
   margin-top: 6px;
 }
+
+/* #430: four current-order regions retain the existing table and light tokens. */
+.pm-lp-card .pm-lp-order-table .lp-pool-heading th {
+  background: var(--surface);
+  border-top: 2px solid var(--line);
+  color: var(--text);
+  font-size: 14px;
+  letter-spacing: 0;
+  padding: 12px 8px;
+  text-transform: none;
+  width: auto;
+}
+.pm-lp-order-table .lp-pool-heading .sub { display: inline; margin-left: 8px; }
+@media (max-width: 720px) {
+  .pm-lp-card .pm-lp-order-table .lp-pool-heading th { display: block; width: 100%; box-sizing: border-box; }
+  .pm-lp-order-table [colspan="7"] { overflow-wrap: anywhere; }
+  .pm-lp-card .pm-check { flex-wrap: wrap; }
+  .pm-lp-card .pm-check label { min-width: 0; max-width: 100%; }
+}

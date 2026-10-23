@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-24 — Current LP trial admission and four order regions
+
+- Admit income entrants only from exact current managed trials. Keep bounded owner-local transfer provenance, refill trial after actual source release, and retire departed income membership without reviving historical orders. Original sample freshness, financial, UNKNOWN and no-replay guards remain.
+- Add read-only current membership to LP state. Remove the historical result log under controls and show today orders in trial, income, SELL and explicitly finished regions with counts and empty states. Preserve shared market metrics, session ownership and all existing cancellation behavior.
+
 ## 2026-10-24 — LP income snapshot test observation synchronization
 
 - Wait for the exact posted D BUY in a receipt-current account and its valid market observation before the next income comparison. Observation passes forbid BUY and cancellation work; the original fixed result, exact next-cycle victims and no-replay assertions remain. Test synchronization only; production behavior is unchanged.
