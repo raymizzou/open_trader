@@ -299,6 +299,10 @@ def _run_host_readiness(
     existing_listener: bool = False,
     existing_plist: bool = False,
     loaded_label: bool = False,
+    prediction_listener: bool = True,
+    manager_status: str = "READY",
+    manager_exit: int = 0,
+    manager_payload: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(parents=True)
@@ -309,6 +313,9 @@ def _run_host_readiness(
         fake_python,
         f"""#!/bin/sh
 echo "python $*" >> "$FAKE_CALLS"
+if [ "$1" = "-c" ]; then
+    case "$2" in *open_trader.prediction_service.preflight.v1*) exec "{sys.executable}" "$@" ;; esac
+fi
 if [ "$1" = "-m" ] && [ "$2" = "open_trader" ] && [ "$3" = "prediction-arb" ] && [ "$4" = "nleg-validate" ]; then
     [ "{fail}" = "1" ] && exit 1
     printf '%s\\n' '{{"replay":{{"status":"PASS"}},"live":{{"reason":"LIVE_CATALOG_UNAVAILABLE"}}}}'
@@ -321,6 +328,20 @@ esac
 exit 0
 """,
     )
+    manager_response=tmp_path/"manager-response.json"
+    manager_response.write_text(manager_payload if manager_payload is not None else json.dumps({
+        "schema_version":"open_trader.prediction_service.preflight.v1","status":manager_status}))
+    # The supported manager CLI is the external boundary for this Make consumer.
+    # The manager itself is exercised by the separate real installer regressions.
+    _write_executable(fake_bin/"bash", f"""#!/bin/sh
+case "$1" in */scripts/install_prediction_service_launchd.sh)
+    echo "prediction-manager $*" >> "$FAKE_CALLS"
+    cat "{manager_response}"
+    exit {manager_exit}
+    ;;
+esac
+exec /bin/bash "$@"
+""")
     lsof_mode = (
         "exit 1"
         if first_deploy and not existing_listener
@@ -330,6 +351,8 @@ exit 0
             else "exit 0"
         )
     )
+    if not prediction_listener:
+        lsof_mode='case "$*" in *8769*) exit 1 ;; esac\n'+lsof_mode
     _write_executable(
         fake_bin / "lsof",
         f'#!/bin/sh\necho "lsof $*" >> "$FAKE_CALLS"\n{lsof_mode}\n',
@@ -383,6 +406,7 @@ exit 0
             f"REPOSITORY_ROOT={runtime_root}",
             f"PLAYWRIGHT_NODE_PATH={runtime_root / 'node_modules'}",
             f"DAILY_CONFIG={daily_config}",
+            f"PREDICTION_CONFIG={runtime_root / 'config/prediction_arbitrage.json'}",
             f"FIRST_DEPLOY={int(first_deploy)}",
         ],
         cwd=ROOT,
@@ -392,6 +416,44 @@ exit 0
         check=False,
         timeout=30,
     )
+
+
+@pytest.mark.parametrize("status", ["READY", "RECOVERABLE"])
+def test_prediction_recovery_readiness_uses_verified_manager_without_old_listener(tmp_path, status):
+    import shlex
+    result=_run_host_readiness(tmp_path,browser_available=True,services="prediction",
+        prediction_listener=False,manager_status=status)
+    assert result.returncode==0,result.stdout+result.stderr
+    assert result.stdout.rstrip().endswith("READY")
+    calls=(tmp_path/"calls").read_text().splitlines()
+    manager=[shlex.split(call)[1:] for call in calls if call.startswith("prediction-manager ")]
+    assert manager==[[str(ROOT/'scripts/install_prediction_service_launchd.sh'),
+        '--mode','production','--preflight','--repo-root',str(ROOT),
+        '--runtime-root',str(tmp_path/'runtime'),'--python',str(tmp_path/'bin/python'),
+        '--config',str(tmp_path/'runtime/config/prediction_arbitrage.json')]]
+    assert not any('lsof ' in call and '8769' in call for call in calls)
+    assert not any('curl ' in call or '--restart' in call or '--prepare-target' in call for call in calls)
+    assert any('prediction-arb wallet' in call for call in calls)
+    assert 'prediction n-leg replay validation: PASS' in result.stdout
+    assert 'Playwright Chromium: PASS' in result.stdout and 'storage: PASS' in result.stdout
+
+
+@pytest.mark.parametrize(("payload","exit_status"), [
+    ('{"schema_version":"open_trader.prediction_service.preflight.v1","status":"BLOCKED"}',0),
+    ('{"schema_version":"open_trader.prediction_service.preflight.v1","status":"READY"}',1),
+    ('{"schema_version":"open_trader.prediction_service.preflight.v1","status":"RECOVERABLE"}',127),
+    ('{"schema_version":"unknown","status":"READY"}',0),
+    ('{"schema_version":"open_trader.prediction_service.preflight.v1","status":"UNKNOWN"}',0),
+    ('{',0), ('[]',0), ('null',0),
+])
+def test_prediction_recovery_readiness_refuses_unverified_manager(tmp_path,payload,exit_status):
+    result=_run_host_readiness(tmp_path,browser_available=True,services="prediction",
+        prediction_listener=False,manager_payload=payload,manager_exit=exit_status)
+    assert result.returncode!=0,result.stdout+result.stderr
+    assert result.stdout.rstrip().endswith("BLOCKED")
+    assert 'prediction managed recovery: BLOCKED' in result.stdout
+    calls=(tmp_path/'calls').read_text()
+    assert '--preflight' in calls and '--restart' not in calls and '--prepare-target' not in calls
 
 
 def test_host_readiness_does_not_require_old_prediction_state(tmp_path: Path) -> None:

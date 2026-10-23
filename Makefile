@@ -148,6 +148,11 @@ host-readiness:
 			| "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); ok=(p.get("replay") or {}).get("status")=="PASS" and (p.get("live") or {}).get("reason")=="LIVE_CATALOG_UNAVAILABLE"; raise SystemExit(0 if ok else 1)'; \
 	}; \
 	if [ $$account_selected -eq 1 ] && [ "$$first_deploy" = 0 ]; then check "account status" "$(PYTHON_BIN)" -m open_trader account-sync-status --account-url "$(ACCOUNT_API_URL)" --json; fi; \
+	prediction_manager_ready() { \
+		manager_payload="$$("$(WORKTREE_ROOT)/scripts/install_prediction_service_launchd.sh" --mode production --preflight --repo-root "$(WORKTREE_ROOT)" --runtime-root "$(REPOSITORY_ROOT)" --python "$(PYTHON_BIN)" --config "$(PREDICTION_CONFIG)")" || return 1; \
+		printf '%s' "$$manager_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); raise SystemExit(0 if isinstance(p,dict) and p.get("schema_version")=="open_trader.prediction_service.preflight.v1" and p.get("status") in ("READY","RECOVERABLE") else 1)'; \
+	}; \
+	if [ $$prediction_selected -eq 1 ] && [ "$$first_deploy" = 0 ]; then check "prediction managed recovery" prediction_manager_ready; fi; \
 	if [ $$prediction_selected -eq 1 ]; then \
 		check "prediction wallet" "$(PYTHON_BIN)" -m open_trader prediction-arb wallet status --config "$(PREDICTION_CONFIG)"; \
 		if nleg_replay_passes >/dev/null 2>&1; then echo "prediction n-leg replay validation: PASS"; else echo "prediction n-leg replay validation: BLOCKED"; status=1; fi; \
@@ -158,10 +163,10 @@ host-readiness:
 	if [ $$gateway_selected -eq 1 ]; then listener_ports="$$listener_ports 8766"; fi; \
 	if [ $$legacy_selected -eq 1 ]; then listener_ports="$$listener_ports 8767"; fi; \
 	if [ $$account_selected -eq 1 ]; then listener_ports="$$listener_ports 8768"; fi; \
-	if [ $$prediction_selected -eq 1 ]; then listener_ports="$$listener_ports 8769"; fi; \
+	if [ $$prediction_selected -eq 1 ] && [ "$$first_deploy" = 1 ]; then listener_ports="$$listener_ports 8769"; fi; \
 	if [ "$$first_deploy" = 1 ]; then \
 		check "loopback listeners absent" sh -c 'command -v lsof >/dev/null || exit 1; for port do if lsof -nP -iTCP:"$$port" -sTCP:LISTEN >/dev/null 2>&1; then exit 1; fi; done' sh $$listener_ports; \
-	else \
+	elif [ -n "$$listener_ports" ]; then \
 		check "loopback listeners" sh -c 'command -v lsof >/dev/null && for port do lsof -nP -iTCP:"$$port" -sTCP:LISTEN >/dev/null || exit 1; done' sh $$listener_ports; \
 	fi; \
 	check "storage" df -P "$(REPOSITORY_ROOT)"; \

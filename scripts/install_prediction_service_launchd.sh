@@ -794,7 +794,6 @@ OLD_PID=""
 if LABEL_OUTPUT="$("$LAUNCHCTL_BIN" print "gui/$UID/$LABEL" 2>&1)"; then
   LABEL_LOADED=1
   OLD_PID="$(printf '%s\n' "$LABEL_OUTPUT" | awk '$1 == "pid" && $2 == "=" && $3 ~ /^[1-9][0-9]*$/ { print $3; exit }')"
-  [[ -n "$OLD_PID" ]] || preflight_fail "managed launchd identity is not verified: managed launchd service has no PID"
 else
   LABEL_STATUS=$?
   if [[ "$LABEL_STATUS" -eq 0 || "$LABEL_OUTPUT" != *"Could not find service"* ]]; then
@@ -813,7 +812,7 @@ fi
 LIVE_RELEASE_MANIFEST="$(release_manifest_argument "$LABEL_ARGUMENTS_JSON")"
 
 CURRENT_CWD=""
-if [[ "$LABEL_LOADED" -eq 1 ]]; then
+if [[ "$LABEL_LOADED" -eq 1 && -n "$OLD_PID" ]]; then
   CURRENT_CWD="$("$LSOF_BIN" -a -p "$OLD_PID" -d cwd -Fn 2>/dev/null \
     | awk '$1 ~ /^n/ { print substr($1, 2); exit }' || true)"
 fi
@@ -879,7 +878,20 @@ managed_identity_matches() {
     "$LABEL_FACTS_JSON" "$CURRENT_HEALTH" "$LIVE_RELEASE_MANIFEST" "$LOCK_OWNER_PIDS")" ]]
 }
 
+observe_failed_managed() {
+  PYTHONPATH="$MANAGER_SRC" "$PYTHON_BIN" - "$1" "$RUNTIME_ROOT" "$CONFIG" "$PYTHON_BIN" \
+    "$PLIST_PATH" "$LAUNCHCTL_BIN" "$LSOF_BIN" "$PS_BIN" "${2:-0}" "$CURRENT_RECORD_JSON" <<'PYCODE'
+import json,sys
+from open_trader.prediction_release import observe_failed_launchd_service
+record,runtime,config,python,plist,launchctl,lsof,ps,absent,expected=sys.argv[1:]
+print(json.dumps(observe_failed_launchd_service(record=json.loads(record),runtime_root=runtime,
+    config_path=config,python=python,plist_path=plist,launchctl=launchctl,lsof=lsof,ps=ps,require_absent=absent=="1",expected_record=json.loads(expected)),separators=(",",":")))
+PYCODE
+}
+
 MANAGED_OLD=0
+FAILED_MANAGED=0
+FAILED_RECORD_JSON="null"
 OBSERVED_RELEASE_JSON="null"
 OBSERVED_READY_JSON="null"
 OBSERVED_RECOVERY_REASON=""
@@ -939,11 +951,27 @@ PY
 )"
     MANAGED_OLD=1
   else
-    if [[ "$PREFLIGHT" -eq 1 ]]; then
+    if FAILED_OBSERVATION="$(observe_failed_managed "$CURRENT_RECORD_JSON" 2>/dev/null)"; then
+      if [[ "$PREFLIGHT" -eq 1 ]]; then
+        preflight_json "RECOVERABLE" "verified failed managed startup requires explicit restart"
+        exit 0
+      fi
+      [[ "$RESTART" -eq 1 ]] || fail "verified failed managed startup requires explicit --restart"
+      FAILED_PID="$("$PYTHON_BIN" -c 'import json,sys; print(json.loads(sys.argv[1])["pid"] or "")' "$FAILED_OBSERVATION")"
+      [[ -z "$OLD_PID" || -z "$FAILED_PID" || "$OLD_PID" == "$FAILED_PID" ]] \
+        || fail "failed managed startup PID changed during observation"
+      # A startup can appear after the first label sample. Its verified PID
+      # must join the teardown proof even if that first sample had no PID.
+      OLD_PID="${OLD_PID:-$FAILED_PID}"
+      FAILED_MANAGED=1
+      FAILED_RECORD_JSON="$CURRENT_RECORD_JSON"
+      OBSERVED_RECOVERY_REASON="verified failed managed startup explicitly restarted"
+    elif [[ "$PREFLIGHT" -eq 1 ]]; then
       preflight_json "BLOCKED" "${IDENTITY_REASON:-live listener or runtime ownership is not verified}"
       exit 1
+    else
+      fail "managed launchd identity is not verified: ${IDENTITY_REASON:-live listener or runtime ownership is not verified}"
     fi
-    fail "managed launchd identity is not verified: ${IDENTITY_REASON:-live listener or runtime ownership is not verified}"
   fi
 else
   if [[ "$LISTENER_STATUS" -eq 0 ]]; then
@@ -1092,10 +1120,18 @@ then
   LP_SELECTION_CURRENT=1
 fi
 
+record_manifest_matches_observed() {
+  "$PYTHON_BIN" - "$CURRENT_RECORD_JSON" "$LIVE_RELEASE_MANIFEST" <<'PYCODE'
+import json,sys
+record=json.loads(sys.argv[1])
+raise SystemExit(0 if isinstance(record,dict) and (record.get('candidate') or {}).get('manifest')==sys.argv[2] else 1)
+PYCODE
+}
+
 if [[ "$RESTART" -eq 0 && "$LP_SELECTION_CURRENT" -eq 1 && "$MANAGED_OLD" -eq 1 \
   && "$CANDIDATE_JSON" == "$OBSERVED_RELEASE_FOR_RECORD" \
   && "$N_LEG_PAUSED_CHANGED" -eq 0 && "$HTTPS_PROXY_CHANGED" -eq 0 ]] && record_matches_observed \
-  && record_ready_matches_observed; then
+  && record_ready_matches_observed && record_manifest_matches_observed; then
   if [[ "$PREPARE_TARGET" -eq 1 ]]; then
     emit_prepare_result NOOP ""
   else
@@ -1138,13 +1174,13 @@ write_record() {
     "$RUNTIME_RECORD" "$CURRENT_RECORD_JSON" "$state" "$CANDIDATE_JSON" "$PREVIOUS_JSON" \
     "$TRANSITION_STARTED_AT" "$failure_reason" "$ready_json" \
     "$OBSERVED_RECOVERY_REASON" "$PLIST_PATH" "$LP_SELECTION_CURRENT" \
-    "$RUNTIME_ROOT" "$REPO_ROOT" "$PYTHON_BIN" "$CONFIG" 9>&9 <<'PY'
+    "$RUNTIME_ROOT" "$REPO_ROOT" "$PYTHON_BIN" "$CONFIG" "$RELEASE_MANIFEST" "$LIVE_RELEASE_MANIFEST" 9>&9 <<'PY'
 import json, sys
 from datetime import datetime
 from pathlib import Path
 from open_trader.prediction_release import (load_prediction_runtime_record,
     write_prediction_runtime_record,validate_lp_management_refresh)
-path, expected_raw, state, candidate, previous, started, failure, ready, recovery_reason, plist, refresh, runtime, release, python, config = sys.argv[1:]
+path, expected_raw, state, candidate, previous, started, failure, ready, recovery_reason, plist, refresh, runtime, release, python, config, manifest, previous_manifest = sys.argv[1:]
 current = load_prediction_runtime_record(Path(path))
 expected = None if expected_raw == "null" else json.loads(expected_raw)
 if current != expected:
@@ -1166,6 +1202,16 @@ for field in ('candidate','previous_release'):
         if source_identity(saved)==source_identity(value) and saved.get('lp_validation') is not None:
             payload[field]={**value,'lp_validation':saved['lp_validation']}
             break
+# Source comparisons exclude the path, but startup self-context needs the
+# independently selected tracked manifest, including non-default manifests.
+if refresh=='1' and state=='ready' and previous_manifest:
+    # A source-compatible refresh does not change the loaded argv. Preserve
+    # its independently observed custom manifest rather than inventing a start.
+    manifest=previous_manifest
+payload['candidate']['manifest']=str(Path(manifest).resolve())
+if (isinstance(payload['previous_release'],dict) and previous_manifest
+        and Path(previous_manifest).is_relative_to(Path(payload['previous_release']['checkout']))):
+    payload['previous_release']['manifest']=str(Path(previous_manifest).resolve())
 payload.update(manager='launchd',manager_identity=plist)
 if current is not None and 'pending_lp_validation' in current:
     payload['pending_lp_validation']=current['pending_lp_validation']
@@ -1226,6 +1272,19 @@ current = load_prediction_runtime_record(Path(sys.argv[1]))
 expected = json.loads(sys.argv[2])
 raise SystemExit(0 if current == expected else 1)
 PY
+}
+
+recheck_failed_managed() {
+  local fresh
+  record_snapshot_matches || return 1
+  fresh="$(observe_failed_managed "$FAILED_RECORD_JSON" "${1:-0}")" || return 1
+  "$PYTHON_BIN" - "$FAILED_OBSERVATION" "$fresh" <<'PYCODE' || return 1
+import json,sys
+old,new=map(json.loads,sys.argv[1:])
+pid=old.pop('pid');fresh_pid=new.pop('pid')
+raise SystemExit(0 if old==new and fresh_pid in (0,pid) else 1)
+PYCODE
+  record_snapshot_matches
 }
 
 recheck_managed_identity_before_handoff() {
@@ -1399,6 +1458,8 @@ write_record maintenance "" "$PREVIOUS_READY_JSON" \
 if [[ "$MANAGED_OLD" -eq 1 ]]; then
   recheck_managed_identity_before_handoff \
     || fail "managed release evidence changed before handoff"
+elif [[ "$FAILED_MANAGED" -eq 1 ]]; then
+  recheck_failed_managed || fail "failed managed release evidence changed before handoff"
 fi
 # The final OS/health observation can cross an operator config change. Keep
 # the existing operation lock and recheck the exact selected bytes and nonce
@@ -1427,7 +1488,7 @@ PYCODE
 then
   fail "LP selected target changed before handoff"
 fi
-if [[ "$MANAGED_OLD" -eq 1 ]]; then
+if [[ "$MANAGED_OLD" -eq 1 || "$FAILED_MANAGED" -eq 1 ]]; then
   bootout_if_loaded \
     || record_failed_and_exit "candidate_cleanup_not_proven"
 fi
@@ -1440,6 +1501,9 @@ listener_absent \
   || record_failed_and_exit "candidate_cleanup_not_proven"
 owner_available \
   || record_failed_and_exit "candidate_cleanup_not_proven"
+if [[ "$FAILED_MANAGED" -eq 1 ]]; then
+  recheck_failed_managed 1 || record_failed_and_exit "failed_managed_evidence_changed_before_arm"
+fi
 remove_managed_plist \
   || record_failed_and_exit "candidate_cleanup_not_proven"
 
@@ -1723,6 +1787,10 @@ then
   setup_failed_and_exit "lp_start_permission_not_armed"
 fi
 refresh_record_snapshot
+# Arm promotes the source binding using its default manifest. Publish the
+# selected tracked manifest before launch, while no candidate exists yet.
+write_record maintenance "" "$PREVIOUS_READY_JSON" \
+  || setup_failed_and_exit "runtime_record_write_failed"
 
 if ! bootstrap_and_wait_for_exact_ready; then
   finish_candidate_failure "$FAILURE_REASON"

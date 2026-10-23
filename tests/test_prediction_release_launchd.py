@@ -761,6 +761,7 @@ def test_production_first_install_records_only_observed_ready_evidence(
     binding = record["candidate"]["lp_validation"]
     assert record["candidate"] == {
         "lp_validation": binding,
+        "manifest": str(release_harness.manifest.resolve()),
         "checkout": str(release_harness.candidate.path),
         "git_sha": release_harness.sha,
         "source_state": "clean",
