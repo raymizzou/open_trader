@@ -275,6 +275,19 @@ If the user explicitly requests a local reviewer again, its scoped result-commen
 authority remains conditional on that assignment. Explicit local-only or
 do-not-post instructions override publication authority.
 
+## Issue acceptance after delivery
+
+After merge and any applicable authorized deployment, the existing task Main
+checks every criterion in the current associated issue and approved changes,
+then publishes criterion-specific evidence and discrepancy decisions on that issue.
+CI, deployment and Smoke success do not establish business acceptance. Follow
+[postdelivery issue acceptance](docs/operations/agent-verification.md#postdelivery-issue-acceptance)
+before closure; preserve the original task/tab owner. Use `Refs`/`Related`, not
+`Fixes`/`Closes`/`Resolves`, while acceptance is pending. Keep the board wip/blocked
+until the issue is closed with all criteria evidenced or explicitly dispositioned.
+Nondeployable work records deployment N/A with a reason and receives applicable
+document/configuration/test acceptance without an artificial deployment gate.
+
 ## Delivery boundaries
 
 Task-branch commits/pushes and PR creation/updates, including in-scope repair
