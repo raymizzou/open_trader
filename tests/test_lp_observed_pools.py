@@ -945,7 +945,7 @@ def test_fill_and_protection_remain_authoritative_during_pool_changes(tmp_path,m
         finally:release.set()
         rig.finish_cancels(changing)
         by_order={h.identity.target.existing_order_id:h.result(timeout=3).status.value for h in handles}
-        assert by_order=={'old-A':'unknown_error','old-B':'unknown_error','old-C':'accepted','old-D':'unknown_error'}
+        assert by_order=={'old-A':'rejected','old-B':'rejected','old-C':'accepted','old-D':'rejected'}
         reconciled=rig.cycle(pool='trial')
         assert not reconciled.outcomes
         reservations=rig.execution.lp_auto_reservations()
@@ -969,7 +969,7 @@ def test_fill_and_protection_remain_authoritative_during_pool_changes(tmp_path,m
             assert record['request_id']==h.identity.request_id
             assert record['order_id']==record['receipt']['order_id']==h.identity.target.existing_order_id
             assert record['kind']=='CANCEL'
-            assert record['receipt']['outcome']==('accepted' if record['order_id']=='old-C' else 'unknown')
+            assert record['receipt']['outcome']==('accepted' if record['order_id']=='old-C' else 'rejected')
         assert rig.sdk.cancels==[('old-A','old-B','old-C','old-D')]
     finally:release.set();rig.close()
 
@@ -1472,7 +1472,7 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
     import time
     rig=AsyncPoolRig(tmp_path,monkeypatch)
     group_entered,group_release,other_entered,other_release=Event(),Event(),Event(),Event()
-    notice=Event();protection_entered=Event();planned=[];other=None
+    protection_release=Event();notice=Event();protection_entered=Event();planned=[];other=None
     try:
         for name in 'ABCDEF':rig.market(name)
         for name,capital in [('A','50'),('B','30'),('C','20'),('D','10'),('E','1'),('F','1')]:
@@ -1505,7 +1505,9 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
             if order_ids==('old-F',):
                 other_entered.set();assert other_release.wait(8),'held peer external watchdog'
             if order_ids==('old-E',):
-                protection_entered.set();rig.release('old-E')
+                protection_entered.set()
+                assert protection_release.wait(8),'independent protective cancel watchdog'
+                rig.release('old-E')
             return actual_cancel(order_ids=order_ids)
         rig.sdk.cancel_orders=cancel
         # Public D2 pool planning is used to retain the real group result/IDs;
@@ -1525,9 +1527,9 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
         assert other is not None and other_entered.wait(2)
         assert rig.live.status()['native_inflight']==2
         assert rig.execution._lp_d2_lease_users==2
-        rig.pump(lambda:failures()==11 and
-            rig.live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)>0)
-        assert not protection_entered.is_set()
+        rig.pump(lambda:failures()==11 and protection_entered.is_set())
+        assert rig.live.status()['native_inflight']==3
+        assert rig.live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)==0
         failure=next(f for k,f in rig.live.state.snapshot().read_failures.items() if k[3]=='old-E')
         assert failure.consecutive_failures==11 and failure.protection_key is not None
         # Wait for all unrelated HTTP mailboxes to be published and consumed,
@@ -1537,20 +1539,21 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
         def wake():notice.set();rig.scheduler.request_check()
         rig.execution.set_lp_auto_wakeup(wake)
         notice.clear();before=list(rig.requests);stamp=rig.seconds
-        assert not handle.done() and rig.live.status()['native_inflight']==2
+        assert not handle.done() and rig.live.status()['native_inflight']==3
         group_release.set();handle._thread.join(3);assert not handle._thread.is_alive()
-        assert rig.execution._lp_d2_lease_users==1
+        assert rig.execution._lp_d2_lease_users==2
         assert notice.wait(.5),'physical group completion must notify existing scheduler'
         assert rig.requests==before  # completion itself needs no HTTP or status GET
         assert rig.scheduler.run_due()
-        rig.pump(protection_entered.is_set)
+        protection_release.set()
+        rig.pump(lambda:rig.live.status()['native_inflight']==1)
         assert rig.seconds==stamp
         assert all(t==stamp for _,_,t in rig.requests[len(before):])
         assert not other_release.is_set() and rig.sdk.posts==[]
         outcomes=[out.handle.result(0) for out in group.rotation_outcomes]
         assert {out.venue_order_id for out in outcomes}=={'old-A','old-B','old-C','old-D'}
         assert {out.venue_order_id for out in outcomes if out.status.value=='accepted'}=={'old-A','old-B','old-D'}
-        assert next(out for out in outcomes if out.venue_order_id=='old-C').status.value=='unknown_error'
+        assert next(out for out in outcomes if out.venue_order_id=='old-C').status.value=='rejected'
         snapshot=rig.live.state.snapshot()
         partial=next(o for o in snapshot.orders if o.key[3]=='old-E')
         assert (partial.original_size.value,partial.size_matched.value)==(Decimal('2.5'),Decimal('.5'))
@@ -1566,7 +1569,7 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
         for _ in range(3):rig.scheduler.run_due()
         assert sum(batch==('old-E',) for batch in rig.sdk.cancels)==1
     finally:
-        group_release.set();other_release.set()
+        protection_release.set();group_release.set();other_release.set()
         if other:other._thread.join(3)
         rig.close()
 
@@ -1576,7 +1579,7 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
     import time
     rig=AsyncPoolRig(tmp_path,monkeypatch)
     group_entered,group_release,other_entered,other_release=Event(),Event(),Event(),Event()
-    notice=Event();callback_release=Event();http_release=Event();protection_entered=Event();planned=[];other=None
+    protection_release=Event();notice=Event();callback_release=Event();http_release=Event();protection_entered=Event();planned=[];other=None
     try:
         for name in 'ABCDEF':rig.market(name)
         for name,capital in [('A','50'),('B','30'),('C','20'),('D','10'),('E','1'),('F','1')]:
@@ -1609,7 +1612,9 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
             if order_ids==('old-F',):
                 other_entered.set();assert other_release.wait(8),'held peer external watchdog'
             if order_ids==('old-E',):
-                protection_entered.set();rig.release('old-E')
+                protection_entered.set()
+                assert protection_release.wait(8),'independent protective cancel watchdog'
+                rig.release('old-E')
             return actual_cancel(order_ids=order_ids)
         rig.sdk.cancel_orders=cancel
         # Public D2 pool planning is used to retain the real group result/IDs;
@@ -1629,9 +1634,9 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
         assert other is not None and other_entered.wait(2)
         assert rig.live.status()['native_inflight']==2
         assert rig.execution._lp_d2_lease_users==2
-        rig.pump(lambda:failures()==11 and
-            rig.live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)>0)
-        assert not protection_entered.is_set()
+        rig.pump(lambda:failures()==11 and protection_entered.is_set())
+        assert rig.live.status()['native_inflight']==3
+        assert rig.live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)==0
         failure=next(f for k,f in rig.live.state.snapshot().read_failures.items() if k[3]=='old-E')
         assert failure.consecutive_failures==11 and failure.protection_key is not None
         # Wait for all unrelated HTTP mailboxes to be published and consumed,
@@ -1646,27 +1651,28 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
         rig.execution.set_lp_auto_wakeup(wake)
         notice.clear();before=list(rig.requests);stamp=rig.seconds
         rig.http_gate=http_release
-        assert not handle.done() and rig.live.status()['native_inflight']==2
+        assert not handle.done() and rig.live.status()['native_inflight']==3
         group_release.set()
         assert notice.wait(2),'actual group completion must enter registered callback'
         assert handle._thread.is_alive()
         assert rig.scheduler.run_due(),'drive early wake before physical thread exit'
-        assert not protection_entered.is_set()
-        assert rig.live.status()['native_inflight']==2
-        assert rig.execution._lp_d2_lease_users==1
+        assert protection_entered.is_set()
+        assert rig.live.status()['native_inflight']==3
+        assert rig.execution._lp_d2_lease_users==2
         callback_release.set();handle._thread.join(3)
         assert not handle._thread.is_alive()
         # Receipt invalidation may start current-account HTTP, but the transport
         # gate prevents any unrelated publication/wake masking this interleaving.
         assert rig.scheduler.run_due()
-        rig.pump(protection_entered.is_set)
+        protection_release.set()
+        rig.pump(lambda:rig.live.status()['native_inflight']==1)
         assert rig.seconds==stamp
         assert all(t==stamp for _,_,t in rig.requests[len(before):])
         assert not other_release.is_set() and rig.sdk.posts==[]
         outcomes=[out.handle.result(0) for out in group.rotation_outcomes]
         assert {out.venue_order_id for out in outcomes}=={'old-A','old-B','old-C','old-D'}
         assert {out.venue_order_id for out in outcomes if out.status.value=='accepted'}=={'old-A','old-B','old-D'}
-        assert next(out for out in outcomes if out.venue_order_id=='old-C').status.value=='unknown_error'
+        assert next(out for out in outcomes if out.venue_order_id=='old-C').status.value=='rejected'
         snapshot=rig.live.state.snapshot()
         partial=next(o for o in snapshot.orders if o.key[3]=='old-E')
         assert (partial.original_size.value,partial.size_matched.value)==(Decimal('2.5'),Decimal('.5'))
@@ -1683,7 +1689,7 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
         for _ in range(3):rig.scheduler.run_due()
         assert sum(batch==('old-E',) for batch in rig.sdk.cancels)==1
     finally:
-        http_release.set();callback_release.set();group_release.set();other_release.set()
+        protection_release.set();http_release.set();callback_release.set();group_release.set();other_release.set()
         if other:other._thread.join(3)
         rig.close()
 
@@ -1801,7 +1807,7 @@ def test_async_read_protection_precedes_pool_rebuild(tmp_path,monkeypatch,pool_a
                 for k,y in rig.live.state.snapshot().yields.items()))
         for _ in range(3):rig.scheduler.run_due()
         assert failure().protection_key is not None  # later success cannot unlatch
-        assert rig.sdk.cancels==[('old-B',)] and rig.sdk.posts==[]
+        assert rig.sdk.cancels==[('old-B',),('old-B',)] and rig.sdk.posts==[]
         partial=next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-B')
         assert (partial.original_size.value,partial.size_matched.value,partial.remaining.value)==(75,3,72)
         assert not rig.sdk.market_orders  # protection never forces liquidation
@@ -1815,8 +1821,11 @@ def test_async_read_protection_precedes_pool_rebuild(tmp_path,monkeypatch,pool_a
         assert new.consecutive_failures==0 and new.protection_key is None
         after={t.request_id for p in rig.live.state.snapshot().progress.values() for t in p.cancel_targets
             if t.order_key[3]=='old-B'}
-        assert after==before
-        assert rig.sdk.cancels==[('old-B',)] and rig.sdk.posts==[] and not rig.sdk.market_orders
+        assert before.isdisjoint(after) and len(after)==1
+        for request_id in before:
+            record,=rig.store.lp_actions('d2:'+request_id)
+            assert record['receipt']['outcome']=='unknown'
+        assert rig.sdk.cancels==[('old-B',),('old-B',)] and rig.sdk.posts==[] and not rig.sdk.market_orders
     finally:rig.close()
 
 
@@ -2013,7 +2022,7 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
     rig=AsyncPoolRig(tmp_path,monkeypatch)
     trial_entered,income_entered,native_release=Event(),Event(),Event()
     callbacks_entered,callback_release,http_release=Event(),Event(),Event()
-    callback_lock=Lock();callback_count=0;groups=[];protection_entered=Event()
+    protection_release=Event();callback_lock=Lock();callback_count=0;groups=[];protection_entered=Event()
     try:
         pools=dict(A='100',B='100',C='100',D='500',E='400',F='300',G='200',H='100',J='1000')
         capitals=dict(A='50',B='30',C='20',D='5',E='5',F='5',G='5',H='5',J='1')
@@ -2027,7 +2036,9 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
             if ids=={'old-F','old-G','old-H'}:trial_entered.set()
             elif ids=={'old-A','old-B','old-C','old-D','old-E'}:income_entered.set()
             elif ids=={'old-J'}:
-                protection_entered.set();rig.release('old-J')
+                protection_entered.set()
+                assert protection_release.wait(8),'independent protection watchdog'
+                rig.release('old-J')
                 return dict(canceled=('old-J',),not_canceled={})
             else:raise AssertionError(('unexpected cancel identity',order_ids))
             assert native_release.wait(8),'two real group calls external watchdog'
@@ -2047,7 +2058,9 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
             return next((f for k,f in rig.live.state.snapshot().read_failures.items() if k[3]=='old-J'),None)
         for expected in range(1,12):
             rig.tick();rig.pump(lambda:failure() is not None and failure().consecutive_failures==expected)
-        assert failure().protection_key is not None and not protection_entered.is_set()
+        assert failure().protection_key is not None and protection_entered.is_set()
+        group_calls=sum(len(batch)>1 for batch in rig.sdk.cancels)
+        assert rig.live.status()['native_inflight']==group_calls+1
         rig.pump(lambda:rig.live.read_runtime.status()['ready_count']==0 and
             not any(s['active'] for s in rig.live.read_runtime.status()['scopes']))
         # Consume the two real public pool opportunities at the same clock.
@@ -2064,7 +2077,7 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
             if current_thread().name=='lp-pool-group-cancel':
                 with callback_lock:
                     callback_count+=1
-                    if callback_count==2:callbacks_entered.set()
+                    if callback_count==group_calls:callbacks_entered.set()
                 assert callback_release.wait(8),'last-owner completion callback watchdog'
         rig.execution.set_lp_auto_wakeup(wake)
         rig.http_gate=http_release;before_http=list(rig.requests);stamp=rig.seconds
@@ -2074,24 +2087,29 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
         # Deterministic public owner boundary: capacity is checked while both
         # physical threads are held, then readiness is read after both exit.
         rig.live.run_protection_once()
-        assert rig.live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)>before_blocks
-        assert not protection_entered.is_set() and rig.live.status()['native_inflight']==2
+        assert rig.live.diagnostics()['cancel_blocks']['by_reason'].get('native_capacity',0)==before_blocks
+        assert protection_entered.is_set() and rig.live.status()['native_inflight']==group_calls+1
         callback_release.set()
         for group in groups:
             group._thread.join(3);assert not group._thread.is_alive()
-        assert rig.execution._lp_d2_lease_users==0
+        import time
+        deadline=time.monotonic()+3
+        while rig.live.status()['native_inflight']!=1:
+            assert time.monotonic()<deadline,'actual group physical exit watchdog'
+            Event().wait(.001)
+        assert rig.execution._lp_d2_lease_users==1
         assert rig.requests==before_http  # no unrelated HTTP publication/wake
         status=rig.live.status()
-        assert status['native_inflight']==0
+        assert status['native_inflight']==1
         assert status['plan_wait'] is None,'last physical exit must keep exact deferred protection immediately runnable'
         assert rig.scheduler.run_due(),'real service scheduler must continue at unchanged business time'
-        rig.pump(protection_entered.is_set)
+        protection_release.set()
         rig.pump(lambda:rig.live.status()['native_inflight']==0)
         assert rig.seconds==stamp
         assert sum(batch==('old-J',) for batch in rig.sdk.cancels)==1
         outcomes=[o.handle.result(0) for result in (trial,income) for o in result.rotation_outcomes]
         assert len(outcomes)==8 and len({o.identity.request_id for o in outcomes})==8
-        assert all(o.status.value=='unknown_error' for o in outcomes)
+        assert all(o.status.value=='rejected' for o in outcomes)
         snapshot=rig.live.state.snapshot()
         assert all(o.terminal_proof is None and o.presence=='present' for o in snapshot.orders if o.key[3]!='old-J')
         partial=next(o for o in snapshot.orders if o.key[3]=='old-J')
@@ -2106,6 +2124,7 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
         assert final.terminal_proof.matched.value==Decimal('.5') and final.remaining.value==2
         assert sum(batch==('old-J',) for batch in rig.sdk.cancels)==1
     finally:
+        protection_release.set()
         http_release.set();callback_release.set();native_release.set()
         for group in groups:group._thread.join(3)
         rig.close()
