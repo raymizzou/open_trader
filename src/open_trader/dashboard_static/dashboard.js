@@ -3583,6 +3583,44 @@ function lpDashboardTodayHasActiveOrder(row) {
   return Number.isFinite(remaining) && remaining > 0;
 }
 
+function lpDashboardTodayTerminal(row) {
+  return ["FILLED", "MATCHED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "DONE", "CLOSED"]
+    .includes(String(row.status || "").toUpperCase())
+    || String(row.state || "").toLowerCase() === "filled";
+}
+
+function lpDashboardCurrentRole(row, membership) {
+  if (membership?.state !== "known") return "unclassified";
+  const same = (entry) => ["account_id", "condition_id", "token_id", "order_id"]
+    .every((key) => row[key] && String(entry[key] || "") === String(row[key]));
+  const matches = (Array.isArray(membership.orders) ? membership.orders : []).filter(same);
+  return matches.length === 1 ? matches[0].pool : "unclassified";
+}
+
+function lpDashboardTodaySections(rows, membership) {
+  const sections = [
+    {key: "trial", title: "试挂区", orders: []},
+    {key: "income", title: "收益区", orders: []},
+    {key: "sell", title: "卖单区", orders: []},
+    {key: "finished", title: "已结束", orders: []},
+  ];
+  const seen = new Set();
+  rows.forEach((row) => {
+    const identity = [row.account_id, row.condition_id, row.token_id, row.order_id];
+    if (identity.every(Boolean)) {
+      const key = JSON.stringify(identity);
+      if (seen.has(key)) return;
+      seen.add(key);
+    }
+    const role = lpDashboardCurrentRole(row, membership);
+    const region = lpDashboardTodayTerminal(row) ? "finished"
+      : String(row.side || "").toUpperCase() === "SELL" ? "sell"
+      : ["income", "promotion"].includes(role) ? "income" : "trial";
+    sections.find((section) => section.key === region).orders.push({...row, lp_current_role: role});
+  });
+  return sections;
+}
+
 function lpDashboardTodayGroups(rows) {
   const groups = new Map();
   const unidentified = [];
@@ -4116,7 +4154,12 @@ function lpNeedsAttentionCopy(session) {
   return { main, counter };
 }
 
-function lpDashboardTodayQuantityCell(orders, session) {
+function lpDashboardPoolLabel(row) {
+  if (String(row.side || "").toUpperCase() !== "BUY" || lpDashboardTodayTerminal(row)) return "";
+  return {trial: "当前试挂", income: "当前收益", promotion: "转入中", unclassified: "归属待核对"}[row.lp_current_role] || "";
+}
+
+function lpDashboardTodayQuantityCell(orders, session, allowAugment = true, marketOrders = orders, showMarketCancel = true) {
   const filledSum = orders.reduce((sum, row) => {
     const filled = Number(row.filled_quantity);
     return sum + (Number.isFinite(filled) && filled > 0 ? filled : 0);
@@ -4155,6 +4198,8 @@ function lpDashboardTodayQuantityCell(orders, session) {
     // must live on the headline itself; missing purpose data adds nothing.
     const purpose = lpDashboardTodayPurposeLabel(orders[0]);
     if (purpose) headline += " · " + purpose;
+    const poolLabel = lpDashboardPoolLabel(orders[0]);
+    if (poolLabel) headline += " · " + poolLabel;
   }
   const singleBuyChip = !multi
     && String(orders[0]?.side || "").toUpperCase() === "BUY"
@@ -4173,7 +4218,9 @@ function lpDashboardTodayQuantityCell(orders, session) {
         + formatDisplayNumber(String(filledSum)) + "/" + formatDisplayNumber(String(orderedTotal)) + "</span>")
     : (cancellable.length > 0
       ? "<span class=\"pm-pill\">挂单中 · 已成交 " + formatDisplayNumber(String(filledSum)) + "</span>"
-      : "<span class=\"pm-pill\">已完结 · 未成交</span>");
+      : orders.every(lpDashboardTodayTerminal)
+        ? "<span class=\"pm-pill\">已完结 · 未成交</span>"
+        : "<span class=\"pm-pill\">状态待核对</span>");
   // 「需要核对」可见性：needs_attention 时行头加琥珀 pill，行内加原因整句说明线。
   const attention = session && typeof session === "object"
     && String(session.state || "").toLowerCase() === "needs_attention"
@@ -4188,16 +4235,20 @@ function lpDashboardTodayQuantityCell(orders, session) {
     : "";
   const fillLine = "已成交 " + formatDisplayNumber(String(filledSum))
     + " · 剩余 " + formatDisplayNumber(String(remainingSum));
-  const augmentButton = lpDashboardAugmentButtonMarkup(orders, session);
-  const cancelRight = cancellable.length >= 2
-    ? lpDashboardCancelButton("all", {conditionId: orders[0]?.condition_id})
-    : orders.length === 1 && cancellable.length === 1
-      ? lpDashboardCancelButton("one", {orderId: orders[0]?.order_id})
-      : "";
+  const augmentButton = allowAugment ? lpDashboardAugmentButtonMarkup(orders, session) : "";
+  // Keep the existing whole-market and exact-order actions when rows split
+  // into regions. The market action still names the complete condition.
+  const marketCancel = showMarketCancel && marketOrders.filter(lpDashboardTodayHasActiveOrder).length >= 2
+    ? lpDashboardCancelButton("all", {conditionId: orders[0]?.condition_id}) : "";
+  const exactCancel = orders.length === 1 && cancellable.length === 1
+    ? lpDashboardCancelButton("one", {orderId: orders[0]?.order_id}) : "";
+  const cancelRight = marketCancel + exactCancel;
   const headlineRight = (cancelRight || augmentButton)
     ? "<span style=\"display:flex;gap:6px;align-items:center\">" + cancelRight + augmentButton + "</span>"
     : "";
-  let markup = "<div class=\"lp-line\"><div>" + escapeHtml(headline)
+  let markup = "<div class=\"lp-line\""
+    + (!multi ? " data-lp-order-id=\"" + escapeHtml(String(orders[0]?.order_id || "")) + "\"" : "")
+    + "><div>" + escapeHtml(headline)
     + (singleBuyChip ? " " + singleBuyChip : "")
     + (groupPill ? " " + groupPill : "")
     + (attentionPill ? " " + attentionPill : "")
@@ -4279,6 +4330,8 @@ function lpDashboardTodayQuantityCell(orders, session) {
         const filled = Number(row.filled_quantity);
         if (Number.isFinite(filled) && filled > 0) parts.push("已成交 " + formatDisplayNumber(String(filled)));
       }
+      const poolLabel = lpDashboardPoolLabel(row);
+      if (poolLabel) parts.push(poolLabel);
       // 逐笔着色 tag：既有文字全部保留（原文仍以纯文本渲染），pill 只追加颜色状态。
       const fillPill = lpDashboardTodayFilled(row)
         ? "<span class=\"pm-pill status-ok\">已成交</span>"
@@ -4294,7 +4347,7 @@ function lpDashboardTodayQuantityCell(orders, session) {
       const right = lpDashboardTodayHasActiveOrder(row)
         ? lpDashboardCancelButton("one", {orderId: row.order_id})
         : "";
-      return "<div class=\"lp-line\"><div>" + parts.map((part) => escapeHtml(part)).join(" · ")
+      return "<div class=\"lp-line\" data-lp-order-id=\"" + escapeHtml(String(row.order_id || "")) + "\"><div>" + parts.map((part) => escapeHtml(part)).join(" · ")
         + (chip ? " · " + chip : "")
         + (fillPill ? " · " + fillPill : "")
         + "</div>" + right + "</div>";
@@ -4339,7 +4392,8 @@ function lpDashboardTodayMarketRow(
       sessionRiskCell,
     )
     : "";
-  const subtitle = lpDashboardTodaySubtitle(orders);
+  const subtitle = lpDashboardTodaySubtitle(orders)
+    + (group.sharedMarket ? " · 市场共享：奖励与占资跨区不重复相加" : "");
   // 实际占用资金列：observed 口径（持仓均成本 + 在挂买单），只认
   // occupied_capital_usd 现值；stale 或缺失一律 UNKNOWN，绝不填 0。
   const capitalStale = observation ? lpDashboardAccountFactsStale(observation) : false;
@@ -4353,9 +4407,9 @@ function lpDashboardTodayMarketRow(
       + "<span class=\"sub\">" + (capitalStale
         ? "账户数据过期"
         : "账户数据缺失 · 不以 0 代替") + "</span>";
-  // 完结沉底：组内无任何在挂余量 → 整行加淡化类（CSS 使 td 与链接降为 muted 色）。
+  // 只有显式终态让整行淡化；缺失余量或 UNKNOWN 不构成完结。
   // class 置于 data-lp-today-market 之后：与既有行的 tr 前缀形状保持一致。
-  const done = !orders.some((row) => lpDashboardTodayHasActiveOrder(row));
+  const done = orders.every((row) => lpDashboardTodayTerminal(row));
   return "<tr data-lp-today-market=\"" + escapeHtml(identity) + "\""
     + (done ? " class=\"lp-today-done\"" : "") + ">"
     + "<td>" + lpMarketTitleLink(firstOrder) + "<span class=\"sub\">" + escapeHtml(subtitle)
@@ -4366,7 +4420,7 @@ function lpDashboardTodayMarketRow(
     + "<td data-label=\"份额占比\">" + shareMarkup + "</td>"
     + "<td data-label=\"实际占用资金\" class=\"num\">" + capitalMarkup + "</td>"
     + "<td data-label=\"压力损失(警戒线 10%)\">" + riskMarkup + "</td>"
-    + "<td data-label=\"委托与成交量\">" + lpDashboardTodayQuantityCell(orders, session) + "</td></tr>";
+    + "<td data-label=\"委托与成交量\">" + lpDashboardTodayQuantityCell(orders, session, !group.multipleSessions && !["sell", "finished"].includes(group.section), group.marketOrders, group.showMarketCancel) + "</td></tr>";
 }
 
 function lpTrialCompetitionMarkup(competition) {
@@ -4611,17 +4665,6 @@ function lpAutoConfigDraft(auto) {
     income_budget_usd: auto.income_budget_usd ?? "", expected_config_version: auto.config_version};
 }
 
-function lpAutoResultMarkup(auto) {
-  const pools = auto.observed_pools || {};
-  const rows = Object.entries(pools.results || {}).slice(0, 20).map(([cid, value]) => {
-    const sample = value.result || {};
-    const role = pools.roles?.[cid] || {};
-    const status = role.pool === "income" && !role.evicted ? "收益池" : role.promotion_pending ? "等待原单离场" : "试挂池";
-    return `<p class="sub">${escapeHtml(cid)} · ${status} · 实测结果 ${escapeHtml(lpDashboardRate(sample.yield_pct_per_hour))} · 测量 BUY 本金 ${escapeHtml(lpDashboardMoney(sample.buy_capital_usd))} · 来源 ${escapeHtml(sample.source_order?.order_id || "UNKNOWN")} · 采样 ${escapeHtml(predictionHktTimestamp(sample.measured_at))} · ${value.eligible === true ? "120 秒内可比较" : "已过期，等待新测量"}</p>`;
-  });
-  return rows.join("");
-}
-
 function predictionLpAutoControls(auto, stale) {
   if (!auto || typeof auto !== "object") return "<p class=\"sub\">自动补位状态 UNKNOWN</p>";
   const prediction = state.predictionMarket;
@@ -4651,7 +4694,6 @@ function predictionLpAutoControls(auto, stale) {
     <button type="button" class="pm-button" data-lp-auto-action="config"${locked ? " disabled" : ""}>保存配置</button></div>
     <p class="sub">双池配置：试挂 3 BUY，按模型估算排序、最小量试挂；收益 3 BUY，按有效实测结果比较，固定 50% / 30% / 20%。预算独立，空位留现金。</p>
     <p class="sub">保存不交易。修改前须人工暂停并核清未决提交。未设置收益资金按 0 保存。0 不撤单。</p>
-    ${lpAutoResultMarkup(auto)}
     <p class="sub">最近检查 ${escapeHtml(predictionHktTimestamp(auto.last_check_at, "尚未检查"))} · 下次 ${escapeHtml(predictionHktTimestamp(auto.next_check_at, "等待本轮结束"))}${auto.check_in_progress ? " · 检查中" : ""}${auto.last_check_error ? ` · 检查失败：${escapeHtml(auto.last_check_error)}` : ""}</p>
     <p role="status">${escapeHtml(prediction.lpAutoMessage)}</p></section>`;
 }
@@ -4834,15 +4876,37 @@ function predictionLpCard(payload) {
     : "<span class=\"pm-clock\">"
       + escapeHtml(predictionHasValue(checkedAt) ? "同步时间：" + predictionHktTimestamp(checkedAt) : "等待首次同步")
       + " · 每 5 秒刷新</span>";
-  const todayGroups = lpDashboardTodayMarketOrder(
-    lpDashboardTodayGroups(lpOrdersToday), observations,
-  );
-  const todayRowsHtml = todayGroups.length
-    ? todayGroups.map((group) => lpDashboardTodayMarketRow(
-      group, rewards, rewardShares, observations,
-      lpDashboardRowSessions(group, sessionsById, sessionByCondition),
-    )).join("")
-    : "<tr><td colspan=\"7\" class=\"pm-observation-empty\">当天暂无 LP 委托。从上方待试挂候选点「挂单」登记第一笔，提交即受位置保护。</td></tr>";
+  const autoState = predictionSplit() ? predictionLpAutoState() : dashboard.auto;
+  const membership = autoState?.observed_pools?.current_membership;
+  const todaySections = lpDashboardTodaySections(lpOrdersToday, membership);
+  const regionCount = new Map();
+  todaySections.forEach((section) => new Set(section.orders.map((row) => row.condition_id)).forEach((cid) => {
+    if (cid) regionCount.set(cid, (regionCount.get(cid) || 0) + 1);
+  }));
+  const marketGroups = new Map(lpDashboardTodayGroups(todaySections.flatMap((section) => section.orders)).map((group) => [group.conditionId, group]));
+  const cancelMarketsShown = new Set();
+  const todayRowsHtml = todaySections.map((section) => {
+    const groups = lpDashboardTodayMarketOrder(lpDashboardTodayGroups(section.orders), observations);
+    const pending = section.key === 'income' && membership?.state === 'known'
+      ? (membership.pending_promotions || []).length : 0;
+    const pendingNote = pending ? `<p class="sub">转入中 ${pending} · 等待当前事实核对，不代表已新增挂单</p>` : '';
+    const rows = groups.map((group) => {
+      const market = marketGroups.get(group.conditionId) || group;
+      const showMarketCancel = !cancelMarketsShown.has(group.conditionId)
+        && group.orders.some(lpDashboardTodayHasActiveOrder);
+      if (showMarketCancel) cancelMarketsShown.add(group.conditionId);
+      return lpDashboardTodayMarketRow(
+        {...group, section: section.key, sharedMarket: regionCount.get(group.conditionId) > 1,
+          multipleSessions: lpDashboardRowSessions(market, sessionsById, sessionByCondition).length > 1,
+          marketOrders: market.orders, showMarketCancel}, rewards, rewardShares, observations,
+        lpDashboardRowSessions(group, sessionsById, sessionByCondition),
+      );
+    }).join("");
+    return `<tbody data-lp-section="${section.key}"><tr class="lp-pool-heading"><th scope="rowgroup" colspan="7">${section.title} <span class="sub">${section.orders.length} 笔</span></th></tr>`
+      + (pendingNote ? `<tr><td colspan="7">${pendingNote}</td></tr>` : "")
+      + (rows || `<tr><td colspan="7" class="pm-observation-empty">本区暂无委托${!lpOrdersToday.length && section.key === "trial" ? " · 当天暂无 LP 委托。从上方待试挂候选点「挂单」登记第一笔，提交即受位置保护。" : ""}</td></tr>`)
+      + "</tbody>";
+  }).join("");
   const nonLpRowCount = Number(dashboard.non_lp_row_count);
   const nonLpFootnote = Number.isFinite(nonLpRowCount) && nonLpRowCount > 0
     ? "<p class=\"sub\">账户另有 " + escapeHtml(String(nonLpRowCount))
@@ -4979,11 +5043,11 @@ function predictionLpCard(payload) {
     + budgetLineMarkup
     + predictionLpAutoControls(predictionSplit() ? predictionLpAutoState() : dashboard.auto, predictionSplit() ? Boolean(state.predictionMarket.lpAutoError) : dashboard.stale === true)
     + lpAutoFundsAndOrders(predictionSplit() ? predictionLpAutoState() : dashboard.auto)
-    + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起 · 活跃在前 · 已完结沉底 · 各按当前小时奖励率降序 · 一标的一行</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
+    + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起 · 试挂 / 收益 / 卖单 / 已结束 · 区内按当前小时奖励率降序 · 区内一标的一行</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
     + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">LP 收益率(推荐 → 实际)</th><th scope=\"col\">今日奖励(累计 · $/小时)</th><th scope=\"col\">份额占比</th><th scope=\"col\">实际占用资金</th><th scope=\"col\">压力损失(警戒线 10%)</th><th scope=\"col\">委托与成交量</th></tr></thead>"
-    + "<tbody>" + todayRowsHtml + "</tbody></table></div>"
+    + todayRowsHtml + "</table></div>"
     + nonLpFootnote
-    + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；「试挂/正式」由委托数量对比最小计分数量自动标注（买=最小计分数量→试挂；更大→正式；卖出单不标注）。份额预警已全量开启（奖励份额连续 >8% 一分钟语音告警，夜间静音）；撤单即时生效;已成交部分不可撤。</p></section>"
+    + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；分区依据当前精确订单归属；归属待核对的 BUY 保守展示于试挂区。市场奖励与占资为共享口径，跨区不重复相加。份额预警已全量开启（奖励份额连续 >8% 一分钟语音告警，夜间静音）；撤单即时生效;已成交部分不可撤。</p></section>"
     + funnelMarkup
     + dataNoticeMarkup
     + lpTrialSelectedResultDiagnostics(selectedResults, recommendations)

@@ -346,6 +346,7 @@ class LPD2LiveExecution:
         self._async_exact_results={}
         self._async_generation=None
         self._async_low_sources={}
+        self._pool_transfers = {}
         self._async_income_demands=()
         self._async_income_updated=False
         self._read_wakeup=lambda:None
@@ -1526,16 +1527,25 @@ class LPD2LiveExecution:
             requested_pool = pool
             roles = self.store.lp_load_observed_pool_roles(self._settings_account()) if observed else None
             if observed:
-                from .polymarket_lp_observed_pools import result_projection
+                from .polymarket_lp_observed_pools import result_projection, current_result_eligible
                 # One detached result snapshot per round, before any local attempt.
                 pool_results = result_projection(self.store.lp_observations(self._settings_account()),
                     self._settings_account(), self._utc_now())
+                pool_results = self._current_pool_results(pool_results, roles, self.state.snapshot())
+                measured_results = pool_results
                 if pool is None:
                     # Both continuously due loops receive a turn. A fresh reward
                     # timestamp cannot repeatedly preempt ordinary trial work.
                     pool = self._pool_next
                     if self.read_runtime is None:
                         self._pool_next = 'trial' if pool == 'income' else 'income'
+            if observed:
+                current_observation = self.state.snapshot().observation
+                current_orders = current_observation.source_frame.current_buys if current_observation else ()
+                pool_results = {cid:{**row, 'eligible':row['eligible'] and
+                    (current_result_eligible(roles['roles'], row['result'], current_orders)
+                        or cid in self._pool_transfers)}
+                    for cid,row in pool_results.items()}
             if observed and self.read_runtime is not None:
                 # Reuse the established bounded low demand port. Admission order
                 # follows observed rank; no new read owner or account engine.
@@ -1628,7 +1638,8 @@ class LPD2LiveExecution:
                     self._pool_pending.discard(pool)
                     self._pool_next='trial' if pool=='income' else 'income'
                 prepared, selection, plan_policy, roles = self._pool_composition(pool, prepared, calculation,
-                    snapshot, roles, pool_results, as_of, orders_accepted)
+                    snapshot, roles, measured_results, as_of, orders_accepted,
+                    financial_accepted=self.read_runtime is None or financial is not None and accepted.status in ('accepted','partial'))
             fixed = self._fixed_plan(observation, prepared, selection, policy=plan_policy, pool=pool if observed else None,
                 roles=roles)
             # LPControlOwner uses this same peer coordination lock while its
@@ -1656,12 +1667,19 @@ class LPD2LiveExecution:
                 changed = dict(roles['roles'])
                 for outcome in outcomes:
                     row = self._sealed_candidates[(start.token.batch_id, outcome.identity.request_id)]
+                    if pool == 'income':
+                        transfer = self._pool_transfers.pop(row['condition_id'], None)
+                        if transfer is not None and outcome.status == LocalStatus.ACCEPTED and outcome.venue_order_id:
+                            # Keep comparison provenance only while this new exact income
+                            # order is current. Success consumes its departure/send authority.
+                            self._pool_transfers[row['condition_id']] = {**transfer,
+                                'accepted_order_id':outcome.venue_order_id}
                     if outcome.status == LocalStatus.ACCEPTED and outcome.venue_order_id:
                         changed[row['condition_id']] = dict(pool=pool, episode=outcome.venue_order_id,
                             request_id=outcome.identity.request_id)
                     elif pool == 'income':
                         cid = row['condition_id']
-                        sample = pool_results[cid]['result']
+                        sample = measured_results[cid]['result']
                         changed[cid] = {**changed[cid], 'pool':'trial', 'promotion_pending':False,
                             'consumed_result':dict(measured_at=sample['measured_at'],
                                 order_id=sample['source_order']['order_id']),
@@ -1940,33 +1958,86 @@ class LPD2LiveExecution:
             return (not current.fatal and current.cycle_generation == generation
                 and (not running or current.effective_running))
 
-    def _pool_composition(self, pool, prepared, calculation, snapshot, roles, results, as_of, orders_accepted):
+    def _current_pool_results(self, results, roles, snapshot):
+        """Bounded process-local provenance; never restore send authority from disk."""
+        from .polymarket_lp_observed_pools import result_projection
+        generation = snapshot.current.cycle_generation
+        transfers = {}
+        merged = dict(results)
+        current_orders = snapshot.observation.source_frame.current_buys if snapshot.observation else ()
+        current_keys = {(r['condition_id'],r['token_id'],r['order_id']) for r in current_orders}
+        current_keys.update(o.key[1:] for o in snapshot.active_orders if o.side == 'BUY')
+        for cid, transfer in self._pool_transfers.items():
+            sample = transfer['sample']
+            accepted_id = transfer.get('accepted_order_id')
+            current_income = not accepted_id or (roles['roles'].get(cid,{}).get('episode') == accepted_id
+                and roles['roles'].get(cid,{}).get('pool') == 'income'
+                and (cid,sample['source_order']['token_id'],accepted_id) in current_keys)
+            observation = snapshot.observation
+            complete_account = (observation is not None and observation.orders_complete
+                and observation.read_ticket.trade_version_at_start == snapshot.trade_version
+                and all(observation.components[k].state == 'known' and observation.components[k].complete
+                    for k in ('balance','open_orders','positions')))
+            if accepted_id and not current_income and complete_account:
+                continue
+            projected = result_projection({cid:dict(pool_result=sample)},
+                self._settings_account(), self._utc_now()).get(cid, {})
+            if (transfer['generation'] == generation and projected.get('eligible')
+                    and transfer['epoch'] == self.process_epoch):
+                transfers[cid] = transfer
+                if not current_income:
+                    merged[cid] = {**projected,'eligible':False}
+                    continue
+                fresh_current = results.get(cid)
+                if (accepted_id and fresh_current and fresh_current.get('eligible')
+                        and fresh_current['result']['source_order']['order_id'] == accepted_id):
+                    transfers[cid] = {**transfer,'sample':fresh_current['result']}
+                else:
+                    merged[cid] = projected
+        self._pool_transfers = transfers
+        return merged
+
+    def _pool_composition(self, pool, prepared, calculation, snapshot, roles, results, as_of, orders_accepted, *, financial_accepted):
         from .polymarket_lp_market_reader import SourceResult
-        from .polymarket_lp_observed_pools import select_income_results, income_order, promotion_eligible
+        from .polymarket_lp_observed_pools import select_income_results, income_order, current_result_eligible
         from decimal import ROUND_DOWN
         active_markets = {r['condition_id'] for r in prepared.current_buys}
+        results = self._current_pool_results(results, roles, snapshot)
+        account_known = (financial_accepted and orders_accepted and snapshot.inventory_cost.state == 'known'
+            and snapshot.observation.components['balance'].state == 'known'
+            and snapshot.observation.components['balance'].complete
+            and snapshot.observation.read_ticket.trade_version_at_start == snapshot.trade_version)
         normalized = {}
+        exact_current = {(r['condition_id'], r['order_id']) for r in prepared.current_buys}
         for cid,role in roles['roles'].items():
             updated = role
             if role.get('evicted') and cid not in active_markets:
                 updated = {**updated,'pool':'trial'}
             if (role.get('promotion_pending') and not results.get(cid,{}).get('eligible')
-                    and cid not in active_markets and orders_accepted
-                    and snapshot.new_capacity.state == 'known'):
+                    and cid not in active_markets and account_known):
                 # A departed source and expired sample grant no future income
                 # authority. Only complete current coverage can release trial
                 # exclusion; unresolved native commitments still block capacity.
                 updated = {**updated,'promotion_pending':False}
+            if (account_known and not self._placement_owners() and cid not in self._pool_transfers
+                    and (cid,role.get('episode')) not in exact_current):
+                updated = {**updated, 'pool':'trial', 'promotion_pending':False}
             normalized[cid] = updated
         if normalized != roles['roles'] and orders_accepted:
             roles = self.store.lp_save_observed_pool_roles(self._settings_account(),
                 expected_revision=roles['revision'],roles=normalized)
-        income = {cid for cid, role in roles['roles'].items() if role['pool'] == 'income'}
+        income = {cid for cid, role in roles['roles'].items() if role['pool'] == 'income'
+            and ((cid,role.get('episode')) in exact_current or cid in self._pool_transfers
+                or not account_known or self._placement_owners())}
         members_before = {cid for cid in income if not roles['roles'][cid].get('evicted')}
         results = {cid:{**value,'eligible':value['eligible'] and (
-            cid in members_before or promotion_eligible(roles['roles'].get(cid,{}),value['result']))}
+            current_result_eligible(roles['roles'], value['result'], prepared.current_buys)
+            or cid in self._pool_transfers)}
             for cid,value in results.items()}
-        promotion_pending = {cid for cid, role in roles['roles'].items() if role.get('promotion_pending')}
+        if self.read_runtime is not None:
+            self._async_income_demands = tuple((cid,row['result']['source_order']['token_id'])
+                for cid,row in results.items() if row['eligible'])[:self.read_runtime.buy_cap]
+        promotion_pending = {cid for cid,t in self._pool_transfers.items() if not t.get('accepted_order_id')}
         current = [r for r in prepared.current_buys
             if income_order(roles['roles'],r['condition_id'],r['order_id']) == (pool == 'income')]
         reserved = sum((r['price']*r['remaining'] for r in current), Decimal(0))
@@ -2010,12 +2081,35 @@ class LPD2LiveExecution:
             or self._protection_cancel_owned((self.account_id,r['condition_id'],r['token_id'],r['order_id']))
             or any(o.phase != 'closed' and o.stop_requested and o.scope[1:3] == (r['condition_id'],r['token_id'])
                 for o in snapshot.openings.values())) for r in prepared.current_buys)
-        if unsafe_incumbent or any(not results.get(cid,{}).get('eligible') for cid in members_before):
+        comparison_deferred = unsafe_incumbent or any(
+            not results.get(cid,{}).get('eligible') for cid in members_before)
+        if comparison_deferred:
             # Missing/currently unsafe incumbent facts are no comparison proof.
 
             # Existing income stays live; trial work remains independent.
             decision = dict(members=tuple(sorted(members_before)),cancel_members=())
         members = decision['members'] if local_policy.budget > 0 else tuple(sorted(income))
+        if orders_accepted and not comparison_deferred and (members or sized or local_policy.budget <= 0):
+            transfers = {}
+            for cid in members:
+                if not results.get(cid,{}).get('eligible'):
+                    continue
+                previous = self._pool_transfers.get(cid)
+                if previous is not None:
+                    transfer = dict(previous)
+                    if decision['cancel_members'] and transfer.get('accepted_order_id'):
+                        oid = transfer.pop('accepted_order_id')
+                        source_order = next((r for r in prepared.current_buys
+                            if r['condition_id'] == cid and r['order_id'] == oid), None)
+                        if source_order is None:
+                            continue
+                        transfer['source_order'] = dict(order_id=oid, token_id=source_order['token_id'])
+                    transfers[cid] = transfer
+                elif cid not in income or decision['cancel_members']:
+                    transfers[cid] = dict(sample=results[cid]['result'],
+                        source_order=results[cid]['result']['source_order'], epoch=self.process_epoch,
+                        generation=snapshot.current.cycle_generation)
+            self._pool_transfers = transfers
         changes = dict(roles['roles'])
         for cid in income-set(members):
             changes[cid] = {**changes[cid], 'evicted':True,

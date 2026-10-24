@@ -19,6 +19,65 @@ def promotion_eligible(role, sample):
     return role.get('consumed_result') != dict(measured_at=sample['measured_at'], order_id=source)
 
 
+def current_result_eligible(roles, sample, orders):
+    """Only an exact managed current episode can admit a measured source."""
+    cid = sample['condition_id']
+    role = roles.get(cid, {})
+    source = sample['source_order']
+    trials = [r for r in orders if r['side'] == 'BUY'
+        and roles.get(r['condition_id'], {}).get('pool') == 'trial'
+        and roles[r['condition_id']].get('episode') == r['order_id']
+        and not roles[r['condition_id']].get('evicted')]
+    if role.get('pool') == 'trial' and len(trials) > 3:
+        return False
+    return (role.get('pool') in ('trial', 'income')
+        and role.get('episode') == source['order_id']
+        and promotion_eligible(role, sample)
+        and any(r['side'] == 'BUY' and r['condition_id'] == cid
+            and r['order_id'] == source['order_id']
+            and r['token_id'] == source['token_id'] for r in orders))
+
+
+def current_membership(snapshot, roles, transfers, *, account_id, settings_account, epoch, as_of):
+    """A read-only view of one accepted snapshot; history never creates rows."""
+    observation = snapshot.observation
+    known = (observation is not None and observation.orders_complete
+        and all(observation.components[k].state == 'known'
+            and observation.components[k].complete for k in ('balance','open_orders','positions'))
+        and observation.read_ticket.trade_version_at_start == snapshot.trade_version
+        and observation.cycle_generation == snapshot.current.cycle_generation
+        and 0 <= (as_of - observation.accepted_at).total_seconds() <= 10)
+    promotions = []
+    for cid, transfer in transfers.items():
+        if transfer.get('accepted_order_id'):
+            continue  # accepted income is current membership, never pending promotion
+        sample = transfer['sample']
+        fresh = result_projection({cid:dict(pool_result=sample)}, settings_account, as_of)
+        if (transfer['epoch'] == epoch
+                and transfer['generation'] == snapshot.current.cycle_generation
+                and fresh.get(cid, {}).get('eligible')):
+            promotions.append(dict(account_id=account_id, condition_id=cid,
+                **transfer.get('source_order',sample['source_order'])))
+    orders = []
+    for order in observation.source_frame.orders if observation else ():
+        if str(order.get('status', '')).upper() in ('FILLED','CANCELED','CANCELLED','EXPIRED','REJECTED'):
+            continue
+        cid, token, oid = order['condition_id'], order['token_id'], order['order_id']
+        role = roles.get(cid, {})
+        pool = 'unclassified'
+        if role.get('episode') == oid and role.get('pool') in ('trial', 'income'):
+            pool = role['pool']
+        if any(p['condition_id'] == cid and p['token_id'] == token
+                and p['order_id'] == oid for p in promotions):
+            pool = 'promotion'
+        orders.append(dict(account_id=account_id, condition_id=cid, token_id=token,
+            order_id=oid, side=order['side'], pool=pool))
+    return dict(state='known' if known else 'unknown', account_id=account_id,
+        observation_id=observation.observation_id if observation else None,
+        observed_at=observation.accepted_at if observation else None,
+        orders=orders, pending_promotions=promotions)
+
+
 def result_projection(observations, account_id, as_of):
     """Age detached results using their original measurement, never read time."""
     projected = {}
