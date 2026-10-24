@@ -2187,6 +2187,7 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
     trial_entered,income_entered,native_release=Event(),Event(),Event()
     callbacks_entered,callback_release,http_release=Event(),Event(),Event()
     protection_release=Event();callback_lock=Lock();callback_count=0;groups=[];protection_entered=Event()
+    protection_scheduled,protection_dispatch_release=Event(),Event()
     try:
         pools=dict(A='100',B='100',C='100',D='500',E='400',F='300',G='200',H='100',J='1000')
         capitals=dict(A='50',B='30',C='20',D='5',E='5',F='5',G='5',H='5',J='1')
@@ -2201,6 +2202,10 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
             if ids=={'old-F','old-G','old-H'}:trial_entered.set()
             elif ids=={'old-A','old-B','old-C','old-D','old-E'}:income_entered.set()
             elif ids=={'old-J'}:
+                # Delay only the external cancel boundary. Publishing the
+                # logical protection key does not prove this callback ran.
+                protection_scheduled.set()
+                assert protection_dispatch_release.wait(8),'external protection dispatch watchdog'
                 protection_entered.set()
                 assert protection_release.wait(8),'independent protection watchdog'
                 rig.release('old-J')
@@ -2223,6 +2228,11 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
             return next((f for k,f in rig.live.state.snapshot().read_failures.items() if k[3]=='old-J'),None)
         for expected in range(1,12):
             rig.tick();rig.pump(lambda:failure() is not None and failure().consecutive_failures==expected)
+        assert failure().protection_key is not None
+        assert protection_scheduled.wait(2)
+        assert not protection_entered.is_set()
+        protection_dispatch_release.set()
+        assert protection_entered.wait(2),'actual independent cancel entry watchdog'
         assert failure().protection_key is not None and protection_entered.is_set()
         group_calls=sum(len(batch)>1 for batch in rig.sdk.cancels)
         assert rig.live.status()['native_inflight']==group_calls+1
@@ -2289,6 +2299,7 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
         assert final.terminal_proof.matched.value==Decimal('.5') and final.remaining.value==2
         assert sum(batch==('old-J',) for batch in rig.sdk.cancels)==1
     finally:
+        protection_dispatch_release.set()
         protection_release.set()
         http_release.set();callback_release.set();native_release.set()
         for group in groups:group._thread.join(3)

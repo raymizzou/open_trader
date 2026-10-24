@@ -325,6 +325,21 @@ class LPD2LiveExecution:
                 or type(process_epoch) is not str or not process_epoch):
             raise ValueError('d2_transport_identity')
         self.store, self.trading, self.account_id, self.venue = store, trading, account_id, venue
+        self.lp_instance_id = getattr(trading.config, 'lp_instance_id', None)
+        self._instance_config = trading.config
+        self._order_provenance = {}
+        binding_reader = getattr(store, 'lp_instance_binding', None)
+        binding = binding_reader() if callable(binding_reader) else None
+        if binding is not None and binding != dict(account_id=account_id.casefold(),
+                venue=venue, instance_id=self.lp_instance_id):
+            raise ValueError('lp_instance_database_already_bound')
+        if self.lp_instance_id is not None:
+            store.lp_bind_instance(account_id, venue, self.lp_instance_id)
+            from .lp_order_ownership import validate_provenance
+            for row in store.lp_order_provenance(account_id, venue):
+                validate_provenance(row)
+                if row['instance_id'] == self.lp_instance_id:
+                    self._order_provenance[row['order_id']] = row
         self.process_epoch, self.policy = process_epoch, policy
         self._clock, self._utc_now = clock, utc_now
         if read_runtime is None and reader is None:
@@ -355,7 +370,8 @@ class LPD2LiveExecution:
         self._positions_full_coverage = reader is None  # owned adapter requests threshold0
         self.reader = reader if reader is not None else MarketReader(trading.lp_reader_source_port(), clock=clock)
         self.writer = writer if writer is not None else LPBusinessWriter(store)
-        self.state = CurrentLPState(account_id, process_epoch, clock=clock, utc_now=utc_now)
+        self.state = CurrentLPState(account_id, process_epoch, clock=clock, utc_now=utc_now,
+            managed_order=self._is_local_order)
         self.rounds = LPRoundCoordinator()
         self.control = LPControlOwner(self.state, _ControlStore(store, account_id, self.load_settings if load_settings_on_start else None), self, self,
                                       clock=clock, utc_now=utc_now)
@@ -412,6 +428,60 @@ class LPD2LiveExecution:
         self._rotation_cancel_backoffs = {}
         self._pool_next = 'trial'
         self._pool_pending = set()
+
+    def _is_local_order(self, order):
+        if self.lp_instance_id is None:
+            return True
+        if self.trading.config != self._instance_config:
+            return False
+        row = self._order_provenance.get(order.key[3])
+        return bool(row and row['instance_id'] == self.lp_instance_id
+            and order.key[:3] == (self.account_id, row['condition_id'], row['token_id'])
+            and order.side == row['side']
+            and all(f.state == 'known' for f in (order.price, order.original_size, order.order_type, order.expiration))
+            and order.price.value == Decimal(row['price'])
+            and order.original_size.value == Decimal(row['quantity'])
+            and order.order_type.value == row['order_type']
+            and (_audit_expiration(order.expiration.value) or 0) == row['expiration'])
+
+    def _cancel_local_orders(self, orders):
+        """Final LP native boundary: a mixed/unproven batch sends nothing."""
+        orders = tuple(orders)
+        if not orders or any(not self._is_local_order(order) for order in orders):
+            return dict(canceled=[], not_canceled={o.key[3]:'instance_ownership_unknown' for o in orders})
+        return self.trading.cancel_orders_detailed(tuple(o.key[3] for o in orders))
+
+    def _managed_frame(self, frame):
+        """Project management IDs while preserving all wallet rows and money."""
+        if self.lp_instance_id is None:return frame
+        managed = set()
+        for row in frame.orders:
+            binding = self._order_provenance.get(row['order_id'])
+            if (binding and binding['condition_id'] == row['condition_id']
+                    and binding['token_id'] == row['token_id'] and binding['side'] == row['side']
+                    and Decimal(binding['price']) == row['price']
+                    and Decimal(binding['quantity']) == Decimal(str(row['original_size']))
+                    and binding['order_type'] == row.get('order_type')
+                    and binding['expiration'] == (_audit_expiration(row.get('expiration')) or 0)):
+                managed.add(row['order_id'])
+        return replace(frame, managed_order_ids=frozenset(managed))
+
+    def instance_ownership_status(self):
+        """Visible UNKNOWN classification; nonlocal never means proven peer."""
+        snapshot = self.state.snapshot()
+        if self.lp_instance_id is None:
+            return dict(instance_id=None,managed_order_ids=[],unattributed_buy_ids=[],
+                ownership_allows_new_risk=True,financial_admission='requires_current_wallet_checks',alert_code=None)
+        local = [o.key[3] for o in snapshot.active_orders if self._is_local_order(o)]
+        unknown = [o.key[3] for o in snapshot.active_orders if o.side=='BUY' and not self._is_local_order(o)]
+        complete = snapshot.observation is not None and snapshot.observation.orders_complete
+        # Ownership UNKNOWN is diagnostic, separate from wallet financial facts.
+        allowed = complete and not self._closed and self.trading.config==self._instance_config
+        return dict(instance_id=self.lp_instance_id,managed_order_ids=sorted(local),
+            unattributed_buy_ids=sorted(unknown),ownership_allows_new_risk=bool(allowed),
+            financial_admission='requires_current_wallet_checks',
+            nonlocal_orders_automatically_protected=False,
+            alert_code='LP_ORDER_OWNERSHIP_UNKNOWN' if unknown else None)
 
     def manual_call(self, operation):
         """Own the whole explicit command, including reliable SQL, until actual end."""
@@ -533,6 +603,8 @@ class LPD2LiveExecution:
                 skipped.append(dict(order_id=oid,reason='unknown_order'))
             elif order not in snapshot.active_orders:
                 skipped.append(dict(order_id=oid,reason='not_active'))
+            elif not self._is_local_order(order):
+                skipped.append(dict(order_id=oid,reason='instance_ownership_unknown'))
             elif order not in selected:
                 selected.append(order)
         if not selected:
@@ -564,7 +636,7 @@ class LPD2LiveExecution:
                         latest=self.state.snapshot()
                         if not self._dispatch_current(observation.cycle_generation) or any(o not in latest.active_orders for o in selected):
                             future.set_result(dict(canceled=[],not_canceled={o.key[3]:'program_stopping' for o in selected}));return
-                    result=self.trading.cancel_orders_detailed(tuple(o.key[3] for o in selected))
+                    result=self._cancel_local_orders(selected)
                     canceled=[o.key[3] for o in selected if o.key[3] in result.get('canceled',())]
                     denied=result.get('not_canceled',{})
                     not_canceled={o.key[3]:str(denied.get(o.key[3],'cancel_result_unknown')) for o in selected if o.key[3] not in canceled}
@@ -602,7 +674,7 @@ class LPD2LiveExecution:
                 self.process_epoch+':manual:'+original['session_id'])
             for order in orders:
                 association = self._opening_order_associations.get(order.key)
-                if (order.side != 'BUY' or order.key[:3] != scope[:3]
+                if (not self._is_local_order(order) or order.side != 'BUY' or order.key[:3] != scope[:3]
                         or order.source != observation.order_view.orders_source
                         or association is not None and association.scope != scope
                         or any(f.state != 'known' for f in (order.price,order.original_size,order.size_matched,order.remaining,order.order_type,order.expiration))
@@ -1271,6 +1343,7 @@ class LPD2LiveExecution:
         demands=[ReadDemand(self.account_id,self.process_epoch,generation,'O',snapshot.trade_version,
             kind='financial',sources=('balance','open_orders','positions'),observation_id=ticket.observation_id)]
         for order in snapshot.active_orders:
+            if not self._is_local_order(order):continue
             demands.append(ReadDemand(self.account_id,self.process_epoch,generation,order.key[3],order.terms_version,
                 order.key[1],order.key[2],kind='buy' if order.side=='BUY' else 'sell'))
         for position in snapshot.positions:
@@ -1346,7 +1419,7 @@ class LPD2LiveExecution:
         observation=snapshot.observation
         if observation is None or not observation.orders_complete:return
         for order in snapshot.active_orders:
-            if order.side!='BUY' or order.key in self._read_store_owners:continue
+            if order.side!='BUY' or not self._is_local_order(order) or order.key in self._read_store_owners:continue
             raw=next((r for r in observation.source_frame.orders if r.get('order_id')==order.key[3]
                 and r.get('condition_id')==order.key[1] and r.get('token_id')==order.key[2]),None)
             if raw is None:continue
@@ -1577,6 +1650,7 @@ class LPD2LiveExecution:
                 frame = self.reader.read_current(ReadScope(self.account_id, ('balance','open_orders','positions',*income_sources), related_markets=True), time.monotonic()+timeout)
             as_of = self._utc_now()
             stage = 'preparation'
+            frame = self._managed_frame(frame)
             prepared = prepare_current_inputs(frame, captured_candidates, policy, as_of,
                 income_sources=income_sources)
             stage = 'calculation'
@@ -1593,7 +1667,7 @@ class LPD2LiveExecution:
                 self._apply_async_market_results(markets)
             if self.read_runtime is not None and accepted.observation is not None:
                 accepted=replace(accepted,observation=self.state.snapshot().observation)
-                frame=accepted.observation.source_frame
+                frame=self._managed_frame(accepted.observation.source_frame)
                 prepared=prepare_current_inputs(frame,captured_candidates,policy,as_of,income_sources=income_sources)
                 calculation=calculate_current(prepared,account_policy,as_of)
             if accepted.observation is None:
@@ -1611,7 +1685,7 @@ class LPD2LiveExecution:
                 accepted.status in ('accepted', 'partial'), orders_current,
                 observation.orders_complete, source.error_code, tuple(
                     _Order(o.key[0], self.venue, o.key[2], o.key[3], o.side)
-                    for o in observation.order_view.open_orders))
+                    for o in observation.order_view.open_orders if self._is_local_order(o)))
             if orders_current and observation.orders_complete:
                 self._associate_current_manual_sells()
                 self._offer_progress(frame)
@@ -1818,6 +1892,7 @@ class LPD2LiveExecution:
             with self.state._lock:
                 snapshot = self.state.snapshot()
                 result = project_diagnostics(self._diagnostics, as_of=self._utc_now())
+                result['instance_ownership'] = self.instance_ownership_status()
                 result['protection'] = {**self._protection_diagnostics,
                     'cancel_outcomes': self._diagnostic_outcomes['protection_cancel_outcomes']}
                 if self.read_runtime is not None:
@@ -1956,6 +2031,7 @@ class LPD2LiveExecution:
         with self.state._lock:
             current = self._control_view()
             return (not current.fatal and current.cycle_generation == generation
+                and (self.lp_instance_id is None or self.trading.config==self._instance_config)
                 and (not running or current.effective_running))
 
     def _current_pool_results(self, results, roles, snapshot):
@@ -2047,13 +2123,17 @@ class LPD2LiveExecution:
         rows = tuple(r for r in source.value or () if pool == 'income'
             or r['condition_id'] not in income | promotion_pending)
         local_frame = replace(prepared, orders=tuple(r for r in prepared.orders
-            if r['side'] != 'BUY' or r in current), buy_reserved=reserved,
+            if r['side'] != 'BUY' or r in current), buy_reserved=prepared.buy_reserved if self.lp_instance_id is not None else reserved,
             sources=MappingProxyType({**prepared.sources, 'candidates':replace(source, value=rows)}))
         if pool == 'trial':
+            other_pool_reserved = sum((r['price']*r['remaining'] for r in prepared.current_buys
+                if roles['roles'].get(r['condition_id'],{}).get('pool')=='income'
+                and roles['roles'][r['condition_id']].get('episode')==r['order_id']),Decimal(0))
             local_calculation = calculate_current(local_frame, local_policy, as_of)
             selection = select_current_composition(local_frame, local_policy, local_calculation,
                 orders_accepted=orders_accepted, positions_accepted=snapshot.inventory_cost.state == 'known',
-                financial_authority=snapshot.new_capacity.state == 'known', as_of=as_of)
+                financial_authority=snapshot.new_capacity.state == 'known', as_of=as_of,
+                budget_exempt_reserved=other_pool_reserved)
             return local_frame, selection, local_policy, roles
         ranked = sorted((cid for cid, result in results.items() if result['eligible']),
             key=lambda cid: (-Decimal(str(results[cid]['result']['yield_pct_per_hour'])), cid not in income, cid))
@@ -2165,7 +2245,7 @@ class LPD2LiveExecution:
             return None
         targets = []
         snapshot = self.state.snapshot()
-        occupied = [o for o in snapshot.active_orders if o.side == 'BUY']
+        occupied = [o for o in snapshot.active_orders if o.side == 'BUY' and self._is_local_order(o)]
         if pool:
             from .polymarket_lp_observed_pools import income_order
             def in_pool(order):
@@ -2173,6 +2253,12 @@ class LPD2LiveExecution:
             slots = min(max(0,6-len(occupied)),max(0,3-sum(in_pool(o) for o in occupied)))
             local_reserved = sum((o.price.value*o.remaining.value for o in occupied
                 if in_pool(o)),Decimal(0))
+            if self.lp_instance_id is not None:
+                other_pool = 'trial' if pool=='income' else 'income'
+                other_pool_reserved = sum((o.price.value*o.remaining.value for o in occupied
+                    if roles['roles'].get(o.key[1],{}).get('pool')==other_pool
+                    and roles['roles'][o.key[1]].get('episode')==o.key[3]),Decimal(0))
+                local_reserved = snapshot.buy_reserved.value-other_pool_reserved
         else:
             slots = max(0, policy.target_count-len(occupied))
             local_reserved = snapshot.buy_reserved.value
@@ -2324,7 +2410,7 @@ class LPD2LiveExecution:
                         with self.state._lock:
                             permitted = permitted and all(self._rotation_current(decision,o) for o in victims)
                         if permitted:
-                            response = self.trading.cancel_orders_detailed(tuple(o.key[3] for o in victims))
+                            response = self._cancel_local_orders(victims)
                         else:
                             response = None
                         for action,order,record in zip(actions,victims,records):
@@ -2664,16 +2750,31 @@ class LPD2LiveExecution:
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         mutation = 'MANUAL_BUY' if manual_origin is not None else 'BUY'
         def current():
-            return self._manual_origin_current(manual_origin) if manual_origin is not None else self._dispatch_current(token.cycle_generation, running=True)
+            return ((self.lp_instance_id is None or self.trading.config==self._instance_config)
+                and (self._manual_origin_current(manual_origin) if manual_origin is not None else self._dispatch_current(token.cycle_generation, running=True)))
         if not lease.allowed(mutation) or not current():
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
+        before_registration = self.state.snapshot()
+        financial_origin = (before_registration.observation, before_registration.trade_version)
         try:
-            signed = self.trading.lp_create_limit_order(token_id=record.token_id, price=terms.price,
+            prepare = self.trading.lp_prepare_limit_order if self.lp_instance_id is not None else self.trading.lp_create_limit_order
+            prepared = prepare(token_id=record.token_id, price=terms.price,
                 quantity=terms.quantity, side='BUY', post_only=terms.post_only, expiration=terms.expiration,
                 **dict(terms.send_options))
+            signed = prepared.signed_order if self.lp_instance_id is not None else prepared
+            if self.lp_instance_id is not None:
+                provenance = self.store.lp_register_order_provenance(prepared.provenance(instance_id=self.lp_instance_id,
+                    request_id=action.request_id, condition_id=record.condition_id, venue=self.venue))
+                with self.state._lock:
+                    self._order_provenance[prepared.order_id] = provenance
         except Exception:
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
-        if not lease.allowed(mutation) or not current():
+        permitted = lease.allowed(mutation) and current()
+        after_registration = self.state.snapshot()
+        if (not permitted
+                or self.lp_instance_id is not None and manual_origin is None
+                and (after_registration.observation is not financial_origin[0]
+                    or after_registration.trade_version != financial_origin[1])):
             return LocalOutcome(action, LocalStatus.NOT_SENT, True)
         native_started_at = self._utc_now()
         try:
@@ -2690,6 +2791,9 @@ class LPD2LiveExecution:
                 return self._uncertain_buy(token, action, record, native_started_at, 'invalid_receipt')
         status = str(value('status', '')).upper()
         venue_id = value('order_id', value('id')) or None
+        if self.lp_instance_id is not None and venue_id is not None and venue_id != prepared.order_id:
+            return self._uncertain_buy(token, action, record, native_started_at,
+                'invalid_receipt', venue_id, status)
         if venue_id is not None and (type(venue_id) is not str or not venue_id):
             return self._uncertain_buy(token, action, record, native_started_at, 'invalid_receipt')
         if value('accepted') is False or value('ok') is False or status in ('REJECTED', 'FAILED'):
@@ -2750,6 +2854,8 @@ class LPD2LiveExecution:
     def _cancel_admitted(self, action, observation, order, *, protection, lease, protection_key, protection_target,
                          protection_origin, rotation_origin=None):
         target = action.target
+        if not self._is_local_order(order):
+            return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='instance_ownership_unknown')
         if not isinstance(target, CancelTarget) or target.venue != self.venue:
             return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='independent_cancel_identity')
         if (order.key[0] != self.account_id or order.key[2:] != (target.token_id, target.existing_order_id)
@@ -2771,7 +2877,7 @@ class LPD2LiveExecution:
                 if self.state.apply_protection(CancelEvidenceUpdate(guard, protection_target)) != 'applied':
                     return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='protection_evidence_not_current')
         try:
-            result = self.trading.cancel_orders_detailed((target.existing_order_id,))
+            result = self._cancel_local_orders((order,))
         except Exception:
             return LocalOutcome(action, LocalStatus.UNKNOWN_ERROR, True)
         status, reason = _cancel_result(result, target.existing_order_id)
@@ -2814,7 +2920,7 @@ class LPD2LiveExecution:
                     wait=dict(kind='dependencies',deadline=(self._utc_now()+timedelta(seconds=min(dependencies)-now)).isoformat())
                 elif reads and reads.get('waiting_for_event'):
                     wait=dict(kind='events')
-            return dict(read_runtime=reads,plan_wait=wait,
+            return dict(read_runtime=reads,plan_wait=wait,instance_ownership=self.instance_ownership_status(),
                 read_persistence_error=self._read_store_error,control=control,
                 round=self.rounds.snapshot() if self.state.snapshot().current.cycle_generation else None,
                 native_inflight=len(owned | self._active_sends), writer=self.writer.status(), closed=self._closed,
@@ -2903,6 +3009,8 @@ class LPD2LiveExecution:
                 # frame. Carry the exact fact validated here through the sender;
                 # selecting again from observation.orders would lose that receipt.
                 current_order = next((o for o in snapshot.active_orders if o.key == order_key and o.side == 'BUY'), None)
+                if current_order is not None and not self._is_local_order(current_order):
+                    raise ValueError('instance_ownership_unknown')
                 protection = (protection_key in snapshot.progress
                     and protection_key.scope[:3] == order_key[:3]) if protection_key is not None else False
                 if protection:
@@ -3289,7 +3397,7 @@ class LPD2LiveExecution:
                 order = next((o for o in snapshot.orders if o.key == key), None)
                 if (floor is None or not isinstance(created, datetime) or stamp.checked_at is None
                         or not floor <= created <= stamp.checked_at or order is None
-                        or order.side != 'SELL' or order.presence != 'present'):
+                        or order.side != 'SELL' or order.presence != 'present' or not self._is_local_order(order)):
                     continue
                 self._opening_order_associations[key] = _OpeningOrderAssociation(opening.scope, key, None,
                     observation.observation_id, stamp, created_at=created)
@@ -3298,7 +3406,7 @@ class LPD2LiveExecution:
         # Raw open_orders is a current view, never a history/ownership store.
         # Missing and terminal exact facts remain with their original episode.
         keys = {a.order_key for a in self._opening_order_associations.values() if a.scope == opening.scope}
-        return tuple(o for o in snapshot.orders if o.key in keys)
+        return tuple(o for o in snapshot.orders if o.key in keys and self._is_local_order(o))
 
     def _own_fills_from_source(self, source, orders):
         if not source.complete or source.error or not isinstance(source.value, tuple):
@@ -3647,6 +3755,12 @@ class LPD2LiveExecution:
                     quantity += used; remaining -= used; price = level
                 if remaining <= 0: break
             minimum = book.get('min_order_size')
+            if self.lp_instance_id is not None:
+                from .lp_order_ownership import normalize_sell_quantity
+                try:
+                    quantity = normalize_sell_quantity(quantity)
+                except ValueError:
+                    return ()
             if price and quantity > 0 and (minimum is None or quantity >= minimum):
                 return (self._start_exit(scope, 'protected_exit', quantity, sold, price, origin),)
         elif economics.opening_loss_usd.state == 'known' and not opening.stop_requested:
@@ -3704,6 +3818,12 @@ class LPD2LiveExecution:
                 and not any(o.side == 'SELL' and o.key[:3] == scope[:3] for o in snapshot.active_orders))
 
     def _start_exit(self, scope, kind, quantity, sold, price, origin):
+        if self.lp_instance_id is not None:
+            from .lp_order_ownership import normalize_sell_quantity
+            try:
+                quantity = normalize_sell_quantity(quantity)
+            except ValueError:
+                return None
         lease = self._acquire_mutation('SELL')
         if lease is None:
             return None
@@ -3795,9 +3915,19 @@ class LPD2LiveExecution:
                 with self.state._lock:
                     self._publish_sell_attempt(scope, replace(attempt, state='rejected', native_state='ended'))
                 return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
-            signed = (self.trading.lp_create_limit_order(token_id=scope[2], side='SELL', price=attempt.price.value,
-                quantity=attempt.submit_quantity.value, expiration=None, post_only=True)
-                if attempt.kind == 'passive_exit' else None)
+            if self.lp_instance_id is not None:
+                prepared = (self.trading.lp_prepare_limit_order(token_id=scope[2], side='SELL',price=attempt.price.value,
+                    quantity=attempt.submit_quantity.value, expiration=None, post_only=True)
+                    if attempt.kind == 'passive_exit' else self.trading.lp_prepare_protected_sell(
+                        token_id=scope[2], quantity=attempt.submit_quantity.value,min_price=attempt.price.value))
+                provenance = self.store.lp_register_order_provenance(prepared.provenance(
+                    instance_id=self.lp_instance_id, request_id=attempt.request_id,condition_id=scope[1],venue=self.venue))
+                with self.state._lock:self._order_provenance[prepared.order_id] = provenance
+                signed = prepared.signed_order
+            else:
+                signed = (self.trading.lp_create_limit_order(token_id=scope[2], side='SELL', price=attempt.price.value,
+                    quantity=attempt.submit_quantity.value, expiration=None, post_only=True)
+                    if attempt.kind == 'passive_exit' else None)
             if not lease.allowed('SELL') or not self._sell_dispatch_current(scope, attempt, generation, origin):
                 with self.state._lock:
                     self._publish_sell_attempt(scope, replace(attempt, state='rejected', native_state='ended'))
@@ -3807,6 +3937,8 @@ class LPD2LiveExecution:
                 self.trading.submit_protected_sell(token_id=scope[2], quantity=attempt.submit_quantity.value, min_price=attempt.price.value))
             value = lambda name, default=None: response.get(name, default) if isinstance(response, Mapping) else getattr(response, name, default)
             venue_id = value('order_id', value('id'))
+            if self.lp_instance_id is not None and venue_id is not None and venue_id != prepared.order_id:
+                raise ValueError('lp_receipt_order_identity_mismatch')
             if value('accepted') is False or value('ok') is False:
                 outcome = 'rejected'
             elif type(venue_id) is str and venue_id:
@@ -3889,7 +4021,10 @@ class LPD2LiveExecution:
                                         or not self._sell_origin_current(current, scope, origin)):
                                     return _ProtectionOutcome(identity.request_id, 'not_sent', attempt.order_key[3])
                                 self._publish_sell_attempt(scope, updated, observation=True)
-                            result = self.trading.cancel_orders_detailed((attempt.order_key[3],))
+                            order = next((o for o in self.state.snapshot().orders if o.key == attempt.order_key),None)
+                            if order is None or not self._is_local_order(order):
+                                return _ProtectionOutcome(identity.request_id, 'not_sent', attempt.order_key[3])
+                            result = self._cancel_local_orders((order,))
                             if attempt.order_key[3] in result['canceled']:
                                 outcome = 'accepted'
                                 snapshot = self.state.snapshot()
@@ -3933,7 +4068,7 @@ class LPD2LiveExecution:
         observation = snapshot.observation
         buckets = {}
         for order in snapshot.active_orders:
-            if order.side == 'BUY':
+            if order.side == 'BUY' and self._is_local_order(order):
                 buckets.setdefault((order.key[:3], order.price.value), []).append(order)
         for (identity, price), orders in buckets.items():
             current = self.state.snapshot()
@@ -4045,7 +4180,7 @@ class LPD2LiveExecution:
                 if progress and progress.cancel_targets:
                     continue
                 orders = tuple(o for o in snapshot.active_orders if o.key[:3] == key.scope[:3]
-                    and o.side == 'BUY' and o.price.value == key.price)
+                    and o.side == 'BUY' and o.price.value == key.price and self._is_local_order(o))
                 anchors = tuple(o for o in orders if o.key[3] in baseline.anchor_order_ids)
                 pending_anchor = any((handle := self._native_for_order(
                     (self.account_id, self.venue, o.key[2], o.key[3]))) is not None

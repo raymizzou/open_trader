@@ -92,7 +92,10 @@ if port:
         for args in (['init','-q'],['add','.'],['-c','user.name=D2 fixture','-c','user.email=d2@invalid','commit','-qm','offline candidate'],['checkout','--detach','-q']):
             subprocess.run(['git','-C',str(self.release_root),*args],check=True,capture_output=True)
         self.sha=subprocess.check_output(['git','-C',str(self.release_root),'rev-parse','HEAD'],text=True).strip()
-        config=self.config_path;config.parent.mkdir(parents=True,exist_ok=True);config.write_text(json.dumps(dict(signer_address='0x'+'a'*40,wallet_address='0x'+'a'*40)));config.chmod(0o600)
+        configuration=dict(signer_address='0x'+'a'*40,wallet_address='0x'+'a'*40)
+        if self.scenario.endswith('instance-health'):
+            configuration['lp_instance_id']='mini' if self.scenario=='consumer-mini-instance-health' else 'tokyo'
+        config=self.config_path;config.parent.mkdir(parents=True,exist_ok=True);config.write_text(json.dumps(configuration));config.chmod(0o600)
         self.launch(self.scenario,expected_running=expected_running)
 
     def launch(self,scenario,*,expected_running=None):
@@ -488,6 +491,9 @@ def child(runtime_root,port,scenario,config_path):
         else:raise AssertionError('uncontrolled external HTTP boundary: '+request.full_url)
         return io.BytesIO(json.dumps(payload).encode())
     sdk=_SDKAccountClient(now)
+    if scenario.endswith('instance-health'):
+        from tests.test_lp_order_registration_contract import _open_order
+        sdk.orders=(_open_order('unattributed-existing-buy','BUY',price='.29',original='10').model_copy(update={'created_at':now}),)
     if scenario.endswith('consumer-nleg-paused-run'):
         sdk.orders=();sdk.positions=()
     if 'rollback-current' in scenario:
@@ -599,7 +605,11 @@ def child(runtime_root,port,scenario,config_path):
         if inspect.currentframe().f_back.f_code.co_name=='_lp_snapshot_public_client':
             (events/'public-client-created').write_text(public.fixture_identity)
         return public
-    adapter=PolymarketTradingClient(TradingConfig(WALLET,WALLET),sdk,urlopen_fn=public_http,public_client_factory=public_factory)
+    if scenario.endswith('instance-health'):
+        from open_trader.polymarket_trading import load_trading_config
+        adapter_config=load_trading_config(config_path)
+    else:adapter_config=TradingConfig(WALLET,WALLET)
+    adapter=PolymarketTradingClient(adapter_config,sdk,urlopen_fn=public_http,public_client_factory=public_factory)
     if scenario=='consumer-ci-independent-cancel':
         native_ci_close=adapter.close
         def close_ci_adapter():

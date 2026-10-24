@@ -32,7 +32,7 @@ def client_ports(c):
 
 def validate(c):
     if not {'release_root','runtime_root','python','ssh_alias','expected_sha','mode'} <= set(c) \
-       or set(c) - {'release_root','runtime_root','python','ssh_alias','expected_sha','mode','gateway_port','tunnel_port','execution_port','execution_expected_sha','cloud_expected_sha'}:
+       or set(c) - {'release_root','runtime_root','python','ssh_alias','expected_sha','mode','gateway_port','tunnel_port','execution_port','execution_expected_sha','cloud_expected_sha','lp_parallel_peer'}:
         raise ValueError('invalid client config keys')
     for key in ('release_root','runtime_root','python'):
         if not re.fullmatch(r'/[A-Za-z0-9_./-]+', c[key]) or '..' in Path(c[key]).parts:
@@ -49,9 +49,70 @@ def validate(c):
             or not re.fullmatch(r'[0-9a-f]{40}', c.get('execution_expected_sha', ''))):
             raise ValueError('split display requires Shadow and explicit Air execution port/SHA')
     client_ports(c)
+    if 'lp_parallel_peer' in c:
+        from .lp_order_ownership import validate_instance_id
+        peer=c['lp_parallel_peer']
+        keys={'instance_id','account_id','expected_sha','release_root','runtime_root','config_path','port'}
+        if type(peer) is not dict or set(peer)!=keys or c['mode']!='production':
+            raise ValueError('explicit local LP peer profile required')
+        validate_instance_id(peer['instance_id'])
+        if (type(peer['port']) is not int or not 1024<=peer['port']<=65535
+                or peer['port'] in client_ports(c)
+                or not isinstance(peer['account_id'],str) or not re.fullmatch(r'0x[0-9a-fA-F]{40}',peer['account_id'])
+                or not isinstance(peer['expected_sha'],str) or not re.fullmatch(r'[0-9a-f]{40}',peer['expected_sha'])):
+            raise ValueError('invalid local LP peer identity')
+        for key in ('release_root','runtime_root','config_path'):
+            if (not isinstance(peer[key],str) or not re.fullmatch(r'/[A-Za-z0-9_./-]+',peer[key])
+                    or '..' in Path(peer[key]).parts):raise ValueError('canonical local LP peer path required')
     a, b = Path(c['release_root']).resolve(), Path(c['runtime_root']).resolve()
     if a.is_relative_to(b) or b.is_relative_to(a):
         raise ValueError('separate client runtime required')
+
+
+def observe_local_lp_peer(c):
+    """Observe one already configured local service; never create a transport."""
+    from dataclasses import asdict
+    from .prediction_start_guard import identity_for_runtime,selected_trading_config,_read,_foreground_process
+    from .prediction_release import inspect_lp_instance_capability
+    validate(c)
+    peer=c['lp_parallel_peer']
+    identity=identity_for_runtime(data_dir=Path(peer['runtime_root'])/'data',
+        prediction_config_path=peer['config_path'],code_root=peer['release_root'],port=peer['port'])
+    configuration=selected_trading_config(identity)
+    if (identity.release_sha!=peer['expected_sha']
+            or configuration.lp_instance_id!=peer['instance_id']
+            or configuration.wallet_address.casefold()!=peer['account_id'].casefold()):
+        raise ValueError('local LP peer selection mismatch')
+    inspect_lp_instance_capability(peer['release_root'])
+    claim=_read(identity)
+    if claim['state']!='CLAIMED':raise ValueError('local LP peer unavailable')
+    process_before=_foreground_process(identity,claim['pid'])
+    health=read_json(peer['port'])
+    capability=health.get('lp_instance_isolation')
+    expected=dict(schema_version='open_trader.lp.local_instance.v1',ownership_policy='local_only_full_wallet_v1',enabled=True,
+        instance_id=peer['instance_id'],account_id=peer['account_id'].casefold(),venue='polymarket',
+        source_sha=identity.release_sha,code_root=identity.code_root,runtime_root=identity.runtime_root,
+        config_path=identity.config,config_sha256=identity.config_digest,process_epoch=claim['process_epoch'])
+    if (not isinstance(capability,dict) or any(capability.get(k)!=v for k,v in expected.items())
+            or health.get('pid')!=claim['pid'] or health.get('runtime_state')!='RUNNING'):
+        raise ValueError('local LP peer capability mismatch')
+    require_fresh_instance_observation(capability)
+    after=identity_for_runtime(data_dir=identity.data_dir,prediction_config_path=identity.config,
+        code_root=identity.code_root,port=identity.port)
+    if (asdict(after)!=claim['identity'] or _read(after)!=claim
+            or _foreground_process(after,claim['pid'])!=process_before):
+        raise ValueError('local LP peer changed during observation')
+    return {**expected,'pid':claim['pid'],'started_at':health['started_at']}
+
+
+def require_fresh_instance_observation(capability):
+    from datetime import UTC,datetime
+    try:
+        observed=datetime.fromisoformat(capability['observed_at'])
+        age=(datetime.now(UTC)-observed).total_seconds()
+        if observed.tzinfo is None or not 0<=age<=10:raise ValueError
+    except (KeyError,TypeError,ValueError):
+        raise ValueError('LP instance observation missing or stale') from None
 
 
 def process_identity(pid):

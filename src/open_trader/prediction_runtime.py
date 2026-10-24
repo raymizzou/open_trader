@@ -613,6 +613,47 @@ class PredictionRuntime:
     def production_owner(self) -> bool:
         return self._mode == "production" and self._owner.held
 
+    @property
+    def lp_instance_isolation(self) -> dict[str, object]:
+        """Local ownership capability; this is not a parallel trading gate."""
+        from .lp_order_ownership import LOCAL_INSTANCE_SCHEMA,LOCAL_INSTANCE_OWNERSHIP_POLICY
+        result: dict[str, object] = dict(
+            schema_version=LOCAL_INSTANCE_SCHEMA, ownership_policy=LOCAL_INSTANCE_OWNERSHIP_POLICY, enabled=False,
+            reason="owner_unavailable")
+        live = self.lp_d2
+        claim = self._lp_start_claim
+        if (self.state != "RUNNING" or not self.production_owner
+                or not isinstance(live, LPD2LiveExecution) or claim is None):
+            return result
+        if live.lp_instance_id is None:
+            return {**result, "reason": "legacy_unbound"}
+        try:
+            from .prediction_start_guard import selected_trading_config
+            identity = claim.identity
+            actual = identity_for_runtime(data_dir=self._data_dir,
+                prediction_config_path=self._prediction_config_path,
+                host=identity.host, port=identity.port)
+            configuration = selected_trading_config(identity)
+            binding = self.store.lp_instance_binding()
+            if (actual != identity or self._git_sha != identity.release_sha
+                    or configuration != self._prediction_trading.config
+                    or live.trading is not self._prediction_trading
+                    or live.lp_instance_id != configuration.lp_instance_id
+                    or live.account_id != configuration.wallet_address
+                    or binding != dict(instance_id=live.lp_instance_id,
+                        account_id=live.account_id.casefold(), venue=live.venue)):
+                return {**result, "reason": "identity_changed"}
+        except Exception:
+            # Missing or changed source/config/persistence is never capability proof.
+            return {**result, "reason": "identity_changed"}
+        return {**result, "enabled": True, "reason": "local_bound_owner",
+            "instance_id": live.lp_instance_id, "account_id": live.account_id.casefold(),
+            "venue": live.venue, "process_epoch": claim.process_epoch,
+            "source_sha": identity.release_sha, "code_root": identity.code_root,
+            "runtime_root": identity.runtime_root, "config_path": identity.config,
+            "config_sha256": identity.config_digest,
+            "observed_at": datetime.now(UTC).isoformat()}
+
     @staticmethod
     def _parse_n_leg_paused(value: str | None) -> bool:
         if value in (None, "", "0"):
@@ -792,6 +833,9 @@ class PredictionRuntime:
                 self.relation_catalog = RelationCatalog(self._data_dir)
             from .prediction_start_guard import selected_trading_config
             trading_config = selected_trading_config(identity)
+            configured_instance = os.environ.get('OPEN_TRADER_LP_INSTANCE_ID')
+            if configured_instance is not None and configured_instance != trading_config.lp_instance_id:
+                raise ValueError('selected LP instance differs from installed service')
             apply_safety_policy = getattr(self.store, "apply_safety_policy", None)
             # Paused entrypoints preserve legacy controls and audit history,
             # including avoiding the policy check's BEGIN IMMEDIATE lock.

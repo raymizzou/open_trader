@@ -95,10 +95,12 @@ class MarketFrame:
     history_fees: Decimal | None = None
     errors: tuple[str, ...] = ()
     reader_diagnostics: Mapping = field(default_factory=dict)
+    managed_order_ids: frozenset[str] | None = None
 
     @property
     def current_buys(self):
-        return tuple(o for o in self.orders if o['side'] == 'BUY' and o['status'] in CURRENT_ORDER_STATES and o['remaining'] > 0)
+        return tuple(o for o in self.orders if o['side'] == 'BUY' and o['status'] in CURRENT_ORDER_STATES and o['remaining'] > 0
+            and (self.managed_order_ids is None or o['order_id'] in self.managed_order_ids))
 
 
 class MarketReader:
