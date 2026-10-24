@@ -126,9 +126,16 @@ def test_public_pool_membership_uses_current_exact_order_facts(tmp_path,monkeypa
         rig.cycle(pool='trial')
         rig.tick()
         rig.converge_current(lambda:rig.live.state.snapshot().observation.read_ticket.trade_version_at_start==rig.live.state.snapshot().trade_version)
-        rig.pump(lambda:rig.live.read_runtime.status()['ready_count']==0
-            and not any(s['active'] for s in rig.live.read_runtime.status()['scopes'])
-            and rig.live.read_runtime.status()['observed_monotonic']>=rig.seconds)
+        def reads_settled():
+            status=rig.live.read_runtime.status()
+            due=status['next_dependency_monotonic']
+            # An idle scope can still have work awaiting supervisor admission.
+            # Observe one coherent status after all work due at this clock drains.
+            return (status['ready_count']==0
+                and not any(s['active'] for s in status['scopes'])
+                and status['observed_monotonic']>=rig.seconds
+                and (due is None or due>rig.seconds))
+        rig.pump(reads_settled)
         before=(rig.live.state.snapshot(),len(rig.requests),rig.store.lp_load_observed_pool_roles(rig.account))
         state=rig.execution.lp_auto_state()['observed_pools']['current_membership']
         again=rig.execution.lp_auto_state()['observed_pools']['current_membership']
