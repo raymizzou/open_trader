@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-24 — LP runtime payload assertion coverage
+
+- Check the complete additive order affiliation error when authenticated account identity is missing. Preserve all existing order and position field assertions; production behavior is unchanged.
+
 ## 2026-10-24 — Exact LP order pool affiliation
 
 - Carry authenticated account identity and exact accepted trial/income order affiliation through the cached dashboard and HTTP response. Keep an existing income order in income when financial membership is UNKNOWN or its role is evicted. Match case variants of the same wallet at display boundaries while keeping every other identity exact.
