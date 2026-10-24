@@ -284,11 +284,75 @@ service-owned credential boundary. The unit pins the chosen mode and only the
 credential backend/path; it contains no secret values.
 
 Production-file profile support alone does not establish Tokyo live readiness.
-Same-wallet per-instance order ownership, the parallel-owner cloud gate and the
-geographic-gate disposition remain pending. Production preflight still requires
+The explicit same-wallet instance profile below requires its own source,
+configuration and running-service evidence. Geographic eligibility remains a
+separate unresolved operational condition. Production preflight still requires
 service-user `wallet read-auth --require-trading-region`; its failure blocks
 `PRECHECK_OK`. This capability change does not deploy or start a service, enable
 live orders, or waive any existing gate.
+
+### Explicit same-wallet LP instances
+
+The approved policy allows Mini and Tokyo to share a wallet with distinct stable
+`lp_instance_id` values, for example `mini` and `tokyo`. Set the field in each
+host's private prediction trading config. The cloud service config must also pin
+its own `lp_instance_id`; the rendered unit pins the same value. Once the local
+database is bound, removing or changing that identity fails closed. A fresh
+unbound database without the field retains single-instance compatibility.
+
+Only exact orders registered by this instance before POST enter its management,
+protection, pool rotation or cancellation paths. Manual and other nonlocal orders
+remain visible but are not automatically protected or canceled by this host.
+Absence from the local index does not prove peer ownership. Legacy orders are not
+adopted or rewritten; the operator must explicitly decide their disposition.
+
+Ownership uncertainty alone does not reject a local BUY. All active wallet BUY
+notional remains reserved, including manual and nonlocal rows. Financial UNKNOWN,
+incomplete or stale facts, wallet identity, balance, allowance, pending requests
+and SELL oversell checks keep their existing meaning. Positions and SELLs do not
+deduct the ADR0005 BUY cap. This provides no cross-host atomic spending guarantee.
+
+To opt in, add `lp_parallel_peer` to the local client config on Mini. It must name
+the already configured local Mini production service. It cannot contain a URL or
+remote transport. The fields below extend the existing complete client config:
+
+```json
+{
+  "lp_parallel_peer": {
+    "instance_id": "mini",
+    "account_id": "0x1111111111111111111111111111111111111111",
+    "expected_sha": "1111111111111111111111111111111111111111",
+    "release_root": "/Users/operator/open-trader/releases/mini-sha",
+    "runtime_root": "/Users/operator/open-trader/runtime",
+    "config_path": "/Users/operator/open-trader/runtime/prediction.json",
+    "port": 8769
+  }
+}
+```
+
+Replace the example wallet, SHA and paths with the selected real identities.
+The peer port must differ from the Gateway and Tokyo tunnel ports. The gate uses
+existing local reads and the existing Tokyo SSH path. It verifies the private
+selected config, trusted release/runtime binding, actual PID/listener/native
+lock/start claim and fresh `/healthz` local-instance capability. Both hosts must
+report the supported `local_only_full_wallet_v1` ownership policy, the same wallet
+and different stable IDs. No peer order registry or shared provenance is used.
+
+Roll out the compatible Mini implementation first under its applicable delivery
+authorization. Tokyo readiness checks its staged source/config plus same-host
+process/listener/lock absence; it does not require Tokyo to run before startup.
+Smoke checks Tokyo's actual running config, process and local-instance capability
+and rechecks Mini. Missing, stale, legacy or mismatched evidence blocks the gate.
+Only this validated explicit profile replaces `old_owner_stopped` with live peer
+evidence. The default profile retains stopped-owner handoff. SSM still requires
+metadata isolation; file profiles retain private file/service identity and
+service-user read-auth. `--require-trading-region` remains mandatory in production:
+a geographic refusal blocks readiness without a bypass or regional exception.
+
+Code and offline verification are not deployment or operational acceptance.
+Source/runtime/lock/config verification, trusted exact-SHA CI, resource checks,
+authorized deployment, fresh Host Readiness, Production Smoke and explicit legacy
+order disposition remain required at their existing boundaries.
 
 The cloud config requires an explicit `"mode": "production"` or
 `"mode": "shadow"`; a missing or unknown value fails closed. The selected mode

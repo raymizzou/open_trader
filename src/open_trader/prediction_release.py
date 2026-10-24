@@ -917,3 +917,39 @@ def prepare_lp_target(*,runtime_root,release_root,python,operation_nonce,host='1
             recheck_selection()
             write_prediction_runtime_record(record_path,document,**publication)
         return operation_nonce
+
+
+def inspect_lp_instance_capability(checkout):
+    """Require the implemented local seams in the exact trusted release source.
+
+    This is an additional source check, not a change to the deployment manifest
+    or a substitute for CI, selected config, or actual running health identity.
+    """
+    import ast
+    checkout=Path(checkout).resolve()
+    source=inspect_prediction_release_checkout(checkout)
+    required={
+        'lp_order_ownership.py':(None,{'verify_signed_order','validate_provenance'}),
+        'polymarket_lp_live_execution.py':('LPD2LiveExecution',{'_cancel_local_orders','instance_ownership_status'}),
+        'polymarket_trading.py':('PolymarketTradingClient',{'lp_prepare_limit_order','lp_prepare_protected_sell'}),
+        'prediction_arbitrage_store.py':('PredictionArbitrageStore',{'lp_bind_instance','lp_register_order_provenance'}),
+        'prediction_runtime.py':('PredictionRuntime',{'lp_instance_isolation'}),
+    }
+    schema=policy=None
+    for name,(owner,names) in required.items():
+        relative='src/open_trader/'+name
+        raw=(checkout/relative).read_bytes()
+        committed=subprocess.check_output(['git','-C',str(checkout),'show','HEAD:'+relative])
+        if raw!=committed:raise ValueError('LP instance source changed')
+        tree=ast.parse(raw)
+        body=tree.body if owner is None else next((n.body for n in tree.body if isinstance(n,ast.ClassDef) and n.name==owner),())
+        present={n.name for n in body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.body}
+        if not names<=present:raise ValueError('LP instance implementation unavailable')
+        if owner is None:
+            schema=next((ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign)
+                and any(isinstance(t,ast.Name) and t.id=='LOCAL_INSTANCE_SCHEMA' for t in n.targets)),None)
+            policy=next((ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign)
+                and any(isinstance(t,ast.Name) and t.id=='LOCAL_INSTANCE_OWNERSHIP_POLICY' for t in n.targets)),None)
+    if schema!='open_trader.lp.local_instance.v1' or policy!='local_only_full_wallet_v1':
+        raise ValueError('LP instance schema unsupported')
+    return dict(schema_version=schema,ownership_policy=policy,source_sha=source['git_sha'])

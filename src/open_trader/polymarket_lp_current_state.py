@@ -625,11 +625,12 @@ def _stamp(source) -> SourceStamp:
 class CurrentLPState:
     def __init__(self, account_id: str, process_epoch: str, *,
                  clock: Callable[[], float] = time.monotonic,
-                 utc_now: Callable[[], datetime] = lambda: datetime.now(UTC)):
+                 utc_now: Callable[[], datetime] = lambda: datetime.now(UTC), managed_order=None):
         if not account_id or not process_epoch:
             raise ValueError('missing_state_identity')
         self.account_id, self.process_epoch = account_id, process_epoch
         self._clock, self._utc_now = clock, utc_now
+        self._managed_order = managed_order or (lambda order: True)
         self._lock = threading.RLock()
         self._current = CurrentControl(account_id, process_epoch)
         self._control_status = ControlStatus(self._current)
@@ -837,7 +838,7 @@ class CurrentLPState:
             yields = {}
             invalid_market=set()
             for k, o in orders.items():
-                if o.side != 'BUY' or o.terminal_proof is not None or o.presence == 'absent' or o.remaining.value == 0:
+                if not self._managed_order(o) or o.side != 'BUY' or o.terminal_proof is not None or o.presence == 'absent' or o.remaining.value == 0:
                     continue
                 previous = self._yields.get(k)
                 if k in rejected_order_inputs:

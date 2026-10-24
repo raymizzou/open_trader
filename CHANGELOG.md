@@ -4,6 +4,15 @@
 
 - Check the complete additive order affiliation error when authenticated account identity is missing. Preserve all existing order and position field assertions; production behavior is unchanged.
 
+## 2026-10-24 — Reliable local LP instance ownership
+
+- Add an explicit stable LP instance ID and reliable exact signed-order provenance before POST. A bound database rejects identity removal or replacement. Restart restores identity only, without replaying a request. Each host manages and cancels only positively local orders at all four native cancellation boundaries.
+- Support the approved same-wallet policy: nonlocal BUYs remain visible, unmanaged and uncancelable locally. Their full notional still reserves wallet funds. Ownership uncertainty alone does not block a financially valid local BUY; financial UNKNOWN, current-fact, balance, allowance, oversell and no-replay rules remain.
+- Normalize local SELL requests to the pinned SDK's two-decimal share precision before registration and signing. Keep exact signed terms and price floors; below-precision dust remains visible inventory, and protected exits still meet the actual minimum after rounding.
+- Keep trial and income budgets independent for exact local pool episodes. Other-pool commitments still reserve wallet funds; foreign, stale and unclassified BUY reservations continue to constrain new risk.
+- Add an opt-in two-host gate with distinct stable IDs, the same wallet, exact source/config/runtime identities and fresh compatible Mini service evidence. Readiness checks staged Tokyo identity; smoke checks both running identities. The default handoff still requires the old owner to stop. File authentication and SSM metadata checks retain their separate boundaries.
+- Synchronize the existing pool-exit regression with actual native cancel entry. Preserve physical drain, UNKNOWN fill and no-replay assertions. This change does not establish geographic eligibility, deploy a service or perform live trading.
+
 ## 2026-10-24 — Exact LP order pool affiliation
 
 - Carry authenticated account identity and exact accepted trial/income order affiliation through the cached dashboard and HTTP response. Keep an existing income order in income when financial membership is UNKNOWN or its role is evicted. Match case variants of the same wallet at display boundaries while keeping every other identity exact.
