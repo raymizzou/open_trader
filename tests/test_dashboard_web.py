@@ -24567,7 +24567,7 @@ def _lp430_card(rows, members=(), **extra):
 
 
 def test_lp_today_has_trial_income_sell_finished_sections() -> None:
-    rows=[_lp430_order('trial'),_lp430_order('income'),_lp430_order('sell',side='SELL'),
+    rows=[_lp436_affiliated('trial','trial'),_lp436_affiliated('income','income'),_lp430_order('sell',side='SELL'),
         _lp430_order('finished',status='CANCELED')]
     member={**rows[1],'pool':'income'}
     html,sections=_lp430_card(rows,[member])
@@ -24583,24 +24583,26 @@ def test_lp_today_has_trial_income_sell_finished_sections() -> None:
 
 
 def test_lp_sections_use_identity_not_order_size_or_historical_role() -> None:
-    rows=[_lp430_order('small-income',quantity='1'),_lp430_order('large-trial',quantity='10000'),
-        _lp430_order('manual'),_lp430_order('source')]
+    rows=[_lp436_affiliated('small-income','income',quantity='1'),_lp436_affiliated('large-trial','trial',quantity='10000'),
+        _lp430_order('manual'),_lp436_affiliated('source','trial')]
     members=[{**rows[0],'pool':'income'},{**rows[1],'pool':'trial'},
         {**rows[2],'order_id':'old-manual','pool':'income'},{**rows[3],'pool':'promotion'}]
-    _,sections=_lp430_card(rows,members)
+    html,sections=_lp430_card(rows,members)
     assert 'data-lp-order-id="small-income"' in sections['income']
     assert 'data-lp-order-id="large-trial"' in sections['trial']
-    assert 'data-lp-order-id="manual"' in sections['trial']
+    assert 'data-lp-order-id="manual"' not in ''.join(sections.values())
+    assert 'data-lp-pool-error-order="manual"' in html
+    assert 'data-lp-order-id="old-manual"' not in html
     assert 'data-lp-order-id="source"' in sections['income'] and '转入中' in sections['income']
-    assert '归属待核对' in sections['trial']
+    assert '归属待核对' not in html
     _,pending=_lp430_card([],[],promotions=[{**rows[3]}])
     assert '0 笔' in pending['income'] and '转入中 1' in pending['income']
     assert 'data-lp-order-id=' not in pending['income']
 
 
 def test_lp_sections_keep_unknown_orders_out_of_finished() -> None:
-    rows=[_lp430_order('unknown',quantity=None),_lp430_order('sell',side='SELL'),
-        _lp430_order('partial',quantity='10'),_lp430_order('canceled',status='CANCELED'),
+    rows=[_lp436_affiliated('unknown','trial',quantity=None),_lp430_order('sell',side='SELL'),
+        _lp436_affiliated('partial','trial',quantity='10'),_lp430_order('canceled',status='CANCELED'),
         _lp430_order('filled',status='FILLED'),_lp430_order('expired',status='EXPIRED')]
     rows[2].update(remaining_quantity='6',filled_quantity='4')
     _,sections=_lp430_card(rows)
@@ -24617,8 +24619,8 @@ def test_lp_sections_keep_unknown_orders_out_of_finished() -> None:
 
 
 def test_lp_section_totals_and_sessions_preserve_order_identity() -> None:
-    rows=[_lp430_order('trial',quantity='10',session_id='trial-session'),
-        _lp430_order('income',quantity='20',session_id='income-session'),
+    rows=[_lp436_affiliated('trial','trial',quantity='10',session_id='trial-session'),
+        _lp436_affiliated('income','income',quantity='20',session_id='income-session'),
         _lp430_order('sell',quantity='30',side='SELL',session_id='income-session'),
         _lp430_order('finished',quantity='40',status='CANCELED',session_id='income-session')]
     sessions=[dict(session_id=sid,condition_id='same-market',state='entry_open',
@@ -24639,3 +24641,154 @@ def test_lp_section_totals_and_sessions_preserve_order_identity() -> None:
     assert 'data-action="lp-augment-entry"' not in sections['finished']
     assert 'data-action="lp-cancel-all"' in html  # global all-order action stays intact
     assert 'data-action="lp-cancel-order" data-order-id="sell"' in sections['sell']
+
+
+def _lp436_affiliated(oid, pool, **extra):
+    row = _lp430_order(oid, **extra)
+    row['pool_affiliation'] = dict(state='known', pool=pool, request_id='request-'+oid,
+        **{key: row[key] for key in ('account_id', 'condition_id', 'token_id', 'order_id')})
+    return row
+
+
+def test_lp_sections_render_income_when_membership_is_unknown() -> None:
+    rows = [_lp436_affiliated('income-fixed', 'income', quantity='1'),
+        _lp436_affiliated('trial-fixed', 'trial', quantity='10000')]
+    for state in ('known', 'unknown', 'known'):
+        auto = dict(allocation_mode='observed_pools', observed_pools=dict(
+            current_membership=dict(state=state, orders=[], pending_promotions=[])))
+        html, sections = _lp430_card(rows, auto=auto)
+        assert list(sections) == ['trial', 'income', 'sell', 'finished']
+        assert 'data-lp-order-id="income-fixed"' in sections['income']
+        assert 'data-lp-order-id="income-fixed"' not in sections['trial']
+        assert 'data-lp-order-id="trial-fixed"' in sections['trial']
+        assert 'data-lp-order-id="trial-fixed"' not in sections['income']
+        assert '收益单' in sections['income'] and '试挂单' in sections['trial']
+        assert '当前收益' not in sections['income'] and '当前试挂' not in sections['trial']
+        assert '归属待核对' not in html
+
+
+@pytest.mark.parametrize('variant', ['missing', 'account', 'condition', 'token', 'order',
+    'request', 'backend_error', 'membership_conflict', 'duplicate_conflict', 'missing_membership', 'missing_auto'])
+def test_lp_sections_report_invalid_pool_identity_without_guessing(variant) -> None:
+    row = _lp436_affiliated('invalid-order', 'income', quantity='7')
+    members = []
+    if variant == 'missing':
+        row.pop('pool_affiliation')
+    elif variant in ('account', 'condition', 'token', 'order'):
+        row['pool_affiliation'][variant+'_id'] = 'wrong-'+variant
+    elif variant == 'request':
+        row['pool_affiliation'].pop('request_id')
+    elif variant == 'backend_error':
+        row['pool_affiliation'] = dict(state='error', reason='accepted_buy_identity_mismatch')
+    elif variant == 'membership_conflict':
+        members = [{**row, 'pool':'trial'}]
+    rows = [row]
+    if variant == 'duplicate_conflict':
+        rows.append(_lp436_affiliated('invalid-order', 'trial', quantity='7'))
+    if variant == 'missing_auto':
+        row.pop('pool_affiliation')
+        html, sections = _lp430_card(rows, auto=None, allocation_mode='observed_pools')
+    elif variant == 'missing_membership':
+        row.pop('pool_affiliation')
+        html, sections = _lp430_card(rows, auto=dict(allocation_mode='observed_pools'))
+    else:
+        html, sections = _lp430_card(rows, members)
+    assert list(sections) == ['trial', 'income', 'sell', 'finished']
+    assert '订单归属数据错误' in html
+    reason = {'missing': '缺少订单归属字段', 'account': '归属账户与订单账户不一致',
+        'condition': '归属市场与订单市场不一致', 'token': '归属 Token 与订单 Token 不一致',
+        'order': '归属订单编号与本订单不一致', 'request': '缺少已接受请求编号',
+        'backend_error': '已接受 BUY 回执与订单身份不一致',
+        'membership_conflict': '订单归属与当前精确角色冲突',
+        'duplicate_conflict': '同一订单的响应记录互相冲突',
+        'missing_membership': '缺少订单归属字段', 'missing_auto': '缺少订单归属字段'}[variant]
+    assert reason in html
+    assert 'data-lp-pool-error-order="invalid-order"' in html
+    for literal in ('offline-account', 'same-market', 'token-invalid-order', 'invalid-order', '7'):
+        assert literal in html
+    assert 'data-action="lp-cancel-order" data-order-id="invalid-order"' in html
+    assert 'data-lp-order-id="invalid-order"' not in ''.join(sections.values())
+    assert '本区暂无委托' not in ''.join(sections.values())  # no false empty-state
+    assert '归属待核对' not in html and '待核对区' not in html
+    # Legacy single-pool payloads remain usable without claiming income identity.
+    legacy, legacy_sections = _lp430_card([_lp430_order('legacy')], auto=dict(allocation_mode='minimum'))
+    assert 'data-lp-order-id="legacy"' in legacy_sections['trial']
+    assert '订单归属数据错误' not in legacy
+
+
+def test_lp_sections_never_create_rows_from_historical_affiliation() -> None:
+    historical = _lp436_affiliated('historical-income', 'income')
+    auto = dict(allocation_mode='observed_pools', observed_pools=dict(
+        roles={'same-market': dict(pool='income', episode='historical-income', request_id='request-old')},
+        accepted_receipts=[dict(order_id='historical-income', outcome='accepted')],
+        current_membership=dict(state='known', orders=[{**historical, 'pool':'income'}], pending_promotions=[])))
+    html, sections = _lp430_card([], auto=auto)
+    assert list(sections) == ['trial', 'income', 'sell', 'finished']
+    assert all('0 笔' in body for body in sections.values())
+    assert 'data-lp-order-id=' not in ''.join(sections.values())
+    assert 'historical-income' not in ''.join(sections.values())
+    new_order = _lp430_order('new-same-market', quantity='10000')
+    html, sections = _lp430_card([new_order], auto=auto)
+    assert 'data-lp-pool-error-order="new-same-market"' in html
+    assert 'data-lp-order-id=' not in ''.join(sections.values())
+    assert 'historical-income' not in ''.join(sections.values())
+    # Verified promotion and explicit SELL/terminal priorities still win.
+    source = _lp436_affiliated('source', 'trial')
+    sell = _lp430_order('sell', side='SELL')
+    terminal = _lp430_order('terminal', status='CANCELED')
+    _, sections = _lp430_card([source, sell, terminal], [{**source, 'pool':'promotion'}])
+    assert 'data-lp-order-id="source"' in sections['income'] and '转入中' in sections['income']
+    assert 'data-lp-order-id="sell"' in sections['sell']
+    assert 'data-lp-order-id="terminal"' in sections['finished']
+    assert 'data-action="lp-augment-entry"' not in sections['sell'] + sections['finished']
+
+
+@pytest.mark.parametrize('variant', ['promotion', 'conflict', 'duplicate', 'affiliation_case',
+    'other_wallet', 'other_affiliation_wallet', 'condition_case', 'token_case', 'order_case', 'request_case'])
+def test_lp_sections_match_canonical_account_identity(variant) -> None:
+    canonical = '0x' + 'ab' * 20
+    mixed = '0x' + 'aB' * 20
+    row = _lp436_affiliated('CaseOrder', 'trial', condition='CaseCondition')
+    row.update(account_id=canonical, token_id='CaseToken')
+    row['pool_affiliation'].update(account_id=canonical, token_id='CaseToken', request_id='CaseRequest')
+    member = {**row, 'account_id': mixed, 'pool': 'promotion'}
+    rows = [row]
+    members = [member]
+    if variant == 'conflict':
+        member['pool'] = 'income'
+    elif variant == 'duplicate':
+        duplicate = {**row, 'account_id': mixed,
+            'pool_affiliation': {**row['pool_affiliation'], 'account_id': mixed}}
+        rows.append(duplicate)
+        members = []
+    elif variant == 'affiliation_case':
+        row['pool_affiliation']['account_id'] = mixed
+        members = []
+    elif variant == 'other_wallet':
+        member['account_id'] = '0x' + 'cd' * 20
+    elif variant == 'other_affiliation_wallet':
+        row['pool_affiliation']['account_id'] = '0x' + 'cd' * 20
+    elif variant in ('condition_case', 'token_case', 'order_case'):
+        key = variant.removesuffix('_case') + '_id'
+        member[key] = {'condition_id':'caseCondition', 'token_id':'caseToken', 'order_id':'caseOrder'}[key]
+    elif variant == 'request_case':
+        rows.append({**row, 'account_id': mixed, 'pool_affiliation': {
+            **row['pool_affiliation'], 'account_id': mixed, 'request_id':'caseRequest'}})
+        members = []
+    html, sections = _lp430_card(rows, members)
+    if variant in ('conflict', 'other_affiliation_wallet', 'request_case'):
+        reason = {'conflict':'订单归属与当前精确角色冲突',
+            'other_affiliation_wallet':'归属账户与订单账户不一致',
+            'request_case':'同一订单的响应记录互相冲突'}[variant]
+        assert reason in html and 'data-lp-pool-error-order="CaseOrder"' in html
+        assert 'data-lp-order-id="CaseOrder"' not in ''.join(sections.values())
+    elif variant == 'promotion':
+        assert 'data-lp-order-id="CaseOrder"' in sections['income']
+        assert '转入中' in sections['income'] and '1 笔' in sections['income']
+        assert 'data-lp-order-id="CaseOrder"' not in sections['trial']
+        assert '订单归属数据错误' not in html
+    else:
+        assert sections['trial'].count('data-lp-order-id="CaseOrder"') == 1
+        assert '1 笔' in sections['trial']
+        assert 'data-lp-order-id="CaseOrder"' not in sections['income']
+        assert '转入中' not in sections['trial'] and '订单归属数据错误' not in html

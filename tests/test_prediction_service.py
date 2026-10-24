@@ -16078,3 +16078,79 @@ def test_shadow_display_http_reads_only_snapshots_and_retains_unknown(tmp_path):
         status, _ = _response(base+'/api/prediction-arbitrage/lp/account/trades?limit=101')
         assert status == 400
     assert ('trades',{'offset':2,'limit':1}) in calls
+
+
+def _lp436_accepted_rig(tmp_path, monkeypatch):
+    from tests.test_lp_observed_pools import AsyncPoolRig
+    import time
+    rig = AsyncPoolRig(tmp_path, monkeypatch)
+    try:
+        rig.market('D'); rig.add_order('D', '1'); rig.measure(dict(D='.8'))
+        canceled = rig.cycle(pool='income'); rig.finish_cancels(canceled)
+        rig.release('old-D')
+        accepted = rig.cycle(pool='income'); rig.finish_cancels(accepted)
+        income_id = next(o.venue_order_id for o in accepted.outcomes
+            if o.identity.target.token_id == 'tD')
+        rig.market('E')
+        trial = rig.cycle(pool='trial'); rig.finish_cancels(trial)
+        rig.converge_current(lambda: any(p['token_id'] == 'tE' for p in rig.sdk.posts))
+        trial_id = next(o['id'] for o in rig.sdk.orders if o['asset_id'] == 'tE')
+        # The disposable writer has its own observable completion and real watchdog.
+        deadline = time.monotonic() + 3
+        while True:
+            status = rig.live.writer.status()
+            if status['pending_entries'] == status['inflight_entries'] == 0:
+                break
+            assert time.monotonic() < deadline, status
+            rig.wake.wait(.002)
+        rig.tick()
+        rig.converge_current(lambda: rig.execution.lp_auto_state()['observed_pools']['current_membership']['state'] == 'known')
+        return rig, income_id, trial_id
+    except BaseException:
+        rig.close()
+        raise
+
+
+def test_lp_dashboard_http_projection_preserves_order_affiliation(tmp_path, monkeypatch):
+    from tests.test_dashboard_web import run_dashboard_js
+    import re
+    rig, income_id, trial_id = _lp436_accepted_rig(tmp_path, monkeypatch)
+    try:
+        runtime = _Runtime()
+        runtime.mode = 'production'  # local synthetic runtime, permits the real auto projection
+        runtime.production_owner = True
+        runtime.store = rig.store
+        runtime.execution = rig.execution
+        runtime.lp_auto_state = rig.execution.lp_auto_state
+        balance = rig.sdk.get_balance_allowance
+        with _server(runtime) as base:
+            for expected in ('known', 'unknown', 'known'):
+                rig.sdk.get_balance_allowance = (lambda **kw: SimpleNamespace(balance=None, allowances={})) if expected == 'unknown' else balance
+                rig.tick(11)
+                rig.converge_current(lambda: rig.execution.lp_auto_state()['observed_pools']['current_membership']['state'] == expected)
+                assert rig.store.lp_advance_trade_generation(rig.store.lp_trade_generation())
+                rig.execution.refresh_lp_dashboard_snapshot()
+                status, payload = _response(base + '/api/prediction-arbitrage/lp/dashboard')
+                assert status == 200
+                assert payload['auto']['observed_pools']['current_membership']['state'] == expected
+                assert payload['allocation_mode'] == 'observed_pools'  # survives independent auto-state loading
+                rows = {row['order_id']: row for row in payload['lp_orders_today']}
+                assert set(rows) == {income_id, trial_id}
+                for oid, pool, cid, token in [(income_id, 'income', rig.cid('D'), 'tD'),
+                        (trial_id, 'trial', rig.cid('E'), 'tE')]:
+                    row = rows[oid]
+                    assert (row['account_id'], row['condition_id'], row['token_id']) == (
+                        rig.adapter.config.wallet_address, cid, token)
+                    assert row['pool_affiliation']['pool'] == pool
+                    assert row['pool_affiliation']['order_id'] == oid
+                    assert row['pool_affiliation']['request_id']
+                html = json.loads(run_dashboard_js('console.log(JSON.stringify(predictionLpCard({lp_dashboard:' + json.dumps(payload) + '})));'))
+                sections = dict(re.findall(r'<tbody data-lp-section="([^"]+)">([\s\S]*?)</tbody>', html))
+                assert list(sections) == ['trial', 'income', 'sell', 'finished']
+                assert f'data-lp-order-id="{income_id}"' in sections['income']
+                assert f'data-lp-order-id="{income_id}"' not in sections['trial']
+                assert f'data-lp-order-id="{trial_id}"' in sections['trial']
+                assert f'data-lp-order-id="{trial_id}"' not in sections['income']
+                assert '归属待核对' not in html and '订单归属数据错误' not in html
+    finally:
+        rig.close()
