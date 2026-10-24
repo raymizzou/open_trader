@@ -2115,6 +2115,7 @@ class PredictionExecutionService:
             buy_price_level = None
         return {
             "state": "snapshot_pending",
+            "allocation_mode": self._lp_d2.policy.allocation_mode if self._lp_d2 is not None else "minimum",
             "buy_price_level": buy_price_level,
             "stale": True,
             "orders": [],
@@ -2972,6 +2973,9 @@ class PredictionExecutionService:
                         if order_id in view["owned_ids"]:  # type: ignore[operator]
                             owning_view = view
                             break
+                    row_account = raw_order.get("account_id") or snapshot.get("account_id") or snapshot.get("wallet_address")
+                    if isinstance(row_account, str):
+                        row_account = row_account.strip().casefold()
                     minimum_order_size = _decimal(raw_order.get("minimum_order_size"))
                     reward_min_size = _decimal(raw_order.get("reward_min_size"))
                     min_scoring_size = _lp_min_scoring_size(
@@ -2980,7 +2984,7 @@ class PredictionExecutionService:
                     orders.append(
                         {
                             "order_id": order_id,
-                            "account_id": raw_order.get("account_id") or (snapshot.get("account") or {}).get("wallet_address"),
+                            "account_id": row_account,
                             "market_id": raw_order.get("market_id"),
                             "condition_id": raw_order.get("condition_id", raw_order.get("market")),
                             "market_title": raw_order.get("market_title", raw_order.get("title")),
@@ -3010,6 +3014,22 @@ class PredictionExecutionService:
                             ),
                         }
                     )
+
+                # Order affiliation is display evidence, independent of the
+                # financial current_membership completeness gate. Read only
+                # the existing exact D2 request/receipt, never infer from size.
+                from .polymarket_lp_observed_pools import dashboard_affiliation
+                try:
+                    roles = self._store.lp_load_observed_pool_roles(self._lp_account_id())["roles"]
+                except ValueError:
+                    roles = {}
+                for order in orders:
+                    role = roles.get(order.get("condition_id"), {})
+                    request_id = role.get("request_id")
+                    actions = self._store.lp_actions("d2:" + request_id) if isinstance(request_id, str) and request_id else []
+                    order["pool_affiliation"] = dashboard_affiliation(
+                        order, role, actions, snapshot=snapshot,
+                        settings_account=self._lp_account_id())
 
                 positions: list[dict[str, object]] = []
                 for raw_position in snapshot["positions"]:
@@ -3506,6 +3526,11 @@ class PredictionExecutionService:
                         for row in (active_rows if active_rows else [session])
                     ],
                 }
+                # Preserve mode with the cached rows while the independent
+                # auto-state projection loads or is unavailable.
+                result["allocation_mode"] = (
+                    self._lp_d2.policy.allocation_mode if self._lp_d2 is not None else "minimum"
+                )
                 self._lp_dashboard_cache = result
                 trades_complete = snapshot.get("display_trades_complete") is True
                 self._lp_account_trades_cache = {

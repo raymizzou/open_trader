@@ -156,3 +156,49 @@ def measured_result(account_id, condition_id, orders, rate, *, reward_known,
                 scoring_checked_at=row.get('scoring_checked_at')))
     except (InvalidOperation, ValueError, TypeError):
         return {**unknown, 'reason': 'measured_terms_unknown'}
+
+
+def dashboard_affiliation(order, role, actions, *, snapshot, settings_account):
+    """Project an existing exact accepted BUY; grant no financial authority."""
+    import hashlib
+
+    def account_key(value):
+        return value.strip().casefold() if isinstance(value, str) else None
+
+    identity = {key: order.get(key) for key in
+        ('account_id', 'condition_id', 'token_id', 'order_id')}
+    identity['account_id'] = account_key(identity['account_id'])
+    def invalid(reason):
+        return dict(state='error', reason=reason, **identity)
+
+    account = account_key(snapshot.get('account_id') or snapshot.get('wallet_address'))
+    wallet = snapshot.get('wallet_address')
+    if (snapshot.get('authenticated') is not True or not isinstance(account, str) or not account
+            or any(not isinstance(value, str) or not value for value in identity.values())
+            or identity['account_id'] != account
+            or wallet and account_key(wallet) != account
+            or hashlib.sha256(account.encode()).hexdigest() != settings_account):
+        return invalid('account_identity_mismatch')
+    if order.get('side') != 'BUY':
+        return invalid('buy_identity_required')
+    if role.get('pool') not in ('trial', 'income') or role.get('episode') != identity['order_id']:
+        return invalid('exact_pool_role_missing')
+    request_id = role.get('request_id')
+    matches = [a for a in actions if a.get('request_id') == request_id and request_id]
+    if len(matches) != 1:
+        return invalid('accepted_buy_request_missing')
+    request = matches[0]
+    receipt = request.get('receipt') or {}
+    keys = ('condition_id', 'token_id')
+    if (request.get('d2_record') != 'request' or request.get('kind') != 'BUY'
+            or account_key(request.get('account_id')) != identity['account_id']
+            or account_key(receipt.get('account_id')) != identity['account_id']
+            or any(request.get(key) != identity[key] for key in keys)
+            or request.get('order_id') not in (None, identity['order_id'])
+            or receipt.get('outcome') != 'accepted'
+            or receipt.get('order_id') != identity['order_id']
+            or receipt.get('request_id') != request_id
+            or any(receipt.get(key) != request.get(key) for key in
+                (*keys, 'process_epoch', 'session_id'))):
+        return invalid('accepted_buy_identity_mismatch')
+    return dict(state='known', pool=role['pool'], **identity, request_id=request_id)

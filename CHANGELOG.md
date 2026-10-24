@@ -7,6 +7,11 @@
 - Add an opt-in two-host gate with distinct stable IDs, the same wallet, exact source/config/runtime identities and fresh compatible Mini service evidence. Readiness checks staged Tokyo identity; smoke checks both running identities. The default handoff still requires the old owner to stop. File authentication and SSM metadata checks retain their separate boundaries.
 - Synchronize the existing pool-exit regression with actual native cancel entry. Preserve physical drain, UNKNOWN fill and no-replay assertions. This change does not establish geographic eligibility, deploy a service or perform live trading.
 
+## 2026-10-24 — Exact LP order pool affiliation
+
+- Carry authenticated account identity and exact accepted trial/income order affiliation through the cached dashboard and HTTP response. Keep an existing income order in income when financial membership is UNKNOWN or its role is evicted. Match case variants of the same wallet at display boundaries while keeping every other identity exact.
+- Label accepted affiliation as “收益单” / “试挂单”; keep “转入中” for an exact promotion. Preserve the four order regions. Show specific identity errors and order details for missing or conflicting dual-pool affiliation, with existing exact cancellation controls. Remove the default trial classification and pending-affiliation copy. Keep legacy single-pool rendering and financial, UNKNOWN, no-replay and owner guards.
+
 ## 2026-10-24 — LP empty-order progress rendering
 
 - Fix a dashboard rendering error when an LP session has progress to show but no current orders. Preserve the wait and retry text without adding a pool label.
