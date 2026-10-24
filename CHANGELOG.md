@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-24 — LP read-only observation and rollback test fixtures
+
+- Wait for all due background reads before asserting that current pool membership reads leave state, requests and stored roles unchanged. Serialize an unset instance identity as an absent field in the retained rollback fixture. Test-only repair; production behavior and CI classification are unchanged.
+
 ## 2026-10-24 — Cloud and LP test compatibility
 
 - Align legacy cloud recovery fixtures and exact LP diagnostic/schema assertions with the additive instance fields. Model a distinct non-root service identity for root and non-root test runners while retaining file, process and recovery protections. Test-only repair; production behavior is unchanged.
