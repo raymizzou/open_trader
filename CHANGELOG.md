@@ -5,6 +5,14 @@
 - Keep the latest financial read timeout's original attempt, observation, deadline and actual sampling time in the existing read-only `async_reads` diagnostics. Capture the deepest bounded native await locations before cancellation, with explicit late, unknown, unavailable and truncation states. A narrow exact-native async-generator driver bridge makes HTTPX context-manager waits visible without reading locals or payloads.
 - Keep five-second UNKNOWN publication, actual response-close ownership, cleanup-fault recovery, provider cooldown, financial admission and no-replay protections. Sampling adds no callback lock wait or external I/O; diagnostic failure still runs original cancellation. Retain the 16 KiB snapshot and 256 KiB combined diagnostic limits. This observation does not prove the network root cause; production deployment and recurrence validation remain separate.
 
+## 2026-10-24 — LP read-only observation and rollback test fixtures
+
+- Wait for all due background reads before asserting that current pool membership reads leave state, requests and stored roles unchanged. Serialize an unset instance identity as an absent field in the retained rollback fixture. Test-only repair; production behavior and CI classification are unchanged.
+
+## 2026-10-24 — Cloud and LP test compatibility
+
+- Align legacy cloud recovery fixtures and exact LP diagnostic/schema assertions with the additive instance fields. Model a distinct non-root service identity for root and non-root test runners while retaining file, process and recovery protections. Test-only repair; production behavior is unchanged.
+
 ## 2026-10-24 — LP runtime payload assertion coverage
 
 - Check the complete additive order affiliation error when authenticated account identity is missing. Preserve all existing order and position field assertions; production behavior is unchanged.

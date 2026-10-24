@@ -78,7 +78,11 @@ def stopped_cloud(tmp_path, monkeypatch, request):
     cfg = cloud.CloudConfig(release,runtime,venv/'bin/python',service_name,sha,
                             '','','','','shadow',1,credential_backend='file',
                             credentials_file=str(tmp_path/'credentials/polymarket.json'),memory_max_bytes=738197504)
-    config = tmp_path/'cloud.json'; config.write_text(json.dumps({**cfg.__dict__,
+    wire_config = dict(cfg.__dict__)
+    if wire_config['lp_instance_id'] is None:
+        # Legacy profiles omit an unconfigured ID; explicit null is invalid.
+        wire_config.pop('lp_instance_id')
+    config = tmp_path/'cloud.json'; config.write_text(json.dumps({**wire_config,
         'release_root':str(release),'runtime_root':str(runtime),'python':str(cfg.python)}));config.chmod(0o600)
     unit = tmp_path/'prediction.service';unit.write_text(cloud.render_unit(cfg));unit.chmod(0o644)
     cloud.record(cfg,'stopped')

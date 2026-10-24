@@ -1076,7 +1076,9 @@ def _assert_systemd_forwarder(child,c,starts,manager_process,monkeypatch):
         child.release_root/'scripts/deploy_release.py')
     wrapper=importlib.util.module_from_spec(spec);spec.loader.exec_module(wrapper)
     config=child.root/'cloud-private.json'
-    config.write_text(json.dumps({k:str(v) if isinstance(v,Path) else v for k,v in c.__dict__.items()}))
+    # Legacy unconfigured instance identity is absent on the wire, never null.
+    config.write_text(json.dumps({k:str(v) if isinstance(v,Path) else v for k,v in c.__dict__.items()
+        if k!='lp_instance_id' or v is not None}))
     config.chmod(0o600)
     fake=child.root/'root-external-github';fake.mkdir()
     gh_called=child.marker('unexpected-systemd-forward-CI-request')
