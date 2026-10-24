@@ -166,11 +166,11 @@ def render_unit(c: CloudConfig) -> str:
         credential_env = 'Environment=OPEN_TRADER_CREDENTIAL_BACKEND=disabled\n'
     elif backend == 'file':
         path = Path(c.credentials_file)
-        if (c.mode != 'shadow' or c.n_leg_paused != 1 or any((c.region, c.secret, c.version, c.role))
+        if (c.n_leg_paused != 1 or any((c.region, c.secret, c.version, c.role))
             or not path.is_absolute() or '..' in path.parts
             or not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(path))
             or path.is_relative_to(c.release_root)):
-            raise ValueError('file backend requires a separate paused Shadow credential path')
+            raise ValueError('file backend requires requested N-leg pause and a separate credential path')
         credential_env = ('Environment=OPEN_TRADER_CREDENTIAL_BACKEND=file\n'
                           f'Environment=OPEN_TRADER_CREDENTIAL_FILE={path}\n')
     else:

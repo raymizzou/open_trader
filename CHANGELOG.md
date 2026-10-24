@@ -4,6 +4,11 @@
 
 - Fix a dashboard rendering error when an LP session has progress to show but no current orders. Preserve the wait and retry text without adding a pool label.
 
+## 2026-10-24 — Explicit production-file credential profile
+
+- Accept explicit production file profiles with requested `n_leg_paused: 1`, a separate absolute credential path outside the release, and no SSM references. Preserve private service-owned credential checks, disabled Shadow-only profiles and all SSM constraints; generated units pin production mode and backend/path without secret values.
+- Keep service-user read-auth and the production trading-region preflight gate. Profile support does not establish Tokyo live readiness: same-wallet per-instance order ownership, parallel-owner cloud gate and geographic disposition remain pending. No deployment, service start or live order was performed.
+
 ## 2026-10-24 — Current LP trial admission and four order regions
 
 - Admit income entrants only from exact current managed trials. Keep bounded owner-local transfer provenance, refill trial after actual source release, and retire departed income membership without reviving historical orders. Original sample freshness, financial, UNKNOWN and no-replay guards remain.
