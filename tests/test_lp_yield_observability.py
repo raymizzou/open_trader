@@ -602,7 +602,19 @@ def test_yield_payload_budget_at_full_caps(current):
         selected=targets,victims=targets,new_targets=targets,source_errors=errors,
         reader=dict(inflight_count=2,jobs=[dict(key=['A'*128,'m'*128],scope=dict(account='A'*128,component='m'*128,
             condition_id='c'*128,token_id='t'*128),age_seconds=25)]*2)))
+    # Saturate the new financial wait snapshot as well as existing yield data.
+    # These literal caps cover three pending sources and sixteen retained
+    # deepest frames each, including explicit truncation and late capture.
+    financial_timeout=dict(attempt=2**63-1,observation_id='o'*96,observation_id_truncated=True,
+        started_monotonic=1234567890.123456,deadline_monotonic=1234567895.123456,
+        timeout_monotonic=1234567895.123456,captured_monotonic=1234567897.123456,
+        late=True,capture_state='captured',sources=[dict(source=source,state='pending',walked=64,
+            end='unknown',truncated=True,frames=[dict(file='m'*64,function='f'*64,
+                line=999999999,text_truncated=True) for _ in range(16)])
+            for source in ('balance','open_orders','positions')])
+    assert len(json.dumps(financial_timeout).encode('utf-8'))<=16*1024
     addition=dict(yield_observation=observation,
+        async_reads=dict(last_financial_timeout=financial_timeout),
         yield_rounds=dict(instance_id='i'*128,round_limit=YIELD_ROUND_LIMIT,row_limit=YIELD_ROW_LIMIT,
             recent=[deepcopy(observation) for _ in range(YIELD_ROUND_LIMIT)]),
         unknown_buy_yields=dict(total=20,omitted=0,recent=[dict(deepcopy(detail),
