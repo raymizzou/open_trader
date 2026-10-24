@@ -1110,7 +1110,8 @@ def test_parallel_instance_gate_rejects_missing_mismatched_or_legacy_peer(parall
     fixture['child'].assert_owned()
 
 
-def test_parallel_instance_identity_is_bound_to_installed_and_live_config(parallel_gate,tmp_path,monkeypatch,capsys):
+@pytest.mark.parametrize('runner_uid', [0, 1001], ids=['root-runner', 'nonroot-runner'])
+def test_parallel_instance_identity_is_bound_to_installed_and_live_config(parallel_gate,tmp_path,monkeypatch,capsys,runner_uid):
     import hashlib,http.client,os,pwd,grp,subprocess,sys
     from datetime import UTC,datetime
     from types import SimpleNamespace
@@ -1122,24 +1123,69 @@ def test_parallel_instance_identity_is_bound_to_installed_and_live_config(parall
     from tests.test_lp_order_registration_contract import WALLET
     fixture=parallel_gate
     cfg=load_config(fixture['cloud_path'])
-    user=pwd.getpwuid(os.getuid());native_user=pwd.getpwnam;native_group=grp.getgrnam
-    monkeypatch.setattr(pwd,'getpwnam',lambda name:user if name=='prediction' else native_user(name))
-    monkeypatch.setattr(grp,'getgrnam',lambda name:SimpleNamespace(gr_gid=user.pw_gid) if name=='prediction' else native_group(name))
-    staged=cloud.staged_instance_identity(cfg)
-    assert staged['stage']=='staged' and staged['instance_id']=='tokyo'
-    assert staged['source_sha']==fixture['child'].sha
-    assert 'enabled' not in staged and 'process_epoch' not in staged
-    assert 'Environment=OPEN_TRADER_LP_INSTANCE_ID=tokyo\n' in render_unit(cfg)
-    selected=Path(staged['config_path']);original=selected.read_bytes()
-    store=PredictionArbitrageStore(cfg.runtime_root/'data');store.lp_bind_instance(WALLET,'polymarket','tokyo')
-    for changes in ({'lp_instance_id':None},{'lp_instance_id':'mini'},{'wallet_address':'0x'+'b'*40}):
-        value=json.loads(original)
-        if changes.get('lp_instance_id','present') is None:value.pop('lp_instance_id')
-        else:value.update(changes)
-        selected.write_text(json.dumps(value))
-        with pytest.raises(ValueError):cloud.staged_instance_identity(cfg)
-    selected.write_bytes(original)
-    assert cloud.staged_instance_identity(cfg)==staged
+    selected=cfg.runtime_root/'config/prediction_arbitrage.json'
+    original=selected.read_bytes()
+    native_stat,native_lstat,native_fstat=Path.stat,Path.lstat,os.fstat
+    native_user,native_group=pwd.getpwnam,grp.getgrnam
+    retained=native_lstat(selected)
+    selected_inode=(retained.st_dev,retained.st_ino)
+    user=SimpleNamespace(pw_uid=42421,pw_gid=42421)
+    assert user.pw_uid not in (0,runner_uid,os.getuid())
+    # Model only the external account view of this exact selected inode.
+    # Content, modes, links, timestamps and path/descriptor identity stay real.
+    def service_owner(info):
+        if (info.st_dev,info.st_ino)!=selected_inode:return info
+        fields={key:getattr(info,key) for key in dir(info) if key.startswith('st_')}
+        return SimpleNamespace(**{**fields,'st_uid':user.pw_uid,'st_gid':user.pw_gid})
+    def selected_owner(path,info):
+        return service_owner(info) if path==selected else info
+    with monkeypatch.context() as identity:
+        identity.setattr(os,'getuid',lambda:runner_uid)
+        identity.setattr(os,'geteuid',lambda:runner_uid)
+        identity.setattr(os,'getgid',lambda:runner_uid)
+        identity.setattr(os,'getegid',lambda:runner_uid)
+        identity.setattr(pwd,'getpwnam',lambda name:user if name=='prediction' else native_user(name))
+        identity.setattr(grp,'getgrnam',lambda name:SimpleNamespace(gr_gid=user.pw_gid) if name=='prediction' else native_group(name))
+        identity.setattr(Path,'stat',lambda path,*a,**kw:selected_owner(path,native_stat(path,*a,**kw)))
+        identity.setattr(Path,'lstat',lambda path,*a,**kw:selected_owner(path,native_lstat(path,*a,**kw)))
+        identity.setattr(os,'fstat',lambda fd:service_owner(native_fstat(fd)))
+        # A root service must remain forbidden even when the runner is root.
+        with monkeypatch.context() as root_service:
+            root_service.setattr(pwd,'getpwnam',lambda name:SimpleNamespace(pw_uid=0,pw_gid=user.pw_gid)
+                if name=='prediction' else native_user(name))
+            with pytest.raises(ValueError,match='dedicated non-root user'):
+                cloud.staged_instance_identity(cfg)
+        staged=cloud.staged_instance_identity(cfg)
+        assert staged['stage']=='staged' and staged['instance_id']=='tokyo'
+        assert staged['source_sha']==fixture['child'].sha
+        assert 'enabled' not in staged and 'process_epoch' not in staged
+        assert 'Environment=OPEN_TRADER_LP_INSTANCE_ID=tokyo\n' in render_unit(cfg)
+        assert staged['config_sha256']==hashlib.sha256(original).hexdigest()
+        assert Path(staged['config_path'])==selected
+        selected.chmod(0o644)
+        try:
+            with pytest.raises(ValueError,match='LP selected config metadata invalid'):
+                cloud.staged_instance_identity(cfg)
+        finally:selected.chmod(0o600)
+        # A replacement inode does not inherit the modeled service ownership.
+        held=selected.with_suffix('.retained');replacement=selected.with_suffix('.replacement')
+        replacement.write_bytes(original);replacement.chmod(0o600)
+        selected.rename(held);replacement.replace(selected)
+        try:
+            assert (selected.lstat().st_dev,selected.lstat().st_ino)!=selected_inode
+            with pytest.raises(ValueError,match='LP selected config metadata invalid'):
+                cloud.staged_instance_identity(cfg)
+        finally:
+            selected.unlink();held.replace(selected)
+        store=PredictionArbitrageStore(cfg.runtime_root/'data');store.lp_bind_instance(WALLET,'polymarket','tokyo')
+        for changes in ({'lp_instance_id':None},{'lp_instance_id':'mini'},{'wallet_address':'0x'+'b'*40}):
+            value=json.loads(original)
+            if changes.get('lp_instance_id','present') is None:value.pop('lp_instance_id')
+            else:value.update(changes)
+            selected.write_text(json.dumps(value))
+            with pytest.raises(ValueError):cloud.staged_instance_identity(cfg)
+        selected.write_bytes(original)
+        assert cloud.staged_instance_identity(cfg)==staged
     # Two actual offline processes now exist. Only smoke requires Tokyo running.
     with ServiceChild(tmp_path/'actual-tokyo',scenario='consumer-instance-health') as tokyo:
         tokyo.config_path=tokyo.runtime_root/'config/prediction_arbitrage.json'

@@ -453,7 +453,10 @@ def test_default_settings_keep_diagnostics_and_estimator_payload(tmp_path,monkey
         state=execution.lp_auto_state()
         assert not set(state)&{'allocation_mode','allocation_weights','allocation_shadow_enabled'}
         assert set(state['diagnostics'])=={'version','reader_coverage','latest_attempt','accepted_observation',
-            'admission','local_outcomes','round_start','yield_observation','yield_rounds','protection','cancel_blocks','rotation','unknown_buy_yields'}
+            'admission','local_outcomes','round_start','yield_observation','yield_rounds','protection','cancel_blocks','rotation','unknown_buy_yields','instance_ownership'}
+        assert state['diagnostics']['instance_ownership']==dict(instance_id=None,managed_order_ids=[],
+            unattributed_buy_ids=[],ownership_allows_new_risk=True,
+            financial_admission='requires_current_wallet_checks',alert_code=None)
         assert 'allocation_shadow' not in json.dumps(state)
     finally:
         assert live.close(timeout=3)
