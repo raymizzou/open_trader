@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-24 — Cloud and LP test compatibility
+
+- Align legacy cloud recovery fixtures and exact LP diagnostic/schema assertions with the additive instance fields. Model a distinct non-root service identity for root and non-root test runners while retaining file, process and recovery protections. Test-only repair; production behavior is unchanged.
+
 ## 2026-10-24 — LP runtime payload assertion coverage
 
 - Check the complete additive order affiliation error when authenticated account identity is missing. Preserve all existing order and position field assertions; production behavior is unchanged.
