@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-24 — Bounded LP financial timeout wait diagnostics
+
+- Keep the latest financial read timeout's original attempt, observation, deadline and actual sampling time in the existing read-only `async_reads` diagnostics. Capture the deepest bounded native await locations before cancellation, with explicit late, unknown, unavailable and truncation states. A narrow exact-native async-generator driver bridge makes HTTPX context-manager waits visible without reading locals or payloads.
+- Keep five-second UNKNOWN publication, actual response-close ownership, cleanup-fault recovery, provider cooldown, financial admission and no-replay protections. Sampling adds no callback lock wait or external I/O; diagnostic failure still runs original cancellation. Retain the 16 KiB snapshot and 256 KiB combined diagnostic limits. This observation does not prove the network root cause; production deployment and recurrence validation remain separate.
+
 ## 2026-10-24 — LP runtime payload assertion coverage
 
 - Check the complete additive order affiliation error when authenticated account identity is missing. Preserve all existing order and position field assertions; production behavior is unchanged.
