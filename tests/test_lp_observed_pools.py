@@ -1995,6 +1995,7 @@ def test_async_read_protection_precedes_pool_rebuild(tmp_path,monkeypatch,pool_a
 
 @pytest.mark.parametrize('manual_market',['A','C','D'])
 def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monkeypatch,manual_market,pool_async_watchdog):
+    import time
     rig=AsyncPoolRig(tmp_path,monkeypatch)
     try:
         for name in 'ABCD':rig.market(name)
@@ -2039,7 +2040,14 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
             rig.cancel_removes=True
             rig.finish_income_rebuild(rig.cid('D'),'tD',after=rig.utc())
             assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts if p['token_id']=='tD']==[('tD',Decimal('30'))]
-            rig.cycle(pool='income',qualified=True)  # publish completed partial group's current account
+            # A cycle can finish only one part of this asynchronous rebuild.
+            # Wait for the three real slots, not for the expected money values.
+            end=time.monotonic()+4
+            while True:
+                rebuilt=rig.cycle(pool='income',qualified=True)
+                rig.finish_cancels(rebuilt)
+                if len(rig.sdk.orders)==3 and rig.live.status()['native_inflight']==0:break
+                assert time.monotonic()<end,'income group completion watchdog'
             assert {(row['asset_id'],row['price']*(row['original_size']-row['size_matched']))
                 for row in rig.sdk.orders}=={('tB',Decimal('50')),('tD',Decimal('30')),('tA',Decimal('20'))}
             assert len(rig.sdk.orders)==3
