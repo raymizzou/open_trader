@@ -3589,36 +3589,99 @@ function lpDashboardTodayTerminal(row) {
     || String(row.state || "").toLowerCase() === "filled";
 }
 
-function lpDashboardCurrentRole(row, membership) {
-  if (membership?.state !== "known") return "unclassified";
-  const same = (entry) => ["account_id", "condition_id", "token_id", "order_id"]
-    .every((key) => row[key] && String(entry[key] || "") === String(row[key]));
-  const matches = (Array.isArray(membership.orders) ? membership.orders : []).filter(same);
-  return matches.length === 1 ? matches[0].pool : "unclassified";
+function lpDashboardAccountKey(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
 
-function lpDashboardTodaySections(rows, membership) {
+function lpDashboardSameOrder(left, right) {
+  return Boolean(lpDashboardAccountKey(left.account_id))
+    && lpDashboardAccountKey(left.account_id) === lpDashboardAccountKey(right.account_id)
+    && ["condition_id", "token_id", "order_id"].every((key) => left[key] && left[key] === right[key]);
+}
+
+function lpDashboardPoolIdentityError(row, membership) {
+  const affiliation = row.pool_affiliation;
+  if (!affiliation) return "缺少订单归属字段";
+  if (affiliation.state === "error") return {
+    account_identity_mismatch: "账户身份不一致",
+    exact_pool_role_missing: "缺少本订单的精确池角色",
+    accepted_buy_request_missing: "缺少对应的已接受 BUY 请求",
+    accepted_buy_identity_mismatch: "已接受 BUY 回执与订单身份不一致",
+  }[affiliation.reason] || "订单归属证据无效";
+  if (affiliation.state !== "known" || !["trial", "income"].includes(affiliation.pool)) return "缺少明确的试挂／收益归属";
+  if (typeof affiliation.request_id !== "string" || !affiliation.request_id.trim()) return "缺少已接受请求编号";
+  const labels = {account_id: "归属账户与订单账户不一致", condition_id: "归属市场与订单市场不一致",
+    token_id: "归属 Token 与订单 Token 不一致", order_id: "归属订单编号与本订单不一致"};
+  for (const key of Object.keys(labels)) {
+    const matches = key === "account_id"
+      ? lpDashboardAccountKey(row[key]) && lpDashboardAccountKey(affiliation[key]) === lpDashboardAccountKey(row[key])
+      : row[key] && affiliation[key] === row[key];
+    if (!matches) return labels[key];
+  }
+  const matches = membership?.state === "known"
+    ? (Array.isArray(membership.orders) ? membership.orders : []).filter((entry) =>
+      lpDashboardSameOrder(entry, row)) : [];
+  if (matches.length > 1) return "当前成员记录重复或冲突";
+  if (matches.length === 1 && ["trial", "income"].includes(matches[0].pool)
+      && matches[0].pool !== affiliation.pool) return "订单归属与当前精确角色冲突";
+  return "";
+}
+
+function lpDashboardCurrentRole(row, membership) {
+  if (lpDashboardPoolIdentityError(row, membership)) return "unclassified";
+  // Financial UNKNOWN cannot change an accepted order's pool. A fresh,
+  // exact promotion may still move its source trial into the income view.
+  const promotion = membership?.state === "known" && (membership.orders || []).some((entry) =>
+    entry.pool === "promotion" && lpDashboardSameOrder(entry, row));
+  return promotion ? "promotion" : row.pool_affiliation.pool;
+}
+
+function lpDashboardTodaySections(rows, membership, dualPools = Boolean(membership)) {
   const sections = [
     {key: "trial", title: "试挂区", orders: []},
     {key: "income", title: "收益区", orders: []},
     {key: "sell", title: "卖单区", orders: []},
     {key: "finished", title: "已结束", orders: []},
   ];
-  const seen = new Set();
-  rows.forEach((row) => {
-    const identity = [row.account_id, row.condition_id, row.token_id, row.order_id];
-    if (identity.every(Boolean)) {
-      const key = JSON.stringify(identity);
-      if (seen.has(key)) return;
-      seen.add(key);
-    }
+  sections.errors = [];
+  const identities = new Map();
+  rows.forEach((row, index) => {
+    const identity = [lpDashboardAccountKey(row.account_id), row.condition_id, row.token_id, row.order_id];
+    const key = identity.every(Boolean) ? JSON.stringify(identity) : `incomplete-${index}`;
+    if (!identities.has(key)) identities.set(key, []);
+    identities.get(key).push(row);
+  });
+  identities.forEach((copies) => {
+    const row = copies[0];
     const role = lpDashboardCurrentRole(row, membership);
-    const region = lpDashboardTodayTerminal(row) ? "finished"
-      : String(row.side || "").toUpperCase() === "SELL" ? "sell"
+    const conflicting = new Set(copies.map((item) => JSON.stringify([
+      item.side, item.status, item.state, item.pool_affiliation ? {
+        ...item.pool_affiliation, account_id: lpDashboardAccountKey(item.pool_affiliation.account_id),
+      } : item.pool_affiliation]))).size > 1;
+    const terminal = lpDashboardTodayTerminal(row);
+    const sell = String(row.side || "").toUpperCase() === "SELL";
+    if (dualPools && (conflicting || (!terminal && !sell &&
+        (String(row.side || "").toUpperCase() !== "BUY" || role === "unclassified")))) {
+      copies.forEach((item) => sections.errors.push({row: item,
+        reason: conflicting ? "同一订单的响应记录互相冲突"
+          : String(item.side || "").toUpperCase() !== "BUY" ? "订单方向缺失或无效"
+          : lpDashboardPoolIdentityError(item, membership)}));
+      return;
+    }
+    const region = terminal ? "finished" : sell ? "sell"
       : ["income", "promotion"].includes(role) ? "income" : "trial";
     sections.find((section) => section.key === region).orders.push({...row, lp_current_role: role});
   });
   return sections;
+}
+
+function lpDashboardPoolErrors(errors) {
+  if (!errors.length) return "";
+  return `<div class="pm-alert danger" role="alert"><strong>订单归属数据错误</strong>`
+    + errors.map(({row, reason}) => `<p data-lp-pool-error-order="${escapeHtml(String(row.order_id || ""))}">`
+      + escapeHtml(`${reason}；订单 ${row.order_id || "缺失"}；账户 ${row.account_id || "缺失"}；市场 ${row.condition_id || "缺失"}；Token ${row.token_id || "缺失"}；${row.side || "方向缺失"}；价格 ${row.price ?? "缺失"}；原数量 ${row.quantity ?? "缺失"}；已成交 ${row.filled_quantity ?? "缺失"}；剩余 ${row.remaining_quantity ?? "缺失"}`)
+      + (lpDashboardTodayHasActiveOrder(row) && row.order_id ? lpDashboardCancelButton("one", {orderId: row.order_id}) : "")
+      + "</p>").join("") + "</div>";
 }
 
 function lpDashboardTodayGroups(rows) {
@@ -4156,7 +4219,7 @@ function lpNeedsAttentionCopy(session) {
 
 function lpDashboardPoolLabel(row) {
   if (String(row?.side || "").toUpperCase() !== "BUY" || lpDashboardTodayTerminal(row)) return "";
-  return {trial: "当前试挂", income: "当前收益", promotion: "转入中", unclassified: "归属待核对"}[row.lp_current_role] || "";
+  return {trial: "试挂单", income: "收益单", promotion: "转入中"}[row.lp_current_role] || "";
 }
 
 function lpDashboardTodayQuantityCell(orders, session, allowAugment = true, marketOrders = orders, showMarketCancel = true) {
@@ -4878,7 +4941,10 @@ function predictionLpCard(payload) {
       + " · 每 5 秒刷新</span>";
   const autoState = predictionSplit() ? predictionLpAutoState() : dashboard.auto;
   const membership = autoState?.observed_pools?.current_membership;
-  const todaySections = lpDashboardTodaySections(lpOrdersToday, membership);
+  const dualPools = dashboard.allocation_mode === "observed_pools"
+    || autoState?.allocation_mode === "observed_pools" || Boolean(autoState?.observed_pools);
+  const todaySections = lpDashboardTodaySections(lpOrdersToday, membership, dualPools);
+  const poolErrorsMarkup = lpDashboardPoolErrors(todaySections.errors);
   const regionCount = new Map();
   todaySections.forEach((section) => new Set(section.orders.map((row) => row.condition_id)).forEach((cid) => {
     if (cid) regionCount.set(cid, (regionCount.get(cid) || 0) + 1);
@@ -4904,7 +4970,7 @@ function predictionLpCard(payload) {
     }).join("");
     return `<tbody data-lp-section="${section.key}"><tr class="lp-pool-heading"><th scope="rowgroup" colspan="7">${section.title} <span class="sub">${section.orders.length} 笔</span></th></tr>`
       + (pendingNote ? `<tr><td colspan="7">${pendingNote}</td></tr>` : "")
-      + (rows || `<tr><td colspan="7" class="pm-observation-empty">本区暂无委托${!lpOrdersToday.length && section.key === "trial" ? " · 当天暂无 LP 委托。从上方待试挂候选点「挂单」登记第一笔，提交即受位置保护。" : ""}</td></tr>`)
+      + (rows || `<tr><td colspan="7" class="pm-observation-empty">${todaySections.errors.length ? "订单分区不完整，请查看具体数据错误" : "本区暂无委托"}${!lpOrdersToday.length && section.key === "trial" ? " · 当天暂无 LP 委托。从上方待试挂候选点「挂单」登记第一笔，提交即受位置保护。" : ""}</td></tr>`)
       + "</tbody>";
   }).join("");
   const nonLpRowCount = Number(dashboard.non_lp_row_count);
@@ -5046,8 +5112,9 @@ function predictionLpCard(payload) {
     + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起 · 试挂 / 收益 / 卖单 / 已结束 · 区内按当前小时奖励率降序 · 区内一标的一行</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
     + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">LP 收益率(推荐 → 实际)</th><th scope=\"col\">今日奖励(累计 · $/小时)</th><th scope=\"col\">份额占比</th><th scope=\"col\">实际占用资金</th><th scope=\"col\">压力损失(警戒线 10%)</th><th scope=\"col\">委托与成交量</th></tr></thead>"
     + todayRowsHtml + "</table></div>"
+    + poolErrorsMarkup
     + nonLpFootnote
-    + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；分区依据当前精确订单归属；归属待核对的 BUY 保守展示于试挂区。市场奖励与占资为共享口径，跨区不重复相加。份额预警已全量开启（奖励份额连续 >8% 一分钟语音告警，夜间静音）；撤单即时生效;已成交部分不可撤。</p></section>"
+    + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；分区依据当前精确订单归属。市场奖励与占资为共享口径，跨区不重复相加。份额预警已全量开启（奖励份额连续 >8% 一分钟语音告警，夜间静音）；撤单即时生效;已成交部分不可撤。</p></section>"
     + funnelMarkup
     + dataNoticeMarkup
     + lpTrialSelectedResultDiagnostics(selectedResults, recommendations)

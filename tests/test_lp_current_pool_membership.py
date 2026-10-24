@@ -182,3 +182,50 @@ def test_trial_refills_after_source_release_before_income_post(tmp_path,monkeypa
         assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts if p['token_id']=='tA']==[('tA',Decimal('50'))]
     finally:
         gate.set();rig.close()
+
+
+def test_dashboard_affiliation_reads_do_not_grant_trading_authority(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tests.test_prediction_service import _lp436_accepted_rig
+    rig, income_id, trial_id = _lp436_accepted_rig(tmp_path, monkeypatch)
+    try:
+        assert rig.store.lp_advance_trade_generation(rig.store.lp_trade_generation())
+        rig.execution.refresh_lp_dashboard_snapshot()
+        assert {r['order_id'] for r in rig.execution.lp_dashboard()['lp_orders_today']} == {income_id, trial_id}
+        rig.sdk.get_balance_allowance = lambda **kw: SimpleNamespace(balance=None, allowances={})
+        rig.tick(11)
+        rig.converge_current(lambda: rig.execution.lp_auto_state()['observed_pools']['current_membership']['state'] == 'unknown')
+        assert rig.store.lp_advance_trade_generation(rig.store.lp_trade_generation())
+        rig.execution.refresh_lp_dashboard_snapshot()
+        # Observe completed background display jobs before testing cached reads.
+        for name in ('_lp_reward_refresh_thread', '_lp_orders_today_refresh_thread'):
+            thread = getattr(rig.execution, name, None)
+            if thread is not None:
+                thread.join(timeout=3)
+                assert not thread.is_alive(), name
+        rig.pump(lambda: rig.live.read_runtime.status()['ready_count'] == 0
+            and not any(s['active'] for s in rig.live.read_runtime.status()['scopes'])
+            and rig.live.read_runtime.status()['observed_monotonic'] >= rig.seconds)
+        before = rig.live.state.snapshot()
+        assert before.new_capacity.state == 'unknown'
+        roles_before = rig.store.lp_load_observed_pool_roles(rig.account)
+        requests_before = tuple(rig.requests)
+        posts_before, cancels_before = list(rig.sdk.posts), list(rig.sdk.cancels)
+        generation_before = rig.store.lp_trade_generation()
+        audits_before = {role['request_id']: rig.store.lp_actions('d2:'+role['request_id'])
+            for role in roles_before['roles'].values()}
+        for _ in range(3):
+            dashboard = rig.execution.lp_dashboard()
+            auto = rig.execution.lp_auto_state()
+            assert auto['observed_pools']['current_membership']['state'] == 'unknown'
+            rows = {r['order_id']: r for r in dashboard['lp_orders_today']}
+            assert rows[income_id]['pool_affiliation']['pool'] == 'income'
+            assert rows[trial_id]['pool_affiliation']['pool'] == 'trial'
+        assert rig.live.state.snapshot() == before
+        assert rig.store.lp_load_observed_pool_roles(rig.account) == roles_before
+        assert tuple(rig.requests) == requests_before
+        assert rig.sdk.posts == posts_before and rig.sdk.cancels == cancels_before
+        assert rig.store.lp_trade_generation() == generation_before
+        assert {rid: rig.store.lp_actions('d2:'+rid) for rid in audits_before} == audits_before
+    finally:
+        rig.close()

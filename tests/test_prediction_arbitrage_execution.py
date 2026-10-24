@@ -9542,3 +9542,151 @@ def test_cloud_display_cache_publishes_failures_expiration_and_bounded_trades(tm
     assert service.lp_account_trades_page(offset=0,limit=1)['state'] == 'unknown'
     for limit in (0,101):
         with pytest.raises(ValueError): service.lp_account_trades_page(offset=0,limit=limit)
+
+
+def _lp436_service(tmp_path, monkeypatch):
+    # Real account adapter with synthetic external SDK/HTTP facts.
+    from tests.test_lp_observed_pools import _measured_service
+    return _measured_service(tmp_path, monkeypatch)
+
+
+def test_lp_dashboard_preserves_authenticated_snapshot_account_identity(tmp_path, monkeypatch):
+    service, external = _lp436_service(tmp_path, monkeypatch)
+    try:
+        snapshot = service._trading.lp_account_snapshot()
+        assert snapshot['account_id'] == 'wallet'
+        assert 'account' not in snapshot  # actual adapter response shape
+        service.refresh_lp_dashboard_snapshot()
+        row = service.lp_dashboard()['lp_orders_today'][0]
+        assert (row['account_id'], row['condition_id'], row['token_id'], row['order_id']) == (
+            'wallet', 'condition-1', 'yes-token', 'trial-D')
+    finally:
+        service._trading.close()
+
+    # Configuration alone cannot identify an authenticated response's rows.
+    trading = _CancelTrading([_cancel_open_order('without-account')])
+    trading.config = SimpleNamespace(wallet_address='configured-only')
+    service = PredictionExecutionService(store=PredictionArbitrageStore(tmp_path/'missing'),
+        monitor=object(), trading=trading, notifier=ChannelNotifier('feishu'),
+        lock_path=tmp_path/'missing.lock')
+    service.refresh_lp_dashboard_snapshot()
+    assert service.lp_dashboard()['lp_orders_today'][0]['account_id'] is None
+
+
+def _lp436_seed_affiliation(service, *, pool='income', evicted=False, changes=None,
+                           receipt_outcome='accepted', role_changes=None):
+    from open_trader.lp_business_writer import RequestRecord, ReceiptRecord
+    values = dict(account_id='wallet', process_epoch='offline-epoch', request_id='request-D',
+        session_id='d2:request-D', condition_id='condition-1', token_id='yes-token', kind='BUY',
+        price=Decimal('.5'), quantity=Decimal('20'), requested_at=datetime.now(UTC))
+    values.update(changes or {})
+    request = RequestRecord(**values)
+    assert service._store.lp_log_business_record(request)
+    receipt = ReceiptRecord(request.account_id, request.process_epoch, request.request_id,
+        request.session_id, request.condition_id, request.token_id, 'trial-D', receipt_outcome,
+        datetime.now(UTC))
+    assert service._store.lp_log_business_record(receipt)
+    service._store.lp_save_current_settings(service._lp_account_id(), expected_config_version=0,
+        changes=dict(trial_budget_usd='10', income_budget_usd='100'))
+    saved = service._store.lp_load_observed_pool_roles(service._lp_account_id())
+    role = dict(pool=pool, episode='trial-D', request_id='request-D', evicted=evicted)
+    role.update(role_changes or {})
+    service._store.lp_save_observed_pool_roles(service._lp_account_id(),
+        expected_revision=saved['revision'], roles={'condition-1': role})
+
+
+def test_lp_dashboard_affiliation_matches_exact_accepted_order(tmp_path, monkeypatch):
+    for pool, evicted in [('trial', False), ('income', False), ('income', True)]:
+        service, external = _lp436_service(tmp_path/(pool+str(evicted)), monkeypatch)
+        try:
+            _lp436_seed_affiliation(service, pool=pool, evicted=evicted)
+            service.refresh_lp_dashboard_snapshot()
+            rows = service.lp_dashboard()['lp_orders_today']
+            assert len(rows) == 1
+            assert rows[0]['pool_affiliation'] == dict(state='known', pool=pool,
+                account_id='wallet', condition_id='condition-1', token_id='yes-token',
+                order_id='trial-D', request_id='request-D')
+        finally:
+            service._trading.close()
+
+
+@pytest.mark.parametrize('variant', ['account', 'condition', 'token', 'order', 'request',
+    'rejected', 'unknown', 'no_role', 'configured_only', 'conflicting_account'])
+def test_lp_dashboard_affiliation_rejects_conflicting_identity(tmp_path, monkeypatch, variant):
+    service, external = _lp436_service(tmp_path, monkeypatch)
+    try:
+        if variant != 'no_role':
+            changes = {'account': dict(account_id='other-account'),
+                'condition': dict(condition_id='other-condition'), 'token': dict(token_id='other-token'),
+                'request': dict(request_id='other-request', session_id='d2:other-request')}.get(variant)
+            _lp436_seed_affiliation(service, changes=changes,
+                role_changes=dict(episode='other-order') if variant == 'order' else None,
+                receipt_outcome=variant if variant in ('rejected', 'unknown') else 'accepted')
+        if variant in ('configured_only', 'conflicting_account'):
+            class SnapshotTrading(_CancelTrading):
+                def lp_account_snapshot(self):
+                    value = super().lp_account_snapshot()
+                    if variant == 'conflicting_account':
+                        value.update(account_id='wallet', wallet_address='other-wallet')
+                        value['open_orders'][0]['account_id'] = 'other-wallet'
+                    return value
+            trading = SnapshotTrading([dict(order_id='trial-D', condition_id='condition-1',
+                token_id='yes-token', side='BUY', status='LIVE', price='.5',
+                original_size='10000', remaining_size='10000', size_matched='0')])
+            trading.config = service._trading.config
+            service._trading.close()
+            from tests.test_prediction_service import _LPDashboardFakeLP
+            service = PredictionExecutionService(store=service._store, monitor=object(),
+                trading=trading, notifier=ChannelNotifier('feishu'), lock_path=tmp_path/'snapshot.lock',
+                lp=_LPDashboardFakeLP())
+        service.refresh_lp_dashboard_snapshot()
+        rows = service.lp_dashboard()['lp_orders_today']
+        assert len(rows) == 1  # no history-created row or silent loss
+        affiliation = rows[0]['pool_affiliation']
+        assert affiliation['state'] == 'error', (variant, affiliation)
+        assert affiliation['order_id'] == 'trial-D'
+        assert affiliation['reason'] in ('account_identity_mismatch', 'exact_pool_role_missing',
+            'accepted_buy_request_missing', 'accepted_buy_identity_mismatch')
+        assert 'pool' not in affiliation  # neither size nor configuration grants trial/income
+    finally:
+        close = getattr(service._trading, 'close', None)
+        if close:
+            close()
+
+
+@pytest.mark.parametrize('pool', ['income', 'trial'])
+@pytest.mark.parametrize('variant', ['same_wallet', 'other_account', 'condition_case',
+    'token_case', 'order_case', 'request_case'])
+def test_lp_dashboard_affiliation_matches_canonical_account_identity(tmp_path, monkeypatch, pool, variant):
+    service, external = _lp436_service(tmp_path, monkeypatch)
+    try:
+        mixed = '0x' + 'aB' * 20
+        canonical = '0x' + 'ab' * 20
+        service._trading.config = replace(service._trading.config, wallet_address=mixed)
+        _lp436_seed_affiliation(service, pool=pool,
+            changes=dict(account_id='0x'+'cd'*20 if variant == 'other_account' else mixed),
+            role_changes=dict(request_id='Request-D') if variant == 'request_case' else None)
+        if variant == 'condition_case':
+            external['orders'][0]['market'] = 'Condition-1'
+        elif variant == 'token_case':
+            external['orders'][0]['asset_id'] = 'Yes-token'
+        elif variant == 'order_case':
+            external['orders'][0]['id'] = 'Trial-D'
+        snapshot = service._trading.lp_account_snapshot()
+        assert snapshot['account_id'] == canonical and snapshot['wallet_address'] == mixed
+        assert 'account' not in snapshot
+        service.refresh_lp_dashboard_snapshot()
+        rows = service.lp_dashboard()['lp_orders_today']
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['account_id'] == canonical
+        affiliation = row['pool_affiliation']
+        if variant == 'same_wallet':
+            assert affiliation == dict(state='known', pool=pool, account_id=canonical,
+                condition_id='condition-1', token_id='yes-token', order_id='trial-D', request_id='request-D')
+        else:
+            assert affiliation['state'] == 'error', (variant, affiliation)
+            assert 'pool' not in affiliation
+            assert row['order_id'] == ('Trial-D' if variant == 'order_case' else 'trial-D')
+    finally:
+        service._trading.close()
