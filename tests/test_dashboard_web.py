@@ -24509,6 +24509,10 @@ console.log(JSON.stringify(html));
     assert (copy if reason != 'market_read_capacity' else '等待可用执行容量') in html
     assert reason not in html
     assert '当前核对进行中，完成后安排重试' in html
+    assert '当前试挂' not in html
+    assert '当前收益' not in html
+    assert '转入中' not in html
+    assert '归属待核对' not in html
 
 
 @pytest.mark.parametrize('reason', ['credential_invalid', 'account_read_cooling_down', 'facts_read_capacity', 'facts_read_in_progress'])

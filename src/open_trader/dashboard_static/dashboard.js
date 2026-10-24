@@ -4155,7 +4155,7 @@ function lpNeedsAttentionCopy(session) {
 }
 
 function lpDashboardPoolLabel(row) {
-  if (String(row.side || "").toUpperCase() !== "BUY" || lpDashboardTodayTerminal(row)) return "";
+  if (String(row?.side || "").toUpperCase() !== "BUY" || lpDashboardTodayTerminal(row)) return "";
   return {trial: "当前试挂", income: "当前收益", promotion: "转入中", unclassified: "归属待核对"}[row.lp_current_role] || "";
 }
 
