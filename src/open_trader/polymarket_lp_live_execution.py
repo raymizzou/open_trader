@@ -2126,10 +2126,14 @@ class LPD2LiveExecution:
             if r['side'] != 'BUY' or r in current), buy_reserved=prepared.buy_reserved if self.lp_instance_id is not None else reserved,
             sources=MappingProxyType({**prepared.sources, 'candidates':replace(source, value=rows)}))
         if pool == 'trial':
+            other_pool_reserved = sum((r['price']*r['remaining'] for r in prepared.current_buys
+                if roles['roles'].get(r['condition_id'],{}).get('pool')=='income'
+                and roles['roles'][r['condition_id']].get('episode')==r['order_id']),Decimal(0))
             local_calculation = calculate_current(local_frame, local_policy, as_of)
             selection = select_current_composition(local_frame, local_policy, local_calculation,
                 orders_accepted=orders_accepted, positions_accepted=snapshot.inventory_cost.state == 'known',
-                financial_authority=snapshot.new_capacity.state == 'known', as_of=as_of)
+                financial_authority=snapshot.new_capacity.state == 'known', as_of=as_of,
+                budget_exempt_reserved=other_pool_reserved)
             return local_frame, selection, local_policy, roles
         ranked = sorted((cid for cid, result in results.items() if result['eligible']),
             key=lambda cid: (-Decimal(str(results[cid]['result']['yield_pct_per_hour'])), cid not in income, cid))
@@ -2249,6 +2253,12 @@ class LPD2LiveExecution:
             slots = min(max(0,6-len(occupied)),max(0,3-sum(in_pool(o) for o in occupied)))
             local_reserved = sum((o.price.value*o.remaining.value for o in occupied
                 if in_pool(o)),Decimal(0))
+            if self.lp_instance_id is not None:
+                other_pool = 'trial' if pool=='income' else 'income'
+                other_pool_reserved = sum((o.price.value*o.remaining.value for o in occupied
+                    if roles['roles'].get(o.key[1],{}).get('pool')==other_pool
+                    and roles['roles'][o.key[1]].get('episode')==o.key[3]),Decimal(0))
+                local_reserved = snapshot.buy_reserved.value-other_pool_reserved
         else:
             slots = max(0, policy.target_count-len(occupied))
             local_reserved = snapshot.buy_reserved.value
@@ -3745,6 +3755,12 @@ class LPD2LiveExecution:
                     quantity += used; remaining -= used; price = level
                 if remaining <= 0: break
             minimum = book.get('min_order_size')
+            if self.lp_instance_id is not None:
+                from .lp_order_ownership import normalize_sell_quantity
+                try:
+                    quantity = normalize_sell_quantity(quantity)
+                except ValueError:
+                    return ()
             if price and quantity > 0 and (minimum is None or quantity >= minimum):
                 return (self._start_exit(scope, 'protected_exit', quantity, sold, price, origin),)
         elif economics.opening_loss_usd.state == 'known' and not opening.stop_requested:
@@ -3802,6 +3818,12 @@ class LPD2LiveExecution:
                 and not any(o.side == 'SELL' and o.key[:3] == scope[:3] for o in snapshot.active_orders))
 
     def _start_exit(self, scope, kind, quantity, sold, price, origin):
+        if self.lp_instance_id is not None:
+            from .lp_order_ownership import normalize_sell_quantity
+            try:
+                quantity = normalize_sell_quantity(quantity)
+            except ValueError:
+                return None
         lease = self._acquire_mutation('SELL')
         if lease is None:
             return None

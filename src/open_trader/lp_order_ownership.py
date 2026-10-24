@@ -1,7 +1,7 @@
 """Exact LP order provenance. Identity records never grant replay authority."""
 import re
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 
 from eth_account import Account
 from eth_account.messages import encode_typed_data
@@ -10,6 +10,20 @@ from polymarket.models.clob.orders import SignedOrder
 
 LOCAL_INSTANCE_SCHEMA = 'open_trader.lp.local_instance.v1'
 LOCAL_INSTANCE_OWNERSHIP_POLICY = 'local_only_full_wallet_v1'
+
+
+def normalize_sell_quantity(value):
+    """Match pinned SDK0.2.0 share precision without rounding inventory up."""
+    try:
+        quantity = Decimal(str(value))
+        if not quantity.is_finite() or quantity <= 0:
+            raise ValueError
+        normalized = quantity.quantize(Decimal('.01'), rounding=ROUND_DOWN)
+        if normalized <= 0:
+            raise ValueError
+        return normalized
+    except Exception:
+        raise ValueError('lp_sell_quantity_below_precision_or_invalid') from None
 
 
 # Frozen CTF Exchange V2 protocol, not a signature or struct-hash identity.

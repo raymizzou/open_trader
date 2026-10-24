@@ -6198,7 +6198,9 @@ class PolymarketTradingClient:
 
     def lp_prepare_limit_order(self, **kwargs):
         """Prepare one signed LP payload with verified canonical identity."""
-        from .lp_order_ownership import verify_signed_order
+        from .lp_order_ownership import verify_signed_order, normalize_sell_quantity
+        if kwargs['side'] == 'SELL':
+            kwargs = {**kwargs, 'quantity': normalize_sell_quantity(kwargs['quantity'])}
         signed = self.lp_create_limit_order(**kwargs)
         return verify_signed_order(signed, signer=self.config.signer_address,
             wallet=self.config.wallet_address, environment=getattr(self._client, 'environment', PRODUCTION),
@@ -6207,7 +6209,8 @@ class PolymarketTradingClient:
 
     def lp_prepare_protected_sell(self, *, token_id, quantity, min_price):
         """Prepare, verify and identify a protected SELL without posting it."""
-        from .lp_order_ownership import verify_signed_order
+        from .lp_order_ownership import verify_signed_order, normalize_sell_quantity
+        quantity = normalize_sell_quantity(quantity)
         if min_price <= 0 or quantity <= 0:
             raise ValueError('protected_exit_floor_invalid')
         signed = self._client.create_market_order(token_id=token_id, side='SELL',

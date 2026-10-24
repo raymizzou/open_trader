@@ -135,7 +135,7 @@ def calculate_current(frame, policy, as_of) -> CalculationResult:
 
 def select_current_composition(frame, policy, calculation, *, orders_accepted=True,
                                positions_accepted=True, financial_authority=True, as_of=None,
-                               shadow_blocked_conditions=None):
+                               shadow_blocked_conditions=None, budget_exempt_reserved=Decimal(0)):
     """Re-gate values against accepted authority without recalculating yields."""
     reserved, inventory = calculation.buy_reserved, calculation.inventory_cost
     estimates = calculation.yields
@@ -194,7 +194,10 @@ def select_current_composition(frame, policy, calculation, *, orders_accepted=Tr
         managed_reserved = sum((r['remaining']*r['price'] for r in frame.current_buys), Decimal(0))
         other_reserved = max(Decimal(0), reserved-managed_reserved)
         if remaining is not None:remaining=max(Decimal(0),remaining-other_reserved)
-        if capacity is not None:capacity=max(Decimal(0),capacity-other_reserved)
+        # Exact commitments of the other independent pool still consume wallet
+        # funds, but are not charged to this pool's budget a second time.
+        budget_charge = other_reserved-min(other_reserved,max(Decimal(0),budget_exempt_reserved))
+        if capacity is not None:capacity=max(Decimal(0),capacity-budget_charge)
     protected = [({**row, 'existing': True}, None, row['remaining'] * row['price'])
         for row in frame.current_buys if estimates[row['order_id']] is None]
     protected_cost = sum((item[2] for item in protected), Decimal(0))

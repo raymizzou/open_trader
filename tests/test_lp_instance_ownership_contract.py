@@ -1085,3 +1085,350 @@ def test_two_local_owners_never_cross_cancel_without_shared_provenance(tmp_path,
         for owner in owners:
             assert owner[1].close(timeout=3)
             owner[1].trading.close()
+
+
+def _real_sdk_signing_adapter(monkeypatch):
+    from eth_account import Account
+    from polymarket import SecureClient
+    from polymarket.models.clob import ApiKeyCreds
+    from polymarket.clients import secure as secure_module
+    account=Account.create()
+    calls=[]
+    class OfflineTransport:
+        def __init__(self,**kwargs):pass
+        def get_json(self,path,**kwargs):
+            calls.append(path)
+            if path=='/auth/api-keys':return {'apiKeys':['00000000-0000-0000-0000-000000000001']}
+            if path=='/tick-size':return {'minimum_tick_size':'.01'}
+            if path=='/neg-risk':return {'neg_risk':False}
+            raise AssertionError('unexpected offline SDK read')
+        def post_json(self,*args,**kwargs):raise AssertionError('signing fixture must never POST')
+        def close(self):pass
+    monkeypatch.setattr(secure_module,'SyncTransport',OfflineTransport)
+    sdk=SecureClient.create(private_key='0x'+account.key.hex(),wallet=account.address,
+        credentials=ApiKeyCreds(key='00000000-0000-0000-0000-000000000001',secret='b2ZmbGluZQ==',passphrase='offline'))
+    adapter=PolymarketTradingClient(TradingConfig(account.address,account.address,lp_instance_id='tokyo'),sdk)
+    return adapter,sdk,calls
+
+
+def test_real_sdk_sell_preparation_uses_exact_normalized_quantity(monkeypatch):
+    from eth_account.messages import encode_typed_data
+    from eth_utils import keccak
+    from polymarket import PRODUCTION
+    from polymarket._internal.actions.orders.types import UnsignedOrder
+    from polymarket._internal.actions.orders.typed_data import build_order_typed_data
+    from open_trader.lp_order_ownership import verify_signed_order
+    adapter,sdk,calls=_real_sdk_signing_adapter(monkeypatch)
+    try:
+        for protected in (False,True):
+            prepare=(lambda q:adapter.lp_prepare_protected_sell(token_id='1234',quantity=q,min_price=Decimal('.29'))) if protected else (
+                lambda q:adapter.lp_prepare_limit_order(token_id='1234',quantity=q,price=Decimal('.29'),side='SELL',post_only=True,expiration=None))
+            prepared=prepare(Decimal('20.123456'))
+            assert prepared.quantity==Decimal('20.12') and prepared.price==Decimal('.29')
+            signed=prepared.signed_order
+            assert signed.maker_amount==20120000 and signed.taker_amount==5834800
+            assert signed.order_type==('FOK' if protected else 'GTC')
+            assert signed.post_only is (not protected)
+            unsigned=UnsignedOrder(chain_id=137,exchange_address=PRODUCTION.standard_exchange,
+                maker=signed.maker,signer=signed.signer,token_id='1234',side='SELL',
+                maker_amount=20120000,taker_amount=5834800,signature_type=signed.signature_type,
+                salt=signed.salt,timestamp=signed.timestamp,metadata=signed.metadata,builder=signed.builder,
+                expiration=0,order_type='FOK' if protected else 'GTC')
+            encoded=encode_typed_data(full_message=build_order_typed_data(unsigned))
+            assert prepared.order_id=='0x'+keccak(b'\x19'+encoded.version+encoded.header+encoded.body).hex()
+            for wrong in (Decimal('20.123456'),Decimal('20.11')):
+                with pytest.raises(ValueError,match='identity'):
+                    verify_signed_order(signed,signer=adapter.config.signer_address,wallet=adapter.config.wallet_address,
+                        environment=PRODUCTION,token_id='1234',side='SELL',quantity=wrong,price=Decimal('.29'),protected=protected)
+            tiny=prepare(Decimal('.01'))
+            assert tiny.quantity==Decimal('.01')
+            assert tiny.signed_order.maker_amount==10000 and tiny.signed_order.taker_amount==2900
+            with pytest.raises(ValueError):prepare(Decimal('.009'))
+        assert '/tick-size' in calls and '/neg-risk' in calls
+    finally:adapter.close()
+
+
+def _real_sdk_exit_runtime(tmp_path,monkeypatch,*,mode='passive'):
+    import hashlib
+    from tests.test_lp_d2_manual_bridge import manual_runtime
+    from tests.test_lp_order_registration_contract import TOKEN_ID,CONDITION_ID,_Notifier
+    from open_trader.polymarket_lp import PolymarketLPService
+    from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+    from open_trader.polymarket_lp_current_state import ValidatedStartAdmission
+    _,previous,sdk,public,clock=manual_runtime(tmp_path,monkeypatch)
+    assert previous.close(timeout=3)
+    real,real_sdk,_=_real_sdk_signing_adapter(monkeypatch)
+    adapter=previous.trading;adapter.config=real.config
+    sdk.environment=real_sdk.environment
+    sdk.create_limit_order=real_sdk.create_limit_order
+    sdk.create_market_order=real_sdk.create_market_order
+    token=str(int(TOKEN_ID,16));clock[0]=datetime.now(UTC)
+    market=public.get_market;book=public.get_order_book;rewards=public.list_market_rewards
+    def get_market(*,id):
+        value=market(id=id)
+        if id=='market-1':value=value.model_copy(update={'outcomes':value.outcomes.model_copy(
+            update={'yes':value.outcomes.yes.model_copy(update={'token_id':token})})})
+        return value
+    def get_book(*,token_id):
+        value=book(token_id=TOKEN_ID if token_id==token else token_id)
+        return value.model_copy(update={'token_id':token_id})
+    def current_rewards(**kwargs):
+        return tuple(value.model_copy(update={'rewards_config':tuple(c.model_copy(update={
+            'start_date':clock[0]-timedelta(days=1),'end_date':clock[0]+timedelta(days=1)})
+            for c in value.rewards_config)}) for value in rewards(**kwargs))
+    public.get_market=get_market;public.get_order_book=get_book;public.list_market_rewards=current_rewards
+    if mode=='protected':public.bid=Decimal('.81');public.ask=Decimal('.83')
+    store=previous.store
+    settings_account=hashlib.sha256(adapter.config.wallet_address.casefold().encode()).hexdigest()
+    store.lp_save_current_control(dict(account_id=settings_account,process_epoch='seed',request_id='paused',
+        request_version=1,desired_running=False,requested_at=clock[0],actor=None))
+    store.lp_save_price_history(CONDITION_ID,token,[],dict(state='known',amplitude=Decimal('.005'),
+        checked_at=clock[0],valid_until=clock[0]+timedelta(hours=24)))
+    lp=PolymarketLPService(store,adapter,clock=lambda:clock[0])
+    live=LPD2LiveExecution(store,adapter,account_id=adapter.config.wallet_address,venue='polymarket',
+        process_epoch='real-sdk-exit',policy=CalculationPolicy(None),utc_now=lambda:clock[0])
+    live.initialize(ValidatedStartAdmission('real-sdk-exit','offline-start-permit'))
+    execution=PredictionExecutionService(store=store,monitor=object(),trading=adapter,notifier=_Notifier(),
+        lock_path=tmp_path/'real-execution.lock',lp=lp,lp_d2=live)
+    execution._breaker_open=False
+    posts=[]
+    def post(signed):
+        rows=store.lp_order_provenance(adapter.config.wallet_address,'polymarket')
+        row,=(r for r in rows if r['protocol_fields']['salt']==signed.salt)
+        attempt=next(iter(live.state.snapshot().sells.values()),None)
+        attempt=(attempt.passive if signed.order_type=='GTC' else attempt.protected) if attempt and signed.side=='SELL' else None
+        posts.append(dict(order_id=row['order_id'],side=signed.side,order_type=signed.order_type,
+            quantity=Decimal(row['quantity']),price=Decimal(row['price']),maker_amount=signed.maker_amount,
+            taker_amount=signed.taker_amount,request_id=row['request_id'],
+            request_quantity=attempt.submit_quantity.value if attempt else None,
+            residual=attempt.submit_residual_quantity.value if attempt else None))
+        sdk.orders+=(_order_from_provenance(row).model_copy(update={'owner':adapter.config.wallet_address,
+            'maker_address':adapter.config.wallet_address,'created_at':clock[0]}),)
+        return dict(accepted=True,status='LIVE',order_id=row['order_id'],making_amount='0',taking_amount='0')
+    sdk.orders=();sdk.post_order=post
+    return execution,live,sdk,public,clock,token,posts,real
+
+
+def _set_real_sdk_exit_fills(live,sdk,clock,token,*,bought,sold='0',buy_price='.29'):
+    from tests.test_lp_order_registration_contract import CONDITION_ID,_maker_order,_trade
+    clock[0]+=timedelta(seconds=1)
+    wallet=live.account_id
+    rows=live.store.lp_order_provenance(wallet,'polymarket')
+    buys=[r for r in rows if r['side']=='BUY'];sells=[r for r in rows if r['side']=='SELL']
+    updated=[];trades=[]
+    for row,quantity in [(r,bought) for r in buys]+[(r,sold) for r in sells]:
+        side=row['side'];price=buy_price if side=='BUY' else row['price']
+        current=next(o for o in sdk.orders if o.id==row['order_id'])
+        updated.append(current.model_copy(update={'size_matched':Decimal(quantity),'status':'CANCELED' if side=='BUY' else 'LIVE' if Decimal(quantity)==0 else 'MATCHED'}))
+        if Decimal(quantity):
+            maker=_maker_order(row['order_id'],side,quantity,price).model_copy(update={'maker_address':wallet,'owner':wallet,'token_id':token})
+            trades.append(_trade('real-'+side,maker,size=quantity).model_copy(update={
+                'token_id':token,'maker_address':wallet,'owner':wallet,'matched_at':clock[0],'updated_at':clock[0]}))
+    sdk.orders=tuple(updated);sdk.trades=tuple(trades)
+    sdk.positions=(dict(condition_id=CONDITION_ID,token_id=token,size=str(Decimal(bought)-Decimal(sold)),average_price=buy_price),)
+
+
+def _observe_real_sdk_exit(live):
+    for _ in range(3):
+        live.run_once()
+        for handle in live.run_protection_once():
+            handle.result(timeout=3);handle._thread.join(3)
+            assert handle.done() and not handle._thread.is_alive()
+
+
+def test_fractional_local_exit_preserves_requested_quantity_and_residual(tmp_path,monkeypatch):
+    from tests.test_lp_d2_manual_bridge import entry
+    for mode in ('passive','protected'):
+        execution,live,sdk,public,clock,token,posts,real=_real_sdk_exit_runtime(tmp_path/mode,monkeypatch,mode=mode)
+        try:
+            price='.80' if mode=='protected' else '.29'
+            response=execution.lp_submit_entry(entry(clock,token_id=token,quantity='30',price=price))
+            assert response['submit_status']=='accepted',response
+            _set_real_sdk_exit_fills(live,sdk,clock,token,bought='20.123456',buy_price=price)
+            public.bid=Decimal('.29') if mode=='protected' else Decimal('.28')
+            public.ask=Decimal('.31') if mode=='protected' else Decimal('.29')
+            _observe_real_sdk_exit(live)
+            sell,=(r for r in posts if r['side']=='SELL')
+            assert sell['quantity']==sell['request_quantity']==Decimal('20.12')
+            assert sell['residual']==Decimal('20.123456')
+            assert sell['maker_amount']==20120000 and sell['taker_amount']==5834800
+            assert sell['price']==Decimal('.29') and sell['order_type']==('FOK' if mode=='protected' else 'GTC')
+            snapshot=live.state.snapshot();state,=snapshot.sells.values()
+            assert state.residual_quantity.value==Decimal('20.123456')
+            attempt=state.protected if mode=='protected' else state.passive
+            assert attempt.request_id==sell['request_id'] and attempt.submit_quantity.value==Decimal('20.12')
+            _set_real_sdk_exit_fills(live,sdk,clock,token,bought='20.123456',sold='20.12',buy_price=price)
+            _observe_real_sdk_exit(live)
+            snapshot=live.state.snapshot();state,=snapshot.sells.values();opening,=snapshot.openings.values()
+            assert state.residual_quantity.state=='known' and state.residual_quantity.value==Decimal('.003456')
+            assert snapshot.positions[0].quantity.value==Decimal('.003456') and opening.phase!='closed'
+            assert len([r for r in posts if r['side']=='SELL'])==1
+            assert len([r for r in live.store.lp_order_provenance(live.account_id,'polymarket') if r['side']=='SELL'])==1
+            assert sdk.cancels==[] and live.status()['native_inflight']==0
+        finally:
+            assert live.close(timeout=3)
+            live.trading.close();real.close()
+
+
+def test_sell_dust_never_posts_or_closes_residual(tmp_path,monkeypatch):
+    from tests.test_lp_d2_manual_bridge import entry
+    for case in ('dust','protected_minimum'):
+        mode='protected' if case=='protected_minimum' else 'passive'
+        execution,live,sdk,public,clock,token,posts,real=_real_sdk_exit_runtime(tmp_path/case,monkeypatch,mode=mode)
+        try:
+            price='.80' if mode=='protected' else '.29'
+            response=execution.lp_submit_entry(entry(clock,token_id=token,quantity='30',price=price))
+            assert response['submit_status']=='accepted'
+            residual='.009' if case=='dust' else '20.123456'
+            _set_real_sdk_exit_fills(live,sdk,clock,token,bought=residual,buy_price=price)
+            public.bid=Decimal('.29') if mode=='protected' else Decimal('.28')
+            public.ask=Decimal('.31') if mode=='protected' else Decimal('.29')
+            if case=='protected_minimum':
+                original_book=public.get_order_book
+                def shallow_book(**kwargs):
+                    book=original_book(**kwargs)
+                    return book.model_copy(update={'min_order_size':Decimal('20.123456'),
+                        'bids':(book.bids[0].model_copy(update={'size':Decimal('20.123456')}),)})
+                public.get_order_book=shallow_book
+            _observe_real_sdk_exit(live)
+            assert [r['side'] for r in posts]==['BUY']
+            snapshot=live.state.snapshot();opening,=snapshot.openings.values();sell,=snapshot.sells.values()
+            assert sell.residual_quantity.state=='known' and sell.residual_quantity.value==Decimal(residual)
+            assert snapshot.positions[0].quantity.value==Decimal(residual) and opening.phase!='closed'
+            assert sell.passive is None and sell.protected is None
+            assert len(live.store.lp_order_provenance(live.account_id,'polymarket'))==1
+            assert sdk.cancels==[] and live.status()['native_inflight']==0
+        finally:
+            assert live.close(timeout=3)
+            live.trading.close();real.close()
+
+
+def _instance_pool_budget_runtime(tmp_path,monkeypatch,*,foreign='0',role_variant='exact'):
+    import hashlib
+    from tests.test_lp_d2_integration import settle_control
+    from tests.test_lp_order_registration_contract import TOKEN_ID,CONDITION_ID
+    from open_trader.polymarket_lp_market_reader import SourceResult
+    _,previous,sdk,public,clock=_isolated_manual_runtime(tmp_path,monkeypatch)
+    tokens=tuple(str(100+i) for i in range(1,5))
+    conditions=tuple('0x'+format(i,'064x') for i in range(1,5))
+    markets=tuple('pool-'+str(i) for i in range(1,5))
+    original_market=public.get_market;original_book=public.get_order_book;original_rewards=public.list_market_rewards
+    def market(*,id):
+        index=markets.index(id);value=original_market(id='market-1')
+        return value.model_copy(update={'id':id,'condition_id':conditions[index],
+            'outcomes':value.outcomes.model_copy(update={
+                'yes':value.outcomes.yes.model_copy(update={'token_id':tokens[index]}),
+                'no':value.outcomes.no.model_copy(update={'token_id':str(900+index)})})})
+    def book(*,token_id):
+        index=tokens.index(token_id);value=original_book(token_id=TOKEN_ID)
+        return value.model_copy(update={'condition_id':conditions[index],'token_id':token_id})
+    def rewards(*,condition_id,sponsored):
+        return tuple(row.model_copy(update={'condition_id':condition_id}) for row in original_rewards(
+            condition_id=CONDITION_ID,sponsored=sponsored))
+    public.get_market=market;public.get_order_book=book;public.list_market_rewards=rewards
+    public.list_markets=lambda **kwargs:[market(id=identity) for identity in markets]
+    public.bid=Decimal('.31');public.ask=Decimal('.33')
+    sdk.get_balance_allowance=lambda **kwargs:SimpleNamespace(balance='1000000000',allowances={sdk.environment.standard_exchange:'1000000000'})
+    records=[]
+    for index,quantity in ((0,'50'),(1,'200')):
+        prepared=previous.trading.lp_prepare_limit_order(token_id=tokens[index],side='BUY',price=Decimal('.40'),
+            quantity=Decimal(quantity),post_only=True,expiration=None)
+        records.append(previous.store.lp_register_order_provenance(prepared.provenance(instance_id='tokyo',
+            request_id='local-'+str(index),condition_id=conditions[index])))
+    policy=CalculationPolicy(Decimal('100'),3,allocation_mode='observed_pools',trial_budget_usd='100',income_budget_usd='100')
+    live=_restart(previous,clock,policy=policy)
+    live.request_running(True);settle_control(live)
+    live.run_once(SourceResult('empty-start',(),checked_at=clock[0]),pool='trial')
+    sdk.orders=tuple(_order_from_provenance(row) for row in records)
+    if Decimal(foreign):
+        sdk.orders+=(_order_from_provenance(records[1],order_id='foreign-buy').model_copy(update={
+            'condition_id':conditions[3],'token_id':tokens[3],'original_size':Decimal(foreign)/Decimal('.40')}),)
+    roles={conditions[0]:dict(pool='trial',episode=records[0]['order_id']),
+        conditions[1]:dict(pool='income',episode=records[1]['order_id'])}
+    if role_variant=='stale':roles[conditions[1]]['episode']='stale-local-income'
+    elif role_variant in ('unclassified','dashboard_label'):roles.pop(conditions[1])
+    elif role_variant=='foreign_episode':roles[conditions[1]]['episode']='foreign-buy'
+    elif role_variant=='wrong_terms':
+        sdk.orders=(sdk.orders[0],sdk.orders[1].model_copy(update={'original_size':Decimal('201')}),*sdk.orders[2:])
+    account=hashlib.sha256(WALLET.casefold().encode()).hexdigest()
+    live.store.lp_save_observed_pool_roles(account,expected_revision=0,roles=roles)
+    if role_variant in ('foreign_episode','shared_condition'):
+        sdk.orders=tuple(row.model_copy(update={'condition_id':conditions[1],'token_id':tokens[1]}) if row.id=='foreign-buy' else row for row in sdk.orders)
+    if role_variant=='dashboard_label':
+        sdk.orders=(sdk.orders[0],{**sdk.orders[1].model_dump(mode='python'),
+            'pool_affiliation':dict(state='income',order_id=records[1]['order_id'])},*sdk.orders[2:])
+    candidate_book=live.trading.lp_order_books((tokens[2],))[tokens[2]]
+    captured=SourceResult('new-trial-30',(
+        dict(condition_id=conditions[2],market_id=markets[2],token_id=tokens[2],venue='polymarket',
+            price=Decimal('.30'),quantity=Decimal('100'),order_type='GTC',expiration=None,post_only=True,send_options=(),
+            direction=dict(market=dict(reward_min_size=Decimal('1'),reward_max_spread=Decimal('.10'),minimum_order_size=Decimal('1')),
+                book=candidate_book,daily_pool_usd=Decimal('24'))),),checked_at=clock[0])
+    posts=[]
+    def post(signed):
+        row,=(r for r in live.store.lp_order_provenance(WALLET,'polymarket') if r['protocol_fields']['salt']==signed.salt)
+        posts.append(dict(order_id=row['order_id'],token_id=row['token_id'],quantity=Decimal(row['quantity']),price=Decimal(row['price'])))
+        return dict(accepted=True,status='LIVE',order_id=row['order_id'],taking_amount='0')
+    sdk.post_order=post
+    return live,sdk,clock,captured,records,posts,tokens,conditions
+
+
+def test_instance_observed_pools_keep_wallet_and_pool_budget_separate(tmp_path,monkeypatch):
+    for foreign,reserve,capacity,trial_headroom in (('0','100','100','80'),('40','140','60','40'),('60','160','40','20')):
+        live,sdk,clock,candidates,records,posts,tokens,conditions=_instance_pool_budget_runtime(tmp_path/foreign,monkeypatch,foreign=foreign)
+        try:
+            result=live.run_once(candidates,pool='trial')
+            financial=result.acceptance.observation.calculation
+            assert financial.buy_reserved==Decimal(reserve) and financial.new_capacity==Decimal(capacity)
+            assert result.acceptance.observation.source_frame.buy_reserved==Decimal(reserve)
+            assert {o.key[3] for o in live.state.snapshot().active_orders}>={row['order_id'] for row in records}
+            assert ((conditions[2],tokens[2]) in result.selection.new_target_keys)==(foreign!='60')
+            if foreign=='60':assert posts==[] and result.outcomes==()
+            else:
+                assert len(posts)==1 and posts[0]['token_id']==tokens[2]
+                assert posts[0]['price']*posts[0]['quantity']==Decimal('30')<=Decimal(trial_headroom)
+                assert len(result.outcomes)==1 and result.outcomes[0].status.value=='accepted'
+            result=live.dispatch_rotation(result)
+            for outcome in result.rotation_outcomes:
+                if outcome.handle:
+                    outcome.handle.result(timeout=3);outcome.handle._thread.join(3)
+            assert sdk.cancels==[]
+            assert set(result.selection.retained_order_ids)>={records[0]['order_id']}
+            assert live.status()['native_inflight']==0
+        finally:
+            assert live.close(timeout=3)
+            live.trading.close()
+
+
+def test_instance_pool_budget_exemption_requires_exact_local_income(tmp_path,monkeypatch):
+    for variant in ('stale','unclassified','dashboard_label','foreign_episode','shared_condition','wrong_terms'):
+        foreign='60' if variant=='shared_condition' else '40'
+        live,sdk,clock,candidates,records,posts,tokens,conditions=_instance_pool_budget_runtime(
+            tmp_path/variant,monkeypatch,foreign=foreign,role_variant=variant)
+        try:
+            result=live.run_once(candidates,pool='trial')
+            financial=result.acceptance.observation.calculation
+            assert financial.buy_reserved is not None and financial.new_capacity is not None
+            assert (conditions[2],tokens[2]) not in result.selection.new_target_keys
+            assert posts==[] and result.outcomes==()
+            dispatched=live.dispatch_rotation(result)
+            for outcome in dispatched.rotation_outcomes:
+                if outcome.handle:outcome.handle.result(timeout=3);outcome.handle._thread.join(3)
+            assert not any('foreign-buy' in batch for batch in sdk.cancels)
+            assert len(live.store.lp_order_provenance(WALLET,'polymarket'))==2
+        finally:
+            assert live.close(timeout=3);live.trading.close()
+    for fault in ('balance','orders','positions','terms'):
+        live,sdk,clock,candidates,records,posts,tokens,conditions=_instance_pool_budget_runtime(
+            tmp_path/fault,monkeypatch,foreign='40')
+        try:
+            if fault=='balance':sdk.get_balance_allowance=lambda **kwargs:None
+            elif fault=='orders':sdk.orders=None
+            elif fault=='positions':sdk.positions=None
+            else:sdk.orders=(sdk.orders[0],sdk.orders[1].model_copy(update={'original_size':None}),*sdk.orders[2:])
+            result=live.run_once(candidates,pool='trial')
+            assert live.state.snapshot().new_capacity.state=='unknown'
+            assert posts==[] and result.outcomes==()
+            assert not any('foreign-buy' in batch for batch in sdk.cancels)
+            assert len(live.store.lp_order_provenance(WALLET,'polymarket'))==2
+        finally:
+            assert live.close(timeout=3);live.trading.close()

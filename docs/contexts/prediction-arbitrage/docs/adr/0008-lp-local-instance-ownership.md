@@ -14,6 +14,13 @@ loads identities only; it does not reconstruct requests, plans or send authority
 Removing or changing a bound identity fails closed. A fresh unbound database
 without the field retains the prior single-instance behavior.
 
+Local SELL quantity is floored to the pinned SDK 0.2.0 two-decimal share precision
+before publishing the request and registering its signed provenance. Request,
+attempt and signed quantity must agree exactly; the original residual remains
+separate. Selling 20.12 of 20.123456 shares leaves .003456 shares of real inventory.
+Rounded-zero dust cannot POST or close the opening. Protected exits must still
+meet the actual order minimum after rounding and retain their price floor.
+
 Only positively local exact orders may enter management, protection, rotation or
 cancellation. All four native cancellation boundaries recheck local identity.
 Manual, legacy and other nonlocal orders are not adopted, rewritten or canceled.
@@ -27,6 +34,13 @@ wallet identity, source completeness/freshness, unknown terms/positions/pending
 requests, funds, allowance, and SELL oversell protections retain their meaning.
 Positions and SELLs do not deduct the BUY cap. Independent hosts do not gain an
 atomic cross-host spending guarantee.
+
+Trial and income budgets remain independent. Only an exact positively local
+other-pool episode is exempt from the selected pool's budget charge; its entire
+BUY reservation still reduces wallet funds. Foreign, stale, unclassified or
+display-only affiliations grant no exemption. With trial/income budgets 100/100,
+local trial 20 and income 80, foreign BUY reservations 0/40/60 leave trial headroom
+80/40/20 and account capacity 100/60/40. Financial UNKNOWN still forbids new risk.
 
 The optional parallel gate proves distinct stable IDs, the same wallet, supported
 implemented ownership policy and exact source/runtime/config identities. It
