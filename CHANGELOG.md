@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-24 — LP empty-order progress rendering
+
+- Fix a dashboard rendering error when an LP session has progress to show but no current orders. Preserve the wait and retry text without adding a pool label.
+
 ## 2026-10-24 — Current LP trial admission and four order regions
 
 - Admit income entrants only from exact current managed trials. Keep bounded owner-local transfer provenance, refill trial after actual source release, and retire departed income membership without reviving historical orders. Original sample freshness, financial, UNKNOWN and no-replay guards remain.
