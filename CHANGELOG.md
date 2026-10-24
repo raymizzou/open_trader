@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-24 — LP runtime payload assertion coverage
+
+- Check the complete additive order affiliation error when authenticated account identity is missing. Preserve all existing order and position field assertions; production behavior is unchanged.
+
 ## 2026-10-24 — Reliable local LP instance ownership
 
 - Add an explicit stable LP instance ID and reliable exact signed-order provenance before POST. A bound database rejects identity removal or replacement. Restart restores identity only, without replaying a request. Each host manages and cancels only positively local orders at all four native cancellation boundaries.
