@@ -956,3 +956,246 @@ def test_cloud_candidate_exclusions_preflight_evidence_binds_requested_value(tmp
     result = cloud.operate(config, 'preflight')
     assert result['status'] == 'PRECHECK_OK'
     assert result['candidate_exclusions'] is enabled
+
+
+@pytest.fixture
+def parallel_gate(tmp_path,monkeypatch):
+    """Actual Mini service, immutable source and private selected configuration.
+
+    Only external SSH/browser programs and the fixture entry command's OS
+    spelling are modeled. Real process/listener/flock/HTTP and release checks run.
+    """
+    import hashlib,importlib.util,os,shlex,subprocess,sys
+    from datetime import UTC,datetime
+    from tests.lp_d2_service_harness import ServiceChild
+    from tests.test_lp_order_registration_contract import WALLET
+    spec=importlib.util.spec_from_file_location('parallel_gate',Path(__file__).resolve().parents[1]/'scripts/prediction-cloud-gate.py')
+    gate=importlib.util.module_from_spec(spec);spec.loader.exec_module(gate)
+    with ServiceChild(tmp_path/'mini',scenario='consumer-mini-instance-health') as child:
+        child.release('metadata');child.start(expected_running=False)
+        child.wait_state(lambda state:state['diagnostics'].get('instance_ownership',{}).get('unattributed_buy_ids')==['unattributed-existing-buy'])
+        remote=tmp_path/'tokyo';(remote/'config').mkdir(parents=True)
+        selected=remote/'config/prediction_arbitrage.json'
+        selected.write_text(json.dumps(dict(signer_address=WALLET,wallet_address=WALLET,lp_instance_id='tokyo')));selected.chmod(0o600)
+        peer=dict(instance_id='mini',account_id=WALLET,expected_sha=child.sha,
+            release_root=str(child.release_root),runtime_root=str(child.runtime_root),
+            config_path=str(child.config_path),port=child.port)
+        local=dict(release_root=str(child.release_root),runtime_root=str(tmp_path/'client'),
+            python=sys.executable,ssh_alias='offline-tokyo',expected_sha=child.sha,mode='production',
+            gateway_port=8876,tunnel_port=8879,lp_parallel_peer=peer)
+        config=dict(release_root=str(child.release_root),runtime_root=str(remote),python=sys.executable,
+            user='prediction',expected_sha=child.sha,mode='production',n_leg_paused=1,
+            credential_backend='file',credentials_file='/private/offline-wallet.json',lp_instance_id='tokyo')
+        client_path=tmp_path/'client.json';client_path.write_text(json.dumps(local))
+        cloud_path=tmp_path/'cloud.json';cloud_path.write_text(json.dumps(config))
+        operator=tmp_path/'operator.json';operator.write_text(json.dumps(dict(git_sha=child.sha,
+            resources_reviewed=True,resources_reviewed_evidence='offline resource review')))
+        capability=dict(schema_version='open_trader.lp.local_instance.v1',ownership_policy='local_only_full_wallet_v1',stage='staged',
+            instance_id='tokyo',account_id=WALLET,venue='polymarket',source_sha=child.sha,
+            code_root=str(child.release_root),runtime_root=str(remote),config_path=str(selected),
+            config_sha256=hashlib.sha256(selected.read_bytes()).hexdigest(),observed_at=datetime.now(UTC).isoformat())
+        remote_result=dict(status='PRECHECK_OK',mode='production',git_sha=child.sha,
+            release_root=str(child.release_root),runtime_root=str(remote),n_leg_paused=1,
+            configured_n_leg_paused=1,credential_backend='file',candidate_exclusions=False,
+            lp_instance_isolation=capability)
+        calls=[];native_run=subprocess.run
+        def external_run(command,*args,**kwargs):
+            if command[0]=='ssh':
+                calls.append(command)
+                return subprocess.CompletedProcess(command,0,json.dumps(remote_result),'')
+            if (command[:3]==[sys.executable,'-c','from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(channel="chrome",headless=True); b.close(); p.stop()']
+                    or command[0]=='node' or str(command[0]).endswith('node_modules/.bin/playwright')):
+                calls.append(command);return subprocess.CompletedProcess(command,0,'','')
+            result=native_run(command,*args,**kwargs)
+            if command[:3]==['/bin/ps','-p',str(child.process.pid)] and command[-1]=='uid=,gid=,lstart=,command=' and result.returncode==0:
+                fields=result.stdout.strip().split(None,7)
+                arguments=[sys.executable,'-m','open_trader','prediction-service','--mode','production',
+                    '--data-dir',str(child.data_dir),'--config',str(child.config_path),'--host','127.0.0.1',
+                    '--port',str(child.port),'--release-manifest',str(child.release_root/'ops/prediction-service-release.json')]
+                return subprocess.CompletedProcess(command,0,' '.join(fields[:7])+' '+shlex.join(arguments)+'\n','')
+            return result
+        monkeypatch.setattr(subprocess,'run',external_run)
+        # Isolate the global OS unit path exactly as the child harness does.
+        from open_trader import prediction_cloud
+        monkeypatch.setattr(prediction_cloud,'UNIT_PATH',tmp_path/'absent-systemd.service')
+        monkeypatch.setattr(sys,'argv',['gate','readiness','--client-config',str(client_path),
+            '--service-config',str(cloud_path),'--remote-config','/etc/offline-cloud.json',
+            '--operator-evidence',str(operator),'--browser-runtime',str(tmp_path)])
+        yield dict(gate=gate,child=child,local=local,config=config,client_path=client_path,
+            cloud_path=cloud_path,operator=operator,result=remote_result,calls=calls,capability=capability)
+
+
+def test_parallel_instance_gate_requires_distinct_bound_instances(parallel_gate,capsys):
+    fixture=parallel_gate
+    assert fixture['gate'].main()==0
+    assert capsys.readouterr().out.endswith('READY\n')
+    assert any(command[0]=='ssh' and 'preflight' in command[-1] for command in fixture['calls'])
+    fixture['child'].assert_owned()
+    assert fixture['child'].actual_posts()==0
+    ownership=fixture['child'].state()['diagnostics']['instance_ownership']
+    assert ownership['unattributed_buy_ids']==['unattributed-existing-buy']
+    assert ownership['managed_order_ids']==[]
+    # Parallel SSM still requires metadata evidence; file authentication above
+    # deliberately requires no invented SSM attestation.
+    ssm={**fixture['config'],'credential_backend':'tencent-ssm','credentials_file':'',
+        'region':'ap-tokyo','secret':'offline-wallet','version':'v1','role':'offline-reader'}
+    fixture['cloud_path'].write_text(json.dumps(ssm));fixture['calls'].clear()
+    assert fixture['gate'].main()==2
+    assert capsys.readouterr().out.endswith('BLOCKED\n') and fixture['calls']==[]
+    operator=json.loads(fixture['operator'].read_text())
+    operator.update(metadata_isolation_verified=True,metadata_isolation_verified_evidence='offline isolation review')
+    fixture['operator'].write_text(json.dumps(operator))
+    fixture['result']['credential_backend']='tencent-ssm'
+    from datetime import UTC,datetime
+    fixture['result']['lp_instance_isolation']['observed_at']=datetime.now(UTC).isoformat()
+    assert fixture['gate'].main()==0
+    assert capsys.readouterr().out.endswith('READY\n')
+    fixture['cloud_path'].write_text(json.dumps(fixture['config']))
+    fixture['result']['credential_backend']='file'
+    # The same old-owner evidence is still mandatory without an explicit profile.
+    local=dict(fixture['local']);local.pop('lp_parallel_peer')
+    fixture['client_path'].write_text(json.dumps(local));fixture['calls'].clear()
+    assert fixture['gate'].main()==2
+    assert capsys.readouterr().out.endswith('BLOCKED\n')
+    assert fixture['calls']==[]
+
+
+def test_parallel_instance_gate_rejects_missing_mismatched_or_legacy_peer(parallel_gate,monkeypatch,capsys):
+    import copy,http.client
+    from datetime import UTC,datetime,timedelta
+    fixture=parallel_gate
+    native=http.client.HTTPConnection.getresponse
+    fault=[None]
+    def external_response(connection,*args,**kwargs):
+        if connection.port!=fixture['child'].port:return native(connection,*args,**kwargs)
+        if fault[0]=='unavailable':raise ConnectionError('offline Mini unavailable')
+        response=native(connection,*args,**kwargs)
+        if fault[0] in ('legacy','disabled','stale','future','wrong_health_config','wrong_health_epoch'):
+            value=json.loads(response.read())
+            capability=value['lp_instance_isolation']
+            if fault[0]=='legacy':value.pop('lp_instance_isolation')
+            elif fault[0]=='disabled':capability['enabled']=False
+            elif fault[0] in ('stale','future'):
+                capability['observed_at']=(datetime.now(UTC)+timedelta(seconds=-61 if fault[0]=='stale' else 61)).isoformat()
+            elif fault[0]=='wrong_health_config':capability['config_sha256']='f'*64
+            else:capability['process_epoch']='different-process'
+            response.read=lambda *a,**k:json.dumps(value).encode()
+        return response
+    monkeypatch.setattr(http.client.HTTPConnection,'getresponse',external_response)
+    original=copy.deepcopy(fixture['result'])
+    for case in ('missing_profile','missing_id','duplicate_id','invalid_id','wallet','sha','config','runtime',
+                 'remote_id','remote_wallet','remote_sha','remote_runtime','remote_config','legacy','disabled',
+                 'stale','future','wrong_health_config','wrong_health_epoch','unavailable'):
+        local=copy.deepcopy(fixture['local']);config=copy.deepcopy(fixture['config'])
+        fixture['result'].clear();fixture['result'].update(copy.deepcopy(original))
+        peer=local['lp_parallel_peer'];fault[0]=case
+        if case=='missing_profile':local.pop('lp_parallel_peer')
+        elif case=='missing_id':peer.pop('instance_id')
+        elif case=='duplicate_id':config['lp_instance_id']='mini'
+        elif case=='invalid_id':peer['instance_id']='Mini'
+        elif case=='wallet':peer['account_id']='0x'+'b'*40
+        elif case=='sha':peer['expected_sha']='f'*40
+        elif case=='config':peer['config_path']=str(fixture['child'].runtime_root/'missing-config.json')
+        elif case=='runtime':peer['runtime_root']=str(fixture['child'].runtime_root/'other-runtime')
+        elif case.startswith('remote_'):
+            key={'remote_id':'instance_id','remote_wallet':'account_id','remote_sha':'source_sha',
+                'remote_runtime':'runtime_root','remote_config':'config_path'}[case]
+            fixture['result']['lp_instance_isolation'][key]='wrong'
+        fixture['client_path'].write_text(json.dumps(local));fixture['cloud_path'].write_text(json.dumps(config))
+        fixture['calls'].clear()
+        assert fixture['gate'].main()==2,case
+        assert capsys.readouterr().out.endswith('BLOCKED\n'),case
+        assert all(command[0]=='ssh' for command in fixture['calls']),case
+        assert fixture['child'].actual_posts()==0
+    fixture['child'].assert_owned()
+
+
+def test_parallel_instance_identity_is_bound_to_installed_and_live_config(parallel_gate,tmp_path,monkeypatch,capsys):
+    import hashlib,http.client,os,pwd,grp,subprocess,sys
+    from datetime import UTC,datetime
+    from types import SimpleNamespace
+    from dataclasses import replace
+    from open_trader import prediction_cloud as cloud
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    from open_trader.prediction_client import process_identity
+    from tests.lp_d2_service_harness import ServiceChild
+    from tests.test_lp_order_registration_contract import WALLET
+    fixture=parallel_gate
+    cfg=load_config(fixture['cloud_path'])
+    user=pwd.getpwuid(os.getuid());native_user=pwd.getpwnam;native_group=grp.getgrnam
+    monkeypatch.setattr(pwd,'getpwnam',lambda name:user if name=='prediction' else native_user(name))
+    monkeypatch.setattr(grp,'getgrnam',lambda name:SimpleNamespace(gr_gid=user.pw_gid) if name=='prediction' else native_group(name))
+    staged=cloud.staged_instance_identity(cfg)
+    assert staged['stage']=='staged' and staged['instance_id']=='tokyo'
+    assert staged['source_sha']==fixture['child'].sha
+    assert 'enabled' not in staged and 'process_epoch' not in staged
+    assert 'Environment=OPEN_TRADER_LP_INSTANCE_ID=tokyo\n' in render_unit(cfg)
+    selected=Path(staged['config_path']);original=selected.read_bytes()
+    store=PredictionArbitrageStore(cfg.runtime_root/'data');store.lp_bind_instance(WALLET,'polymarket','tokyo')
+    for changes in ({'lp_instance_id':None},{'lp_instance_id':'mini'},{'wallet_address':'0x'+'b'*40}):
+        value=json.loads(original)
+        if changes.get('lp_instance_id','present') is None:value.pop('lp_instance_id')
+        else:value.update(changes)
+        selected.write_text(json.dumps(value))
+        with pytest.raises(ValueError):cloud.staged_instance_identity(cfg)
+    selected.write_bytes(original)
+    assert cloud.staged_instance_identity(cfg)==staged
+    # Two actual offline processes now exist. Only smoke requires Tokyo running.
+    with ServiceChild(tmp_path/'actual-tokyo',scenario='consumer-instance-health') as tokyo:
+        tokyo.config_path=tokyo.runtime_root/'config/prediction_arbitrage.json'
+        tokyo.release('metadata');tokyo.start(expected_running=False)
+        health=tokyo.request('/healthz');capability=health['lp_instance_isolation']
+        assert capability['enabled'] is True and capability['instance_id']=='tokyo'
+        config={**fixture['config'],'release_root':str(tokyo.release_root),
+            'runtime_root':str(tokyo.runtime_root),'expected_sha':tokyo.sha}
+        local={**fixture['local'],'cloud_expected_sha':tokyo.sha}
+        fixture['cloud_path'].write_text(json.dumps(config));fixture['client_path'].write_text(json.dumps(local))
+        fixture['operator'].write_text(json.dumps(dict(git_sha=tokyo.sha,resources_reviewed=True,
+            resources_reviewed_evidence='offline resource review')))
+        fixture['result'].update(status='BACKEND_SMOKE_OK',pid=health['pid'],started_at=health['started_at'],
+            systemd_started_at='offline-native-start',git_sha=tokyo.sha,release_root=str(tokyo.release_root),
+            runtime_root=str(tokyo.runtime_root),lp_instance_isolation={**capability,'stage':'running'})
+        client_root=Path(local['runtime_root']);client_root.mkdir(mode=0o700)
+        (client_root/'gateway.log').write_text('frontend_gateway_runtime: started\n')
+        state=dict(config=local,gateway=dict(pid=os.getpid(),identity=process_identity(os.getpid())),
+            ssh=dict(pid=fixture['child'].process.pid,identity=process_identity(fixture['child'].process.pid)))
+        (client_root/'client.json').write_text(json.dumps(state))
+        native_connection=http.client.HTTPConnection
+        gateway=dict(pid=os.getpid(),prediction_only=True,prediction_upstream_status='ok',
+            prediction_route_mode='service',cwd=local['release_root'],code_root=local['release_root']+'/src',
+            git_sha=local['expected_sha'],source_state='clean',started_at=datetime.now(UTC).isoformat())
+        class ExternalClientHTTP(native_connection):
+            def request(self,*args,**kwargs):
+                if self.port in (8876,8879):return
+                return super().request(*args,**kwargs)
+            def getresponse(self):
+                if self.port in (8876,8879):
+                    value=gateway if self.port==8876 else tokyo.request('/healthz')
+                    return SimpleNamespace(status=200,read=lambda:json.dumps(value).encode())
+                return super().getresponse()
+        monkeypatch.setattr(http.client,'HTTPConnection',ExternalClientHTTP)
+        native_run=subprocess.run
+        def browser_process(command,*args,**kwargs):
+            if command[:6]==[sys.executable,'-m','pytest','-q','-m','browser']:
+                return subprocess.CompletedProcess(command,0,'','')
+            return native_run(command,*args,**kwargs)
+        monkeypatch.setattr(subprocess,'run',browser_process)
+        sys.argv[1]='smoke'
+        assert fixture['gate'].main()==0
+        assert capsys.readouterr().out.endswith('HEALTHY\n')
+        # A validly shaped live identity cannot claim a different config/process.
+        for key in ('config_path','config_sha256','runtime_root','source_sha','instance_id'):
+            wrong=json.loads(json.dumps(fixture['result']))
+            wrong['lp_instance_isolation'][key]='wrong'
+            with pytest.raises(ValueError):fixture['gate'].remote_identity(wrong,load_config(fixture['cloud_path']),'smoke')
+        assert tokyo.actual_posts()==fixture['child'].actual_posts()==0
+        tokyo.assert_owned();fixture['child'].assert_owned()
+    # An installed unit pin cannot be bypassed by loading another selected ID.
+    with monkeypatch.context() as boundary:
+        boundary.setenv('OPEN_TRADER_LP_INSTANCE_ID','other')
+        with ServiceChild(tmp_path/'wrong-installed-pin',scenario='consumer-instance-health') as denied:
+            denied.start(expected_running=None)
+            assert denied.wait_exit()!=0
+            assert 'selected LP instance differs from installed service' in denied.output.read_text()
+            assert denied.actual_posts()==0
+            denied.assert_owner_available()

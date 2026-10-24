@@ -512,9 +512,61 @@ class PredictionArbitrageStore:
         """Admission before a caller-owned memory lock; commits stay separate."""
         return self._lp_write_coordinator.scope(priority)
 
+    def lp_instance_binding(self):
+        """Read the immutable local owner before selecting an execution path."""
+        with self._read_connection() as connection:
+            row = connection.execute(
+                'SELECT account_id,venue,instance_id FROM lp_instance_binding WHERE singleton=1').fetchone()
+            return dict(row) if row is not None else None
+
+    def lp_bind_instance(self, account_id, venue, instance_id):
+        """Bind this database once; process epochs cannot change its owner."""
+        from .lp_order_ownership import validate_instance_id
+        validate_instance_id(instance_id)
+        if not isinstance(account_id, str) or not account_id or venue != 'polymarket':
+            raise ValueError('lp_instance_account_identity')
+        binding = (account_id.casefold(), venue, instance_id)
+        with self._transaction(lp_priority='reliable') as connection:
+            saved = connection.execute(
+                'SELECT account_id, venue, instance_id FROM lp_instance_binding WHERE singleton=1'
+            ).fetchone()
+            if saved is not None and tuple(saved) != binding:
+                raise ValueError('lp_instance_database_already_bound')
+            connection.execute(
+                'INSERT OR IGNORE INTO lp_instance_binding VALUES (1, ?, ?, ?)', binding)
+        return instance_id
+
     def lp_write_operation(self, operation, *, priority='background'):
         """Run a guard-owning publication phase with safe pre-body requeue."""
         return self._lp_write_coordinator.run_write(operation, priority)
+
+    def lp_register_order_provenance(self, row):
+        """Commit an immutable exact order binding through reliable admission."""
+        from .lp_order_ownership import validate_provenance
+        # Freeze outside SQL; never retain signatures or replay payloads.
+        # Validate only new identities, retaining exact immutable-conflict errors.
+        payload = json.dumps(row, sort_keys=True, separators=(',',':'), allow_nan=False)
+        record = json.loads(payload)
+        key = (record['account_id'].casefold(), record['venue'], record['order_id'])
+        with self._transaction(lp_priority='reliable') as connection:
+            saved = connection.execute('SELECT payload FROM lp_order_provenance '
+                'WHERE account_id=? AND venue=? AND order_id=?', key).fetchone()
+            if saved is not None and saved[0] != payload:
+                raise ValueError('lp_provenance_binding_conflict')
+            if saved is None:
+                validate_provenance(record)
+                owner = connection.execute('SELECT account_id,venue,instance_id FROM lp_instance_binding WHERE singleton=1').fetchone()
+                if owner is None or tuple(owner) != (*key[:2], record['instance_id']):
+                    raise ValueError('lp_provenance_instance_conflict')
+                connection.execute('INSERT INTO lp_order_provenance VALUES (?,?,?,?)', (*key,payload))
+        return record
+
+    def lp_order_provenance(self, account_id, venue):
+        """Identity-only read; no actions, plans or financial state are restored."""
+        with self._read_connection() as connection:
+            return tuple(json.loads(row[0]) for row in connection.execute(
+                'SELECT payload FROM lp_order_provenance WHERE account_id=? AND venue=? ORDER BY order_id',
+                (account_id.casefold(),venue)))
 
     @contextmanager
     def _native_transaction(self, *, immediate, prepared_at, diagnostics, prepare_seconds,
@@ -649,6 +701,19 @@ class PredictionArbitrageStore:
     def _create_schema(connection: sqlite3.Connection) -> None:
         connection.executescript(
             """
+            CREATE TABLE IF NOT EXISTS lp_instance_binding (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                account_id TEXT NOT NULL,
+                venue TEXT NOT NULL,
+                instance_id TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS lp_order_provenance (
+                account_id TEXT NOT NULL,
+                venue TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (account_id, venue, order_id)
+            );
             CREATE TABLE IF NOT EXISTS lp_auto_pool (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 payload TEXT NOT NULL

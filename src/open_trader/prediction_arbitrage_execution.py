@@ -825,6 +825,8 @@ class PredictionExecutionService:
                 or lp.store is not store or lp.exchange is not trading):
             raise ValueError("lp_d2_attachment_identity")
         self._lp_d2 = lp_d2
+        binding_reader = getattr(store, 'lp_instance_binding', None)
+        self._lp_instance_binding = binding_reader() if callable(binding_reader) else None
         self._lp_d2_control_request = (None, None)
         self._lp_capture_failure_logged_at = None
         self._lp_d2_lease_lock = threading.Lock()
@@ -1014,9 +1016,22 @@ class PredictionExecutionService:
             lease.release()
 
     def _lp_auto_pool(self):
+        self._require_lp_instance_owner()
         if self._lp is None:
             raise ValueError("lp_unavailable")
         return self._auto_pool
+
+    def _lp_instance_owner_missing(self):
+        instance = getattr(getattr(self._trading, 'config', None), 'lp_instance_id', None)
+        if instance is None and self._lp_instance_binding is None:
+            return False
+        from .polymarket_lp_live_execution import LPD2LiveExecution
+        return (not isinstance(self._lp_d2, LPD2LiveExecution) or instance is None
+            or self._lp_d2.lp_instance_id != instance or self._lp_d2.trading is not self._trading)
+
+    def _require_lp_instance_owner(self):
+        if self._lp_instance_owner_missing():
+            raise ValueError('lp_instance_requires_d2_owner')
 
     def lp_auto_state(self, *, include_intents=True):
         if self._lp_d2 is not None:
@@ -1174,6 +1189,7 @@ class PredictionExecutionService:
         return self._lp_auto_pool().configure(payload, audit=audit)
 
     def lp_auto_set_desired_running(self, running, *, audit=None):
+        self._require_lp_instance_owner()
         if self._lp_d2 is not None:
             result = self._lp_d2.request_running(running, actor=(audit or {}).get('actor'))
             self._lp_d2_control_request = (result.status, result.reason)
@@ -1182,6 +1198,7 @@ class PredictionExecutionService:
         return self._lp_auto_pool().set_desired_running(running, audit=audit)
 
     def lp_auto_scheduled_check(self):
+        self._require_lp_instance_owner()
         if self._lp_d2 is not None:
             self._lp_d2.poll()
             attempted_at = self._lp_d2.begin_scheduled_attempt()
@@ -1202,6 +1219,7 @@ class PredictionExecutionService:
         return self._lp_auto_pool().run_once(reuse_facts=True)
 
     def lp_auto_run_once(self, *, round_id=None):
+        self._require_lp_instance_owner()
         if self._lp_d2 is not None:
             return self._lp_d2_wake()
         return self._lp_auto_pool().run_once(round_id=round_id)
@@ -2291,6 +2309,7 @@ class PredictionExecutionService:
         or request-level error notifies Feishu.
         """
 
+        self._require_lp_instance_owner()
         if request.get("confirm") is not True:
             raise ValueError("confirm must be true")
         order_ids_selector = request.get("order_ids")
@@ -4815,6 +4834,7 @@ class PredictionExecutionService:
     def lp_start(self, preview_id: str, idempotency_key: str) -> dict[str, object]:
         """Start one LP session under the shared execution mutex."""
 
+        self._require_lp_instance_owner()
         if self._lp_d2 is not None:
             return self._lp_d2.manual_call(lambda: self._lp_d2_submit_entry(
                 dict(idempotency_key=idempotency_key),preview_id=str(preview_id)))
@@ -4879,6 +4899,7 @@ class PredictionExecutionService:
     def lp_stop(self, session_id: str | None = None) -> dict[str, object]:
         """Claim one stop durably, then cancel outside the shared locks."""
 
+        self._require_lp_instance_owner()
         if self._lp_d2 is not None:
             def permission():
                 return self.lp_mutation_allowed('submit') and self._lp._mutation_allowed('submit')
@@ -4912,6 +4933,7 @@ class PredictionExecutionService:
         active-LP-session busy gate — the augment requires the session.
         """
 
+        self._require_lp_instance_owner()
         if self._lp_d2 is not None:
             return self._lp_d2.manual_call(lambda: self._lp_d2_submit_augment(
                 dict(session_id=str(session_id),idempotency_key=idempotency_key),preview_id=str(preview_id)))
@@ -4947,6 +4969,7 @@ class PredictionExecutionService:
         preview plumbing — the payload carries the full order intent.
         """
 
+        self._require_lp_instance_owner()
         if self._lp_d2 is not None:
             return self._lp_d2.manual_call(lambda: self._lp_d2_submit_entry(payload))
         service = self._lp
@@ -5028,6 +5051,7 @@ class PredictionExecutionService:
         active-LP busy gate must not block it.
         """
 
+        self._require_lp_instance_owner()
         if self._lp_d2 is not None:
             return self._lp_d2.manual_call(lambda: self._lp_d2_submit_augment(payload))
         service = self._lp
@@ -5078,6 +5102,7 @@ class PredictionExecutionService:
         venue while another submission is in flight.
         """
 
+        self._require_lp_instance_owner()
         if self._lp_d2 is not None:
             return self._lp_d2_wake()
         service = self._lp
@@ -11971,7 +11996,7 @@ class PredictionExecutionService:
         """Expose the existing execution breaker to LP exchange writes."""
 
         del action
-        return not self._breaker_is_open()
+        return not self._lp_instance_owner_missing() and not self._breaker_is_open()
 
     def _acquire_global_lock_once(self) -> tuple[threading.Lock, Any] | None:
         global _PROCESS_LOCK_OWNER

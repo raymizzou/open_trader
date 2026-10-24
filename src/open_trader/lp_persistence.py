@@ -155,13 +155,15 @@ class WriteAdmission:
 def write_priority(operation):
     if operation == 'lp_save_current_control':
         return 'control'
-    if ('claim' in operation or 'recover' in operation or operation == 'lp_save_current_settings'
+    if ('claim' in operation or 'recover' in operation or operation in {'lp_save_current_settings', 'lp_bind_instance', 'lp_register_order_provenance'}
             or operation.startswith(('lp_finish_preparation', 'lp_finish_attention', 'lp_finalize_attention'))):
         return 'reliable'
     return 'background'
 
 
 LP_WRITE_OPERATIONS = frozenset({
+    'lp_bind_instance',
+    'lp_register_order_provenance',
     'consume_lp_preview', 'lp_claim_manual_command', 'lp_finish_manual_command',
     'lp_record_book_samples', 'lp_save_price_history_batch', 'lp_record_market_exclusion',
     'lp_prune_market_exclusions', 'lp_clear_ended_market_exclusions', '_ensure_lp_metadata_cache_schema',

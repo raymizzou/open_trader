@@ -49,6 +49,7 @@ class CloudConfig:
     credentials_file: str = ''
     memory_max_bytes: int = 768 * 1024 * 1024
     candidate_exclusions: bool = False
+    lp_instance_id: str | None = None
 
     @property
     def effective_n_leg_paused(self) -> int:
@@ -67,6 +68,9 @@ class CloudConfig:
 
 def load_config(path: Path, *, contents: bytes | None = None) -> CloudConfig:
     data = json.loads(path.read_text() if contents is None else contents)
+    if 'lp_instance_id' in data:
+        from .lp_order_ownership import validate_instance_id
+        validate_instance_id(data['lp_instance_id'])
     if data.get('mode') not in {'production', 'shadow'}:
         raise ValueError('cloud service mode must be explicit production or shadow')
     credential_fields = ('region', 'secret', 'version', 'role')
@@ -137,6 +141,10 @@ def trusted_layout(c: CloudConfig) -> None:
 
 
 def render_unit(c: CloudConfig) -> str:
+    if c.lp_instance_id is not None:
+        from .lp_order_ownership import validate_instance_id
+        validate_instance_id(c.lp_instance_id)
+        if c.mode != 'production':raise ValueError('LP instance requires production mode')
     if type(c.candidate_exclusions) is not bool:
         raise ValueError("candidate_exclusions must be a boolean")
     if type(c.memory_max_bytes) is not int or not 64 * 1024**2 < c.memory_max_bytes:
@@ -212,7 +220,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=GIT_CONFIG_COUNT=1
 Environment=GIT_CONFIG_KEY_0=safe.directory
 Environment=GIT_CONFIG_VALUE_0={c.release_root}
-{exclusions_env}{credential_env}Environment=OPEN_TRADER_NLEG_PAUSED={c.effective_n_leg_paused}
+{exclusions_env}{credential_env}{'Environment=OPEN_TRADER_LP_INSTANCE_ID='+c.lp_instance_id+chr(10) if c.lp_instance_id is not None else ''}Environment=OPEN_TRADER_NLEG_PAUSED={c.effective_n_leg_paused}
 Environment=OPEN_TRADER_NLEG_PAUSED={c.effective_n_leg_paused}
 ExecStart={c.python} -m open_trader prediction-service --mode {c.mode} --data-dir {c.runtime_root}/data --config {c.runtime_root}/config/prediction_arbitrage.json --host 127.0.0.1 --port 8769 --release-manifest {c.release_root}/ops/prediction-service-release.json
 {resources}Restart={'no' if guarded else 'on-failure'}
@@ -389,15 +397,49 @@ def live_identity(c: CloudConfig) -> dict:
     if unit_state()['MainPID'] != str(pid):
         raise ValueError('owner changed during inspection')
     release_identity(c)  # Recheck after process and API observations.
+    isolation = {}
+    if c.lp_instance_id is not None:
+        expected = staged_instance_identity(c)
+        capability = health.get('lp_instance_isolation')
+        if (not isinstance(capability,dict) or capability.get('enabled') is not True
+                or not capability.get('process_epoch')
+                or any(capability.get(k)!=v for k,v in expected.items() if k!='stage')):
+            raise ValueError('running LP instance identity mismatch')
+        isolation={'lp_instance_isolation':{k:v for k,v in capability.items() if k!='observed_at'}|{'stage':'running'}}
     return {'pid': pid, 'git_sha': c.expected_sha, 'candidate_exclusions': effective_exclusions,
             'started_at': health.get('started_at'),
-            'systemd_started_at': state.get('ExecMainStartTimestamp')}
+            'systemd_started_at': state.get('ExecMainStartTimestamp'), **isolation}
 
 
-def preflight(c: CloudConfig) -> None:
+def staged_instance_identity(c: CloudConfig) -> dict:
+    """Read prospective selected identity without requiring a running owner."""
+    from .prediction_release import inspect_lp_instance_capability,selected_lp_config
+    support=inspect_lp_instance_capability(c.release_root)
+    if support['source_sha']!=c.expected_sha:raise ValueError('LP instance source SHA mismatch')
+    user=service_user(c)
+    config=c.runtime_root/'config/prediction_arbitrage.json'
+    with selected_lp_config(config,uid=user.pw_uid,gid=user.pw_gid) as (configuration,selection,recheck):
+        if configuration.lp_instance_id!=c.lp_instance_id or c.lp_instance_id is None:
+            raise ValueError('selected LP instance mismatch')
+        account=configuration.wallet_address.casefold()
+        database=c.runtime_root/'data/prediction_arbitrage/prediction_arbitrage.sqlite3'
+        if database.exists():
+            with closing(sqlite3.connect(database.resolve().as_uri()+'?mode=ro',uri=True)) as connection:
+                exists=connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lp_instance_binding'").fetchone()
+                binding=connection.execute('SELECT account_id,venue,instance_id FROM lp_instance_binding WHERE singleton=1').fetchone() if exists else None
+                if binding is not None and tuple(binding)!=(account,'polymarket',c.lp_instance_id):
+                    raise ValueError('LP database instance mismatch')
+        recheck()
+    return {**support,'stage':'staged','instance_id':c.lp_instance_id,'account_id':account,
+        'venue':'polymarket','code_root':str(c.release_root),'runtime_root':str(c.runtime_root),
+        'config_path':selection['path'],'config_sha256':selection['sha256']}
+
+
+def preflight(c: CloudConfig) -> dict | None:
     release_identity(c)
     absent(c)
     trusted_layout(c)
+    isolation=staged_instance_identity(c) if c.lp_instance_id is not None else None
     run(str(c.python), '-c', 'import sys; assert sys.version_info >= (3,12)' +
         ('; import tencentcloud.ssm.v20190923.ssm_client' if credential_backend(c) == 'tencent-ssm' else ''))
     from .prediction_arbitrage_store import read_minimum_reader_generation
@@ -415,6 +457,7 @@ def preflight(c: CloudConfig) -> None:
             *(['--require-trading-region'] if c.mode == 'production' or not c.n_leg_paused else []), timeout=60)
     if os.statvfs(c.runtime_root).f_bavail * os.statvfs(c.runtime_root).f_frsize < 1024**3:
         raise ValueError('less than 1 GiB free runtime storage')
+    return isolation
 
 
 def systemd_record_identity(c):
@@ -910,11 +953,15 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
             or type(extras) not in (list,tuple) or any(v not in ('cloud-ssm','browser') for v in extras)):
         raise ValueError('runtime extras require a production mutation')
     if action == 'preflight':
-        preflight(c)
+        isolation=preflight(c)
+        if isolation is not None:
+            from datetime import UTC,datetime
+            isolation={**isolation,'observed_at':datetime.now(UTC).isoformat()}
         return {'status': 'PRECHECK_OK', 'git_sha': c.expected_sha, 'mode': c.mode,
                 'n_leg_paused': c.effective_n_leg_paused, 'configured_n_leg_paused': c.n_leg_paused,
                 'credential_backend': credential_backend(c),
-                'candidate_exclusions': c.candidate_exclusions}
+                'candidate_exclusions': c.candidate_exclusions,
+                **({'lp_instance_isolation':isolation} if isolation is not None else {})}
     if action == 'status' and unit_state()['MainPID'] == '0':
         absent(c)
         installed_unit(c)
@@ -961,6 +1008,10 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
         component = {'mode': c.mode, 'n_leg_paused': c.effective_n_leg_paused,
                      'configured_n_leg_paused': c.n_leg_paused,
                      'credential_backend': credential_backend(c), 'candidate_exclusions': c.candidate_exclusions}
+        if 'lp_instance_isolation' in evidence:
+            from datetime import UTC,datetime
+            evidence={**evidence,'lp_instance_isolation':{**evidence['lp_instance_isolation'],
+                'observed_at':datetime.now(UTC).isoformat()}}
         return {'status': 'RUNNING' if action == 'status' else 'BACKEND_SMOKE_OK',
                 **evidence, **component, **({'display_snapshot':display_evidence} if display_evidence else {})}
     if os.geteuid() != 0:

@@ -223,3 +223,5 @@ _Avoid_: 单次请求超时、递增退避
 _Avoid_: ACK 即释放占用、每次核对重发原请求
 
 **LP Facts Reader**：读取当前余额／allowance、挂单、持仓及相关市场事实，保留各源时间、完整性与脱敏错误。正常自动规划不读取全量成交历史，2026-10-20 起 BUY 预算不再扣库存成本，但持仓成本仍须完整已知；历史保持未读／未知，UNKNOWN 或成交恢复可按需取证。收益计算和窄字段持久发布在下游完成，暂停和空计划也更新当前挂单收益。显式手动命令保留新鲜校验，状态 GET 为纯快照。逐 BUY 独立 scope、completed reference cache、5/6 秒取消清理及第 11 次精确失败保护见 [ADR 0006](docs/adr/0006-lp-owned-async-reads.md)；金融/计划 owner 仍沿用 [ADR 0005](docs/adr/0005-lp-serial-fact-cycle.md)。
+
+- [ADR 0008: reliable local LP instance ownership](docs/adr/0008-lp-local-instance-ownership.md) distinguishes local management from full-wallet financial authority for approved same-wallet hosts.

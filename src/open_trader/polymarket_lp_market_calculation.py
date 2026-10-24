@@ -188,6 +188,13 @@ def select_current_composition(frame, policy, calculation, *, orders_accepted=Tr
         remaining = reserved
         if not budget_reduction:
             capacity = reserved
+    if frame.managed_order_ids is not None and reserved is not None:
+        # Nonmanaged BUYs keep their full financial cost, without becoming
+        # candidates/victims. A management projection cannot release wallet funds.
+        managed_reserved = sum((r['remaining']*r['price'] for r in frame.current_buys), Decimal(0))
+        other_reserved = max(Decimal(0), reserved-managed_reserved)
+        if remaining is not None:remaining=max(Decimal(0),remaining-other_reserved)
+        if capacity is not None:capacity=max(Decimal(0),capacity-other_reserved)
     protected = [({**row, 'existing': True}, None, row['remaining'] * row['price'])
         for row in frame.current_buys if estimates[row['order_id']] is None]
     protected_cost = sum((item[2] for item in protected), Decimal(0))
