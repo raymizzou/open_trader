@@ -436,6 +436,8 @@ def create_prediction_server(
                         ),
                         "mutations": "prohibited" if mode == "shadow" else "enabled",
                         "runtime_state": str(getattr(runtime, "state", "")),
+                        "lp_instance_isolation": getattr(runtime, "lp_instance_isolation",
+                            {"enabled": False, "reason": "owner_unavailable"}),
                         **metadata,
                         "code_root": str(Path(__file__).resolve().parent.parent),
                         "codex": evidence.get("codex", {}),

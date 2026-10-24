@@ -226,6 +226,12 @@ class TradingConfig:
     signer_address: str
     wallet_address: str
     predict: PredictConfig | None = None
+    lp_instance_id: str | None = None
+
+    def __post_init__(self):
+        if self.lp_instance_id is not None:
+            from .lp_order_ownership import validate_instance_id
+            validate_instance_id(self.lp_instance_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,9 +507,12 @@ def load_trading_config(path: Path) -> TradingConfig:
     if not isinstance(payload, dict):
         raise ValueError("prediction arbitrage config must be an object")
     expected = {"signer_address", "wallet_address"}
-    if set(payload) not in (expected, expected | {"predict"}):
+    if not expected <= set(payload) or set(payload) - expected - {"predict", "lp_instance_id"}:
         raise ValueError("prediction arbitrage config must contain signer_address and wallet_address")
     predict: PredictConfig | None = None
+    if 'lp_instance_id' in payload:
+        from .lp_order_ownership import validate_instance_id
+        validate_instance_id(payload['lp_instance_id'])
     if "predict" in payload:
         predict_payload = payload["predict"]
         if not isinstance(predict_payload, dict) or set(predict_payload) != {
@@ -522,6 +531,7 @@ def load_trading_config(path: Path) -> TradingConfig:
         signer_address=_canonical_address(payload.get("signer_address"), "signer_address"),
         wallet_address=_canonical_address(payload.get("wallet_address"), "wallet_address"),
         predict=predict,
+        lp_instance_id=payload.get('lp_instance_id'),
     )
 
 
@@ -6185,6 +6195,29 @@ class PolymarketTradingClient:
 
     def lp_post_order(self, signed_order: object) -> object:
         return self._client.post_order(signed_order)
+
+    def lp_prepare_limit_order(self, **kwargs):
+        """Prepare one signed LP payload with verified canonical identity."""
+        from .lp_order_ownership import verify_signed_order, normalize_sell_quantity
+        if kwargs['side'] == 'SELL':
+            kwargs = {**kwargs, 'quantity': normalize_sell_quantity(kwargs['quantity'])}
+        signed = self.lp_create_limit_order(**kwargs)
+        return verify_signed_order(signed, signer=self.config.signer_address,
+            wallet=self.config.wallet_address, environment=getattr(self._client, 'environment', PRODUCTION),
+            token_id=str(kwargs['token_id']), side=kwargs['side'],
+            price=kwargs['price'], quantity=kwargs['quantity'])
+
+    def lp_prepare_protected_sell(self, *, token_id, quantity, min_price):
+        """Prepare, verify and identify a protected SELL without posting it."""
+        from .lp_order_ownership import verify_signed_order, normalize_sell_quantity
+        quantity = normalize_sell_quantity(quantity)
+        if min_price <= 0 or quantity <= 0:
+            raise ValueError('protected_exit_floor_invalid')
+        signed = self._client.create_market_order(token_id=token_id, side='SELL',
+            shares=quantity, min_price=min_price, order_type='FOK')
+        return verify_signed_order(signed, signer=self.config.signer_address,
+            wallet=self.config.wallet_address, environment=getattr(self._client,'environment',PRODUCTION),
+            token_id=token_id, side='SELL', price=min_price, quantity=quantity, protected=True)
 
     def get_order_scoring(self, order_id: str) -> bool:
         return self._client.get_order_scoring(order_id=order_id) is True

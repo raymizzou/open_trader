@@ -10315,6 +10315,14 @@ def test_lp_dashboard_payload_keeps_orders_and_positions_intact(
         # manual rows stay unattributed.
         "session_id": None,
         "scoring_status": "false",
+        "pool_affiliation": {
+            "state": "error",
+            "reason": "account_identity_mismatch",
+            "account_id": None,
+            "condition_id": "condition-1",
+            "token_id": "yes-token",
+            "order_id": "manual-order",
+        },
     }
     assert dashboard["positions"] == [
         {
