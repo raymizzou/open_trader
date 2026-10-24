@@ -271,9 +271,18 @@ mutation/notification attempts。`data-check --config <runtime-config> --sample 
 是另一项数据检查，最佳 `PARTIAL` 也不等于完整池/live-feed 验收。普通 SDK
 `create()` 可能创建凭据或钱包，不能替代只读 read-auth。
 
-生产仍按现有 SSM-only profile，使用固定 secret version、最小 CAM 权限、
-明确 SSM region、metadata isolation 和 old-owner 停止证据。file profile
-不成为生产通道。具体非秘密字段和切换条件见 [凭据与所有权](prediction-cloud.md)。
+2026-10-24：配置校验也支持显式 `mode: production`、请求值
+`n_leg_paused: 1` 的 file profile。沿用上述独立的私有凭据路径和
+service-owned 0700/0600 边界，不得混入 SSM 引用；unit 只固定 backend/path
+和 production 模式，不包含秘密值。生产 preflight 仍须以 service 身份执行
+`wallet read-auth --require-trading-region`，失败不能返回 `PRECHECK_OK`。
+现有 SSM profile 的固定 secret version、最小 CAM 权限、明确 region、
+metadata isolation 和 old-owner 停止证据要求不变；不改现有生产门禁。
+具体非秘密字段见 [凭据与所有权](prediction-cloud.md)。
+
+本项仅增加 production-file 配置兼容能力，不代表东京可以实盘。同钱包逐实例
+订单归属、并行 owner 的 cloud gate 和地域门禁处置仍待完成。本次未部署、
+启动服务或实盘下单；上文历史 Shadow 失败及未验收项继续保留。
 
 ## 5. 地域、公开可达与订单测试
 

@@ -110,8 +110,9 @@ setup or create, replace or revoke an API key for this probe.
 The file backend is explicit: `OPEN_TRADER_CREDENTIAL_BACKEND=file` and
 `OPEN_TRADER_CREDENTIAL_FILE=/var/lib/open-trader/prediction-credentials/polymarket.json`.
 Missing or invalid files fail closed with no fallback. The process only opens
-the file for reading. No instance role or metadata isolation attestation is
-needed for this file profile. Existing SSM profiles remain available:
+the file for reading. The file credential loader does not use an instance role
+or SSM. Existing production deployment attestations and gates still apply.
+Existing SSM profiles remain available:
 
 Install the optional `cloud-ssm` extra only for an SSM profile in the release's Python 3.12 virtualenv.
 The approved pins are `tencentcloud-sdk-python-ssm==3.1.160` and
@@ -275,8 +276,19 @@ Shadow config after the operator has privately imported the credential file:
 ```
 
 These fields extend the complete example above; they are not a standalone
-config. File credentials are accepted only with `mode: shadow` and
-`n_leg_paused: 1`. The service remains read-only in an independent runtime.
+config. File credentials require requested `n_leg_paused: 1`, a separate absolute
+credential path outside the release, and no SSM references. Explicit
+`mode: shadow` retains the read-only service in an independent runtime.
+Explicit `mode: production` is also supported with the same private,
+service-owned credential boundary. The unit pins the chosen mode and only the
+credential backend/path; it contains no secret values.
+
+Production-file profile support alone does not establish Tokyo live readiness.
+Same-wallet per-instance order ownership, the parallel-owner cloud gate and the
+geographic-gate disposition remain pending. Production preflight still requires
+service-user `wallet read-auth --require-trading-region`; its failure blocks
+`PRECHECK_OK`. This capability change does not deploy or start a service, enable
+live orders, or waive any existing gate.
 
 The cloud config requires an explicit `"mode": "production"` or
 `"mode": "shadow"`; a missing or unknown value fails closed. The selected mode
@@ -285,8 +297,8 @@ automatically, and selecting another mode requires the matching stopped-owner,
 credential, readiness and authorization gates. The helper also accepts simple
 alphanumeric/dash/underscore SSM references and absolute paths without spaces or
 systemd specifiers. Use those names when creating the dedicated credential.
-Production and Shadow profiles requesting legacy `n_leg_paused: 0` continue
-to require those four SSM references.
+SSM production profiles and Shadow profiles requesting legacy `n_leg_paused: 0`
+continue to require those four SSM references.
 Credentialless paused Shadow requires them to be omitted, pins
 `OPEN_TRADER_CREDENTIAL_BACKEND=disabled`, and never touches Keychain, SSM or
 instance metadata.

@@ -6,6 +6,39 @@ pytestmark = pytest.mark.xdist_group("prediction_cloud_ports")
 from open_trader.prediction_cloud import CloudConfig, credential_backend, load_config, render_unit
 
 
+def test_file_production_profile_preserves_explicit_mode_and_credentials_boundary(tmp_path):
+    profile = dict(
+        release_root=str(tmp_path/'release'), runtime_root=str(tmp_path/'runtime'),
+        python=str(tmp_path/'venv/bin/python'), user='prediction', expected_sha='a'*40,
+        mode='production', n_leg_paused=1, credential_backend='file',
+        credentials_file='/var/lib/open-trader/prediction-credentials/polymarket.json')
+    path = tmp_path/'cloud.json'
+    path.write_text(json.dumps(profile))
+    cfg = load_config(path)
+    unit = render_unit(cfg)
+    assert cfg.mode == 'production' and cfg.n_leg_paused == 1
+    assert cfg.credential_backend == 'file'
+    assert cfg.credentials_file == '/var/lib/open-trader/prediction-credentials/polymarket.json'
+    assert (cfg.region, cfg.secret, cfg.version, cfg.role) == ('', '', '', '')
+    assert '--mode production ' in unit and '--mode shadow' not in unit
+    assert 'Environment=OPEN_TRADER_NLEG_PAUSED=1\n' in unit
+    assert 'Environment=OPEN_TRADER_CREDENTIAL_BACKEND=file\n' in unit
+    assert 'Environment=OPEN_TRADER_CREDENTIAL_FILE=/var/lib/open-trader/prediction-credentials/polymarket.json\n' in unit
+    assert 'OPEN_TRADER_SSM_' not in unit
+    assert all(value not in unit for value in ('private_key', 'SecretKey', 'passphrase', 'builder_secret'))
+    for invalid in (
+        dict(n_leg_paused=0),
+        *({field: 'ssm-reference'} for field in ('region', 'secret', 'version', 'role')),
+        dict(credentials_file='relative/polymarket.json'),
+        dict(credentials_file=str(tmp_path/'release/credentials.json')),
+        dict(credentials_file='/var/lib/../credentials.json'),
+        dict(credentials_file='/var/lib/unsafe path.json'),
+    ):
+        path.write_text(json.dumps({**profile, **invalid}))
+        with pytest.raises(ValueError):
+            load_config(path)
+
+
 def test_systemd_unit_pins_all_code_paths_and_keeps_secrets_out(tmp_path):
     cfg = CloudConfig(release_root=tmp_path/'release', runtime_root=tmp_path/'runtime',
         python=tmp_path/'venv/bin/python', user='prediction', expected_sha='a'*40,
@@ -56,8 +89,13 @@ def test_systemd_unit_pins_all_code_paths_and_keeps_secrets_out(tmp_path):
     assert 'OPEN_TRADER_CREDENTIAL_BACKEND=file' in file_unit
     assert 'OPEN_TRADER_CREDENTIAL_FILE=/var/lib/open-trader/prediction-credentials/polymarket.json' in file_unit
     assert 'OPEN_TRADER_SSM_' not in file_unit
+    file_production = CloudConfig(**{**file_shadow.__dict__, 'mode': 'production'})
+    assert '--mode production' in render_unit(file_production)
+    assert 'OPEN_TRADER_CREDENTIAL_BACKEND=file' in render_unit(file_production)
     with pytest.raises(ValueError):
-        render_unit(CloudConfig(**{**file_shadow.__dict__, 'mode': 'production'}))
+        render_unit(CloudConfig(**{**file_production.__dict__, 'n_leg_paused': 0}))
+    with pytest.raises(ValueError, match='disabled backend requires'):
+        render_unit(CloudConfig(**{**cfg.__dict__, 'mode': 'production', 'credential_backend': 'disabled'}))
     missing.write_text(json.dumps({
         'release_root':str(tmp_path/'release'),'runtime_root':str(tmp_path/'runtime'),
         'python':str(tmp_path/'venv/bin/python'),'user':'prediction','expected_sha':'a'*40,
@@ -138,6 +176,51 @@ def test_cloud_preflight_file_shadow_uses_safe_auth_without_ssm(tmp_path, monkey
     assert not any('--require-trading-region' in args for args in commands)
     assert not any('import tencentcloud' in ' '.join(args) for args in commands)
     assert any('OPEN_TRADER_CREDENTIAL_FILE='+cfg.credentials_file in args for args in commands)
+
+
+def test_file_production_preflight_requires_service_auth_and_region_without_ssm(tmp_path, monkeypatch):
+    import subprocess
+    import open_trader.prediction_cloud as cloud
+    from tests.test_prediction_retirement_lifecycle import cloud_host_fixture
+
+    _, _, commands, requests = cloud_host_fixture(tmp_path, monkeypatch, 'production', 1)
+    path = tmp_path/'cloud.json'
+    path.write_text(json.dumps(dict(
+        release_root=str(tmp_path/'release'), runtime_root=str(tmp_path/'runtime'),
+        python=str(tmp_path/'python'), user='prediction', expected_sha='a'*40,
+        mode='production', n_leg_paused=1, credential_backend='file',
+        credentials_file='/var/lib/open-trader/prediction-credentials/polymarket.json')))
+    cfg = cloud.load_config(path)
+    external = subprocess.run
+    failures = [None]
+
+    def checked_external(command, **kwargs):
+        if failures[0] is not None and 'read-auth' in command:
+            commands.append(list(command))
+            return subprocess.CompletedProcess(command, 2, '', failures[0])
+        return external(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'run', checked_external)
+    result = cloud.operate(cfg, 'preflight')
+    assert result == dict(status='PRECHECK_OK', git_sha='a'*40, mode='production',
+        n_leg_paused=1, configured_n_leg_paused=1, credential_backend='file', candidate_exclusions=False)
+    for failure in (None, 'fixture authentication denied', 'fixture trading region blocked'):
+        if failure is not None:
+            commands.clear()
+            failures[0] = failure
+            with pytest.raises(ValueError, match='runuser inspection failed'):
+                cloud.operate(cfg, 'preflight')
+        auth, = [command for command in commands if 'read-auth' in command]
+        assert auth[:5] == ['runuser', '-u', 'prediction', '--', 'env']
+        assert 'OPEN_TRADER_CREDENTIAL_BACKEND=file' in auth
+        assert 'OPEN_TRADER_CREDENTIAL_FILE=/var/lib/open-trader/prediction-credentials/polymarket.json' in auth
+        assert auth[-9:] == [str(tmp_path/'python'), '-m', 'open_trader',
+            'prediction-arb', 'wallet', 'read-auth', '--config',
+            str(tmp_path/'runtime/config/prediction_arbitrage.json'), '--require-trading-region']
+        assert not any('SSM_' in argument or 'tencentcloud' in argument for command in commands for argument in command)
+        assert all(command[0] in {str(tmp_path/'python'), 'git', 'runuser', 'ss', 'systemctl'} for command in commands)
+        assert all(command[0] != 'systemctl' or command[1] == 'show' for command in commands)
+        assert requests == []
 
 
 @pytest.mark.parametrize(('mode','n_leg_paused'), [
