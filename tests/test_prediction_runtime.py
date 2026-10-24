@@ -10288,6 +10288,7 @@ def test_lp_dashboard_payload_keeps_orders_and_positions_intact(
     assert order.pop("scoring_last_success_at") == scoring_checked_at
     assert order == {
         "order_id": "manual-order",
+        "account_id": None,
         "market_id": "market-1",
         "condition_id": "condition-1",
         "market_title": "Intact LP market",
