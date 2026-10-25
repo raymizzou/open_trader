@@ -101,3 +101,65 @@ to `lp_read_log_limited` counts. Logging is best effort: process exit, sink fail
 or overflow can lose events. `output_continuity=unknown` explicitly avoids claiming
 complete output history, even when the in-memory episode is intact. This log is
 not a persistent audit store. Missing lines do not establish success or rejection.
+
+
+## Financial timeout await snapshot
+
+`GET /api/prediction-arbitrage/lp/auto/state` exposes the latest financial
+read timeout at `diagnostics.async_reads.last_financial_timeout`. The same
+value is available from `LPReadRuntime.status()`. It is `null` before the first
+financial timeout. It is memory-only and survives scope retirement, but not a
+process restart. It is observation evidence; it does not grant financial or
+trading authority and does not prove the cause of a network stall.
+
+The existing supervisor still seals an incomplete/UNKNOWN result at the
+five-second attempt deadline. It immediately records a pending summary without
+waiting for the I/O loop. On the owning control loop, the existing cancellation
+callback copies await-location metadata **before** cancelling the source tasks.
+It stages only values for publication by the supervisor's next existing tick.
+Sampling adds no lock wait, network, disk, logging, await or scheduler wakeup to
+that callback. Diagnostic failure does not suppress cancellation. Response close,
+actual resource exit, the six-second cleanup-fault boundary, recovery, cadence,
+Retry-After, identity checks and no-replay protections keep their existing meaning.
+
+Read the record with these limits:
+
+- `attempt` and bounded `observation_id` identify the original timeout, rather
+  than a later demand. `observation_id_truncated` discloses identity truncation.
+  Old staged captures cannot replace a newer timeout record.
+- `started_monotonic`, `deadline_monotonic` and `timeout_monotonic` distinguish
+  attempt start, deadline and timeout publication. `captured_monotonic` is the
+  actual sampling time, independent of the deadline. These are process-local
+  monotonic times, not UTC timestamps or identities across restarts.
+- `capture_state=pending` means no capture has been published yet; the I/O loop
+  may still be blocked. `captured` means safe metadata was copied, not that the
+  full chain was visible. `unavailable` means observation failed; no exception
+  message or guessed wait location is exposed. A known sampling time is retained
+  even when observation fails. `late=true` explicitly marks sampling after the
+  original deadline. Missing sampling time and lateness remain `null`.
+- `sources` contains at most `balance`, `open_orders` and `positions`. A captured
+  source's `state=done` means its task was already done when sampled; it does not
+  certify successful financial facts. `pending` means that source was unfinished
+  at capture. Neither state says that cancellation has completed or that a
+  response is closed.
+- Each source retains the deepest 16 safely observed frames from at most 64
+  native await links. Frames contain only a module/file basename, function name
+  and line number, with 64-character ASCII text caps and `text_truncated`.
+  `walked`, `truncated` and `end` disclose missing context. `end=unknown` is
+  normal at an opaque or native Future boundary. No phase is inferred beyond an
+  opaque or truncated boundary, even when an earlier frame suggests HTTP work.
+
+The only compatibility bridge is CPython's exact native `async_generator_asend`
+type, established from an inert local generator. `gc.get_referents` is used only
+on that exact type, and only a single native async-generator referent is followed.
+The bridge counts toward the 64-link cap. Custom objects, spoofed type names,
+other referents, locals, payloads, headers, URLs, wallets, exceptions and HTTP pool
+internals are not inspected. No live driver is advanced or closed by observation.
+The record holds copied values, with a hard 16 KiB JSON budget; existing combined
+diagnostic payload coverage retains its 256 KiB limit. GET returns detached
+values and does not initiate reads, cancel requests, write storage or wake work.
+
+Opaque/native awaiters can prevent this snapshot from identifying a network
+phase. Deployment and a later recurrence are separate from implementation and
+from root-cause proof. Deployment needs its own authorization and exact-SHA gates;
+a restart can remove the current stalled process and its in-memory evidence.

@@ -5,14 +5,84 @@ import time
 import asyncio
 import threading
 import json
-from collections import OrderedDict
+import gc
+from collections import OrderedDict, deque
 from datetime import UTC, datetime
-from types import MappingProxyType
+from types import MappingProxyType, CoroutineType, GeneratorType, AsyncGeneratorType
 from .polymarket_lp_market_reader import freeze, SourceResult
 
 BUY_SCOPE_CAP = 64
 REFERENCE_CACHE_ENTRIES = 256
 REFERENCE_CACHE_BYTES = 8*1024*1024
+FINANCIAL_WAIT_BYTES = 16*1024
+FINANCIAL_WAIT_FRAMES = 16
+FINANCIAL_WAIT_LINKS = 64
+_FINANCIAL_SOURCES = ('balance', 'open_orders', 'positions')
+
+
+def _native_asend_type():
+    # Establish the native type without trusting an arbitrary object's name.
+    async def sentinel():
+        yield None
+    generator = sentinel()  # Inert, never entered; owns no external resources.
+    driver = generator.__anext__()
+    driver_type = type(driver)
+    driver.close()  # Only our local sentinel, never a captured live driver.
+    return driver_type
+
+
+_NATIVE_ASEND_TYPE = _native_asend_type()
+
+
+def _location_text(value, limit=64):
+    # Code metadata / opaque observation identity only; never stringify objects.
+    if type(value) is not str:
+        return 'unknown'
+    return ''.join(c if c.isascii() and (c.isalnum() or c in '_.:-<>') else '_'
+                   for c in value[:limit])
+
+
+def _await_locations(task):
+    """Inspect native await links only, retaining the deepest safe locations.
+
+    Unknown awaiters are terminal: no repr, arbitrary attributes, locals, task
+    enumeration or client/pool introspection. Returned values own no frames.
+    """
+    frames = deque(maxlen=FINANCIAL_WAIT_FRAMES)
+    current = task.get_coro()
+    walked = 0
+    while current is not None and walked < FINANCIAL_WAIT_LINKS:
+        if type(current) is CoroutineType:
+            code, frame, following = current.cr_code, current.cr_frame, current.cr_await
+        elif type(current) is GeneratorType:
+            code, frame, following = current.gi_code, current.gi_frame, current.gi_yieldfrom
+        elif type(current) is AsyncGeneratorType:
+            code, frame, following = current.ag_code, current.ag_frame, current.ag_await
+        elif type(current) is _NATIVE_ASEND_TYPE:
+            # CPython exposes no public next-link on this native driver. Only
+            # this exact type may bridge to its single native async generator.
+            generators = [item for item in gc.get_referents(current)
+                          if type(item) is AsyncGeneratorType]
+            walked += 1
+            if len(generators) == 1:
+                current = generators[0]
+                continue
+            return dict(frames=list(frames), walked=walked, end='unknown',
+                        truncated=walked > FINANCIAL_WAIT_FRAMES)
+        else:
+            return dict(frames=list(frames), walked=walked, end='unknown',
+                        truncated=walked > FINANCIAL_WAIT_FRAMES)
+        walked += 1
+        if frame is not None:
+            basename = code.co_filename.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+            frames.append(dict(file=_location_text(basename), function=_location_text(code.co_name),
+                               line=min(999999999, max(0, frame.f_lineno)),
+                               text_truncated=len(basename)>64 or len(code.co_name)>64))
+        current = following
+    return dict(frames=list(frames), walked=walked,
+                end='complete' if current is None else 'unknown',
+                truncated=walked > FINANCIAL_WAIT_FRAMES or current is not None)
+
 
 @dataclass(frozen=True)
 class ReadDemand:
@@ -61,6 +131,7 @@ class _Scope:
         self.retiring=False;self.attempt=0;self.next_start=0;self.result=None
         self.started=self.deadline=0;self.actual_end=None;self.expired=False;self.cancel_sent=False;self.fault=False;self.fault_pending=False
         self.financial_cleanup_delayed=False
+        self.financial_wait_capture=None
 
 class LPReadRuntime:
     def __init__(self, source_factory, *, clock=time.monotonic, utc_now=lambda:datetime.now(UTC), buy_cap=BUY_SCOPE_CAP,
@@ -73,6 +144,7 @@ class LPReadRuntime:
         # scalar avoids retaining an unbounded ledger of departed order keys.
         self._attempt_sequence=0
         self._financial_cleanup_faults=0;self._last_financial_cleanup_fault=None
+        self._last_financial_timeout=None
         self._close_lock=threading.Lock()
         self._last_notice=None
         self._observed=-1;self._closed=False;self._started=False;self._signal=threading.Event();self._wakeup=lambda:None
@@ -108,6 +180,15 @@ class LPReadRuntime:
             with self._lock:
                 self._observed=self.clock()
                 for key,scope in tuple(self._scopes.items()):
+                    # The owning loop stages only copied values. Publish on
+                    # the existing supervisor tick, under its existing lock;
+                    # diagnostic work never adds a lock wait before cancel.
+                    capture=scope.financial_wait_capture
+                    if capture is not None:
+                        original,snapshot=capture
+                        scope.financial_wait_capture=None
+                        if self._last_financial_timeout is original:
+                            self._last_financial_timeout=snapshot
                     if self._closed:
                         scope.result=None;scope.fault_pending=False
                     if key not in self._demands:
@@ -187,13 +268,56 @@ class LPReadRuntime:
             if changed:self._notify()
             if done:return
 
-    @staticmethod
-    def _cancel_children(scope):
-        for task in scope.tasks:
-            if not task.done():task.cancel()
+    def _cancel_children(self,scope):
+        # Observation failure must never suppress or postpone original cleanup.
+        try:
+            if scope.demand.kind=='financial' and scope.expired:
+                self._capture_financial_timeout(scope)
+        finally:
+            for task in scope.tasks:
+                if not task.done():task.cancel()
+
+    def _capture_financial_timeout(self,scope):
+        original=self._last_financial_timeout
+        if (original is None or original['attempt']!=scope.attempt
+                or original['capture_state']!='pending' or scope.financial_wait_capture is not None):
+            return
+        captured=None
+        try:
+            captured=self.clock()
+            sources=[]
+            for name,task in zip(scope.demand.sources[:3],scope.tasks[:3]):
+                if name not in _FINANCIAL_SOURCES:continue
+                done=task.done()
+                sources.append(dict(source=name,state='done' if done else 'pending',
+                    **(dict(frames=[],walked=0,end='complete',truncated=False) if done
+                       else _await_locations(task))))
+            snapshot=dict(original,capture_state='captured',captured_monotonic=captured,
+                late=captured>original['deadline_monotonic'],sources=sources)
+            # A second hard bound covers future schema additions as well as the
+            # fixed 3 x 16 x bounded ASCII location schema above.
+            if len(json.dumps(snapshot,allow_nan=False).encode('utf-8'))>FINANCIAL_WAIT_BYTES:
+                raise ValueError('financial_wait_budget')
+        except Exception:
+            snapshot=dict(original,capture_state='unavailable',captured_monotonic=captured,
+                late=None if captured is None else captured>original['deadline_monotonic'])
+        # No lock, event, await or I/O on the cancellation path. The supervisor
+        # checks immutable record identity before accepting this staged value;
+        # an older callback cannot replace a more recent attempt's snapshot.
+        scope.financial_wait_capture=(original,snapshot)
 
     def _expire(self,scope):
         scope.expired=True
+        if scope.demand.kind=='financial':
+            self._last_financial_timeout=dict(attempt=scope.attempt,
+                observation_id=_location_text(scope.demand.observation_id,96),
+                observation_id_truncated=type(scope.demand.observation_id) is str and len(scope.demand.observation_id)>96,
+                started_monotonic=scope.started,deadline_monotonic=scope.deadline,
+                timeout_monotonic=self.clock(),captured_monotonic=None,late=None,
+                capture_state='pending',sources=[dict(source=name,
+                    state='done' if name in scope.completed_sources else 'pending',frames=[],
+                    walked=0,end='unavailable',truncated=False)
+                    for name in scope.demand.sources[:3] if name in _FINANCIAL_SOURCES])
         scope.result=MarketAttempt(scope.demand,scope.attempt,scope.started,scope.deadline,self.clock(),
             freeze_sources({name:scope.completed_sources.get(name,SourceResult('',complete=False,error='timeout')) for name in scope.demand.sources}),
             False,'timeout')
@@ -358,6 +482,7 @@ class LPReadRuntime:
                 observed_monotonic=self._observed,cleanup_faults=faults,owned_buy_scopes=len(owned),
                 financial_cleanup_faults=self._financial_cleanup_faults,
                 last_financial_cleanup_fault=self._last_financial_cleanup_fault,
+                last_financial_timeout=self._last_financial_timeout,
                 retiring_buy_scopes=sum(s.retiring for s in owned),deferred_count=len(deferred),
                 deferred_order_ids=tuple(d.order_id for d in deferred[:64]),new_buy_allowed=len(owned)<self.buy_cap and not deferred and not fixed_faults,
                 ready_buy_count=sum(s.result is not None or s.fault_pending for s in owned),
