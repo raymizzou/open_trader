@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-25 — Income rebuild test completion
+
+- Observe the actual three-slot income group and native action completion before checking the final portfolio. Preserve exact 50/30/20 amounts, manual-order protection and all existing assertions. Test synchronization only; production behavior and CI classification are unchanged.
+
 ## 2026-10-24 — LP read-only observation and rollback test fixtures
 
 - Wait for all due background reads before asserting that current pool membership reads leave state, requests and stored roles unchanged. Serialize an unset instance identity as an absent field in the retained rollback fixture. Test-only repair; production behavior and CI classification are unchanged.
