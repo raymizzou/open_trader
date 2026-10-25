@@ -6195,24 +6195,451 @@ def test_lp_metadata_error_response_diagnostics_are_bounded_and_redacted(
     ]
 
 
-def test_lp_metadata_shares_one_public_client_per_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    probe = _LpMetadataProbe()
-    condition_ids = tuple(f"0x{index:064x}" for index in range(201))
-    for index, condition_id in enumerate(condition_ids):
-        probe.market_rows[condition_id] = _lp_cache_market(
-            condition_id, slug=f"cache-{index}"
+def test_lp_metadata_concurrent_h2_reads_preserve_wire_request_identity(monkeypatch) -> None:
+    """Use installed SDK→httpx→httpcore→h2 and a byte-level offline peer."""
+    import h2.config
+    import h2.connection
+    import h2.events
+    import hpack
+    import httpcore
+    import httpx
+    from httpcore._sync.http2 import HTTP2Connection
+    from httpcore._models import Origin, Request
+
+    ids_a = tuple(f"0x{index:064x}" for index in range(100))
+    ids_c = ("0x" + "c" * 64,)
+    # Literal response truth is held by the external peer, independently of
+    # the adapter's projection, request identity, or scheduling instrumentation.
+    markets = {cid: dict(_lp_market_payload(cid), events=[{"id": "42"}])
+               for cid in (*ids_a, *ids_c)}
+    held = threading.Event()
+    release = threading.Event()
+    b_done = threading.Event()
+    errors = []
+    decoded = []
+    peers = []
+    original_encode = hpack.Encoder.encode
+
+    def encode(encoder, headers, huffman=True):
+        headers = list(headers)
+        path = dict(headers).get(b":path", b"")
+        if ids_a[50].encode() in path:
+            assert held.wait(5), "first original encode must precede second"
+        block = original_encode(encoder, headers, huffman=huffman)
+        if ids_a[0].encode() in path:
+            held.set()
+            assert release.wait(5), "independent HPACK scheduler watchdog"
+        return block
+
+    monkeypatch.setattr(hpack.Encoder, "encode", encode)
+
+    class Peer:
+        def __init__(self):
+            self.condition = threading.Condition()
+            self.server = h2.connection.H2Connection(config=h2.config.H2Configuration(
+                client_side=False, header_encoding="utf-8"))
+            self.server.initiate_connection()
+            self.buffer = bytearray(self.server.data_to_send())
+            self.closed = False
+            peers.append(self)
+
+        def write(self, data, timeout=None):
+            with self.condition:
+                try:
+                    for event in self.server.receive_data(data):
+                        if not isinstance(event, h2.events.RequestReceived):
+                            continue
+                        path = dict(event.headers)[":path"]
+                        query = parse_qs(urlsplit(path).query)
+                        decoded.append(path)
+                        if path == "/prime":
+                            payload = {}
+                        elif path.startswith("/markets/keyset"):
+                            payload = {"markets": [markets[cid] for cid in query["condition_ids"]]}
+                        else:
+                            assert path.startswith("/events/keyset")
+                            assert query["id"] == ["42"]
+                            payload = {"events": [{"id": "42", "slug": "literal-parent", "ended": True}]}
+                        body = json.dumps(payload).encode()
+                        self.server.send_headers(event.stream_id, [
+                            (":status", "200"), ("content-type", "application/json"),
+                            ("content-length", str(len(body))),
+                        ])
+                        for offset in range(0, len(body), 16000):
+                            self.server.send_data(event.stream_id, body[offset:offset + 16000],
+                                                  end_stream=offset + 16000 >= len(body))
+                except Exception as exc:
+                    errors.append(type(exc).__name__)
+                self.buffer.extend(self.server.data_to_send())
+                self.condition.notify_all()
+
+        def read(self, max_bytes, timeout=None):
+            with self.condition:
+                deadline = time.monotonic() + 3
+                while not self.buffer and not self.closed:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise httpcore.ReadTimeout("offline peer watchdog")
+                    self.condition.wait(remaining)
+                data = bytes(self.buffer[:max_bytes])
+                del self.buffer[:max_bytes]
+                return data
+
+        def close(self):
+            with self.condition:
+                self.closed = True
+                self.condition.notify_all()
+
+        def get_extra_info(self, name):
+            return None
+
+    class Transport(httpx.BaseTransport):
+        def __init__(self):
+            self.connection = HTTP2Connection(Origin(b"https", b"gamma-api.polymarket.com", 443), Peer())
+            # Warm the actual encoder/decoder tables before any concurrency.
+            response = self.handle_request(httpx.Request("GET", "https://gamma-api.polymarket.com/prime"))
+            response.read()
+
+        def handle_request(self, request):
+            core_request = Request(request.method, str(request.url), headers=request.headers.raw,
+                                   extensions={"timeout": {"read": 3, "write": 3}})
+            try:
+                response = self.connection.handle_request(core_request)
+                try:
+                    body = response.read()
+                    return httpx.Response(response.status, headers=response.headers, content=body,
+                                          request=request)
+                finally:
+                    response.close()
+            finally:
+                if ids_a[50] in str(request.url):
+                    b_done.set()
+
+        def close(self):
+            self.connection.close()
+
+    def factory():
+        public = PublicClient(PRODUCTION)
+        public._ctx.gamma._client = httpx.Client(base_url=PRODUCTION.gamma_url, transport=Transport())
+        return public
+
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=object(),
+                                     public_client_factory=factory)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(adapter.lp_market_metadata_batch, ids_a)
+        try:
+            assert held.wait(5), "first original HPACK encode not reached"
+            second = pool.submit(adapter.lp_market_metadata_fresh, ids_c, include_diagnostics=True)
+            assert b_done.wait(5), "second real HTTP request did not finish"
+        finally:
+            release.set()
+        results = (first.result(timeout=8), second.result(timeout=8))
+    assert errors == [], f"real peer could not decode HPACK: {errors}"
+    for result, expected in zip(results, (ids_a, ids_c)):
+        assert result["state"] == "known"
+        assert set(result["markets"]) == set(expected)
+        assert result["failed_ids"] == {}
+        assert result["confirmed_absent_ids"] == result["deferred_ids"] == ()
+        assert all(facts["event_id"] == "42" and facts["event_ended"] is True
+                   for facts in result["markets"].values())
+    wire_ids = [cid for path in decoded if path.startswith("/markets/keyset")
+                for cid in parse_qs(urlsplit(path).query)["condition_ids"]]
+    assert sorted(wire_ids) == sorted((*ids_a, *ids_c))
+    assert all(peer.closed for peer in peers)
+
+
+def test_lp_metadata_h2_protocol_diagnostics_keep_codes_and_redact_secrets(caplog) -> None:
+    import h2.events
+    import h2.exceptions
+    import httpcore
+    import httpx
+
+    condition = "0x" + "d" * 64
+    secret = "opaque-secret-sentinel-" + "x" * 3000
+    terminated = h2.events.ConnectionTerminated()
+    terminated.error_code = 11
+    terminated.last_stream_id = 17
+    terminated.additional_data = secret.encode()
+    reset = h2.events.StreamReset(stream_id=13, error_code=7)
+    cases = (
+        (reset, "StreamReset", "7", "13", "unknown"),
+        (terminated, "ConnectionTerminated", "11", "unknown", "17"),
+        (h2.exceptions.ProtocolError(secret), "ProtocolError", "1", "unknown", "unknown"),
+        (None, "RemoteProtocolError", "unknown", "unknown", "unknown"),
+    )
+    for event, kind, code, stream, last_stream in cases:
+        caplog.clear()
+
+        def handler(request):
+            try:
+                raise httpcore.RemoteProtocolError(event, secret, {"Authorization": secret})
+            except httpcore.RemoteProtocolError as cause:
+                raise httpx.RemoteProtocolError(
+                    f"https://secret.invalid/?token={secret}", request=request,
+                ) from cause
+
+        adapter = PolymarketTradingClient(
+            TradingConfig(SIGNER, WALLET), client=object(),
+            public_client_factory=lambda: _lp_mock_public_client(handler),
         )
-    _lp_cache_clock(monkeypatch, datetime(2026, 9, 17, 12, 0, tzinfo=UTC))
-    adapter = _lp_cache_adapter(probe)
+        result = adapter.lp_market_metadata_batch((condition,))
+        assert result["state"] == "unknown"
+        assert result["markets"] == {}
+        assert result["confirmed_absent_ids"] == result["deferred_ids"] == ()
+        assert result["failed_ids"] == {condition: "market_read_TransportError"}
+        assert result["failure_facts"][condition]["error_chain"] == (
+            "TransportError", "RemoteProtocolError",
+        )
+        messages = [record.getMessage() for record in caplog.records]
+        diagnostic, = [message for message in messages if "lp_metadata_read_failed" in message]
+        assert f"protocol_type={kind}" in diagnostic
+        assert f"error_code={code}" in diagnostic
+        assert f"stream_id={stream}" in diagnostic
+        assert f"last_stream_id={last_stream}" in diagnostic
+        assert len(diagnostic) <= 512
+        assert all(value not in "\n".join(messages) for value in (
+            secret, "Authorization", "secret.invalid", "token=", condition,
+        ))
+        assert adapter.lp_metadata_cache_status()["core_entries"] == 0
 
-    result = adapter.lp_market_metadata(condition_ids)
 
+def _lp_tracked_public_factory(handler):
+    """Observe allocation, transport consumption and close at the external boundary."""
+    import httpx
+
+    clients = []
+    lock = threading.Lock()
+
+    def factory():
+        record = SimpleNamespace(owner=threading.get_ident(), active=False,
+                                 closes=0, live_at_creation=0, violations=[])
+        with lock:
+            clients.append(record)
+            record.live_at_creation = sum(value.closes == 0 for value in clients)
+
+        def existing_hook(response):
+            pass
+
+        class Stream(httpx.SyncByteStream):
+            def __init__(self, body):
+                self.body = body
+
+            def __iter__(self):
+                try:
+                    assert threading.get_ident() == record.owner
+                    yield self.body
+                finally:
+                    record.active = False
+
+        def observed(request):
+            if record.active or record.closes or threading.get_ident() != record.owner:
+                record.violations.append("concurrent reuse or wrong owner")
+            record.active = True
+            try:
+                response = handler(request)
+            except BaseException:
+                record.active = False
+                raise
+            return httpx.Response(response.status_code, headers=response.headers,
+                                  stream=Stream(response.content), request=request)
+
+        public = _lp_mock_public_client(observed, response_hooks=(existing_hook,))
+        close = public.close
+
+        def observed_close():
+            if record.active or threading.get_ident() != record.owner:
+                record.violations.append("close before task I/O exited")
+            if public._ctx.gamma._client.event_hooks["response"] != [existing_hook]:
+                record.violations.append("task response hook retained at close")
+            record.closes += 1
+            close()
+
+        public.close = observed_close
+        return public
+
+    return factory, clients
+
+
+def _assert_lp_task_clients_closed(clients):
+    assert clients
+    assert max(record.live_at_creation for record in clients) <= 8
+    assert all(record.closes == 1 and not record.active and not record.violations
+               for record in clients)
+
+
+def test_lp_metadata_task_clients_are_bounded_and_closed_after_io() -> None:
+    condition_ids = tuple(f"0x{index:064x}" for index in range(201))
+    requests = []
+    barrier = threading.Barrier(5)
+
+    def handler(request):
+        ids = tuple(request.url.params.get_list("condition_ids"))
+        requests.append(ids)
+        barrier.wait(5)
+        return _lp_market_page_response(request, [_lp_market_payload(cid) for cid in ids])
+
+    factory, clients = _lp_tracked_public_factory(handler)
+    result = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=object(),
+                                     public_client_factory=factory).lp_market_metadata(condition_ids)
     assert len(result) == 201
-    assert len(probe.clients) == 1
-    assert probe.clients[0].closed is True
-    assert len(probe.market_queries) == 5
+    assert set(result) == set(condition_ids)
+    assert len(requests) == 5
+    assert sorted(map(len, requests)) == [1, 50, 50, 50, 50]
+    assert len(clients) == 5
+    _assert_lp_task_clients_closed(clients)
+
+
+@pytest.mark.parametrize("outcome", ["complete", "failed", "cancelled"])
+def test_lp_metadata_task_client_limit_failure_and_queued_cancellation(outcome) -> None:
+    import httpx
+
+    condition_ids = tuple(f"0x{index:064x}" for index in range(501))
+    stop = threading.Event()
+    barrier = threading.Barrier(8, action=stop.set if outcome == "cancelled" else None)
+    requests = []
+    lock = threading.Lock()
+
+    def handler(request):
+        ids = tuple(request.url.params.get_list("condition_ids"))
+        with lock:
+            requests.append(ids)
+            first_wave = len(requests) <= 8
+        if first_wave:
+            barrier.wait(5)
+        if outcome == "failed" and condition_ids[0] in ids:
+            return httpx.Response(400, json={"error": "unavailable"}, request=request)
+        return _lp_market_page_response(request, [_lp_market_payload(cid) for cid in ids])
+
+    factory, clients = _lp_tracked_public_factory(handler)
+    result = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=object(),
+                                     public_client_factory=factory).lp_market_metadata_batch(
+                                         condition_ids, stop_event=stop)
+    _assert_lp_task_clients_closed(clients)
+    assert max(record.live_at_creation for record in clients) == 8
+    assert result["confirmed_absent_ids"] == ()
+    if outcome == "cancelled":
+        assert len(clients) == len(requests) == 8  # Queued tasks allocate nothing.
+        observed = {cid for ids in requests for cid in ids}
+        assert len(observed) == 400
+        assert result["state"] == "cancelled"
+        assert set(result["markets"]) == observed
+        assert result["failed_ids"] == {}
+        assert set(result["deferred_ids"]) == set(condition_ids) - observed
+    else:
+        assert len(clients) == len(requests) == 11
+        assert result["deferred_ids"] == ()
+        failed = set(condition_ids[:50]) if outcome == "failed" else set()
+        assert result["state"] == ("partial" if failed else "known")
+        assert set(result["markets"]) == set(condition_ids) - failed
+        assert result["failed_ids"] == dict.fromkeys(failed, "market_read_RequestRejectedError")
+
+
+@pytest.mark.parametrize("phase", ["numeric", "direct", "closed-market"])
+@pytest.mark.parametrize("outcome", ["complete", "failed", "cancelled"])
+def test_lp_metadata_task_clients_cover_event_pages_and_closed_fallback(phase, outcome) -> None:
+    import httpx
+
+    condition = "0x" + "e" * 64
+    event_id = "42" if phase == "numeric" else "event-42"
+    stop = threading.Event()
+    requests = []
+
+    def handler(request):
+        requests.append((request.url.path, request.url.params.get("after_cursor")))
+        if request.url.path == "/markets/keyset":
+            if phase == "closed-market" and request.url.params.get("closed") != "true":
+                return _lp_market_page_response(request, ())
+            if phase != "closed-market":
+                return _lp_market_page_response(request, [dict(
+                    _lp_market_payload(condition), events=[{"id": event_id}],
+                )])
+        if outcome == "failed":
+            return httpx.Response(400, json={"error": "unavailable"}, request=request)
+        if outcome == "cancelled":
+            stop.set()
+        if phase == "closed-market":
+            return _lp_market_page_response(request, [_lp_market_payload(condition)])
+        event = {"id": event_id, "slug": "literal-parent", "ended": True}
+        if phase == "direct":
+            return httpx.Response(200, json=event, request=request)
+        # Two real SDK pages must be consumed before this task's client closes.
+        payload = {"events": [event]} if request.url.params.get("after_cursor") else {
+            "events": [], "next_cursor": "last",
+        }
+        return httpx.Response(200, json=payload, request=request)
+
+    factory, clients = _lp_tracked_public_factory(handler)
+    result = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=object(),
+                                     public_client_factory=factory).lp_market_metadata_batch(
+                                         (condition,), stop_event=stop)
+    _assert_lp_task_clients_closed(clients)
+    assert result["confirmed_absent_ids"] == result["deferred_ids"] == ()
+    assert result["state"] == ("unknown" if outcome == "failed" else
+                               "cancelled" if outcome == "cancelled" else "known")
+    if outcome == "failed":
+        stage = "market" if phase == "closed-market" else "event"
+        assert result["failed_ids"] == {condition: f"{stage}_read_RequestRejectedError"}
+    elif outcome == "cancelled" and phase == "numeric":
+        assert result["failed_ids"] == {condition: "event_read_cancelled"}
+    else:
+        assert result["failed_ids"] == {}
+    if outcome == "complete" and phase == "numeric":
+        assert requests == [("/markets/keyset", None), ("/events/keyset", None),
+                            ("/events/keyset", "last")]
+        assert len(clients) == 2
+    if phase != "closed-market":
+        assert result["markets"][condition]["event_id"] == event_id
+        assert result["markets"][condition]["event_ended"] is (
+            True if outcome == "complete" or (phase == "direct" and outcome == "cancelled") else None
+        )
+
+
+def test_lp_metadata_task_hooks_keep_concurrent_batch_failure_facts_separate(caplog) -> None:
+    import httpx
+
+    condition_ids = tuple(f"0x{index:064x}" for index in range(51))
+    barrier = threading.Barrier(4)
+
+    def adapter_for(status, retry_after):
+        def handler(request):
+            ids = tuple(request.url.params.get_list("condition_ids"))
+            barrier.wait(5)
+            if condition_ids[-1] not in ids:
+                return _lp_market_page_response(request, [_lp_market_payload(cid) for cid in ids])
+            return httpx.Response(status, headers={"retry-after": str(retry_after)}, json={
+                "error": "public failure https://private.invalid/?token=secret-sentinel",
+            }, request=request)
+
+        factory, clients = _lp_tracked_public_factory(handler)
+        return PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=object(),
+                                       public_client_factory=factory), clients
+
+    first, first_clients = adapter_for(400, 7)
+    second, second_clients = adapter_for(429, 11)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(adapter.lp_market_metadata_batch, condition_ids)
+                   for adapter in (first, second)]
+        results = [future.result(timeout=8) for future in futures]
+    for result, status, retry, error, clients in zip(
+        results, (400, 429), (7, 11), ("RequestRejectedError", "RateLimitError"),
+        (first_clients, second_clients),
+    ):
+        assert result["state"] == "partial"
+        assert set(result["markets"]) == set(condition_ids[:-1])
+        assert result["confirmed_absent_ids"] == result["deferred_ids"] == ()
+        assert result["failed_ids"] == {condition_ids[-1]: f"market_read_{error}"}
+        facts = result["failure_facts"][condition_ids[-1]]
+        assert facts["status"] == status
+        assert facts["retry_after_seconds"] == retry
+        assert len(clients) == 2
+        _assert_lp_task_clients_closed(clients)
+    messages = [record.getMessage() for record in caplog.records
+                if "lp_metadata_http_failure" in record.getMessage()]
+    assert len(messages) == 2
+    assert all(len(message) <= 2048 and "requested_ids=1" in message for message in messages)
+    assert all(secret not in "\n".join(messages) for secret in (
+        "private.invalid", "secret-sentinel", *condition_ids,
+    ))
 
 
 def test_lp_metadata_cache_hit_within_ttl(

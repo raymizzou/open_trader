@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-25 — Metadata HTTP/2 task isolation
+
+- Give each concurrent market or event metadata task its own public client through pagination and response consumption. Keep the eight-task limit, 50-market and 10-event batches, failure/absence distinction, valid sibling results and cache rules. Remove task response hooks before closing clients, including failed and cancelled reads.
+- Keep bounded, redacted HTTP failure diagnostics and status/Retry-After facts. Add typed HTTP/2 protocol type, error code and stream facts, with explicit unknown fields and no exception text. Account trades and snapshot client sharing remain outside this repair; production Smoke success and the historical 400 cause remain unproven.
+
 ## 2026-10-25 — LP pool test publication synchronization
 
 - Follow the actual idle read deadline for the held-market wake test’s final account publication. Require receipt-current reads, exact order IDs and freshness after the unchanged-time wake proof; preserve financial assertions and the four-second watchdog. Test-only synchronization.
