@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-25 — Income rebuild test completion
+
+- Observe the actual three-slot income group and native action completion before checking the final portfolio. Preserve exact 50/30/20 amounts, manual-order protection and all existing assertions. Test synchronization only; production behavior and CI classification are unchanged.
+
 ## 2026-10-24 — Bounded LP financial timeout wait diagnostics
 
 - Keep the latest financial read timeout's original attempt, observation, deadline and actual sampling time in the existing read-only `async_reads` diagnostics. Capture the deepest bounded native await locations before cancellation, with explicit late, unknown, unavailable and truncation states. A narrow exact-native async-generator driver bridge makes HTTPX context-manager waits visible without reading locals or payloads.
