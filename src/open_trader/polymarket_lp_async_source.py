@@ -14,6 +14,7 @@ import threading
 from email.utils import parsedate_to_datetime
 import math
 import zlib
+import httpx
 from .polymarket_lp_market_reader import SourceResult, freeze
 
 @dataclass(frozen=True)
@@ -64,6 +65,39 @@ class _Budget:
 
 _budget=ContextVar('lp_source_budget')
 
+class _OwnedCloseStream(httpx.AsyncByteStream):
+    """Keep release owned until the transport has actually finished closing.
+
+    HTTPX marks its response closed before awaiting stream.aclose(), including
+    the implicit EOF close in aiter_raw(). Install this boundary before reading
+    so native cancellation cannot abandon that one-way transition.
+    """
+    def __init__(self, stream):
+        self._stream=stream
+        self._close_task=None
+
+    async def __aiter__(self):
+        async for chunk in self._stream:yield chunk
+
+    async def aclose(self):
+        if self._close_task is None:
+            self._close_task=asyncio.create_task(self._stream.aclose())
+        cancellation=None
+        while not self._close_task.done():
+            try:
+                await asyncio.shield(self._close_task)
+            except asyncio.CancelledError as exc:
+                cancellation=exc
+            except Exception:
+                # Retrieve below even when cancellation and failure coincide.
+                break
+        try:
+            self._close_task.result()
+        except BaseException as exc:
+            if cancellation is not None:raise cancellation from exc
+            raise
+        if cancellation is not None:raise cancellation
+
 class LPAsyncSourcePort:
     def __init__(self, clients, *, clock=time.monotonic, utc_now=lambda: datetime.now(UTC), provider_limits=None,auth_resolver=None,signature_type=2,spender="spender",response_bytes=4*1024*1024,branch_bytes=16*1024*1024,page_limit=128,item_limit=20000):
         self.clients, self.clock, self.utc_now = clients, clock, utc_now
@@ -86,6 +120,7 @@ class LPAsyncSourcePort:
         if request.source in ('balance','open_orders','order','fills','scoring') and self.auth_resolver is not None:
             headers.update(self.auth_resolver('GET',path,None))
         async with self.clients[service].stream('GET',path,params=params,headers=headers) as response:
+            response.stream=_OwnedCloseStream(response.stream)
             if response.status_code >= 400:
                 facts={'status':response.status_code}
                 retry_at=None
