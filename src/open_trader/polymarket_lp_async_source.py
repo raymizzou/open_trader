@@ -4,7 +4,10 @@ Clients and authentication are capabilities supplied by the existing owner.
 This module never creates a SecureClient or changes authentication state.
 """
 import asyncio
+import sys
+from collections import deque
 from contextvars import ContextVar
+from contextlib import aclosing
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
@@ -26,6 +29,7 @@ class SourceRequest:
     order_id: str = ''
     request_id: str = ''
     auth: object = None
+    diagnostic_attempt: int = 0
 
 class ProviderLimits:
     """Shared provider/account waits; never reset by order or pool rotation."""
@@ -65,38 +69,164 @@ class _Budget:
 
 _budget=ContextVar('lp_source_budget')
 
-class _OwnedCloseStream(httpx.AsyncByteStream):
-    """Keep release owned until the transport has actually finished closing.
+class OwnedReadTask(asyncio.Task):
+    """The actual source task owns request unwind, including library cleanup.
 
-    HTTPX marks its response closed before awaiting stream.aclose(), including
-    the implicit EOF close in aiter_raw(). Install this boundary before reading
-    so native cancellation cannot abandon that one-way transition.
+    Use only the public Task cancellation API. The first network cancellation
+    is delivered normally. Once unwinding/closing starts, further cancellation
+    requests are retained until the request has actually exited. No extra close
+    task, private HTTPX state, or pool introspection is involved.
     """
-    def __init__(self, stream):
-        self._stream=stream
-        self._close_task=None
+    def __init__(self, coro):
+        self.in_read = False
+        self.cleanup = False
+        self.cancel_requests = 0
+        self.cancel_message = None
+        self.record = None
+        self.request_marker = None
+        self.cleanup_result = 'not_started'
+        super().__init__(coro, loop=asyncio.get_running_loop())
+
+    def cancel(self, msg=None):
+        if self.done():
+            return False
+        if not self.in_read:
+            return super().cancel(msg)
+        self.cancel_requests += 1
+        self.cancel_message = msg
+        if self.record is not None:
+            self.record.note('cancel')
+        if self.cleanup or self.cancel_requests > 1:
+            return True
+        return super().cancel(msg)
+
+    def cancelling(self):
+        return max(self.cancel_requests, super().cancelling())
+
+    def uncancel(self):
+        # AnyIO uses balanced cancel/uncancel for its own network scopes.
+        # Those internal cancellations must not become caller cancellation.
+        self.cancel_requests = max(0, self.cancel_requests - 1)
+        super().uncancel()
+        if not self.cancel_requests and self.record is not None:
+            self.record.note('uncancel')
+        return self.cancelling()
+
+
+class _RequestRecord:
+    """Fixed-schema values only. Never retain HTTP objects or trace info."""
+    def __init__(self, port, request):
+        self.port = port
+        self.value = dict(source=request.source, attempt=request.diagnostic_attempt,
+            sequence=port._request_sequence, phase='request', trace_state='started', phase_monotonic=None,
+            started_monotonic=None, cleanup_started_monotonic=None,
+            cleanup_completed_monotonic=None, cancel_requested_monotonic=None,
+            ended_monotonic=None, cleanup_state='not_started', outcome='running')
+
+    def note(self, event):
+        try:
+            now = float(self.port.clock())
+            if not math.isfinite(now):
+                return
+            value = self.value
+            if event == 'request':
+                value['started_monotonic'] = value['phase_monotonic'] = now
+            elif event == 'cancel':
+                if value['cancel_requested_monotonic'] is None:
+                    value['cancel_requested_monotonic'] = now
+            elif event == 'uncancel':
+                value['cancel_requested_monotonic'] = None
+            elif event.startswith('cleanup.'):
+                state = event.split('.')[1]
+                value['cleanup_state'] = state
+                if state == 'started' and value['cleanup_started_monotonic'] is None:
+                    value['cleanup_started_monotonic'] = now
+                elif state == 'completed':
+                    value['cleanup_completed_monotonic'] = now
+            elif event in ('complete', 'failed', 'cancelled'):
+                value['outcome'] = event
+                value['ended_monotonic'] = now
+            elif event in ('headers.started', 'headers.complete', 'headers.failed',
+                           'body.started', 'body.complete', 'body.failed'):
+                value['phase'], value['trace_state'] = event.split('.')
+                value['phase_monotonic'] = now
+            self.port._stage_cleanup_records()
+        except Exception:
+            # Diagnostic failure cannot suppress cancellation or cleanup.
+            pass
+
+
+_request_owner = ContextVar('lp_request_owner', default=None)
+_HTTP_PHASE_EVENTS = {f'http{version}.{phase}.{state}': f'{name}.{state}'
+    for version in ('11', '2')
+    for phase, name in (('receive_response_headers', 'headers'), ('receive_response_body', 'body'))
+    for state in ('started', 'complete', 'failed')}
+_HTTP_CLEANUP_EVENTS = {f'http{version}.response_closed.{state}': result
+    for version in ('11', '2')
+    for state, result in (('started', 'started'), ('complete', 'completed'), ('failed', 'failed'))}
+
+
+async def _install_request_trace(request):
+    owner = _request_owner.get()
+    if owner is None:
+        return
+    previous = request.extensions.get('trace')
+    marker, record = owner.request_marker, owner.record
+
+    async def trace(event, info):
+        # Bind each public callback to its actual request, including pagination.
+        if owner.request_marker is marker:
+            cleanup = _HTTP_CLEANUP_EVENTS.get(event)
+            if cleanup is not None:
+                owner.cleanup = True
+                owner.cleanup_result = cleanup
+                if record is not None:
+                    record.note('cleanup.' + cleanup)
+            elif record is not None and event in _HTTP_PHASE_EVENTS:
+                record.note(_HTTP_PHASE_EVENTS[event])
+        # Existing externally supplied traces retain their public behavior.
+        # Our observations never inspect or serialize raw info.
+        if previous is not None:
+            await previous(event, info)
+    request.extensions['trace'] = trace
+
+
+class _OwnedCloseStream(httpx.AsyncByteStream):
+    """Also cover external transports without a public httpcore trace."""
+    def __init__(self, stream, owner):
+        self._stream, self._owner = stream, owner
+        self._iterator = None
 
     async def __aiter__(self):
-        async for chunk in self._stream:yield chunk
+        self._iterator = self._stream.__aiter__()
+        async for chunk in self._iterator:
+            yield chunk
 
     async def aclose(self):
-        if self._close_task is None:
-            self._close_task=asyncio.create_task(self._stream.aclose())
-        cancellation=None
-        while not self._close_task.done():
-            try:
-                await asyncio.shield(self._close_task)
-            except asyncio.CancelledError as exc:
-                cancellation=exc
-            except Exception:
-                # Retrieve below even when cancellation and failure coincide.
-                break
+        self._owner.cleanup = True
+        self._owner.cleanup_result = 'started'
+        record = self._owner.record
+        if record is not None:
+            record.note('cleanup.started')
         try:
-            self._close_task.result()
-        except BaseException as exc:
-            if cancellation is not None:raise cancellation from exc
+            await self._close()
+        except BaseException:
+            self._owner.cleanup_result = 'failed'
+            if record is not None:
+                record.note('cleanup.failed')
             raise
-        if cancellation is not None:raise cancellation
+        else:
+            self._owner.cleanup_result = 'completed'
+            if record is not None:
+                record.note('cleanup.completed')
+
+    async def _close(self):
+        try:
+            close = getattr(self._iterator, 'aclose', None)
+            if close is not None:
+                await close()
+        finally:
+            await self._stream.aclose()
 
 class LPAsyncSourcePort:
     def __init__(self, clients, *, clock=time.monotonic, utc_now=lambda: datetime.now(UTC), provider_limits=None,auth_resolver=None,signature_type=2,spender="spender",response_bytes=4*1024*1024,branch_bytes=16*1024*1024,page_limit=128,item_limit=20000):
@@ -104,9 +234,55 @@ class LPAsyncSourcePort:
         self.auth_resolver,self.signature_type,self.spender=auth_resolver,signature_type,spender
         self._limits=(response_bytes,branch_bytes,page_limit,item_limit)
         self.provider_limits=provider_limits if provider_limits is not None else ProviderLimits()
+        self._request_sequence = 0
+        self._record_attempt = 0
+        self._current_records = {}
+        self._record_history = deque(maxlen=32)
+        self._cleanup_snapshot = None
+        for client in dict.fromkeys(clients.values()):
+            if _install_request_trace not in client.event_hooks['request']:
+                client.event_hooks['request'].append(_install_request_trace)
 
     def not_before(self, provider, account):
         return self.provider_limits.not_before(provider,account)
+
+    def _stage_cleanup_records(self):
+        snapshot = dict(attempt=self._record_attempt,
+            current=[dict(record.value) for record in self._current_records.values()],
+            history=[dict(row) for row in self._record_history])
+        while len(json.dumps(snapshot, allow_nan=False).encode()) > 16 * 1024:
+            if not snapshot['history']:
+                return
+            self._record_history.popleft()
+            snapshot['history'].pop(0)
+        # Atomic copied staging. Only the existing supervisor publishes status.
+        self._cleanup_snapshot = snapshot
+
+    def financial_cleanup_records(self, attempt):
+        snapshot = self._cleanup_snapshot
+        return snapshot if snapshot is not None and snapshot['attempt'] == attempt else None
+
+    def _start_record(self, request):
+        if (request.source not in ('balance', 'open_orders', 'positions')
+                or type(request.diagnostic_attempt) is not int or request.diagnostic_attempt <= 0
+                or request.diagnostic_attempt < self._record_attempt
+                or request.source in self._current_records):
+            return None
+        self._request_sequence += 1
+        self._record_attempt = request.diagnostic_attempt
+        record = _RequestRecord(self, request)
+        self._current_records[request.source] = record
+        record.note('request')
+        return record
+
+    def _finish_record(self, record, outcome):
+        if record is None:
+            return
+        record.note(outcome)
+        if self._current_records.get(record.value['source']) is record:
+            self._current_records.pop(record.value['source'])
+            self._record_history.append(dict(record.value))
+            self._stage_cleanup_records()
 
     async def _json(self, service, path, params, request, deadline):
         if self.clock() >= deadline:
@@ -119,37 +295,70 @@ class LPAsyncSourcePort:
         headers={'x-lp-order':request.order_id,'x-lp-source':request.source,'accept-encoding':'identity'}
         if request.source in ('balance','open_orders','order','fills','scoring') and self.auth_resolver is not None:
             headers.update(self.auth_resolver('GET',path,None))
-        async with self.clients[service].stream('GET',path,params=params,headers=headers) as response:
-            response.stream=_OwnedCloseStream(response.stream)
-            if response.status_code >= 400:
-                facts={'status':response.status_code}
-                retry_at=None
-                raw=response.headers.get('Retry-After')
+        owner = asyncio.current_task()
+        owner.cleanup = False
+        owner.cleanup_result = 'not_started'
+        owner.request_marker = object()
+        record = owner.record = self._start_record(request)
+        try:
+            async with self.clients[service].stream('GET',path,params=params,headers=headers) as response:
+                response.stream=_OwnedCloseStream(response.stream, owner)
+                if record is not None:
+                    record.note('headers.complete')
+                if response.status_code >= 400:
+                    facts={'status':response.status_code}
+                    retry_at=None
+                    raw=response.headers.get('Retry-After')
+                    try:
+                        seconds=float(raw)
+                        if not math.isfinite(seconds) or seconds<0:raise ValueError('invalid_retry')
+                        facts['retry_after_seconds']=seconds
+                    except (TypeError,ValueError):
+                        seconds=None
+                        if raw:
+                            try:
+                                target=parsedate_to_datetime(raw)
+                                date=parsedate_to_datetime(response.headers['Date']) if 'Date' in response.headers else self.utc_now()
+                                if target.tzinfo is None or date.tzinfo is None:raise ValueError('naive_retry')
+                                seconds=max(0,(target-date).total_seconds())
+                                facts.update(retry_after_at=target,response_date=date)
+                            except (ValueError,TypeError,OverflowError):pass
+                    if seconds is not None:
+                        retry_at=self.clock()+seconds
+                        self.provider_limits.observe(service,request.account,retry_at)
+                    raise ReadResponseError(facts,retry_at)
+                data=bytearray()
+                if record is not None:
+                    record.note('body.started')
+                async with aclosing(self._decoded_chunks(response,budget)) as chunks:
+                    async for chunk in chunks:
+                        if self.clock()>=deadline:raise TimeoutError('attempt_deadline')
+                        if len(data)+len(chunk)>budget.response_limit:raise ReadLimitError('response_bytes')
+                        if budget.bytes+len(chunk)>budget.byte_limit:raise ReadLimitError('branch_bytes')
+                        budget.bytes+=len(chunk);data.extend(chunk)
+                return json.loads(data)
+        except BaseException as exc:
+            if owner.cancel_requests and not isinstance(exc, asyncio.CancelledError):
+                raise asyncio.CancelledError(owner.cancel_message) from exc
+            raise
+        finally:
+            error = sys.exception()
+            if record is not None:
+                if owner.cleanup_result in ('completed', 'failed'):
+                    record.note('cleanup.' + owner.cleanup_result)
+                outcome = ('cancelled' if owner.cancel_requests or isinstance(error, asyncio.CancelledError)
+                    else 'failed' if error is not None else 'complete')
                 try:
-                    seconds=float(raw)
-                    if not math.isfinite(seconds) or seconds<0:raise ValueError('invalid_retry')
-                    facts['retry_after_seconds']=seconds
-                except (TypeError,ValueError):
-                    seconds=None
-                    if raw:
-                        try:
-                            target=parsedate_to_datetime(raw)
-                            date=parsedate_to_datetime(response.headers['Date']) if 'Date' in response.headers else self.utc_now()
-                            if target.tzinfo is None or date.tzinfo is None:raise ValueError('naive_retry')
-                            seconds=max(0,(target-date).total_seconds())
-                            facts.update(retry_after_at=target,response_date=date)
-                        except (ValueError,TypeError,OverflowError):pass
-                if seconds is not None:
-                    retry_at=self.clock()+seconds
-                    self.provider_limits.observe(service,request.account,retry_at)
-                raise ReadResponseError(facts,retry_at)
-            data=bytearray()
-            async for chunk in self._decoded_chunks(response,budget):
-                if self.clock()>=deadline:raise TimeoutError('attempt_deadline')
-                if len(data)+len(chunk)>budget.response_limit:raise ReadLimitError('response_bytes')
-                if budget.bytes+len(chunk)>budget.byte_limit:raise ReadLimitError('branch_bytes')
-                budget.bytes+=len(chunk);data.extend(chunk)
-            return json.loads(data)
+                    self._finish_record(record, outcome)
+                except Exception:
+                    pass
+            owner.record = None
+            owner.request_marker = None
+            owner.cleanup = False
+            if owner.cancel_requests and error is None:
+                # All response/library cleanup has exited; no subsequent page
+                # may turn a cancelled read into complete financial facts.
+                raise asyncio.CancelledError(owner.cancel_message)
 
     async def _decoded_chunks(self,response,budget):
         """Bound decompression output before JSON or an expanding body buffer."""
@@ -251,6 +460,50 @@ class LPAsyncSourcePort:
         return value
 
     async def read(self, request, deadline):
+        current = asyncio.current_task()
+        if isinstance(current, OwnedReadTask):
+            return await self._owned_read(request, deadline)
+        # A native external caller keeps its ordinary Task. Shield only the
+        # ownership join, forwarding cancellation to the actual source owner.
+        owner = OwnedReadTask(self._owned_read(request, deadline))
+        cancellation = None
+        while not owner.done():
+            try:
+                await asyncio.shield(owner)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+                owner.cancel(exc.args[0] if exc.args else None)
+            except Exception:
+                break
+        try:
+            result = owner.result()
+        except BaseException as exc:
+            if cancellation is not None and not isinstance(exc, asyncio.CancelledError):
+                raise cancellation from exc
+            raise
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    async def _owned_read(self, request, deadline):
+        owner = asyncio.current_task()
+        owner.in_read = True
+        token = _request_owner.set(owner)
+        try:
+            result = await self._read(request, deadline)
+        except BaseException as exc:
+            if owner.cancel_requests and not isinstance(exc, asyncio.CancelledError):
+                raise asyncio.CancelledError(owner.cancel_message) from exc
+            raise
+        else:
+            if owner.cancel_requests:
+                raise asyncio.CancelledError(owner.cancel_message)
+            return result
+        finally:
+            owner.in_read = False
+            _request_owner.reset(token)
+
+    async def _read(self, request, deadline):
         identity=request.request_id or uuid.uuid4().hex
         token=_budget.set(_Budget(*self._limits))
         try:

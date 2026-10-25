@@ -357,3 +357,374 @@ def test_response_close_error_never_returns_complete_facts():
 
     for cancel in (False, True):
         asyncio.run(scenario(cancel))
+
+
+class ErrorPositions:
+    """Real HTTP/1.1 errors; accept and full request arrival are separate facts."""
+    def __init__(self, phase, before_error=None):
+        self.before_error = before_error
+        self.phase = phase
+        self.events = []
+        self.writers = set()
+        self.handlers = set()
+        self.positions = 0
+
+    async def start(self):
+        self.server = await asyncio.start_server(self.handle, '127.0.0.1', 0)
+        self.url = 'http://127.0.0.1:' + str(self.server.sockets[0].getsockname()[1])
+        return self
+
+    async def handle(self, reader, writer):
+        task = asyncio.current_task()
+        self.handlers.add(task)
+        self.writers.add(writer)
+        self.events.append(('tcp_accept', time.monotonic()))
+        try:
+            while True:
+                request = await reader.readuntil(b'\r\n\r\n')
+                source = next(line.split(b':', 1)[1].strip().decode()
+                    for line in request.split(b'\r\n') if line.lower().startswith(b'x-lp-source:'))
+                self.events.append(('full_get', source, time.monotonic()))
+                if source == 'positions':
+                    self.positions += 1
+                    if self.positions == 1 and self.phase in ('headers', 'body'):
+                        if self.before_error is not None:
+                            assert await asyncio.to_thread(self.before_error.wait, 4)
+                        if self.phase == 'headers':
+                            writer.write(b'INVALID HTTP RESPONSE\r\n\r\n')
+                        else:
+                            writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n[')
+                        await writer.drain()
+                        return
+                body = json.dumps({'positions': [], 'balance': dict(balance='100000000',
+                    allowances={'spender': '100000000'}),
+                    'open_orders': dict(data=[], next_cursor='LTE=')}[source]).encode()
+                if self.phase == 'limit' and self.positions == 1:
+                    body = b'[' + b' ' * 70000 + b']'
+                writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode()
+                    + b'\r\n\r\n' + body)
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            self.writers.discard(writer)
+            self.handlers.discard(task)
+
+    async def close(self):
+        self.server.close()
+        for writer in tuple(self.writers):
+            writer.close()
+        await self.server.wait_closed()
+        await asyncio.gather(*tuple(self.handlers), return_exceptions=True)
+
+
+def wait_functions(task):
+    """Native await metadata for failure evidence; no transport or pool state."""
+    from open_trader.polymarket_lp_read_runtime import _await_locations
+    return [frame['function'] for frame in _await_locations(task)['frames']]
+
+
+async def error_cleanup_scenario(mode, artifact_dir, repeat=1):
+    phase, action = mode.split('_')
+    server = await ErrorPositions(phase).start()
+    events = []
+    tasks = []
+    original = None
+    first = True
+
+    def cancel_original():
+        events.append(('parent_cancel_target', original.get_name()))
+        events.append(('parent_cancel_delivery', original.cancel('error-cleanup')))
+        if sum(e[0] == 'parent_cancel_delivery' for e in events) < repeat:
+            asyncio.get_running_loop().call_soon(cancel_original)
+
+    async def on_request(request):
+        nonlocal first
+        is_first = first
+        first = False
+        async def trace(event, _info):
+            events.append(('trace', event))
+            if is_first and action == 'cancel' and event == 'http11.response_closed.started':
+                asyncio.get_running_loop().call_soon(cancel_original)
+        request.extensions['trace'] = trace
+
+    client = httpx.AsyncClient(base_url=server.url, timeout=None, trust_env=False,
+        limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+        event_hooks={'request': [on_request]})
+    port = LPAsyncSourcePort({'data': client})
+    try:
+        original = asyncio.create_task(port.read(SourceRequest('positions', 'offline-account',
+            request_id='error-first'), time.monotonic() + 5), name='original-parent')
+        tasks.append(original)
+        original.add_done_callback(lambda task: events.append(('parent_exit', task.cancelled())))
+        if action == 'cancel':
+            with pytest.raises(asyncio.CancelledError):
+                await settled(original)
+        else:
+            result = await settled(original)
+            assert not result.complete and result.error == 'RemoteProtocolError'
+        assert original.done()
+        followup = asyncio.create_task(port.read(SourceRequest('positions', 'offline-account',
+            request_id='same-pool-next'), time.monotonic() + 5))
+        tasks.append(followup)
+        done, _ = await asyncio.wait((followup,), timeout=2)
+        if not done:
+            events.append(('next_request_wait', wait_functions(followup)))
+        assert done, events
+        result = await followup
+        assert result.complete and not result.error and result.value == ()
+        assert result.source_id == 'same-pool-next'
+        assert server.positions == 2
+        assert sum(e[0] == 'full_get' for e in server.events) == 2
+        assert ('trace', 'http11.response_closed.complete') in events
+        if action == 'cancel':
+            assert sum(e == ('parent_cancel_delivery', True) for e in events) == repeat
+            assert ('parent_exit', True) in events
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await client.aclose()
+        await server.close()
+        (artifact_dir / ('real-error-' + mode + '.json')).write_text(
+            json.dumps(dict(server=server.events, client=events), indent=2))
+    assert all(task.done() for task in tasks)
+
+
+@pytest.mark.parametrize('mode', ('headers_baseline', 'headers_cancel', 'body_baseline', 'body_cancel'))
+def test_source_error_cleanup_preserves_same_pool_progress(mode, tmp_path):
+    asyncio.run(error_cleanup_scenario(mode, tmp_path))
+
+
+def test_request_cleanup_owner_survives_repeated_outer_cancel(tmp_path):
+    asyncio.run(error_cleanup_scenario('body_cancel', tmp_path, repeat=2))
+
+
+class ErrorServerThread:
+    def __init__(self, phase, before_error=None):
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self.thread.start()
+        self.server = asyncio.run_coroutine_threadsafe(
+            ErrorPositions(phase, before_error).start(), self.loop).result(2)
+        self.url = self.server.url
+
+    def close(self):
+        asyncio.run_coroutine_threadsafe(self.server.close(), self.loop).result(2)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(2)
+        self.loop.close()
+        assert not self.thread.is_alive()
+
+
+@pytest.mark.parametrize('phase', ('headers', 'body'))
+def test_financial_error_cleanup_cancel_preserves_supervisor_recovery(phase):
+    clock = Clock()
+    observer = Boundary(clock)
+    siblings_done = threading.Event()
+    entered = threading.Event()
+    release = threading.Event()
+    cleaned = threading.Event()
+    exited = threading.Event()
+    server = ErrorServerThread(phase, siblings_done)
+    original = []
+    siblings = set()
+    ports = []
+    clients = []
+
+    async def on_request(request):
+        source = request.headers['x-lp-source']
+        is_first = source == 'positions' and not original
+        if is_first:
+            original.append(asyncio.current_task())
+            original[0].add_done_callback(lambda _task: exited.set())
+        async def trace(event, _info):
+            if source in ('balance', 'open_orders') and event == 'http11.response_closed.complete':
+                siblings.add(source)
+                if len(siblings) == 2:
+                    siblings_done.set()
+            if is_first and event == 'http11.response_closed.started':
+                entered.set()
+                assert release.wait(4), 'independent cleanup release watchdog'
+            if is_first and event == 'http11.response_closed.complete':
+                cleaned.set()
+        request.extensions['trace'] = trace
+
+    def factory(_demand):
+        owned = {name: httpx.AsyncClient(base_url=server.url, timeout=None, trust_env=False,
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+            event_hooks={'request': [on_request]}) for name in ('data', 'clob')}
+        clients.extend(owned.values())
+        port = LPAsyncSourcePort(owned, clock=clock, utc_now=clock.utc)
+        ports.append(port)
+        return port
+
+    runtime = LPReadRuntime(factory, clock=clock, utc_now=clock.utc)
+    runtime.start()
+    try:
+        runtime.reconcile((demand('O', kind='financial',
+            sources=('balance', 'open_orders', 'positions')),))
+        assert entered.wait(4)
+        first = runtime.status()['scopes'][0]['attempt']
+        clock.value = 5
+        runtime.wake()
+        timeout, = collect(runtime, observer, bool)
+        assert timeout.attempt == first and timeout.reason == 'timeout' and not timeout.complete
+        assert timeout.sources['balance'].complete and timeout.sources['open_orders'].complete
+        assert not timeout.sources['positions'].complete
+        assert not cleaned.is_set() and not exited.is_set()
+        clock.value = 6
+        runtime.wake()
+        observer.wait(lambda: runtime.status()['cleanup_faults'] == 1)
+        fault, = runtime.drain_results()
+        assert fault.attempt == first and fault.cleanup_fault
+        assert runtime.drain_results() == ()
+        assert not runtime.status()['new_buy_allowed']
+        assert server.server.positions == 1
+        assert len(ports) == 1 and not exited.is_set()
+        release.set()
+        assert cleaned.wait(4) and exited.wait(4)
+        recovered, = collect(runtime, observer, lambda rows: any(row.complete for row in rows))
+        assert recovered.complete and recovered.attempt > first and recovered.started == 6
+        assert all(row.complete and not row.error for row in recovered.sources.values())
+        assert recovered.sources['positions'].value == ()
+        assert recovered.sources['positions'].source_id != timeout.sources['positions'].source_id
+        assert original[0].cancelled() and original[0].cancelling() == 1
+        assert runtime.drain_results() == () and runtime.status()['cleanup_faults'] == 0
+        assert server.server.positions == 2 and len(ports) == 1
+        observer.wait(lambda: runtime.status()['financial_request_cleanup']['attempt'] == recovered.attempt
+            and not runtime.status()['financial_request_cleanup']['current'])
+        normal = [row for row in runtime.status()['financial_request_cleanup']['history']
+            if row['attempt'] == recovered.attempt]
+        assert len(normal) == 3 and all(row['outcome'] == 'complete' for row in normal)
+        assert all(row['cancel_requested_monotonic'] is None for row in normal)
+    finally:
+        siblings_done.set()
+        release.set()
+        runtime.reconcile(())
+        assert runtime.close(4)
+        server.close()
+    assert all(client.is_closed for client in clients)
+
+
+def test_business_body_limit_closes_generator_and_preserves_same_pool_progress():
+    async def scenario():
+        server = await ErrorPositions('limit').start()
+        iterations = []
+        closes = []
+        before = asyncio.all_tasks()
+
+        class ObservedStream(httpx.AsyncByteStream):
+            def __init__(self, stream):
+                self.stream = stream
+            async def __aiter__(self):
+                try:
+                    async for chunk in self.stream:
+                        yield chunk
+                finally:
+                    iterations.append('iterator_exited')
+            async def aclose(self):
+                await self.stream.aclose()
+                closes.append('response_closed')
+
+        async def on_response(response):
+            response.stream = ObservedStream(response.stream)
+
+        async with httpx.AsyncClient(base_url=server.url, timeout=None, trust_env=False,
+                limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+                event_hooks={'response': [on_response]}) as client:
+            port = LPAsyncSourcePort({'data': client}, response_bytes=1024)
+            try:
+                failed = await port.read(SourceRequest('positions', 'offline'), time.monotonic() + 5)
+                assert not failed.complete and failed.error == 'ReadLimitError'
+                assert iterations == ['iterator_exited']
+                assert closes == ['response_closed']
+                good = await port.read(SourceRequest('positions', 'offline'), time.monotonic() + 5)
+                assert good.complete and good.value == ()
+                assert server.positions == 2
+                assert iterations == ['iterator_exited'] * 2
+                assert closes == ['response_closed'] * 2
+                assert asyncio.all_tasks() - server.handlers == before
+            finally:
+                await server.close()
+    asyncio.run(scenario())
+
+
+def test_owned_request_tasks_are_counted_and_drained():
+    clock = Clock()
+    observer = Boundary(clock)
+    lock = threading.Lock()
+    entered = set()
+    closing = set()
+    loops = set()
+    releases = {}
+    clients = []
+    cap = 64
+    expected_sources = 4 * cap + 3 + 2 + 4
+
+    async def http(request):
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        with lock:
+            loops.add(loop)
+            release = releases.setdefault(loop, asyncio.Event())
+            entered.add(task)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            with lock:
+                closing.add(task)
+            await release.wait()
+
+    def factory(d):
+        services = (('clob',) if d.kind == 'exact' else
+            ('clob', 'data') if d.kind == 'financial' else ('clob', 'gamma'))
+        owned = {name: httpx.AsyncClient(transport=httpx.MockTransport(http),
+            base_url='http://127.0.0.1', trust_env=False,
+            limits=httpx.Limits(max_connections=3 if name == 'clob' else 1,
+                               max_keepalive_connections=3 if name == 'clob' else 1))
+            for name in services}
+        clients.extend(owned.values())
+        return LPAsyncSourcePort(owned, clock=clock, utc_now=clock.utc)
+
+    async def actual_tasks():
+        return asyncio.all_tasks() - {asyncio.current_task()}
+
+    runtime = LPReadRuntime(factory, clock=clock, utc_now=clock.utc, buy_cap=cap)
+    assert runtime.status()['managed_tasks'] == 0
+    runtime.start()
+    try:
+        demands = [demand('B' + str(i)) for i in range(cap)]
+        demands += [demand('O', kind='financial', sources=('balance', 'open_orders', 'positions')),
+            demand('C', kind='exact', sources=('order', 'fills')),
+            demand('L', kind='position')]
+        runtime.reconcile(demands)
+        observer.wait(lambda: len(entered) == expected_sources)
+        status = runtime.status()
+        observed = set().union(*(asyncio.run_coroutine_threadsafe(actual_tasks(), loop).result(2)
+            for loop in tuple(loops)))
+        assert entered <= observed
+        assert status['managed_tasks'] == len(observed) == expected_sources + cap + 3
+        assert status['managed_tasks'] <= 8 * cap + 32
+        assert status['pool_count'] == len(clients) == 2 * cap + 5
+        assert status['pool_limit'] == 2 * cap + 5
+        assert status['connection_limit'] == 4 * cap + 9
+        runtime.reconcile(())
+        observer.wait(lambda: len(closing) == expected_sources)
+        assert not runtime.close(0.01)
+        status = runtime.status()
+        observed = set().union(*(asyncio.run_coroutine_threadsafe(actual_tasks(), loop).result(2)
+            for loop in tuple(loops)))
+        assert status['managed_tasks'] == len(observed) == expected_sources + cap + 3
+        assert all(not task.done() for task in entered)
+    finally:
+        runtime.reconcile(())
+        for loop, release in tuple(releases.items()):
+            loop.call_soon_threadsafe(release.set)
+        assert runtime.close(4)
+    assert runtime.status()['managed_tasks'] == 0
+    assert all(task.done() for task in entered)
+    assert all(client.is_closed for client in clients)

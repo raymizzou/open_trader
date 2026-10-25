@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-25 — LP whole-request cleanup and bounded lifecycle evidence
+
+- Keep header-error and body-error cleanup owned through actual request exit. Reuse the runtime source task, defer repeated cleanup cancellation, and close iterators on early body-limit rejection. Preserve cancellable network waits, fixed clients/pools, resource limits, five-second UNKNOWN, six-second cleanup faults and all financial/identity/no-replay guards.
+- Add bounded, detached financial request lifecycle records to existing read-only async diagnostics, with request/attempt binding and no raw HTTP, account, order, payload or exception data. Offline real HTTP tests prove same-pool progress after the reproduced cancellation; candidate recovery remains an existing-behavior guard. Production trigger attribution, deployment and normal trial/income 3+3 acceptance remain pending separate evidence and authorization.
+
 ## 2026-10-25 — LP pool test publication synchronization
 
 - Follow the actual idle read deadline for the held-market wake test’s final account publication. Require receipt-current reads, exact order IDs and freshness after the unchanged-time wake proof; preserve financial assertions and the four-second watchdog. Test-only synchronization.
