@@ -164,31 +164,112 @@ phase. Deployment and a later recurrence are separate from implementation and
 from root-cause proof. Deployment needs its own authorization and exact-SHA gates;
 a restart can remove the current stalled process and its in-memory evidence.
 
-## Response release ownership (2026-10-25)
+## Request and cleanup ownership (2026-10-25, #455)
 
-The LP source adapter installs a release boundary before iterating each response
-body. Body and network reads remain cancellable. Both HTTPX's implicit EOF close
-and context exit use the same owned transport-close task. Outer read cancellation
-is retained while the adapter waits for actual close completion, then propagates
-to the original caller. Repeated close waits reuse that task. Close failure is
-observed and cannot return complete source facts; if cancellation coincides with
-failure, cancellation propagates with the close error as its cause.
+The existing runtime source task now owns the whole request: connection
+acquisition, send, response headers, response body and actual cleanup. Its first
+network cancellation is delivered normally. Once cleanup begins, or that first
+cancellation starts unwinding the request, further cancellation requests are
+retained until actual exit. Cancellation then propagates to the caller. The
+source task uses the public asyncio Task cancellation API and the public httpcore
+trace extension; it does not inspect or modify pool state or library locks.
+Balanced library cancel/uncancel operations do not become caller cancellations.
 
-This adds at most one short-lived close task per current response. That child is
-shielded from outer read cancellation and remains owned by the unfinished source
-read. `managed_tasks` counts the runtime's scope/source tasks; it does not measure
-all asyncio tasks or separately count these close children. A stalled close keeps
-its original source unfinished. The supervisor still publishes UNKNOWN at five
-seconds and reports a cleanup fault at six seconds if actual drain has not
-finished. Neither cancellation sent, a closed response flag nor a timeout snapshot
-proves release. Recovery retains the fixed clients/pools, original retry cadence,
-provider cooldown, fresh attempt identity and financial admission gates.
+Runtime reads reuse their existing source task. The former separate close child
+is removed. `managed_tasks` therefore includes the actual I/O and cleanup owners,
+with no hidden per-response task. A direct native caller of `source.read()` joins
+one owned source task and forwards cancellation to it. The runtime does not add
+that join task. The existing limits remain: B <= 64, tasks <= 8B+32, pools <= 2B+5,
+connections <= 4B+9. Early body-size rejection explicitly closes the adapter's
+iterator as well as the response. Close failure cannot return complete facts.
+When cancellation and close failure coincide, cancellation retains the failure
+as its cause.
 
-Offline real HTTP/1.1 tests with a one-connection pool reproduce cancellation at
-the normal-close library checkpoint and verify that a later read reaches the
-server on the same pool. The full financial supervisor test verifies its own
-deadline cancellation, one UNKNOWN result and fresh recovery after actual close.
-Separate external-stream tests cover incomplete close and close errors. These
-prove the reproduced mechanism and repair; the original production trigger
-interleaving was not directly observed. Production attribution, deployment and
-recurrence acceptance remain separate and are not established by local tests.
+The supervisor still publishes UNKNOWN at five seconds and exposes unfinished
+cleanup at six seconds. A retry cannot start before the previous source actually
+exits. Recovery keeps the same clients, fixed pools, cadence, provider cooldown,
+identity and financial admission rules. Successful cleanup alone grants no
+financial authority or permission to send or replay a trade.
+
+The LP client factory sets HTTPX `timeout=None`. Recovery therefore does not
+have an extra HTTPX timeout bound. If an internal AnyIO scope balances its own
+cancellations while a caller cancellation overlaps, the remaining caller
+cancellation must still reach the next ordinary network await. The owner
+coalesces one loop callback after the synchronous balance boundary, checks the
+remaining public cancellation count, and delivers it only outside cleanup.
+It does not inject cancellation on each `uncancel()` call: on Python 3.12 that
+could leave a pending injection after the library-only count reaches zero.
+Actual source exit, rather than a counter or timeout assumption, still owns drain.
+
+The task accounting above applies to supported production runtime demand shapes:
+financial reads use three separate leaf sources; BUY market reads use `book`,
+`metadata`, `native_rewards` and `sponsored_rewards`; exact reads use individual
+sources. It is not a census of arbitrary caller-created demands/tasks or transient
+internally scoped AnyIO connect helpers. The standalone source-port convenience
+`SourceRequest('market', ...)` gathers its own child reads outside the runtime
+registry. Its child tasks are not included in `managed_tasks`, and its use as a
+custom runtime source is outside the stated production accounting proof. Its
+standalone behavior remains covered by the existing source contract.
+
+The factory supplies LP-owned HTTPX clients. Constructing the port appends one
+deduplicated public request hook to each supplied client's `event_hooks` list;
+this is an intentional mutation of those owned clients, not a factory change.
+The hook is a no-op when there is no active source ownership context, so ordinary
+non-owned reads retain their trace behavior. The supplied-client contract is an
+HTTPX AsyncClient with that public hook API, not an arbitrary fake-client protocol.
+
+## Financial request cleanup records
+
+`LPReadRuntime.status()['financial_request_cleanup']` and
+`GET /api/prediction-arbitrage/lp/auto/state` at
+`diagnostics.async_reads.financial_request_cleanup` expose a copied, memory-only
+snapshot. It is null until a financial request has been observed. The existing
+supervisor publishes staged values only for the matching attempt. Status GET
+copies values; it does not start reads, cancel, retry, write storage or wake work.
+The original `last_financial_timeout` await chain remains available separately
+and still targets the actual network source task.
+
+- `attempt` binds the snapshot and each row to the runtime attempt. `sequence`
+  is an opaque process-local request/page number. Neither contains account,
+  order, URL or request identity text. Each public trace callback is bound to
+  its own request, so late callbacks cannot relabel another request or attempt.
+- `current` retains unfinished requests, at most one per financial source
+  (`balance`, `open_orders`, `positions`). `history` retains at most 32 ended
+  requests across pages and attempts. The entire cleanup snapshot is at most
+  16 KiB JSON; ended history is evicted first, preserving current requests.
+- `phase`, `trace_state` and `phase_monotonic` describe the latest observed
+  request/header/body stage. Public HTTP/1.1 and HTTP/2 trace names are mapped to
+  fixed enums; raw trace info is never read or serialized. External transports
+  can omit these trace events. Absence is not evidence of successful cleanup.
+- `cleanup_state` is `not_started`, `started`, `completed` or `failed`.
+  `cleanup_started_monotonic` and `cleanup_completed_monotonic` distinguish
+  entry from completion. `started` with no end is unfinished, regardless of a
+  response's closed flag. A protocol cleanup event alone does not prove that
+  a pool slot is reusable.
+- `cancel_requested_monotonic` records an outstanding source cancellation;
+  balanced library cancellation is cleared. `ended_monotonic` and `outcome`
+  (`running`, `complete`, `failed`, `cancelled`) describe actual request exit,
+  not successful financial parsing or source-task completion. A source can
+  continue through later pages. Runtime scope `active` and the timeout/fault
+  record remain the authority for source drain and retry admission.
+
+All times are process-local monotonic observations, not UTC or identities across
+restarts. Callbacks update bounded memory only, with no lock wait, file/network
+I/O or added asynchronous checkpoint. Diagnostic clock/serialization failure is
+isolated from cancellation and cleanup. Records contain no request/account/order
+text, URL, headers, payload, exception text or library objects. Copies are detached;
+process restart loses this history.
+
+Offline real HTTP/1.1 tests reproduce cancellation during header-error cleanup
+and verify the same fixed one-connection pool can complete a subsequent full GET
+after repair. Body-error, normal-close, repeated cancellation, body-limit and
+supervisor recovery cases cover the same ownership boundary. Offline reproduction
+proves this local mechanism, not the first production trigger. Deployment and
+production acceptance remain separate: normal reads, fresh eligible candidates,
+and normal trial/income 3+3 operation under the original market and financial
+rules still require their own evidence and authorization.
+
+The body-error cancellation case was ALREADY_COVERED when introduced after the
+header fix. It has no independent pre-fix RED; neither that guard nor a later
+`body.failed`/cleanup trace proves the first production trigger. No production
+fault injection is part of this verification.

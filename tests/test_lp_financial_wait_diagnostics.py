@@ -509,3 +509,248 @@ def test_unknown_await_object_preserves_original_cancel_and_close():
         assert inspected
     finally:
         auditing[0] = False
+
+
+def cleanup_record(runtime, source, *, ended=False):
+    snapshot = plain(runtime.status())['financial_request_cleanup']
+    rows = snapshot['history'] if ended else snapshot['current']
+    return next(row for row in reversed(rows) if row['source'] == source)
+
+
+def test_financial_request_cleanup_records_distinguish_started_and_completed():
+    clock = Clock()
+    boundary = WaitBoundary(clock, 'body')
+    runtime = LPReadRuntime(boundary.factory, clock=clock, utc_now=clock.utc)
+    runtime.start()
+    try:
+        runtime.reconcile((financial('cleanup-observation'),))
+        assert boundary.entered.wait(4)
+        boundary.wait(lambda: plain(runtime.status()).get('financial_request_cleanup') is not None)
+        running = cleanup_record(runtime, 'open_orders')
+        attempt = runtime.status()['scopes'][0]['attempt']
+        assert running['attempt'] == attempt and running['outcome'] == 'running'
+        assert running['ended_monotonic'] is None
+        assert running['cleanup_state'] == 'not_started'
+        clock.value = 5
+        runtime.wake()
+        assert boundary.cancelled.wait(4) and boundary.close_entered.wait(4)
+        boundary.wait(lambda: cleanup_record(runtime, 'open_orders')['cleanup_state'] == 'started')
+        closing = cleanup_record(runtime, 'open_orders')
+        assert closing['cancel_requested_monotonic'] == 5
+        assert closing['ended_monotonic'] is None
+        assert closing['cleanup_completed_monotonic'] is None
+        assert runtime.status()['scopes'][0]['active']
+        clock.value = 6
+        runtime.wake()
+        boundary.wait(lambda: runtime.status()['cleanup_faults'] == 1)
+        assert not runtime.status()['new_buy_allowed'] and len(boundary.requests) == 3
+        boundary.close_release.set()
+        assert boundary.close_exited.wait(4)
+        boundary.wait(lambda: not runtime.status()['scopes'][0]['active'])
+        boundary.wait(lambda: any(row['source'] == 'open_orders'
+            for row in plain(runtime.status())['financial_request_cleanup']['history']))
+        finished = cleanup_record(runtime, 'open_orders', ended=True)
+        assert finished['attempt'] == attempt and finished['sequence'] == closing['sequence']
+        assert finished['cleanup_state'] == 'completed'
+        assert finished['cleanup_completed_monotonic'] == finished['ended_monotonic'] == 6
+        assert finished['outcome'] == 'cancelled'
+        assert runtime.status()['cleanup_faults'] == 0
+        notice, = runtime.drain_results()
+        assert notice.reason == 'timeout' and notice.attempt == attempt and not notice.complete
+        assert runtime.drain_results() == ()
+    finally:
+        boundary.close_release.set()
+        runtime.reconcile(())
+        assert runtime.close(4)
+
+
+def test_financial_request_cleanup_records_are_bounded_detached_and_secret_free():
+    from test_lp_async_source_contract import CID
+    secret = 'LP455-PRIVATE-URL-ACCOUNT-HEADER-PAYLOAD-EXCEPTION'
+    clock = Clock()
+    boundary = Boundary(clock)
+    entered = threading.Event()
+    close_entered = threading.Event()
+    close_release = threading.Event()
+    closed = threading.Event()
+    diagnostic_failures = []
+    fail_next_clock = [False]
+    requests = []
+    positions_pages = []
+
+    def source_clock():
+        if fail_next_clock[0]:
+            fail_next_clock[0] = False
+            diagnostic_failures.append('clock-failed')
+            raise RuntimeError(secret)
+        return clock()
+
+    class Payload:
+        def __repr__(self):
+            raise AssertionError('raw trace info is not diagnostic data')
+
+    class HeldBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+                yield b''
+            finally:
+                # External clock failure at the next cleanup observation only.
+                fail_next_clock[0] = True
+        async def aclose(self):
+            close_entered.set()
+            await asyncio.get_running_loop().run_in_executor(None, close_release.wait)
+            closed.set()
+            raise RuntimeError(secret)
+
+    async def http(request):
+        source = request.headers['x-lp-source']
+        request.headers['authorization'] = secret
+        request.url = request.url.copy_add_param('private', secret)
+        requests.append(source)
+        if source == 'positions':
+            positions_pages.append(request.url.params['offset'])
+            await request.extensions['trace']('http11.receive_response_headers.started',
+                dict(request=Payload(), exception=Payload(), return_value=Payload()))
+            if len(positions_pages) == 41:
+                return httpx.Response(200, stream=HeldBody())
+            return httpx.Response(200, json=[dict(conditionId=CID, asset='yes',
+                size='1', avgPrice='0.4', private=secret)] * 100)
+        return httpx.Response(200, json=({'balance': dict(balance='100000000',
+            allowances={'spender': '100000000'}),
+            'open_orders': dict(data=[], next_cursor='LTE=')}[source]))
+
+    def factory(_demand):
+        clients = {name: httpx.AsyncClient(transport=httpx.MockTransport(http),
+            base_url='http://127.0.0.1', trust_env=False) for name in ('clob', 'data')}
+        return LPAsyncSourcePort(clients, clock=source_clock, utc_now=clock.utc)
+
+    runtime = LPReadRuntime(factory, clock=clock, utc_now=clock.utc)
+    runtime.start()
+    try:
+        runtime.reconcile((financial(secret),))
+        assert entered.wait(4)
+        boundary.wait(lambda: plain(runtime.status()).get('financial_request_cleanup') is not None
+            and len(plain(runtime.status())['financial_request_cleanup']['history']) == 32
+            and any(r['source'] == 'positions' for r in plain(runtime.status())['financial_request_cleanup']['current']))
+        snapshot = plain(runtime.status())['financial_request_cleanup']
+        current, = snapshot['current']
+        assert current['source'] == 'positions' and current['ended_monotonic'] is None
+        assert len(snapshot['history']) == 32
+        assert len(positions_pages) == 41
+        assert positions_pages == [str(100 * i) for i in range(41)]
+        assert len(json.dumps(snapshot).encode()) <= 16 * 1024
+        assert secret not in json.dumps(snapshot)
+        before = tuple(requests)
+        for _ in range(5):
+            copy = plain(runtime.status())['financial_request_cleanup']
+            copy['current'][0]['sequence'] = -1
+            copy['history'].append(dict(secret=secret))
+            assert plain(runtime.status())['financial_request_cleanup'] == snapshot
+        assert tuple(requests) == before
+        clock.value = 5
+        runtime.wake()
+        assert close_entered.wait(4)
+        assert diagnostic_failures == ['clock-failed']
+        assert not closed.is_set() and runtime.status()['scopes'][0]['active']
+        close_release.set()
+        assert closed.wait(4)
+        boundary.wait(lambda: not runtime.status()['scopes'][0]['active'])
+        boundary.wait(lambda: not plain(runtime.status())['financial_request_cleanup']['current'])
+        final = plain(runtime.status())['financial_request_cleanup']
+        ended = next(row for row in reversed(final['history']) if row['sequence'] == current['sequence'])
+        assert ended['outcome'] == 'cancelled' and ended['cleanup_state'] == 'failed'
+        assert ended['ended_monotonic'] == 5
+        assert len(final['history']) <= 32 and len(json.dumps(final).encode()) <= 16 * 1024
+        assert secret not in json.dumps(final)
+        notice, = runtime.drain_results()
+        assert not notice.complete and notice.reason == 'timeout'
+        assert runtime.drain_results() == () and tuple(requests) == before
+    finally:
+        close_release.set()
+        runtime.reconcile(())
+        assert runtime.close(4)
+
+
+def test_financial_request_cleanup_records_preserve_attempt_identity():
+    from dataclasses import replace
+    clock = Clock()
+    boundary = Boundary(clock)
+    entered = [threading.Event(), threading.Event()]
+    released = [threading.Event(), threading.Event()]
+    traces = []
+    requests = []
+
+    class Body(httpx.AsyncByteStream):
+        def __init__(self, index):
+            self.index = index
+        async def __aiter__(self):
+            entered[self.index].set()
+            await asyncio.Event().wait()
+            yield b''
+        async def aclose(self):
+            await asyncio.get_running_loop().run_in_executor(None, released[self.index].wait)
+
+    async def http(request):
+        source = request.headers['x-lp-source']
+        requests.append(source)
+        if source == 'positions':
+            index = len(traces)
+            traces.append((asyncio.get_running_loop(), request.extensions['trace']))
+            return httpx.Response(200, stream=Body(index))
+        return httpx.Response(200, json={'balance': dict(balance='100000000',
+            allowances={'spender': '100000000'}),
+            'open_orders': dict(data=[], next_cursor='LTE=')}[source])
+
+    def factory(_demand):
+        clients = {name: httpx.AsyncClient(transport=httpx.MockTransport(http),
+            base_url='http://127.0.0.1', trust_env=False) for name in ('data', 'clob')}
+        return LPAsyncSourcePort(clients, clock=clock, utc_now=clock.utc)
+
+    runtime = LPReadRuntime(factory, clock=clock, utc_now=clock.utc)
+    runtime.start()
+    try:
+        runtime.reconcile((financial('old-observation'),))
+        assert entered[0].wait(4)
+        first = runtime.status()['scopes'][0]['attempt']
+        clock.value = 5
+        runtime.wake()
+        old, = collect(runtime, boundary, bool)
+        assert not old.complete and old.reason == 'timeout' and old.attempt == first
+        wait_capture(runtime, boundary)
+        timeout = plain(runtime.status())['last_financial_timeout']
+        runtime.reconcile((financial('new-observation'),))
+        assert len(traces) == 1
+        released[0].set()
+        assert entered[1].wait(4)
+        fresh = runtime.status()['scopes'][0]['attempt']
+        assert fresh > first and len(requests) == 6
+        boundary.wait(lambda: plain(runtime.status())['financial_request_cleanup']['attempt'] == fresh
+            and any(r['source'] == 'positions' for r in
+                plain(runtime.status())['financial_request_cleanup']['current']))
+        before = plain(runtime.status())['financial_request_cleanup']
+        current, = before['current']
+        assert current['attempt'] == fresh and current['outcome'] == 'running'
+        old_history = [row for row in before['history'] if row['attempt'] == first]
+        assert len(old_history) == 3
+        async def late():
+            for event in ('http11.response_closed.started', 'http11.response_closed.failed',
+                          'http11.response_closed.complete'):
+                await traces[0][1](event, {'exception': RuntimeError('old-private-payload')})
+        asyncio.run_coroutine_threadsafe(late(), traces[0][0]).result(2)
+        # Advance the supervisor's observation without advancing the deadline.
+        clock.value = 5.5
+        runtime.wake()
+        boundary.wait(lambda: runtime.status()['observed_monotonic'] == 5.5)
+        after = plain(runtime.status())['financial_request_cleanup']
+        assert after == before
+        assert plain(runtime.status())['last_financial_timeout'] == timeout
+        assert runtime.drain_results() == ()
+        assert old.demand.observation_id == 'old-observation' and not old.complete
+        assert current['ended_monotonic'] is None and len(requests) == 6
+    finally:
+        for release in released:
+            release.set()
+        runtime.reconcile(())
+        assert runtime.close(4)
