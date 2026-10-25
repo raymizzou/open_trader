@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-25 — JP API startup region observations
+
+- Apply Ray's 2026-10-24 #432 decision to production cloud startup: explicitly observe a genuine JP `blocked=true` response without denying readiness for that fact alone. Preserve the public boolean, country and region in read-auth/preflight output, with a separate startup policy result; omit IP addresses and secrets.
+- Keep other countries and unknown region facts blocking, along with authentication, complete account facts, read-only guards and all source, runtime, ownership and financial checks. Strict region checks and transaction paths stay unchanged. This code change does not merge, deploy, change an exit/proxy, start LP or establish live-order acceptance.
+
 ## 2026-10-25 — Income rebuild test completion
 
 - Observe the actual three-slot income group and native action completion before checking the final portfolio. Preserve exact 50/30/20 amounts, manual-order protection and all existing assertions. Test synchronization only; production behavior and CI classification are unchanged.

@@ -1373,6 +1373,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--config", type=Path, default=Path("config/prediction_arbitrage.json")
     )
     wallet_read.add_argument("--require-trading-region", action="store_true")
+    wallet_read.add_argument("--observe-jp-api-region", action="store_true",
+                             help="Record known JP blocking as a startup observation; requires --require-trading-region")
     data_check = prediction_commands.add_parser(
         "data-check", help="Check bounded public and same-wallet data without trading"
     )
@@ -1576,9 +1578,13 @@ def _prediction_probe_backend() -> str:
     return backend
 
 
-def _prediction_read_auth(config_path: Path, *, require_trading_region: bool = False) -> int:
+def _prediction_read_auth(config_path: Path, *, require_trading_region: bool = False,
+                          observe_jp_api_region: bool = False) -> int:
+    if observe_jp_api_region and not require_trading_region:
+        raise ValueError("region_observation_requires_region_check")
     backend = _prediction_probe_backend()
     client = None
+    region_allowed = False
     guard = PolymarketReadOnlyGuard()
     result: dict[str, object] = {
         "initialization": {"status": "unknown", "path": "GET /auth/derive-api-key", "backend": backend},
@@ -1590,7 +1596,18 @@ def _prediction_read_auth(config_path: Path, *, require_trading_region: bool = F
         with guard_polymarket_client(client, guard):
             account = client._lp_account_facts(include_raw_trades=True)
             if require_trading_region:
-                region_allowed = client.geoblock_allowed()
+                if observe_jp_api_region:
+                    observation = client.geoblock_observation()
+                    jp_observation = (observation.get("blocked") is True
+                                      and observation.get("country") == "JP")
+                    region_allowed = observation.get("blocked") is False or jp_observation
+                    region_report = {**observation,
+                                     "policy": "jp_api_observation_only" if jp_observation else "strict",
+                                     "startup_allowed": region_allowed}
+                else:
+                    region_allowed = client.geoblock_allowed()
+                    region_report = ({"status": "allowed"} if region_allowed else
+                                     {"status": "blocked", "reason": "geoblock_denied_or_unavailable"})
         complete = (account.get("open_orders_complete") is True
                     and account.get("positions_complete") is True
                     and account.get("trades_complete") is True
@@ -1603,8 +1620,7 @@ def _prediction_read_auth(config_path: Path, *, require_trading_region: bool = F
             "checked_at": str(account.get("checked_at")),
         }
         if require_trading_region:
-            result["trading_region"] = ({"status": "allowed"} if region_allowed else
-                                        {"status": "blocked", "reason": "geoblock_denied_or_unavailable"})
+            result["trading_region"] = region_report
     except Exception as exc:
         result["account_read"] = {"status": "unknown", "reason": type(exc).__name__}
         if require_trading_region:
@@ -1615,7 +1631,7 @@ def _prediction_read_auth(config_path: Path, *, require_trading_region: bool = F
     result["guard"] = {"mutation_attempts": guard.mutation_calls,
                        "notification_attempts": guard.live_notifications}
     result["result"] = "PASS" if (result["account_read"]["status"] == "ready" and not guard.attempts
-                                  and (not require_trading_region or result["trading_region"]["status"] == "allowed")) else "BLOCKED"
+                                  and (not require_trading_region or region_allowed)) else "BLOCKED"
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result["result"] == "PASS" else 2
 
@@ -2141,7 +2157,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.prediction_command == "wallet" and args.wallet_command == "read-auth":
             try:
                 return _prediction_read_auth(args.config.expanduser(),
-                                             require_trading_region=args.require_trading_region)
+                                             require_trading_region=args.require_trading_region,
+                                             observe_jp_api_region=args.observe_jp_api_region)
             except (FileNotFoundError, ValueError) as exc:
                 print(json.dumps({"result": "BLOCKED", "reason": str(exc)
                                   if str(exc) in {"credential_backend_unset", "credential_file_unset", "ssm_references_incomplete"}

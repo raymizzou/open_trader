@@ -285,11 +285,23 @@ credential backend/path; it contains no secret values.
 
 Production-file profile support alone does not establish Tokyo live readiness.
 The explicit same-wallet instance profile below requires its own source,
-configuration and running-service evidence. Geographic eligibility remains a
-separate unresolved operational condition. Production preflight still requires
-service-user `wallet read-auth --require-trading-region`; its failure blocks
-`PRECHECK_OK`. This capability change does not deploy or start a service, enable
-live orders, or waive any existing gate.
+configuration and running-service evidence. Under Ray's explicit 2026-10-24
+decision for #432, production preflight invokes service-user
+`wallet read-auth --require-trading-region --observe-jp-api-region`.
+A genuine `blocked=true, country=JP` response is observation-only for this
+startup check. The output retains `status=blocked`, the original boolean,
+country and region, with `policy=jp_api_observation_only` and
+`startup_allowed=true`. Native preflight includes this `trading_region` evidence
+in its JSON. It never reports the public geoblock response as unblocked.
+
+Other blocked countries, missing country on a blocked response, malformed or
+unavailable region facts, failed authentication and incomplete account facts
+still block startup. Successful authentication must retain zero mutation and
+notification attempts. The explicit observation option requires the region
+check; existing strict `geoblock_allowed()` and transaction preflights do not
+change. This is the operator's startup policy, not official confirmation of
+account eligibility or evidence that an exchange accepts orders. It does not
+change routing, proxies, credentials, CI policy or authorization for deployment.
 
 ### Explicit same-wallet LP instances
 
@@ -346,8 +358,9 @@ and rechecks Mini. Missing, stale, legacy or mismatched evidence blocks the gate
 Only this validated explicit profile replaces `old_owner_stopped` with live peer
 evidence. The default profile retains stopped-owner handoff. SSM still requires
 metadata isolation; file profiles retain private file/service identity and
-service-user read-auth. `--require-trading-region` remains mandatory in production:
-a geographic refusal blocks readiness without a bypass or regional exception.
+service-user read-auth. Production passes `--require-trading-region` together
+with the explicit JP observation option described above. Its narrow JP exception
+does not waive the other readiness, identity or financial checks.
 
 Code and offline verification are not deployment or operational acceptance.
 Source/runtime/lock/config verification, trusted exact-SHA CI, resource checks,
@@ -417,9 +430,10 @@ without credentials skips the wallet read. A credentialed profile runs
 derivation from complete authenticated account reads. The installed SDK's
 ordinary `create()` can create credentials or deploy a wallet, so it is not
 used by this read-only probe. Production and SSM Shadow profiles requesting
-legacy zero still pass `--require-trading-region`, retaining the existing geoblock
-gate even though the service is effectively paused. Shadow profiles requesting
-one omit the trading-region requirement.
+legacy zero still pass `--require-trading-region`. Only production additionally
+passes `--observe-jp-api-region`, implementing Ray's 2026-10-24 JP startup policy.
+Shadow zero retains the strict region check; Shadow profiles requesting one
+omit the trading-region requirement. No new wallet/API key is created.
 
 Using the accepted release's Python and non-secret runtime config as the
 `prediction` user, run `prediction-arb wallet read-auth --config <runtime-config>`

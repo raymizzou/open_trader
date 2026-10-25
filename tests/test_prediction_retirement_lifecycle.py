@@ -94,7 +94,11 @@ def cloud_host_fixture(tmp_path, monkeypatch, mode, requested):
         elif args[0]=='git':
             output='HEAD' if args[-1]=='HEAD' and '--abbrev-ref' in args else ('a'*40 if 'rev-parse' in args else '')
         elif args[0]=='runuser':
-            output='a'*40 if 'git' in args else ''
+            output='a'*40 if 'git' in args else json.dumps(dict(
+                result='PASS', account_read=dict(status='ready',complete=True),
+                guard=dict(mutation_attempts=0,notification_attempts=0),
+                trading_region=dict(status='allowed',blocked=False,country='US',region='CA',
+                                    policy='strict',startup_allowed=True)))
         elif args[0]==str(python): output=''
         elif args[0]=='journalctl': output='prediction_runtime_state state=RUNNING'
         else: raise AssertionError('uncontrolled external command: '+str(args))
@@ -126,9 +130,10 @@ def test_cloud_lifecycle_binds_effective_pause(tmp_path, monkeypatch, scenario):
     preflight = cloud.operate(cfg,'preflight')
     assert preflight['status']=='PRECHECK_OK'
     assert preflight['n_leg_paused']==1 and preflight['configured_n_leg_paused']==requested
-    # Raw authentication/geographic eligibility is preserved even when effective pause differs.
+    # Authentication stays required; only production opts into known-JP startup observation.
     auth = next(command for command in commands if 'read-auth' in command)
     assert ('--require-trading-region' in auth) is (mode=='production' or requested==0)
+    assert ('--observe-jp-api-region' in auth) is (mode=='production')
     state['active']=True
     status = cloud.operate(cfg,'status')
     assert status['n_leg_paused']==1 and status['configured_n_leg_paused']==requested

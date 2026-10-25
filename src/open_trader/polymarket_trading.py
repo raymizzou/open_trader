@@ -2625,6 +2625,31 @@ class PolymarketTradingClient:
             metadata_cache=metadata_cache,
         )
 
+    def geoblock_observation(self) -> dict[str, object]:
+        """Read public region facts without deciding trading permission.
+
+        Startup policy may treat a known JP response as observation-only. Keep
+        the venue's boolean intact; omit IP addresses and raw error payloads.
+        """
+        opener = self._urlopen_fn or urlopen
+        try:
+            request = Request(GEOBLOCK_URL, headers={"User-Agent": "OpenTrader/1.0"})
+            with opener(request, timeout=GEOBLOCK_TIMEOUT_SECONDS) as response:
+                payload = json.loads(response.read())
+            if not isinstance(payload, dict) or type(payload.get("blocked")) is not bool:
+                raise ValueError("unknown region response")
+            report: dict[str, object] = {
+                "status": "blocked" if payload["blocked"] else "allowed",
+                "blocked": payload["blocked"],
+            }
+            for key, pattern in (("country", r"[A-Z]{2}"), ("region", r"[A-Za-z0-9-]{1,16}")):
+                value = payload.get(key)
+                if isinstance(value, str) and re.fullmatch(pattern, value):
+                    report[key] = value
+            return report
+        except Exception:
+            return {"status": "unknown", "reason": "geoblock_denied_or_unavailable"}
+
     def geoblock_allowed(self) -> bool:
         """Return true only for an explicit ``{"blocked": false}`` response."""
 
