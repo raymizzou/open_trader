@@ -1627,7 +1627,15 @@ def test_observed_pool_due_work_survives_async_wait_and_wakeup(tmp_path,monkeypa
                 for key,y in rig.live.state.snapshot().yields.items()))
             assert rig.seconds==stamp
         rig.tick()
-        rig.pump(lambda:rig.live.state.snapshot().observation.components['open_orders'].checked_at==rig.utc())
+        # The unchanged-time wake is proven above; account publication may
+        # require the next actual read deadline after the BUY receipt.
+        def account_current():
+            snapshot=rig.live.state.snapshot();observation=snapshot.observation
+            return (observation is not None and observation.orders_complete
+                and observation.components['open_orders'].checked_at==rig.utc()
+                and observation.read_ticket.trade_version_at_start==snapshot.trade_version
+                and {row['order_id'] for row in observation.source_frame.current_buys}=={'old-D','new-E-1'})
+        rig.converge_current(account_current)
         assert len(rig.sdk.posts)==1 and rig.sdk.cancels==[]
         assert rig.live.rounds.snapshot().round_number>1
     finally:rig.close()
