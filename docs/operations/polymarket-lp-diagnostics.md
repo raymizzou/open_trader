@@ -191,6 +191,33 @@ exits. Recovery keeps the same clients, fixed pools, cadence, provider cooldown,
 identity and financial admission rules. Successful cleanup alone grants no
 financial authority or permission to send or replay a trade.
 
+The LP client factory sets HTTPX `timeout=None`. Recovery therefore does not
+have an extra HTTPX timeout bound. If an internal AnyIO scope balances its own
+cancellations while a caller cancellation overlaps, the remaining caller
+cancellation must still reach the next ordinary network await. The owner
+coalesces one loop callback after the synchronous balance boundary, checks the
+remaining public cancellation count, and delivers it only outside cleanup.
+It does not inject cancellation on each `uncancel()` call: on Python 3.12 that
+could leave a pending injection after the library-only count reaches zero.
+Actual source exit, rather than a counter or timeout assumption, still owns drain.
+
+The task accounting above applies to supported production runtime demand shapes:
+financial reads use three separate leaf sources; BUY market reads use `book`,
+`metadata`, `native_rewards` and `sponsored_rewards`; exact reads use individual
+sources. It is not a census of arbitrary caller-created demands/tasks or transient
+internally scoped AnyIO connect helpers. The standalone source-port convenience
+`SourceRequest('market', ...)` gathers its own child reads outside the runtime
+registry. Its child tasks are not included in `managed_tasks`, and its use as a
+custom runtime source is outside the stated production accounting proof. Its
+standalone behavior remains covered by the existing source contract.
+
+The factory supplies LP-owned HTTPX clients. Constructing the port appends one
+deduplicated public request hook to each supplied client's `event_hooks` list;
+this is an intentional mutation of those owned clients, not a factory change.
+The hook is a no-op when there is no active source ownership context, so ordinary
+non-owned reads retain their trace behavior. The supplied-client contract is an
+HTTPX AsyncClient with that public hook API, not an arbitrary fake-client protocol.
+
 ## Financial request cleanup records
 
 `LPReadRuntime.status()['financial_request_cleanup']` and
@@ -241,3 +268,8 @@ proves this local mechanism, not the first production trigger. Deployment and
 production acceptance remain separate: normal reads, fresh eligible candidates,
 and normal trial/income 3+3 operation under the original market and financial
 rules still require their own evidence and authorization.
+
+The body-error cancellation case was ALREADY_COVERED when introduced after the
+header fix. It has no independent pre-fix RED; neither that guard nor a later
+`body.failed`/cleanup trace proves the first production trigger. No production
+fault injection is part of this verification.

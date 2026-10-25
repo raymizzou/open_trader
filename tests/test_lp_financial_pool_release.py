@@ -728,3 +728,192 @@ def test_owned_request_tasks_are_counted_and_drained():
     assert runtime.status()['managed_tasks'] == 0
     assert all(task.done() for task in entered)
     assert all(client.is_closed for client in clients)
+
+
+class InternalScopeNetwork:
+    """Real AnyIO scope at an external HTTPX boundary, with public observations."""
+    def __init__(self):
+        self.internal_seen = threading.Event()
+        self.scope_exited = threading.Event()
+        self.network_entered = threading.Event()
+        self.network_cancelled = threading.Event()
+        self.cleanup_entered = threading.Event()
+        self.cleanup_exited = threading.Event()
+        self.requests = []
+        self.observations = []
+        self.loop = None
+        self.scope_release = None
+        self.response_release = None
+        self.cleanup_release = None
+
+    async def http(self, request):
+        import anyio
+        source = request.headers['x-lp-source']
+        self.requests.append(source)
+        if source != 'positions' or self.requests.count('positions') > 1:
+            return httpx.Response(200, json={'positions': [],
+                'balance': dict(balance='100000000', allowances={'spender': '100000000'}),
+                'open_orders': dict(data=[], next_cursor='LTE=')}[source])
+        self.loop = asyncio.get_running_loop()
+        self.scope_release = asyncio.Event()
+        self.response_release = asyncio.Event()
+        self.cleanup_release = asyncio.Event()
+        task = asyncio.current_task()
+        try:
+            with anyio.CancelScope() as scope:
+                scope.cancel()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.observations.append(('internal_delivered', task.cancelling()))
+                    self.internal_seen.set()
+                    await self.scope_release.wait()
+                    self.observations.append(('before_balance', task.cancelling()))
+                    raise
+            self.observations.append(('after_balance', task.cancelling()))
+            self.scope_exited.set()
+            self.network_entered.set()
+            try:
+                await self.response_release.wait()
+            except asyncio.CancelledError:
+                self.observations.append(('external_delivered', task.cancelling()))
+                self.network_cancelled.set()
+                raise
+            return httpx.Response(200, json=[])
+        finally:
+            self.cleanup_entered.set()
+            await self.cleanup_release.wait()
+            self.cleanup_exited.set()
+
+    def release(self, name):
+        self.loop.call_soon_threadsafe(getattr(self, name).set)
+
+
+async def internal_scope_direct_case(overlap):
+    boundary = InternalScopeNetwork()
+    before = asyncio.all_tasks()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(boundary.http),
+            base_url='http://127.0.0.1', timeout=None, trust_env=False) as client:
+        port = LPAsyncSourcePort({'data': client})
+        original = asyncio.create_task(port.read(SourceRequest('positions', 'offline-account'),
+            time.monotonic() + 5))
+        try:
+            assert await asyncio.to_thread(boundary.internal_seen.wait, 2)
+            assert boundary.observations[0] == ('internal_delivered', 1)
+            if overlap:
+                assert original.cancel('independent-outer-cancel')
+            # Explicit loop barriers let the public read forward cancellation
+            # while the actual internal CancelScope is still balancing.
+            for _ in range(3):
+                barrier = asyncio.get_running_loop().create_future()
+                asyncio.get_running_loop().call_soon(barrier.set_result, None)
+                await barrier
+            boundary.release('scope_release')
+            assert await asyncio.to_thread(boundary.scope_exited.wait, 2)
+            after = next(count for event, count in boundary.observations if event == 'after_balance')
+            assert after == (1 if overlap else 0)
+            assert next(count for event, count in boundary.observations
+                if event == 'before_balance') > after + 1
+            assert boundary.network_entered.is_set()
+            if overlap:
+                assert await asyncio.to_thread(boundary.network_cancelled.wait, 2), boundary.observations
+                assert boundary.cleanup_entered.is_set() and not boundary.cleanup_exited.is_set()
+                assert not original.done()
+                boundary.release('cleanup_release')
+                with pytest.raises(asyncio.CancelledError):
+                    await settled(original)
+                assert boundary.cleanup_exited.is_set()
+            else:
+                assert not boundary.network_cancelled.is_set() and not original.done()
+                boundary.release('response_release')
+                boundary.release('cleanup_release')
+                result = await settled(original)
+                assert result.complete and result.value == () and not result.error
+                assert not boundary.network_cancelled.is_set()
+            assert boundary.requests == ['positions']
+        finally:
+            for name in ('scope_release', 'response_release', 'cleanup_release'):
+                if getattr(boundary, name) is not None:
+                    boundary.release(name)
+            await asyncio.gather(original, return_exceptions=True)
+    assert asyncio.all_tasks() == before
+
+
+def internal_scope_runtime_case(overlap):
+    clock = Clock()
+    observer = Boundary(clock)
+    boundary = InternalScopeNetwork()
+    clients = []
+
+    def factory(_demand):
+        owned = {name: httpx.AsyncClient(transport=httpx.MockTransport(boundary.http),
+            base_url='http://127.0.0.1', timeout=None, trust_env=False)
+            for name in ('data', 'clob')}
+        clients.extend(owned.values())
+        return LPAsyncSourcePort(owned, clock=clock, utc_now=clock.utc)
+
+    runtime = LPReadRuntime(factory, clock=clock, utc_now=clock.utc)
+    runtime.start()
+    try:
+        runtime.reconcile((demand('O', kind='financial',
+            sources=('balance', 'open_orders', 'positions')),))
+        assert boundary.internal_seen.wait(2)
+        assert boundary.observations[0] == ('internal_delivered', 1)
+        first = runtime.status()['scopes'][0]['attempt']
+        if overlap:
+            clock.value = 5
+            runtime.wake()
+            notice, = collect(runtime, observer, bool)
+            assert notice.attempt == first and notice.reason == 'timeout' and not notice.complete
+            assert notice.sources['balance'].complete and notice.sources['open_orders'].complete
+            assert not notice.sources['positions'].complete
+            observer.wait(lambda: runtime.status()['last_financial_timeout']['capture_state'] != 'pending')
+            assert runtime.drain_results() == ()
+            runtime.reconcile(())
+        boundary.release('scope_release')
+        assert boundary.scope_exited.wait(2)
+        after = next(count for event, count in boundary.observations if event == 'after_balance')
+        assert after == (1 if overlap else 0)
+        assert next(count for event, count in boundary.observations
+            if event == 'before_balance') > after + 1
+        assert boundary.network_entered.is_set()
+        if overlap:
+            assert boundary.network_cancelled.wait(2), boundary.observations
+            assert boundary.cleanup_entered.is_set() and not boundary.cleanup_exited.is_set()
+            assert runtime.status()['scopes'][0]['active']
+            assert runtime.status()['managed_tasks'] == 2
+            assert boundary.requests.count('positions') == 1
+            assert runtime.drain_results() == ()
+            boundary.release('cleanup_release')
+            assert boundary.cleanup_exited.wait(2)
+            observer.wait(lambda: not runtime.status()['scopes']
+                or not runtime.status()['scopes'][0]['active'])
+            assert runtime.drain_results() == ()
+        else:
+            assert not boundary.network_cancelled.is_set()
+            boundary.release('response_release')
+            boundary.release('cleanup_release')
+            normal, = collect(runtime, observer, lambda rows: any(row.complete for row in rows))
+            assert normal.attempt == first and normal.complete and not normal.reason
+            assert normal.sources['positions'].value == ()
+            assert all(row.complete and not row.error for row in normal.sources.values())
+            assert not boundary.network_cancelled.is_set()
+        assert boundary.requests.count('positions') == 1
+    finally:
+        for name in ('scope_release', 'response_release', 'cleanup_release'):
+            if getattr(boundary, name) is not None:
+                boundary.release(name)
+        runtime.reconcile(())
+        assert runtime.close(4)
+    assert all(client.is_closed for client in clients)
+    assert runtime.status()['managed_tasks'] == 0
+
+
+@pytest.mark.parametrize('mode', ('direct', 'runtime'))
+def test_internal_cancel_scope_preserves_outer_read_cancellation(mode):
+    if mode == 'direct':
+        asyncio.run(internal_scope_direct_case(False))
+        asyncio.run(internal_scope_direct_case(True))
+    else:
+        internal_scope_runtime_case(False)
+        internal_scope_runtime_case(True)

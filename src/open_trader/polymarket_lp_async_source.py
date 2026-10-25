@@ -85,6 +85,7 @@ class OwnedReadTask(asyncio.Task):
         self.record = None
         self.request_marker = None
         self.cleanup_result = 'not_started'
+        self._cancel_balance_pending = False
         super().__init__(coro, loop=asyncio.get_running_loop())
 
     def cancel(self, msg=None):
@@ -110,7 +111,21 @@ class OwnedReadTask(asyncio.Task):
         super().uncancel()
         if not self.cancel_requests and self.record is not None:
             self.record.note('uncancel')
+        if self.in_read and not self.cleanup and not self._cancel_balance_pending:
+            # A scope can balance several deliveries synchronously. Wait until
+            # that whole boundary exits: Python 3.12 uncancel() does not rescind
+            # an already queued injection if a later balance reduces it to zero.
+            self._cancel_balance_pending = True
+            self.get_loop().call_soon(self._deliver_unbalanced_cancel)
         return self.cancelling()
+
+    def _deliver_unbalanced_cancel(self):
+        self._cancel_balance_pending = False
+        if self.in_read and self.cancel_requests and not self.cleanup and not self.done():
+            # Deliver the remaining caller request, not a new counted request.
+            # No library-scope message: an enclosing scope must not mistake it
+            # for its own internal cancellation and swallow it again.
+            super().cancel()
 
 
 class _RequestRecord:
