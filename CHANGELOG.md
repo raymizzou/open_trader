@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-25 — LP pool test publication synchronization
+
+- Wait for exact account order IDs, receipt versions and fresh HTTP publication before pool assertions. Hold test time while reads are pending, observe candidate responses from departing orders as well as income reads, and wait for actual rebuild slots and native exit. Preserve financial amounts, manual-order protection and candidate withholding; test-only, with no production or CI-result claim.
+
 ## 2026-10-25 — JP API startup region observations
 
 - Apply Ray's 2026-10-24 #432 decision to production cloud startup: explicitly observe a genuine JP `blocked=true` response without denying readiness for that fact alone. Preserve the public boolean, country and region in read-auth/preflight output, with a separate startup policy result; omit IP addresses and secrets.
