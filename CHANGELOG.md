@@ -3,6 +3,7 @@
 ## 2026-10-25 — LP pool test publication synchronization
 
 - Wait for exact account order IDs, receipt versions and fresh HTTP publication before pool assertions. Hold test time while reads are pending, observe candidate responses from departing orders as well as income reads, and wait for actual rebuild slots and native exit. Preserve financial amounts, manual-order protection and candidate withholding; test-only, with no production or CI-result claim.
+- Consume queued reads at receipt handoffs and publish each exact native receipt account before later income selection. Cover delayed open-order, exact-order and book responses without changing financial assertions or watchdogs; test synchronization only.
 
 ## 2026-10-25 — LP response release ownership
 
