@@ -163,3 +163,32 @@ Opaque/native awaiters can prevent this snapshot from identifying a network
 phase. Deployment and a later recurrence are separate from implementation and
 from root-cause proof. Deployment needs its own authorization and exact-SHA gates;
 a restart can remove the current stalled process and its in-memory evidence.
+
+## Response release ownership (2026-10-25)
+
+The LP source adapter installs a release boundary before iterating each response
+body. Body and network reads remain cancellable. Both HTTPX's implicit EOF close
+and context exit use the same owned transport-close task. Outer read cancellation
+is retained while the adapter waits for actual close completion, then propagates
+to the original caller. Repeated close waits reuse that task. Close failure is
+observed and cannot return complete source facts; if cancellation coincides with
+failure, cancellation propagates with the close error as its cause.
+
+This adds at most one short-lived close task per current response. That child is
+shielded from outer read cancellation and remains owned by the unfinished source
+read. `managed_tasks` counts the runtime's scope/source tasks; it does not measure
+all asyncio tasks or separately count these close children. A stalled close keeps
+its original source unfinished. The supervisor still publishes UNKNOWN at five
+seconds and reports a cleanup fault at six seconds if actual drain has not
+finished. Neither cancellation sent, a closed response flag nor a timeout snapshot
+proves release. Recovery retains the fixed clients/pools, original retry cadence,
+provider cooldown, fresh attempt identity and financial admission gates.
+
+Offline real HTTP/1.1 tests with a one-connection pool reproduce cancellation at
+the normal-close library checkpoint and verify that a later read reaches the
+server on the same pool. The full financial supervisor test verifies its own
+deadline cancellation, one UNKNOWN result and fresh recovery after actual close.
+Separate external-stream tests cover incomplete close and close errors. These
+prove the reproduced mechanism and repair; the original production trigger
+interleaving was not directly observed. Production attribution, deployment and
+recurrence acceptance remain separate and are not established by local tests.
