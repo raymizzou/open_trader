@@ -178,6 +178,75 @@ def test_cloud_preflight_file_shadow_uses_safe_auth_without_ssm(tmp_path, monkey
     assert any('OPEN_TRADER_CREDENTIAL_FILE='+cfg.credentials_file in args for args in commands)
 
 
+@pytest.mark.parametrize('backend', ['file', 'ssm'])
+def test_production_preflight_preserves_jp_region_observation(tmp_path, monkeypatch, backend):
+    from dataclasses import replace
+    import subprocess
+    import open_trader.prediction_cloud as cloud
+    from tests.test_prediction_retirement_lifecycle import cloud_host_fixture
+
+    cfg, _, commands, _ = cloud_host_fixture(tmp_path, monkeypatch, 'production', 1)
+    if backend == 'file':
+        cfg = replace(cfg, region='', secret='', version='', role='', credential_backend='file',
+                      credentials_file='/var/lib/open-trader/prediction-credentials/polymarket.json')
+    region = dict(status='blocked', blocked=True, country='JP', region='13',
+                  policy='jp_api_observation_only', startup_allowed=True)
+    external = subprocess.run
+
+    def checked_external(command, **kwargs):
+        if 'read-auth' in command:
+            commands.append(list(command))
+            return subprocess.CompletedProcess(command, 0, json.dumps(dict(
+                result='PASS', trading_region=region,
+                account_read=dict(status='ready', complete=True),
+                guard=dict(mutation_attempts=0, notification_attempts=0))), '')
+        return external(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'run', checked_external)
+    result = cloud.operate(cfg, 'preflight')
+    auth, = [command for command in commands if 'read-auth' in command]
+    assert '--require-trading-region' in auth
+    assert '--observe-jp-api-region' in auth
+    assert result['status'] == 'PRECHECK_OK'
+    assert result['trading_region'] == region
+    assert all(command[0] != 'systemctl' or command[1] == 'show' for command in commands)
+
+
+@pytest.mark.parametrize('failure', ['empty', 'malformed', 'missing-region',
+                                     'financial-unknown', 'auth-blocked', 'mutation-seen'])
+def test_production_preflight_rejects_missing_region_evidence(tmp_path, monkeypatch, failure):
+    import subprocess
+    import open_trader.prediction_cloud as cloud
+    from tests.test_prediction_retirement_lifecycle import cloud_host_fixture
+
+    cfg, _, commands, _ = cloud_host_fixture(tmp_path, monkeypatch, 'production', 1)
+    report = dict(result='PASS', account_read=dict(status='ready',complete=True),
+                  guard=dict(mutation_attempts=0,notification_attempts=0),
+                  trading_region=dict(status='blocked',blocked=True,country='JP',region='13',
+                                      policy='jp_api_observation_only',startup_allowed=True))
+    if failure == 'missing-region':
+        del report['trading_region']
+    elif failure == 'financial-unknown':
+        report['account_read']['complete'] = False
+    elif failure == 'auth-blocked':
+        report['result'] = 'BLOCKED'
+    elif failure == 'mutation-seen':
+        report['guard']['mutation_attempts'] = 1
+    stdout = '' if failure == 'empty' else 'not-json' if failure == 'malformed' else json.dumps(report)
+    external = subprocess.run
+
+    def checked_external(command, **kwargs):
+        if 'read-auth' in command:
+            commands.append(list(command))
+            return subprocess.CompletedProcess(command, 0, stdout, '')
+        return external(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'run', checked_external)
+    with pytest.raises(ValueError, match='production read-auth evidence unavailable'):
+        cloud.operate(cfg, 'preflight')
+    assert all(command[0] != 'systemctl' or command[1] == 'show' for command in commands)
+
+
 def test_file_production_preflight_requires_service_auth_and_region_without_ssm(tmp_path, monkeypatch):
     import subprocess
     import open_trader.prediction_cloud as cloud
@@ -203,7 +272,9 @@ def test_file_production_preflight_requires_service_auth_and_region_without_ssm(
     monkeypatch.setattr(subprocess, 'run', checked_external)
     result = cloud.operate(cfg, 'preflight')
     assert result == dict(status='PRECHECK_OK', git_sha='a'*40, mode='production',
-        n_leg_paused=1, configured_n_leg_paused=1, credential_backend='file', candidate_exclusions=False)
+        n_leg_paused=1, configured_n_leg_paused=1, credential_backend='file', candidate_exclusions=False,
+        trading_region=dict(status='allowed',blocked=False,country='US',region='CA',
+                            policy='strict',startup_allowed=True))
     for failure in (None, 'fixture authentication denied', 'fixture trading region blocked'):
         if failure is not None:
             commands.clear()
@@ -214,9 +285,10 @@ def test_file_production_preflight_requires_service_auth_and_region_without_ssm(
         assert auth[:5] == ['runuser', '-u', 'prediction', '--', 'env']
         assert 'OPEN_TRADER_CREDENTIAL_BACKEND=file' in auth
         assert 'OPEN_TRADER_CREDENTIAL_FILE=/var/lib/open-trader/prediction-credentials/polymarket.json' in auth
-        assert auth[-9:] == [str(tmp_path/'python'), '-m', 'open_trader',
+        assert auth[-10:] == [str(tmp_path/'python'), '-m', 'open_trader',
             'prediction-arb', 'wallet', 'read-auth', '--config',
-            str(tmp_path/'runtime/config/prediction_arbitrage.json'), '--require-trading-region']
+            str(tmp_path/'runtime/config/prediction_arbitrage.json'), '--require-trading-region',
+            '--observe-jp-api-region']
         assert not any('SSM_' in argument or 'tencentcloud' in argument for command in commands for argument in command)
         assert all(command[0] in {str(tmp_path/'python'), 'git', 'runuser', 'ss', 'systemctl'} for command in commands)
         assert all(command[0] != 'systemctl' or command[1] == 'show' for command in commands)
@@ -241,6 +313,10 @@ def test_cloud_preflight_reads_wallet_except_paused_shadow(tmp_path, monkeypatch
                         'read_minimum_reader_generation', lambda path: 1)
     def checked_run(*args, **kwargs):
         commands.append(args)
+        if 'read-auth' in args:
+            return json.dumps(dict(result='PASS',account_read=dict(status='ready',complete=True),
+                guard=dict(mutation_attempts=0,notification_attempts=0),
+                trading_region=dict(status='allowed',blocked=False,policy='strict',startup_allowed=True)))
         return cfg.expected_sha if args[-1] == 'HEAD' else 'ok'
     monkeypatch.setattr(cloud, 'run', checked_run)
     monkeypatch.setattr(os, 'statvfs', lambda path: SimpleNamespace(
@@ -253,6 +329,7 @@ def test_cloud_preflight_reads_wallet_except_paused_shadow(tmp_path, monkeypatch
         assert any('--require-trading-region' in args for args in commands)
     else:
         assert not any('--require-trading-region' in args for args in commands)
+    assert any('--observe-jp-api-region' in args for args in commands) is (mode == 'production')
 
 
 def test_two_host_gate_blocks_missing_operator_evidence_before_ssh(tmp_path):
@@ -952,7 +1029,7 @@ def test_cloud_candidate_exclusions_preflight_evidence_binds_requested_value(tmp
         'prediction', 'a'*40, '', '', '', '', 'shadow', 1, candidate_exclusions=enabled)
     # Existing focused preflight tests prove its checks; this boundary exercises
     # the operation response that the two-host wrapper consumes.
-    monkeypatch.setattr(cloud, 'preflight', lambda cfg: None)
+    monkeypatch.setattr(cloud, 'preflight', lambda cfg: {})
     result = cloud.operate(config, 'preflight')
     assert result['status'] == 'PRECHECK_OK'
     assert result['candidate_exclusions'] is enabled

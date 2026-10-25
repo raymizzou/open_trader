@@ -435,11 +435,12 @@ def staged_instance_identity(c: CloudConfig) -> dict:
         'config_path':selection['path'],'config_sha256':selection['sha256']}
 
 
-def preflight(c: CloudConfig) -> dict | None:
+def preflight(c: CloudConfig) -> dict:
     release_identity(c)
     absent(c)
     trusted_layout(c)
     isolation=staged_instance_identity(c) if c.lp_instance_id is not None else None
+    evidence={'lp_instance_isolation':isolation} if isolation is not None else {}
     run(str(c.python), '-c', 'import sys; assert sys.version_info >= (3,12)' +
         ('; import tencentcloud.ssm.v20190923.ssm_client' if credential_backend(c) == 'tencent-ssm' else ''))
     from .prediction_arbitrage_store import read_minimum_reader_generation
@@ -451,13 +452,28 @@ def preflight(c: CloudConfig) -> dict | None:
     if run('runuser', '-u', c.user, '--', 'env', *references, 'git', '-C', str(c.release_root), 'rev-parse', 'HEAD') != c.expected_sha:
         raise ValueError('service user cannot verify release SHA')
     if credential_backend(c) != 'disabled':
-        run('runuser', '-u', c.user, '--', 'env', *references, str(c.python), '-m', 'open_trader',
+        authentication=run('runuser', '-u', c.user, '--', 'env', *references, str(c.python), '-m', 'open_trader',
             'prediction-arb', 'wallet', 'read-auth', '--config',
             str(c.runtime_root/'config/prediction_arbitrage.json'),
-            *(['--require-trading-region'] if c.mode == 'production' or not c.n_leg_paused else []), timeout=60)
+            *(['--require-trading-region'] if c.mode == 'production' or not c.n_leg_paused else []),
+            *(['--observe-jp-api-region'] if c.mode == 'production' else []), timeout=60)
+        if c.mode == 'production':
+            try:
+                report=json.loads(authentication)
+            except (TypeError, ValueError):
+                raise ValueError('production read-auth evidence unavailable') from None
+            if (not isinstance(report,dict) or report.get('result')!='PASS'
+                    or not isinstance(report.get('account_read'),dict)
+                    or report['account_read'].get('status')!='ready'
+                    or report['account_read'].get('complete') is not True
+                    or report.get('guard')!=dict(mutation_attempts=0,notification_attempts=0)
+                    or not isinstance(report.get('trading_region'),dict)
+                    or report['trading_region'].get('startup_allowed') is not True):
+                raise ValueError('production read-auth evidence unavailable')
+            evidence['trading_region']=report['trading_region']
     if os.statvfs(c.runtime_root).f_bavail * os.statvfs(c.runtime_root).f_frsize < 1024**3:
         raise ValueError('less than 1 GiB free runtime storage')
-    return isolation
+    return evidence
 
 
 def systemd_record_identity(c):
@@ -953,15 +969,16 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
             or type(extras) not in (list,tuple) or any(v not in ('cloud-ssm','browser') for v in extras)):
         raise ValueError('runtime extras require a production mutation')
     if action == 'preflight':
-        isolation=preflight(c)
+        evidence=preflight(c)
+        isolation=evidence.get('lp_instance_isolation')
         if isolation is not None:
             from datetime import UTC,datetime
-            isolation={**isolation,'observed_at':datetime.now(UTC).isoformat()}
+            evidence['lp_instance_isolation']={**isolation,'observed_at':datetime.now(UTC).isoformat()}
         return {'status': 'PRECHECK_OK', 'git_sha': c.expected_sha, 'mode': c.mode,
                 'n_leg_paused': c.effective_n_leg_paused, 'configured_n_leg_paused': c.n_leg_paused,
                 'credential_backend': credential_backend(c),
                 'candidate_exclusions': c.candidate_exclusions,
-                **({'lp_instance_isolation':isolation} if isolation is not None else {})}
+                **evidence}
     if action == 'status' and unit_state()['MainPID'] == '0':
         absent(c)
         installed_unit(c)

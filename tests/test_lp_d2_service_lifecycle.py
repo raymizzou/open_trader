@@ -996,6 +996,12 @@ def _assert_systemd_service_identity(child,monkeypatch,*,restart_recovery=None,c
             if args[0]=='ss':return subprocess.CompletedProcess(command,0,'','')
             if args[0]=='runuser':
                 if 'git' in args:return actual_run(args[args.index('git'):],*a,**kw)
+                if 'read-auth' in args:
+                    return subprocess.CompletedProcess(command,0,json.dumps(dict(
+                        result='PASS',account_read=dict(status='ready',complete=True),
+                        guard=dict(mutation_attempts=0,notification_attempts=0),
+                        trading_region=dict(status='allowed',blocked=False,country='US',region='CA',
+                                            policy='strict',startup_allowed=True))), '')
                 return subprocess.CompletedProcess(command,0,'','')
             if args[0]==str(c.python) and args[1]=='-c':return subprocess.CompletedProcess(command,0,'','')
             if args[:2]==['systemctl','start']:

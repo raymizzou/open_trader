@@ -49,8 +49,8 @@ Mac 入口 `~/.local/bin/lpprobe tokyo` 已安装于 `Mac-mini.local`，须在 M
 
 这是实际单笔订单的接受、LIVE 观察、撤单和对账证据，不只是认证或合成测试。
 地域报告没有变为 unblocked；冲突原因仍未知，不据此作法律合规、永久可用、
-全市场可达、全钱包安全或持续稳定的结论。production 交易地域门禁和 Shadow
-mutation guard 保持不变。原始回执及诊断留在东京私有 runtime 目录
+全市场可达、全钱包安全或持续稳定的结论。该次诊断未改变 production 地域门禁
+或 Shadow mutation guard；2026-10-24 的新启动策略另见第 5 节。原始回执及诊断留在东京私有 runtime 目录
 `/var/lib/open-trader/prediction/order-probe/`，不公开钱包派生文件名、完整订单 ID
 或秘密。后续会话仍须刷新主机及外部状态；下列早期失败记录继续保留。
 
@@ -275,13 +275,14 @@ mutation/notification attempts。`data-check --config <runtime-config> --sample 
 `n_leg_paused: 1` 的 file profile。沿用上述独立的私有凭据路径和
 service-owned 0700/0600 边界，不得混入 SSM 引用；unit 只固定 backend/path
 和 production 模式，不包含秘密值。生产 preflight 仍须以 service 身份执行
-`wallet read-auth --require-trading-region`，失败不能返回 `PRECHECK_OK`。
+`wallet read-auth --require-trading-region --observe-jp-api-region`；JP 的观测规则
+见第 5 节，认证、财务完整性或其他地域失败不能返回 `PRECHECK_OK`。
 现有 SSM profile 的固定 secret version、最小 CAM 权限、明确 region、
-metadata isolation 和 old-owner 停止证据要求不变；不改现有生产门禁。
+metadata isolation 和 old-owner/显式并行实例证据要求不变。
 具体非秘密字段见 [凭据与所有权](prediction-cloud.md)。
 
 本项仅增加 production-file 配置兼容能力，不代表东京可以实盘。同钱包逐实例
-订单归属、并行 owner 的 cloud gate 和地域门禁处置仍待完成。本次未部署、
+订单归属、并行 owner 的 cloud gate 和实际地域观测仍需各自核验。本项代码未部署、
 启动服务或实盘下单；上文历史 Shadow 失败及未验收项继续保留。
 
 ## 5. 地域、公开可达与订单测试
@@ -291,10 +292,24 @@ metadata isolation 和 old-owner 停止证据要求不变；不改现有生产�
 任务证据指出官方 [API 地域说明](https://docs.polymarket.com/api-reference/geoblock)
 称日本 API 不受限，而 [帮助页](https://help.polymarket.com/en/articles/13364163-geographic-restrictions)
 的地域说明不同；此文档未重新联网核对，保留该冲突为未知原因，不能用文档
-解释覆盖实际 gate。不得绕过限制、使用 proxy/VPN 规避或伪造 region attestation。
-production 的 require-trading-region 保持阻断；Shadow 禁止所有交易 POST。
+解释声称官方已放行。不得使用 proxy/VPN 改换出口或伪造 region attestation。
+
+**Ray 2026-10-24 20:48 PT 决策（#432）：去掉 JP/API 启动硬阻断。**
+production 的原生 preflight 自动组合 `--require-trading-region` 与
+`--observe-jp-api-region`。只有真实且明确的 `blocked=true,country=JP` 结果
+按观测处理：保留原 `blocked/country/region` 和 `status=blocked`，另外记录
+`policy=jp_api_observation_only`、`startup_allowed=true`；不把地域原值改为允许。
+read-auth 与 cloud preflight JSON 都携带该观测，不输出 IP 或秘密。
+
+这项操作者决策不再等待官方邮件；它不等于官方资格确认或 CLOB 接单证明。
+其他国家的 blocked、国家缺失、格式错误和地域读取失败仍阻断；认证失败、
+财务 UNKNOWN、完整账户读取、实例归属、凭据/SSM、source/runtime/CI 与
+新鲜 Host Readiness 的其余条件均保留。裸 `--require-trading-region`、
+既有 `geoblock_allowed()` 和交易前置检查保持严格语义；Shadow 禁止交易 POST。
+本项授权包含代码修改与开 PR，不含该 PR 的合并。只有有效合并批准、准确新 main
+CI 通过及适用部署授权齐备后才可 install/start，再做只读 Smoke。
 2026-10-10 用户单笔诊断的地域报告与实际订单结果并列记录于第 1 节，
-不能用该订单的接受覆盖地域报告或 production 门禁。
+不能用历史订单的接受冒充本次实盘验证或改写地域报告。
 
 ### 一命令东京单笔诊断（2026-10-10）
 
