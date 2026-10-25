@@ -145,6 +145,7 @@ class LPReadRuntime:
         self._attempt_sequence=0
         self._financial_cleanup_faults=0;self._last_financial_cleanup_fault=None
         self._last_financial_timeout=None
+        self._financial_request_cleanup=None
         self._close_lock=threading.Lock()
         self._last_notice=None
         self._observed=-1;self._closed=False;self._started=False;self._signal=threading.Event();self._wakeup=lambda:None
@@ -189,6 +190,14 @@ class LPReadRuntime:
                         scope.financial_wait_capture=None
                         if self._last_financial_timeout is original:
                             self._last_financial_timeout=snapshot
+                    if scope.demand.kind=='financial' and scope.port is not None:
+                        try:
+                            observe=getattr(scope.port,'financial_cleanup_records',None)
+                            records=observe(scope.attempt) if observe is not None else None
+                            if records is not None and records['attempt']==scope.attempt:
+                                self._financial_request_cleanup=records
+                        except Exception:
+                            pass
                     if self._closed:
                         scope.result=None;scope.fault_pending=False
                     if key not in self._demands:
@@ -354,7 +363,7 @@ class LPReadRuntime:
         return result
 
     async def _attempt(self,scope):
-        from .polymarket_lp_async_source import SourceRequest
+        from .polymarket_lp_async_source import SourceRequest, OwnedReadTask
         sources={}
         try:
             if scope.port is None:
@@ -368,8 +377,9 @@ class LPReadRuntime:
                         else:scope.port=owned[0]
                 else:scope.port=self.source_factory(scope.demand)
             d=scope.demand
-            scope.tasks=tuple(asyncio.create_task(self._read_source(scope,source,SourceRequest(source,d.account,
-                d.condition_id,d.token_id,d.target_order_id or d.order_id,':'.join(map(str,(*d.key,scope.attempt,source))))))
+            scope.tasks=tuple(OwnedReadTask(self._read_source(scope,source,SourceRequest(source,d.account,
+                d.condition_id,d.token_id,d.target_order_id or d.order_id,':'.join(map(str,(*d.key,scope.attempt,source))),
+                diagnostic_attempt=scope.attempt if d.kind=='financial' else 0)))
                 for source in d.sources)
             if scope.cancel_sent:self._cancel_children(scope)
             values=await asyncio.gather(*scope.tasks,return_exceptions=True)
@@ -483,6 +493,7 @@ class LPReadRuntime:
                 financial_cleanup_faults=self._financial_cleanup_faults,
                 last_financial_cleanup_fault=self._last_financial_cleanup_fault,
                 last_financial_timeout=self._last_financial_timeout,
+                financial_request_cleanup=self._financial_request_cleanup,
                 retiring_buy_scopes=sum(s.retiring for s in owned),deferred_count=len(deferred),
                 deferred_order_ids=tuple(d.order_id for d in deferred[:64]),new_buy_allowed=len(owned)<self.buy_cap and not deferred and not fixed_faults,
                 ready_buy_count=sum(s.result is not None or s.fault_pending for s in owned),
