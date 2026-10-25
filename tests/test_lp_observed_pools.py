@@ -891,7 +891,7 @@ def test_ready_trial_progresses_while_income_results_change_or_wait(tmp_path,mon
                 measured.append(sample['measured_at'])
             scheduler.request_check();assert scheduler.run_due()
         rig.pump(lambda:len(rig.sdk.posts)==1)
-        rig.cycle(pool='trial')  # fresh post-receipt account publication
+        rig.publish_account({'old-D','new-E-1'})  # exact receipt-current publication
         if measured:assert measured[0]!=measured[1]
         assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts]==[('tE',Decimal('1'))]
         assert rig.sdk.cancels==[]
@@ -1271,7 +1271,7 @@ class AsyncPoolRig(PoolRig):
         self.utc=lambda:self.dates[0]
         super().__init__(tmp_path,monkeypatch,trial=trial,income=income,wallet=wallet,clock=self.utc,build_owner=False)
         self.wake=threading.Event();self.release_http=threading.Event()
-        self.http_mode='ok';self.requests=[];self.failed_book_tokens=set();self.http_gate=None
+        self.http_mode='ok';self.requests=[];self.published_books=[];self.failed_book_tokens=set();self.http_gate=None
         self.sdk._ctx.environment=SimpleNamespace(gamma_url='http://127.0.0.1',
             clob_url='http://127.0.0.1',data_url='http://127.0.0.1',
             standard_exchange=self.sdk.environment.standard_exchange)
@@ -1280,7 +1280,7 @@ class AsyncPoolRig(PoolRig):
         self.live=LPD2LiveExecution(self.store,self.adapter,account_id=self.adapter.config.wallet_address,
             venue='polymarket',process_epoch='async-pools',policy=CalculationPolicy(None),
             load_settings_on_start=True,clock=lambda:self.seconds,utc_now=self.utc,
-            read_transport=httpx.MockTransport(self.http))
+            read_transport=httpx.MockTransport(self.published_http))
         self.producer=PolymarketLPService(self.store,self.adapter,clock=self.utc)
         self.execution=attach(self.live,self.producer,tmp_path)
         self.live.initialize(ValidatedStartAdmission('async-pools','offline-permit'))
@@ -1319,6 +1319,13 @@ class AsyncPoolRig(PoolRig):
     def cid(self,name):return '0x'+format(ord(name),'064x')
 
     def name(self,condition):return chr(int(condition,16))
+
+    async def published_http(self,req):
+        # Capture after subclass transport gates release the actual response.
+        response=await self.http(req)
+        if req.headers['x-lp-source']=='book' and response.status_code==200:
+            self.published_books.append((req.headers['x-lp-order'],req.url.params['token_id'],self.utc()))
+        return response
 
     async def http(self,req):
         import asyncio,httpx,json
@@ -1365,11 +1372,11 @@ class AsyncPoolRig(PoolRig):
         else:raise AssertionError(source)
         return httpx.Response(200,json=value)
 
-    def pump(self,predicate,*,timeout=4):
+    def pump(self,predicate,*,timeout=4,drive=None):
         import time
         end=time.monotonic()+timeout
         while not predicate():
-            self.scheduler.run_due()
+            (drive or self.scheduler.run_due)()
             assert not self.scheduler.snapshot()['last_check_error'], self.live.diagnostics()
             if time.monotonic()>=end:
                 observation=self.live.state.snapshot().observation
@@ -1383,7 +1390,7 @@ class AsyncPoolRig(PoolRig):
         self.dates[0]+=timedelta(seconds=seconds);self.now=self.utc()
         self.live.read_runtime.wake();self.scheduler.request_check()
 
-    def converge_current(self,predicate,*,timeout=4):
+    def converge_current(self,predicate,*,timeout=4,drive=None):
         """After wake assertions, follow actual read deadlines to current proof."""
         import time
         end=time.monotonic()+timeout
@@ -1395,24 +1402,57 @@ class AsyncPoolRig(PoolRig):
                     and not any(scope['active'] for scope in status['scopes'])
                     and status['observed_monotonic']>=self.seconds
                     and due is not None and due>self.seconds))
-            self.pump(progress,timeout=max(0,end-time.monotonic()))
+            self.pump(progress,timeout=max(0,end-time.monotonic()),drive=drive)
             if predicate():return
             status=self.live.read_runtime.status()
             due=status['next_dependency_monotonic']
             assert time.monotonic()<end,self.live.diagnostics()
             if (status['ready_count']==0 and not any(scope['active'] for scope in status['scopes'])
+                    and status['observed_monotonic']>=self.seconds
                     and due is not None and due>self.seconds):
                 self.tick(due-self.seconds)
+
+    def publish_account(self,order_ids,*,timeout=4):
+        """Observe exact current HTTP account facts before granting candidate authority."""
+        import time
+        after=self.utc();end=time.monotonic()+timeout
+        while True:
+            result=self.live.run_once(pool='trial')
+            assert not result.outcomes  # no candidate capture during account setup
+            snapshot=self.live.state.snapshot();observation=snapshot.observation
+            if (observation is not None and observation.orders_complete
+                    and {row['order_id'] for row in observation.source_frame.current_buys}==set(order_ids)
+                    and observation.read_ticket.trade_version_at_start==snapshot.trade_version
+                    and observation.read_ticket.started_at>=after
+                    and observation.components['open_orders'].checked_at==self.utc()):return
+            assert time.monotonic()<end,(self.live.status(),self.live.diagnostics())
+            self.advance_idle_read()
+            self.wake.wait(.01);self.wake.clear()
+
+    def advance_idle_read(self):
+        """Keep pending reads at one stamp; advance only an observed idle deadline."""
+        status=self.live.read_runtime.status();due=status['next_dependency_monotonic']
+        if (status['ready_count']==0 and not any(scope['active'] for scope in status['scopes'])
+                and status['observed_monotonic']>=self.seconds
+                and self.live.status()['native_inflight']==0
+                and due is not None and due>self.seconds):
+            self.tick(due-self.seconds)
 
     def finish_income_rebuild(self,condition,token,*,after,timeout=4):
         """Wait for candidate proof and its BUY in a receipt-current account."""
         import time
         end=time.monotonic()+timeout;candidate_seen=False
-        self.tick()
+        candidate_orders={'income:'+condition+':'+token}|{oid for oid,row in self.history.items()
+            if (row['market'],row['asset_id'])==(condition,token)}
+        self.advance_idle_read()
         while True:
             result=self.live.dispatch_rotation(self.live.run_once(
                 self.producer.capture_qualified_pool(),pool='income'))
             self.finish_cancels(result)
+            if result.outcomes or result.rotation_outcomes:
+                # A later income turn must see the exact account after this receipt.
+                self.publish_account({row['id'] for row in self.sdk.orders},
+                    timeout=max(0,end-time.monotonic()))
             snapshot=self.live.state.snapshot();observation=snapshot.observation
             if observation is not None:
                 source=observation.source_frame.sources.get('market_income:'+condition+':'+token)
@@ -1420,23 +1460,29 @@ class AsyncPoolRig(PoolRig):
                     and source.error is None and source.checked_at is not None
                     and source.checked_at>=after
                     and 0<=(self.utc()-source.checked_at).total_seconds()<=10)
+                # A departing exact order can publish the same candidate book
+                # before the detached income scope is admitted. Retain that real
+                # HTTP response across the account/source handoff.
+                candidate_seen=candidate_seen or any(oid in candidate_orders
+                    and response_token==token and stamp>=after
+                    and 0<=(self.utc()-stamp).total_seconds()<=10
+                    for oid,response_token,stamp in self.published_books)
                 if (candidate_seen and observation.orders_complete
                         and observation.components['open_orders'].checked_at>after
                         and observation.read_ticket.trade_version_at_start==snapshot.trade_version
-                        and any(o.key[1:3]==(condition,token) for o in observation.orders)
+                        and any((row['condition_id'],row['token_id'])==(condition,token)
+                            for row in observation.source_frame.current_buys)
                         and self.live.status()['native_inflight']==0):return
             assert time.monotonic()<end,(self.live.status(),self.live.rotation_diagnostics())
-            status=self.live.read_runtime.status();due=status['next_dependency_monotonic']
-            if (status['ready_count']==0 and not any(scope['active'] for scope in status['scopes'])
-                    and status['observed_monotonic']>=self.seconds
-                    and self.live.status()['native_inflight']==0
-                    and due is not None and due>self.seconds):
-                self.tick(due-self.seconds)
+            self.advance_idle_read()
             self.wake.wait(.01);self.wake.clear()
 
-    def cycle(self,*,pool=None,qualified=False):
+    def cycle(self,*,pool=None,qualified=False,settle_reads=False):
         import time
-        self.tick()
+        # Receipt handoffs consume pending work first. Other cases deliberately
+        # advance business time here to exercise expiry and cadence boundaries.
+        if settle_reads:self.advance_idle_read()
+        else:self.tick()
         end=time.monotonic()+4;latest=None
         while True:
             result=self.live.dispatch_rotation(self.live.run_once(
@@ -1447,12 +1493,16 @@ class AsyncPoolRig(PoolRig):
             idle=status['ready_count']==0 and not any(scope['active'] for scope in status['scopes'])
             if idle:
                 observation=latest.acceptance.observation if latest is not None else None
-                if observation is not None and observation.accepted_at==self.utc():return latest
+                if (observation is not None and observation.accepted_at==self.utc()
+                        and (not settle_reads or observation.read_ticket.trade_version_at_start
+                            ==self.live.state.snapshot().trade_version)):return latest
                 # A cancel/BUY receipt may invalidate a ticket already in flight.
                 # Follow the real next start, preserving the five-second cadence;
                 # do not call an older accepted snapshot a fresh account read.
-                due=status['next_dependency_monotonic']
-                if due is not None and due>self.seconds:self.tick(due-self.seconds)
+                if settle_reads:self.advance_idle_read()
+                else:
+                    due=status['next_dependency_monotonic']
+                    if due is not None and due>self.seconds:self.tick(due-self.seconds)
             assert time.monotonic()<end,(self.live.status(),self.live.rotation_diagnostics())
             time.sleep(.001)
 
@@ -2006,7 +2056,8 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
         assert all(measured['observations'][rig.cid(n)]['pool_result']['state']=='known' for n in 'ABCD')
         manual='manual-extra-'+manual_market
         rig.add_order(manual_market,'5',order_id=manual)
-        planned=rig.cycle(pool='income',qualified=True);rig.finish_cancels(planned)
+        rig.publish_account({'old-A','old-B','old-C','old-D',manual})
+        planned=rig.cycle(pool='income',qualified=True,settle_reads=True);rig.finish_cancels(planned)
         sent={oid for batch in rig.sdk.cancels for oid in batch}
         assert manual not in sent,'pool authority must never cancel an unclassified same-market BUY'
         assert sent=={'old-A','old-B','old-C','old-D'}
@@ -2016,7 +2067,7 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
         assert snapshot.buy_reserved.value==Decimal('5')
         assert next(o for o in snapshot.active_orders if o.key[3]==manual).remaining.value==Decimal('12.5')
         rig.release('old-A','old-B','old-C','old-D')
-        rig.cycle(pool='income',qualified=True)
+        rig.cycle(pool='income',qualified=True,settle_reads=True)
         expected=[('tB',Decimal('50')),('tD',Decimal('30')),('tA',Decimal('20'))]
         expected=[row for row in expected if row[0]!='t'+manual_market]
         assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts]==expected
@@ -2024,9 +2075,12 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
         assert all(manual not in batch for batch in rig.sdk.cancels)
         # Actual external account coverage, rather than a cancel ACK or pool
         # classification, keeps the manual capital and its same-market slot.
-        rig.tick()
+        # Publish the successful partial group before another income selection.
+        published_ids={row['id'] for row in rig.sdk.orders}
         rig.converge_current(lambda:rig.live.state.snapshot().observation.components['open_orders'].checked_at==rig.utc()
-            and rig.live.state.snapshot().observation.read_ticket.trade_version_at_start==rig.live.state.snapshot().trade_version)
+            and rig.live.state.snapshot().observation.read_ticket.trade_version_at_start==rig.live.state.snapshot().trade_version
+            and {row['order_id'] for row in rig.live.state.snapshot().observation.source_frame.current_buys}==published_ids,
+            drive=lambda:rig.live.run_once(pool='trial'))
         snapshot=rig.live.state.snapshot()
         assert snapshot.buy_reserved.value==Decimal('5')+sum((capital for _,capital in expected),Decimal(0))
         assert len([o for o in snapshot.active_orders if o.key[1]==rig.cid(manual_market)])==1
@@ -2044,10 +2098,16 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
             # Wait for the three real slots, not for the expected money values.
             end=time.monotonic()+4
             while True:
-                rebuilt=rig.cycle(pool='income',qualified=True)
+                rebuilt=rig.live.dispatch_rotation(rig.live.run_once(
+                    rig.producer.capture_qualified_pool(),pool='income'))
                 rig.finish_cancels(rebuilt)
+                if rebuilt.outcomes or rebuilt.rotation_outcomes:
+                    rig.publish_account({row['id'] for row in rig.sdk.orders},
+                        timeout=max(0,end-time.monotonic()))
                 if len(rig.sdk.orders)==3 and rig.live.status()['native_inflight']==0:break
                 assert time.monotonic()<end,'income group completion watchdog'
+                rig.advance_idle_read()
+                rig.wake.wait(.01);rig.wake.clear()
             assert {(row['asset_id'],row['price']*(row['original_size']-row['size_matched']))
                 for row in rig.sdk.orders}=={('tB',Decimal('50')),('tD',Decimal('30')),('tA',Decimal('20'))}
             assert len(rig.sdk.orders)==3
@@ -2460,7 +2520,7 @@ def _exercise_postreceipt_publication(
                     None,self.proof_release.wait,4),'external proof publication watchdog'
             return response
 
-        def converge_current(self,predicate,*,timeout=4):
+        def converge_current(self,predicate,*,timeout=4,drive=None):
             end=time.monotonic()+timeout
             if defer_admission:
                 def deferred_until_next_read():
@@ -2470,7 +2530,7 @@ def _exercise_postreceipt_publication(
                         and not any(scope['active'] for scope in status['scopes'])
                         and status['observed_monotonic']>=self.seconds
                         and due is not None and due>self.seconds)
-                super().converge_current(deferred_until_next_read,timeout=max(0,end-time.monotonic()))
+                super().converge_current(deferred_until_next_read,timeout=max(0,end-time.monotonic()),drive=drive)
                 assert not self.proof_entered.is_set() and not self.proof_release.is_set()
                 partial=next(o for o in self.live.state.snapshot().orders if o.key[3]==target)
                 assert partial.remaining.state=='unknown'
@@ -2480,7 +2540,7 @@ def _exercise_postreceipt_publication(
             # Original wake assertions have already completed at their original
             # stamp. Admission may need a later published read deadline; only an
             # actually held HTTP response starts the unchanged-time proof phase.
-            super().converge_current(self.proof_entered.is_set,timeout=max(0,end-time.monotonic()))
+            super().converge_current(self.proof_entered.is_set,timeout=max(0,end-time.monotonic()),drive=drive)
             assert self.proof_entered.is_set() and not self.proof_release.is_set()
             stamp=self.seconds
             if defer_admission:
@@ -2504,11 +2564,11 @@ def _exercise_postreceipt_publication(
                     and not any(scope['active'] for scope in status['scopes'])
                     and status['observed_monotonic']>=self.seconds
                     and due is not None and due>self.seconds))
-            self.pump(published_or_next_read,timeout=max(0,end-time.monotonic()))
+            self.pump(published_or_next_read,timeout=max(0,end-time.monotonic()),drive=drive)
             status=self.live.read_runtime.status()
             # If the result is stale, a fixed-clock pump has no runnable read.
             self.proof_checks.append((source,stamp,predicate(),status['next_dependency_monotonic']))
-            super().converge_current(predicate,timeout=max(0,end-time.monotonic()))
+            super().converge_current(predicate,timeout=max(0,end-time.monotonic()),drive=drive)
 
         def close(self):
             self.proof_release.set()
@@ -2573,7 +2633,8 @@ def test_manual_income_rebuild_waits_for_candidate_publication(tmp_path,monkeypa
                     and all(row['id']!='manual-extra-D' for row in response.json()['data'])):
                 self.account_capture=(self.seconds,tuple(row['id'] for row in response.json()['data']))
                 self.account_ready.set()
-            if (source=='book' and req.headers['x-lp-order'].startswith('income:')
+            if (source=='book' and req.headers['x-lp-order'] in (
+                    'old-D','manual-extra-D','income:'+self.cid('D')+':tD')
                     and req.url.params['token_id']=='tD' and not self.candidate_release.is_set()):
                 self.candidate_entered.set()
                 assert await asyncio.get_running_loop().run_in_executor(
