@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-25 — Metadata HTTP/2 task isolation
+
+- Give each concurrent market or event metadata task its own public client through pagination and response consumption. Keep the eight-task limit, 50-market and 10-event batches, failure/absence distinction, valid sibling results and cache rules. Remove task response hooks before closing clients, including failed and cancelled reads.
+- Keep bounded, redacted HTTP failure diagnostics and status/Retry-After facts. Add typed HTTP/2 protocol type, error code and stream facts, with explicit unknown fields and no exception text. Account trades and snapshot client sharing remain outside this repair; production Smoke success and the historical 400 cause remain unproven.
+
 ## 2026-10-25 — LP whole-request cleanup and bounded lifecycle evidence
 
 - Preserve outer cancellation that overlaps an internal AnyIO scope's cancellation balancing. Deliver any remaining cancellation to the next network await after balancing, with no extra source task and no interruption of cleanup. Keep library-only cancellation normal; the LP clients have HTTPX timeout disabled, so recovery cannot rely on an extra network timeout. Clarify supported runtime leaf-source accounting and the LP-owned client hook.

@@ -562,6 +562,49 @@ def _safe_error_code(exc: BaseException) -> str:
     return "sdk_error"
 
 
+def _safe_h2_protocol_detail(exc: BaseException) -> str:
+    """Read typed protocol events only; never parse exception text or debug data."""
+    from enum import IntEnum
+
+    from h2.events import ConnectionTerminated, StreamReset
+    from h2.exceptions import H2Error
+    from httpcore import RemoteProtocolError as CoreRemoteProtocolError
+    from httpx import RemoteProtocolError
+
+    protocol: object | None = None
+    protocol_type = "unknown"
+    for error in _read_exception_chain(exc):
+        if isinstance(error, (CoreRemoteProtocolError, RemoteProtocolError)):
+            protocol_type = "RemoteProtocolError"
+        for value in (error, *error.args[:8]):
+            if type(value) is StreamReset:
+                protocol, protocol_type = value, "StreamReset"
+                break
+            if type(value) is ConnectionTerminated:
+                protocol, protocol_type = value, "ConnectionTerminated"
+                break
+            if isinstance(value, H2Error) and type(value).__module__ == "h2.exceptions":
+                protocol, protocol_type = value, type(value).__name__[:64]
+                break
+        if protocol is not None:
+            break
+    if protocol is None and protocol_type == "unknown":
+        return ""
+
+    def number(name: str, maximum: int) -> str:
+        value = getattr(protocol, name, None)
+        if (type(value) is int or isinstance(value, IntEnum)) and 0 <= value <= maximum:
+            return str(int(value))
+        return "unknown"
+
+    return (
+        f" protocol_type={protocol_type}"
+        f" error_code={number('error_code', 2**32 - 1)}"
+        f" stream_id={number('stream_id', 2**31 - 1)}"
+        f" last_stream_id={number('last_stream_id', 2**31 - 1)}"
+    )
+
+
 def _safe_read_failure(stage: str, exc: BaseException) -> str:
     """Identify a failed read without retaining exception details."""
 
@@ -582,10 +625,11 @@ def _safe_read_failure(stage: str, exc: BaseException) -> str:
         current = cause if isinstance(cause, BaseException) else None
     status_detail = f" status={status}" if status is not None else ""
     logger.warning(
-        "lp_metadata_read_failed stage=%s error_types=%s%s",
+        "lp_metadata_read_failed stage=%s error_types=%s%s%s",
         stage,
         ">".join(error_types) or "unknown",
         status_detail,
+        _safe_h2_protocol_detail(exc),
     )
     return f"{stage}_read_{type(exc).__name__}"
 
@@ -3698,21 +3742,15 @@ class PolymarketTradingClient:
         fetched: dict[str, dict[str, object]] = {}
         fetched_absent: frozenset[str] = frozenset()
         if refresh_ids:
-            public: object | None = None
             try:
-                public = self._public_client_factory()
                 fetched, failed_ids, fetched_absent = self._fetch_lp_market_metadata(
-                    tuple(refresh_ids), public=public, stop_event=stop_event, planning_only=planning_only
+                    tuple(refresh_ids), stop_event=stop_event, planning_only=planning_only
                 )
             except Exception as exc:
                 reason = _safe_metadata_failure("market", exc)
                 failed_ids.update(
                     (condition_id, reason) for condition_id in refresh_ids
                 )
-            finally:
-                close = getattr(public, "close", None)
-                if callable(close):
-                    close()
             markets.update(fetched)
             confirmed_absent.update(fetched_absent)
             self._record_metadata_entries(
@@ -3959,7 +3997,6 @@ class PolymarketTradingClient:
         self,
         requested: tuple[str, ...],
         *,
-        public: object,
         stop_event: threading.Event | None = None,
         closed_query: bool = False,
         planning_only: bool = False,
@@ -3973,25 +4010,44 @@ class PolymarketTradingClient:
         rows: list[object] = []
         completed_market_ids: set[str] = set()
         failed_ids: dict[str, object] = {}
-        response_facts_by_condition_ids: dict[
-            frozenset[str], dict[str, object]
-        ] = {}
+        response_facts_by_condition_ids: dict[frozenset[str], dict[str, object]] = {}
+
+        @contextmanager
+        def task_client(batch: tuple[str, ...] = ()):
+            # Allocate only in an active worker.  The client owns all pages and
+            # response consumption until that worker exits, including errors.
+            public = self._public_client_factory()
+            remove_hook = None
+            try:
+                if batch:
+                    remove_hook = _install_lp_metadata_response_hook(
+                        public, len(batch),
+                        facts=response_facts_by_condition_ids[frozenset(batch)],
+                    )
+                yield public
+            finally:
+                if remove_hook is not None:
+                    remove_hook()
+                close = getattr(public, "close", None)
+                if callable(close):
+                    close()
 
         def read_market_batch(
             batch: tuple[str, ...],
         ) -> tuple[tuple[object, ...], bool]:
             if stop_event is not None and stop_event.is_set():
                 return (), False
-            return (
-                _collect_lp_market_pages(
-                    public.list_markets(
-                        condition_ids=batch, page_size=100,
-                        **({"closed": True} if closed_query else {}),
+            with task_client(batch) as public:
+                return (
+                    _collect_lp_market_pages(
+                        public.list_markets(
+                            condition_ids=batch, page_size=100,
+                            **({"closed": True} if closed_query else {}),
+                        ),
+                        set(batch), planning_only=planning_only,
                     ),
-                    set(batch), planning_only=planning_only,
-                ),
-                True,
-            )
+                    True,
+                )
 
         market_batches = tuple(
             requested[offset : offset + LP_METADATA_MARKET_BATCH_SIZE]
@@ -4000,38 +4056,28 @@ class PolymarketTradingClient:
         response_facts_by_condition_ids = {
             frozenset(batch): {} for batch in market_batches
         }
-        remove_response_hook = _install_lp_metadata_response_hook(
-            public,
-            len(requested),
-            facts_by_condition_ids=response_facts_by_condition_ids,
-        )
-        try:
-            with ThreadPoolExecutor(max_workers=min(8, len(market_batches))) as pool:
-                futures = deque(
-                    (batch, pool.submit(read_market_batch, batch))
-                    for batch in market_batches
-                )
-                while futures:
-                    batch, future = futures.popleft()
-                    try:
-                        batch_rows, completed = future.result()
-                    except Exception as exc:
-                        reason = _safe_metadata_failure(
-                            "market",
-                            exc,
-                            response_facts_by_condition_ids.get(frozenset(batch)),
-                        )
-                        failed_ids.update((condition_id, reason) for condition_id in batch)
-                        continue
-                    finally:
-                        del future
-                    if completed:
-                        completed_market_ids.update(batch)
-                        rows.extend(batch_rows)
-                    del batch_rows
-        finally:
-            if remove_response_hook is not None:
-                remove_response_hook()
+        with ThreadPoolExecutor(max_workers=min(8, len(market_batches))) as pool:
+            futures = deque(
+                (batch, pool.submit(read_market_batch, batch))
+                for batch in market_batches
+            )
+            while futures:
+                batch, future = futures.popleft()
+                try:
+                    batch_rows, completed = future.result()
+                except Exception as exc:
+                    reason = _safe_metadata_failure(
+                        "market", exc,
+                        response_facts_by_condition_ids.get(frozenset(batch)),
+                    )
+                    failed_ids.update((condition_id, reason) for condition_id in batch)
+                    continue
+                finally:
+                    del future
+                if completed:
+                    completed_market_ids.update(batch)
+                    rows.extend(batch_rows)
+                del batch_rows
 
         numeric_event_keys: dict[int, list[str]] = {}
         direct_event_ids: list[str] = []
@@ -4133,28 +4179,29 @@ class PolymarketTradingClient:
                     reason = "event_read_cancelled"
                     mark_event_failure(batch, reason)
                     return (), reason
-                list_events = getattr(public, "list_events", None)
-                if not callable(list_events):
-                    reason = "event_read_unavailable"
-                    mark_event_failure(batch, reason)
-                    return (), reason
                 try:
-                    # Project inside the reader so completed futures retain
-                    # only LP facts, never the full SDK event/market trees.
-                    return (
-                        tuple(
-                            facts
-                            for value in _iter_reward_items(
-                                list_events(
-                                    ids=batch, closed=is_closed,
-                                    page_size=LP_METADATA_EVENT_BATCH_SIZE,
-                                ),
-                                stop_event,
-                            )
-                            if (facts := _lp_event_facts(value)) is not None
-                        ),
-                        None,
-                    )
+                    with task_client() as public:
+                        list_events = getattr(public, "list_events", None)
+                        if not callable(list_events):
+                            reason = "event_read_unavailable"
+                            mark_event_failure(batch, reason)
+                            return (), reason
+                        # Project inside the reader so completed futures retain
+                        # only LP facts, never the full SDK event/market trees.
+                        return (
+                            tuple(
+                                facts
+                                for value in _iter_reward_items(
+                                    list_events(
+                                        ids=batch, closed=is_closed,
+                                        page_size=LP_METADATA_EVENT_BATCH_SIZE,
+                                    ),
+                                    stop_event,
+                                )
+                                if (facts := _lp_event_facts(value)) is not None
+                            ),
+                            None,
+                        )
                 except _RewardReadCancelled:
                     reason = "event_read_cancelled"
                     mark_event_failure(batch, reason)
@@ -4209,11 +4256,12 @@ class PolymarketTradingClient:
         ) -> tuple[str, Mapping[str, object] | None, str | Mapping[str, object] | None]:
             if stop_event is not None and stop_event.is_set():
                 return event_id, None, "event_read_cancelled"
-            get_event = getattr(public, "get_event", None)
-            if not callable(get_event):
-                return event_id, None, "event_read_unavailable"
             try:
-                event = _lp_event_facts(get_event(id=event_id))
+                with task_client() as public:
+                    get_event = getattr(public, "get_event", None)
+                    if not callable(get_event):
+                        return event_id, None, "event_read_unavailable"
+                    event = _lp_event_facts(get_event(id=event_id))
             except Exception as exc:
                 return event_id, None, _safe_metadata_failure("event", exc)
             if event is None or str(event.get("id") or "") != event_id:
@@ -4241,7 +4289,7 @@ class PolymarketTradingClient:
             missing = tuple(value for value in requested if value in confirmed_absent_ids)
             try:
                 closed_markets, closed_failed, confirmed_absent_ids = self._fetch_lp_market_metadata(
-                    missing, public=public, stop_event=stop_event, closed_query=True, planning_only=planning_only,
+                    missing, stop_event=stop_event, closed_query=True, planning_only=planning_only,
                 )
             except Exception as exc:
                 reason = _safe_metadata_failure("market", exc)
