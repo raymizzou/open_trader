@@ -45,7 +45,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('python3 scripts/ci_plan.py required', required)
         self.assertNotIn('continue-on-error', workflow)
         self.assertEqual(workflow.count('if-no-files-found: error'), 6)
-        for scope in ['gateway', 'legacy', 'account', 'prediction', 'portable', 'trend-curve']:
+        for scope in ['gateway', 'legacy', 'account', 'prediction-${{ matrix.shard }}', 'portable', 'trend-curve']:
             self.assertIn(f'"{scope}"', workflow)
         self.assertIn('test_ci_*.py', workflow)
         self.assertEqual(workflow.count('including phase metrics and JUnit'), 6)
@@ -62,7 +62,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('scripts/ci_evidence.py', script)
         self.assertIn('TEST_N_LEG="$nleg"', script)
         self.assertIn('workers=1', script)
-        self.assertIn('[[ "$scope" != prediction ]] || workers=2', script)
+        self.assertIn('[[ "$service" != prediction ]] || workers=2', script)
         self.assertIn('TEST_WORKERS="$workers"', script)
         self.assertIn('set -euo pipefail', script)
         self.assertIn('sha256sum uv.lock', script)
@@ -82,7 +82,7 @@ class WorkflowTests(unittest.TestCase):
         makefile = (ROOT / 'Makefile').read_text()
         script = (ROOT / 'scripts/run_ci_service.sh').read_text()
         self.assertIn('workers=1', script)
-        self.assertIn('[[ "$scope" != prediction ]] || workers=2', script)
+        self.assertIn('[[ "$service" != prediction ]] || workers=2', script)
         self.assertIn('--dist=loadgroup', makefile)
         self.assertIn('scripts.ci_test_metrics', makefile)
         self.assertIn('--junitxml=/tmp/open-trader-ci-evidence/junit.xml', makefile)

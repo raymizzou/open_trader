@@ -21,8 +21,8 @@ def file_sha256(path):
 OPTIONAL_POLICY = 'release-advisory-v1'
 # Reviewed full parameterized identities, pinned independently of manifest bytes.
 # A new function or parameter instance stays required until explicitly reviewed.
-OPTIONAL_COUNT = 224
-OPTIONAL_NODEIDS_SHA256 = '913655864de870f8f83f9e59695840d42bee775b49c3dbc535a7105698b2c82d'
+OPTIONAL_COUNT = 279
+OPTIONAL_NODEIDS_SHA256 = '607edf6f00872abe4e5c8de99d5d73828fd63a7915fbb313dde0a1c448071621'
 
 
 def optional_policy(root):
@@ -136,6 +136,12 @@ def service_partitions(root, nleg='0', manifest=None):
 
 
 def expected_selection(scope, root):
+    shard = None
+    for service, count in (('prediction', 3), ('release-advisory', 4)):
+        if scope in tuple(f'{service}-{index}' for index in range(1, count+1)):
+            shard = dict(index=int(scope.rsplit('-', 1)[1]), count=count)
+            scope = service
+            break
     if scope == 'release-advisory':
         roots = sorted({node.split('::', 1)[0] for node in optional_policy(root)['optional_nodeids']})
     elif scope == 'portable':
@@ -148,10 +154,12 @@ def expected_selection(scope, root):
     else:
         raise ValueError('unknown CI scope')
     selection = {'roots': roots, 'marker': MARKER, 'keyword': 'not LIVE' if scope == 'portable' else ''}
-    if scope == 'prediction':
+    if scope in BACKEND_SCOPES:
         selection['deselect'] = optional_policy(root)['optional_nodeids']
     if scope == 'release-advisory':
         selection['nodeids'] = optional_policy(root)['optional_nodeids']
+    if shard is not None:
+        selection['shard'] = shard
     return selection
 
 
@@ -334,7 +342,7 @@ def validate_junit(data, metrics):
 
 
 def build_evidence(root, directory, scope, nleg, workers, status, env):
-    if nleg != '0' or workers != (2 if scope == 'prediction' else 1):
+    if nleg != '0' or workers != (2 if scope == 'prediction' or scope.startswith('prediction-') else 1):
         raise ValueError('CI requires active retirement policy and the declared serial/loadgroup policy')
     for key, pattern in [('GITHUB_SHA', '[0-9a-f]{40}'), ('GITHUB_RUN_ID', '[1-9][0-9]*'),
                          ('GITHUB_RUN_ATTEMPT', '[1-9][0-9]*')]:
@@ -379,10 +387,67 @@ def build_evidence(root, directory, scope, nleg, workers, status, env):
         'status': 'success' if status == 0 else 'failure', 'exit_status': status,
         'selection': selection, 'selection_sha256': selection_sha256(selection),
         'policy': retirement_policy(root), 'optional_policy': optional_policy(root),
-        'test_tier': 'optional' if scope == 'release-advisory' else 'required',
+        'test_tier': 'optional' if scope == 'release-advisory' or scope.startswith('release-advisory-') else 'required',
         'selected_nodeids': nodes, 'environment': environment,
     }
 
+
+
+REQUIRED_SHARDS = ('gateway', 'legacy', 'account', 'prediction-1', 'prediction-2', 'prediction-3', 'portable')
+
+
+def validate_required_shards(records, proof, sha, run_id, attempt):
+    """Bind every required machine to one run and the complete collected partition."""
+    if not isinstance(records,list) or any(not isinstance(record,dict) or not isinstance(record.get('scope'),str) for record in records):
+        raise ValueError('malformed required shard records')
+    scopes = [record.get('scope') for record in records]
+    if len(scopes) != len(REQUIRED_SHARDS) or set(scopes) != set(REQUIRED_SHARDS):
+        raise ValueError('missing, duplicate or unexpected required shard')
+    spec = __import__('importlib.util', fromlist=['spec_from_file_location'])
+    module_spec = spec.spec_from_file_location('required_partition', Path(__file__).with_name('ci_partition.py'))
+    partition = spec.module_from_spec(module_spec)
+    module_spec.loader.exec_module(partition)
+    for record in records:
+        if any(record.get(key) != value or type(record.get(key)) is not type(value)
+               for key, value in dict(source_sha=sha, run_id=str(run_id), run_attempt=str(attempt),
+                                      status='success', exit_status=0).items()):
+            raise ValueError('required shard source/run/attempt/result mismatch')
+        scope = record['scope']
+        if scope.startswith('prediction-'):
+            expected = partition.shard_nodeids('prediction', proof['partitions']['prediction'], int(scope[-1]))
+        elif scope != 'portable':
+            expected = sorted(proof['partitions'][scope])
+        else:
+            continue
+        if record.get('selected_nodeids') != expected:
+            raise ValueError('required shard nodeids are missing, overlapping or extra')
+
+
+def validate_required_directory(root, directory, env):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('aggregate_preflight', Path(__file__).with_name('deployment_preflight.py'))
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    sha, run_id, attempt = (env[key] for key in ('GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'))
+    for value,pattern in ((sha,'[0-9a-f]{40}'),(run_id,'[1-9][0-9]*'),(attempt,'[1-9][0-9]*')):
+        if type(value) is not str or not re.fullmatch(pattern,value):
+            raise ValueError('invalid aggregate source/run/attempt')
+    if env['GITHUB_EVENT_NAME'] not in ('push','workflow_dispatch'):
+        raise ValueError('invalid aggregate CI event')
+    run = dict(head_sha=sha, id=int(run_id), run_attempt=int(attempt), event=env['GITHUB_EVENT_NAME'])
+    directory = Path(directory)
+    names = {f'ci-{scope}-{sha}-{run_id}-{attempt}' for scope in REQUIRED_SHARDS}
+    if {path.name for path in directory.iterdir()} != names:
+        raise ValueError('missing, duplicate or unexpected required artifact directory')
+    records, proof = [], None
+    for scope in REQUIRED_SHARDS:
+        path = directory / f'ci-{scope}-{sha}-{run_id}-{attempt}'
+        files = {item.name:item.read_bytes() for item in path.iterdir() if item.is_file()}
+        result = verifier.verify_artifact_files(files, scope, run, Path(root))
+        record = json.loads(files['evidence.json'])
+        records.append(record)
+        if scope == 'portable':proof = result['partition']
+    validate_required_shards(records, proof, sha, run_id, attempt)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

@@ -24,7 +24,7 @@ import zipfile
 
 REPOSITORY = 'raymizzou/open_trader'
 WORKFLOW = '.github/workflows/ci.yml'
-SCOPES = ('gateway', 'legacy', 'account', 'prediction', 'portable')
+SCOPES = ('gateway', 'legacy', 'account', 'prediction-1', 'prediction-2', 'prediction-3', 'portable')
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 
 
@@ -147,12 +147,19 @@ def verify_artifact(api, artifact, scope, run, root, now):
     data = api.download(artifact['id'])
     require(artifact.get('digest') == f'sha256:{sha256(data)}', f'{scope} artifact digest mismatch or missing')
     files = read_archive(data)
+    result = verify_artifact_files(files, scope, run, root)
+    return dict(result, id=artifact['id'], digest=artifact['digest'])
+
+
+def verify_artifact_files(files, scope, run, root):
+    """Shared exact-run content checks for CI aggregation and deployment."""
+    sha = run['head_sha']
     metadata = json.loads(files['evidence.json'])
     lock_hash = sha256((root/'uv.lock').read_bytes())
     fixed = dict(schema_version=2, source_sha=sha, repository=REPOSITORY,
                  workflow_ref=f'{REPOSITORY}/{WORKFLOW}@refs/heads/main', event_name=run['event'], ref='refs/heads/main',
                  run_id=str(run['id']), run_attempt=str(run['run_attempt']), scope=scope, test_n_leg='0',
-                 workers=2 if scope == 'prediction' else 1, lock_sha256=lock_hash, status='success', exit_status=0,
+                 workers=2 if scope.startswith('prediction-') else 1, lock_sha256=lock_hash, status='success', exit_status=0,
                  evidence_role='test-only', selection=expected_selection(scope, root),
                  selection_sha256=ci_contract(root).selection_sha256(expected_selection(scope, root)),
                  policy=ci_contract(root).retirement_policy(root),
@@ -197,8 +204,7 @@ def verify_artifact(api, artifact, scope, run, root, now):
             partition = ci_contract(root).validate_partition(root, json.loads(files['partition.json']))
         except (ValueError, KeyError, TypeError) as error:
             raise PreflightError('Incomplete required/optional/retired backend partition evidence') from error
-    return {'scope':scope, 'id':artifact['id'], 'digest':artifact['digest'],
-            'selected_nodeids':nodes, 'partition':partition}
+    return {'scope':scope, 'selected_nodeids':nodes, 'partition':partition}
 
 
 def verify_main_membership(api, sha):
@@ -253,6 +259,12 @@ def verify_ci(api, sha, root, now):
             and selected['required']['check_run_url'] == f'https://api.github.com/{prefix}/check-runs/{check["id"]}',
             'Required check is not successful GitHub Actions evidence from selected run/suite/SHA')
     artifacts = api.items(f'{prefix}/actions/runs/{run["id"]}/artifacts', 'artifacts')
+    for artifact in artifacts:
+        match=re.fullmatch(r'ci-(.+)-([0-9a-f]{40})-([0-9]+)-([0-9]+)',artifact['name'])
+        if match and match.groups()[2:]==(str(run['id']),str(run['run_attempt'])):
+            scope,artifact_sha=match[1],match[2]
+            if not scope.startswith('release-advisory'):
+                require(scope in SCOPES and artifact_sha==sha,'Unexpected current-attempt required artifact')
     evidence = []
     for scope in SCOPES:
         name = f'ci-{scope}-{sha}-{run["id"]}-{run["run_attempt"]}'
@@ -260,9 +272,13 @@ def verify_ci(api, sha, root, now):
         require(len(matches) == 1, f'Missing or ambiguous current-attempt artifact: {scope}')
         evidence.append(verify_artifact(api, matches[0], scope, run, root, now))
     proof = evidence[-1]['partition']
-    for artifact in evidence[:-1]:
-        require(artifact['selected_nodeids'] == proof['partitions'][artifact['scope']],
-                f"{artifact['scope']} executed nodeids do not cover active partition")
+    try:
+        ci_contract(root).validate_required_shards(
+            [dict(item, source_sha=sha, run_id=str(run['id']), run_attempt=str(run['run_attempt']),
+                  status='success', exit_status=0) for item in evidence],
+            proof, sha, run['id'], run['run_attempt'])
+    except (ValueError, KeyError, TypeError) as error:
+        raise PreflightError('Required shards do not cover exact active partitions') from error
     evidence = [{key: value for key, value in item.items() if key not in ('selected_nodeids', 'partition')}
                 for item in evidence]
     # Close the obvious mutable-run and main-reference race before returning.

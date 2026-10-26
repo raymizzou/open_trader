@@ -69,11 +69,19 @@ def required(needs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['plan', 'required'])
+    parser.add_argument('--evidence', type=Path)
     args = parser.parse_args()
     if args.command == 'required':
         try:
             ok, reason = required(json.load(sys.stdin))
-        except ValueError:
+            if ok:
+                if args.evidence is None:
+                    raise ValueError('required execution artifacts missing')
+                spec = importlib.util.spec_from_file_location('aggregate_evidence', Path(__file__).with_name('ci_evidence.py'))
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                module.validate_required_directory(Path(__file__).resolve().parents[1], args.evidence, os.environ)
+        except (ValueError, KeyError, TypeError, OSError):
             ok, reason = False, 'invalid job-result JSON'
         print(('PASS: ' if ok else 'FAIL: ') + reason)
         return 0 if ok else 1

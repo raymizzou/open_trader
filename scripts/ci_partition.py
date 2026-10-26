@@ -22,18 +22,26 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
-    if not config.getoption('--ci-required'):
+    scope = os.environ.get('CI_TEST_SCOPE', '')
+    required = config.getoption('--ci-required')
+    if not required and not scope:
         return
     import pytest
     from scripts.ci_evidence import optional_policy
-    excluded = set(optional_policy(config.rootpath)['optional_nodeids'])
+    excluded = set(optional_policy(config.rootpath)['optional_nodeids']) if required else set()
 
     class RequiredSelection:
         @pytest.hookimpl(tryfirst=True)
         def pytest_collection_modifyitems(self, config, items):
-            # Before xdist appends loadgroup execution decoration. Never prefix-match.
-            removed = [item for item in items if item.nodeid in excluded]
-            items[:] = [item for item in items if item.nodeid not in excluded]
+            # Before xdist decorates identities; parameters containing @ stay literal.
+            selected = [item.nodeid for item in items if item.nodeid not in excluded]
+            for service, count in (('prediction', 3), ('release-advisory', 4)):
+                if scope in tuple(f'{service}-{index}' for index in range(1, count+1)):
+                    selected = shard_nodeids(service, selected, int(scope.rsplit('-', 1)[1]))
+                    break
+            selected = set(selected)
+            removed = [item for item in items if item.nodeid not in selected]
+            items[:] = [item for item in items if item.nodeid in selected]
             config.hook.pytest_deselected(items=removed)
 
     config.pluginmanager.register(RequiredSelection(), 'ci-exact-required-selection')
@@ -48,6 +56,25 @@ def pytest_collection_finish(session):
 def fingerprint(nodes):
     return hashlib.sha256(json.dumps(sorted(nodes), separators=(',', ':')).encode()).hexdigest()
 
+
+
+def shard_nodeids(scope, nodes, index):
+    """Select full canonical identities, keeping parameter and shared-port groups together."""
+    count = {'prediction': 3, 'release-advisory': 4}[scope]
+    if type(index) is not int or not 1 <= index <= count:
+        raise ValueError('invalid CI shard')
+    if len(nodes) != len(set(nodes)):
+        raise ValueError('duplicate collected nodeids')
+    selected = []
+    for node in sorted(nodes):
+        key = node.split('[', 1)[0]
+        if node.split('::', 1)[0] in ('tests/test_prediction_cloud.py', 'tests/test_prediction_client.py'):
+            key = 'prediction_cloud_ports'
+        buckets = 2 if scope == 'release-advisory' and node.startswith('tests/test_lp410_launchd_recovery.py::') else count
+        bucket = int(hashlib.sha256(key.encode()).hexdigest(), 16) % buckets + 1
+        if bucket == index:
+            selected.append(node)
+    return selected
 
 def verify_partition(complete, partitions, retired=None, root=None, optional=None):
     from importlib.util import spec_from_file_location, module_from_spec
@@ -97,18 +124,22 @@ def verify_partition(complete, partitions, retired=None, root=None, optional=Non
 def collect(root, paths, output, required=False):
     env = dict(os.environ, CI_COLLECTION_OUTPUT=str(output), PYTHONDONTWRITEBYTECODE='1',
                PYTHONPATH=os.pathsep.join([str(root), str(root / 'src'), str(Path(__file__).resolve().parents[1])]))
-    command = [sys.executable, '-B', '-m', 'pytest', '-p', 'no:cacheprovider', '--collect-only', '-q', '-p', 'scripts.ci_partition',
+    command = [sys.executable, '-B', '-m', 'pytest', '-p', 'no:cacheprovider', '--collect-only', '-q', '--rootdir='+str(root), '-p', 'scripts.ci_partition',
                '-m', MARKER, '-o', 'cache_dir=/tmp/open-trader-collection-cache', *paths]
     if required:
         command += ['--ci-required']
     result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True)
-    if result.returncode:
+    empty_shard=(result.returncode==5 and os.environ.get('CI_TEST_SCOPE','').startswith(('prediction-','release-advisory-'))
+                 and output.is_file() and json.loads(output.read_text())==[])
+    if result.returncode and not empty_shard:
         raise RuntimeError(f'collection failed ({result.returncode}):\n{result.stdout}\n{result.stderr}')
     return json.loads(output.read_text())
 
 
 def main():
     from ci_evidence import service_partitions, retirement_policy, optional_policy
+    # The coverage proof always collects the full universe, including from a shard job.
+    os.environ.pop('CI_TEST_SCOPE', None)
     root = Path(__file__).resolve().parents[1]
     selections = service_partitions(root)
     with tempfile.TemporaryDirectory(prefix='open-trader-ci-collection-') as directory:

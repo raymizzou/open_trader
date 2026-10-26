@@ -99,6 +99,11 @@ jobs:
           if-no-files-found: error
 
   prediction:
+    name: prediction-${{ matrix.shard }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     needs: plan
     if: contains(fromJSON(needs.plan.outputs.plan).scopes, 'prediction')
     runs-on: ubuntu-24.04
@@ -111,12 +116,12 @@ jobs:
       - name: Run offline prediction development tests
         env:
           TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
-        run: bash scripts/run_ci_service.sh "prediction" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
+        run: bash scripts/run_ci_service.sh "prediction-${{ matrix.shard }}" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
       - name: Preserve exact-SHA evidence including phase metrics and JUnit
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ci-prediction-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ci-prediction-${{ matrix.shard }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ci-evidence
           retention-days: 3
           if-no-files-found: error
@@ -178,9 +183,14 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Download every required machine's execution evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: ci-*
+          path: ${{ runner.temp }}/required-evidence
       - name: Require all backend, portable and partition checks
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
-          printf '%s' "$NEEDS_JSON" | python3 scripts/ci_plan.py required | tee -a "$GITHUB_STEP_SUMMARY"
+          printf '%s' "$NEEDS_JSON" | python3 scripts/ci_plan.py required --evidence "${{ runner.temp }}/required-evidence" | tee -a "$GITHUB_STEP_SUMMARY"

@@ -1095,10 +1095,15 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
     ]
 
 
+    _assert_current_nleg_pause(d2_root)
+
+
+def _assert_current_nleg_pause(root: Path, service=None) -> dict:
     # N-leg pause leaves a legitimately RUN LP current cycle active. Empty
     # current orders/positions and budget None cannot cause mutation here.
-    from tests.lp_d2_service_harness import ServiceChild
-    with ServiceChild(d2_root, scenario="consumer-nleg-paused-run") as child:
+    from tests.lp_d2_service_harness import InProcessService
+    service=InProcessService if service is None else service
+    with service(root, scenario="consumer-nleg-paused-run") as child:
         child.release("metadata")
         child.start(expected_running=True)
         for run in range(2):
@@ -1123,6 +1128,11 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
             child.assert_owner_available()
             if run == 0:
                 child.launch("automatic-consumer-nleg-paused-run", expected_running=True)
+        result=dict(state={key:state.get(key) for key in ("effective_running","desired_running","buy_reserved_usd",
+            "inventory_cost_usd","current_exposure_usd","new_capacity_usd","account_buys","observed_pools")},
+            requests=child.sdk_requests())
+        (root/"business-result.json").write_text(json.dumps(result,sort_keys=True,indent=2))
+        return result
 
 
 @pytest.mark.parametrize("reader_generation", (True, False, 0, -1))
@@ -1494,10 +1504,15 @@ def test_restart_preserves_manual_orders_and_resumes_monitoring(
     assert owners_by_run[0] == owners_by_run[1]
     assert mutations == []
 
+    _assert_current_manual_preserved(d2_root)
+
+
+def _assert_current_manual_preserved(root: Path, service=None) -> dict:
     # Default production has separate data and real current/round/control
     # authority. Persisted pause makes this no exception to RUN BUY cleanup.
-    from tests.lp_d2_service_harness import ServiceChild
-    with ServiceChild(d2_root, scenario='rollback-current-manual-preserved') as child:
+    from tests.lp_d2_service_harness import InProcessService
+    service=InProcessService if service is None else service
+    with service(root, scenario='rollback-current-manual-preserved') as child:
         child.release('metadata')
         child.start(expected_running=False)
         for run in range(2):
@@ -1528,6 +1543,11 @@ def test_restart_preserves_manual_orders_and_resumes_monitoring(
             child.process.terminate(); assert child.wait_exit() == 0
             child.assert_owner_available()
             if run == 0: child.launch('operator-rollback-current-manual-preserved', expected_running=False)
+        result=dict(state={key:state.get(key) for key in ("effective_running","desired_running","buy_reserved_usd",
+            "inventory_cost_usd","current_exposure_usd","new_capacity_usd","account_buys","observed_pools")},
+            requests=child.sdk_requests())
+        (root/"business-result.json").write_text(json.dumps(result,sort_keys=True,indent=2))
+        return result
 
 
 def test_lp_restart_owns_one_session_and_preserves_monitoring(
@@ -1867,9 +1887,14 @@ def test_lp_report_waits_for_restart_reconciliation(
     reopened = PredictionArbitrageStore(tmp_path)
     assert reopened.lp_daily_report("2026-09-15") == report
 
+    _assert_current_stale_report(d2_root)
+
+
+def _assert_current_stale_report(root: Path, service=None) -> dict:
     # A separate real paused D2 startup leaves the old due row historical.
-    from tests.lp_d2_service_harness import ServiceChild
-    with ServiceChild(d2_root, scenario='rollback-current-stale-report') as child:
+    from tests.lp_d2_service_harness import InProcessService
+    service=InProcessService if service is None else service
+    with service(root, scenario='rollback-current-stale-report') as child:
         child.release('metadata'); child.start(expected_running=False)
         state = child.wait_state(lambda state: state.get('current_exposure_usd') == '3.80')
         assert child.request('/healthz')['runtime_state'] == 'RUNNING'
@@ -1879,7 +1904,8 @@ def test_lp_report_waits_for_restart_reconciliation(
         # current iteration without also triggering D2's independent600s guard.
         child.advance(1)
         state = child.wait_state(lambda state: state.get('last_check_at') == '2026-10-16T12:00:01+00:00'
-            and state.get('current_exposure_usd') == '3.80')
+            and state.get('current_exposure_usd') == '3.80'
+            and all(order['source']['checked_at']=='2026-10-16T12:00:01+00:00' for order in state.get('account_buys',[])))
         assert state['desired_running'] is False and state['current_exposure_usd'] == '3.80'
         current_store = PredictionArbitrageStore(child.data_dir)
         assert current_store.lp_daily_report('2026-09-15') is None
@@ -1889,6 +1915,11 @@ def test_lp_report_waits_for_restart_reconciliation(
         child.assert_owned()
         child.process.terminate(); assert child.wait_exit() == 0
         child.assert_owner_available()
+        result=dict(state={key:state.get(key) for key in ("effective_running","desired_running","buy_reserved_usd",
+            "inventory_cost_usd","current_exposure_usd","new_capacity_usd","account_buys","observed_pools")},
+            requests=child.sdk_requests())
+        (root/"business-result.json").write_text(json.dumps(result,sort_keys=True,indent=2))
+        return result
 
 
 def test_lp_dashboard_refresh_cannot_block_risk_monitor(
@@ -2342,10 +2373,11 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
     _assert_current_progress_with_blocked_optional_source(tmp_path / "actual-d2", "catalog")
 
 
-def _assert_actual_candidate_queue(root: Path) -> None:
-    from tests.lp_d2_service_harness import ServiceChild
+def _assert_actual_candidate_queue(root: Path, service=None) -> dict:
+    from tests.lp_d2_service_harness import InProcessService
+    service=InProcessService if service is None else service
     from open_trader.lp_auto_cli import _Client
-    with ServiceChild(root, scenario="consumer-rollback-current-producer-candidate") as child:
+    with service(root, scenario="consumer-rollback-current-producer-candidate") as child:
         child.release("metadata")
         child.start(expected_running=False)
         child.wait("producer-preparation-result.json")
@@ -2374,6 +2406,10 @@ def _assert_actual_candidate_queue(root: Path) -> None:
         stopped = json.loads(child.marker("producer-stopped.json").read_text())
         assert stopped == dict(state="STOPPED", queue_accepted=False)
         child.assert_owner_available()
+
+        return dict(state={key:state.get(key) for key in ("effective_running","desired_running","buy_reserved_usd",
+            "inventory_cost_usd","current_exposure_usd","new_capacity_usd","account_buys","observed_pools")},
+            requests=child.sdk_requests())
 
 
 def test_candidate_monitors_run_independently(
@@ -2631,9 +2667,10 @@ def test_candidate_monitor_scan_cadence(
     _assert_actual_candidate_queue(tmp_path / "actual-d2")
 
 
-def _assert_actual_trial_maintenance(root: Path) -> None:
-    from tests.lp_d2_service_harness import ServiceChild
-    with ServiceChild(root, scenario="consumer-producer-trial") as child:
+def _assert_actual_trial_maintenance(root: Path, service=None) -> dict:
+    from tests.lp_d2_service_harness import InProcessService
+    service=InProcessService if service is None else service
+    with service(root, scenario="consumer-producer-trial") as child:
         child.release("metadata")
         child.start(expected_running=False)
         # No dashboard/queue request initiates this real maintenance work.
@@ -2654,6 +2691,10 @@ def _assert_actual_trial_maintenance(root: Path) -> None:
         assert child.marker("optional-trading-closed").exists()
         child.assert_owner_available()
         assert child.actual_posts() == 0 and list(child.events.glob("cancel-call-*")) == []
+
+        return dict(state={key:state.get(key) for key in ("effective_running","desired_running","buy_reserved_usd",
+            "inventory_cost_usd","current_exposure_usd","new_capacity_usd","account_buys","observed_pools")},
+            requests=child.sdk_requests())
 
 
 def test_lp_trial_maintenance_runs_without_page_and_stops(
@@ -3018,10 +3059,11 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
     _assert_actual_trial_maintenance(tmp_path / "actual-d2")
 
 
-def _assert_current_progress_with_blocked_optional_source(root: Path, source: str) -> None:
-    from tests.lp_d2_service_harness import ServiceChild
+def _assert_current_progress_with_blocked_optional_source(root: Path, source: str, service=None) -> dict:
+    from tests.lp_d2_service_harness import InProcessService
+    service=InProcessService if service is None else service
     scenario = ("consumer-optional-metadata" if source == "metadata" else "consumer-rollback-current-optional-" + source)
-    with ServiceChild(root, scenario=scenario) as child:
+    with service(root, scenario=scenario) as child:
         child.release("metadata")
         child.start(expected_running=False)
         child.wait("optional-entered")
@@ -3035,7 +3077,9 @@ def _assert_current_progress_with_blocked_optional_source(root: Path, source: st
         child.advance(1)
         child.wait("optional-current-read-" + str(initial + 1))
         exposure, reserved, inventory = ("0", "0", "0") if source == "metadata" else ("3.80", "3.20", "0.60")
-        current = child.wait_state(lambda row: row.get("current_exposure_usd") == exposure)
+        current = child.wait_state(lambda row: row.get("current_exposure_usd") == exposure
+            and all(order["source"]["checked_at"] == "2026-10-16T12:00:01+00:00"
+                for order in row.get("account_buys", [])))
         assert current["effective_running"] is False and current["desired_running"] is False
         assert current["buy_reserved_usd"] == reserved and current["inventory_cost_usd"] == inventory
         assert not child.marker("optional-ended").exists()
@@ -3057,6 +3101,13 @@ def _assert_current_progress_with_blocked_optional_source(root: Path, source: st
         assert child.marker("optional-runtime-stopped").exists()
         assert json.loads(child.marker("optional-native-counts.json").read_text()) == dict(calls=1, active=0, max_active=1)
         child.assert_owner_available()
+
+        result=dict(state={key:current.get(key) for key in ("effective_running","desired_running","buy_reserved_usd",
+            "inventory_cost_usd","current_exposure_usd","new_capacity_usd","account_buys","observed_pools")},
+            requests=child.sdk_requests())
+
+        (root/"business-result.json").write_text(json.dumps(result,sort_keys=True,indent=2))
+        return result
 
 
 def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
@@ -4556,7 +4607,7 @@ def _nr_cycle(child, kind='known'):
 
 
 def test_d2_paused_restart_ignores_stale_lp_execution_bookkeeping_without_reconcile(tmp_path):
-    from tests.lp_d2_service_harness import ServiceChild
+    from tests.lp_d2_service_harness import InProcessService as ServiceChild
     with ServiceChild(tmp_path,scenario='nr-stale') as child:
         started=_nr_start(child)
         assert started['reconcile_calls']==0, 'D2 paused startup must use local admission, not reconcile_startup'
@@ -4575,7 +4626,7 @@ def test_d2_paused_restart_ignores_stale_lp_execution_bookkeeping_without_reconc
 
 
 def test_d2_account_unknown_stays_online_without_buy_until_fresh_complete_facts(tmp_path):
-    from tests.lp_d2_service_harness import ServiceChild
+    from tests.lp_d2_service_harness import InProcessService as ServiceChild
     with ServiceChild(tmp_path,scenario='nr-unknown') as child:
         started=_nr_start(child)
         assert started['state']=='RUNNING', 'account API timeout must not make D2 startup NOT_READY'
@@ -5925,9 +5976,10 @@ def _start_source_preparation_helpers(runtime, trading, monitor_factory, executi
     runtime._start_history_monitor()
 
 
-def _assert_actual_preparation_result(root: Path, profile: str, expected: str) -> None:
-    from tests.lp_d2_service_harness import ServiceChild
-    with ServiceChild(root, scenario="consumer-producer-prep-" + profile) as child:
+def _assert_actual_preparation_result(root: Path, profile: str, expected: str, service=None) -> dict:
+    from tests.lp_d2_service_harness import InProcessService
+    service=InProcessService if service is None else service
+    with service(root, scenario="consumer-producer-prep-" + profile) as child:
         child.release("metadata")
         child.start(expected_running=False)
         child.wait("producer-preparation-result.json")
@@ -5944,6 +5996,10 @@ def _assert_actual_preparation_result(root: Path, profile: str, expected: str) -
         assert child.marker("optional-runtime-stopped").exists()
         child.assert_owner_available()
         assert child.actual_posts() == 0 and list(child.events.glob("cancel-call-*")) == []
+
+        return dict(state={key:state.get(key) for key in ("effective_running","desired_running","buy_reserved_usd",
+            "inventory_cost_usd","current_exposure_usd","new_capacity_usd","account_buys","observed_pools")},
+            requests=child.sdk_requests())
 
 
 @pytest.mark.parametrize(

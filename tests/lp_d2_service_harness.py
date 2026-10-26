@@ -1,8 +1,15 @@
-"""Real offline child-service harness; only OS/SDK/SQLite/time boundaries vary."""
+"""Real offline current service; only OS/SDK/SQLite/time boundaries vary.
+
+New real-child cases must name their death, cross-process lock, installed identity
+boundary, or the migrated scenario's single retained smoke.
+"""
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import fcntl
+import atexit
+from functools import lru_cache
+import tempfile
 import http.client
 import json
 import os
@@ -18,6 +25,7 @@ import time
 class ServiceChild:
     def __init__(self,root,*,scenario):
         self.root=Path(root);self.scenario=scenario;self.process=None;self.http_thread=None
+        self.timings={};self.scenario_started=time.monotonic()
         self.release_root=self.root/'release';self.runtime_root=self.root/'runtime'
         self.data_dir=self.runtime_root/'data';self.events=self.runtime_root/'events'
         self.config_path=(self.runtime_root/'config/prediction_arbitrage.json' if 'launchd-nested' in scenario
@@ -54,7 +62,8 @@ class ServiceChild:
                 raise AssertionError(f'waiting {name}: {self.output.read_text()}\n{json.dumps(diagnostics,default=str)}')
             threading.Event().wait(.01)
 
-    def start(self,*,expected_running=True):
+    def prepare_release(self):
+        phase=time.monotonic()
         source=Path(__file__).parents[1]
         for name in ('src','ops','scripts'):
             shutil.copytree(source/name,self.release_root/name,ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
@@ -67,6 +76,7 @@ class ServiceChild:
         # Existing external GitHub artifact fixture supplies only the minimal
         # active/retired partition inputs. The application and new lifecycle
         # source above are the actual candidate bytes.
+        self.timings['copy']=time.monotonic()-phase;phase=time.monotonic()
         from tests.test_deployment_preflight import evidence
         scratch=self.root/'ci-fixture';scratch.mkdir()
         evidence.__wrapped__(scratch)
@@ -88,15 +98,40 @@ if port:
         return native(sock,address)
     socket.socket.connect_ex=isolated_listener_probe
 """)
+        self.timings['fixture']=time.monotonic()-phase;phase=time.monotonic()
         # Explicitly authorized fixture Git only; never operates on the task branch.
         for args in (['init','-q'],['add','.'],['-c','user.name=D2 fixture','-c','user.email=d2@invalid','commit','-qm','offline candidate'],['checkout','--detach','-q']):
             subprocess.run(['git','-C',str(self.release_root),*args],check=True,capture_output=True)
         self.sha=subprocess.check_output(['git','-C',str(self.release_root),'rev-parse','HEAD'],text=True).strip()
+        self.timings['git']=time.monotonic()-phase
+    def start(self,*,expected_running=True):
+        template_start=time.monotonic()
+        template=release_template()
+        self.timings['template']=time.monotonic()-template_start
+        self.timings['template_phases']=json.loads((template.parent.parent/'template-phase-timings.json').read_text())
+        started=time.monotonic()
+        shared=self.scenario.startswith(('consumer-ci-current-','consumer-producer-',
+            'consumer-rollback-current-producer-','consumer-rollback-current-optional-',
+            'consumer-optional-','nr-stale','nr-unknown')) and not self.scenario.endswith('-fatal')
+        if shared:
+            self.release_root=template
+        else:
+            shutil.copytree(template,self.release_root)
+            # Identity/tamper cases retain an independently writable checkout.
+            for path in self.release_root.rglob('*'):
+                if path.is_dir():path.chmod(0o755)
+                elif path.is_file():path.chmod(path.stat().st_mode | 0o200)
+            self.release_root.chmod(0o755)
+        self.timings['copy']=time.monotonic()-started
+        self.sha=subprocess.check_output(['git','-C',str(self.release_root),'rev-parse','HEAD'],text=True).strip()
+        self.configure()
+        self.launch(self.scenario,expected_running=expected_running)
+
+    def configure(self):
         configuration=dict(signer_address='0x'+'a'*40,wallet_address='0x'+'a'*40)
         if self.scenario.endswith('instance-health'):
             configuration['lp_instance_id']='mini' if self.scenario=='consumer-mini-instance-health' else 'tokyo'
         config=self.config_path;config.parent.mkdir(parents=True,exist_ok=True);config.write_text(json.dumps(configuration));config.chmod(0o600)
-        self.launch(self.scenario,expected_running=expected_running)
 
     def launch(self,scenario,*,expected_running=None):
         assert self.process is None or self.process.poll() is not None
@@ -105,11 +140,15 @@ if port:
             self.marker(name).unlink(missing_ok=True)
         self.output=self.root/('child-'+scenario+'.log')
         self.log_handle=self.output.open('w')
-        env=dict(os.environ,PYTHONPATH=str(self.release_root/'src')+os.pathsep+str(self.release_root),PYTHONDONTWRITEBYTECODE='1',OPEN_TRADER_NLEG_PAUSED='1',OPEN_TRADER_DISABLE_NLEG_BACKGROUND='1')
+        env=dict(os.environ,PYTHONPATH=str(self.release_root/'src')+os.pathsep+str(self.release_root),PYTHONDONTWRITEBYTECODE='',PYTHONPYCACHEPREFIX=str(release_template().parent.parent/'bytecode'),GIT_OPTIONAL_LOCKS='0',OPEN_TRADER_NLEG_PAUSED='1',OPEN_TRADER_DISABLE_NLEG_BACKGROUND='1')
+        startup=time.monotonic()
         self.process=subprocess.Popen([sys.executable,'-m','tests.lp_d2_service_harness','child',str(self.runtime_root),str(self.port),scenario,str(self.config_path)],cwd=getattr(self,'caller_cwd',self.release_root),env=env,stdout=self.log_handle,stderr=subprocess.STDOUT)
         self.wait('service-starting')
+        if scenario in ('nr-stale','nr-unknown'):self.wait('nr-start-completed')
         if expected_running is not None:
             self.wait_state(lambda s:s.get('effective_running') is expected_running)
+        self.timings['start_ready']=time.monotonic()-startup
+        self.scenario_started=time.monotonic()
 
     def request(self,path,payload=None):
         from urllib.request import Request,build_opener,ProxyHandler,HTTPCookieProcessor
@@ -232,10 +271,18 @@ if port:
     def assert_owner_available(self):
         with (self.data_dir/'prediction_arbitrage/runtime.lock').open('a+') as handle:
             fcntl.flock(handle.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
-    def wait_exit(self):return self.process.wait(timeout=15)
+    def wait_exit(self):
+        started=time.monotonic()
+        try:return self.process.wait(timeout=15)
+        finally:self.timings['exit']=self.timings.get('exit',0)+time.monotonic()-started
     def actual_posts(self):return len(list(self.events.glob('post-call-*')))
+    def sdk_requests(self):
+        return {kind:[json.loads(path.read_text()) for path in sorted(self.events.glob('sdk-'+kind+'-*.json'))]
+            for kind in ('post','cancel')}
     def __enter__(self):return self
     def __exit__(self,*args):
+        self.timings['scenario']=time.monotonic()-self.scenario_started
+        exiting=time.monotonic()
         for resource in ('post','reader','reader-shutdown','notready','business','metadata','http','control','settings','manual','optional',
                          'business-native','metadata-native','settings-native'):self.release(resource)
         for name in self.http_handles:self.release(name)
@@ -248,15 +295,176 @@ if port:
         for thread,_,_ in self.http_handles.values():thread.join(5)
         if self.manual_thread:self.manual_thread.join(5)
         if hasattr(self,'log_handle'):self.log_handle.close()
+        self.timings['exit']=self.timings.get('exit',0)+time.monotonic()-exiting
+        (self.root/'phase-timings.json').write_text(json.dumps(self.timings))
         if args[0] is not None and self.output.exists():print(self.output.read_text())
 
 
-def child(runtime_root,port,scenario,config_path):
+
+@lru_cache(maxsize=1)
+def release_template():
+    """One read-only candidate per interpreter; runtime/config/database stay private."""
+    root=Path(tempfile.mkdtemp(prefix='open-trader-service-template-'))
+    def cleanup():
+        for path in root.rglob('*'):
+            if path.is_dir():path.chmod(0o755)
+            elif path.is_file():path.chmod(path.stat().st_mode | 0o200)
+        shutil.rmtree(root)
+    atexit.register(cleanup)
+    fixture=ServiceChild(root/'template',scenario='template')
+    fixture.prepare_release()
+    (root/'template-phase-timings.json').write_text(json.dumps(fixture.timings))
+    for path in fixture.release_root.rglob('*'):
+        if path.is_file():path.chmod(path.stat().st_mode & ~0o222)
+        elif path.is_dir():path.chmod(0o555)
+    fixture.release_root.chmod(0o555)
+    return fixture.release_root
+
+
+_INPROCESS_LOCK=threading.Lock()
+
+
+class InProcessService(ServiceChild):
+    """Same clean current service/SDK/SQLite/native assembly, without another interpreter.
+
+    Actual process death, install identity and competing-process lock tests stay
+    on ServiceChild. Migrated families retain one real child comparison each.
+    """
+    def start(self,*,expected_running=True):
+        starting=time.monotonic()
+        self.release_root=release_template()
+        self.timings.update(template=time.monotonic()-starting,copy=0.0,
+            template_phases=json.loads((self.release_root.parent.parent/'template-phase-timings.json').read_text()))
+        self.sha=subprocess.check_output(['git','-C',str(self.release_root),'rev-parse','HEAD'],text=True).strip()
+        self.configure()
+        self.launch(self.scenario,expected_running=expected_running)
+
+    def launch(self,scenario,*,expected_running=None):
+        import signal
+        import pytest
+        assert self.process is None or self.process.poll() is not None
+        if not hasattr(self,'isolation'):
+            _INPROCESS_LOCK.acquire()
+            self.previous_modules={name:module for name,module in sys.modules.items()
+                if name=='open_trader' or name.startswith('open_trader.') or name=='tests' or name.startswith('tests.')}
+            for name in self.previous_modules:sys.modules.pop(name)
+            self.previous_path=sys.path[:]
+            self.previous_trace=threading.gettrace();self.previous_profile=threading.getprofile()
+            from websockets.asyncio import client as websocket_client
+            self.previous_proxy=websocket_client.connect_http_proxy
+            sys.path[:0]=[str(self.release_root/'src'),str(self.release_root)]
+            self.isolation=pytest.MonkeyPatch()
+            self.isolation.chdir(self.release_root)
+            self.isolation.setattr(sys,'dont_write_bytecode',False)
+            self.isolation.setattr(sys,'pycache_prefix',str(self.release_root.parent.parent/'bytecode'))
+            self.isolation.setenv('OPEN_TRADER_NLEG_PAUSED','1')
+            self.isolation.setenv('OPEN_TRADER_DISABLE_NLEG_BACKGROUND','1')
+            self.isolation.setenv('GIT_OPTIONAL_LOCKS','0')
+        for name in ('service-starting','process-finalizing','metadata-admission-closed'):
+            self.marker(name).unlink(missing_ok=True)
+        self.output=self.root/('inprocess-'+scenario+'.log');self.output.write_text('')
+        self.control=_ServiceSignals();self.errors=[];self.returncode=None
+        self.owned_before=set(threading.enumerate())
+        def serve():
+            try:
+                from tests.lp_d2_service_harness import child as clean_child
+                clean_child(self.runtime_root,self.port,scenario,self.config_path,control=self.control)
+            except SystemExit as result:self.returncode=result.code
+            except BaseException as error:
+                import traceback
+                self.errors.append(error);self.output.write_text(traceback.format_exc());self.returncode=1
+            else:self.returncode=0
+            finally:
+                for resource in self.control.resources:
+                    try:resource.close()
+                    except BaseException as error:self.errors.append(error);self.returncode=1
+                self.marker('process-finalizing').touch()
+        thread=threading.Thread(target=serve,name='fixture-current-service')
+        self.process=_ServiceThread(thread,self.control,lambda:self.returncode)
+        startup=time.monotonic();thread.start()
+        self.wait('service-starting')
+        if scenario in ('nr-stale','nr-unknown'):self.wait('nr-start-completed')
+        if expected_running is not None:self.wait_state(lambda state:state.get('effective_running') is expected_running)
+        self.timings['start_ready']=time.monotonic()-startup;self.scenario_started=time.monotonic()
+
+    def __exit__(self,*args):
+        try:
+            result=super().__exit__(*args)
+            # This process-wide diagnostic daemon has no Runtime stop port.
+            # Terminate only this isolated module's real consumer after native drain.
+            module=sys.modules.get('open_trader.polymarket_trading')
+            if module is not None and module._lp_read_log_thread.is_alive():
+                diagnostic=module._lp_read_log_thread
+                previous_hook=threading.excepthook
+                def diagnostic_exit(args):
+                    if args.thread is not diagnostic or args.exc_type is not SystemExit:previous_hook(args)
+                def end_diagnostics():raise SystemExit(0)
+                try:
+                    threading.excepthook=diagnostic_exit
+                    module._lp_read_log_queue.put(end_diagnostics,timeout=3)
+                    diagnostic.join(5)
+                finally:threading.excepthook=previous_hook
+            owned=[thread for thread in threading.enumerate() if thread not in self.owned_before]
+            for thread in owned:thread.join(5)
+            alive=[thread.name for thread in owned if thread.is_alive()]
+            if alive:
+                import traceback
+                frames=sys._current_frames()
+                (self.root/'owned-thread-stacks.txt').write_text(''.join(
+                    thread.name+'\n'+''.join(traceback.format_stack(frames[thread.ident]))
+                    for thread in owned if thread.is_alive() and thread.ident in frames))
+            assert alive==[],('current service leaked owned threads',alive)
+            assert not self.errors,(self.errors,self.output.read_text())
+            return result
+        finally:
+            if hasattr(self,'isolation'):
+                threading.settrace(self.previous_trace);threading.setprofile(self.previous_profile)
+                from websockets.asyncio import client as websocket_client
+                websocket_client.connect_http_proxy=self.previous_proxy
+                for name in list(sys.modules):
+                    if name=='open_trader' or name.startswith('open_trader.') or name=='tests' or name.startswith('tests.'):
+                        sys.modules.pop(name)
+                sys.modules.update(self.previous_modules)
+                sys.path[:]=self.previous_path
+                self.isolation.undo();del self.isolation
+                _INPROCESS_LOCK.release()
+
+
+class _ServiceSignals:
+    def __init__(self):
+        import signal
+        self.SIGINT=signal.SIGINT;self.SIGTERM=signal.SIGTERM
+        self.handlers={};self.stopped=threading.Event();self.resources=[];self.caller_thread=threading.current_thread()
+    def getsignal(self,signum):return self.handlers.get(signum)
+    def signal(self,signum,handler):self.handlers[signum]=handler
+    def stop(self):
+        self.stopped.set()
+        handler=self.handlers.get(self.SIGTERM)
+        if handler is not None:handler(self.SIGTERM,None)
+
+
+class _ServiceThread:
+    def __init__(self,thread,control,result):self.thread=thread;self.control=control;self.result=result
+    def poll(self):return None if self.thread.is_alive() else self.result()
+    def terminate(self):self.control.stop()
+    def send_signal(self,signum):
+        import faulthandler
+        import signal
+        if signum in (signal.SIGTERM,signal.SIGINT):self.control.stop()
+        else:faulthandler.dump_traceback()
+    def wait(self,timeout):
+        self.thread.join(timeout)
+        if self.thread.is_alive():raise subprocess.TimeoutExpired('in-process current service',timeout)
+        return self.result()
+    def kill(self):raise AssertionError('in-process native resources did not drain; cannot kill the test interpreter')
+
+def child(runtime_root,port,scenario,config_path,*,control=None):
     """Install external boundaries, arm explicitly, then run the real service."""
+    owner_thread=threading.current_thread()
     runtime_only=scenario.startswith('nr-')
     if runtime_only:scenario='consumer-'+scenario
     import sqlite3,faulthandler,signal
-    faulthandler.register(signal.SIGUSR1,all_threads=True)
+    if control is None:faulthandler.register(signal.SIGUSR1,all_threads=True)
     import pytest
     from polymarket.models.clob.order_response import AcceptedOrder
     from polymarket.models.clob.rewards import CurrentReward,CurrentRewardConfig
@@ -287,7 +495,7 @@ def child(runtime_root,port,scenario,config_path):
         # the result before the second already-accepted public observation.
         if (scenario=='late_control' and control_native
                 and not control_native[0].is_alive()
-                and threading.current_thread().name=='MainThread'):
+                and threading.current_thread() is owner_thread):
             owner_clock_observations[0]+=1
             if owner_clock_observations[0]>=2:mark('late-control-observation-ready')
         return float((events/'clock').read_text())
@@ -610,6 +818,7 @@ def child(runtime_root,port,scenario,config_path):
         adapter_config=load_trading_config(config_path)
     else:adapter_config=TradingConfig(WALLET,WALLET)
     adapter=PolymarketTradingClient(adapter_config,sdk,urlopen_fn=public_http,public_client_factory=public_factory)
+    if control is not None:control.resources.append(adapter)
     if scenario=='consumer-ci-independent-cancel':
         native_ci_close=adapter.close
         def close_ci_adapter():
@@ -666,7 +875,7 @@ def child(runtime_root,port,scenario,config_path):
             result=native_ci_adapter_close();mark('ci-client-closed');return result
         adapter.close=ci_native_close
     import atexit
-    atexit.register(lambda:mark('process-finalizing'))
+    if control is None:atexit.register(lambda:mark('process-finalizing'))
     if not (root/'data/prediction_arbitrage/prediction_arbitrage.sqlite3').exists():
         store=PredictionArbitrageStore(root/'data')
         if scenario.startswith('consumer-ci-fence-'):
@@ -718,6 +927,21 @@ def child(runtime_root,port,scenario,config_path):
         if 'optional-history' not in scenario and 'producer-prep-partial' not in scenario:
             store.lp_save_price_history(CONDITION_ID,TOKEN_ID,[],dict(state='known',amplitude=Decimal('.005'),checked_at=now,valid_until=now+timedelta(days=1)))
             store.lp_save_price_history(CONDITION_ID,NO_TOKEN_ID,[],dict(state='known',amplitude=Decimal('.005'),checked_at=now,valid_until=now+timedelta(days=1)))
+    request_lock=threading.Lock()
+    def record_sdk_request(kind,payload):
+        with request_lock:
+            count=len(list(events.glob('sdk-'+kind+'-*.json')))+1
+            (events/f'sdk-{kind}-{count:04}.json').write_text(json.dumps(payload,default=str,sort_keys=True))
+    actual_post=sdk.post_order
+    def observed_post(order):
+        record_sdk_request('post',order)
+        return actual_post(order)
+    sdk.post_order=observed_post
+    actual_cancel=sdk.cancel_orders
+    def observed_cancel(**kwargs):
+        record_sdk_request('cancel',kwargs)
+        return actual_cancel(**kwargs)
+    sdk.cancel_orders=observed_cancel
     real_connect=sqlite3.connect;failures=[0]
     import itertools
     sql_serial=itertools.count(1)
@@ -758,12 +982,12 @@ def child(runtime_root,port,scenario,config_path):
             return result
         def execute(self,sql,*a,**kw):
             name=threading.current_thread().name
-            if name=='MainThread' and sql=='PRAGMA journal_mode=WAL':mark('actual-store-sql-'+scenario)
-            if (scenario=='consumer-reconcile-error' and name=='MainThread'
+            if threading.current_thread() is owner_thread and sql=='PRAGMA journal_mode=WAL':mark('actual-store-sql-'+scenario)
+            if (scenario=='consumer-reconcile-error' and threading.current_thread() is owner_thread
                     and sql.startswith('SELECT * FROM incidents WHERE acknowledged_at IS NULL')):
                 mark('actual-reconcile-sql-failed')
                 raise sqlite3.OperationalError('offline reconciliation storage unavailable')
-            if name=='MainThread' and sql=='SELECT payload FROM lp_auto_pool WHERE singleton=1':
+            if threading.current_thread() is owner_thread and sql=='SELECT payload FROM lp_auto_pool WHERE singleton=1':
                 mark('startup-control-settings-read-'+scenario)
                 caller=sys._getframe(1).f_code.co_name
                 if caller in ('lp_load_current_control','lp_load_current_settings'):
@@ -778,7 +1002,7 @@ def child(runtime_root,port,scenario,config_path):
                 if scenario!='late_control' and not scenario.startswith('resume-') and not scenario.startswith('consumer-ci-native-'):
                     mark('control-failure-'+str(failures[0]))
                     raise sqlite3.OperationalError('actual control save failure')
-            if (name=='MainThread' or ('rollback-current' in scenario and 'producer-' not in scenario)) and (
+            if (threading.current_thread() is owner_thread or ('rollback-current' in scenario and 'producer-' not in scenario)) and (
                     'lp_order_registrations' in sql or 'FROM lp_sessions' in sql
                     or 'INTO lp_sessions' in sql or 'UPDATE lp_sessions' in sql):
                 mark('legacy-bookkeeping-unavailable');raise sqlite3.OperationalError('legacy LP bookkeeping unavailable')
@@ -831,8 +1055,17 @@ def child(runtime_root,port,scenario,config_path):
             return real_from_keychain(config,client_factory=external_sdk_init,run=external_keychain,public_client_factory=public_factory)
         return adapter
     with pytest.MonkeyPatch.context() as patch:
+        if control is not None:
+            from open_trader import prediction_service
+            patch.setattr(prediction_service,'signal',control)
         if not runtime_only:
-            patch.setattr(sqlite3,'connect',lambda *a,**kw:real_connect(*a,**(kw|dict(factory=NativeSQL))))
+            def fixture_connect(*args,**kwargs):
+                # Faults belong only to this service's private database.
+                if control is not None and (threading.current_thread() is control.caller_thread or
+                        not str(args[0] if args else kwargs.get('database','')).startswith(str(root))):
+                    return real_connect(*args,**kwargs)
+                return real_connect(*args,**(kwargs|dict(factory=NativeSQL)))
+            patch.setattr(sqlite3,'connect',fixture_connect)
         from open_trader.lp_persistence import LPWriteCoordinator
         native_admission = LPWriteCoordinator.acquire
         @contextmanager
@@ -1025,7 +1258,7 @@ def child(runtime_root,port,scenario,config_path):
             import socketserver
             native_select=socketserver._ServerSelector.select
             def external_selector_io(selector,*a,**kw):
-                if (threading.current_thread().name=='MainThread'
+                if (threading.current_thread() is owner_thread
                         and (events/'owner-loop-fault-arm').exists()
                         and not (events/'owner-loop-fault-fired').exists()):
                     mark('owner-loop-fault-fired')
@@ -1451,7 +1684,7 @@ def child(runtime_root,port,scenario,config_path):
         if runtime_only:
             seed_no_reconcile_permit(root,release_root,config_path,port)
             return run_no_reconcile_runtime(root,config_path,scenario,sdk,publish_snapshot,mark,
-                business_clock,utc_clock)
+                business_clock,utc_clock,control=control)
         if not scenario.startswith('automatic'):
             from contextlib import ExitStack
             with ExitStack() as operation:
@@ -1636,11 +1869,14 @@ def offline_github_fixture(release,scratch):
         with zipfile.ZipFile(io.BytesIO(api.downloads[artifact['id']])) as archive:
             files={name:archive.read(name) for name in archive.namelist()}
         metadata=json.loads(files['evidence.json']);scope=metadata['scope']
-        nodes=sorted(parts[scope]) if scope!='portable' else ['acceptance/test_prediction_arbitrage_scenarios.py::test_ok']
+        service='prediction' if scope.startswith('prediction-') else scope
+        nodes=sorted(parts[service]) if scope!='portable' else ['acceptance/test_prediction_arbitrage_scenarios.py::test_ok']
+        if scope.startswith('prediction-'):
+            nodes=partition.shard_nodeids('prediction',nodes,int(scope[-1]))
         metrics=json.loads(files['metrics.json']);metrics.update(source_sha=sha,selected_nodeids=nodes,results=[])
         for node in nodes:
             metrics['results'].append(dict(nodeid=node,execution_nodeid=node,outcome='passed',phases={
-                phase:dict(duration=.1,outcome='passed',worker='gw0' if scope=='prediction' else 'serial')
+                phase:dict(duration=.1,outcome='passed',worker='gw0' if scope.startswith('prediction-') else 'serial')
                 for phase in ('setup','call','teardown')}))
         files['metrics.json']=json.dumps(metrics).encode()
         files['selected-nodeids.json']=json.dumps(nodes).encode()
@@ -1726,7 +1962,7 @@ def seed_no_reconcile_permit(root,release,config,port):
         ci=dict(run_id=1,run_attempt=1,artifact_role='test-only',
             run_url='https://github.com/raymizzou/open_trader/actions/runs/1',
             artifacts=[dict(scope=scope,id=i,digest='sha256:'+'0'*64)
-                for i,scope in enumerate(('gateway','legacy','account','prediction','portable'),1)]))
+                for i,scope in enumerate(('gateway','legacy','account','prediction-1','prediction-2','prediction-3','portable'),1)]))
     write_prediction_runtime_record(root/'prediction-service-runtime.json',dict(state='stopped',
         manager='foreground',manager_identity=f'foreground:{os.getuid()}',
         candidate=dict(source,lp_validation=binding)))
@@ -1738,7 +1974,7 @@ def seed_no_reconcile_permit(root,release,config,port):
     permit.chmod(0o600)
 
 
-def run_no_reconcile_runtime(root,config_path,scenario,sdk,publish,mark,clock,utc_now):
+def run_no_reconcile_runtime(root,config_path,scenario,sdk,publish,mark,clock,utc_now,*,control=None):
     """Observe real owners with a profiler; never replace their return values."""
     import signal
     from open_trader.prediction_runtime import PredictionRuntime
@@ -1782,8 +2018,8 @@ def run_no_reconcile_runtime(root,config_path,scenario,sdk,publish,mark,clock,ut
                     mark('nr-cycle-'+kind+'-completed')
         return observe
     sys.setprofile(observe);threading.setprofile(observe)
-    stopped=threading.Event()
-    signal.signal(signal.SIGTERM,lambda *_:stopped.set())
+    stopped=threading.Event() if control is None else control.stopped
+    if control is None:signal.signal(signal.SIGTERM,lambda *_:stopped.set())
     mark('service-starting')
     code=0
     try:

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-26 — CI machines and current-service test startup
+
+- Split required Prediction coverage across three machines with two workers each. Run the exact reviewed release advisory cases on four serial machines, with lp410 on two. Keep business, UNKNOWN, no-replay, ownership and native-drain checks required. Preserve main-only CI triggers and the separate deployment authorization.
+- Verify all seven required artifact payloads and their exact source, lock, environment, run, attempt and executed-node union. Bind retained LP validation references to the selected release's five- or seven-scope contract, so old verified rollback releases remain usable without accepting incomplete current evidence.
+- Reuse real killed-owner snapshots and a read-only source template. Compare migrated current-service scenarios with real children, retain process-boundary tests and record startup phases. Financial, order identity and negative assertions remain in place; trading behavior is unchanged.
+
 ## 2026-10-26 — Departed income test account publication
 
 - Wait for the real asynchronous account observation to contain only the remaining trial order before testing income selection. Preserve the departed order's unchanged, fresh historical result, exact selection and cancellation identities, and no-reopen assertion. Test synchronization only; production behavior is unchanged.

@@ -53,7 +53,7 @@ The retained standalone trend-curve job stays skipped because the legacy suite
 already includes its tests. Make and `scripts/ci_evidence.py` share one service selection entry point.
 Update that selector's service prefixes for new service-specific test families.
 The [explicit retirement manifest](ci-nleg-retirement.md) omits exactly 29 reviewed
-N-leg files from default execution. The 224 exact release-test identities described below
+N-leg files from default execution. The 279 exact release-test identities described below
 are advisory; all other active tests remain required, including the three
 mixed/shared files, LP and pause guards. Production pause state is unchanged.
 Unknown/new files do not inherit retirement from their names.
@@ -78,7 +78,10 @@ hosted output scanner. Normal subsequent push evidence verifies hosted transport
 
 Each service reuses `make test SERVICE=...` with `TEST_N_LEG=0` and the locked
 Docker dev image. Non-Prediction services retain Makefile's serial default;
-Prediction uses two xdist workers appropriate for a standard Linux runner.
+Prediction runs on three machines, each with two xdist workers. Gateway,
+Legacy, Account and Portable retain one machine each. Prediction parameters
+stay together, including the existing cross-file shared-port group. Advisory
+runs on four machines with one process each; lp410 uses exactly two of them.
 Image builds can download locked dependencies; tests use the existing
 network-disabled container, no host mounts, forwarded credentials, Docker socket
 or published ports. There are no real account credentials, trading requests,
@@ -102,11 +105,11 @@ required check permanently pending.
 
 ## Release advisory
 
-`scripts/ci_optional_tests.json` declares 224 reviewed full nodeids under
-`release-advisory-v1`: the existing rollback regression plus 223 release,
-installer and manager cases across seven files. The selector pins the sorted
+`scripts/ci_optional_tests.json` declares 279 reviewed full nodeids under
+`release-advisory-v1`: the existing rollback regression plus 278 release,
+installer and manager cases across ten files. The selector pins the sorted
 literal set to SHA-256
-`913655864de870f8f83f9e59695840d42bee775b49c3dbc535a7105698b2c82d`.
+`607edf6f00872abe4e5c8de99d5d73828fd63a7915fbb313dde0a1c448071621`.
 Tests and business assertions stay unchanged. Required Prediction CI excludes
 only these canonical identities, before xdist adds execution group names.
 New names and new parameter identities stay required; no file, function prefix
@@ -122,7 +125,7 @@ and Make target use `release-advisory`. It runs automatically only on pushes to
 `main`, normally after a merge, and provides `workflow_dispatch` for manual use.
 It does not run on PRs, ordinary branch pushes or a schedule. A PR therefore
 has no premerge advisory execution. The exact `github.sha` is checked out and
-all declared cases run unchanged in one serial session, with the same locked,
+the declared cases are partitioned over four machines, each with one serial session, with the same locked,
 offline Docker environment and 60-minute job timeout. Parameter IDs are quoted
 as whole command arguments.
 
@@ -206,3 +209,36 @@ Prediction timing comparison must use the same source, locked dependencies,
 runner/CPU and two workers, changing only inclusion of the retired collection.
 File counts are classification evidence, not elapsed-time savings. Record both
 selections and full wall time; no periodic full N-leg regression is required.
+
+## Three-machine evidence and source-bound compatibility
+
+The required artifact scopes, in order, are `gateway`, `legacy`, `account`,
+`prediction-1`, `prediction-2`, `prediction-3`, `portable`. Each artifact keeps
+schema 2, its literal full selected/executed nodeids, phase metrics, JUnit,
+source/lock/environment and exact run/attempt identity. The portable proof keeps
+the complete four-service partition. Both required aggregation and preflight
+validate every machine's payload and compare its nodeids to the deterministic
+partition; a matrix job result or a matching test count alone is insufficient.
+Missing, duplicate, overlapping, extra, failed or misbound required evidence is
+rejected. Advisory results are independent and cannot substitute for required
+coverage. No trigger, retry, timeout or per-machine worker increase is added.
+
+Retained LP bindings keep their schema and fields. Their expected artifact scope
+list comes from the already-verified selected clean release's preflight contract,
+not from the binding's length or the newer manager's own version. An old selected
+release retains its five-scope contract; a new selected release requires all
+seven exact scopes, ordered and with distinct positive IDs and valid digests.
+Unknown selected contracts fail closed. Runtime and trading decisions are unchanged.
+
+OQ3 moves 55 exact startup/install identities to the existing advisory allowlist,
+including all 39 lp410 cases, instance health/parallel identity and pure Runtime
+resource/owner startup checks. Real process death, installation and competing
+process tests still execute as actual processes. Current-account financial
+recovery, UNKNOWN, no-replay, in-flight native/HTTP drain and SSM runtime checks
+remain required. Future names and parameter identities remain required. The
+tradeoff is that a genuine startup/install advisory failure no longer blocks
+preflight; its original result and evidence remain visible.
+
+See [current-service test coverage](ci-current-service-tests.md) for the migrated
+scenario families, retained real-process boundaries, source-template/cache rules
+and focused local runner setup.

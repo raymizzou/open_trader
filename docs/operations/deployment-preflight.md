@@ -16,7 +16,7 @@ reuses their evidence and does not run backend pytest or build a Docker image.
 `make deployment-preflight`; they no longer mean a separate test stage.
 
 The backend still excludes `pressure` and `browser`. Gateway, Account and Legacy
-remain serial. Prediction keeps two xdist workers and its explicit shared-port
+remain serial. Prediction runs on three machines, each with two xdist workers and its explicit shared-port
 and solver-fixture groups. Portable scenarios run serially. CI checks collected
 executed required plus explicit optional and retired nodeids against the full backend
 collection so new files, nested tests, marker changes and omitted partitions cannot silently reduce coverage. The old single
@@ -46,8 +46,10 @@ label. Missing API access is BLOCKED. It requires:
   and code imports from that release's source
 
 Each service's recorded executions must equal its required partition in the
-portable collection proof. Required, optional and retired collections must be
-pairwise disjoint and complete. The 224 exact reviewed release-test identities in
+portable collection proof. Prediction's three machines must cover that one
+partition without overlap; all seven required artifact scopes are checked for
+the exact selected SHA, run and attempt. Required, optional and retired collections must be
+pairwise disjoint and complete. The 279 exact reviewed release-test identities in
 `scripts/ci_optional_tests.json` (`release-advisory-v1`) are classified as `not-executed-advisory`, never
 passed by declaration. Their separate Release advisory workflow runs automatically only on main
 pushes, with a manual entry; its success is not a preflight wait or gate, and
@@ -184,3 +186,10 @@ are not forced through latest forward-release evidence or expiring CI artifacts.
 Dashboard `--mode single` remains a rollback action and is intentionally excluded
 from the forward wrapper. The wrapper is the supported forward entrypoint; this
 PR does not claim that every direct low-level invocation is globally guarded.
+
+The retained LP validation binding format stays unchanged. Its artifact-reference
+list follows the trusted selected release's own preflight `SCOPES`: five entries
+for old immutable releases, seven for the new sharded contract. A five-entry
+binding cannot satisfy the new release. Unknown contracts, wrong scope order,
+duplicate IDs and malformed digests remain errors; rollback does not inherit the
+new manager's artifact count merely because the manager source is newer.

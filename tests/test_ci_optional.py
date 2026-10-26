@@ -65,9 +65,9 @@ class OptionalPolicyTests:
         ci = load('ci_evidence')
         selection = ci.expected_selection('prediction', ROOT)
         reviewed = selection['deselect']
-        check.assertEqual(len(reviewed), 224)
+        check.assertEqual(len(reviewed), 279)
         check.assertEqual(hashlib.sha256(json.dumps(sorted(reviewed), separators=(',', ':')).encode()).hexdigest(),
-                          '913655864de870f8f83f9e59695840d42bee775b49c3dbc535a7105698b2c82d')
+                          '607edf6f00872abe4e5c8de99d5d73828fd63a7915fbb313dde0a1c448071621')
         ready = 'tests/test_lp_d2_service_cutover_repairs.py::test_explicit_systemd_restart_recovers_absent_ready_or_failed_record[ready]'
         failed = 'tests/test_lp_d2_service_cutover_repairs.py::test_explicit_systemd_restart_recovers_absent_ready_or_failed_record[failed]'
         foreground = 'tests/test_lp_d2_service_cutover_repairs.py::test_foreground_operator_from_other_cwd_remains_manageable'
@@ -102,7 +102,7 @@ class OptionalPolicyTests:
             original = json.loads(path.read_text())
             reviewed = original['optional']
             check.assertEqual(ci.optional_policy(root)['optional_nodeids'], reviewed)
-            check.assertEqual(len(reviewed), 224)
+            check.assertEqual(len(reviewed), 279)
             check.assertEqual(ci.optional_policy(root)['policy'], 'release-advisory-v1')
             changed_parameter = [node.replace('[ready]', '[future]') for node in reviewed]
             for nodes in ([], reviewed[:-1], reviewed+[reviewed[0]], changed_parameter,
@@ -144,11 +144,11 @@ class OptionalPolicyTests:
             partition.verify_partition(complete, {**parts, 'prediction':parts['prediction']+[ROLLBACK]}, retired, ROOT)
         proof = partition.verify_partition(complete, parts, retired, ROOT, optional=optional)
         check.assertEqual(proof['optional'], optional)
-        check.assertEqual(proof['optional_count'], 224)
-        check.assertEqual(proof['optional_sha256'], '913655864de870f8f83f9e59695840d42bee775b49c3dbc535a7105698b2c82d')
+        check.assertEqual(proof['optional_count'], 279)
+        check.assertEqual(proof['optional_sha256'], '607edf6f00872abe4e5c8de99d5d73828fd63a7915fbb313dde0a1c448071621')
         check.assertEqual(proof['optional_status'], 'not-executed-advisory')
         check.assertEqual(proof['executed_count'], 5)
-        check.assertEqual(proof['complete_count'], 230)
+        check.assertEqual(proof['complete_count'], 285)
         check.assertEqual(proof['optional_policy'], ci.optional_policy(ROOT))
         check.assertEqual(ci.validate_partition(ROOT, proof), proof)
         wrong_parameter = [node.replace('[ready]', '[future]') for node in optional]
@@ -171,7 +171,7 @@ class OptionalPolicyTests:
             required = partition.collect(root, paths, root/'required.json', required=True)
             advisory = partition.collect(root, optional, root/'optional.json')
             check.assertEqual(sorted(advisory), optional)
-            check.assertEqual(len(advisory), 224)
+            check.assertEqual(len(advisory), 279)
             check.assertEqual(set(full), set(required)|set(advisory))
             check.assertFalse(set(required)&set(advisory))
 
@@ -214,7 +214,7 @@ class OptionalRunnerTests:
             check.assertNotIn(' -n ', commands)
             if not change.get('fail_copy'):
                 check.assertEqual(evidence['selected_nodeids'], json.loads((ROOT/'scripts/ci_optional_tests.json').read_text())['optional'])
-                check.assertEqual(len(evidence['selected_nodeids']), 224)
+                check.assertEqual(len(evidence['selected_nodeids']), 279)
                 metrics = json.loads(run.ci_files['metrics.json'])
                 check.assertEqual(metrics['exit_status'], 7)
                 check.assertEqual(metrics['results'][0]['phases']['call']['outcome'], 'failed')
@@ -242,10 +242,10 @@ class OptionalWorkflowTests:
             check.assertNotIn(forbidden, text)
         check.assertIn('ref: ${{ github.sha }}', text)
         check.assertIn('persist-credentials: false', text)
-        check.assertIn('scripts/run_ci_service.sh "release-advisory" "0"', text)
+        check.assertIn('scripts/run_ci_service.sh "release-advisory-${{ matrix.shard }}" "0"', text)
         check.assertIn('if: always()', text)
         check.assertIn('retention-days: 3', text)
-        check.assertIn('name: ci-release-advisory-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}', text)
+        check.assertIn('name: ci-release-advisory-${{ matrix.shard }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}', text)
         required = (ROOT/'.github/workflows/ci.yml').read_text().split('  required:\n',1)[1]
         check.assertIn('needs: [plan, gateway, legacy, account, prediction, portable, trend_curve]', required)
         check.assertNotIn('advisory', required)
@@ -271,14 +271,14 @@ class OptionalPreflightTests:
             api.artifacts.append({**api.artifacts[3], 'id':99,
                 'name':'ci-release-advisory-'+module.SHA+'-22-2'})
             report = module.preflight.verify_ci(api, module.SHA, root, module.NOW)
-            check.assertEqual(len(report['artifacts']), 5)
+            check.assertEqual(len(report['artifacts']), 7)
             check.assertFalse(any('advisory' in call or call=='download:99' for call in api.calls))
-            files = module.preflight.read_archive(api.downloads[5])
+            files = module.preflight.read_archive(api.downloads[7])
             proof = json.loads(files['partition.json'])
             check.assertEqual(proof['optional'], json.loads((ROOT/'scripts/ci_optional_tests.json').read_text())['optional'])
-            check.assertEqual(proof['optional_count'], 224)
+            check.assertEqual(proof['optional_count'], 279)
             check.assertEqual(proof['optional_policy']['policy'], 'release-advisory-v1')
-            check.assertEqual(proof['optional_sha256'], '913655864de870f8f83f9e59695840d42bee775b49c3dbc535a7105698b2c82d')
+            check.assertEqual(proof['optional_sha256'], '607edf6f00872abe4e5c8de99d5d73828fd63a7915fbb313dde0a1c448071621')
             check.assertEqual(proof['optional_status'], 'not-executed-advisory')
             check.assertFalse(set(proof['optional']) & set(sum(proof['partitions'].values(), [])))
 
@@ -309,7 +309,7 @@ class OptionalPreflightTests:
                     module.mutate_metadata(api, lambda metadata: metadata['optional_policy'].update(optional_nodeids=[
                         node.replace('[ready]', '[future]') for node in metadata['optional_policy']['optional_nodeids']]))
                 else:
-                    index = 4 if mutation == 'expanded_optional' else 3
+                    index = 6 if mutation == 'expanded_optional' else 3
                     artifact = api.artifacts[index]
                     files = module.preflight.read_archive(api.downloads[artifact['id']])
                     metadata = json.loads(files['evidence.json'])
@@ -345,10 +345,11 @@ class OptionalFixtureTests:
         root = base/'release'
         root.mkdir()
         policy_root(root)
-        for name in ('ci_evidence.py', 'ci_partition.py'):
+        for name in ('ci_evidence.py', 'ci_partition.py', 'deployment_preflight.py'):
             shutil.copy(ROOT/'scripts'/name, root/'scripts'/name)
         for name in ('Dockerfile.dev', 'uv.lock'):
             shutil.copy(ROOT/name, root/name)
+        (root/'tests/test_lp_fixture.py').write_text('def test_a(): pass\ndef test_b(): pass\ndef test_c(): pass\ndef test_d(): pass\n')
         # Distinct bytes establish that the actual release, rather than its seed
         # fixture's manifest hash, is bound into every reconstructed artifact.
         manifest = root/'scripts/ci_optional_tests.json'
@@ -367,13 +368,13 @@ class OptionalFixtureTests:
             root, sha, api, verifier = self.actual_fixture(Path(tmp))
             report = verifier.verify_ci(api, sha, root, datetime.now(timezone.utc))
             check.assertEqual(report['run_attempt'], 2)
-            files = verifier.read_archive(api.downloads[5])
+            files = verifier.read_archive(api.downloads[7])
             proof = json.loads(files['partition.json'])
             optional = json.loads((ROOT/'scripts/ci_optional_tests.json').read_text())['optional']
             check.assertEqual(proof['optional'], optional)
-            check.assertEqual(proof['optional_count'], 224)
-            check.assertEqual(proof['optional_sha256'], '913655864de870f8f83f9e59695840d42bee775b49c3dbc535a7105698b2c82d')
-            check.assertEqual(len({node.split('::')[0] for node in optional}), 7)
+            check.assertEqual(proof['optional_count'], 279)
+            check.assertEqual(proof['optional_sha256'], '607edf6f00872abe4e5c8de99d5d73828fd63a7915fbb313dde0a1c448071621')
+            check.assertEqual(len({node.split('::')[0] for node in optional}), 10)
             check.assertIn('tests/test_lp_d2_service_cutover_repairs.py::test_explicit_systemd_restart_recovers_absent_ready_or_failed_record[ready]', optional)
             check.assertIn('tests/test_lp_d2_service_cutover_repairs.py::test_explicit_systemd_restart_recovers_absent_ready_or_failed_record[failed]', optional)
             check.assertEqual(proof['optional_status'], 'not-executed-advisory')
@@ -395,7 +396,11 @@ class OptionalFixtureTests:
                 check.assertFalse(set(optional) & set(nodes))
                 check.assertEqual(json.loads(files['metrics.json'])['selected_nodeids'], nodes)
                 if metadata['scope'] != 'portable':
-                    check.assertEqual(nodes, proof['partitions'][metadata['scope']])
+                    scope=metadata['scope']
+                    expected=proof['partitions']['prediction' if scope.startswith('prediction-') else scope]
+                    if scope.startswith('prediction-'):
+                        expected=load('ci_partition').shard_nodeids('prediction',expected,int(scope[-1]))
+                    check.assertEqual(nodes,expected)
 
     def test_actual_release_fixture_rejects_missing_required_and_tampered_optional_policy(self):
         import copy
@@ -407,7 +412,7 @@ class OptionalFixtureTests:
             for mutation in ('missing_required', 'optional_identity', 'optional_hash',
                              'optional_as_required', 'optional_proof_identity', 'optional_parameter_identity'):
                 api = copy.deepcopy(original)
-                target = 5 if mutation == 'optional_proof_identity' else 4
+                target = 7 if mutation == 'optional_proof_identity' else 4
                 files = verifier.read_archive(api.downloads[target])
                 metadata = json.loads(files['evidence.json'])
                 if mutation == 'missing_required':
