@@ -5,6 +5,15 @@ Prediction，并通过本地 Mac Gateway 和 SSH 隧道访问。默认目标是�
 N-leg 暂停的 Shadow；它不接管原生产实例，不提交订单。购买、配置、部署、
 凭据迁移和交易各自需要相应授权；本文件不是执行这些操作的授权。
 
+**执行端硬规则（Ray，2026-10-26）：东京/生产部署默认用 Mac mini。**
+只有 Ray 在当次部署中明文指定 Air，且已核验 Air 对东京目标主机的 SSH 连接，
+才可由 Air 执行；两项条件必须同时满足。Bot 不得因为 Air 空闲而自动把东京
+部署改派给 Air。Mini 暂时不可用时，报告缺口，不自动改派。
+
+本次 SOP 文档 PR 与已授权部署分别交付；文档 PR 合入仍须 Ray 明确批准。
+已有授权的部署不以文档 PR 合入为前提，仍须核对所选精确 SHA 并通过既有门禁。
+执行端选择不增加部署、凭据、ACL 或交易权限，也不代表部署或验收已经完成。
+
 先读 [云端拓扑及门禁](prediction-cloud.md)、
 [Deployment Preflight](deployment-preflight.md)、
 [验证及交付规则](agent-verification.md) 和
