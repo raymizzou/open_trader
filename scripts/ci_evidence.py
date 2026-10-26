@@ -432,9 +432,17 @@ def validate_required_directory(root, directory, env):
     for value,pattern in ((sha,'[0-9a-f]{40}'),(run_id,'[1-9][0-9]*'),(attempt,'[1-9][0-9]*')):
         if type(value) is not str or not re.fullmatch(pattern,value):
             raise ValueError('invalid aggregate source/run/attempt')
-    if env['GITHUB_EVENT_NAME'] not in ('push','workflow_dispatch'):
+    event = env.get('GITHUB_EVENT_NAME')
+    expected_ref = 'refs/heads/main'
+    if event == 'pull_request':
+        expected_ref = env.get('GITHUB_REF')
+        if type(expected_ref) is not str or not re.fullmatch(r'refs/pull/[1-9][0-9]*/merge', expected_ref):
+            raise ValueError('invalid aggregate CI ref')
+    elif event not in ('push','workflow_dispatch'):
         raise ValueError('invalid aggregate CI event')
-    run = dict(head_sha=sha, id=int(run_id), run_attempt=int(attempt), event=env['GITHUB_EVENT_NAME'])
+    elif env.get('GITHUB_REF', expected_ref) != expected_ref:
+        raise ValueError('invalid aggregate CI ref')
+    run = dict(head_sha=sha, id=int(run_id), run_attempt=int(attempt), event=event)
     directory = Path(directory)
     names = {f'ci-{scope}-{sha}-{run_id}-{attempt}' for scope in REQUIRED_SHARDS}
     if {path.name for path in directory.iterdir()} != names:
@@ -443,7 +451,7 @@ def validate_required_directory(root, directory, env):
     for scope in REQUIRED_SHARDS:
         path = directory / f'ci-{scope}-{sha}-{run_id}-{attempt}'
         files = {item.name:item.read_bytes() for item in path.iterdir() if item.is_file()}
-        result = verifier.verify_artifact_files(files, scope, run, Path(root))
+        result = verifier.verify_artifact_files(files, scope, run, Path(root), expected_ref=expected_ref)
         record = json.loads(files['evidence.json'])
         records.append(record)
         if scope == 'portable':proof = result['partition']

@@ -125,10 +125,14 @@ focused diagnosis and is not a prerequisite to task-branch publication.
 
 GitHub CI runs all four backend services (`gateway`, `legacy`, `account`,
 `prediction`) with `TEST_N_LEG=0` and the explicit permanent N-leg retirement
-manifest automatically on every final GitHub `main` push. Feature pushes, PR
-events and tag pushes do not trigger it. Preserve the existing main-only
+manifest automatically on PRs targeting `main` and every final GitHub `main`
+push. Feature branches receive CI through their PR; feature pushes without a PR
+and tag pushes do not trigger it. Preserve the existing main-only
 `workflow_dispatch` with no inputs and exact `github.sha` checkout; plan and
-required jobs guard `refs/heads/main`. Manual fallback requires separate
+required guards restrict only manual runs to `refs/heads/main`. Before merge,
+verify successful PR `CI / required`. For CI trigger changes, follow the
+[mandatory PR coverage rule](docs/operations/ci.md); disabling that coverage needs
+Ray's explicit approval at the time. Manual fallback requires separate
 authorization. No workflow concurrency group cancels or replaces another run.
 Documentation-only, LP-only,
 trend-only, and missing-diff cases have the same active backend coverage, excluding
@@ -257,15 +261,14 @@ Main's responsibility; report unfinished review, feedback and verification accur
 authorization for that PR's merge, verify repository, base `main`, open state,
 expected head SHA and absence of conflicts, then merge through GitHub with the
 expected head. Unknown mergeability needs a bounded metadata refresh; an actual
-conflict needs scoped resolution. Do not wait for feature-push/PR-merge CI,
-pending independent review/dots or an old review-ready/full-acceptance label.
-These ongoing duties do not create a replacement premerge wait. Do not integrate
+conflict needs scoped resolution. Verify successful current PR `CI / required`
+before merge; pending independent review/dots or an old review-ready/full-acceptance
+label does not replace this check. Do not integrate
 through local `main` or direct push.
 See [CI identity](docs/operations/ci.md) and the
 [repository protections](docs/operations/repository-protection.md); use dated
 read-back evidence for settings. Old feature branches can still carry workflows
-that trigger extra runs during migration; do not synchronize or push solely to
-remove those runs, or wait for them.
+that trigger duplicate runs; do not synchronize or push solely to remove them.
 
 ## OpenTrader PR review publication
 

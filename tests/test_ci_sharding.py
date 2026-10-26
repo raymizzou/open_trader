@@ -253,3 +253,93 @@ def test_required_cli_reports_artifact_failure_reason(tmp_path):
     assert 'artifact validation failed:' in damaged.stdout and 'hash' in damaged.stdout.lower()
     assert 'invalid job-result JSON' not in damaged.stdout
     assert len(damaged.stdout)<512 and 'Traceback' not in damaged.stderr
+
+
+def test_required_pr_evidence_binds_merge_ref_and_stays_non_deployable(tmp_path):
+    import io,json,os,shutil,subprocess,sys,zipfile
+    from pathlib import Path
+    import pytest
+    from scripts import ci_evidence
+    from tests.test_ci_routing import RequiredTests
+    from tests.test_deployment_preflight import NOW,SHA,evidence,pack,preflight
+    root=tmp_path/'source';root.mkdir()
+    root,api=evidence.__wrapped__(root)
+    directory=tmp_path/'artifacts';directory.mkdir()
+    ref='refs/pull/473/merge'
+    workflow_ref='raymizzou/open_trader/.github/workflows/ci.yml@'+ref
+    for artifact in api.artifacts:
+        target=directory/artifact['name'];target.mkdir()
+        with zipfile.ZipFile(io.BytesIO(api.downloads[artifact['id']])) as archive:
+            files={name:archive.read(name) for name in archive.namelist()}
+        metadata=json.loads(files['evidence.json'])
+        metadata.update(event_name='pull_request',ref=ref,workflow_ref=workflow_ref)
+        files['evidence.json']=json.dumps(metadata).encode()
+        api.downloads[artifact['id']]=pack(files)
+        for name,data in files.items():(target/name).write_bytes(data)
+    env=dict(GITHUB_SHA=SHA,GITHUB_RUN_ID='22',GITHUB_RUN_ATTEMPT='2',
+             GITHUB_EVENT_NAME='pull_request',GITHUB_REF=ref)
+    assert ci_evidence.validate_required_directory(root,directory,env) is None
+    for name in ('ci_plan.py','ci_evidence.py','ci_partition.py','deployment_preflight.py'):
+        shutil.copy(Path(__file__).resolve().parents[1]/'scripts'/name,root/'scripts'/name)
+    needs=json.dumps(RequiredTests().needs([]))
+    def aggregate(environment):
+        return subprocess.run([sys.executable,str(root/'scripts/ci_plan.py'),'required','--evidence',str(directory)],
+            cwd=root,env=dict(os.environ,**environment),input=needs,text=True,capture_output=True)
+    result=aggregate(env)
+    assert result.returncode==0,result.stdout+result.stderr
+    api.run.update(event='pull_request',head_branch='feature')
+    with pytest.raises(preflight.PreflightError):preflight.verify_ci(api,SHA,root,NOW)
+    for artifact in api.artifacts:
+        files={item.name:item.read_bytes() for item in (directory/artifact['name']).iterdir()}
+        scope=json.loads(files['evidence.json'])['scope']
+        with pytest.raises(preflight.PreflightError):
+            preflight.verify_artifact_files(files,scope,api.run,root)
+    # Identical candidate/run evidence cannot cross an event or PR-ref boundary.
+    for key,value in (('GITHUB_EVENT_NAME','push'),('GITHUB_EVENT_NAME','workflow_dispatch'),
+                      ('GITHUB_REF','refs/pull/474/merge')):
+        altered=dict(env,**{key:value})
+        with pytest.raises(ValueError):ci_evidence.validate_required_directory(root,directory,altered)
+        assert aggregate(altered).returncode!=0
+    shard=directory/f'ci-prediction-1-{SHA}-22-2'/'evidence.json'
+    original=shard.read_bytes()
+    for key,value in [('event_name','push'),('event_name','workflow_dispatch'),
+            ('ref','refs/pull/474/merge'),('ref','refs/pull/473/head'),('ref','refs/heads/main'),('ref',None),
+            ('workflow_ref','raymizzou/open_trader/.github/workflows/ci.yml@refs/pull/474/merge'),
+            ('workflow_ref','raymizzou/open_trader/.github/workflows/ci.yml@refs/pull/473/head'),
+            ('workflow_ref','raymizzou/open_trader/.github/workflows/ci.yml@refs/heads/main')]:
+        metadata=json.loads(original)
+        if value is None:metadata.pop(key)
+        else:metadata[key]=value
+        shard.write_text(json.dumps(metadata))
+        with pytest.raises(ValueError):ci_evidence.validate_required_directory(root,directory,env)
+        result=aggregate(env)
+        assert result.returncode!=0,(key,value,result.stdout,result.stderr)
+        shard.write_bytes(original)
+    # Main push and manual aggregation keep their existing exact-main contract.
+    for event in ('push','workflow_dispatch'):
+        main_env=dict(env,GITHUB_EVENT_NAME=event,GITHUB_REF='refs/heads/main')
+        for artifact in api.artifacts:
+            path=directory/artifact['name']/'evidence.json'
+            metadata=json.loads(path.read_text())
+            metadata.update(event_name=event,ref='refs/heads/main',
+                workflow_ref='raymizzou/open_trader/.github/workflows/ci.yml@refs/heads/main')
+            path.write_text(json.dumps(metadata))
+        assert ci_evidence.validate_required_directory(root,directory,main_env) is None
+        result=aggregate(main_env)
+        assert result.returncode==0,result.stdout+result.stderr
+
+
+def test_required_rejects_invalid_event_ref(tmp_path):
+    import pytest
+    from scripts import ci_evidence
+    from tests.test_deployment_preflight import SHA
+    env=dict(GITHUB_SHA=SHA,GITHUB_RUN_ID='22',GITHUB_RUN_ATTEMPT='2',GITHUB_EVENT_NAME='pull_request')
+    for ref in (None,'',True,'refs/pull/0/merge','refs/pull/0473/merge','refs/pull/-1/merge',
+                'refs/pull/473/head','refs/heads/main','refs/pull/473/merge\n'):
+        invalid=dict(env)
+        if ref is not None:invalid['GITHUB_REF']=ref
+        with pytest.raises(ValueError,match='invalid aggregate CI'):
+            ci_evidence.validate_required_directory(tmp_path,tmp_path,invalid)
+    with pytest.raises(ValueError,match='invalid aggregate CI'):
+        ci_evidence.validate_required_directory(tmp_path,tmp_path,
+            dict(env,GITHUB_EVENT_NAME='pull_request_target',GITHUB_REF='refs/pull/473/merge'))

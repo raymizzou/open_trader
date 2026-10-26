@@ -195,7 +195,7 @@ not passing evidence. Keep TDD, relevant stability checks and independent review
 Docker is not a prerequisite to task-branch publication. Optional focused Docker
 diagnosis can use `make test TEST='tests/path.py::test_name'`; local development
 does not require whole-service or full-backend suites. GitHub CI owns required backend coverage and the explicit optional
-classification automatically on every final GitHub `main` push: `gateway`, `legacy`, `account`, and
+classification automatically on PRs targeting `main` and every final GitHub `main` push: `gateway`, `legacy`, `account`, and
 `prediction`, with `TEST_N_LEG=0` and the permanent retirement manifest, excluding
 `pressure` and `browser`. The 273 exact reviewed release-test identities are declared in
 `scripts/ci_optional_tests.json` under `release-advisory-v1`; see
@@ -206,9 +206,13 @@ and new parameter identities remain required. Financial/order, UNKNOWN, no-repla
 fatal-stop and owner-lock, current-API handoff/restart, active drain, credential SSM runtime and stopped
 data-recovery transaction tests remain required.
 Documentation-only, LP-only, trend-only and unavailable/empty diff cases all run
-that same coverage. Feature pushes, PR events and tag pushes do not trigger this
-workflow. Preserve its existing main-only `workflow_dispatch` with no inputs,
-plan and required main-ref guards and exact `github.sha` checkout. A manual
+that same coverage. Feature branches receive CI through their PR; feature pushes
+without a PR and tag pushes do not trigger this workflow. Preserve its existing
+main-only `workflow_dispatch` with no inputs and exact `github.sha` checkout;
+plan and required guards restrict only manual runs to main. Verify successful
+PR `CI / required` before merge. For trigger changes, follow the
+[mandatory PR coverage rule](ci.md); disabling coverage needs Ray's explicit
+approval at the time. A manual
 fallback needs separate authorization; dispatch alone is not successful evidence.
 There is no workflow concurrency group, so later pushes or manual dispatches do
 not cancel or replace earlier runs, including pending runs.
@@ -517,9 +521,10 @@ authorized merge, and at each pending-review/CI check, Main freshly retrieves:
 
 Paginate every collection, including nested thread comments. Record retrieval time,
 identities and completeness; incomplete reads are not a complete feedback check.
-A missing head CI run is not PASS. Preserve main-only CI triggers and the separately
-authorized main-only manual workflow; do not enable PR CI, dispatch manually,
-change checks or bypass failed CI under this feedback procedure.
+A missing candidate CI run is not PASS. Preserve formal PR-to-main and main-push
+CI plus the separately authorized main-only manual workflow. Follow the
+[mandatory PR coverage rule](ci.md) for trigger changes; this feedback procedure
+does not authorize manual dispatch, changing checks or bypassing failed CI.
 
 Assess all historical and new dots/Opus findings against current code and the
 approved contract. Record each thread's state and each top-level/review-body
@@ -567,9 +572,9 @@ pending independent review/dots is a replacement premerge waiting gate.
 After explicit user authorization for that PR's GitHub merge, Main verifies the
 repository, base `main`, open state, expected head SHA and absence of conflicts,
 then merges through GitHub with the expected head. Unknown mergeability needs
-a bounded metadata refresh; an actual conflict needs scoped resolution. Do not
-wait for feature-push CI or synthetic PR-merge CI, or rebase/synchronize solely
-because main advanced. Keep fresh feedback and mergeability evidence without
+a bounded metadata refresh; an actual conflict needs scoped resolution. Verify
+successful current PR `CI / required` before merge. Do not rebase/synchronize
+solely because main advanced. Keep fresh feedback and mergeability evidence without
 waiting for pending feedback to finish. See [CI identity](ci.md).
 
 Main monitors until the authorized completion or accepted handoff,
@@ -636,7 +641,7 @@ The delivery path is isolated branch/worktree from freshly fetched
 `origin/main` → focused local development/security checks and dated `CHANGELOG.md`
 entry → Main stages/commits task-only files → prompt task-branch push/normal PR
 → independent review and feedback/repair work alongside delivery
-→ explicit authorization for that PR + current no-conflict/expected-head checks
+→ successful PR `CI / required` + explicit authorization for that PR + current no-conflict/expected-head checks
 → GitHub merge → final-main-push CI. Follow the
 [delivery procedure](#authorized-pr-delivery-loop). Local `main` is
 only a synchronized copy of GitHub `main`, never an integration or repair path.
@@ -676,8 +681,7 @@ have dated active read-back evidence. The 2026-10-22 approved change removed onl
 the main required-status object, retaining PR, deletion/non-fast-forward and tag
 protections. Future settings changes need applicable authorization and exact
 read-back. Old feature branches can still carry workflows that trigger extra
-runs during migration; do not synchronize or push solely to remove them, or wait
-for those runs. Older dated plans, reports and changelog entries describing local-main-first delivery
+duplicate runs; do not synchronize or push solely to remove them. Older dated plans, reports and changelog entries describing local-main-first delivery
 are historical evidence; this runbook supersedes their delivery instructions.
 Host Readiness is separate and read-only; it does not mutate launchd, data, or
 production.
@@ -728,7 +732,7 @@ scope; their success alone is not business acceptance.
 
 This is a postdelivery step, not a premerge waiting gate, another backend suite,
 or the `acceptance`/`candidate-acceptance` Deployment Preflight aliases. Keep
-focused verification, main-only exact-SHA CI, external dots/Opus review without a
+focused verification, PR CI and final-main exact-SHA CI, external dots/Opus review without a
 local fallback, and separate merge/deploy authority. For nondeployable
 documentation, configuration or test-only changes, perform applicable deliverable
 acceptance and record deployment **N/A with a reason**; do not require deployment

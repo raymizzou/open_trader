@@ -151,13 +151,13 @@ def verify_artifact(api, artifact, scope, run, root, now):
     return dict(result, id=artifact['id'], digest=artifact['digest'])
 
 
-def verify_artifact_files(files, scope, run, root):
+def verify_artifact_files(files, scope, run, root, *, expected_ref='refs/heads/main'):
     """Shared exact-run content checks for CI aggregation and deployment."""
     sha = run['head_sha']
     metadata = json.loads(files['evidence.json'])
     lock_hash = sha256((root/'uv.lock').read_bytes())
     fixed = dict(schema_version=2, source_sha=sha, repository=REPOSITORY,
-                 workflow_ref=f'{REPOSITORY}/{WORKFLOW}@refs/heads/main', event_name=run['event'], ref='refs/heads/main',
+                 workflow_ref=f'{REPOSITORY}/{WORKFLOW}@{expected_ref}', event_name=run['event'], ref=expected_ref,
                  run_id=str(run['id']), run_attempt=str(run['run_attempt']), scope=scope, test_n_leg='0',
                  workers=2 if scope.startswith('prediction-') else 1, lock_sha256=lock_hash, status='success', exit_status=0,
                  evidence_role='test-only', selection=expected_selection(scope, root),

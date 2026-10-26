@@ -1,10 +1,17 @@
 # Active backend CI and focused local verification
 
-`.github/workflows/ci.yml` runs automatically only on pushes to GitHub `main`,
-including documentation-only changes and each final merged-main SHA. Feature
-pushes, PR events and tag pushes do not trigger it. Preserve the existing
-`workflow_dispatch` with no inputs: plan and required jobs guard
-`refs/heads/main`, and all checkouts use the exact `github.sha`.
+`.github/workflows/ci.yml` runs automatically on `pull_request` events targeting
+`main` and pushes to GitHub `main`, including documentation-only changes and
+each final merged-main SHA. Feature branches receive formal CI through their PR;
+feature pushes without a PR and tag pushes do not trigger it. Preserve the existing
+`workflow_dispatch` with no inputs. The plan and required guards restrict only
+manual runs to `refs/heads/main`; PR runs on `refs/pull/N/merge` are admitted.
+All checkouts use the exact `github.sha`. Planning uses
+`github.event.pull_request.base.sha || github.event.before` as `BASE_SHA`.
+
+Formal CI must cover feature/PR work. Do not change it back to main-push-only
+without Ray's explicit approval at the time of that change. Every PR that changes
+`ci.yml` triggers must explicitly verify that a PR event still runs `required`.
 Every run selects all four existing backend services: `gateway`, `legacy`,
 `account`, and `prediction`, with `TEST_N_LEG=0`. Active backend coverage excludes
 `pressure` and `browser`; it does not include Deployment Preflight, Host Readiness
@@ -15,16 +22,23 @@ The stable aggregate appears as **CI / required** in the UI (workflow `CI`, job
 `required`), but its exact API check-run/context name is **`required`**, emitted
 by **GitHub Actions**, app ID **15368**. Deployment evidence must bind that exact
 name and source, not the display string or an arbitrary same-named status.
-It is not a premerge gate. No repository settings are changed by this workflow;
-the [dated settings read-back](repository-protection.md) records active PR/tag
+Before merging a PR, verify that its current candidate's **CI / required** succeeds.
+This is premerge evidence; it does not replace final-main CI for deployment.
+No repository settings are changed by this workflow; the
+[dated settings read-back](repository-protection.md) records active PR/tag
 protections and the separately approved removal of the main required-status rule.
 
 ## Identity and coverage
 
-Jobs check out `github.sha`, the exact main SHA for the push or manual run. Record
-the PR head/base, final merge SHA, event, Actions run ID, attempt and actual result. The final main
-commit can differ from a PR head or historical synthetic merge SHA; evidence
-does not transfer between them. After authorized GitHub merge, inspect the
+Jobs check out `github.sha`: the PR's synthetic merge candidate for a PR event,
+or the exact main SHA for a main push or manual run. Record the PR head/base,
+checked-out candidate, final merge SHA, event, Actions run ID, attempt and actual result.
+The final main commit can differ from a PR head or synthetic merge SHA; evidence
+does not transfer between them. PR aggregation accepts only canonical
+`refs/pull/<positive-number>/merge` refs and binds every artifact's event, ref,
+workflow ref, source SHA, run and attempt to that candidate. Deployment validation
+keeps its main-only default and rejects PR evidence, even for the same source SHA.
+After authorized GitHub merge, inspect the
 main-push run for that exact final SHA. Failed, cancelled or missing results
 remain visible; merge success is not CI success.
 
@@ -166,11 +180,11 @@ remain Main-owned duties; report them accurately and continue unfinished work.
 After explicit authorization for that PR's merge, Main checks repository, base
 `main`, open state, expected head and absence of conflicts, then merges through
 GitHub with the expected head SHA. Unknown mergeability needs a bounded refresh;
-actual conflicts need scoped resolution. Do not wait for feature/PR CI, pending
-review/dots or an old review-ready/full-acceptance label. A newer main alone does
+actual conflicts need scoped resolution. Verify successful PR **CI / required**
+before merge; pending review/dots or an old review-ready/full-acceptance label does
+not replace this check. A newer main alone does
 not require a rebase, branch synchronization, push or rerun for CI freshness.
-During migration, old feature-branch workflows can still trigger extra runs;
-do not synchronize/push solely to remove them, or wait for them.
+Do not synchronize/push solely to remove duplicate runs from old feature-branch workflows.
 Local main only synchronizes the remote. Merge remains separate from release/tag
 creation, Deployment Preflight and deployment; no CI job grants production or
 trading authorization.
@@ -221,7 +235,7 @@ validate every machine's payload and compare its nodeids to the deterministic
 partition; a matrix job result or a matching test count alone is insufficient.
 Missing, duplicate, overlapping, extra, failed or misbound required evidence is
 rejected. Advisory results are independent and cannot substitute for required
-coverage. No trigger, retry, timeout or per-machine worker increase is added.
+coverage. No retry, timeout or per-machine worker increase is added.
 
 Retained LP bindings keep their schema and fields. Their expected artifact scope
 list comes from the already-verified selected clean release's preflight contract,
