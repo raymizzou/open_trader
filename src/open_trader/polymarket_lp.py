@@ -18787,6 +18787,9 @@ class PolymarketLPService:
         if (session.get("stop_requested") is True or session.get("state") == "review"
                 or session.get("state") == "needs_attention" and session.get("resume_state") == "review"):
             return
+        # A terminal historical SELL still holds inventory until fills and position converge.
+        if session.get("protected_exit_order_id"):
+            return
         # A submit that may have reached the venue is durable before the POST.
         # Pending, unknown, and accepted-without-ID states are never safe to
         # replay merely because a monitoring process restarted.
@@ -18834,6 +18837,21 @@ class PolymarketLPService:
             return
         if not asks:
             return
+        old_order = str(session.get("passive_exit_order_id") or "")
+        old_passive_record: dict[str, object] = {}
+        if old_order:
+            old_terminal = self._order_terminal(snapshot, old_order, session)
+            if not old_terminal:
+                row = self._queue_level_rows(snapshot).get(old_order)
+                remaining = self._queue_row_remaining(row) if row is not None else None
+                if remaining is not None and remaining != quantity and not session.get("passive_cancel_requested"):
+                    self._request_passive_cancel(session,
+                        expected_generation=trade_generation if trade_generation is not None else snapshot.get("_lp_trade_generation"),
+                        expected_trade_revision=expected_trade_revision if expected_trade_revision is not None else trade_revision)
+                return
+            # Preserve the legacy exact-ID record before clearing the role.
+            # Its GTD facts remain the only source for replacement expiration.
+            old_passive_record = dict(history.get(old_order) or {})
         try:
             positions = [p for p in _items(snapshot.get("account", {}).get("positions"))
                 if str(_field(p, "token_id", _field(p, "asset_id", ""))) == str(session["token_id"])]
@@ -18852,21 +18870,6 @@ class PolymarketLPService:
             self.store.lp_update_session(str(session["session_id"]), state="needs_attention",
                 patch={"reconciliation": str(exc), "resume_state": "passive_exit"})
             return
-        old_order = str(session.get("passive_exit_order_id") or "")
-        old_passive_record: dict[str, object] = {}
-        if old_order:
-            old_terminal = self._order_terminal(snapshot, old_order, session)
-            if not old_terminal:
-                row = self._queue_level_rows(snapshot).get(old_order)
-                remaining = self._queue_row_remaining(row) if row is not None else None
-                if remaining is not None and remaining != quantity and not session.get("passive_cancel_requested"):
-                    self._request_passive_cancel(session,
-                        expected_generation=trade_generation if trade_generation is not None else snapshot.get("_lp_trade_generation"),
-                        expected_trade_revision=expected_trade_revision if expected_trade_revision is not None else trade_revision)
-                return
-            # Preserve the legacy exact-ID record before clearing the role.
-            # Its GTD facts remain the only source for replacement expiration.
-            old_passive_record = dict(history.get(old_order) or {})
         expiration: int | None
         expiration_error: str | None = None
         if old_passive_record and (old_passive_record.get("order_type") or old_passive_record.get("expiration") is not None):

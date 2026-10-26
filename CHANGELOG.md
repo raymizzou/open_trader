@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-26 — LP exit review protections
+
+- Keep historical protected SELL obligations blocking new passive orders until confirmed fills and current position converge, including after restart.
+- Cancel an exact old SELL whose remaining quantity differs from current holdings before validating the replacement cost. Unknown or unquotable cost still blocks replacement; exact terminal proof and valid current cost are required before posting once.
+
 ## 2026-10-26 — CI partition fixture search path
 
 - Select the copied sibling dependency explicitly in the partition CLI test while retaining Python safe-path mode. Preserve full collection and shard coverage assertions; hosted main CI remains unverified.
