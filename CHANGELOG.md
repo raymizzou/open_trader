@@ -4,6 +4,7 @@
 
 - Add one cached LP summary for orders, durable cancellation audits, both pools, balance/capacity and exact own-account fills. Show Chinese status reasons and details at the top of the existing LP card; preserve its controls and all UNKNOWN values. Today uses Tokyo midnight.
 - Add a separate numeric loopback/Tailscale-only read-only page and opt-in one-minute LP checks in the existing health notifier. Keep transition/fill deduplication, restart baselines and pending delivery through quiet hours or failures. Trading policy, main CI and production configuration are unchanged; deployment and live notification setup require separate approval.
+- Preserve historical cancellation audits when the same wallet restarts with different letter casing. Keep other wallets and instances isolated and receipt/progress identities exact. Include an unknown account field in the pending dashboard so its shape stays complete without extra account reads.
 
 ## 2026-10-26 — Departed income test account publication
 

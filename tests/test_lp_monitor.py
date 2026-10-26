@@ -173,6 +173,79 @@ def test_monitor_cancel_history_survives_restart(tmp_path, monkeypatch):
         rig.close()
 
 
+@pytest.mark.parametrize('reverse', [False, True], ids=['mixed-to-lower', 'lower-to-mixed'])
+def test_monitor_cancel_audits_preserve_wallet_identity_across_case_restart(tmp_path, reverse):
+    from copy import deepcopy
+    from open_trader.lp_business_writer import RequestRecord, ReceiptRecord
+    from open_trader.polymarket_lp_monitor import LPMonitorSummary
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+
+    mixed = '0x' + 'aB12' * 10
+    original, restarted_account = (mixed.lower(), mixed) if reverse else (mixed, mixed.lower())
+    foreign = '0x' + 'cd34' * 10
+    now = datetime(2026, 10, 26, 12, tzinfo=UTC)
+    at = now - timedelta(minutes=5)
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_bind_instance(original, 'polymarket', 'tokyo-test')
+    for account, key in [(original, 'ours'), (foreign, 'foreign')]:
+        assert store.lp_log_business_record(RequestRecord(account, 'old-process', key, 'd2:' + key,
+            'condition-A', 'token-A', 'CANCEL', Decimal('.4'), Decimal('2.5'), at,
+            order_id='order-' + key))
+        assert store.lp_log_business_record(ReceiptRecord(account, 'old-process', key, 'd2:' + key,
+            'condition-A', 'token-A', 'order-' + key, 'unknown', at))
+    # Store connections close after each action. Reopen the same durable DB,
+    # without an execution owner or any trading/network collaborator.
+    del store
+    restarted = PredictionArbitrageStore(tmp_path, initialize=False)
+    restarted.lp_bind_instance(restarted_account, 'polymarket', 'tokyo-test')
+    with restarted._read_connection() as connection:
+        before = list(connection.iterdump())
+
+    def summary(rows, account=restarted_account):
+        return LPMonitorSummary().summarize(auto={}, dashboard={}, trades={}, audits=rows,
+            account_id=account, now=now)['cancellations']
+
+    audits = restarted.lp_monitor_cancel_audits(restarted_account, instance_id='tokyo-test')
+    assert [row['request_id'] for row in audits] == ['ours']
+    assert audits[0]['account_id'] == audits[0]['receipt']['account_id'] == original
+    assert audits[0]['order_id'] == 'order-ours'
+    value = summary(audits)
+    assert value['hour'] == value['today'] == dict(success=0, rejected=0, unknown=1, blocked=0)
+    assert value['status'] == 'abnormal'
+    assert [(row['request_id'], row['order_id'], row['outcome']) for row in value['items']] == [
+        ('ours', 'order-ours', 'unknown')]
+    with pytest.raises(ValueError, match='monitor_instance_identity_mismatch'):
+        restarted.lp_monitor_cancel_audits(restarted_account, instance_id='other-instance')
+    with pytest.raises(ValueError, match='monitor_instance_identity_mismatch'):
+        restarted.lp_monitor_cancel_audits(foreign, instance_id='tokyo-test')
+
+    # Equivalent wallet spelling changes attribution only. Every evidence
+    # identity remains exact; mismatches must never count as successful/zero.
+    for evidence in ('receipt', 'progress'):
+        for key in ('account_id', 'process_epoch', 'request_id', 'session_id',
+                    'condition_id', 'token_id', 'order_id'):
+            broken = deepcopy(audits)
+            if evidence == 'progress':
+                broken[0]['progress'] = {k: audits[0][k] for k in (
+                    'account_id', 'process_epoch', 'request_id', 'session_id',
+                    'condition_id', 'token_id', 'order_id')}
+                broken[0]['progress']['status'] = 'CANCELED'
+            broken[0][evidence][key] = 'different-' + key
+            result = summary(broken)
+            assert result['status'] == 'unknown', (evidence, key)
+            assert all(count is None for count in result['hour'].values())
+    for bad_account in (None, '', [], 123):
+        assert summary([], bad_account)['status'] == 'unknown'
+        broken = deepcopy(audits)
+        broken[0]['account_id'] = bad_account
+        assert summary(broken)['status'] == 'unknown'
+    zero = summary([])
+    assert zero['status'] == 'normal'
+    assert zero['hour'] == dict(success=0, rejected=0, unknown=0, blocked=0)
+    with restarted._read_connection() as connection:
+        assert list(connection.iterdump()) == before  # no historical rewrite/replay
+
+
 def test_monitor_pool_runtime_and_candidate_thresholds(tmp_path, monkeypatch):
     from copy import deepcopy
     from tests.test_lp_observed_pools import AsyncPoolRig

@@ -184,8 +184,10 @@ class LPMonitorSummary:
 
     def cancellations(self, audits, account_id, orders, orders_known, now):
         unknown = unknown_summary(now)['cancellations']
-        if not isinstance(audits, list):
+        if (not isinstance(audits, list) or not isinstance(account_id, str)
+                or not account_id.strip()):
             return unknown
+        canonical_account = account_id.casefold()
         start = now.astimezone(TOKYO).replace(hour=0, minute=0, second=0, microsecond=0)
         hour = dict.fromkeys(('success','rejected','unknown','blocked'), 0)
         today = dict(hour)
@@ -194,7 +196,8 @@ class LPMonitorSummary:
         for raw in audits:
             row = mapping(raw)
             at = moment(row.get('requested_at'))
-            if (row.get('account_id') != account_id or at is None or at > now
+            if (not isinstance(row.get('account_id'), str)
+                    or row['account_id'].casefold() != canonical_account or at is None or at > now
                     or row.get('kind') != 'CANCEL' or not row.get('request_id')
                     or not all(row.get(k) for k in ('condition_id','token_id','order_id'))):
                 return unknown

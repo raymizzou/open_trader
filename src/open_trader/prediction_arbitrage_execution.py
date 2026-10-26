@@ -2117,6 +2117,7 @@ class PredictionExecutionService:
             buy_price_level = None
         return {
             "state": "snapshot_pending",
+            "account_id": None,
             "allocation_mode": self._lp_d2.policy.allocation_mode if self._lp_d2 is not None else "minimum",
             "buy_price_level": buy_price_level,
             "stale": True,

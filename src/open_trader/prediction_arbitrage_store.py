@@ -8592,19 +8592,23 @@ class PredictionArbitrageStore:
 
     def lp_monitor_cancel_audits(self, account_id, *, instance_id=None):
         """Read local durable CANCEL audits across process restarts, never replay."""
-        if not isinstance(account_id, str) or not account_id:
+        if not isinstance(account_id, str) or not account_id.strip():
             raise ValueError('monitor_account_unknown')
+        canonical_account = account_id.casefold()
         with self._read_connection() as connection:
             binding = connection.execute('SELECT * FROM lp_instance_binding WHERE singleton=1').fetchone()
-            if (binding is not None and (binding['account_id'] != account_id.casefold()
+            if (binding is not None and (binding['account_id'] != canonical_account
                     or binding['instance_id'] != instance_id)
                     or binding is None and instance_id is not None):
                 raise ValueError('monitor_instance_identity_mismatch')
             rows = connection.execute(
                 "SELECT payload FROM lp_actions WHERE json_extract(payload,'$.kind')='CANCEL' "
-                "AND json_extract(payload,'$.account_id')=? ORDER BY created_at,action_id",
-                (account_id,)).fetchall()
-            return [_load_payload(str(row['payload'])) for row in rows]
+                "ORDER BY created_at,action_id").fetchall()
+            audits = [_load_payload(str(row['payload'])) for row in rows]
+            # Match the immutable binding's casefold rule without rewriting
+            # historical payloads or relaxing receipt/progress identities.
+            return [audit for audit in audits if isinstance(audit.get('account_id'), str)
+                    and audit['account_id'].casefold() == canonical_account]
 
     def lp_actions(self, session_id: str, *, connection=None) -> list[dict[str, object]]:
         with (self._read_connection() if connection is None else nullcontext(connection)) as connection:
