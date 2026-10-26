@@ -17,7 +17,7 @@ def run_sample(root, source, workers=1, filename="test_sample.py"):
     directory=root/'records'
     env=dict(os.environ,PYTEST_DISABLE_PLUGIN_AUTOLOAD='1',PYTHONPATH=str(ROOT),
              CI_TEST_METRICS=str(directory/'metrics.json'),CI_TEST_SOURCE_SHA=SHA,CI_TEST_WORKERS=str(workers))
-    run=subprocess.run([sys.executable,'-B','-m','pytest','-p','no:cacheprovider','-q','-p','scripts.ci_test_metrics',
+    run=subprocess.run([sys.executable,'-B','-m','pytest','-p','no:cacheprovider','-q','-p','scripts.ci_test_metrics','--rootdir='+str(root),
                         '--junitxml='+str(directory/'junit.xml'),*( ['-p','xdist.plugin','-n','2','--dist=loadgroup'] if workers==2 else []),'tests'],cwd=root,env=env,capture_output=True,text=True)
     (directory/'pytest.log').write_text(run.stdout+run.stderr)
     return run, directory

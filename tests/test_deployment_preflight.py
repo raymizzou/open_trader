@@ -132,7 +132,8 @@ def evidence(tmp_path):
              'test_paused_state_and_lp_remain_responsive_during_preparation',
              'test_shadow_paused_n_leg_posts_report_pause_before_read_only']
     for name, guards in [('runtime',runtime),('service',service)]:
-        (tmp_path/f'tests/test_prediction_{name}.py').write_text(''.join('def '+guard+'(): pass\n' for guard in guards))
+        path=tmp_path/f'tests/test_prediction_{name}.py'
+        path.write_text(path.read_text()+''.join('def '+guard+'(): pass\n' for guard in guards))
     spec=importlib.util.spec_from_file_location('fixture_ci',tmp_path/'scripts/ci_evidence.py')
     ci=importlib.util.module_from_spec(spec); spec.loader.exec_module(ci)
     spec=importlib.util.spec_from_file_location('fixture_partition',tmp_path/'scripts/ci_partition.py')
@@ -149,7 +150,10 @@ def evidence(tmp_path):
     lock = hashlib.sha256((tmp_path/'uv.lock').read_bytes()).hexdigest()
     for i, scope in enumerate(preflight.SCOPES):
         selection=ci.expected_selection(scope,tmp_path)
-        nodes=sorted(parts[scope]) if scope != "portable" else ["acceptance/test_prediction_arbitrage_scenarios.py::test_ok"]
+        service='prediction' if scope.startswith('prediction-') else scope
+        nodes=sorted(parts[service]) if scope != "portable" else ["acceptance/test_prediction_arbitrage_scenarios.py::test_ok"]
+        if scope.startswith('prediction-'):
+            nodes=partition.shard_nodeids('prediction',nodes,int(scope[-1]))
         manifest = dict(role='test-only; synthetic Git snapshot is not a release SHA', source_sha=SHA,
                         source_state='clean', python='3.12.14', platform='Linux/x86_64', lock_sha256=lock,
                         base_images=['python:3.12.14@sha256:'+'c'*64], dependencies=[['pytest','8.0']])
@@ -158,7 +162,7 @@ def evidence(tmp_path):
         files = {'dependency-manifest.json':json.dumps(manifest).encode(), 'image.json':json.dumps(image).encode()}
         env = dict(runner_os='Linux', runner_arch='X64', dependency_manifest_sha256=hashlib.sha256(files['dependency-manifest.json']).hexdigest(),
                    image_inspect_sha256=hashlib.sha256(files['image.json']).hexdigest())
-        workers=2 if scope=='prediction' else 1
+        workers=2 if scope.startswith('prediction-') else 1
         results=[]
         for node in nodes:
             skipped=node=='tests/test_lp_example.py::test_ok'
@@ -181,7 +185,7 @@ def evidence(tmp_path):
         files['evidence.json'] = dict(schema_version=2, source_sha=SHA, repository=preflight.REPOSITORY,
             workflow_ref=f'{preflight.REPOSITORY}/{preflight.WORKFLOW}@refs/heads/main', event_name='push',
             ref='refs/heads/main', run_id='22', run_attempt='2', scope=scope, test_n_leg='0',
-            workers=2 if scope=='prediction' else 1, lock_sha256=lock, status='success', exit_status=0,
+            workers=2 if scope.startswith('prediction-') else 1, lock_sha256=lock, status='success', exit_status=0,
             selection=selection,selection_sha256=ci.selection_sha256(selection),policy=ci.retirement_policy(tmp_path),
             optional_policy=ci.optional_policy(tmp_path),test_tier='required',
             selected_nodeids=nodes,environment=env,evidence_role='test-only')
@@ -242,7 +246,7 @@ def test_trusted_main_manual_run_is_accepted_with_bound_artifacts(evidence):
     report = preflight.verify_ci(api, SHA, root, NOW)
     assert report['run_id'] == 22
     assert report['run_attempt'] == 2
-    assert len(report['artifacts']) == 5
+    assert len(report['artifacts']) == 7
     assert api.run['event'] == 'workflow_dispatch'
     for artifact in api.artifacts:
         with zipfile.ZipFile(io.BytesIO(api.downloads[artifact['id']])) as archive:
@@ -257,13 +261,13 @@ def test_trusted_main_active_coverage_is_accepted(evidence):
     report=preflight.verify_ci(api,SHA,root,NOW)
     assert report['run_id']==22
     assert report['run_attempt']==2
-    assert len(report['artifacts'])==5
-    with zipfile.ZipFile(io.BytesIO(api.downloads[5])) as archive:
+    assert len(report['artifacts'])==7
+    with zipfile.ZipFile(io.BytesIO(api.downloads[7])) as archive:
         proof=json.loads(archive.read('partition.json'))
     assert proof['retired_status']=='not-executed-permanent-retirement'
     assert proof['retired_count']==29
-    assert proof['executed_count']+29+224==proof['complete_count']
-    assert proof['optional_count']==224
+    assert proof['executed_count']+29+273==proof['complete_count']
+    assert proof['optional_count']==273
     assert proof['optional_status']=='not-executed-advisory'
     assert proof['retired'] and not set(proof['retired']) & set(sum(proof['partitions'].values(),[]))
 
@@ -558,7 +562,10 @@ def test_active_coverage_tampering_is_rejected(evidence, mutation):
     if mutation=='old_attempt': api.artifacts[0]['name']=api.artifacts[0]['name'][:-1]+'1'
     elif mutation=='expired': api.artifacts[0]['expired']=True
     else:
-        target=4 if mutation in ('missing_lp','missing_pause') else 5
+        prefix='tests/test_lp_example.py::' if mutation=='missing_lp' else 'tests/test_prediction_runtime.py::test_n_leg_pause_keeps_lp_running'
+        target=(next(item['id'] for item in api.artifacts if any(node.startswith(prefix)
+            for node in json.loads(zipfile.ZipFile(io.BytesIO(api.downloads[item['id']])).read('selected-nodeids.json'))))
+            if mutation in ('missing_lp','missing_pause') else 7)
         with zipfile.ZipFile(io.BytesIO(api.downloads[target])) as archive:
             files={name:archive.read(name) for name in archive.namelist()}
         metadata=json.loads(files['evidence.json'])
@@ -593,7 +600,8 @@ def test_active_coverage_tampering_is_rejected(evidence, mutation):
 def test_measurement_artifact_tampering_is_rejected(evidence, mutation):
     root,api=evidence
     assert preflight.verify_ci(api,SHA,root,NOW)['run_attempt']==2
-    target=4
+    target=next(item['id'] for item in api.artifacts if b'literal@parameter' in
+        zipfile.ZipFile(io.BytesIO(api.downloads[item['id']])).read('selected-nodeids.json'))
     def read_files():
         with zipfile.ZipFile(io.BytesIO(api.downloads[target])) as archive:
             return {name:archive.read(name) for name in archive.namelist()}
@@ -632,3 +640,43 @@ def test_measurement_artifact_tampering_is_rejected(evidence, mutation):
     if mutation not in ('malformed_xml','empty_junit'): files['junit.xml']=ET.tostring(xml)
     files['metrics.json']=json.dumps(metrics).encode();publish(files)
     with pytest.raises(preflight.PreflightError): preflight.verify_ci(api,SHA,root,NOW)
+
+
+def test_shard_evidence_is_exact_and_complete(evidence):
+    """A complete run needs all three current prediction machines, with no legacy substitute."""
+    from scripts.ci_partition import shard_nodeids
+    root, api = evidence
+    assert len(preflight.verify_ci(api,SHA,root,NOW)['artifacts']) == 7
+    for mutation in ('missing','duplicate','extra-artifact','overlap','extra','wrong-shard','run','attempt','sha','failed'):
+        broken = copy.deepcopy(api)
+        if mutation == 'missing':broken.artifacts.pop()
+        elif mutation == 'duplicate':broken.artifacts.append(broken.artifacts[-1])
+        elif mutation == 'extra-artifact':
+            item=copy.deepcopy(broken.artifacts[3]);item['id']=99;item['name']=f'ci-prediction-4-{SHA}-22-2'
+            broken.artifacts.append(item)
+        else:
+            item = broken.artifacts[4]
+            with zipfile.ZipFile(io.BytesIO(broken.downloads[item['id']])) as archive:
+                altered = {name: archive.read(name) for name in archive.namelist()}
+            metadata = json.loads(altered['evidence.json'])
+            if mutation in ('overlap','extra'):
+                metrics=json.loads(altered['metrics.json'])
+                if mutation=='overlap':
+                    with zipfile.ZipFile(io.BytesIO(broken.downloads[broken.artifacts[3]['id']])) as other:
+                        node=json.loads(other.read('selected-nodeids.json'))[0]
+                else:node='tests/test_lp_extra.py::test_uncollected'
+                row=copy.deepcopy(metrics['results'][0]);row.update(nodeid=node,execution_nodeid=node)
+                metrics['results'].append(row);metrics['results'].sort(key=lambda row:row['nodeid'])
+                metrics['selected_nodeids']=sorted(metrics['selected_nodeids']+[node])
+                metadata['selected_nodeids']=metrics['selected_nodeids']
+                altered['metrics.json']=json.dumps(metrics).encode()
+                altered['selected-nodeids.json']=json.dumps(metrics['selected_nodeids']).encode()
+                altered['junit.xml']=literal_junit(metrics)
+                for name,key in (('metrics.json','metrics_sha256'),('selected-nodeids.json','selected_nodeids_sha256'),('junit.xml','junit_sha256')):
+                    metadata['environment'][key]=hashlib.sha256(altered[name]).hexdigest()
+            elif mutation=='wrong-shard':metadata['scope']='prediction-3'
+            else:metadata[{'run':'run_id','attempt':'run_attempt','sha':'source_sha','failed':'status'}[mutation]] = 'wrong'
+            altered['evidence.json'] = metadata
+            data = pack(altered);broken.downloads[item['id']] = data
+            item['digest'] = 'sha256:'+hashlib.sha256(data).hexdigest()
+        with pytest.raises(preflight.PreflightError):preflight.verify_ci(broken,SHA,root,NOW)

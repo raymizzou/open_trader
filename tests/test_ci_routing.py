@@ -18,9 +18,9 @@ spec.loader.exec_module(ci)
 # Independently supplied reviewed identities, not derived from ci_plan.policy().
 OPTIONAL_SUMMARY = {
     'policy': 'release-advisory-v1',
-    'manifest_sha256': '93bfa67f74468df58c25af1062fcdbb88f809b149d2f564969ea05e3d163d485',
-    'optional_count': 224,
-    'optional_sha256': '913655864de870f8f83f9e59695840d42bee775b49c3dbc535a7105698b2c82d',
+    'manifest_sha256': '69840d683503a2baf2f466e7653a0511795fc9817456d7f2ad3aa09fa2109f38',
+    'optional_count': 273,
+    'optional_sha256': '0343677be27fc53783631374b15fb20de6985d5f821f45aa5efa002918af3e78',
 }
 
 
@@ -133,7 +133,7 @@ class RoutingTests(unittest.TestCase):
             manifest = ROOT/'scripts/ci_optional_tests.json'
             self.assertEqual(hashlib.sha256(manifest.read_bytes()).hexdigest(), OPTIONAL_SUMMARY['manifest_sha256'])
             nodes = json.loads(manifest.read_text())['optional']
-            self.assertEqual(len(nodes), 224)
+            self.assertEqual(len(nodes), 273)
             self.assertEqual(hashlib.sha256(json.dumps(sorted(nodes), separators=(',', ':')).encode()).hexdigest(),
                              OPTIONAL_SUMMARY['optional_sha256'])
             spec = importlib.util.spec_from_file_location('artifact_ci_policy', ROOT/'scripts/ci_evidence.py')
@@ -211,7 +211,7 @@ class RequiredTests(unittest.TestCase):
         mutations = [
             ('policy', {**OPTIONAL_SUMMARY, 'policy': 'unreviewed'}),
             ('manifest_hash', {**OPTIONAL_SUMMARY, 'manifest_sha256': '0'*64}),
-            ('count', {**OPTIONAL_SUMMARY, 'optional_count': 223}),
+            ('count', {**OPTIONAL_SUMMARY, 'optional_count': 272}),
             ('node_set_hash', {**OPTIONAL_SUMMARY, 'optional_sha256': '0'*64}),
             ('full_nodeids', {**OPTIONAL_SUMMARY, 'optional_nodeids':
                              json.loads((ROOT/'scripts/ci_optional_tests.json').read_text())['optional']}),

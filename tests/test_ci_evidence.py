@@ -34,12 +34,12 @@ class PartitionTests(unittest.TestCase):
         proof = module.verify_partition(complete, parts, retired, ROOT, OPTIONAL)
         self.assertEqual(proof['executed_count'], 5)
         self.assertEqual(proof['retired_count'], 1)
-        self.assertEqual(proof['complete_count'], 230)
+        self.assertEqual(proof['complete_count'], 279)
         self.assertEqual(proof['retired_status'], 'not-executed-permanent-retirement')
         nested = 'tests/nested/test_new.py::test_new'
         self.assertRaises(ValueError, module.verify_partition, complete + [nested], parts, retired, ROOT, OPTIONAL)
         expanded = {**parts, 'legacy': parts['legacy'] + [nested]}
-        self.assertEqual(module.verify_partition(complete+[nested], expanded, retired, ROOT, OPTIONAL)['complete_count'], 231)
+        self.assertEqual(module.verify_partition(complete+[nested], expanded, retired, ROOT, OPTIONAL)['complete_count'], 280)
         for universe, executed, omitted in [
             (complete, {**parts, 'prediction': parts['prediction'][:-1]}, retired),
             (complete + [complete[0]], parts, retired),
@@ -57,7 +57,7 @@ class PartitionTests(unittest.TestCase):
         complete = sum(parts.values(), []) + OPTIONAL
         proof = module.verify_partition(complete, parts, optional=OPTIONAL)
         self.assertEqual(proof['status'], 'success')
-        self.assertEqual(proof['complete_count'], 228)
+        self.assertEqual(proof['complete_count'], 277)
         self.assertEqual(proof['partition_count'], 4)
         self.assertEqual(proof['complete_sha256'], proof['coverage_sha256'])
         self.assertEqual(proof, module.verify_partition(list(reversed(complete)), parts, optional=OPTIONAL))
@@ -252,7 +252,7 @@ class EvidenceTests(unittest.TestCase):
         for scope in module.BACKEND_SCOPES:
             self.assertEqual(module.expected_selection(scope, ROOT), {
                 'roots': parts[scope], 'marker': 'not pressure and not browser', 'keyword': '',
-                **({'deselect': OPTIONAL} if scope == 'prediction' else {})})
+                'deselect': OPTIONAL})
         self.assertEqual(module.expected_selection('portable', ROOT), {
             'roots': ['acceptance/test_prediction_arbitrage_scenarios.py'],
             'marker': 'not pressure and not browser', 'keyword': 'not LIVE'})

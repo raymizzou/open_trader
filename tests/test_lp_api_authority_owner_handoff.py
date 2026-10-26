@@ -13,7 +13,8 @@ from open_trader.prediction_runtime import _RuntimeOwnershipLock, PredictionRunt
 from tests.test_lp_account_reservation_reconciliation import runtime, _advance, _refill_identity, _position
 from tests.test_lp_auto_refill_contract import prepare, RefillPublic, _historical_api_buy_intents
 from tests.test_lp_auto_restart_preparation import _four_buys, _new_owner, _terminate_old, _arm_refill
-from tests.test_lp_auto_restart_preparation import dead_preparation, _assert_current_after_legacy
+from tests.test_lp_auto_restart_preparation import (dead_preparation, _assert_current_after_legacy,
+    preparation_snapshots, killed_owner_snapshot, KilledOwnerSnapshot)
 from tests.test_lp_order_registration_contract import _open_order
 
 
@@ -69,8 +70,7 @@ def _old_buy_owner(path, scenario, ready, release):
         patch.undo()
 
 
-@pytest.fixture
-def interrupted_buy_owner(tmp_path, runtime, request):
+def _live_interrupted_buy_owner(tmp_path, runtime, request):
     context = multiprocessing.get_context('spawn')
     read, write = context.Pipe(duplex=False)
     release = context.Event()
@@ -91,6 +91,35 @@ def interrupted_buy_owner(tmp_path, runtime, request):
             child.join(5)
         read.close()
         assert not child.is_alive()
+
+
+def _old_buy_snapshot_owner(path,ready,release,phase):
+    _old_buy_owner(path,phase,ready,release)
+
+
+@pytest.fixture(scope='session')
+def buy_owner_snapshots(tmp_path_factory):
+    cache={}
+    def snapshot(phase):
+        if phase not in cache:
+            cache[phase]=killed_owner_snapshot(tmp_path_factory.mktemp('dead-buy-owner')/'owner',_old_buy_snapshot_owner,phase)
+        return cache[phase]
+    return snapshot
+
+
+@pytest.fixture
+def interrupted_buy_owner(tmp_path,runtime,request,buy_owner_snapshots):
+    if request.node.originalname=='test_live_manual_and_augment_sender_has_no_owner_exit_coverage':
+        yield from _live_interrupted_buy_owner(tmp_path,runtime,request)
+        return
+    import shutil
+    snapshot,(sid,boundary,orders,actions)=buy_owner_snapshots(request.param)
+    destination=tmp_path/'state.sqlite/prediction_arbitrage/prediction_arbitrage.sqlite3'
+    destination.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(snapshot,destination)
+    runtime.clock[0]=boundary+timedelta(seconds=1)
+    owner=KilledOwnerSnapshot(tmp_path)
+    try:yield owner,sid,deepcopy(orders),deepcopy(actions)
+    finally:owner.release_owner()
 
 
 @pytest.mark.parametrize('interrupted_buy_owner', ['manual-signing', 'manual-post', 'augment-signing', 'augment-post'], indirect=True)

@@ -197,13 +197,13 @@ diagnosis can use `make test TEST='tests/path.py::test_name'`; local development
 does not require whole-service or full-backend suites. GitHub CI owns required backend coverage and the explicit optional
 classification automatically on every final GitHub `main` push: `gateway`, `legacy`, `account`, and
 `prediction`, with `TEST_N_LEG=0` and the permanent retirement manifest, excluding
-`pressure` and `browser`. The 224 exact reviewed release-test identities are declared in
+`pressure` and `browser`. The 273 exact reviewed release-test identities are declared in
 `scripts/ci_optional_tests.json` under `release-advisory-v1`; see
-[Release advisory](ci.md#release-advisory). Their unchanged whole cases run serially in a separate workflow, automatically
+[Release advisory](ci.md#release-advisory). Their unchanged whole cases run on four serial machines in a separate workflow, automatically
 only on main pushes, with a manual entry. Genuine failures can be deferred;
 required CI and Deployment Preflight do not wait for it. Only the literal reviewed set is exempt from required execution. New names
 and new parameter identities remain required. Financial/order, UNKNOWN, no-replay,
-current-API handoff/restart, active drain, credential SSM runtime and stopped
+fatal-stop and owner-lock, current-API handoff/restart, active drain, credential SSM runtime and stopped
 data-recovery transaction tests remain required.
 Documentation-only, LP-only, trend-only and unavailable/empty diff cases all run
 that same coverage. Feature pushes, PR events and tag pushes do not trigger this
@@ -212,7 +212,8 @@ plan and required main-ref guards and exact `github.sha` checkout. A manual
 fallback needs separate authorization; dispatch alone is not successful evidence.
 There is no workflow concurrency group, so later pushes or manual dispatches do
 not cancel or replace earlier runs, including pending runs.
-See [CI identity and execution](ci.md). CI also runs the non-LIVE portable prediction scenarios. It does not run
+Required artifact scopes are `gateway`, `legacy`, `account`, `prediction-1`,
+`prediction-2`, `prediction-3` and `portable`; see [CI identity and execution](ci.md). CI also runs the non-LIVE portable prediction scenarios. It does not run
 Deployment Preflight, Host Readiness or Production Smoke.
 
 ### Existing Docker test mechanics
@@ -227,7 +228,7 @@ job is not selected because legacy already includes its tests.
 
 Makefile and CI use `TEST_N_LEG=0`: only the 29 reviewed files in
 `scripts/ci_nleg_retired.json` are omitted from execution because N-leg is
-permanently retired. CI separately excludes the 224 exact reviewed release-advisory identities;
+permanently retired. CI separately excludes the 273 exact reviewed release-advisory identities;
 ordinary local direct pytest remains unchanged. The three mixed/shared files
 remain active, as do LP,
 service/runtime and pause guards. Unknown/new files default to active coverage.
@@ -240,8 +241,7 @@ collection proof and deployment evidence; update its prefixes for new service
 families. Invalid manifests and empty partitions fail before the test build.
 The Makefile's Prediction service default remains six pytest-xdist workers with
 `--dist=loadgroup`, distributing individual tests across workers; solver benchmark
-tests share one worker to reuse their full-handoff fixture cache. CI overrides
-this to two workers for Prediction. `TEST_WORKERS=4` can reduce busy-host load and
+tests share one worker to reuse their full-handoff fixture cache. CI uses three Prediction machines with two workers each. `TEST_WORKERS=4` can reduce busy-host load and
 `TEST_WORKERS=1` supports serial diagnosis. Non-Prediction services and explicit
 `TEST=...` selections default to serial, and also accept `TEST_WORKERS`.
 Portable scenarios run serially in CI. Known Prediction shared-port and cached

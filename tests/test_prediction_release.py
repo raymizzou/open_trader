@@ -121,3 +121,122 @@ def test_runtime_record_rejects_unhashable_state(
     )
     with pytest.raises(ValueError, match="runtime record"):
         load_prediction_runtime_record(path)
+
+
+NEW_CI_SCOPES = ('gateway', 'legacy', 'account', 'prediction-1', 'prediction-2', 'prediction-3', 'portable')
+OLD_CI_SCOPES = ('gateway', 'legacy', 'account', 'prediction', 'portable')
+
+
+def _lp_validation_release(path, scopes, *, contract_source=None):
+    """Real clean selected source and private config; no admission or source doubles."""
+    import hashlib
+    import shutil
+    import subprocess
+    import sys
+    from open_trader.prediction_release import LP_VALIDATION_SCHEMA, inspect_lp_capability
+    root = path/'release';root.mkdir(parents=True)
+    (root/'ops').mkdir();(root/'scripts').mkdir()
+    project = Path(__file__).parents[1]
+    for name in ('prediction-service-release.json', 'lp-runtime-contract.json'):
+        shutil.copyfile(project/'ops'/name,root/'ops'/name)
+    (root/'scripts/deployment_preflight.py').write_text(f'SCOPES = {scopes!r}\n' if contract_source is None else contract_source)
+    (root/'uv.lock').write_text('independent selected release lock\n')
+    def git(*args):
+        return subprocess.check_output(['git','-C',str(root),*args],stderr=subprocess.DEVNULL,text=True).strip()
+    git('init','-q');git('add','.')
+    git('-c','user.name=fixture','-c','user.email=fixture@invalid','commit','-qm','selected immutable release')
+    git('checkout','--detach','-q');sha=git('rev-parse','HEAD')
+    runtime=path/'runtime';runtime.mkdir()
+    config=runtime/'prediction.json';config.write_text(json.dumps(dict(signer_address='0x'+'a'*40,wallet_address='0x'+'a'*40)));config.chmod(0o600)
+    binding=dict(schema_version=LP_VALIDATION_SCHEMA,source_sha=sha,release_root=str(root),runtime_root=str(runtime),
+        python=sys.executable,operation_nonce='independent-operator-operation',capability_digest=inspect_lp_capability(root),
+        config_selection=dict(path=str(config),sha256=hashlib.sha256(config.read_bytes()).hexdigest()),
+        runtime=dict(python=sys.executable,python_version=sys.version,platform=sys.platform,source_root=str(root),
+                     lock_sha256=hashlib.sha256((root/'uv.lock').read_bytes()).hexdigest(),extras=[],
+                     dependencies={'offline-fixture':'test-only'},provenance='independent local test fixture'),
+        ci=dict(run_id=22,run_attempt=2,artifact_role='test-only',
+                run_url='https://github.com/raymizzou/open_trader/actions/runs/22',
+                artifacts=[dict(scope=scope,id=index,digest='sha256:'+str(index)*64) for index,scope in enumerate(scopes,1)]))
+    return root,runtime,config,binding
+
+
+def test_lp_validation_accepts_selected_release_shard_contract(tmp_path):
+    import copy
+    import sys
+    from open_trader.prediction_release import validate_lp_validation
+    root,runtime,config,binding=_lp_validation_release(tmp_path,NEW_CI_SCOPES)
+    original=copy.deepcopy(binding)
+    assert validate_lp_validation(binding,release_root=root,runtime_root=runtime,python=sys.executable,config_path=config)==original
+    assert binding==original
+
+
+def test_lp_validation_preserves_old_selected_release_contract(tmp_path):
+    import copy
+    import sys
+    from open_trader.prediction_release import validate_lp_validation
+    old_root,old_runtime,old_config,old_binding=_lp_validation_release(tmp_path/'old',OLD_CI_SCOPES)
+    assert validate_lp_validation(old_binding,release_root=old_root,runtime_root=old_runtime,
+                                  python=sys.executable,config_path=old_config)==old_binding
+    root,runtime,config,binding=_lp_validation_release(tmp_path/'new',NEW_CI_SCOPES)
+    binding['ci']['artifacts']=copy.deepcopy(old_binding['ci']['artifacts'])
+    with pytest.raises(ValueError,match='LP trusted CI identity'):
+        validate_lp_validation(binding,release_root=root,runtime_root=runtime,python=sys.executable,config_path=config)
+
+
+@pytest.mark.parametrize('mutation', ['missing','extra','order','scope','id','bool-id','digest','unknown-contract'])
+def test_lp_validation_rejects_wrong_or_incomplete_shard_contract(tmp_path,mutation):
+    import sys
+    from open_trader.prediction_release import validate_lp_validation
+    scopes=NEW_CI_SCOPES if mutation!='unknown-contract' else ('gateway','legacy','account','prediction-1','portable')
+    root,runtime,config,binding=_lp_validation_release(tmp_path,scopes)
+    artifacts=binding['ci']['artifacts']
+    if mutation=='missing':artifacts.pop()
+    elif mutation=='extra':artifacts.append(dict(scope='extra',id=8,digest='sha256:'+'8'*64))
+    elif mutation=='order':artifacts[0],artifacts[1]=artifacts[1],artifacts[0]
+    elif mutation=='scope':artifacts[1]['scope']=artifacts[0]['scope']
+    elif mutation=='id':artifacts[1]['id']=artifacts[0]['id']
+    elif mutation=='bool-id':artifacts[0]['id']=True
+    elif mutation=='digest':artifacts[0]['digest']='sha256:not-a-digest'
+    with pytest.raises(ValueError,match='LP (trusted|selected CI)'):
+        validate_lp_validation(binding,release_root=root,runtime_root=runtime,python=sys.executable,config_path=config)
+
+
+def test_lp_validation_reads_scopes_without_executing_contract(tmp_path):
+    import sys
+    from open_trader.prediction_release import validate_lp_validation
+    sentinel=tmp_path/'contract-executed'
+    script=f'SCOPES = {NEW_CI_SCOPES!r}\nfrom pathlib import Path\nPath({str(sentinel)!r}).touch()\n'
+    root,runtime,config,binding=_lp_validation_release(tmp_path,NEW_CI_SCOPES,contract_source=script)
+    writes=[]
+    original_class=sys.__class__
+    class ObservedInterpreter(original_class):
+        def __setattr__(self,name,value):
+            if name in ('dont_write_bytecode','pycache_prefix'):writes.append(name)
+            super().__setattr__(name,value)
+    try:
+        sys.__class__=ObservedInterpreter
+        result=validate_lp_validation(binding,release_root=root,runtime_root=runtime,python=sys.executable,config_path=config)
+    finally:sys.__class__=original_class
+    assert result==binding
+    assert not sentinel.exists(), 'selected contract source was executed'
+    assert writes==[], 'selected contract mutated interpreter bytecode state'
+
+
+def test_lp_validation_accepts_real_preflight_source(tmp_path):
+    import sys
+    from open_trader.prediction_release import validate_lp_validation
+    script=(Path(__file__).resolve().parents[1]/'scripts/deployment_preflight.py').read_text()
+    root,runtime,config,binding=_lp_validation_release(tmp_path,NEW_CI_SCOPES,contract_source=script)
+    assert validate_lp_validation(binding,release_root=root,runtime_root=runtime,python=sys.executable,config_path=config)==binding
+
+
+@pytest.mark.parametrize('shape',['missing','ambiguous','nonliteral','augmented'])
+def test_lp_validation_rejects_nonliteral_or_ambiguous_scopes(tmp_path,shape):
+    import sys
+    from open_trader.prediction_release import validate_lp_validation
+    literal=f'SCOPES = {NEW_CI_SCOPES!r}\n'
+    scripts={'missing':'OTHER = ()\n','ambiguous':literal+literal,
+        'nonliteral':f'SCOPES = tuple({NEW_CI_SCOPES!r})\n','augmented':literal+'SCOPES += ()\n'}
+    root,runtime,config,binding=_lp_validation_release(tmp_path,NEW_CI_SCOPES,contract_source=scripts[shape])
+    with pytest.raises(ValueError,match='LP selected CI contract'):
+        validate_lp_validation(binding,release_root=root,runtime_root=runtime,python=sys.executable,config_path=config)

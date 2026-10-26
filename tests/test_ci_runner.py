@@ -34,6 +34,15 @@ class RunnerTests(unittest.TestCase):
                 'make': '#!/bin/sh\nprintf \'make %s\\n\' "$*" >> "$FAKE_COMMANDS"\n[ "$FAKE_MAKE_FAILURE" != 1 ] || { echo synthetic test failure; exit 7; }\n',
                 'docker': '#!' + os.sys.executable + '\n' + 'import json, os, sys\nimport xml.etree.ElementTree as ET\nfrom pathlib import Path\nsys.path.insert(0,str(Path(os.environ[\'FAKE_ROOT\'])/\'scripts\'))\nimport ci_evidence, ci_partition\nargs=sys.argv[1:]\nwith open(os.environ[\'FAKE_COMMANDS\'],\'a\') as stream: stream.write(\'docker \'+\' \'.join(args)+\'\\n\')\nif args[:2]==[\'image\',\'inspect\']: print(\'[{"Id":"sha256:image"}]\')\nelif \'scripts/dev_dependency_manifest.py\' in args: print(json.dumps(dict(source_sha=os.environ[\'GITHUB_SHA\'],source_state=\'clean\')))\nelif \'scripts/ci_partition.py\' in args:\n    if os.environ[\'FAKE_PROOF_FAILURE\']==\'1\': sys.exit(8)\n    parts={scope:[path+\'::test_ok\' for path in roots] for scope,roots in ci_evidence.service_partitions(Path(os.environ[\'FAKE_ROOT\'])).items()}\n    retired=[path+\'::test_ok\' for path in ci_evidence.retirement_policy(Path(os.environ[\'FAKE_ROOT\']))[\'retired_files\']]\n    optional=ci_evidence.optional_policy(Path(os.environ[\'FAKE_ROOT\']))[\'optional_nodeids\']\n    print(json.dumps(ci_partition.verify_partition(sum(parts.values(),[])+retired+optional,parts,retired,Path(os.environ[\'FAKE_ROOT\']),optional)))\nelif args[0]==\'cp\':\n    if os.environ[\'FAKE_COPY_FAILURE\']==\'1\': sys.exit(6)\n    scope=os.environ[\'FAKE_SCOPE\']; workers=2 if scope==\'prediction\' else 1\n    selection=ci_evidence.expected_selection(scope,Path(os.environ[\'FAKE_ROOT\']))\n    nodes=selection.get(\'nodeids\', [path+\'::test_ok\' for path in selection[\'roots\']])\n    destination=Path(args[-1]); destination.mkdir(exist_ok=True)\n    metrics=dict(schema_version=1,source_sha=os.environ[\'GITHUB_SHA\'],workers=workers,selected_nodeids=nodes,\n                 python=\'3.12.14\',platform=\'Linux/x86_64\',architecture=\'x86_64\',cpu_model=\'Example CPU\',\n                 cpu_model_source=\'/proc/cpuinfo\',cpu_model_unavailable=None,cpu_count=2,\n                 results=[dict(nodeid=node,execution_nodeid=node,outcome=\'passed\',phases={\n                    phase:dict(duration=0.1,outcome=\'passed\',worker=\'gw0\' if workers==2 else \'serial\')\n                    for phase in (\'setup\',\'call\',\'teardown\')}) for node in nodes],collection_errors=[],\n                 exit_status=0,complete=True,wall_seconds=1.0)\n    if scope==\'release-advisory\' and os.environ[\'FAKE_MAKE_FAILURE\']==\'1\':\n        metrics[\'exit_status\']=7; metrics[\'results\'][0][\'outcome\']=\'failed\'; metrics[\'results\'][0][\'phases\'][\'call\'][\'outcome\']=\'failed\'\n    (destination/\'selected-nodeids.json\').write_text(json.dumps(nodes))\n    xml=ET.Element(\'testsuites\')\n    suite=ET.SubElement(xml,\'testsuite\',tests=str(len(nodes)),errors=\'0\',failures=\'1\' if scope==\'release-advisory\' and os.environ[\'FAKE_MAKE_FAILURE\']==\'1\' else \'0\',skipped=\'0\')\n    for node in nodes:\n        file,name=node.split(\'::\',1)\n        case=ET.SubElement(suite,\'testcase\',classname=file[:-3].replace(\'/\',\'.\'),name=name,time=\'0.3\')\n        if scope==\'release-advisory\' and os.environ[\'FAKE_MAKE_FAILURE\']==\'1\': ET.SubElement(case,\'failure\',message=\'synthetic test failure\')\n    (destination/\'junit.xml\').write_bytes(ET.tostring(xml))\n    if os.environ[\'FAKE_MISSING_METRICS\']!=\'1\': (destination/\'metrics.json\').write_text(json.dumps(metrics))\nelif args[0]==\'rm\': pass\nelse: sys.exit(9)\n',
             }
+            stubs['docker']=stubs['docker'].replace("scope=='prediction'", "scope.startswith('prediction')")
+            stubs['docker']=stubs['docker'].replace("scope=='release-advisory'", "scope.startswith('release-advisory')")
+            stubs['docker']=stubs['docker'].replace(
+                "    destination=Path(args[-1]); destination.mkdir(exist_ok=True)",
+                "    if 'shard' in selection:\n"
+                "        base_scope='prediction' if scope.startswith('prediction-') else 'release-advisory'\n"
+                "        if base_scope=='prediction': nodes=[path+'::test_case_'+str(i) for path in selection['roots'] for i in range(24)]\n"
+                "        nodes=ci_partition.shard_nodeids(base_scope,nodes,selection['shard']['index'])\n"
+                "    destination=Path(args[-1]); destination.mkdir(exist_ok=True)")
             for name, source in stubs.items():
                 path = binary / name; path.write_text(source); path.chmod(0o755)
             env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
@@ -94,6 +103,39 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(evidence['exit_status'], 7)
         self.assertEqual(evidence['status'], 'failure')
         self.assertIn('dev_dependency_manifest.py', commands)
+
+    def test_shard_runner_preserves_workers_selection_and_advisory_failure(self):
+        required=[]
+        for index in range(1,4):
+            scope=f'prediction-{index}'
+            run,evidence,commands=self.run_scope(scope)
+            self.assertEqual(run.returncode,0,run.stdout+run.stderr)
+            self.assertEqual(evidence['scope'],scope)
+            self.assertEqual(evidence['workers'],2)
+            self.assertEqual(evidence['selection']['shard'],dict(index=index,count=3))
+            self.assertIn(f'make test SERVICE=prediction TEST_N_LEG=0 TEST_WORKERS=2 CI_TEST_SCOPE={scope}',commands)
+            selected=set(evidence['selected_nodeids'])
+            self.assertTrue(selected)
+            self.assertFalse(any(selected & previous for previous in required))
+            required.append(selected)
+        from scripts.ci_partition import shard_nodeids
+        all_nodes=sorted(set.union(*required))
+        for index,nodes in enumerate(required,1):
+            self.assertEqual(sorted(nodes),shard_nodeids('prediction',all_nodes,index))
+        advisory=[]
+        for index in range(1,5):
+            scope=f'release-advisory-{index}'
+            run,evidence,commands=self.run_scope(scope,fail_make=True)
+            self.assertEqual(run.returncode,7,run.stdout+run.stderr)
+            self.assertEqual(evidence['exit_status'],7)
+            self.assertEqual(evidence['status'],'failure')
+            self.assertEqual(evidence['workers'],1)
+            self.assertIn(f'CI_TEST_SCOPE={scope}',commands)
+            self.assertIn('synthetic test failure',run.ci_files['test.log'])
+            self.assertTrue(json.loads(run.ci_files['metrics.json'])['results'])
+            advisory.append(set(evidence['selected_nodeids']))
+        self.assertEqual(sum(map(len,advisory)),len(set.union(*advisory)))
+        self.assertEqual(sum(any('test_lp410_' in node for node in nodes) for nodes in advisory),2)
 
     def test_failed_partition_proof_fails_portable_job(self):
         run, evidence, commands = self.run_scope('portable', fail_proof=True)

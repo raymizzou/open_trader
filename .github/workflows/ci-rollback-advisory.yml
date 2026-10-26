@@ -10,6 +10,11 @@ permissions:
 
 jobs:
   release-advisory:
+    name: release-advisory-${{ matrix.shard }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -18,12 +23,12 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Run reviewed unchanged release regressions serially in locked offline container
-        run: bash scripts/run_ci_service.sh "release-advisory" "0" "${{ runner.temp }}/ci-evidence"
+        run: bash scripts/run_ci_service.sh "release-advisory-${{ matrix.shard }}" "0" "${{ runner.temp }}/ci-evidence"
       - name: Preserve original result, phase metrics, JUnit and exact run identity
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ci-release-advisory-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ci-release-advisory-${{ matrix.shard }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ci-evidence
           retention-days: 3
           if-no-files-found: error

@@ -20,9 +20,9 @@ CI_TEST_CONTAINER ?= open-trader-test-records
 ifeq ($(CI_TEST_ARTIFACTS),1)
 DOCKER_RUN = $(DOCKER) run --name "$(CI_TEST_CONTAINER)" --init --network none --cap-drop ALL --security-opt no-new-privileges "$(DOCKER_IMAGE)"
 CI_TEST_TIER ?= required
-CI_PYTEST_SELECTION = $(if $(filter optional,$(CI_TEST_TIER)),,-p scripts.ci_partition --ci-required)
+CI_PYTEST_SELECTION = -p scripts.ci_partition $(if $(filter optional,$(CI_TEST_TIER)),,--ci-required)
 CI_PYTEST_RECORDS = -p scripts.ci_test_metrics --junitxml=/tmp/open-trader-ci-evidence/junit.xml
-CI_PYTEST_ENV = CI_TEST_METRICS=/tmp/open-trader-ci-evidence/metrics.json CI_TEST_SOURCE_SHA=$(SOURCE_SHA) CI_TEST_WORKERS=$(TEST_WORKERS)
+CI_PYTEST_ENV = CI_TEST_SCOPE=$(CI_TEST_SCOPE) CI_TEST_METRICS=/tmp/open-trader-ci-evidence/metrics.json CI_TEST_SOURCE_SHA=$(SOURCE_SHA) CI_TEST_WORKERS=$(TEST_WORKERS)
 endif
 BACKEND_PYTEST = env $(CI_PYTEST_ENV) PYTHONSAFEPATH=1 PYTHONPATH=/workspace:/workspace/src PYTHONDONTWRITEBYTECODE= PYTHONPYCACHEPREFIX=/tmp/open-trader-bytecache pytest -q $(CI_PYTEST_RECORDS) $(CI_PYTEST_SELECTION) -m "not pressure and not browser" -o cache_dir=/tmp/open-trader-pytest-cache --basetemp=/tmp/open-trader-pytest
 TEST_WORKERS ?= $(if $(filter prediction,$(SERVICE)),6,1)

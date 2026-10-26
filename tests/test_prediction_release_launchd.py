@@ -786,7 +786,7 @@ def test_production_first_install_records_only_observed_ready_evidence(
     fixture = release_harness.root / ("github-" + release_harness.sha)
     expected_artifacts = [dict(scope=scope, id=index,
         digest="sha256:" + hashlib.sha256((fixture / (str(index) + ".zip")).read_bytes()).hexdigest())
-        for index, scope in enumerate(("gateway", "legacy", "account", "prediction", "portable"), 1)]
+        for index, scope in enumerate(("gateway", "legacy", "account", "prediction-1", "prediction-2", "prediction-3", "portable"), 1)]
     assert binding["ci"] == dict(run_id=22, run_attempt=2, artifact_role="test-only",
         run_url="https://github.com/raymizzou/open_trader/actions/runs/22", artifacts=expected_artifacts)
     permit = json.loads((release_harness.runtime_root / "lp-start-guard/permit.json").read_text())

@@ -77,33 +77,71 @@ def _old_preparing_owner(path, ready, release, phase):
         patch.undo()
 
 
-@pytest.fixture
-def dead_preparation(tmp_path, runtime, request):
-    context = multiprocessing.get_context('spawn')
-    read, write = context.Pipe(duplex=False)
-    release = context.Event()
-    child = context.Process(target=_old_preparing_owner,
-        args=(str(tmp_path), write, release, getattr(request, 'param', 'signing')))
-    child.start()
-    write.close()
+class KilledOwnerSnapshot:
+    """A per-test copied database, locally held until the original boundary is released."""
+    def __init__(self,path):
+        self.lock=_RuntimeOwnershipLock(path/'state.sqlite/prediction_arbitrage/runtime.lock')
+        self.lock.acquire()
+    def release_owner(self):self.lock.release()
+
+
+def killed_owner_snapshot(root,target,phase):
+    """Only a real spawned/killed owner can create this reusable input."""
+    import fcntl,json,sqlite3
+    root.mkdir()
+    context=multiprocessing.get_context('spawn')
+    read,write=context.Pipe(duplex=False);release=context.Event()
+    child=context.Process(target=target,args=(str(root),write,release,phase))
+    child.start();write.close()
     try:
-        diagnostic = tmp_path / 'preparation-watchdog.log'
-        assert read.poll(10), ('Independent preparation registration watchdog; '
-            f'alive={child.is_alive()} exitcode={child.exitcode}; '
-            + (diagnostic.read_text() if diagnostic.exists() else 'child did not enter preparation'))
-        intent, boundary = read.recv()
-        runtime.clock[0] = boundary + timedelta(seconds=1)
-        yield child, intent, release
+        assert read.poll(10),'independent killed-owner snapshot registration watchdog'
+        facts=read.recv()
     finally:
-        # Cleanup uses real process supervision; the business clock cannot hide a leak.
-        if child.is_alive():
-            child.terminate()
+        if child.is_alive():child.terminate()
         child.join(5)
-        if child.is_alive():
-            child.kill()
-            child.join(5)
+        if child.is_alive():child.kill();child.join(5)
         read.close()
         assert not child.is_alive()
+        assert child.exitcode!=0
+    lock=root/'state.sqlite/prediction_arbitrage/runtime.lock'
+    with lock.open('a+') as handle:fcntl.flock(handle.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+    source=root/'state.sqlite/prediction_arbitrage/prediction_arbitrage.sqlite3'
+    snapshot=root/'killed.sqlite3'
+    with sqlite3.connect(source) as original,sqlite3.connect(snapshot) as destination:original.backup(destination)
+    (root/'death-proof.json').write_text(json.dumps(dict(phase=phase,pid=child.pid,exitcode=child.exitcode,owner_available=True)))
+    return snapshot,facts
+
+
+@pytest.fixture(scope='session')
+def preparation_snapshots(tmp_path_factory):
+    cache={}
+    def snapshot(phase):
+        if phase not in cache:
+            cache[phase]=killed_owner_snapshot(tmp_path_factory.mktemp('dead-preparation')/'owner',_old_preparing_owner,phase)
+        return cache[phase]
+    return snapshot
+
+
+@pytest.fixture
+def dead_preparation(tmp_path,runtime,request,preparation_snapshots):
+    import shutil
+    phase=getattr(request,'param','signing')
+    snapshot,(intent,boundary)=preparation_snapshots(phase)
+    destination=tmp_path/'state.sqlite/prediction_arbitrage/prediction_arbitrage.sqlite3'
+    destination.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(snapshot,destination)
+    runtime.clock[0]=boundary+timedelta(seconds=1)
+    owner=KilledOwnerSnapshot(tmp_path)
+    try:yield owner,deepcopy(intent),Event()
+    finally:owner.release_owner()
+
+
+@pytest.mark.parametrize('phase',['signing','before-post-marker','awaiting-receipt'])
+def test_dead_process_snapshot_releases_owner(preparation_snapshots,phase):
+    import json
+    snapshot,_=preparation_snapshots(phase)
+    proof=json.loads((snapshot.parent/'death-proof.json').read_text())
+    assert proof['phase']==phase and proof['exitcode']!=0 and proof['owner_available'] is True
+    assert snapshot.stat().st_size>0
 
 
 def _new_owner(runtime, monkeypatch, tmp_path, *, orders=None):
@@ -139,14 +177,15 @@ def _new_owner(runtime, monkeypatch, tmp_path, *, orders=None):
     return LegacyComponents(), store, adapter, account, public
 
 
-def _assert_current_after_legacy(root,store,account,public,*,mode='known',restart=False,manual=False):
+def _assert_current_after_legacy(root,store,account,public,*,mode='known',restart=False,manual=False,observed=False,full_state=False,service=None):
     """Current API exposure despite old audit rows; no legacy money/authority."""
     import hashlib,json,sqlite3
     from datetime import UTC,datetime
     from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
-    from tests.lp_d2_service_harness import ServiceChild
+    from tests.lp_d2_service_harness import InProcessService
+    service=InProcessService if service is None else service
     old_actions={row['session_id']:deepcopy(store.lp_actions(row['session_id'])) for row in store.lp_sessions()}
-    class CurrentChild(ServiceChild):
+    class CurrentChild(service):
         def __exit__(self,*args):
             self.release('ci-current-scheduler')
             return super().__exit__(*args)
@@ -164,8 +203,15 @@ def _assert_current_after_legacy(root,store,account,public,*,mode='known',restar
                     request_version=1,desired_running=False,
                     requested_at=datetime(2026,10,16,12,tzinfo=UTC),actor='offline operator'))
                 settings=target.lp_load_current_settings(aid)
+                changes=dict(budget_usd='100',target_buy_count=5)
+                if observed:
+                    changes.update(allocation_mode='observed_pools',budget_usd='40',trial_budget_usd='40',target_buy_count=3,
+                        income_budget_usd='60',trial_target_buy_count=3,income_target_buy_count=3)
+                    target.lp_save_observed_pool_roles(aid,expected_revision=0,roles={row.condition_id:
+                        dict(pool='trial' if index<2 else 'income',episode=row.id)
+                        for index,row in enumerate(account.orders)})
                 target.lp_save_current_settings(aid,expected_config_version=0 if settings is None else settings['config_version'],
-                    changes=dict(budget_usd='100',target_buy_count=5),actor='offline operator')
+                    changes=changes,actor='offline operator')
             super().launch(scenario,expected_running=expected_running)
     def encode(row):return row.model_dump(mode='json')
     # Market terms are static inputs; books/timestamps originate from a NEW
@@ -192,6 +238,10 @@ def _assert_current_after_legacy(root,store,account,public,*,mode='known',restar
             for row in state['account_buys']:
                 original=next(value for value in account.orders if value.id==row['key'][3])
                 assert row['key'][2]==original.token_id and row['key'][1]==original.condition_id
+            if observed:
+                membership=state['observed_pools']['current_membership']
+                assert {row['order_id'] for row in membership['orders'] if row['pool']=='trial'}=={'manual-1','manual-2'}
+                assert {row['order_id'] for row in membership['orders'] if row['pool']=='income'}=={'manual-3','manual-4'}
         else:
             assert state['current_exposure_usd'] is None and state['new_capacity_usd'] is None
             observed=json.loads(child.marker('ci-current-observed.json').read_text())
@@ -230,6 +280,12 @@ def _assert_current_after_legacy(root,store,account,public,*,mode='known',restar
             assert child.actual_posts()==0 and not list(child.events.glob('cancel-call-*'))
             child.process.terminate();assert child.wait_exit()==0;child.assert_owner_available()
             assert {sid:saved.lp_actions(sid) for sid in old_actions}==old_actions
+
+        result=dict(state=state if full_state else {key:state.get(key) for key in ('effective_running','desired_running','buy_reserved_usd',
+            'inventory_cost_usd','current_exposure_usd','new_capacity_usd','account_buys','observed_pools')},
+            requests=child.sdk_requests())
+        (root/'business-result.json').write_text(json.dumps(result,sort_keys=True,indent=2))
+        return result
 
 
 def _assert_current_control_fence(root,fence):
@@ -321,6 +377,8 @@ def _assert_current_control_fence(root,fence):
 
 
 def _terminate_old(child):
+    if isinstance(child,KilledOwnerSnapshot):
+        child.release_owner();return
     child.terminate()
     child.join(5)
     assert not child.is_alive() and child.exitcode != 0
