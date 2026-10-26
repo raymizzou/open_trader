@@ -2302,7 +2302,7 @@ def test_old_passive_replacement_observes_shared_cancel_fence(tmp_path) -> None:
         }))
         store.lp_update_session("session-01", patch={
             "submit_status": "accepted",
-            "residual_quantity": "2",
+            "residual_quantity": "3",
             "position_reconciled": True,
             "passive_exit_order_id": "passive-order-01",
             "passive_exit_price": Decimal("0.29"),
@@ -2348,6 +2348,8 @@ def test_old_passive_replacement_observes_shared_cancel_fence(tmp_path) -> None:
                     "size_matched": "0",
                 },
             ],
+            "market": {"tick_size": Decimal("0.01")},
+            "account": {"positions": [{"token_id": request["token_id"], "size": Decimal("3"), "average_price": Decimal("0.30")}]},
             "book": {
                 "received_at": now.isoformat(),
                 "asks": [{"price": Decimal("0.31"), "size": Decimal("5")}],
@@ -2358,7 +2360,7 @@ def test_old_passive_replacement_observes_shared_cancel_fence(tmp_path) -> None:
     service, store, engine, session, cancels, submits, snapshot = prepare("stale")
     store.lp_register_trade_change("session-02")
     service._ensure_passive_exit(
-        session, snapshot, Decimal("2"), trade_revision=0
+        session, snapshot, Decimal("3"), trade_revision=0
     )
 
     assert cancels == [] and submits == []
@@ -2376,7 +2378,7 @@ def test_old_passive_replacement_observes_shared_cancel_fence(tmp_path) -> None:
         "fresh"
     )
     service._ensure_passive_exit(
-        _session, snapshot, Decimal("2"), trade_revision=0
+        _session, snapshot, Decimal("3"), trade_revision=0
     )
 
     assert cancels == ["passive-order-01"] and submits == []
@@ -2694,7 +2696,9 @@ def test_stale_passive_exit_intent_fails_closed_before_post(tmp_path) -> None:
             "original_size": "10",
             "size_matched": "0",
         }],
-        "book": {
+        "market": {"tick_size": Decimal("0.01")},
+            "account": {"positions": [{"token_id": request["token_id"], "size": Decimal("2"), "average_price": Decimal("0.30")}]},
+            "book": {
             "received_at": now.isoformat(),
             "asks": [{"price": Decimal("0.31"), "size": Decimal("5")}],
         },

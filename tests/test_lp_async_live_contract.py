@@ -335,8 +335,11 @@ def test_sell_thirty_second_cadence_retains_reprice_and_finality(tmp_path,monkey
         assert sum(e[0]=='entered' and e[2]=='book' for e in boundary.events)==reads
         assert sdk.cancels==[]
         values[0]=start+30;live.read_runtime.wake()
-        pump_live(live,boundary,lambda:bool(sdk.cancels))
-        assert sdk.cancels==[('passive-exit',)]
+        pump_live(live,boundary,lambda:any(k.startswith('market_sell:') and v.complete
+            and v.checked_at==clock.utc() for k,v in live.state.snapshot().observation.source_frame.sources.items())
+            and not any(s['active'] for s in live.read_runtime.status()['scopes']))
+        assert sdk.cancels==[]
+        assert sum(e[0]=='entered' and e[2]=='book' for e in boundary.events)>reads
         assert sdk.market_orders==[]
         sell=next(iter(live.state.snapshot().sells.values()))
         assert sell.residual_quantity.value==60
@@ -383,16 +386,22 @@ def test_position_sixty_second_cadence_retains_stop_loss_and_quantity(tmp_path,m
         assert snapshot.sells[scope].residual_quantity.value==60
         assert sdk.cancels==[]
         values[0]=start+60;live.read_runtime.wake()
-        pump_live(live,boundary,lambda:live.state.snapshot().openings[scope].stop_loss_latched.value
-            and sdk.cancels==[('passive-exit',)])
+        pump_live(live,boundary,lambda:any(k.startswith('market_position:') and v.complete
+            and v.checked_at==clock.utc() for k,v in live.state.snapshot().observation.source_frame.sources.items())
+            and not any(s['active'] for s in live.read_runtime.status()['scopes']))
+        observation=live.state.snapshot().observation
+        assert all(observation.source_frame.sources[k].complete
+            and (clock.utc()-observation.source_frame.sources[k].checked_at).total_seconds()<=1
+            for k in ('balance','open_orders','positions'))
         opening=live.state.snapshot().openings[scope]
-        assert opening.stop_loss_triggered_loss_usd.value==Decimal('5.00')
+        assert opening.economics.opening_loss_usd.value==Decimal('5.00')
+        assert opening.stop_loss_latched.value is False
+        assert opening.stop_loss_triggered_loss_usd.state=='unknown'
         assert live.state.snapshot().sells[scope].residual_quantity.value==60
-        assert sdk.cancels==[('passive-exit',)] and sdk.market_orders==[]
-        at=opening.stop_loss_triggered_at
+        assert sdk.cancels==[] and sdk.market_orders==[]
         live.run_once();live.run_protection_once()
-        assert live.state.snapshot().openings[scope].stop_loss_triggered_at==at
-        assert sdk.cancels==[('passive-exit',)]
+        assert live.state.snapshot().openings[scope].stop_loss_triggered_at is None
+        assert sdk.cancels==[]
     finally:assert live.close(4);live.trading.close()
     test_d2_opening_stop_loss_is_current_and_latched_once(tmp_path/'financial-finality',monkeypatch)
     for closed in (False,True):
@@ -1457,11 +1466,11 @@ def test_scheduler_wakes_deferred_read_fault_cancel_after_manual_cancel_completi
 
 
 def test_protection_native_completion_notifies_owner_and_preserves_outcome(tmp_path,monkeypatch):
-    from tests.test_lp_d2_integration import _d2_filled_opening
+    from tests.test_lp_d2_integration import _d2_filled_opening, explicit_historical_protection
     live,sdk,public,clock=_d2_filled_opening(tmp_path,monkeypatch)
     posted=threading.Event();post_release=threading.Event()
     cancelled=threading.Event();cancel_release=threading.Event();woken=threading.Event()
-    broken=False;handles=[]
+    broken=False;historical=False;handles=[]
     def notice():
         woken.set()
         if broken:raise RuntimeError('offline owner callback failure')
@@ -1477,7 +1486,9 @@ def test_protection_native_completion_notifies_owner_and_preserves_outcome(tmp_p
         return cancel(order_ids=order_ids)
     sdk.post_order=held_post;sdk.cancel_orders=held_cancel
     def tick():
-        live.run_once();current=live.run_protection_once();handles.extend(current)
+        live.run_once()
+        current=explicit_historical_protection(live, loss=Decimal('5')) if historical else live.run_protection_once()
+        handles.extend(current)
         return current
     try:
         assert live.read_runtime is None  # no unrelated asynchronous HTTP wake can satisfy this oracle
@@ -1499,7 +1510,7 @@ def test_protection_native_completion_notifies_owner_and_preserves_outcome(tmp_p
         assert snapshot.sells[scope].passive.submit_quantity.value==60
         assert sdk.posts[-1]['size']==60 and sdk.posts[-1]['price']==Decimal('.32')
         assert sdk.posts[-1]['expiration'] is None and sdk.posts[-1]['post_only'] is True
-        woken.clear();broken=True;clock[0]=3;public.bid=Decimal('.25')
+        woken.clear();broken=True;historical=True;clock[0]=3;public.bid=Decimal('.25')
         current=tick();exit_cancel,=current
         assert exit_cancel.identity.kind=='cancel_exit' and cancelled.wait(4)
         assert not exit_cancel.done() and live.status()['native_inflight']==1 and not woken.is_set()

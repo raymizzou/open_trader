@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 from .polymarket_lp_reader_comparison import capture as _reader_capture
 from .polymarket_lp_risk import (
     BOOK_FRESHNESS_SECONDS,
+    passive_exit_price,
     _MARKET_METADATA_MAX_AGE_SECONDS,
     LP_QUEUE_PROTECTION_THRESHOLD,
     TERMINAL_ORDER_STATES,
@@ -13289,49 +13290,6 @@ class PolymarketLPService:
         if canceling and not self._group_buys_terminal(current, snapshot):
             return
         residual = _decimal(current.get("residual_quantity", 0), "residual_quantity")
-        loss = self._opening_loss_from_session(current)
-        business_patch: dict[str, object] = {"opening_loss": loss}
-        if loss is not None and loss >= STOP_LOSS:
-            business_patch.update(self._stop_loss_latch_patch(current, loss))
-            business_patch["state"] = "stop_loss_exit"
-        stop_loss_exit = (
-            bool(current.get("stop_loss_latched"))
-            or str(current.get("state")) == "stop_loss_exit"
-            or business_patch.get("state") == "stop_loss_exit"
-        )
-        if stop_loss_exit:
-            if str(current.get("state")) != "stop_loss_exit":
-                business_patch.update({"state": "stop_loss_exit", "stop_loss_latched": True})
-            current = {**current, **business_patch}
-            if not self._owned_sells_terminal(current, snapshot):
-                patch = {**convergence_patch, **business_patch}
-                patch.pop("state", None)
-                self._request_passive_cancel(
-                    current,
-                    expected_generation=trade_generation,
-                    expected_trade_revision=initial_revision,
-                    claim_patch=patch,
-                    claim_state="stop_loss_exit",
-                )
-                return
-            if residual > 0 and not current.get("protected_exit_order_id"):
-                claim_state = (
-                    str(business_patch["state"])
-                    if business_patch.get("state")
-                    else None
-                )
-                patch = {**convergence_patch, **business_patch}
-                patch.pop("state", None)
-                self._submit_protected_exit(
-                    current,
-                    residual,
-                    snapshot,
-                    trade_generation=trade_generation,
-                    expected_trade_revision=initial_revision,
-                    claim_patch=patch,
-                    claim_state=claim_state,
-                )
-            return
         if residual > 0 and str(current.get("state")) != "review":
             self._ensure_passive_exit(
                 current,
@@ -14016,37 +13974,6 @@ class PolymarketLPService:
                 patch={"review_status": "awaiting_reconciliation"},
             )
             return self._status_payload(updated)
-        if loss is not None and loss >= STOP_LOSS:
-            session = self.store.lp_update_session(
-                str(session["session_id"]),
-                state="stop_loss_exit",
-                patch=self._stop_loss_latch_patch(session, loss),
-            )
-        session = self.store.lp_session(str(session["session_id"])) or session
-        if bool(session.get("stop_loss_latched")) or str(session.get("state")) == "stop_loss_exit":
-            if str(session.get("state")) != "stop_loss_exit":
-                session = self.store.lp_update_session(
-                    str(session["session_id"]),
-                    state="stop_loss_exit",
-                    patch={"stop_loss_latched": True},
-                )
-            session = self._request_passive_cancel(
-                session,
-                expected_generation=snapshot.get("_lp_trade_generation"),
-                expected_trade_revision=trade_revision,
-            )
-            session = self.store.lp_session(str(session["session_id"])) or session
-            if not self._owned_sells_terminal(session, snapshot):
-                return self._status_payload(session)
-            residual = _decimal(session.get("residual_quantity", 0), "residual_quantity")
-            if residual > 0 and not session.get("protected_exit_order_id"):
-                self._submit_protected_exit(
-                    session, residual, snapshot, trade_revision=trade_revision
-                )
-                session = self.store.lp_session(str(session["session_id"])) or session
-            return self._complete_if_flat(session, snapshot)
-        if loss is None:
-            return self._complete_if_flat(session, snapshot)
         if residual > 0:
             self._ensure_passive_exit(
                 session, snapshot, residual, trade_revision=trade_revision
@@ -18857,6 +18784,9 @@ class PolymarketLPService:
         trade_generation: int | None = None,
         expected_trade_revision: int | None = None,
     ) -> None:
+        if (session.get("stop_requested") is True or session.get("state") == "review"
+                or session.get("state") == "needs_attention" and session.get("resume_state") == "review"):
+            return
         # A submit that may have reached the venue is durable before the POST.
         # Pending, unknown, and accepted-without-ID states are never safe to
         # replay merely because a monitoring process restarted.
@@ -18904,21 +18834,35 @@ class PolymarketLPService:
             return
         if not asks:
             return
-        price = asks[0][0]
-        old_price = _maybe_decimal(session.get("passive_exit_price"))
+        try:
+            positions = [p for p in _items(snapshot.get("account", {}).get("positions"))
+                if str(_field(p, "token_id", _field(p, "asset_id", ""))) == str(session["token_id"])]
+            average = _maybe_decimal(_field(positions[0], "average_price")) if len(positions) == 1 else None
+            if average is None and len(positions) == 1:
+                cost = _maybe_decimal(_field(positions[0], "inventory_cost_usd", _field(positions[0], "cost_usd")))
+                average = cost / quantity if cost is not None and quantity > 0 else None
+            # Historical cost proves current cost only when it covers all inventory without sales.
+            bought = _maybe_decimal(session.get("buy_filled_quantity"))
+            if (average is None and _maybe_decimal(session.get("sold_quantity")) == 0
+                    and bought == quantity):
+                cost = _maybe_decimal(session.get("buy_cost"))
+                average = cost / bought if cost is not None and bought else None
+            price = passive_exit_price(asks[0][0], average, snapshot.get("market", {}).get("tick_size"))
+        except ValueError as exc:
+            self.store.lp_update_session(str(session["session_id"]), state="needs_attention",
+                patch={"reconciliation": str(exc), "resume_state": "passive_exit"})
+            return
         old_order = str(session.get("passive_exit_order_id") or "")
         old_passive_record: dict[str, object] = {}
         if old_order:
             old_terminal = self._order_terminal(snapshot, old_order, session)
             if not old_terminal:
-                if old_price == price and not session.get("passive_cancel_requested"):
-                    return
-                if not bool(session.get("passive_cancel_requested")):
-                    self._request_passive_cancel(
-                        session,
+                row = self._queue_level_rows(snapshot).get(old_order)
+                remaining = self._queue_row_remaining(row) if row is not None else None
+                if remaining is not None and remaining != quantity and not session.get("passive_cancel_requested"):
+                    self._request_passive_cancel(session,
                         expected_generation=trade_generation if trade_generation is not None else snapshot.get("_lp_trade_generation"),
-                        expected_trade_revision=expected_trade_revision if expected_trade_revision is not None else trade_revision,
-                    )
+                        expected_trade_revision=expected_trade_revision if expected_trade_revision is not None else trade_revision)
                 return
             # Preserve the legacy exact-ID record before clearing the role.
             # Its GTD facts remain the only source for replacement expiration.
@@ -19584,28 +19528,6 @@ class PolymarketLPService:
         updated = self.store.lp_update_session(
             str(session["session_id"]), patch={"opening_loss": loss}
         )
-        latched = bool(updated.get("stop_loss_latched"))
-        if loss is None and not latched:
-            return self._complete_if_flat(updated, snapshot)
-        if (loss is not None and loss >= STOP_LOSS) or latched:
-            updated = self.store.lp_update_session(
-                str(session["session_id"]),
-                state="stop_loss_exit",
-                patch=self._stop_loss_latch_patch(updated, loss),
-            )
-            updated = self._request_passive_cancel(
-                updated,
-                expected_generation=snapshot.get("_lp_trade_generation"),
-                expected_trade_revision=trade_revision,
-            )
-            if self._owned_sells_terminal(updated, snapshot):
-                self._submit_protected_exit(
-                    updated,
-                    _decimal(updated.get("residual_quantity", 0), "residual_quantity"),
-                    snapshot,
-                    trade_revision=trade_revision,
-                )
-            updated = self.store.lp_session(str(session["session_id"])) or updated
         return self._complete_if_flat(updated, snapshot)
 
     def _completion_patch(self, session):

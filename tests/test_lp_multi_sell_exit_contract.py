@@ -148,7 +148,7 @@ def _fresh_round(
 def test_stop_loss_batches_old_sell_cancel_then_one_protected_exit(
     tmp_path, monkeypatch
 ) -> None:
-    """Exact terminal old SELLs gate the single protected FOK replacement."""
+    """Loss never dumps inventory; explicit stop cancels every old SELL exactly."""
 
     sells, filled_buy, trades = _inventory_fixtures()
     positions = (
@@ -179,11 +179,14 @@ def test_stop_loss_batches_old_sell_cancel_then_one_protected_exit(
 
         _warm_public_book(adapter)
         first = execution.lp_tick()
-        assert first["sessions"]
+        assert account.cancel_calls == [] and account.market_orders == [] and account.posts == []
+        assert store.lp_session(session_id)["stop_loss_latched"] is False
+        first = execution.lp_stop(session_id)
+        assert first["session_id"] == session_id
         session = store.lp_session(session_id)
         assert session["state"] == "needs_attention"
-        assert session["stop_loss_latched"] is True
-        assert session["reconciliation"] == "passive_cancel_RuntimeError"
+        assert session["stop_loss_latched"] is False
+        assert session["reconciliation"] == "stop_cancel_RuntimeError"
         assert Decimal(str(session["buy_filled_quantity"])) == Decimal("15")
         assert Decimal(str(session["buy_cost"])) == Decimal("6")
         assert Decimal(str(session["residual_quantity"])) == Decimal("15")
@@ -204,16 +207,10 @@ def test_stop_loss_batches_old_sell_cancel_then_one_protected_exit(
         account.mark_old_sells_canceled()
         _fresh_round(store, adapter, execution)
 
-        assert len(account.market_orders) == 1
-        assert len(account.posts) == 1
-        signed = account.market_orders[0]
-        assert signed["token_id"] == TOKEN_ID
-        assert signed["side"] == "SELL"
-        assert signed["order_type"] == "FOK"
-        assert Decimal(str(signed["shares"])) == Decimal("15")
-        assert Decimal(str(signed["min_price"])) > 0
+        assert account.market_orders == [] and account.posts == []
         session = store.lp_session(session_id)
-        assert session["protected_exit_order_id"] == "new-sell-1"
+        assert session["state"] == "review"
+        assert Decimal(str(session["residual_quantity"])) == Decimal("15")
         canceled_ids = [
             order_id
             for requested in account.cancel_calls
