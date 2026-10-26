@@ -571,7 +571,7 @@ def _assert_sell_registration(tmp_path, monkeypatch, mode):
                 handle.result(timeout=3)
                 handle._thread.join(3)
                 assert handle.done()
-        assert [p[:2] for p in posts] == [('BUY','GTD'),('SELL','FOK' if mode == 'protected' else 'GTC')]
+        assert [p[:2] for p in posts] == [('BUY','GTD'),('SELL','GTC')]
         assert len(live.store.lp_order_provenance(WALLET,'polymarket')) == 2
         assert sdk.cancels == []
     finally:
@@ -1251,11 +1251,11 @@ def test_fractional_local_exit_preserves_requested_quantity_and_residual(tmp_pat
             sell,=(r for r in posts if r['side']=='SELL')
             assert sell['quantity']==sell['request_quantity']==Decimal('20.12')
             assert sell['residual']==Decimal('20.123456')
-            assert sell['maker_amount']==20120000 and sell['taker_amount']==5834800
-            assert sell['price']==Decimal('.29') and sell['order_type']==('FOK' if mode=='protected' else 'GTC')
+            assert sell['maker_amount']==20120000 and sell['taker_amount']==(16096000 if mode=='protected' else 5834800)
+            assert sell['price']==Decimal('.80' if mode=='protected' else '.29') and sell['order_type']=='GTC'
             snapshot=live.state.snapshot();state,=snapshot.sells.values()
             assert state.residual_quantity.value==Decimal('20.123456')
-            attempt=state.protected if mode=='protected' else state.passive
+            attempt=state.passive
             assert attempt.request_id==sell['request_id'] and attempt.submit_quantity.value==Decimal('20.12')
             _set_real_sdk_exit_fills(live,sdk,clock,token,bought='20.123456',sold='20.12',buy_price=price)
             _observe_real_sdk_exit(live)

@@ -568,7 +568,7 @@ def test_converged_queue_buy_allows_protected_sell_outside_common_mutex(tmp_path
     store.lp_create_session(
         "protected-off-lock",
         "protected-off-lock",
-        state="review",
+        state="entry_open",
         payload={
             **_manual_request(now),
             "quantity": Decimal("100"),
@@ -576,7 +576,8 @@ def test_converged_queue_buy_allows_protected_sell_outside_common_mutex(tmp_path
             "entry_order_id": "o1",
             "owned_order_ids": ["o1"],
             "submit_status": "accepted",
-            "review_status": "awaiting_reconciliation",
+            "review_status": None,
+            "stop_loss_latched": False,
             "order_history": {
                 "o1": {
                     "order_id": "o1",
@@ -636,13 +637,15 @@ def test_converged_queue_buy_allows_protected_sell_outside_common_mutex(tmp_path
         "position_flat": False,
     }
 
-    def protected_sell(**kwargs):
-        sell_calls.append(kwargs)
+    def passive_sell(signed):
+        assert signed["side"] == "SELL" and signed["quantity"] == Decimal("100")
+        assert signed["price"] >= Decimal("0.40")
+        sell_calls.append(signed)
         entered.set()
         assert release.wait(5)
         return {"order_id": "sell-o1", "status": "LIVE"}
 
-    exchange.submit_protected_sell = protected_sell
+    exchange.lp_post_order = passive_sell
     results = []
     worker = Thread(target=lambda: results.append(execution.lp_tick()))
     worker.start()
@@ -653,8 +656,8 @@ def test_converged_queue_buy_allows_protected_sell_outside_common_mutex(tmp_path
         )
         lp._mutex.release()
         claimed = store.lp_session("protected-off-lock")
-        assert claimed["state"] == "stop_loss_exit"
-        assert claimed["stop_loss_latched"] is True
+        assert claimed["state"] == "passive_exit"
+        assert claimed["stop_loss_latched"] is False
         assert Decimal(str(claimed["residual_quantity"])) == Decimal("100")
         assert claimed["position_reconciled"] is True
         assert claimed["fee_status"] == "known"

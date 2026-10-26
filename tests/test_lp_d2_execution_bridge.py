@@ -29,7 +29,7 @@ MIXED_WALLET = '0x' + 'aA' * 20
 
 @pytest.mark.parametrize('disposition', ['accepted', 'unknown'])
 def test_d2_diagnostics_record_exit_cancel_outcomes(tmp_path, monkeypatch, disposition):
-    from tests.test_lp_d2_integration import _d2_filled_opening
+    from tests.test_lp_d2_integration import _d2_filled_opening, explicit_historical_protection
     live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch, manual_sale=False)
     entered, release = Event(), Event()
     pending = []
@@ -57,10 +57,10 @@ def test_d2_diagnostics_record_exit_cancel_outcomes(tmp_path, monkeypatch, dispo
         assert before['by_kind'] == {'BUY': {'accepted': 1}, 'SELL': {'accepted': 1}}
         assert before['total'] == 2
         clock[0] = 2
-        public.ask = Decimal('.40')  # real subsequent price change requests exact exit cancellation
+        public.ask = Decimal('.40')  # Price alone never authorizes cancellation.
         live.run_once()
         origin, original_round = live.state.snapshot(), live.rounds.snapshot().round_number
-        pending.extend(live.run_protection_once())
+        pending.extend(explicit_historical_protection(live))
         handle, = pending
         assert handle.identity.kind == 'cancel_exit'
         assert entered.wait(2) and not handle.done()
@@ -1464,7 +1464,7 @@ def test_d2_execution_native_lease_drains_all_actual_calls_before_release(tmp_pa
     import fcntl
     from concurrent.futures import TimeoutError as NativeTimeout
     from tests.test_lp_order_registration_contract import _open_order
-    from tests.test_lp_d2_integration import _d2_filled_opening, _d2_protection_runtime
+    from tests.test_lp_d2_integration import _d2_filled_opening, explicit_historical_protection, _d2_protection_runtime
     def file_available(path):
         with path.open('a+') as handle:
             try: fcntl.flock(handle.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -1515,7 +1515,7 @@ def test_d2_execution_native_lease_drains_all_actual_calls_before_release(tmp_pa
         for handle in handles: handle._thread.join(3)
         assert live.close(timeout=3)
         live.trading.close()
-    # Real BUY fills and current bid loss authorize protection, never a synthetic latch.
+    # An explicit historical request retains real BUY-fill and native-drain guards.
     live, sdk, public, clock = _d2_filled_opening(tmp_path/'sell', monkeypatch, manual_sale=False)
     sell_release, sell_entered = Event(), Event()
     try:
@@ -1525,6 +1525,7 @@ def test_d2_execution_native_lease_drains_all_actual_calls_before_release(tmp_pa
         execution._breaker_open = True; public.bid = Decimal('.20'); clock[0] += 1
         execution.lp_auto_scheduled_check()  # actual own BUY fill receipt invalidates old observation
         execution.lp_auto_scheduled_check()
+        explicit_historical_protection(live)
         snapshot = live.state.snapshot()
         assert snapshot.openings[scope].stop_loss_latched.value is True
         assert snapshot.own_fills[(*scope[:3], 'entry-A')].quantity.value == 100
@@ -1537,7 +1538,8 @@ def test_d2_execution_native_lease_drains_all_actual_calls_before_release(tmp_pa
             return post(signed)
         sdk.post_order = held_sell
         execution._breaker_open = False; clock[0] += 1
-        execution.lp_auto_scheduled_check(); assert sell_entered.wait(2)
+        live.run_once(); explicit_historical_protection(live)
+        assert sell_entered.wait(2)
         pending = live.state.snapshot().sells[scope].protected
         assert pending.native_state == 'running' and pending.submit_quantity.value == 100
         assert pending.submit_residual_quantity.value == 100 and pending.submit_sold_quantity.value == 0
@@ -1578,7 +1580,7 @@ def test_d2_execution_native_lease_drains_all_actual_calls_before_release(tmp_pa
 @pytest.mark.parametrize('transition', ['BUYpause', 'BUYresume', 'BUYfatal', 'BUYclose',
     'independentBUYcancelpause', 'protectedSELLclose', 'SELLcancelclose'])
 def test_d2_final_safety_sql_cannot_outlive_current_dispatch_permission(tmp_path, monkeypatch, transition):
-    from tests.test_lp_d2_integration import _d2_filled_opening
+    from tests.test_lp_d2_integration import _d2_filled_opening, explicit_historical_protection
     from tests.test_lp_order_registration_contract import _open_order
     entered, release, signed = Event(), Event(), Event()
     failures, completed, errors, phase_reads = [], [], [], []
@@ -1637,7 +1639,12 @@ def test_d2_final_safety_sql_cannot_outlive_current_dispatch_permission(tmp_path
                 entered.set(); assert release.wait(8), 'final safety SQL watchdog'
             return cursor
     def run():
-        try: completed.append(execution.lp_auto_scheduled_check())
+        try:
+            if transition in ('protectedSELLclose', 'SELLcancelclose'):
+                live.run_once()
+                completed.append(explicit_historical_protection(live))
+            else:
+                completed.append(execution.lp_auto_scheduled_check())
         except BaseException as exc: errors.append(exc)
     try:
         monkeypatch.setattr(sqlite3, 'connect', lambda *a, **kw: real_connect(*a, **(kw|dict(factory=LastSafetySQL))))
@@ -1820,7 +1827,7 @@ def test_d2_deferred_cancel_revalidates_original_trigger_after_admission_io(tmp_
 @pytest.mark.parametrize('change', ['passive_position_decreased', 'protected_position_decreased', 'protected_manual_sell'])
 def test_d2_sell_dispatch_revalidates_original_financial_origin_after_safety_sql(tmp_path, monkeypatch, change):
     import fcntl
-    from tests.test_lp_d2_integration import _d2_filled_opening
+    from tests.test_lp_d2_integration import _d2_filled_opening, explicit_historical_protection
     from tests.test_lp_order_registration_contract import _open_order
     live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch, manual_sale=False)
     producer = PolymarketLPService(live.store, live.trading)
@@ -1858,7 +1865,12 @@ def test_d2_sell_dispatch_revalidates_original_financial_origin_after_safety_sql
         monkeypatch.setattr(sqlite3, 'connect', lambda *a, **kw: real_connect(*a, **(kw|dict(factory=FinalSellSQL))))
         control = live.state.snapshot().current
         def dispatch():
-            try: results.append(execution.lp_auto_scheduled_check())
+            try:
+                if change.startswith('protected'):
+                    live.run_once()
+                    results.append(explicit_historical_protection(live))
+                else:
+                    results.append(execution.lp_auto_scheduled_check())
             except BaseException as exc: errors.append(exc)
         worker = threading.Thread(target=dispatch, name='sell-refinement-dispatch'); worker.start()
         assert entered.wait(3)
@@ -1909,7 +1921,7 @@ def test_d2_sell_dispatch_revalidates_original_financial_origin_after_safety_sql
 
 def test_d2_same_tick_scoring_preserves_current_sell_cancel_admission(tmp_path, monkeypatch):
     import fcntl
-    from tests.test_lp_d2_integration import _d2_filled_opening
+    from tests.test_lp_d2_integration import _d2_filled_opening, explicit_historical_protection
     live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch, manual_sale=False)
     execution = attach(live, PolymarketLPService(live.store, live.trading), tmp_path)
     scope = (WALLET, CONDITION_ID, TOKEN_ID, 'protection-epoch')
@@ -1951,7 +1963,7 @@ def test_d2_same_tick_scoring_preserves_current_sell_cancel_admission(tmp_path, 
                 return cursor
         monkeypatch.setattr(sqlite3, 'connect', lambda *a, **kw: real_connect(*a, **(kw|dict(factory=CancelSafetySQL))))
         def dispatch():
-            try: results.extend(live.run_protection_once())
+            try: results.extend(explicit_historical_protection(live))
             except BaseException as exc: errors.append(exc)
         worker = threading.Thread(target=dispatch, name='same-tick-protection'); worker.start()
         assert scoring_entered.wait(3)

@@ -34,8 +34,8 @@ from .polymarket_lp_current_state import (
 from .polymarket_lp_market_calculation import CalculationPolicy, calculate_current, select_current_composition
 from .polymarket_lp_market_reader import MarketReader, ReadScope, freeze
 from .polymarket_lp_risk import (estimate_lp_queue_position, first_observation_baseline,
-    _executable_bid_value, _projected_taker_fee, _freshness, _levels, _maybe_decimal, TERMINAL_ORDER_STATES)
-from .polymarket_lp import SCORING_POLL_SECONDS, SCORING_STALE_SECONDS, SCORING_FAILURE_WINDOW_SECONDS, STOP_LOSS
+    passive_exit_price, _executable_bid_value, _projected_taker_fee, _freshness, _levels, _maybe_decimal, TERMINAL_ORDER_STATES)
+from .polymarket_lp import SCORING_POLL_SECONDS, SCORING_STALE_SECONDS, SCORING_FAILURE_WINDOW_SECONDS
 from .polymarket_lp_round import (
     LPRoundCoordinator, CycleStatus, FixedBuyPlan, StartStatus, CancelTarget,
     LocalOutcome, LocalStatus, BuyTarget, BuyTerms, ActionIdentity, BatchKind,
@@ -1348,8 +1348,15 @@ class LPD2LiveExecution:
                 order.key[1],order.key[2],kind='buy' if order.side=='BUY' else 'sell'))
         for position in snapshot.positions:
             if position.quantity.state=='known' and position.quantity.value>0:
+                sells=tuple(o for o in snapshot.active_orders if o.key[:3]==(
+                    self.account_id,position.condition_id,position.token_id) and o.side=='SELL')
+                pending=any(a is not None and (a.native_state!='ended' or a.state not in ('terminal','rejected'))
+                    for scope,sell in snapshot.sells.items() if scope[:3]==(self.account_id,position.condition_id,position.token_id)
+                    for a in (sell.passive,sell.protected))
+                kind='holding' if not sells and not pending else 'position'
                 demands.append(ReadDemand(self.account_id,self.process_epoch,generation,
-                    'position:'+position.condition_id+':'+position.token_id,0,position.condition_id,position.token_id,kind='position'))
+                    'position:'+position.condition_id+':'+position.token_id+':'+str(position.quantity.value),
+                    0,position.condition_id,position.token_id,kind=kind))
         # Detached measured candidates use the existing serialized low lane and
         # its physical ports, deadlines, cache and cleanup owner. They never
         # become exact BUY identities or financial observations.
@@ -1385,7 +1392,7 @@ class LPD2LiveExecution:
                     financial=(ticket,MarketReader.from_captured_sources(CapturedSources(self.account_id,sources)))
                     self._async_financial_ticket=None
             elif result.demand.kind=='buy':markets.append(result)
-            elif result.demand.kind in ('sell','position','income'):
+            elif result.demand.kind in ('sell','position','holding','income'):
                 from .polymarket_lp_async_source import market_value,closed_position_value
                 from .polymarket_lp_market_reader import SourceResult
                 try:
@@ -1398,6 +1405,8 @@ class LPD2LiveExecution:
                     if result.demand.kind=='income':self._async_income_updated=True
                     self._async_low_sources['market_'+result.demand.kind+':'+result.demand.condition_id+':'+result.demand.token_id]=source
                     self._async_low_sources['market:'+result.demand.condition_id+':'+result.demand.token_id]=source
+                    if result.demand.kind=='holding':
+                        self._async_low_sources['market_sell:'+result.demand.condition_id+':'+result.demand.token_id]=source
                     with self.state._lock:
                         observation=self.state.snapshot().observation
                         if observation is not None:
@@ -3629,6 +3638,8 @@ class LPD2LiveExecution:
                 book=sell_data.get('book')
                 if isinstance(book,Mapping):
                     try:
+                        if (book.get('condition_id'),book.get('token_id'))!=scope[1:3]:
+                            raise ValueError('book_identity_mismatch')
                         _freshness(book.get('received_at'),self._utc_now(),'book_freshness')
                         _freshness(book.get('timestamp'),self._utc_now(),'book_timestamp')
                     except ValueError:book=None
@@ -3658,13 +3669,7 @@ class LPD2LiveExecution:
         if self.read_runtime is not None and risk_evaluate and loss.state=='known':
             self._risk_next[scope]=self._clock()+60
             if risk_source is not None:self._risk_seen[scope]=risk_source.source_id
-        latch = risk_evaluate and not opening.stop_loss_latched.value and loss.state == 'known' and loss.value >= STOP_LOSS
-        if opening.stop_loss_latched.value or latch:
-            book=risk_book or book
         updated = replace(opening, buy_filled_quantity=fact(bought, sources), economics=economics,
-            stop_loss_latched=Fact('known', True, loss.sources) if latch else opening.stop_loss_latched,
-            stop_loss_triggered_at=self._utc_now() if latch else opening.stop_loss_triggered_at,
-            stop_loss_triggered_loss_usd=loss if latch else opening.stop_loss_triggered_loss_usd,
             scope_version=snapshot.scope_versions.get(scope, 0)+1)
         with self.state._lock:
             if self.state.apply_protection(OpeningProtectionUpdate(
@@ -3739,39 +3744,39 @@ class LPD2LiveExecution:
         if not reconciled or residual.state != 'known' or residual.value <= 0 or not book:
             return ()
         passive = sell.passive
-        if opening.stop_loss_latched.value:
-            if passive and (passive.native_state != 'ended' or passive.state not in ('terminal', 'rejected')):
-                if passive.order_key and not passive.cancel_request_id and passive.native_state == 'ended':
-                    return (self._cancel_exit(scope, passive, origin),)
-                return ()
-            if (sell.protected is not None and (sell.protected.native_state != 'ended'
-                    or sell.protected.state not in ('terminal', 'rejected'))) or sell.current_sells:
-                return ()
-            bids = sorted(((Decimal(str(r['price'])), Decimal(str(r['size']))) for r in book['bids']), reverse=True)
-            remaining, quantity, price = residual.value, Decimal(0), None
-            for level, size in bids:
-                used = min(remaining, size)
-                if used > 0:
-                    quantity += used; remaining -= used; price = level
-                if remaining <= 0: break
-            minimum = book.get('min_order_size')
+        if (sell.protected is not None and (sell.protected.native_state != 'ended'
+                or sell.protected.state not in ('terminal', 'rejected'))):
+            return ()
+        if not opening.stop_requested:
+            quantity = residual.value
             if self.lp_instance_id is not None:
                 from .lp_order_ownership import normalize_sell_quantity
                 try:
                     quantity = normalize_sell_quantity(quantity)
                 except ValueError:
                     return ()
-            if price and quantity > 0 and (minimum is None or quantity >= minimum):
-                return (self._start_exit(scope, 'protected_exit', quantity, sold, price, origin),)
-        elif economics.opening_loss_usd.state == 'known' and not opening.stop_requested:
+            minimum = _maybe_decimal(book.get('min_order_size'))
+            if minimum is not None and quantity < minimum:
+                return ()
             asks = sorted((Decimal(str(r['price'])), Decimal(str(r['size']))) for r in book['asks'])
             own_at_price = {}
             for order in sell.current_sells:
                 own_at_price[order.price.value] = own_at_price.get(order.price.value, Decimal(0))+order.remaining.value
             price = next((p for p,size in asks if size > own_at_price.get(p, 0)), None)
+            if price is not None:
+                try:
+                    price = passive_exit_price(price, position.average_price.value if position else None,
+                        book.get('tick_size'))
+                except ValueError as exc:
+                    blocked_cost = replace(sell.inventory_cost_usd, reason_codes=(str(exc),))
+                    self.state.apply_protection(ExitEvidenceUpdate(origin.guard,
+                        replace(sell, inventory_cost_usd=blocked_cost)))
+                    return ()
             if passive and (passive.state not in ('terminal', 'rejected') or passive.native_state != 'ended'):
-                if (price is not None and price != passive.price.value and passive.native_state == 'ended'
-                        and passive.order_key and not passive.cancel_request_id):
+                current = next((o for o in sell.current_sells if o.key == passive.order_key), None)
+                if (current is not None and current.remaining.state == 'known'
+                        and current.remaining.value != quantity and passive.native_state == 'ended'
+                        and not passive.cancel_request_id):
                     return (self._cancel_exit(scope, passive, origin),)
                 return ()
             if price and not sell.current_sells:

@@ -611,7 +611,7 @@ def test_stop_loss_is_per_opening_and_includes_partial_exits(tmp_path) -> None:
                 "token_id": "0x" + "1" * 64,
                 "side": "SELL",
                 "matched_amount": Decimal("40"),
-                "price": Decimal("0.29"),
+                "price": Decimal("0.31"),
                 "fee": Decimal("0"),
             }
         ],
@@ -644,7 +644,7 @@ def test_stop_loss_is_per_opening_and_includes_partial_exits(tmp_path) -> None:
         **entry_filled,
         "account": {
             **entry_filled["account"],  # type: ignore[dict-item]
-            "positions": [{"token_id": "0x" + "1" * 64, "size": Decimal("60")}],
+            "positions": [{"token_id": "0x" + "1" * 64, "size": Decimal("60"), "average_price": Decimal("0.30")}],
         },
         "book": {
             "timestamp": now,
@@ -662,7 +662,7 @@ def test_stop_loss_is_per_opening_and_includes_partial_exits(tmp_path) -> None:
             {
                 "order_id": "order-2", "token_id": "0x" + "1" * 64, "side": "SELL",
                 "status": "LIVE", "price": Decimal("0.29"),
-                "original_size": Decimal("60"), "size_matched": Decimal("0"),
+                "original_size": Decimal("100"), "size_matched": Decimal("40"),
                 "remaining_size": Decimal("60"),
             },
         ],
@@ -673,49 +673,8 @@ def test_stop_loss_is_per_opening_and_includes_partial_exits(tmp_path) -> None:
             "timestamp": now,
             "received_at": now,
             "asks": [{"price": Decimal("0.29"), "size": Decimal("100")}],
-            "bids": [{"price": Decimal("0.225"), "size": Decimal("60")}],
+            "bids": [{"price": Decimal("0.20"), "size": Decimal("60")}],
         },
-    }
-    cancelled = {
-        **trigger,
-        "orders": [
-            {
-                "order_id": "order-1", "token_id": "0x" + "1" * 64, "side": "BUY",
-                "status": "FILLED", "price": Decimal("0.30"),
-                "original_size": Decimal("100"), "size_matched": Decimal("100"),
-            },
-            {
-                "order_id": "order-2", "token_id": "0x" + "1" * 64, "side": "SELL",
-                "status": "CANCELED", "price": Decimal("0.29"),
-                "original_size": Decimal("60"), "size_matched": Decimal("0"),
-            },
-        ],
-    }
-    later = {
-        **cancelled,
-        "book": {
-            "timestamp": now,
-            "received_at": now,
-            "asks": [{"price": Decimal("0.29"), "size": Decimal("100")}],
-            "bids": [{"price": Decimal("0.226"), "size": Decimal("60")}],
-        },
-        "orders": [
-            {
-                "order_id": "order-1", "token_id": "0x" + "1" * 64, "side": "BUY",
-                "status": "FILLED", "price": Decimal("0.30"),
-                "original_size": Decimal("100"), "size_matched": Decimal("100"),
-            },
-            {
-                "order_id": "order-2", "token_id": "0x" + "1" * 64, "side": "SELL",
-                "status": "CANCELED", "price": Decimal("0.29"),
-                "original_size": Decimal("60"), "size_matched": Decimal("0"),
-            },
-            {
-                "order_id": "stop-1", "token_id": "0x" + "1" * 64, "side": "SELL",
-                "status": "LIVE", "price": Decimal("0.225"),
-                "original_size": Decimal("60"), "size_matched": Decimal("0"),
-            },
-        ],
     }
     exchange.snapshots = [
         base,
@@ -723,8 +682,8 @@ def test_stop_loss_is_per_opening_and_includes_partial_exits(tmp_path) -> None:
         entry_filled,
         partial,
         trigger,
-        cancelled,
-        later,
+        trigger,
+        partial,
     ]
 
     first = service.tick()
@@ -732,38 +691,30 @@ def test_stop_loss_is_per_opening_and_includes_partial_exits(tmp_path) -> None:
     assert first["stop_loss_latched"] is False
 
     second = service.tick()
-    assert second["opening_loss"] == Decimal("4.94032")
+    assert second["opening_loss"] == Decimal("4.14032")
     assert second["stop_loss_latched"] is False
     assert exchange.cancels == []
 
     third = service.tick()
-    assert third["opening_loss"] == Decimal("5.00")
-    assert third["stop_loss_latched"] is True
-    assert third["state"] == "stop_loss_exit"
-    assert exchange.cancels == ["order-2"]
+    assert third["opening_loss"] >= Decimal("5")
+    assert third["stop_loss_latched"] is False
+    assert third["state"] == "passive_exit"
+    assert exchange.cancels == []
     assert exchange.protected_sells == []
 
     fourth = service.tick()
-    assert fourth["opening_loss"] == Decimal("5.00")
-    assert fourth["stop_loss_latched"] is True
-    assert exchange.protected_sells == [
-        {
-            "token_id": "0x" + "1" * 64,
-            "quantity": Decimal("60"),
-            "min_price": Decimal("0.225"),
-        }
-    ]
-
+    assert fourth["opening_loss"] == third["opening_loss"]
+    assert fourth["stop_loss_latched"] is False
     fifth = service.tick()
     assert fifth["residual_quantity"] == Decimal("60")
-    assert fifth["stop_loss_latched"] is True
-    assert fifth["state"] == "stop_loss_exit"
-    passive_orders = [
-        item for item in exchange.limit_orders if item["side"] == "SELL"
-    ]
+    assert fifth["stop_loss_latched"] is False
+    assert fifth["state"] == "passive_exit"
+    passive_orders = [item for item in exchange.limit_orders if item["side"] == "SELL"]
     assert len(passive_orders) == 1
-    assert passive_orders[0]["price"] == Decimal("0.29")
-    assert len(exchange.protected_sells) == 1
+    assert passive_orders[0]["price"] == Decimal("0.30")
+    assert passive_orders[0]["quantity"] == Decimal("100")
+    assert exchange.cancels == []
+    assert exchange.protected_sells == []
 
 
 def test_stop_trigger_evidence_is_latched_across_restart(tmp_path) -> None:
@@ -805,8 +756,12 @@ def test_stop_trigger_evidence_is_latched_across_restart(tmp_path) -> None:
         residual_value=Decimal("24.99"),
         passive_status="LIVE",
     )
-    triggered = service.tick()
     triggered_at = current[0].isoformat(timespec="microseconds").replace("+00:00", "Z")
+    store.lp_update_session(session_id, patch={
+        "stop_loss_latched": True, "stop_loss_triggered_at": triggered_at,
+        "stop_loss_triggered_loss": Decimal("5.01"),
+    })
+    triggered = service.tick()
     assert triggered["opening_loss"] == Decimal("5.01")
     assert triggered["stop_loss_latched"] is True
     assert triggered["stop_loss_triggered_at"] == triggered_at
@@ -843,6 +798,7 @@ def test_stop_trigger_evidence_is_latched_across_restart(tmp_path) -> None:
         passive_status="LIVE",
     )
     reviewed = restarted.tick()
+    assert exchange.protected_sells == []
     assert reviewed["state"] == "review"
     assert reviewed["stop_loss_triggered_at"] == triggered_at
     assert reviewed["stop_loss_triggered_loss"] == Decimal("5.01")
@@ -1212,31 +1168,48 @@ def test_maker_exit_reprices_without_overselling(tmp_path) -> None:
         passive_status="LIVE",
         orders_terminal=False,
     )
-    settled_cancel = _inventory_snapshot(
-        now,
-        buy_quantity=Decimal("15"),
-        buy_cost=Decimal("4.50"),
-        sold_quantity=Decimal("3"),
-        sold_revenue=Decimal("0.93"),
-        residual=Decimal("12"),
-        residual_value=Decimal("3.48"),
-        passive_status="CANCELED",
-    )
-    for item in (changed, settled_cancel):
+    for item in (changed,):
         item["book"] = {
             **item["book"],  # type: ignore[dict-item]
             "asks": [{"price": Decimal("0.32"), "size": Decimal("100")}],
         }
-    exchange.snapshots = [base, base, filled, changed, settled_cancel]
+    changed["account"]["positions"][0]["average_price"] = Decimal("0.30")
+    exchange.snapshots = [base, base, filled, changed, changed]
 
     service.tick()
     assert [item["quantity"] for item in exchange.limit_orders if item["side"] == "SELL"] == [Decimal("15")]
     service.tick()
-    assert exchange.cancels == ["order-2"]
+    assert exchange.cancels == []
     assert [item["quantity"] for item in exchange.limit_orders if item["side"] == "SELL"] == [Decimal("15")]
     service.tick()
-    assert [item["quantity"] for item in exchange.limit_orders if item["side"] == "SELL"] == [Decimal("15"), Decimal("12")]
+    assert [item["quantity"] for item in exchange.limit_orders if item["side"] == "SELL"] == [Decimal("15")]
+    assert exchange.protected_sells == []
     assert all(item["quantity"] <= Decimal("15") for item in exchange.limit_orders if item["side"] == "SELL")
+
+
+def explicit_legacy_protected_tick(service):
+    """Drive the retained submission boundary for an explicit historical exit.
+
+    New automatic ticks never create this request from the loss threshold.
+    """
+    session, = service.store.lp_sessions()
+    sid=str(session['session_id'])
+    session=service.store.lp_update_session(sid,state='stop_loss_exit',patch={'stop_loss_latched':True})
+    snapshot=service._read_snapshot(service._normalize_request(session))
+    session=service.store.lp_update_session(sid,patch=service._fill_patch(session,snapshot))
+    session=service._sync_order_history(session,snapshot)
+    session=service._reconcile_protected_exit(session,snapshot)
+    # The current read follows the fixture's durable historical registration.
+    generation=service.store.lp_trade_generation()
+    snapshot=service._read_snapshot(service._normalize_request(session))
+    session,revision=service.store.lp_session_with_revision(sid,trading=True)
+    if not service._owned_sells_terminal(session,snapshot):
+        service._request_passive_cancel(session,expected_generation=generation,
+            expected_trade_revision=revision)
+    elif Decimal(str(session.get('residual_quantity',0)))>0:
+        service._submit_protected_exit(session,Decimal(str(session['residual_quantity'])),snapshot,
+            trade_revision=revision,trade_generation=generation)
+    return service._complete_if_flat(service.store.lp_session(sid),snapshot)
 
 
 def test_exit_waits_for_terminal_receipt_before_retry(tmp_path) -> None:
@@ -1301,14 +1274,14 @@ def test_exit_waits_for_terminal_receipt_before_retry(tmp_path) -> None:
     exchange.snapshot_value = base
     exchange.snapshots = []
 
-    first = service.tick()
+    first = explicit_legacy_protected_tick(service)
     assert first["state"] == "stop_loss_exit"
     assert first["protected_exit_attempt_state"] == "rejected"
     assert len(exchange.protected_sells) == 1
-    second = service.tick()
+    second = explicit_legacy_protected_tick(service)
     assert second["protected_exit_attempt_state"] == "unknown"
     assert len(exchange.protected_sells) == 2
-    third = service.tick()
+    third = explicit_legacy_protected_tick(service)
     assert third["protected_exit_attempt_state"] == "unknown"
     assert len(exchange.protected_sells) == 2
 
@@ -1521,9 +1494,10 @@ def test_review_keeps_stop_loss_and_no_repeat_entry(tmp_path) -> None:
     )
     exchange.snapshot_value = with_bid
     exiting = service.tick()
-    assert exiting["state"] == "stop_loss_exit"
-    assert exiting["stop_loss_latched"] is True
-    assert len(exchange.protected_sells) == 1
+    assert exiting["state"] == "review"
+    assert exiting["stop_loss_latched"] is False
+    assert exiting["residual_quantity"] == Decimal("60")
+    assert exchange.protected_sells == []
     assert len([item for item in exchange.limit_orders if item["side"] == "BUY"]) == 1
 
     flat = _inventory_snapshot(
@@ -1531,30 +1505,18 @@ def test_review_keeps_stop_loss_and_no_repeat_entry(tmp_path) -> None:
         buy_quantity=Decimal("100"),
         buy_cost=Decimal("30"),
         sold_quantity=Decimal("100"),
-        sold_revenue=Decimal("25.10"),
+        sold_revenue=Decimal("31.00"),
         residual=Decimal("0"),
         residual_value=Decimal("0"),
         fees=Decimal("0.10"),
-        protected_status="FILLED",
+        passive_status="FILLED",
         position_flat=True,
     )
-    # Retain the 40-share passive fill and add only the 60-share protected
-    # remainder. A second order filled for 100 would oversell the opening.
-    flat["trades"] = with_bid["trades"] + [{
-        "trade_id": "protected-sell-2", "token_id": "0x" + "1" * 64,
-        "side": "SELL", "status": "CONFIRMED", "maker_orders": [{
-            "order_id": "stop-1", "token_id": "0x" + "1" * 64,
-            "side": "SELL", "matched_amount": Decimal("60"),
-            "price": Decimal("0.225"), "fee": Decimal("0"),
-        }],
-    }]
-    for order in flat["orders"]:
-        if order["order_id"] == "stop-1":
-            order.update(original_size=Decimal("60"), size_matched=Decimal("60"))
+    # A late exact-ID passive fill settles only the remaining inventory.
     exchange.snapshot_value = flat
     completed = service.tick()
     assert completed["state"] == "complete"
-    assert len(exchange.protected_sells) == 1
+    assert exchange.protected_sells == []
 
 
 def test_completion_requires_terminal_orders_and_flat_position(tmp_path) -> None:
@@ -1875,7 +1837,7 @@ def test_unresolved_submission_keeps_flat_session_active(tmp_path, role) -> None
             )
             exchange.protected_responses = [TimeoutError("protected receipt timeout")]
             exchange.snapshot_value = cancelled
-            unresolved = service.tick()
+            unresolved = explicit_legacy_protected_tick(service)
             assert unresolved["state"] == "stop_loss_exit"
             assert unresolved["protected_exit_attempt_state"] == "unknown"
             flat = _inventory_snapshot(
@@ -1974,23 +1936,23 @@ def test_unknown_passive_submission_blocks_protected_exit(tmp_path) -> None:
     )
     exchange.snapshot_value = trigger
     crossed = service.tick()
-    assert crossed["state"] == "stop_loss_exit"
-    assert crossed["stop_loss_latched"] is True
+    assert crossed["state"] == "passive_exit"
+    assert crossed["stop_loss_latched"] is False
     assert crossed["residual_quantity"] == Decimal("100")
     assert crossed["passive_exit_attempt_state"] == "unknown"
     assert exchange.protected_sells == []
 
     restarted = PolymarketLPService(store, exchange, clock=lambda: now)
     after_restart = restarted.tick()
-    assert after_restart["state"] == "stop_loss_exit"
-    assert after_restart["stop_loss_latched"] is True
+    assert after_restart["state"] == "passive_exit"
+    assert after_restart["stop_loss_latched"] is False
     assert exchange.protected_sells == []
 
     stopped = restarted.stop(started["session_id"])
     assert stopped["state"] == "review"
     exchange.snapshot_value = trigger
     after_review = restarted.tick()
-    assert after_review["stop_loss_latched"] is True
+    assert after_review["stop_loss_latched"] is False
     assert after_review["passive_exit_attempt_state"] == "unknown"
     assert exchange.protected_sells == []
     assert len([item for item in exchange.posts if item["side"] == "BUY"]) == 1
@@ -2057,7 +2019,7 @@ def test_protected_pending_restart_and_confirmed_portions(tmp_path) -> None:
     crash_exchange.snapshot_value = cancelled
     crash_exchange.protected_responses = [BaseException("process lost after FOK POST")]
     with pytest.raises(BaseException):
-        crash_service.tick()
+        explicit_legacy_protected_tick(crash_service)
     assert len(crash_exchange.protected_sells) == 1
     restarted = PolymarketLPService(crash_store, crash_exchange, clock=lambda: now)
     still_pending = restarted.tick()
@@ -2095,7 +2057,7 @@ def test_protected_pending_restart_and_confirmed_portions(tmp_path) -> None:
         bids=[{"price": Decimal("0.25"), "size": Decimal("100")}],
     )
     exchange.snapshot_value = trigger
-    stop_requested = service.tick()
+    stop_requested = explicit_legacy_protected_tick(service)
     assert stop_requested["state"] == "stop_loss_exit"
     cancelled_partial_depth = _inventory_snapshot(
         now,
@@ -2107,7 +2069,7 @@ def test_protected_pending_restart_and_confirmed_portions(tmp_path) -> None:
         bids=[{"price": Decimal("0.25"), "size": Decimal("40")}],
     )
     exchange.snapshot_value = cancelled_partial_depth
-    first_exit = service.tick()
+    first_exit = explicit_legacy_protected_tick(service)
     assert first_exit["state"] == "stop_loss_exit"
     assert first_exit["residual_quantity"] == Decimal("100")
     assert first_exit["residual_exit_value"] is None
@@ -2124,10 +2086,16 @@ def test_protected_pending_restart_and_confirmed_portions(tmp_path) -> None:
         protected_status="FILLED",
         bids=[{"price": Decimal("0.25"), "size": Decimal("40")}],
     )
+    # The terminal receipt lacks execution price and trade proof until settlement.
+    unsettled["orders"][-1].update(
+        original_size=Decimal("40"), size_matched=Decimal("40"),
+        remaining_size=Decimal("0"), price=Decimal("0.25")
+    )
     exchange.snapshot_value = unsettled
     before_fills = service.tick()
     assert before_fills["protected_exit_order_id"] == "stop-1"
     assert len(exchange.protected_sells) == 1
+    assert len(exchange.posts) == 2
 
     confirmed_first = _inventory_snapshot(
         now,
@@ -2141,15 +2109,24 @@ def test_protected_pending_restart_and_confirmed_portions(tmp_path) -> None:
         protected_status="FILLED",
         bids=[{"price": Decimal("0.25"), "size": Decimal("60")}],
     )
+    confirmed_first["orders"][-1].update(
+        original_size=Decimal("40"), remaining_size=Decimal("0"), price=Decimal("0.25")
+    )
+    confirmed_first["account"]["positions"][0]["average_price"] = Decimal("0.30")
     exchange.snapshot_value = confirmed_first
+    service.tick()  # Apply the exact historical finality before the next claim.
     after_first_fill = service.tick()
     assert after_first_fill["residual_quantity"] == Decimal("60")
     assert exchange.protected_sells == [
         {"token_id": token_id, "quantity": Decimal("40"), "min_price": Decimal("0.25")},
-        {"token_id": token_id, "quantity": Decimal("60"), "min_price": Decimal("0.25")},
     ]
     assert "stop-1" in after_first_fill["order_history"]
-    assert "stop-2" in after_first_fill["order_history"]
+    remaining_sell = exchange.limit_orders[-1]
+    assert remaining_sell["side"] == "SELL"
+    assert remaining_sell["quantity"] == Decimal("60")
+    assert remaining_sell["price"] == Decimal("0.31")
+    assert after_first_fill["stop_loss_latched"] is True
+    assert "order-3" in after_first_fill["order_history"]
 
     final = {
         **confirmed_first,
@@ -2161,7 +2138,7 @@ def test_protected_pending_restart_and_confirmed_portions(tmp_path) -> None:
         "orders": [
             {"order_id": "order-1", "token_id": token_id, "side": "BUY", "status": "FILLED"},
             {"order_id": "stop-1", "token_id": token_id, "side": "SELL", "status": "FILLED"},
-            {"order_id": "stop-2", "token_id": token_id, "side": "SELL", "status": "FILLED"},
+            {"order_id": "order-3", "token_id": token_id, "side": "SELL", "status": "FILLED"},
         ],
         "trades": [
             {
@@ -2203,11 +2180,11 @@ def test_protected_pending_restart_and_confirmed_portions(tmp_path) -> None:
                 "status": "CONFIRMED",
                 "maker_orders": [
                     {
-                        "order_id": "stop-2",
+                        "order_id": "order-3",
                         "token_id": token_id,
                         "side": "SELL",
                         "matched_amount": Decimal("60"),
-                        "price": Decimal("0.25"),
+                        "price": Decimal("0.31"),
                         "fee": Decimal("0"),
                     }
                 ],
@@ -2220,7 +2197,7 @@ def test_protected_pending_restart_and_confirmed_portions(tmp_path) -> None:
     completed = service.tick()
     assert completed["state"] == "complete"
     assert completed["residual_quantity"] == Decimal("0")
-    assert len(exchange.protected_sells) == 2
+    assert len(exchange.protected_sells) == 1
     assert len([item for item in exchange.limit_orders if item["side"] == "BUY"]) == 1
 
 
@@ -2256,7 +2233,7 @@ def test_protected_exit_keeps_pending_fill_guard_with_api_positions(tmp_path, mi
         bids=[{"price": Decimal("0.25"), "size": Decimal("100")}],
     )
     exchange.snapshot_value = trigger
-    latched = service.tick()
+    latched = explicit_legacy_protected_tick(service)
     assert latched["stop_loss_latched"] is True
 
     cancelled = _inventory_snapshot(
@@ -2269,7 +2246,7 @@ def test_protected_exit_keeps_pending_fill_guard_with_api_positions(tmp_path, mi
         bids=[{"price": Decimal("0.25"), "size": Decimal("40")}],
     )
     exchange.snapshot_value = cancelled
-    first_exit = service.tick()
+    first_exit = explicit_legacy_protected_tick(service)
     assert first_exit["residual_quantity"] == Decimal("100")
     assert exchange.protected_sells == [
         {"token_id": token_id, "quantity": Decimal("40"), "min_price": Decimal("0.25")}
@@ -2298,14 +2275,14 @@ def test_protected_exit_keeps_pending_fill_guard_with_api_positions(tmp_path, mi
             bids=[{"price": Decimal("0.25"), "size": Decimal("60")}],
         )
     exchange.snapshot_value = mismatch_snapshot
-    blocked = service.tick()
+    blocked = explicit_legacy_protected_tick(service)
     assert blocked["position_reconciled"] is True
     assert blocked["protected_exit_order_id"] == "stop-1"
     assert blocked["residual_quantity"] == (
         Decimal("100") if mismatch == "sale_first" else Decimal("60")
     )
     assert len(exchange.protected_sells) == 1
-    repeated = service.tick()
+    repeated = explicit_legacy_protected_tick(service)
     assert repeated["protected_exit_order_id"] == "stop-1"
     assert len(exchange.protected_sells) == 1
 
@@ -2321,7 +2298,7 @@ def test_protected_exit_keeps_pending_fill_guard_with_api_positions(tmp_path, mi
         bids=[{"price": Decimal("0.25"), "size": Decimal("60")}],
     )
     exchange.snapshot_value = matching
-    reconciled = service.tick()
+    reconciled = explicit_legacy_protected_tick(service)
     assert reconciled["position_reconciled"] is True
     assert reconciled["residual_quantity"] == Decimal("60")
     assert exchange.protected_sells == [
@@ -2395,7 +2372,7 @@ def test_protected_exit_keeps_pending_fill_guard_with_api_positions(tmp_path, mi
         "position_flat": True,
     }
     exchange.snapshot_value = final
-    completed = service.tick()
+    completed = explicit_legacy_protected_tick(service)
     assert completed["state"] == "complete"
     assert len(exchange.protected_sells) == 2
     assert service.status(started["session_id"])["state"] == "complete"
@@ -2433,6 +2410,8 @@ def test_review_preserves_latched_exit_with_partial_depth(tmp_path, transition) 
         bids=[{"price": Decimal("0.25"), "size": Decimal("100")}],
     )
     exchange.snapshot_value = trigger
+    service.store.lp_update_session(str(started["session_id"]), state="stop_loss_exit",
+        patch={"stop_loss_latched": True, "stop_loss_triggered_loss": Decimal("5")})
     latched = service.tick()
     assert latched["state"] == "stop_loss_exit"
     assert latched["stop_loss_latched"] is True
@@ -2482,18 +2461,16 @@ def test_review_preserves_latched_exit_with_partial_depth(tmp_path, transition) 
     )
     exchange.snapshot_value = partial
     exiting = service.tick()
-    assert exiting["state"] == "stop_loss_exit"
+    assert exiting["state"] == "review"
     assert exiting["stop_loss_latched"] is True
     assert exiting["residual_exit_value"] is None
-    assert exchange.protected_sells == [
-        {"token_id": token_id, "quantity": Decimal("40"), "min_price": Decimal("0.25")}
-    ]
+    assert exchange.protected_sells == []
     assert len([item for item in exchange.limit_orders if item["side"] == "BUY"]) == 1
     assert len([item for item in exchange.limit_orders if item["side"] == "SELL"]) == 1
 
     repeat = service.tick()
     assert repeat["stop_loss_latched"] is True
-    assert len(exchange.protected_sells) == 1
+    assert exchange.protected_sells == []
     assert len([item for item in exchange.limit_orders if item["side"] == "SELL"]) == 1
 
 
@@ -13185,8 +13162,7 @@ def test_lp166_tick_two_groups_aggregate_prefers_needs_attention(tmp_path) -> No
 
 
 def test_lp166_stop_loss_isolated_per_group(tmp_path, monkeypatch) -> None:
-    """C(隔离): 组 A 亏至 −$5 触发止损后，组 B 载荷逐字段与触发前一致
-    （订单/仓位/状态）。"""
+    """An explicit group-A review cancel fences group-B financial reads."""
     now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
     exchange = _PerTokenExchange()
     token_a = str(_lp166_market_identity(1)["token_id"])
@@ -13295,6 +13271,7 @@ def test_lp166_stop_loss_isolated_per_group(tmp_path, monkeypatch) -> None:
     assert baseline_error is None
     assert baseline_b['facts_checked_at']
     exchange.by_token[token_a] = trigger_a
+    store.lp_update_session(session_a, state="review", patch={"stop_requested": True})
     b_read = threading.Event()
     a_changed = threading.Event()
     read = service._read_snapshot
@@ -13328,8 +13305,9 @@ def test_lp166_stop_loss_isolated_per_group(tmp_path, monkeypatch) -> None:
     assert store.lp_trade_generation() > generations[0]
 
     after_a = store.lp_session(session_a)
-    assert after_a["state"] == "stop_loss_exit"
-    assert after_a["stop_loss_latched"] is True
+    assert after_a["state"] == "review"
+    assert after_a["stop_loss_latched"] is False
+    assert exchange.protected_sells == []
     # first/second 是聚合报文：两组在场时顶层 session_id 为 None。
     assert first["session_id"] is None
     assert second["session_id"] is None
@@ -13738,7 +13716,7 @@ def test_lp167_s8_cross_level_cost_and_single_stop_loss_latch(tmp_path) -> None:
         positions=[{"token_id": "0x" + "1" * 64, "size": Decimal("100")}],
     )
     exchange.snapshot_value = both_filled
-    assert service.tick()["state"] in {"entry_open", "stop_loss_exit"}
+    assert service.tick()["state"] in {"entry_open", "passive_exit"}
 
     # 两张单终态：持仓 100， bids 只够 100 份 × ~0.295 → 亏损 ≥ $5 触发止损。
     cancelled = _lp167_book(
@@ -13769,15 +13747,20 @@ def test_lp167_s8_cross_level_cost_and_single_stop_loss_latch(tmp_path) -> None:
     exchange.snapshot_value = cancelled
     stop = service.tick()
 
-    assert store.lp_session(session_id)["state"] == "stop_loss_exit"
+    assert store.lp_session(session_id)["state"] == "passive_exit"
     status = service.status(session_id)
-    assert status["stop_loss_latched"] is True
+    assert status["stop_loss_latched"] is False
     assert Decimal(str(status["buy_cost"])) == Decimal("41.20")
     assert Decimal(str(status["buy_filled_quantity"])) == Decimal("100")
-    latched_loss = Decimal(str(status["stop_loss_triggered_loss"]))
-    assert latched_loss == Decimal("41.20") - Decimal("29.50")
-    assert status["stop_loss_triggered_at"] is not None
-    latched_at = status["stop_loss_triggered_at"]
+    assert Decimal(str(status["opening_loss"])) == Decimal("11.70")
+    assert status["stop_loss_triggered_at"] is None
+    assert status["stop_loss_triggered_loss"] is None
+    sell, = [o for o in exchange.limit_orders if o["side"] == "SELL"]
+    assert sell["quantity"] == Decimal("100")
+    assert sell["price"] >= Decimal("0.412")
+    historical_at = now.isoformat()
+    store.lp_update_session(session_id, patch={"stop_loss_latched": True,
+        "stop_loss_triggered_at": historical_at, "stop_loss_triggered_loss": Decimal("11.70")})
 
     # 后续 tick 亏损更大也只保留第一次 latch 证据。
     deeper = _lp167_book(
@@ -13792,10 +13775,11 @@ def test_lp167_s8_cross_level_cost_and_single_stop_loss_latch(tmp_path) -> None:
     deeper["book"]["bids"] = [{"price": Decimal("0.10"), "size": Decimal("100")}]
     exchange.snapshot_value = deeper
     again = service.tick()
-    assert store.lp_session(session_id)["state"] == "stop_loss_exit"
+    assert store.lp_session(session_id)["state"] == "passive_exit"
     status = service.status(session_id)
-    assert Decimal(str(status["stop_loss_triggered_loss"])) == latched_loss
-    assert status["stop_loss_triggered_at"] == latched_at
+    assert Decimal(str(status["stop_loss_triggered_loss"])) == Decimal("11.70")
+    assert status["stop_loss_triggered_at"] == historical_at
+    assert exchange.protected_sells == []
 
 
 def test_lp167_s10_outage_conservative_cancel_covers_both_levels(tmp_path) -> None:

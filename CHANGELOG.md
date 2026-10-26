@@ -11,6 +11,12 @@
 - Verify all seven required artifact payloads and their exact source, lock, environment, run, attempt and executed-node union. Bind retained LP validation references to the selected release's five- or seven-scope contract, so old verified rollback releases remain usable without accepting incomplete current evidence.
 - Reuse real killed-owner snapshots and a read-only source template. Compare migrated current-service scenarios with real children, retain process-boundary tests and record startup phases. Financial, order identity and negative assertions remain in place; trading behavior is unchanged.
 
+## 2026-10-26 — LP cost-floor passive exits
+
+- Start market reads for confirmed holdings without a live or unresolved SELL as soon as the account observation arrives, using the existing read lane. Do not wait for the normal 30-second SELL or 60-second risk refresh.
+- Quote passive SELLs at the higher of the external best ask and the current average acquisition cost rounded up to the market tick, excluding fees. Unknown or unquotable cost blocks submission. Keep posted prices; replace only for an actual remaining-quantity mismatch after exact cancellation and finality.
+- Remove automatic loss-threshold taker exits, including those driven by historical stop-loss latches. Preserve historical audit and unresolved requests, explicit stop/cancel, identity, financial and no-replay guards. No deployment is included.
+
 ## 2026-10-26 — Unified production Smoke log checks
 
 - Run the same release-local standalone checker for file, cloud journal and local Gateway logs. Check all logs since startup, require existing runtime markers, and reject empty, unreadable or non-UTF-8 logs and journal failures.

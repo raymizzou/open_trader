@@ -1075,13 +1075,63 @@ def _d2_filled_opening(tmp_path, monkeypatch, *, manual_sale=True):
     return live, sdk, public, clock
 
 
+def explicit_historical_protection(live, *, loss=None):
+    """Exercise the retained protected-submit boundary for historical obligations.
+
+    Production ticks no longer create this obligation from a loss threshold.
+    This fixture explicitly requests it; every real dispatch guard still applies.
+    """
+    from dataclasses import replace
+    from uuid import uuid4
+    from open_trader.polymarket_lp_current_state import ProtectionGuard, OpeningProtectionUpdate, Fact
+    from open_trader.polymarket_lp_live_execution import _SellCalculationOrigin
+    def guard(snapshot, scope):
+        return ProtectionGuard(scope, snapshot.current.cycle_generation, snapshot.scope_versions.get(scope,0),
+            tuple((o.key,o.terms_version) for o in snapshot.orders if o.key[:3]==scope[:3]),
+            None, uuid4().hex)
+    for scope,opening in live.state.snapshot().openings.items():
+        if opening.phase=='closed':continue
+        snapshot=live.state.snapshot();g=guard(snapshot,scope)
+        historical=replace(opening,stop_requested=True,stop_loss_latched=Fact('known',True),
+            stop_loss_triggered_at=opening.stop_loss_triggered_at or live._utc_now(),
+            stop_loss_triggered_loss_usd=opening.stop_loss_triggered_loss_usd if opening.stop_loss_latched.value else
+                Fact('known',loss) if loss is not None else opening.stop_loss_triggered_loss_usd,
+            scope_version=g.expected_scope_version+1)
+        assert live.state.apply_protection(OpeningProtectionUpdate(g,historical))=='applied'
+    handles=list(live.run_protection_once())
+    for scope,sell in live.state.snapshot().sells.items():
+        snapshot=live.state.snapshot();opening=snapshot.openings[scope]
+        if opening.phase=='closed' or not sell.position_reconciled or sell.residual_quantity.state!='known' or sell.residual_quantity.value<=0:continue
+        g=replace(guard(snapshot,scope),observation_id=snapshot.observation.observation_id)
+        sold=opening.buy_filled_quantity.value-sell.residual_quantity.value
+        origin=_SellCalculationOrigin(g,snapshot.trade_version,sell.residual_quantity.value,sold)
+        passive=sell.passive
+        if passive and (passive.native_state!='ended' or passive.state not in ('terminal','rejected')):
+            if passive.order_key and passive.native_state=='ended' and not passive.cancel_request_id:
+                handles.append(live._cancel_exit(scope,passive,origin))
+            continue
+        if sell.current_sells or sell.protected and (sell.protected.native_state!='ended' or sell.protected.state not in ('terminal','rejected')):continue
+        source=snapshot.observation.source_frame.sources.get('market:'+scope[1]+':'+scope[2])
+        book=source.value.get('book') if source and source.complete and not source.error else None
+        if not book:continue
+        remaining=sell.residual_quantity.value;quantity=Decimal(0);price=None
+        for row in sorted(book['bids'],key=lambda row:row['price'],reverse=True):
+            used=min(remaining,row['size']);quantity+=used;remaining-=used
+            if used:price=row['price']
+            if remaining<=0:break
+        if quantity and price and quantity>=book.get('min_order_size',0):
+            handles.append(live._start_exit(scope,'protected_exit',quantity,sold,price,origin))
+    return tuple(handle for handle in handles if handle is not None)
+
+
 def test_d2_opening_stop_loss_is_current_and_latched_once(tmp_path, monkeypatch):
     from tests.test_lp_order_registration_contract import CONDITION_ID, TOKEN_ID
     live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch)
     scope = (WALLET, CONDITION_ID, TOKEN_ID, 'protection-epoch')
     def tick():
         live.run_once()
-        attempts = live.run_protection_once()
+        attempts = (explicit_historical_protection(live, loss=Decimal('5'))
+            if public.bid <= Decimal('.25') else live.run_protection_once())
         for attempt in attempts: attempt.result(timeout=3)
         return live.state.snapshot()
     try:
@@ -1092,7 +1142,7 @@ def test_d2_opening_stop_loss_is_current_and_latched_once(tmp_path, monkeypatch)
         tick()
         unknown = tick().openings[scope]
         assert unknown.economics.opening_loss_usd.state == 'unknown'
-        assert unknown.stop_loss_latched.value is False and len(sdk.posts) == 2
+        assert unknown.stop_loss_latched.value is False and len(sdk.posts) == 3
         sdk.trades = original
         public.bid = Decimal('.251')
         clock[0] = 2
@@ -1165,7 +1215,8 @@ def test_d2_sell_reconciliation_preserves_real_quantity_and_pending_attempt(tmp_
     sdk.post_order = post
     def tick(*, wait=True):
         live.run_once()
-        attempts = live.run_protection_once()
+        attempts = (explicit_historical_protection(live, loss=Decimal('5'))
+            if public.bid <= Decimal('.25') else live.run_protection_once())
         if wait:
             for a in attempts: a.result(timeout=3)
         return attempts
@@ -1245,7 +1296,8 @@ def test_d2_protection_evidence_is_exact_and_market_bounded(tmp_path, monkeypatc
     def tick():
         live.run_once()
         reads = (sdk.balance_reads, sdk.order_reads, sdk.position_reads, public.book_reads)
-        attempts = live.run_protection_once()
+        attempts = (explicit_historical_protection(live, loss=Decimal('5'))
+            if public.bid <= Decimal('.25') else live.run_protection_once())
         for a in attempts:
             outcome = a.result(timeout=3)
             assert getattr(outcome.status, 'value', outcome.status) == 'accepted'
@@ -1648,9 +1700,9 @@ def test_d2_completed_opening_starts_distinct_economics_episode(tmp_path, monkey
         new = snapshot.openings[second_scope]
         assert new.entry_order_ids == ('entry-B',)
         assert new.economics.buy_cost_usd.value == 30 and new.economics.sold_revenue_usd.value == 0
-        assert new.economics.opening_loss_usd.value == 5 and new.stop_loss_latched.value is True
-        assert snapshot.sells[second_scope].protected.submit_quantity.value == 100
-        assert snapshot.sells[second_scope].protected.submit_sold_quantity.value == 0
+        assert new.economics.opening_loss_usd.value == 5 and new.stop_loss_latched.value is False
+        assert snapshot.sells[second_scope].passive.submit_quantity.value == 100
+        assert snapshot.sells[second_scope].passive.submit_sold_quantity.value == 0
         assert snapshot.sells[first_scope].passive is None and snapshot.sells[first_scope].protected is None
         assert original_proof.submit_quantity == first.submit_quantity
         assert [result for _,result,_,_ in retirements] == ['applied']
@@ -1721,8 +1773,8 @@ def test_d2_manual_sell_disappearance_preserves_opening_attribution(tmp_path, mo
         clock[0] += 1
         snapshot = tick()
         assert snapshot.openings[scope].economics.opening_loss_usd.value == 5
-        assert snapshot.openings[scope].stop_loss_latched.value is True
-        assert sdk.cancels == [('passive-exit',)] and sdk.market_orders == []
+        assert snapshot.openings[scope].stop_loss_latched.value is False
+        assert sdk.cancels == [] and sdk.market_orders == []
         assert 'unobserved-old-sale' not in {o.key[3] for o in snapshot.orders}
     finally:
         assert live.close(timeout=3)
@@ -1776,7 +1828,7 @@ def test_d2_resolved_protected_exit_can_sell_only_reconciled_remainder(tmp_path,
     handles = ()
     def tick():
         live.run_once()
-        for handle in live.run_protection_once(): handle.result(timeout=3)
+        for handle in explicit_historical_protection(live): handle.result(timeout=3)
         return live.state.snapshot()
     try:
         sdk.post_order(sdk.create_limit_order(token_id=TOKEN_ID, side='SELL', price=Decimal('.40'), size=Decimal('100'),
@@ -1790,7 +1842,7 @@ def test_d2_resolved_protected_exit_can_sell_only_reconciled_remainder(tmp_path,
         tick()  # exact manual terminal0 receipt; no invented cancellation fill
         public.level = Decimal('40')
         live.run_once()
-        handles = live.run_protection_once()
+        handles = explicit_historical_protection(live)
         assert len(handles) == 1
         if first_result in ('native_pending', 'not_sent'):
             assert entered.wait(2)
@@ -1858,7 +1910,7 @@ def test_d2_resolved_protected_exit_can_sell_only_reconciled_remainder(tmp_path,
                 clock[0] += 1
                 live.run_once()
                 before_late = live.state.snapshot()
-                assert live.run_protection_once() == ()  # actual late fee proof fences this ordinary frame
+                assert explicit_historical_protection(live) == ()  # actual late fee proof fences this ordinary frame
                 assert live.status()['last_current_evidence'] == (first.request_id, 'protection_own_fill', 'applied')
                 late = live.state.snapshot()
                 assert late.sells[scope] == before_late.sells[scope]  # current native/quantity/source projection is untouched
