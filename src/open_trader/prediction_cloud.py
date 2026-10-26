@@ -1017,8 +1017,15 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
             since = evidence['systemd_started_at']
             if not since:
                 raise ValueError('log time boundary missing')
-            logs = run('journalctl', '-u', UNIT, '--since', since, '--no-pager', '-o', 'cat')
-            if not logs or 'prediction_runtime_state' not in logs or re.search(r'traceback|fatal|exception|error', logs, re.I):
+            try:
+                logs = subprocess.run(
+                    [str(c.python), str(c.release_root/'scripts/check_production_log.py'),
+                     '--journal-unit', UNIT, '--since', since, '--require-text', 'prediction_runtime_state'],
+                    check=False, capture_output=True, timeout=20,
+                )
+            except (OSError, subprocess.SubprocessError):
+                raise ValueError('runtime logs missing or contain errors') from None
+            if logs.returncode:
                 raise ValueError('runtime logs missing or contain errors')
             if live_identity(c) != evidence:
                 raise ValueError('owner changed during smoke')

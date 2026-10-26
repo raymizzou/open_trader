@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-26 — Unified production Smoke log checks
+
+- Run the same release-local standalone checker for file, cloud journal and local Gateway logs. Check all logs since startup, require existing runtime markers, and reject empty, unreadable or non-UTF-8 logs and journal failures.
+- Remove metadata warning exemptions and the 200-line window. Report `RemoteProtocolError` explicitly, preserve strict JSON validation and the proven healthy `last_error:null` exception, and retain all Smoke identity and business checks. No deployment is included.
+
 ## 2026-10-26 — Tokyo LP read-only monitoring
 
 - Add one cached LP summary for orders, durable cancellation audits, both pools, balance/capacity and exact own-account fills. Show Chinese status reasons and details at the top of the existing LP card; preserve its controls and all UNKNOWN values. Today uses Tokyo midnight.

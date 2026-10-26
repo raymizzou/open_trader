@@ -678,8 +678,8 @@ def test_scoped_smoke_preserves_prediction_pause_contract(
     ('FATAL worker stopped\n', False),
     ('Unhandled exception\n', False),
     (b'\xff\xfe\n', False),
-    ('ERROR outside retained window\n' + 'clean\n' * 200, True),
-    (b'\xff\n' + b'clean\n' * 200, True),
+    ('ERROR outside retained window\n' + 'clean\n' * 200, False),
+    (b'\xff\n' + b'clean\n' * 200, False),
 ])
 def test_smoke_log_checker_only_exempts_proven_healthy_null(tmp_path, log_content, healthy):
     result, calls = _run_smoke(tmp_path, services="prediction", log_content=log_content)

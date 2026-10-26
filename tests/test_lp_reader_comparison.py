@@ -403,6 +403,7 @@ def _assert_default_observation_streams(tmp_path, monkeypatch):
             root.addHandler(business_handler)
             root.setLevel(logging.INFO)
             logger.setLevel(logging.INFO)
+            logging.getLogger('test_business_startup').info('business startup ready')
             assert observer.offer(packet(old='8', new='8'))
             assert observer.wait_idle(timeout=3)
             assert written.wait(3), 'default observation output did not finish within the real watchdog'

@@ -146,9 +146,8 @@ def main():
             if before['status'] != 'CONNECTED':
                 raise ValueError('local client not connected')
             log = Path(local['runtime_root'])/'gateway.log'
-            text = log.read_text()
-            if 'frontend_gateway_runtime:' not in text or any(word in text.lower() for word in ('traceback','fatal','exception','error')):
-                raise ValueError('local Gateway log missing or contains errors')
+            checked([local['python'],str(release/'scripts/check_production_log.py'),
+                     '--file',str(log),'--require-text','frontend_gateway_runtime:'],cwd=release,env=env)
             checked([local['python'],'-m','pytest','-q','-m','browser'],cwd=release,env=env)
             checked([str(runner),'test','tests/e2e/production-smoke.spec.ts','--config=playwright.config.ts','--project=chromium'],cwd=release,env=env)
             if client_operation(local,'status') != before:
