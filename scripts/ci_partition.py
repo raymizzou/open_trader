@@ -122,6 +122,7 @@ def verify_partition(complete, partitions, retired=None, root=None, optional=Non
 
 
 def collect(root, paths, output, required=False):
+    root = root.resolve()
     env = dict(os.environ, CI_COLLECTION_OUTPUT=str(output), PYTHONDONTWRITEBYTECODE='1',
                PYTHONPATH=os.pathsep.join([str(root), str(root / 'src'), str(Path(__file__).resolve().parents[1])]))
     command = [sys.executable, '-B', '-m', 'pytest', '-p', 'no:cacheprovider', '--collect-only', '-q', '--rootdir='+str(root), '-p', 'scripts.ci_partition',

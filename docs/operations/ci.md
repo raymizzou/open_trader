@@ -53,7 +53,7 @@ The retained standalone trend-curve job stays skipped because the legacy suite
 already includes its tests. Make and `scripts/ci_evidence.py` share one service selection entry point.
 Update that selector's service prefixes for new service-specific test families.
 The [explicit retirement manifest](ci-nleg-retirement.md) omits exactly 29 reviewed
-N-leg files from default execution. The 279 exact release-test identities described below
+N-leg files from default execution. The 273 exact release-test identities described below
 are advisory; all other active tests remain required, including the three
 mixed/shared files, LP and pause guards. Production pause state is unchanged.
 Unknown/new files do not inherit retirement from their names.
@@ -105,11 +105,11 @@ required check permanently pending.
 
 ## Release advisory
 
-`scripts/ci_optional_tests.json` declares 279 reviewed full nodeids under
-`release-advisory-v1`: the existing rollback regression plus 278 release,
+`scripts/ci_optional_tests.json` declares 273 reviewed full nodeids under
+`release-advisory-v1`: the existing rollback regression plus 272 release,
 installer and manager cases across ten files. The selector pins the sorted
 literal set to SHA-256
-`607edf6f00872abe4e5c8de99d5d73828fd63a7915fbb313dde0a1c448071621`.
+`0343677be27fc53783631374b15fb20de6985d5f821f45aa5efa002918af3e78`.
 Tests and business assertions stay unchanged. Required Prediction CI excludes
 only these canonical identities, before xdist adds execution group names.
 New names and new parameter identities stay required; no file, function prefix
@@ -230,9 +230,9 @@ release retains its five-scope contract; a new selected release requires all
 seven exact scopes, ordered and with distinct positive IDs and valid digests.
 Unknown selected contracts fail closed. Runtime and trading decisions are unchanged.
 
-OQ3 moves 55 exact startup/install identities to the existing advisory allowlist,
-including all 39 lp410 cases, instance health/parallel identity and pure Runtime
-resource/owner startup checks. Real process death, installation and competing
+OQ3 moves 49 exact startup/install identities to the existing advisory allowlist,
+including all 39 lp410 cases, instance health/parallel identity and five pure Runtime
+resource startup checks. Real process death, installation and competing
 process tests still execute as actual processes. Current-account financial
 recovery, UNKNOWN, no-replay, in-flight native/HTTP drain and SSM runtime checks
 remain required. Future names and parameter identities remain required. The
@@ -242,3 +242,23 @@ preflight; its original result and evidence remain visible.
 See [current-service test coverage](ci-current-service-tests.md) for the migrated
 scenario families, retained real-process boundaries, source-template/cache rules
 and focused local runner setup.
+
+
+## Shard allocation limits
+
+The six fatal-stop/owner-lock cases named in
+[`test_terminal_failure_and_owner_lock_cases_remain_required`](../../tests/test_ci_optional.py)
+remain required, including actual process exclusion/death and terminal failure.
+They are outside the 273 literal advisory identities. Their restoration changes
+routing, not their assertions or process boundaries.
+
+Function-name hashing gives deterministic identity and parameter grouping; it
+is not a measured timing balance. Hosted per-machine durations and three
+consecutive main-run timing results remain UNKNOWN. The fixed three/four shard
+counts are repeated in workflow matrices, partition/evidence selection, preflight
+scopes and the production validator's accepted binding tuples. This is a known
+compatibility and maintenance cost. Future balancing needs measured per-machine
+data and an approved scoped PR; it is not authorized automatically.
+
+Required CLI output separates malformed job-result JSON from bounded artifact
+validation reasons. A useful error message never changes the fail-closed verdict.

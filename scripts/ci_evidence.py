@@ -21,8 +21,8 @@ def file_sha256(path):
 OPTIONAL_POLICY = 'release-advisory-v1'
 # Reviewed full parameterized identities, pinned independently of manifest bytes.
 # A new function or parameter instance stays required until explicitly reviewed.
-OPTIONAL_COUNT = 279
-OPTIONAL_NODEIDS_SHA256 = '607edf6f00872abe4e5c8de99d5d73828fd63a7915fbb313dde0a1c448071621'
+OPTIONAL_COUNT = 273
+OPTIONAL_NODEIDS_SHA256 = '0343677be27fc53783631374b15fb20de6985d5f821f45aa5efa002918af3e78'
 
 
 def optional_policy(root):

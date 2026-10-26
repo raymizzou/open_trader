@@ -73,16 +73,26 @@ def main():
     args = parser.parse_args()
     if args.command == 'required':
         try:
-            ok, reason = required(json.load(sys.stdin))
-            if ok:
-                if args.evidence is None:
-                    raise ValueError('required execution artifacts missing')
-                spec = importlib.util.spec_from_file_location('aggregate_evidence', Path(__file__).with_name('ci_evidence.py'))
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                module.validate_required_directory(Path(__file__).resolve().parents[1], args.evidence, os.environ)
-        except (ValueError, KeyError, TypeError, OSError):
+            needs = json.load(sys.stdin)
+        except (ValueError, TypeError):
             ok, reason = False, 'invalid job-result JSON'
+        else:
+            try:
+                ok, reason = required(needs)
+                if ok:
+                    if args.evidence is None:
+                        raise ValueError('required execution artifacts missing')
+                    spec = importlib.util.spec_from_file_location('aggregate_evidence', Path(__file__).with_name('ci_evidence.py'))
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    module.validate_required_directory(Path(__file__).resolve().parents[1], args.evidence, os.environ)
+            except (ValueError, KeyError, TypeError, OSError) as error:
+                if isinstance(error, OSError):detail = error.strerror or type(error).__name__
+                elif isinstance(error, KeyError):detail = 'missing required artifact field'
+                elif isinstance(error, TypeError):detail = 'malformed required artifact field'
+                else:detail = str(error)
+                detail = ''.join(char if char.isprintable() else ' ' for char in detail)[:240]
+                ok, reason = False, 'artifact validation failed: ' + detail
         print(('PASS: ' if ok else 'FAIL: ') + reason)
         return 0 if ok else 1
     head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()

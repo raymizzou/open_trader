@@ -49,7 +49,7 @@ Each service's recorded executions must equal its required partition in the
 portable collection proof. Prediction's three machines must cover that one
 partition without overlap; all seven required artifact scopes are checked for
 the exact selected SHA, run and attempt. Required, optional and retired collections must be
-pairwise disjoint and complete. The 279 exact reviewed release-test identities in
+pairwise disjoint and complete. The 273 exact reviewed release-test identities in
 `scripts/ci_optional_tests.json` (`release-advisory-v1`) are classified as `not-executed-advisory`, never
 passed by declaration. Their separate Release advisory workflow runs automatically only on main
 pushes, with a manual entry; its success is not a preflight wait or gate, and
@@ -193,3 +193,12 @@ for old immutable releases, seven for the new sharded contract. A five-entry
 binding cannot satisfy the new release. Unknown contracts, wrong scope order,
 duplicate IDs and malformed digests remain errors; rollback does not inherit the
 new manager's artifact count merely because the manager source is newer.
+
+
+The manager parses the selected script's exact tracked bytes and reads one
+unambiguous literal top-level `SCOPES` assignment. It does not execute the script
+or change global bytecode settings. Missing, repeated, augmented and nonliteral
+assignments fail closed. Six fatal-stop/owner-lock tests remain required; the
+remaining 273 advisory identities cannot replace required artifacts. See
+[shard allocation limits](ci.md#shard-allocation-limits) for the fixed-count cost
+and unverified hosted timing.

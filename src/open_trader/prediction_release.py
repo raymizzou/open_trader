@@ -538,7 +538,7 @@ def selected_lp_config(path, *, uid, gid=None):
 def validate_lp_validation(binding,*,release_root,runtime_root,python,config_path=None,
                            config_uid=None,config_gid=None,verify_config=True):
     """Check an internally retained exact binding, never infer validation from READY."""
-    import hashlib,re,sys
+    import ast,hashlib,re
     source=inspect_prediction_release_checkout(release_root)
     root=Path(release_root).resolve();runtime_root=Path(runtime_root).resolve()
     keys={'schema_version','source_sha','release_root','runtime_root','python','runtime','capability_digest','ci','operation_nonce','config_selection'}
@@ -565,21 +565,25 @@ def validate_lp_validation(binding,*,release_root,runtime_root,python,config_pat
             or type(report['extras']) is not list or type(report['dependencies']) is not dict or not report['dependencies']
             or any(type(report[k]) is not str or not report[k] for k in ('python_version','platform','provenance'))):
         raise ValueError('LP retained interpreter/lock report invalid')
-    import importlib.util
     contract=root/'scripts/deployment_preflight.py'
     if contract.is_symlink() or not contract.resolve().is_relative_to(root):
         raise ValueError('LP selected CI contract invalid')
-    previous=sys.dont_write_bytecode
     try:
         committed=subprocess.check_output(['git','-C',str(root),'show','HEAD:scripts/deployment_preflight.py'])
         if contract.read_bytes()!=committed:raise ValueError('LP selected CI contract is not exact tracked source')
-        sys.dont_write_bytecode=True
-        spec=importlib.util.spec_from_file_location('lp_selected_ci_contract',contract)
-        verifier=importlib.util.module_from_spec(spec);spec.loader.exec_module(verifier)
-        scopes=verifier.SCOPES
-    except (OSError,AttributeError,ImportError,SyntaxError,subprocess.CalledProcessError) as exc:
+        values=[]
+        for statement in ast.parse(committed).body:
+            targets=(statement.targets if isinstance(statement,ast.Assign) else
+                [statement.target] if isinstance(statement,(ast.AnnAssign,ast.AugAssign)) else [])
+            if any(isinstance(node,ast.Name) and node.id=='SCOPES' for target in targets for node in ast.walk(target)):
+                if (isinstance(statement,ast.AugAssign) or len(targets)!=1
+                        or not isinstance(targets[0],ast.Name)):
+                    raise ValueError('ambiguous selected SCOPES')
+                values.append(statement.value)
+        if len(values)!=1:raise ValueError('missing or ambiguous selected SCOPES')
+        scopes=ast.literal_eval(values[0])
+    except (OSError,SyntaxError,ValueError,TypeError,subprocess.CalledProcessError) as exc:
         raise ValueError('LP selected CI contract unavailable') from exc
-    finally:sys.dont_write_bytecode=previous
     if type(scopes) is not tuple or scopes not in (
             ('gateway','legacy','account','prediction','portable'),
             ('gateway','legacy','account','prediction-1','prediction-2','prediction-3','portable')):

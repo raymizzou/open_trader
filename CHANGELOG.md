@@ -1,10 +1,20 @@
 # Changelog
 
+## 2026-10-26 — CI review repairs and required owner guards
+
+- Keep six fatal-stop and owner-lock regressions in required CI. Add real awaiting-receipt takeover parity, preserve caller state on incomplete harness setup, and build Runtime source templates without socket binding.
+- Preserve canonical collection identities through symlinks, read selected-release artifact scopes as literals without executing source, and report bounded aggregation failure reasons. Hosted shard timing remains unverified.
+
 ## 2026-10-26 — CI machines and current-service test startup
 
 - Split required Prediction coverage across three machines with two workers each. Run the exact reviewed release advisory cases on four serial machines, with lp410 on two. Keep business, UNKNOWN, no-replay, ownership and native-drain checks required. Preserve main-only CI triggers and the separate deployment authorization.
 - Verify all seven required artifact payloads and their exact source, lock, environment, run, attempt and executed-node union. Bind retained LP validation references to the selected release's five- or seven-scope contract, so old verified rollback releases remain usable without accepting incomplete current evidence.
 - Reuse real killed-owner snapshots and a read-only source template. Compare migrated current-service scenarios with real children, retain process-boundary tests and record startup phases. Financial, order identity and negative assertions remain in place; trading behavior is unchanged.
+
+## 2026-10-26 — Unified production Smoke log checks
+
+- Run the same release-local standalone checker for file, cloud journal and local Gateway logs. Check all logs since startup, require existing runtime markers, and reject empty, unreadable or non-UTF-8 logs and journal failures.
+- Remove metadata warning exemptions and the 200-line window. Report `RemoteProtocolError` explicitly, preserve strict JSON validation and the proven healthy `last_error:null` exception, and retain all Smoke identity and business checks. No deployment is included.
 
 ## 2026-10-26 — Departed income test account publication
 

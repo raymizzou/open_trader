@@ -619,7 +619,11 @@ server.serve_forever()
             stdout=''
         elif args[0]=='ss':
             stdout=f'LISTEN 0 100 127.0.0.1:8769 0.0.0.0:* users:(("python",pid={proc.pid},fd=3))' if proc.poll() is None else ''
-        elif args[0]=='journalctl':stdout='prediction_runtime_state state=RUNNING'
+        elif list(args) == [str(cfg.python), str(release/'scripts/check_production_log.py'),
+                           '--journal-unit', 'open-trader-prediction.service', '--since', '2026-09-29 00:00:00 UTC',
+                           '--require-text', 'prediction_runtime_state']:
+            assert kwargs['timeout'] > 15
+            stdout=''
         else:return original_run(args,**kwargs)
         return subprocess.CompletedProcess(args,0,stdout,'')
     def wait_ready():
@@ -806,7 +810,7 @@ def test_cloud_display_smoke_accepts_reward_usd_unknown_and_records_source_evide
     'missing_n_leg_paused', 'missing_credential_backend', 'missing_status',
     'candidate_exclusions', 'missing_candidate_exclusions',
     'missing_display_snapshot', 'stale_display_snapshot', 'missing_snapshot_account',
-    'missing_snapshot_time', 'changed_extra_identity',
+    'missing_snapshot_time', 'changed_extra_identity', 'gateway-healthy-json', 'gateway-protocol',
 ])
 @pytest.mark.parametrize('observation', ['before', 'after'])
 def test_two_host_smoke_revalidates_refresh_and_stable_identity(tmp_path, monkeypatch, capsys, change, observation):
@@ -820,7 +824,7 @@ def test_two_host_smoke_revalidates_refresh_and_stable_identity(tmp_path, monkey
     cfg = CloudConfig(tmp_path/'release', tmp_path/'remote', tmp_path/'python',
         'prediction', 'a'*40, '', '', '', '', 'shadow', 1, 'file', '/private/wallet.json')
     local = dict(release_root=str(cfg.release_root), runtime_root=str(tmp_path/'client'),
-        python=str(cfg.python), ssh_alias='fixture', expected_sha='b'*40,
+        python=sys.executable, ssh_alias='fixture', expected_sha='b'*40,
         cloud_expected_sha=cfg.expected_sha, execution_port=8769,
         execution_expected_sha='c'*40, gateway_port=8766, tunnel_port=8879, mode='shadow')
     client_config = tmp_path/'client.json'; client_config.write_text(json.dumps(local))
@@ -829,7 +833,14 @@ def test_two_host_smoke_revalidates_refresh_and_stable_identity(tmp_path, monkey
         resources_reviewed=True, resources_reviewed_evidence='offline fixture')))
     cfg.runtime_root.mkdir()
     Path(local['runtime_root']).mkdir()
-    (Path(local['runtime_root'])/'gateway.log').write_text('frontend_gateway_runtime: started\n')
+    import shutil, subprocess
+    scripts = cfg.release_root/'scripts'; scripts.mkdir(parents=True)
+    shutil.copyfile(Path(__file__).resolve().parents[1]/'scripts/check_production_log.py', scripts/'check_production_log.py')
+    log = 'frontend_gateway_runtime: started\n'
+    if change == 'gateway-healthy-json':
+        log += '{"level":"INFO","status":"healthy","degraded_reasons":[],"last_error":null}\n'
+    elif change == 'gateway-protocol': log += 'RemoteProtocolError private-log-sentinel\n'
+    (Path(local['runtime_root'])/'gateway.log').write_text(log)
     monkeypatch.setattr(gate, 'load_config', lambda path: cfg)
     monkeypatch.setattr(gate, 'validate', lambda value: None)
     monkeypatch.setattr(gate, 'inspect_prediction_release_checkout', lambda path: {'git_sha':local['expected_sha']})
@@ -857,24 +868,40 @@ def test_two_host_smoke_revalidates_refresh_and_stable_identity(tmp_path, monkey
         changed.pop(change.removeprefix('missing_'))
     elif change == 'stale_display_snapshot':
         changed['display_snapshot']['account']['checked_at'] = (datetime.now(UTC)-timedelta(seconds=61)).isoformat()
-    elif change != 'refresh':
+    elif change not in ('refresh', 'gateway-healthy-json', 'gateway-protocol'):
         changed[change] = {'pid':124, 'n_leg_paused':0}.get(change, 'changed')
-    remote_results = iter([before, after]); ssh_calls = []
-    def checked(command, **kwargs):
+    remote_results = iter([before, after]); ssh_calls = []; browser_calls = []; checker_calls = []
+    native_run = subprocess.run
+    checker = [local['python'], str(scripts/'check_production_log.py'), '--file',
+        str(Path(local['runtime_root'])/'gateway.log'), '--require-text', 'frontend_gateway_runtime:']
+    def external(command, **kwargs):
         if command[0] == 'ssh':
             ssh_calls.append(command)
-            return json.dumps(next(remote_results))
-        if command[0] == 'git': return 'HEAD\n'
-        return ''
-    monkeypatch.setattr(gate, 'checked', checked)
+            return subprocess.CompletedProcess(command, 0, json.dumps(next(remote_results)), '')
+        if command[0] == 'git': return subprocess.CompletedProcess(command, 0, 'HEAD\n', '')
+        if command == checker:
+            checker_calls.append(command)
+            assert kwargs['cwd'] == cfg.release_root
+            return native_run(command, **kwargs)
+        if command[:6] == [local['python'], '-m', 'pytest', '-q', '-m', 'browser'] or str(command[0]).endswith('node_modules/.bin/playwright'):
+            browser_calls.append(command)
+            return subprocess.CompletedProcess(command, 0, '', '')
+        raise AssertionError('uncontrolled external command: ' + str(command))
+    monkeypatch.setattr(subprocess, 'run', external)
     monkeypatch.setattr(sys, 'argv', ['gate', 'smoke', '--client-config',str(client_config),
         '--service-config',str(tmp_path/'unused'), '--remote-config','/etc/cloud.json',
         '--operator-evidence',str(operator), '--browser-runtime',str(tmp_path)])
-    assert gate.main() == (0 if change == 'refresh' else 2)
-    assert capsys.readouterr().out.endswith('HEALTHY\n' if change == 'refresh' else 'ROLLBACK\n')
-    early_rejection = observation == 'before' and change not in {
-        'refresh', 'pid', 'started_at', 'systemd_started_at', 'changed_extra_identity'}
+    healthy = change in ('refresh', 'gateway-healthy-json')
+    assert gate.main() == (0 if healthy else 2)
+    output = capsys.readouterr().out
+    assert output.endswith('HEALTHY\n' if healthy else 'ROLLBACK\n')
+    assert 'private-log-sentinel' not in output
+    early_rejection = change == 'gateway-protocol' or observation == 'before' and change not in {
+        'refresh', 'pid', 'started_at', 'systemd_started_at', 'changed_extra_identity', 'gateway-healthy-json'}
     assert len(ssh_calls) == (1 if early_rejection else 2)
+    if change.startswith('gateway-'):
+        assert checker_calls == [checker]
+        assert len(browser_calls) == (2 if healthy else 0)
 
 
 def test_cloud_candidate_exclusions_config_is_strict_and_disabled_unit_compatible():
@@ -991,7 +1018,17 @@ def test_cloud_candidate_exclusions_live_identity_checks_effective_process_switc
         cloud.record(config, 'ready', ready=identity)
         health['n_leg'] = dict(status='paused', code='N_LEG_PAUSED')
         monkeypatch.setattr(cloud, 'read_status', lambda port, path: 503)
-        monkeypatch.setattr(cloud, 'run', lambda *args: 'prediction_runtime_state state=RUNNING')
+        import subprocess
+        native_run = subprocess.run
+        checker = [str(config.python), str(config.release_root/'scripts/check_production_log.py'),
+            '--journal-unit', 'open-trader-prediction.service', '--since', 'fixture-systemd-start',
+            '--require-text', 'prediction_runtime_state']
+        def external_check(command, **kwargs):
+            if list(command) == checker:
+                assert kwargs['timeout'] > 15
+                return subprocess.CompletedProcess(command, 0, b'', b'')
+            return native_run(command, **kwargs)
+        monkeypatch.setattr(subprocess, 'run', external_check)
         smoke = cloud.operate(config, 'smoke')
         assert smoke['status'] == 'BACKEND_SMOKE_OK'
         assert smoke['candidate_exclusions'] is enabled
@@ -1298,14 +1335,32 @@ def test_parallel_instance_identity_is_bound_to_installed_and_live_config(parall
                 return super().getresponse()
         monkeypatch.setattr(http.client,'HTTPConnection',ExternalClientHTTP)
         native_run=subprocess.run
+        checker=[local['python'],str(Path(local['release_root'])/'scripts/check_production_log.py'),
+            '--file',str(client_root/'gateway.log'),'--require-text','frontend_gateway_runtime:']
+        checker_calls=[];browser_calls=[]
         def browser_process(command,*args,**kwargs):
+            if command==checker:
+                checker_calls.append(command)
+                assert kwargs['cwd']==Path(local['release_root'])
             if command[:6]==[sys.executable,'-m','pytest','-q','-m','browser']:
+                browser_calls.append(command)
                 return subprocess.CompletedProcess(command,0,'','')
             return native_run(command,*args,**kwargs)
         monkeypatch.setattr(subprocess,'run',browser_process)
         sys.argv[1]='smoke'
-        assert fixture['gate'].main()==0
-        assert capsys.readouterr().out.endswith('HEALTHY\n')
+        for extra,healthy in [('',True),
+                ('{"level":"INFO","status":"healthy","degraded_reasons":[],"last_error":null}\n',True),
+                ('RemoteProtocolError private-log-sentinel\n',False)]:
+            (client_root/'gateway.log').write_text('frontend_gateway_runtime: started\n'+extra)
+            fixture['calls'].clear();checker_calls.clear();browser_calls.clear()
+            assert fixture['gate'].main()==(0 if healthy else 2)
+            output=capsys.readouterr().out
+            assert output.endswith('HEALTHY\n' if healthy else 'ROLLBACK\n')
+            assert 'private-log-sentinel' not in output
+            assert checker_calls==[checker]
+            assert len(browser_calls)==(1 if healthy else 0)
+            assert sum(command[0]=='ssh' for command in fixture['calls'])==(2 if healthy else 1)
+            assert any(str(command[0]).endswith('node_modules/.bin/playwright') for command in fixture['calls']) is healthy
         # A validly shaped live identity cannot claim a different config/process.
         for key in ('config_path','config_sha256','runtime_root','source_sha','instance_id'):
             wrong=json.loads(json.dumps(fixture['result']))
@@ -1322,3 +1377,52 @@ def test_parallel_instance_identity_is_bound_to_installed_and_live_config(parall
             assert 'selected LP instance differs from installed service' in denied.output.read_text()
             assert denied.actual_posts()==0
             denied.assert_owner_available()
+
+
+@pytest.mark.parametrize('case', ['clean', 'checker-failure', 'missing-start', 'owner-changed'])
+def test_cloud_smoke_uses_release_checker_and_rejects_failure(tmp_path, monkeypatch, case):
+    import subprocess
+    from tests.test_prediction_retirement_lifecycle import cloud_host_fixture
+    import open_trader.prediction_cloud as cloud
+    cfg, state, commands, requests = cloud_host_fixture(tmp_path, monkeypatch, 'production', 0)
+    state['active'] = True
+    expected = [str(cfg.python), str(cfg.release_root/'scripts/check_production_log.py'),
+        '--journal-unit', 'open-trader-prediction.service', '--since', 'systemd-start',
+        '--require-text', 'prediction_runtime_state']
+    external = subprocess.run
+    checks = []
+    def run(command, **kwargs):
+        args = list(command)
+        if args[:2] == expected[:2]:
+            commands.append(args)
+            checks.append((args, kwargs))
+            if case == 'owner-changed': state['health']['started_at'] = 'replacement-process'
+            return subprocess.CompletedProcess(command, 1 if case == 'checker-failure' else 0,
+                '', 'private-checker-sentinel')
+        result = external(command, **kwargs)
+        if case == 'missing-start' and args[:2] == ['systemctl', 'show']:
+            result.stdout = result.stdout.replace('ExecMainStartTimestamp=systemd-start', 'ExecMainStartTimestamp=')
+        return result
+    monkeypatch.setattr(subprocess, 'run', run)
+    error = {'checker-failure':'runtime logs missing or contain errors',
+             'missing-start':'log time boundary missing', 'owner-changed':'owner changed during smoke'}
+    before = {path:path.read_bytes() for path in (cfg.record, cloud.UNIT_PATH,
+              cfg.runtime_root/'config/prediction_arbitrage.json')}
+    if case == 'clean':
+        result = cloud.operate(cfg, 'smoke')
+        assert result['status'] == 'BACKEND_SMOKE_OK'
+        assert result['pid'] == 12345 and result['started_at'] == 'process-start'
+        assert result['n_leg_paused'] == 1 and result['configured_n_leg_paused'] == 0
+    else:
+        with pytest.raises(ValueError, match=error[case]) as failure:
+            cloud.operate(cfg, 'smoke')
+        assert 'private-checker-sentinel' not in str(failure.value)
+    assert {path:path.read_bytes() for path in before} == before
+    if case == 'missing-start':
+        assert checks == []
+    else:
+        assert len(checks) == 1 and checks[0][0] == expected
+        assert checks[0][1]['timeout'] > 15
+    assert '/api/prediction-arbitrage/state' not in requests
+    assert '/api/prediction-arbitrage/lp/dashboard' in requests
+    assert all(command[:2] not in (['systemctl','start'], ['systemctl','stop']) for command in commands)

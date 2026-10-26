@@ -9,14 +9,14 @@ An assertion-failure case also checks restoration and owner release.
 | Family | Current-path coverage | Real process coverage retained |
 | --- | --- | --- |
 | Dead owner | Copies of real killed-owner databases, current-account exposure, unchanged historical actions and no replay | Signing, before-POST-marker and awaiting-receipt death/lock-release proofs; live-owner negatives |
-| Takeover | Known account, incomplete orders/positions, foreign identity, restart and manual idempotency | Each mode has a real-child parity smoke |
+| Takeover | Known account, incomplete orders/positions, foreign identity, restart, manual idempotency and awaiting-receipt takeover | Each mode has a real-child parity smoke |
 | Observed pools | Populated trial/income order membership and exact current financial state | Real-child parity with independent membership expectations |
 | Runtime stale/UNKNOWN | Actual current Runtime with stale bookkeeping or incomplete account facts | One real-child parity smoke per mode |
 | Background work | Candidate queue, trial maintenance, four preparation outcomes and five blocked optional sources | One real-child comparison per scenario |
 | Restart observations | N-leg pause, preserved manual orders and stale daily-report history | One real-child comparison per scenario, including original restart assertions |
 | Process/installation boundaries | Original tests and assertions | Actual death, competing-process locks, installed identity, HTTP/native drain and startup cleanup stay real |
 
-`tests/test_lp_service_harness.py` contains 23 parity scenarios. It compares
+`tests/test_lp_service_harness.py` contains 24 parity scenarios. It compares
 POST/CANCEL arguments and current financial/account/pool outputs. Only fresh
 source/observation IDs are renamed to compare their equality relationships;
 account, order, token, monetary and request terms remain exact. Original
@@ -84,29 +84,29 @@ Baseline: `664194cd79069cded9e4cdfe03868bebdc27ed60`. Each row names an original
 
 The common takeover check retains all 20 original expressions and adds two independent observed-pool assertions. These include `state["intents"] == audit`, unchanged historical `lp_actions`, exact current money and the zero-POST/single-manual-POST checks. Its manual/idless callers continue through the same `_check_idless_buy_guard` chain. The three extracted Runtime checks retain all original expressions: N-leg pause 91 = 81 + 10, manual restart 21 = 9 + 12, stale report 24 = 16 + 8. Setup, process-death and cleanup assertions are included in those totals.
 
-The CI format expectations below deliberately change with the approved seven-artifact/279-node contract. All other original assertion expressions and negative cases in each listed function remain. `old5/new7` refers to gateway, legacy, account, one/three Prediction scopes and portable. `oldHash/newHash` is the literal optional-node SHA256 in the test: `913655864de870f8f83f9e59695840d42bee775b49c3dbc535a7105698b2c82d` → `607edf6f00872abe4e5c8de99d5d73828fd63a7915fbb313dde0a1c448071621`.
+The CI format expectations below deliberately change with the approved seven-artifact/273-node contract. All other original assertion expressions and negative cases in each listed function remain. `old5/new7` refers to gateway, legacy, account, one/three Prediction scopes and portable. `oldHash/newHash` is the literal optional-node SHA256 in the test: `913655864de870f8f83f9e59695840d42bee775b49c3dbc535a7105698b2c82d` → `0343677be27fc53783631374b15fb20de6985d5f821f45aa5efa002918af3e78`.
 
 | Original test function | Cases / identities | Shared check | Original → current expectation |
 | --- | --- | --- | --- |
-| [`PartitionTests::test_executed_and_retired_collections_cover_universe`](../../tests/test_ci_evidence.py#L25) | 1; unchanged | actual CI module / runner | `complete_count == 230/231` → `285/286`; missing, duplicate and retired negatives unchanged |
-| [`PartitionTests::test_exact_nodeid_partition_and_fingerprints`](../../tests/test_ci_evidence.py#L54) | 1; unchanged | actual CI module / runner | `complete_count == 228` → `283`; exact fingerprints unchanged |
+| [`PartitionTests::test_executed_and_retired_collections_cover_universe`](../../tests/test_ci_evidence.py#L25) | 1; unchanged | actual CI module / runner | `complete_count == 230/231` → `279/280`; missing, duplicate and retired negatives unchanged |
+| [`PartitionTests::test_exact_nodeid_partition_and_fingerprints`](../../tests/test_ci_evidence.py#L54) | 1; unchanged | actual CI module / runner | `complete_count == 228` → `277`; exact fingerprints unchanged |
 | [`EvidenceTests::test_selection_is_exact_make_partition_and_serial_portable`](../../tests/test_ci_evidence.py#L245) | 1; unchanged | actual CI module / runner | `deselect=OPTIONAL` on Prediction only → every backend scope; portable serial selection unchanged |
-| [`OptionalPolicyTests::test_only_reviewed_release_nodes_are_optional`](../../tests/test_ci_optional.py#L64) | 1; unchanged | `policy_root` / actual CI script | `len(reviewed) == 224` → `279`; `oldHash` → `newHash` |
-| [`OptionalPolicyTests::test_invalid_missing_or_expanded_optional_declarations_fail`](../../tests/test_ci_optional.py#L96) | 1; unchanged | `policy_root` / actual CI script | `len(reviewed) == 224` → `279`; malformed/missing/expanded rejection unchanged |
-| [`OptionalPolicyTests::test_required_optional_retired_form_disjoint_complete_partition`](../../tests/test_ci_optional.py#L131) | 1; unchanged | `policy_root` / actual CI script | optional/advisory `224` → `279`, complete `230` → `285`, `oldHash` → `newHash`; disjointness unchanged |
-| [`OptionalRunnerTests::test_optional_failure_preserves_exit_status_and_evidence`](../../tests/test_ci_optional.py#L182) | 1; unchanged | `policy_root` / actual CI script | selected optional count `224` → `279`; exit 7, failure evidence and metrics assertions unchanged |
+| [`OptionalPolicyTests::test_only_reviewed_release_nodes_are_optional`](../../tests/test_ci_optional.py#L64) | 1; unchanged | `policy_root` / actual CI script | `len(reviewed) == 224` → `273`; `oldHash` → `newHash` |
+| [`OptionalPolicyTests::test_invalid_missing_or_expanded_optional_declarations_fail`](../../tests/test_ci_optional.py#L96) | 1; unchanged | `policy_root` / actual CI script | `len(reviewed) == 224` → `273`; malformed/missing/expanded rejection unchanged |
+| [`OptionalPolicyTests::test_required_optional_retired_form_disjoint_complete_partition`](../../tests/test_ci_optional.py#L131) | 1; unchanged | `policy_root` / actual CI script | optional/advisory `224` → `273`, complete `230` → `279`, `oldHash` → `newHash`; disjointness unchanged |
+| [`OptionalRunnerTests::test_optional_failure_preserves_exit_status_and_evidence`](../../tests/test_ci_optional.py#L182) | 1; unchanged | `policy_root` / actual CI script | selected optional count `224` → `273`; exit 7, failure evidence and metrics assertions unchanged |
 | [`OptionalWorkflowTests::test_advisory_runs_separately_without_required_dependency`](../../tests/test_ci_optional.py#L229) | 1; unchanged | `policy_root` / actual CI script | runner/artifact `release-advisory` → `release-advisory-${{ matrix.shard }}`; required independence unchanged |
-| [`OptionalPreflightTests::test_required_success_accepts_explicit_optional_policy_without_optional_pass`](../../tests/test_ci_optional.py#L266) | 1; unchanged | `policy_root` / actual CI script | artifact count `5` → `7`, optional `224` → `279`, `oldHash` → `newHash`; advisory remains not executed |
+| [`OptionalPreflightTests::test_required_success_accepts_explicit_optional_policy_without_optional_pass`](../../tests/test_ci_optional.py#L266) | 1; unchanged | `policy_root` / actual CI script | artifact count `5` → `7`, optional `224` → `273`, `oldHash` → `newHash`; advisory remains not executed |
 | [`OptionalPreflightTests::test_optional_policy_cannot_hide_other_missing_or_failed_tests`](../../tests/test_ci_optional.py#L285) | 1; unchanged | `policy_root` / actual CI script | All rejection expressions unchanged; target portable artifact index `4` → `6` |
-| [`OptionalFixtureTests::test_actual_release_fixture_preserves_required_optional_proof`](../../tests/test_ci_optional.py#L364) | 1; unchanged | `policy_root` / actual CI script | optional `224` → `279`, file count `7` → `10`, `oldHash` → `newHash`; exact Prediction nodes now equal the selected shard |
+| [`OptionalFixtureTests::test_actual_release_fixture_preserves_required_optional_proof`](../../tests/test_ci_optional.py#L364) | 1; unchanged | `policy_root` / actual CI script | optional `224` → `273`, file count `7` → `10`, `oldHash` → `newHash`; exact Prediction nodes now equal the selected shard |
 | [`OptionalFixtureTests::test_actual_release_fixture_rejects_missing_required_and_tampered_optional_policy`](../../tests/test_ci_optional.py#L405) | 1; unchanged | `policy_root` / actual CI script | All rejection expressions unchanged; proof artifact ID `5` → `7` |
-| [`RoutingTests::test_plan_output_uses_only_fingerprinted_optional_summary`](../../tests/test_ci_routing.py#L100) | 1; unchanged | actual CI module / runner | `len(nodes) == 224` → `279`; independent manifest/set hashes updated to approved literal identities |
-| [`RequiredTests::test_optional_plan_summary_tampering_fails_closed`](../../tests/test_ci_routing.py#L206) | 1; unchanged | actual CI module / runner | Assertions unchanged; invalid optional count `223` → `278` |
+| [`RoutingTests::test_plan_output_uses_only_fingerprinted_optional_summary`](../../tests/test_ci_routing.py#L100) | 1; unchanged | actual CI module / runner | `len(nodes) == 224` → `273`; independent manifest/set hashes updated to approved literal identities |
+| [`RequiredTests::test_optional_plan_summary_tampering_fails_closed`](../../tests/test_ci_routing.py#L206) | 1; unchanged | actual CI module / runner | Assertions unchanged; invalid optional count `223` → `272` |
 | [`WorkflowTests::test_fixed_required_check_and_all_service_results`](../../tests/test_ci_workflow.py#L38) | 1; unchanged | actual CI module / runner | Assertions unchanged; expected workflow scope `prediction` → `prediction-${{ matrix.shard }}` |
 | [`WorkflowTests::test_runner_uses_existing_offline_make_gate_and_records_evidence`](../../tests/test_ci_workflow.py#L56) | 1; unchanged | actual CI module / runner | two-worker shell predicate `$scope` → normalized `$service`; workers remain 2 |
 | [`WorkflowTests::test_serial_and_shared_session_contracts_are_preserved`](../../tests/test_ci_workflow.py#L81) | 1; unchanged | actual CI module / runner | two-worker shell predicate `$scope` → normalized `$service`; serial/loadgroup checks unchanged |
 | [`test_trusted_main_manual_run_is_accepted_with_bound_artifacts`](../../tests/test_deployment_preflight.py#L243) | 1; unchanged | `evidence` / `verify_ci` | `len(report["artifacts"]) == 5` → `7`; manual event/run/attempt assertions unchanged |
-| [`test_trusted_main_active_coverage_is_accepted`](../../tests/test_deployment_preflight.py#L259) | 1; unchanged | `evidence` / `verify_ci` | artifact `5` → `7`, optional `224` → `279`; `executed + 29 + 224 == complete` → `executed + 29 + 279 == complete` |
+| [`test_trusted_main_active_coverage_is_accepted`](../../tests/test_deployment_preflight.py#L259) | 1; unchanged | `evidence` / `verify_ci` | artifact `5` → `7`, optional `224` → `273`; `executed + 29 + 224 == complete` → `executed + 29 + 273 == complete` |
 | [`test_active_coverage_tampering_is_rejected`](../../tests/test_deployment_preflight.py#L560) | 9; unchanged | `evidence` / `verify_ci` | All nine parameter identities/rejections unchanged; select the shard containing the target node instead of old position |
 | [`test_measurement_artifact_tampering_is_rejected`](../../tests/test_deployment_preflight.py#L600) | 12; unchanged | `evidence` / `verify_ci` | All 12 parameter identities and assertion expressions unchanged; find the literal-parameter shard by identity |
 | [`test_production_first_install_records_only_observed_ready_evidence`](../../tests/test_prediction_release_launchd.py#L750) | 1; unchanged | `release_harness` | All 28 assertion expressions unchanged; independently constructed expected artifact list `old5` → `new7` |
@@ -124,3 +124,37 @@ The shared metrics sample runner now pins `--rootdir` to its isolated source. It
 | [`test_subtest_count_tampering_is_rejected`](../../tests/test_ci_test_metrics.py#L288) | 1; unchanged | [`run_sample`](../../tests/test_ci_test_metrics.py#L14) | Unchanged reference |
 
 Other direct consumers of the seven-artifact release fixture keep their original test bodies and parameter identities. This includes all 39 cases in [lp410 recovery](../../tests/test_lp410_launchd_recovery.py), the retained-release/current-API [lifecycle](../../tests/test_lp_d2_service_lifecycle.py) and [cutover](../../tests/test_lp_d2_service_cutover_repairs.py) checks, and [release operations](../../tests/test_prediction_release_launchd.py). The unchanged process-specific HTTP/native-owner assertions remain in [authority handoff](../../tests/test_lp_api_authority_owner_handoff.py); live-owner and genuine death proofs remain in [restart preparation](../../tests/test_lp_auto_restart_preparation.py). Newly added [selected-release format cases](../../tests/test_prediction_release.py) and [shard contracts](../../tests/test_ci_sharding.py) have no original assertions to migrate.
+
+
+## Review repair coverage
+
+| Test/check | Preserved or added assertion contract |
+| --- | --- |
+| [`test_collection_through_symlink_preserves_literal_nodeids`](../../tests/test_ci_sharding.py) | Real symlink entry keeps exact `tests/` prefixes, literal `@` parameter text and exact required exclusion. Native-temp collection consumers remain unchanged. |
+| [`test_inprocess_setup_failure_preserves_caller`](../../tests/test_lp_service_harness.py) | Three public-context failures (before start, template copy, partial isolation) preserve the original exception, caller diagnostic thread, exact global/module state and subsequent Runtime owner/lock availability. Global equality uses safe boolean diagnostics. |
+| [`test_runtime_template_needs_no_socket_bind`](../../tests/test_lp_service_harness.py) | Fresh template cache and denied OS bind still reach both original stale/UNKNOWN Runtime assertion functions. |
+| [`test_terminal_failure_and_owner_lock_cases_remain_required`](../../tests/test_ci_optional.py) | Six independently named fatal-stop/owner-lock identities are absent from optional and actually selected by required collection. Their original tests retain real process, owner and zero-POST assertions. |
+| [`test_inprocess_matches_child[current-awaiting-receipt]`](../../tests/test_lp_service_harness.py) | Adds one scenario to the prior 23. Real awaiting-receipt death snapshot, identical ServiceChild/in-process inputs, canonical full public state, exact empty POST/CANCEL lists, `41.80` reserved and exact five order IDs. Original 23 scenarios and assertions remain. |
+| [`test_lp_validation_reads_scopes_without_executing_contract`](../../tests/test_prediction_release.py) | Valid tracked contract must not create a side-effect sentinel or write interpreter bytecode globals. Real current preflight bytes remain valid; missing/ambiguous/nonliteral/augmented contracts fail. Old5/current7 and eight original artifact negatives remain. |
+| [`test_required_cli_reports_artifact_failure_reason`](../../tests/test_ci_sharding.py) | Real CLI keeps nonzero exits and distinct bounded reasons for bad job JSON, absent artifact sets and damaged payload hashes. Existing seven-payload positive/advisory-independent and corruption checks remain. |
+
+The new awaiting-receipt input has four current manual buys of 20 at `.30`
+and one late POST buy of 20 at `.89`: `4 × 20 × .30 + 20 × .89 = 41.80`.
+The historical killed sender's audit is unchanged; current account facts determine
+money. The five identities are `manual-1` through `manual-4` and `late-post-buy`.
+Only this new full-state case reads optional `observed_pools` with `.get`; original
+projected cases retain their direct key/membership assertion. All new financial
+and request assertions execute after full state comparison.
+
+Full-state canonicalization renames fresh diagnostic generation/capture/attempt,
+source, read and round process identifiers while preserving their equality
+relationships and read/transition values. Financial values and account, order,
+token identities remain exact. The shared current helper keeps its original
+projected result by default; full state is requested only by the new case.
+
+Initialization snapshots precede source preparation and module isolation. Cleanup
+stops only positively owned resources, preserves a fixed thread baseline across
+restarts and retains native-drain/leak assertions after launch. Watchdog failures
+include bounded alive/returncode and test-log-path diagnostics. Hash-based shard
+placement and fixed-count maintenance limits are documented in
+[CI allocation limits](ci.md#shard-allocation-limits); hosted performance remains UNKNOWN.

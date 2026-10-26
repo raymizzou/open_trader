@@ -15,8 +15,8 @@ def test_full_partition_collection_is_not_narrowed_by_inherited_shard(tmp_path):
         env=dict(os.environ,CI_TEST_SCOPE='prediction-1'),capture_output=True,text=True)
     assert run.returncode==0,run.stdout+run.stderr
     proof=json.loads(run.stdout)
-    assert proof['complete_count']==314 and proof['partition_count']==6
-    assert proof['optional_count']==279 and proof['retired_count']==29
+    assert proof['complete_count']==308 and proof['partition_count']==6
+    assert proof['optional_count']==273 and proof['retired_count']==29
 
 
 def test_real_prediction_shards_execute_two_workers_without_losing_literal_ids(tmp_path):
@@ -200,3 +200,55 @@ def test_required_rejects_missing_duplicate_or_failed_shards(tmp_path):
         with pytest.raises(ValueError):ci_evidence.validate_required_directory(root,altered,env)
         result=aggregate(altered)
         assert result.returncode != 0, mutation
+
+
+def test_collection_through_symlink_preserves_literal_nodeids(tmp_path):
+    from tests.test_ci_optional import policy_root, ROLLBACK
+    source=tmp_path/'source';source.mkdir();policy_root(source)
+    (source/'tests/test_lp_d2_service_lifecycle.py').write_text(
+        'def test_supported_rollback_uses_current_api_without_disposable_record_audit(): pass\n'
+        'def test_new(): pass\n')
+    (source/'tests/test_lp_symlink.py').write_text(
+        'import pytest\n@pytest.mark.parametrize("case", ["one@literal", "two"])\n'
+        'def test_identity(case): pass\n')
+    entrance=tmp_path/'entrance';entrance.symlink_to(source,target_is_directory=True)
+    paths=['tests/test_lp_d2_service_lifecycle.py','tests/test_lp_symlink.py']
+    expected=['tests/test_lp_d2_service_lifecycle.py::test_new',
+        'tests/test_lp_symlink.py::test_identity[one@literal]',
+        'tests/test_lp_symlink.py::test_identity[two]']
+    full=ci_partition.collect(entrance,paths,tmp_path/'full.json')
+    required=ci_partition.collect(entrance,paths,tmp_path/'required.json',required=True)
+    assert sorted(full)==sorted(expected+[ROLLBACK])
+    assert sorted(required)==expected
+
+
+def test_required_cli_reports_artifact_failure_reason(tmp_path):
+    import io,json,os,shutil,subprocess,sys,zipfile
+    from pathlib import Path
+    from tests.test_ci_routing import RequiredTests
+    from tests.test_deployment_preflight import evidence,SHA
+    root=tmp_path/'source';root.mkdir();root,api=evidence.__wrapped__(root)
+    for name in ('ci_plan.py','ci_evidence.py','ci_partition.py','deployment_preflight.py'):
+        shutil.copy(Path(__file__).resolve().parents[1]/'scripts'/name,root/'scripts'/name)
+    artifacts=tmp_path/'artifacts';artifacts.mkdir()
+    env=dict(os.environ,GITHUB_SHA=SHA,GITHUB_RUN_ID='22',GITHUB_RUN_ATTEMPT='2',GITHUB_EVENT_NAME='push')
+    def aggregate(body):
+        return subprocess.run([sys.executable,str(root/'scripts/ci_plan.py'),'required','--evidence',str(artifacts)],
+            cwd=root,env=env,input=body,text=True,capture_output=True)
+    bad_job=aggregate('{')
+    assert bad_job.returncode!=0 and 'invalid job-result JSON' in bad_job.stdout
+    needs=json.dumps(RequiredTests().needs([]))
+    absent=aggregate(needs)
+    assert absent.returncode!=0
+    assert 'artifact validation failed:' in absent.stdout and 'required artifact directory' in absent.stdout
+    assert 'invalid job-result JSON' not in absent.stdout
+    for artifact in api.artifacts:
+        target=artifacts/artifact['name'];target.mkdir()
+        with zipfile.ZipFile(io.BytesIO(api.downloads[artifact['id']])) as archive:
+            for name in archive.namelist():(target/name).write_bytes(archive.read(name))
+    (artifacts/f'ci-prediction-1-{SHA}-22-2'/'metrics.json').write_text('{}')
+    damaged=aggregate(needs)
+    assert damaged.returncode!=0
+    assert 'artifact validation failed:' in damaged.stdout and 'hash' in damaged.stdout.lower()
+    assert 'invalid job-result JSON' not in damaged.stdout
+    assert len(damaged.stdout)<512 and 'Traceback' not in damaged.stderr

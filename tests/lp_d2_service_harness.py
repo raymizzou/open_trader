@@ -33,8 +33,8 @@ class ServiceChild:
         self.events.mkdir(parents=True);self.data_dir.mkdir()
         self.clock_path=self.events/'clock';self.clock_path.write_text('0')
         self.permit_path=self.runtime_root/'lp-start-guard'/'permit.json'
-        if scenario.startswith('nr-'):
-            # Runtime-only subprocess: no listener or loopback bind.
+        if scenario.startswith('nr-') or scenario=='template':
+            # Runtime and pure source templates have no listener or loopback bind.
             self.port=8769
         else:
             with socket.socket() as sock:
@@ -291,7 +291,8 @@ if port:
             try:self.process.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 self.process.kill();self.process.wait(timeout=5)
-                raise AssertionError('offline child failed real watchdog cleanup; no production process was targeted')
+                raise AssertionError(f'offline child failed real watchdog cleanup; alive={self.process.poll() is None} '
+                    f'returncode={self.process.poll()} log={self.output}; no production process was targeted')
         for thread,_,_ in self.http_handles.values():thread.join(5)
         if self.manual_thread:self.manual_thread.join(5)
         if hasattr(self,'log_handle'):self.log_handle.close()
@@ -331,6 +332,8 @@ class InProcessService(ServiceChild):
     on ServiceChild. Migrated families retain one real child comparison each.
     """
     def start(self,*,expected_running=True):
+        self.previous_modules={name:module for name,module in sys.modules.items()
+            if name=='open_trader' or name.startswith('open_trader.') or name=='tests' or name.startswith('tests.')}
         starting=time.monotonic()
         self.release_root=release_template()
         self.timings.update(template=time.monotonic()-starting,copy=0.0,
@@ -345,15 +348,23 @@ class InProcessService(ServiceChild):
         assert self.process is None or self.process.poll() is not None
         if not hasattr(self,'isolation'):
             _INPROCESS_LOCK.acquire()
-            self.previous_modules={name:module for name,module in sys.modules.items()
-                if name=='open_trader' or name.startswith('open_trader.') or name=='tests' or name.startswith('tests.')}
-            for name in self.previous_modules:sys.modules.pop(name)
-            self.previous_path=sys.path[:]
-            self.previous_trace=threading.gettrace();self.previous_profile=threading.getprofile()
-            from websockets.asyncio import client as websocket_client
-            self.previous_proxy=websocket_client.connect_http_proxy
+            try:
+                if not hasattr(self,'previous_modules'):
+                    self.previous_modules={name:module for name,module in sys.modules.items()
+                        if name=='open_trader' or name.startswith('open_trader.') or name=='tests' or name.startswith('tests.')}
+                self.previous_path=sys.path[:]
+                self.previous_trace=threading.gettrace();self.previous_profile=threading.getprofile()
+                from websockets.asyncio import client as websocket_client
+                self.previous_proxy=websocket_client.connect_http_proxy
+                self.owned_before=set(threading.enumerate())
+                self.isolation=pytest.MonkeyPatch()
+            except BaseException:
+                _INPROCESS_LOCK.release()
+                raise
+            for name in list(sys.modules):
+                if name=='open_trader' or name.startswith('open_trader.') or name=='tests' or name.startswith('tests.'):
+                    sys.modules.pop(name)
             sys.path[:0]=[str(self.release_root/'src'),str(self.release_root)]
-            self.isolation=pytest.MonkeyPatch()
             self.isolation.chdir(self.release_root)
             self.isolation.setattr(sys,'dont_write_bytecode',False)
             self.isolation.setattr(sys,'pycache_prefix',str(self.release_root.parent.parent/'bytecode'))
@@ -364,7 +375,6 @@ class InProcessService(ServiceChild):
             self.marker(name).unlink(missing_ok=True)
         self.output=self.root/('inprocess-'+scenario+'.log');self.output.write_text('')
         self.control=_ServiceSignals();self.errors=[];self.returncode=None
-        self.owned_before=set(threading.enumerate())
         def serve():
             try:
                 from tests.lp_d2_service_harness import child as clean_child
@@ -380,8 +390,8 @@ class InProcessService(ServiceChild):
                     except BaseException as error:self.errors.append(error);self.returncode=1
                 self.marker('process-finalizing').touch()
         thread=threading.Thread(target=serve,name='fixture-current-service')
-        self.process=_ServiceThread(thread,self.control,lambda:self.returncode)
         startup=time.monotonic();thread.start()
+        self.process=_ServiceThread(thread,self.control,lambda:self.returncode)
         self.wait('service-starting')
         if scenario in ('nr-stale','nr-unknown'):self.wait('nr-start-completed')
         if expected_running is not None:self.wait_state(lambda state:state.get('effective_running') is expected_running)
@@ -389,11 +399,14 @@ class InProcessService(ServiceChild):
 
     def __exit__(self,*args):
         try:
+            if self.process is None:
+                return super().__exit__(*args)
             result=super().__exit__(*args)
             # This process-wide diagnostic daemon has no Runtime stop port.
             # Terminate only this isolated module's real consumer after native drain.
             module=sys.modules.get('open_trader.polymarket_trading')
-            if module is not None and module._lp_read_log_thread.is_alive():
+            if (module is not None and module._lp_read_log_thread not in self.owned_before
+                    and module._lp_read_log_thread.is_alive()):
                 diagnostic=module._lp_read_log_thread
                 previous_hook=threading.excepthook
                 def diagnostic_exit(args):
@@ -421,10 +434,12 @@ class InProcessService(ServiceChild):
                 threading.settrace(self.previous_trace);threading.setprofile(self.previous_profile)
                 from websockets.asyncio import client as websocket_client
                 websocket_client.connect_http_proxy=self.previous_proxy
+            if hasattr(self,'previous_modules'):
                 for name in list(sys.modules):
                     if name=='open_trader' or name.startswith('open_trader.') or name=='tests' or name.startswith('tests.'):
                         sys.modules.pop(name)
                 sys.modules.update(self.previous_modules)
+            if hasattr(self,'isolation'):
                 sys.path[:]=self.previous_path
                 self.isolation.undo();del self.isolation
                 _INPROCESS_LOCK.release()

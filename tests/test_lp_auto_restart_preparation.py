@@ -177,7 +177,7 @@ def _new_owner(runtime, monkeypatch, tmp_path, *, orders=None):
     return LegacyComponents(), store, adapter, account, public
 
 
-def _assert_current_after_legacy(root,store,account,public,*,mode='known',restart=False,manual=False,observed=False,service=None):
+def _assert_current_after_legacy(root,store,account,public,*,mode='known',restart=False,manual=False,observed=False,full_state=False,service=None):
     """Current API exposure despite old audit rows; no legacy money/authority."""
     import hashlib,json,sqlite3
     from datetime import UTC,datetime
@@ -281,7 +281,7 @@ def _assert_current_after_legacy(root,store,account,public,*,mode='known',restar
             child.process.terminate();assert child.wait_exit()==0;child.assert_owner_available()
             assert {sid:saved.lp_actions(sid) for sid in old_actions}==old_actions
 
-        result=dict(state={key:state.get(key) for key in ('effective_running','desired_running','buy_reserved_usd',
+        result=dict(state=state if full_state else {key:state.get(key) for key in ('effective_running','desired_running','buy_reserved_usd',
             'inventory_cost_usd','current_exposure_usd','new_capacity_usd','account_buys','observed_pools')},
             requests=child.sdk_requests())
         (root/'business-result.json').write_text(json.dumps(result,sort_keys=True,indent=2))

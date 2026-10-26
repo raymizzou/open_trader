@@ -34,12 +34,12 @@ class PartitionTests(unittest.TestCase):
         proof = module.verify_partition(complete, parts, retired, ROOT, OPTIONAL)
         self.assertEqual(proof['executed_count'], 5)
         self.assertEqual(proof['retired_count'], 1)
-        self.assertEqual(proof['complete_count'], 285)
+        self.assertEqual(proof['complete_count'], 279)
         self.assertEqual(proof['retired_status'], 'not-executed-permanent-retirement')
         nested = 'tests/nested/test_new.py::test_new'
         self.assertRaises(ValueError, module.verify_partition, complete + [nested], parts, retired, ROOT, OPTIONAL)
         expanded = {**parts, 'legacy': parts['legacy'] + [nested]}
-        self.assertEqual(module.verify_partition(complete+[nested], expanded, retired, ROOT, OPTIONAL)['complete_count'], 286)
+        self.assertEqual(module.verify_partition(complete+[nested], expanded, retired, ROOT, OPTIONAL)['complete_count'], 280)
         for universe, executed, omitted in [
             (complete, {**parts, 'prediction': parts['prediction'][:-1]}, retired),
             (complete + [complete[0]], parts, retired),
@@ -57,7 +57,7 @@ class PartitionTests(unittest.TestCase):
         complete = sum(parts.values(), []) + OPTIONAL
         proof = module.verify_partition(complete, parts, optional=OPTIONAL)
         self.assertEqual(proof['status'], 'success')
-        self.assertEqual(proof['complete_count'], 283)
+        self.assertEqual(proof['complete_count'], 277)
         self.assertEqual(proof['partition_count'], 4)
         self.assertEqual(proof['complete_sha256'], proof['coverage_sha256'])
         self.assertEqual(proof, module.verify_partition(list(reversed(complete)), parts, optional=OPTIONAL))

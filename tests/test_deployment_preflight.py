@@ -266,8 +266,8 @@ def test_trusted_main_active_coverage_is_accepted(evidence):
         proof=json.loads(archive.read('partition.json'))
     assert proof['retired_status']=='not-executed-permanent-retirement'
     assert proof['retired_count']==29
-    assert proof['executed_count']+29+279==proof['complete_count']
-    assert proof['optional_count']==279
+    assert proof['executed_count']+29+273==proof['complete_count']
+    assert proof['optional_count']==273
     assert proof['optional_status']=='not-executed-advisory'
     assert proof['retired'] and not set(proof['retired']) & set(sum(proof['partitions'].values(),[]))
 

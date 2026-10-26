@@ -144,14 +144,16 @@ across push and the existing main-only manual workflow, then verifies its latest
 attempt and artifacts bound to the real event. A newer unsuccessful run blocks
 older green evidence. It checks immutable source/lock/runtime identity and never
 reruns backend tests.
-CI also runs the non-LIVE portable prediction scenarios and proves that executed
+Required evidence has seven scopes: `gateway`, `legacy`, `account`,
+`prediction-1`, `prediction-2`, `prediction-3`, `portable`. Prediction uses three
+machines with two workers each. CI also runs the non-LIVE portable prediction scenarios and proves that executed
 required nodeids plus the explicit optional collection and declared retired nodeids
-cover the complete backend collection without overlap. The 224 exact reviewed release-test identities are declared in
+cover the complete backend collection without overlap. The 273 exact reviewed release-test identities are declared in
 `scripts/ci_optional_tests.json` under `release-advisory-v1`. Their unchanged
-cases run serially in `Release advisory`, automatically only on main pushes,
+cases run on four serial machines in `Release advisory`, automatically only on main pushes,
 with a manual entry. Only full literal nodeids, including parameter identities,
 are exempt; new names and new parameters stay required. Financial/order,
-UNKNOWN, no-replay, current-API owner handoff/restart, active-service drain,
+UNKNOWN, no-replay, fatal-stop and owner-lock, current-API owner handoff/restart, active-service drain,
 credential SSM runtime and stopped data-recovery transaction tests stay required.
 Genuine advisory failures can be deferred; required CI and Deployment Preflight
 do not wait for them. Optional classification is not execution or success. Other active
