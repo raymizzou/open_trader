@@ -12,7 +12,8 @@ def test_full_partition_collection_is_not_narrowed_by_inherited_shard(tmp_path):
         shutil.copyfile(source/'scripts'/name,tmp_path/'scripts'/name)
     (tmp_path/'pyproject.toml').write_text('[tool.pytest.ini_options]\ntestpaths=["tests"]\n')
     run=subprocess.run([sys.executable,str(tmp_path/'scripts/ci_partition.py')],cwd=tmp_path,
-        env=dict(os.environ,CI_TEST_SCOPE='prediction-1'),capture_output=True,text=True)
+        env=dict(os.environ,CI_TEST_SCOPE='prediction-1',PYTHONSAFEPATH='1',
+            PYTHONPATH=str(tmp_path/'scripts')),capture_output=True,text=True)
     assert run.returncode==0,run.stdout+run.stderr
     proof=json.loads(run.stdout)
     assert proof['complete_count']==308 and proof['partition_count']==6

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-26 — CI partition fixture search path
+
+- Select the copied sibling dependency explicitly in the partition CLI test while retaining Python safe-path mode. Preserve full collection and shard coverage assertions; hosted main CI remains unverified.
+
 ## 2026-10-26 — CI review repairs and required owner guards
 
 - Keep six fatal-stop and owner-lock regressions in required CI. Add real awaiting-receipt takeover parity, preserve caller state on incomplete harness setup, and build Runtime source templates without socket binding.
