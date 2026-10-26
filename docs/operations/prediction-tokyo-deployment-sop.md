@@ -723,3 +723,95 @@ bash scripts/prediction-client.sh status --config '<private-client-json>'
 
 新会话必须重新读 inventory 与所选发布 runbook，刷新外部/主机状态。不能把
 本次历史 `HEALTHY`、旧 SHA 或临时 helper 的存在当作当前成功。
+
+## 9. 东京 LP 五项只读现况（#463；代码交付，不代表生产已配置）
+
+主服务继续只绑定 loopback。新汇总为
+`GET http://127.0.0.1:8769/api/prediction-arbitrage/lp/monitor`。
+`orders`、`cancellations`、`pools`、`balance`、`fills` 各有
+`status`（`normal/attention/abnormal/unknown`）和中文 `reason`。
+GET 只读取一次自动池投影、后台缓存及本机持久审计，不刷新交易所、不下单、
+不撤单、不写交易状态。现有 LP 卡顶部显示五格，展开看明细；原控制项保留。
+Shadow 没有生产自动池来源时返回未知，不把缺失来源作为正常。
+
+统计口径：今天按 `Asia/Tokyo` 的 00:00 起算，一小时为滚动窗口。
+挂单/两池共用同一次当前成员投影，目标来自有效配置。缺单先注意，连续
+300 秒异常；读取失败打断连续证据，恢复确认满池后重新计时。
+想开而实际未开、致命错误、有效候选为零、连续 600 秒候选刷新失败均异常。
+余额超过 300 秒未更新为注意；可用资金未知连续 300 秒异常，缺失金额保留 null。
+这些计时是当前进程的观察证据，重启不伪造先前连续时长。
+
+撤单成功只计已确认终态撤完；接受回执仍等待当前账户确认。请求超过
+120 秒且同一账户/市场/token/订单仍确认挂着才列卡单。小时/今天计数来自本机
+持久 CANCEL 请求审计，按请求时间归属，跨进程重启保留；早期拦截只有启动内存
+记录时，拦截总量保留未知，并单列本次启动参考。历史未入审计的拦截不能称为零。
+没有可归属的原始补位/换单时间时显示未知并说明来源未保存，不用读取时间代替。
+成交只用完整本钱包缓存；按成交及我方订单分配身份去重，保留不同订单的同刻成交。
+只统计已确认成交，失败不计；未确认/不完整来源保持未知。池归属无法确认时保留
+未知。当前库存成本来自当前账户事实，绝不用历史成交重建余额或库存。
+
+### Mini / 手机地址与访问规则
+
+另一个只读监听器只提供 `/` 和上述汇总 GET，不提供完整 Dashboard、cookie、
+凭据、写接口或任意上游代理。绑定地址只接受数字 loopback 或操作员明确选定的
+Tailscale 地址（IPv4 `100.64.0.0/10`、IPv6 `fd7a:115c:a1e0::/48`）；拒绝通配、
+公网、LAN 和 DNS 名。上游固定为数字 loopback 的精确汇总 URL，拒绝重定向。
+浏览器必须使用绑定的数字 IP 和实际端口；Host 校验不接受 DNS 别名。
+上游失败时显示未知，不沿用上一份正常结果。
+
+- 东京本机：批准启动只读监听器后打开 `http://127.0.0.1:8780/`（须选择 loopback 绑定）。
+- Mini / 手机：保持 Ray 已有 Tailscale 网络连接，打开 `http://<东京数字 Tailscale IP>:8780/`。
+  IPv6 URL 须用方括号，例如 `http://[<东京数字 IPv6>]:8780/`。
+- 操作员需核对东京和客户端确已加入同一 tailnet；用 Tailscale ACL 只允许 Ray 明确
+  放行的设备到东京只读端口 8780，其他设备拒绝。不要开放 8769，也不把既有完整看板
+  转发到 tailnet。Tailscale 的安装、登录和 ACL 修改须另有授权；本次没有执行或验证。
+
+### 获得单独部署批准后才执行的上线与回滚
+
+先按第 6 节及所选发布的门禁核实精确 main SHA、正式 CI、源码/锁/运行时、
+Host Readiness，再使用现有 wrapper。下面均为操作模板，当前未执行；所有占位值
+须由操作员选择。配置文件需已受信任并绑定相同 SHA，不能用修改路径绕过门禁。
+
+```sh
+LP463_SHA='<approved-40hex-main-sha>'
+LP463_RELEASE="/opt/open-trader/releases/$LP463_SHA"
+LP463_PYTHON="/opt/open-trader/venvs/$LP463_SHA/bin/python"
+export OPEN_TRADER_PYTHON="$LP463_PYTHON"
+"$LP463_PYTHON" -B "$LP463_RELEASE/scripts/deploy_release.py" \
+  --expected-sha "$LP463_SHA" --release-root "$LP463_RELEASE" \
+  --runtime-root /var/lib/open-trader/prediction --python "$LP463_PYTHON" \
+  prediction-systemd --config /etc/open-trader/prediction-cloud.json --action install
+
+# 正式服务启动仍走已批准的同一 wrapper action start 及 Production Smoke。
+# 以下额外进程须有单独批准，使用前台便于审查，不安装或启用系统服务。
+LP463_TAILNET_IP='<verified-numeric-tailscale-ip>'
+env PYTHONPATH="$LP463_RELEASE/src" "$LP463_PYTHON" \
+  -m open_trader.lp_monitor_readonly --host "$LP463_TAILNET_IP" --port 8780 \
+  --upstream-url http://127.0.0.1:8769/api/prediction-arbitrage/lp/monitor
+```
+
+健康检查保留原默认 7200 秒频率；仅加 `--lp-monitor` 后独立每 60 秒读取 LP，
+包括 N-leg 已暂停时。复用既有飞书 notifier 和既有夜间时钟规则（上海 08:00–23:00
+允许通知），稳定状态不重复；异常/未知变化及恢复、每个新成交分别通知。
+第一次完整观察及重启先建立基线，不重播已存在成交。飞书失败或静音时保留待发，
+仅实际成功后清除。建议指定下列本机私有状态文件，保留重启前待发消息；不指定时
+待发只在当前进程中保存。文件不包含凭据。实际飞书配置和东京检查进程是否已安装
+仍未核实，不把离线测试称为生产通知成功。
+
+```sh
+env PYTHONPATH="$LP463_RELEASE/src" "$LP463_PYTHON" -m open_trader \
+  prediction-arb health-check --url http://127.0.0.1:8769 \
+  --config '<existing-private-notifier-config>' --lp-monitor \
+  --lp-monitor-state '<private-local-runtime>/lp-monitor-notifications.json' \
+  --lp-monitor-dashboard-url "http://$LP463_TAILNET_IP:8780/"
+```
+
+先在离线/回放环境验证一次状态变化及逐笔成交通知，不为验收在东京新下单或撤单。
+`--once --no-notify --json` 可在已有授权的只读检查中读取一次，且不会发送通知。
+
+只读访问回滚：对上述前台只读监听器按 Ctrl-C，仅停止本次监听进程；对本次新增健康
+进程按 Ctrl-C，按原调用恢复既有健康检查。保留待发送文件和日志，不改做市开关、不
+取消挂单。若正式源码也需回滚，另选已批准且有有效门禁证据的旧 main SHA，使用同一
+wrapper 的 `prediction-systemd --config <匹配旧发布的受信任配置> --action install/start`
+重新执行 Preflight、Host Readiness 和 Smoke；不手改 current 链接、不绕过失败 CI。
+是否回滚正式服务、是否启用任何进程均取决于单独批准，本节不授予生产操作权限。

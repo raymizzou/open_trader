@@ -838,6 +838,8 @@ class PredictionExecutionService:
         from .lp_persistence import SerializedCalls
         self._lp_share_watch_notification_lock = SerializedCalls()
         self._lp_share_watch_seen: set[str] = set()
+        from .polymarket_lp_monitor import LPMonitorSummary
+        self._lp_monitor_summary = LPMonitorSummary()
         self._lp_dashboard_cache: dict[str, object] | None = None
         self._lp_account_trades_cache: dict[str, object] | None = None
         self._lp_reward_percentage_cache: dict[str, object] | None = None
@@ -2284,6 +2286,28 @@ class PredictionExecutionService:
         except ValueError:
             return True
 
+    def lp_monitor_summary(self, *, now=None):
+        """Capture automatic membership once; use cached sources, never venue IO."""
+        moment = now or _utc_now()
+        if moment.utcoffset() is None:
+            raise ValueError('monitor_time_must_be_aware')
+        try:
+            auto = self.lp_auto_state()
+        except Exception:
+            auto = {}
+        with self._lp_dashboard_lock:
+            dashboard = deepcopy(self._lp_dashboard_cache or {})
+            trades = deepcopy(self._lp_account_trades_cache or {})
+        account_id = getattr(self._lp_d2, 'account_id', None) or getattr(
+            getattr(self._trading, 'config', None), 'wallet_address', None)
+        try:
+            audits = self._store.lp_monitor_cancel_audits(account_id,
+                instance_id=getattr(self._lp_d2, 'lp_instance_id', None))
+        except Exception:
+            audits = None
+        return self._lp_monitor_summary.summarize(auto=auto, dashboard=dashboard,
+            trades=trades, audits=audits, account_id=account_id, now=moment)
+
     def lp_account_trades_page(self, *, offset: int, limit: int) -> dict[str, object]:
         """Serve bounded display details from the shared background round."""
         if offset < 0 or not 1 <= limit <= 100:
@@ -3497,6 +3521,7 @@ class PredictionExecutionService:
                         if isinstance(previous_dashboard, Mapping) else None),
                     "stale": not display_complete,
                     "authenticated": True,
+                    "account_id": getattr(getattr(self._trading, "config", None), "wallet_address", None),
                     "balance": snapshot.get("balance"),
                     "allowance": snapshot.get("allowance"),
                     "trades_complete": snapshot.get("display_trades_complete") is True,
@@ -3537,6 +3562,7 @@ class PredictionExecutionService:
                     "state": "ready" if trades_complete else "unknown",
                     "complete": trades_complete, "stale": False,
                     "checked_at": checked_at, "source": "same-wallet CLOB trades",
+                    "account_id": getattr(getattr(self._trading, "config", None), "wallet_address", None),
                     "total": snapshot.get("account_trades_total"),
                     "items": tuple(snapshot.get("account_trades", ())),
                 }

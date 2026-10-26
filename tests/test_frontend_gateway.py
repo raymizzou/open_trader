@@ -1102,3 +1102,26 @@ def test_split_prediction_routes_responsibility_and_isolates_authorization(tmp_p
     assert len(air.requests) == 13
     assert air.requests[1]['path'] == '/api/prediction-arbitrage/venues'
     assert [row['path'] for row in legacy.requests] == ['/api/portfolio']
+
+
+def test_gateway_lp_monitor_summary_is_readonly_and_routes_to_prediction(tmp_path):
+    static=tmp_path/'static';_write_static_files(static)
+    route=tmp_path/'route.json';_write_route(route,'service')
+    air,display,legacy=_Upstream(),_Upstream(),_Upstream()
+    config=FrontendGatewayConfig(static_dir=static,prediction_route_path=route,
+        upstream_port=legacy.server_address[1],account_upstream_port=legacy.server_address[1],
+        prediction_upstream_port=air.server_address[1],prediction_display_upstream_port=display.server_address[1])
+    server=create_frontend_gateway(config=config,host='127.0.0.1',port=0)
+    path='/api/prediction-arbitrage/lp/monitor'
+    with _running(air),_running(display),_running(legacy),_running(server):
+        base=f'http://127.0.0.1:{server.server_address[1]}'
+        with urllib.request.urlopen(urllib.request.Request(base+path,
+                headers={'Cookie':'secret','X-CSRF-Token':'secret'}),timeout=5) as response:
+            assert response.status==200
+        for target,headers in [(path,{}),('/api/prediction-arbitrage/lp/orders',{'Origin':'https://untrusted.example'})]:
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(urllib.request.Request(base+target,data=b'{}',method='POST',headers=headers),timeout=5)
+            assert error.value.code in (403,405)
+    assert [r['path'] for r in display.requests]==[path]
+    assert air.requests==legacy.requests==[]
+    assert 'Cookie' not in display.requests[0]['headers'] and 'X-CSRF-Token' not in display.requests[0]['headers']

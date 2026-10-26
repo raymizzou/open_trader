@@ -68,9 +68,15 @@ POST HTTP 200 返回以下全部字段：
 | `released_amount_usd` | 若本次释放任一金额未知则为 null；全部金额已知时为合计十进制字符串，无新增释放时为 `"0"`；不是钱包回款或收益 |
 | `state` | 完整当前自动池状态，与 `GET /api/prediction-arbitrage/lp/auto/state` 的执行层状态字段相同；不包含运行时 scheduler 附加字段 |
 
-操作者应检查 `state.slots`、`state.funds`、`state.block_reasons` 和
-`state.admission_block_reasons`，不能把 `released` 或 `desired_running=true`
-当作已补位或资金已核清的证据。未知当前库存成本仍返回 null；当前持仓成本优先使用 API 成本金额，缺失时用其数量乘平均成本价。
+2026-10-26：当前 D2 执行路径不再提供旧 `slots`、`funds`、`block_reasons` 和
+`admission_block_reasons`；不要用这些退役字段判断正常。读取
+`GET /api/prediction-arbitrage/lp/monitor` 的五项 `status/reason`、`orders.counts`、
+`pools.items` 和 `balance.capacity_usd`；需要原始执行事实时读 `/lp/auto/state` 的
+`desired_running`、`effective_running`、`fatal`、`observed_pools.current_membership`、
+`buy_reserved_usd`、`inventory_cost_usd` 和 `new_capacity_usd`。
+汇总中的挂单和两池来自一次投影；未知保留 null。不能把 `released` 或
+`desired_running=true` 当作已补位或资金已核清的证据。未知当前库存成本仍返回
+null；当前持仓成本优先使用 API 成本金额，缺失时用其数量乘平均成本价。
 预算始终为配置值，历史盈亏、成交或费用资料只影响报告；报告 UNKNOWN 不否定有效的当前资金事实。
 
 常见排除或跳过原因：
