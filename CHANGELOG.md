@@ -16,6 +16,12 @@
 - Run the same release-local standalone checker for file, cloud journal and local Gateway logs. Check all logs since startup, require existing runtime markers, and reject empty, unreadable or non-UTF-8 logs and journal failures.
 - Remove metadata warning exemptions and the 200-line window. Report `RemoteProtocolError` explicitly, preserve strict JSON validation and the proven healthy `last_error:null` exception, and retain all Smoke identity and business checks. No deployment is included.
 
+## 2026-10-26 — Tokyo LP read-only monitoring
+
+- Add one cached LP summary for orders, durable cancellation audits, both pools, balance/capacity and exact own-account fills. Show Chinese status reasons and details at the top of the existing LP card; preserve its controls and all UNKNOWN values. Today uses Tokyo midnight.
+- Add a separate numeric loopback/Tailscale-only read-only page and opt-in one-minute LP checks in the existing health notifier. Keep transition/fill deduplication, restart baselines and pending delivery through quiet hours or failures. Trading policy, main CI and production configuration are unchanged; deployment and live notification setup require separate approval.
+- Preserve historical cancellation audits when the same wallet restarts with different letter casing. Keep other wallets and instances isolated and receipt/progress identities exact. Include an unknown account field in the pending dashboard so its shape stays complete without extra account reads.
+
 ## 2026-10-26 — Departed income test account publication
 
 - Wait for the real asynchronous account observation to contain only the remaining trial order before testing income selection. Preserve the departed order's unchanged, fresh historical result, exact selection and cancellation identities, and no-reopen assertion. Test synchronization only; production behavior is unchanged.

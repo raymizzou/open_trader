@@ -734,6 +734,85 @@ def _report_signature(report: HealthReport) -> tuple[str, tuple[str, ...], tuple
     )
 
 
+class LPMonitorAlerts:
+    """Use existing notifier delivery results; pending facts survive quiet/failure."""
+    def __init__(self, *, state_path=None, dashboard_url=''):
+        self.state_path=Path(state_path) if state_path is not None else None
+        self.dashboard_url=dashboard_url
+        self.previous=None
+        self.fills_baselined=False
+        self.seen=set()
+        self.pending=[]
+        if self.state_path is not None and self.state_path.exists():
+            saved=json.loads(self.state_path.read_text())
+            if (saved.get('version') != 1 or not isinstance(saved.get('pending'),list)
+                    or not isinstance(saved.get('seen'),list)):
+                raise ValueError('lp_notification_state_invalid')
+            self.pending=saved['pending'];self.seen=set(saved['seen'])
+
+    def save(self):
+        if self.state_path is None:return
+        import tempfile
+        self.state_path.parent.mkdir(parents=True,exist_ok=True)
+        fd,path=tempfile.mkstemp(prefix=self.state_path.name+'.',dir=self.state_path.parent)
+        try:
+            with os.fdopen(fd,'w') as stream:
+                json.dump(dict(version=1,seen=sorted(self.seen),pending=self.pending),stream,ensure_ascii=False)
+                stream.flush();os.fsync(stream.fileno())
+            os.replace(path,self.state_path)
+        finally:
+            if os.path.exists(path):os.unlink(path)
+
+    def observe(self, payload, notifier, *, now):
+        from .lp_monitor_readonly import safe_summary,LABELS,STATUS
+        from .notifications import xiaoai_voice_allowed, CompositeNotifier, MacOSNotifier, XiaoaiSSHNotifier
+        from .daily_premarket import send_notification_with_results
+        value=safe_summary(payload)
+        current={key:value[key]['status'] for key in LABELS}
+        if self.previous is not None:
+            for key,status in current.items():
+                old=self.previous[key]
+                if status != old and (status in ('abnormal','unknown') or old in ('abnormal','unknown')):
+                    label=STATUS[status] if status in ('abnormal','unknown') else '已恢复'
+                    self.pending.append(dict(title='东京做市 · '+LABELS[key]+' · '+label,
+                        message=value[key]['reason']))
+        self.previous=current
+        fills=value['fills']
+        rows=fills.get('items') if fills['status'] in ('normal','attention') else None
+        if isinstance(rows,list):
+            valid=[r for r in rows if isinstance(r,dict) and isinstance(r.get('id'),str) and r['id']]
+            if len(valid) != len(rows):
+                rows=None  # never establish a partial initial fill baseline
+            elif self.fills_baselined:
+                for row in valid:
+                    if row['id'] in self.seen:continue
+                    self.seen.add(row['id'])
+                    self.pending.append(dict(title='东京做市 · 新成交',message='\n'.join([
+                        '订单：'+str(row.get('order_id') or '未知'), '市场：'+str(row.get('market') or '未知'),
+                        '所属池：'+str(row.get('pool') or '未知'),
+                        str(row.get('side') or '未知')+' '+str(row.get('quantity') or '未知')+' × '+str(row.get('price') or '未知'),
+                        '时间：'+str(row.get('time') or '未知')])))
+            else:
+                self.seen.update(row['id'] for row in valid)
+                self.fills_baselined=True
+        self.save()  # pending is durable before any external send
+        if not xiaoai_voice_allowed(now):return
+        while self.pending:
+            item=self.pending[0]
+            message=item['message'] + ('\n只读看板：'+self.dashboard_url if self.dashboard_url else '')
+            attempts=send_notification_with_results(notifier,item['title'],message,channels={'feishu','feishu_app'})
+            if not attempts and not isinstance(notifier,(CompositeNotifier,NullNotifier,MacOSNotifier,XiaoaiSSHNotifier)):
+                attempts=send_notification_with_results(notifier,item['title'],message)
+            if not any(attempt.success and not attempt.suppressed for attempt in attempts):return
+            self.pending.pop(0)
+            self.save()
+
+
+def _fetch_lp_monitor(url, timeout):
+    from .lp_monitor_readonly import fetch_summary,SUMMARY_PATH
+    return fetch_summary(url.rstrip('/')+SUMMARY_PATH,timeout=timeout)
+
+
 def run_service(
     notifier: object,
     *,
@@ -744,18 +823,45 @@ def run_service(
     dashboard_url: str = "",
     fetch_state: Callable[[str, float], Mapping[str, object]] = _fetch_state,
     fetch_healthz: Callable[[str, float], Mapping[str, object]] = _fetch_healthz,
+    lp_monitor: bool = False,
+    lp_monitor_state: Path | None = None,
+    lp_monitor_dashboard_url: str = '',
+    fetch_lp_monitor: Callable = _fetch_lp_monitor,
     timeout: float = 10.0,
     now_fn: Callable[[], datetime] = lambda: datetime.now(UTC),
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> int:
     notify_configured = notify and not isinstance(notifier, NullNotifier)
+    alerts=LPMonitorAlerts(state_path=lp_monitor_state,dashboard_url=lp_monitor_dashboard_url) if lp_monitor else None
+    next_lp=now_fn().timestamp()+60 if lp_monitor else None
+    def check_lp():
+        from .polymarket_lp_monitor import unknown_summary
+        try:
+            value=fetch_lp_monitor(url,timeout)
+        except Exception:
+            value=unknown_summary()
+        if notify_configured:
+            try:alerts.observe(value,notifier,now=now_fn())
+            except Exception:_log('LP notification state unavailable; delivery remains unconfirmed')
+    def wait_interval(seconds):
+        nonlocal next_lp
+        if not lp_monitor:
+            sleep_fn(seconds)
+            return
+        end=now_fn().timestamp()+seconds
+        while now_fn().timestamp()<end:
+            delay=min(end-now_fn().timestamp(),max(0,next_lp-now_fn().timestamp()))
+            if delay>0:sleep_fn(delay)
+            if now_fn().timestamp()>=next_lp:
+                next_lp=now_fn().timestamp()+60  # no burst/replay after a late check
+                check_lp()
     if not once:
         first = now_fn().timestamp() + interval_seconds
         _log(
             f"health service started interval={interval_seconds:.0f}s "
             f"first_check_at={datetime.fromtimestamp(first, UTC).isoformat(timespec='seconds')}"
         )
-        sleep_fn(interval_seconds)
+        wait_interval(interval_seconds)
     last_signature: tuple[str, tuple[str, ...], tuple[str, ...]] | None = None
     last_sent_status: str | None = None
     last_sent_at: datetime | None = None
@@ -765,13 +871,14 @@ def run_service(
     check_history: deque[tuple[datetime, bool]] = deque()
     summary_sent_on: str | None = None
     while True:
+        if once and lp_monitor:check_lp()
         report = run_health_check(
             url=url,
             fetch_state=fetch_state,
             fetch_healthz=fetch_healthz,
             timeout=timeout,
             notify_configured=notify_configured,
-            sleep_fn=sleep_fn,
+            sleep_fn=wait_interval,
             dashboard_url=dashboard_url,
         )
         _log(format_report(report).replace("\n", " | "))
@@ -915,7 +1022,7 @@ def run_service(
                 if report.status in {"PASS", "PAUSED"}
                 else (1 if report.status == "WARN" else 2)
             )
-        sleep_fn(interval_seconds)
+        wait_interval(interval_seconds)
 
 
 def _deliver(notifier: object, title: str, message: str) -> bool:
@@ -934,6 +1041,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--no-notify", action="store_true")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument('--lp-monitor',action='store_true',help='每60秒读取东京LP只读汇总；原健康检查频率保留')
+    parser.add_argument('--lp-monitor-state',type=Path,help='可选的本机待发送状态文件（建议配置以保留重启前待发消息）')
+    parser.add_argument('--lp-monitor-dashboard-url',default='',help='通知中的私有内网只读页地址')
     args = parser.parse_args(argv)
     try:
         config = load_env_config(args.config)
@@ -947,8 +1057,14 @@ def main(argv: list[str] | None = None) -> int:
             notify_configured=not args.no_notify and not isinstance(notifier, NullNotifier),
             dashboard_url=config.health_dashboard_url,
         )
+        lp_value = _fetch_lp_monitor(args.url,10) if args.lp_monitor else None
+        if args.lp_monitor and not args.no_notify and not isinstance(notifier,NullNotifier):
+            LPMonitorAlerts(state_path=args.lp_monitor_state,dashboard_url=args.lp_monitor_dashboard_url).observe(
+                lp_value,notifier,now=datetime.now(UTC))
         if args.json:
-            print(json.dumps(report_to_dict(report), ensure_ascii=False))
+            output=report_to_dict(report)
+            if args.lp_monitor:output['lp_monitor']=lp_value
+            print(json.dumps(output, ensure_ascii=False))
         else:
             print(format_report(report))
         if not args.no_notify and not isinstance(notifier, NullNotifier):
@@ -965,4 +1081,6 @@ def main(argv: list[str] | None = None) -> int:
         interval_seconds=args.interval,
         notify=not args.no_notify,
         dashboard_url=config.health_dashboard_url,
+        lp_monitor=args.lp_monitor,lp_monitor_state=args.lp_monitor_state,
+        lp_monitor_dashboard_url=args.lp_monitor_dashboard_url,
     )

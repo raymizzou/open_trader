@@ -40,6 +40,7 @@ _STATIC_ROUTES = {
 _PREDICTION_DISPLAY_PATHS = frozenset({
     "/api/prediction-arbitrage/venues",
     "/api/prediction-arbitrage/lp/dashboard",
+    "/api/prediction-arbitrage/lp/monitor",
     "/api/prediction-arbitrage/lp/account/trades",
 })
 
@@ -200,6 +201,10 @@ def create_frontend_gateway(
             self._send_error(HTTPStatus.NOT_FOUND, "not_found", "Not found")
 
         def _proxy(self) -> None:
+            if (urlsplit(self.path).path == '/api/prediction-arbitrage/lp/monitor'
+                    and self.command != 'GET'):
+                self._send_error(HTTPStatus.METHOD_NOT_ALLOWED, 'readonly_monitor', 'Monitor is read-only')
+                return
             path = urlsplit(self.path).path
             if config.prediction_only and not _is_prediction_path(path):
                 self._send_error(HTTPStatus.NOT_FOUND, "not_found", "Not found")

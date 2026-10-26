@@ -71,7 +71,9 @@ def current_membership(snapshot, roles, transfers, *, account_id, settings_accou
                 and p['order_id'] == oid for p in promotions):
             pool = 'promotion'
         orders.append(dict(account_id=account_id, condition_id=cid, token_id=token,
-            order_id=oid, side=order['side'], pool=pool))
+            order_id=oid, side=order['side'], pool=pool,
+            price=order.get('price'), remaining=order.get('remaining'),
+            last_change_at=role.get('assigned_at')))
     return dict(state='known' if known else 'unknown', account_id=account_id,
         observation_id=observation.observation_id if observation else None,
         observed_at=observation.accepted_at if observation else None,

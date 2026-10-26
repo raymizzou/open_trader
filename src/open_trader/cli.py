@@ -1560,6 +1560,9 @@ def build_parser() -> argparse.ArgumentParser:
     health_parser.add_argument("--once", action="store_true")
     health_parser.add_argument("--no-notify", action="store_true")
     health_parser.add_argument("--json", action="store_true")
+    health_parser.add_argument('--lp-monitor',action='store_true')
+    health_parser.add_argument('--lp-monitor-state',type=Path)
+    health_parser.add_argument('--lp-monitor-dashboard-url',default='')
 
     return parser
 
@@ -2475,6 +2478,12 @@ def main(argv: list[str] | None = None) -> int:
                 "--interval",
                 str(args.interval),
             ]
+            if args.lp_monitor:
+                health_argv.append('--lp-monitor')
+            if args.lp_monitor_state is not None:
+                health_argv.extend(['--lp-monitor-state',str(args.lp_monitor_state)])
+            if args.lp_monitor_dashboard_url:
+                health_argv.extend(['--lp-monitor-dashboard-url',args.lp_monitor_dashboard_url])
             if args.once:
                 health_argv.append("--once")
             if args.no_notify:

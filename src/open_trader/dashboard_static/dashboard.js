@@ -4885,6 +4885,55 @@ async function loadLpAutoReport(day) {
   if (state.predictionMarket.lpAutoReport === selection) renderPredictionMarket();
 }
 
+function lpMonitorCards(summary) {
+  const labels = {orders:"当前挂单", cancellations:"撤单情况", pools:"双池运行", balance:"余额与可用资金", fills:"本钱包成交"};
+  const statuses = {normal:"正常", attention:"注意", abnormal:"异常", unknown:"未知"};
+  const text = (value) => escapeHtml(value == null ? "未知" : value === true ? "是" : value === false ? "否" : String(value));
+  const pairs = (rows) => "<dl>" + rows.map(([key,value]) => `<dt>${text(key)}</dt><dd>${text(value)}</dd>`).join("") + "</dl>";
+  const table = (rows,columns) => !Array.isArray(rows) || !rows.length ? "<p>暂无已确认明细</p>" :
+    '<div class="pm-table-wrap"><table class="pm-table"><thead><tr>' + columns.map(([,label]) => `<th scope="col">${text(label)}</th>`).join("") +
+    "</tr></thead><tbody>" + rows.map((row) => "<tr>" + columns.map(([key]) => `<td>${text(row?.[key])}</td>`).join("") + "</tr>").join("") + "</tbody></table></div>";
+  const cards = Object.entries(labels).map(([key,label]) => {
+    const raw = summary?.[key];
+    const data = raw && Object.hasOwn(statuses, raw.status) ? raw : {status:"unknown",reason:"当前来源未读全，情况未知"};
+    let big = "未知", detail = "";
+    if (key === "orders") {
+      big = `试挂 ${text(data.counts?.trial)} / 收益 ${text(data.counts?.income)}`;
+      detail = pairs([["未归池买单",data.counts?.unassigned],["卖单",data.counts?.sell],["确认时间",data.observed_at]]) +
+        table(data.items,[["order_id","订单"],["condition_id","市场"],["side","方向"],["pool","所属池"]]);
+    } else if (key === "pools") {
+      big = `候选 ${text(data.eligible_candidates)}`;
+      detail = pairs([["想开",data.desired_running],["实际开",data.effective_running],["致命错误",data.fatal],["候选上次刷新成功",data.candidate_last_success_at]]);
+      for (const [pool,name] of [["trial","试挂池"],["income","收益池"]]) {
+        const row = data.items?.[pool] || {};
+        detail += `<h4>${name}</h4>` + pairs([["当前 / 目标",`${row.count ?? "未知"} / ${row.target ?? "未知"}`],["预算（USD）",row.budget_usd],
+          ["已占用（USD）",row.used_usd],["最近补位或换单",row.last_change_at],["时间来源说明",row.last_change_reason]]);
+      }
+    } else if (key === "balance") {
+      big = `可用 $${text(data.capacity_usd)}`;
+      detail = pairs([["余额（USD）",data.balance_usd],["授权额度（USD）",data.allowance_usd],["还能用来挂单（USD）",data.capacity_usd],
+        ["当前库存成本（USD）",data.inventory_cost_usd],["读取时间",data.checked_at]]);
+    } else if (key === "cancellations") {
+      big = `卡单 ${data.hour?.success == null ? "未知" : text(data.stuck?.length)}`;
+      for (const [window,name] of [["hour","最近一小时"],["today","Tokyo 今天"]]) {
+        const row = data[window] || {};
+        detail += `<h4>${name}</h4>` + pairs([["已确认撤完",row.success],["被拒",row.rejected],["结果未知",row.unknown],["被拦下",row.blocked]]);
+      }
+      detail += pairs([["审计覆盖",data.coverage]]) + table(data.items,[["order_id","订单"],["outcome","结果"],["requested_at","请求时间"]]);
+    } else {
+      big = `今天 ${text(data.today?.count)} 笔`;
+      for (const [window,name] of [["hour","最近一小时"],["today","Tokyo 今天"]]) {
+        const row = data[window] || {};
+        detail += `<h4>${name}</h4>` + pairs([["成交笔数",row.count],["成交金额（USD）",row.amount_usd]]);
+      }
+      detail += pairs([["当前库存成本（USD）",data.inventory_cost_usd]]) + table(data.items,
+        [["market","市场"],["pool","所属池"],["side","方向"],["price","价格"],["quantity","数量"],["time","成交时间"]]);
+    }
+    return `<details data-lp-monitor="${key}" data-lp-details-key="lp-monitor-${key}" class="lp-monitor-card ${data.status}"><summary><span>${label}</span><strong>${big}</strong><b>${statuses[data.status]}</b><span>${text(data.reason)}</span><small>展开明细</small></summary>${detail}</details>`;
+  }).join("");
+  return `<section aria-label="做市五项现况"><h3>做市现况 · 东京</h3><p class="sub">今天按 Asia/Tokyo 零点统计；未知不代表零。读取时间：${text(summary?.as_of)}</p><div class="lp-monitor-cards">${cards}</div></section>`;
+}
+
 function predictionLpCard(payload) {
   const dashboard = payload?.lp_dashboard && typeof payload.lp_dashboard === "object"
     ? payload.lp_dashboard : {};
@@ -5093,7 +5142,9 @@ function predictionLpCard(payload) {
     && state.predictionMarket.nLegStatus === "paused"
     ? `<section class="pm-alert warning" role="status"><div class="pm-alert-body"><strong data-lp-realtime-status>LP 实时数据暂不可用</strong><p data-lp-realtime-note>这不是生产正常交易看板；写操作不可用。</p></div></section>`
     : "";
-  return "<section class=\"pm-panel pm-lp-card\" aria-label=\"LP 会话\"><header class=\"pm-panel-heading\">"
+  return "<section class=\"pm-panel pm-lp-card\" aria-label=\"LP 会话\">"
+    + lpMonitorCards(dashboard.stale || payload?.lp_error ? null : dashboard.monitor)
+    + "<header class=\"pm-panel-heading\">"
     + "<div><h2>流动性提供试验</h2><p>手工挂单 · 自动补位 · 收益与风险观察</p></div>"
     + "<div class=\"pm-panel-heading-actions\">" + freshness
     + "<button class=\"pm-button\" type=\"button\" data-action=\"lp-dashboard-refresh\""
@@ -6690,6 +6741,7 @@ async function fetchPredictionLpDashboard({force = false} = {}) {
       stale: true,
       last_success_at: previous.last_success_at || previous.checked_at || null,
       error: state.predictionMarket.lpDashboardError,
+      monitor: null,
     };
   } finally {
     if (state.predictionMarket.lpDashboardPendingSeq !== requestSeq) return;

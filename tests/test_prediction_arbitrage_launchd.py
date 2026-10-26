@@ -567,3 +567,58 @@ def test_prediction_health_cli_has_no_dead_storage_flags() -> None:
                 ["prediction-arb", "health-check", flag, "unused"]
             )
         assert error.value.code == 2
+
+    args=cli.build_parser().parse_args(['prediction-arb','health-check','--lp-monitor',
+        '--lp-monitor-state','/private/test-lp-state.json','--lp-monitor-dashboard-url','http://100.64.0.1:8780/',
+        '--once','--no-notify'])
+    assert args.lp_monitor is True and args.lp_monitor_state==Path('/private/test-lp-state.json')
+    assert args.lp_monitor_dashboard_url=='http://100.64.0.1:8780/'
+    assert args.interval==7200 and args.once is True and args.no_notify is True
+
+
+def test_prediction_health_cli_forwards_lp_monitor_options(tmp_path,monkeypatch,capsys):
+    import json
+    from datetime import UTC,datetime
+    from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+    from tests.test_frontend_gateway import _running
+    from tests.test_prediction_arbitrage_health import _paused_healthz
+    from open_trader.polymarket_lp_monitor import unknown_summary
+    from open_trader import prediction_arbitrage_health as health
+    class Clock(datetime):
+        @classmethod
+        def now(cls,tz=None):return datetime(2026,10,26,2,tzinfo=UTC).astimezone(tz) if tz else datetime(2026,10,26,2)
+    monkeypatch.setattr(health,'datetime',Clock)
+    requests=[];notifications=[]
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self,*args):pass
+        def do_GET(self):
+            requests.append(self.path)
+            body=json.dumps(_paused_healthz() if self.path=='/healthz' else unknown_summary()).encode()
+            self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+        def do_POST(self):
+            notifications.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+            body=b'{"code":0}';self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+    server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+    with _running(server):
+        url=f'http://127.0.0.1:{server.server_address[1]}'
+        values=dict(OPEN_TRADER_REPO=str(tmp_path),OPEN_TRADER_PYTHON=sys.executable,
+            OPEN_TRADER_TIMEZONE='Asia/Shanghai',OPEN_TRADER_DEADLINE='08:00',OPEN_TRADER_FUTU_HOST='127.0.0.1',
+            OPEN_TRADER_FUTU_PORT='11111',DEEPSEEK_API_KEY='test-only-placeholder',
+            OPEN_TRADER_NOTIFIERS='feishu',OPEN_TRADER_FEISHU_WEBHOOK_URL=url+'/feishu')
+        for key,value in values.items():monkeypatch.setenv(key,value)
+        config=tmp_path/'health.env';config.write_text('\n'.join(k+'='+v for k,v in values.items()))
+        state=tmp_path/'lp-state.json'
+        saved=dict(version=1,seen=[],pending=[dict(title='东京做市 · 待发',message='保留的通知')])
+        state.write_text(json.dumps(saved))
+        args=['prediction-arb','health-check','--url',url,'--config',str(config),'--once','--json',
+            '--lp-monitor','--lp-monitor-state',str(state),'--lp-monitor-dashboard-url','http://100.64.0.1:8780/']
+        assert cli.main(args)==0
+        output=json.loads(capsys.readouterr().out)
+        assert '/api/prediction-arbitrage/lp/monitor' in requests
+        assert 'lp_monitor' in output
+        assert json.loads(state.read_text())['pending']==[]
+        assert any('http://100.64.0.1:8780/' in row['content']['text'] for row in notifications)
+        sent=len(notifications);state.write_text(json.dumps(saved))
+        assert cli.main(args+['--no-notify'])==0
+        assert len(notifications)==sent and json.loads(state.read_text())['pending']==saved['pending']
+        assert '/api/prediction-arbitrage/state' not in requests

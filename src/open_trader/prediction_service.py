@@ -576,6 +576,7 @@ def create_prediction_server(
                 "/api/prediction-arbitrage/n-leg/mode",
                 "/api/prediction-arbitrage/n-leg/report",
                 "/api/prediction-arbitrage/lp/dashboard",
+                "/api/prediction-arbitrage/lp/monitor",
                 "/api/prediction-arbitrage/lp/auto/state",
                 "/api/prediction-arbitrage/lp/auto/reservations",
                 "/api/prediction-arbitrage/lp/sessions/current",
@@ -711,6 +712,20 @@ def create_prediction_server(
                 except (sqlite3.Error, OSError, RuntimeError) as exc:
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return
+            if parsed.path == "/api/prediction-arbitrage/lp/monitor":
+                from .polymarket_lp_monitor import unknown_summary
+                if parsed.query:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "monitor_query_not_allowed"})
+                    return
+                reader = getattr(getattr(runtime, 'execution', None), 'lp_monitor_summary', None)
+                result = unknown_summary()
+                if mode != 'shadow' and callable(reader):
+                    try:
+                        result = reader()
+                    except Exception:
+                        result = unknown_summary()
+                self._send_json(HTTPStatus.OK, _lp_projection_safe_value(result))
+                return
             if parsed.path == "/api/prediction-arbitrage/lp/dashboard":
                 execution = getattr(runtime, "execution", None)
                 if execution is None or not callable(getattr(execution, "lp_dashboard", None)):
@@ -725,6 +740,15 @@ def create_prediction_server(
                     if callable(auto_state) and mode != "shadow":
                         # The automatic order/intent list is paused on the dashboard.
                         result = {**result, "auto": auto_state(include_intents=False)}
+                    from .polymarket_lp_monitor import unknown_summary
+                    monitor_reader = getattr(execution, 'lp_monitor_summary', None)
+                    monitor = unknown_summary()
+                    if mode != 'shadow' and callable(monitor_reader):
+                        try:
+                            monitor = monitor_reader()
+                        except Exception:
+                            monitor = unknown_summary()
+                    result = {**result, 'monitor': monitor}
                     safe_result = _lp_projection_safe_value(result)
                     if not isinstance(safe_result, Mapping):
                         raise RuntimeError("LP dashboard result is invalid")

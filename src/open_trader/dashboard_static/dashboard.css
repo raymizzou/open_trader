@@ -6994,3 +6994,19 @@ button { cursor: pointer; }
   .pm-lp-card .pm-check { flex-wrap: wrap; }
   .pm-lp-card .pm-check label { min-width: 0; max-width: 100%; }
 }
+
+/* Tokyo LP observations; native details retain keyboard behavior and open state. */
+.lp-monitor-cards { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 12px; align-items: start; margin-bottom: 20px; }
+.lp-monitor-card { min-width: 0; padding: 12px; border: 1px solid var(--line); border-top: 5px solid var(--muted); border-radius: 10px; background: var(--surface); overflow-wrap: anywhere; }
+.lp-monitor-card.normal { border-top-color: var(--success); }
+.lp-monitor-card.attention { border-top-color: var(--warning-text); }
+.lp-monitor-card.abnormal { border-top-color: var(--danger); }
+.lp-monitor-card summary { min-height: 48px; cursor: pointer; }
+.lp-monitor-card summary > * { display: block; }
+.lp-monitor-card summary strong { font-size: 20px; }
+.lp-monitor-card summary small { font-size: 14px; }
+.lp-monitor-card summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
+.lp-monitor-card dt { font-weight: 600; }
+.lp-monitor-card dd { margin: 0 0 8px; }
+@media (max-width: 1100px) { .lp-monitor-cards { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+@media (max-width: 600px) { .lp-monitor-cards { grid-template-columns: 1fr; font-size: 16px; } }
