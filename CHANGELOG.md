@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-26 — Mini as the default deployment workstation
+
+- Document Mac mini as the default workstation for Tokyo and production deployments. Air requires both Ray's explicit selection for that deployment and a verified SSH connection from Air to the Tokyo target; an idle Air is not a fallback.
+- Keep the documentation PR separate from already authorized deployment. The PR still needs Ray's merge approval; deployment retains its exact-SHA gates and separate permissions. No deployment or live acceptance is claimed.
+
 ## 2026-10-26 — LP exit review protections
 
 - Keep historical protected SELL obligations blocking new passive orders until confirmed fills and current position converge, including after restart.
