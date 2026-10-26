@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-26 — Unified production Smoke log checks
+
+- Run the same release-local standalone checker for file, cloud journal and local Gateway logs. Check all logs since startup, require existing runtime markers, and reject empty, unreadable or non-UTF-8 logs and journal failures.
+- Remove metadata warning exemptions and the 200-line window. Report `RemoteProtocolError` explicitly, preserve strict JSON validation and the proven healthy `last_error:null` exception, and retain all Smoke identity and business checks. No deployment is included.
+
 ## 2026-10-26 — Departed income test account publication
 
 - Wait for the real asynchronous account observation to contain only the remaining trial order before testing income selection. Preserve the departed order's unchanged, fresh historical result, exact selection and cancellation identities, and no-reopen assertion. Test synchronization only; production behavior is unchanged.

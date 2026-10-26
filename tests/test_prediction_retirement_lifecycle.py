@@ -99,8 +99,16 @@ def cloud_host_fixture(tmp_path, monkeypatch, mode, requested):
                 guard=dict(mutation_attempts=0,notification_attempts=0),
                 trading_region=dict(status='allowed',blocked=False,country='US',region='CA',
                                     policy='strict',startup_allowed=True)))
-        elif args[0]==str(python): output=''
-        elif args[0]=='journalctl': output='prediction_runtime_state state=RUNNING'
+        elif args in (
+            [str(python), '-c', 'import sys; assert sys.version_info >= (3,12)'],
+            [str(python), '-c', 'import sys; assert sys.version_info >= (3,12); import tencentcloud.ssm.v20190923.ssm_client'],
+        ):
+            output=''
+        elif args == [str(python), str(release/'scripts/check_production_log.py'),
+                      '--journal-unit', 'open-trader-prediction.service', '--since', 'systemd-start',
+                      '--require-text', 'prediction_runtime_state']:
+            assert kwargs['timeout'] > 15
+            output=''
         else: raise AssertionError('uncontrolled external command: '+str(args))
         return subprocess.CompletedProcess(command,0,output,'')
     monkeypatch.setattr(subprocess,'run',external)
@@ -261,7 +269,10 @@ def test_cloud_lifecycle_rejects_configured_pause_substitution(tmp_path, monkeyp
         assert 'Environment=OPEN_TRADER_NLEG_PAUSED=0\n' not in unit
     assert host['health'] == original_health and host['health']['pid'] == 12345
     assert (tmp_path/'cloud.json').read_bytes() == original_config
-    assert all(command[0] in {'systemctl', 'ss', 'git', 'runuser', 'journalctl'} for command in commands)
+    checker = [str(deployed.python), str(deployed.release_root/'scripts/check_production_log.py'),
+        '--journal-unit', 'open-trader-prediction.service', '--since', 'systemd-start',
+        '--require-text', 'prediction_runtime_state']
+    assert all(command[0] in {'systemctl', 'ss', 'git', 'runuser'} or command == checker for command in commands)
     assert all(command[:2] != ['systemctl', 'start'] and command[:2] != ['systemctl', 'stop'] for command in commands)
 
 

@@ -1,23 +1,14 @@
-"""Check the original 200-line Smoke window without printing log contents."""
+"""Check all Smoke log lines without printing log contents."""
 
-from collections import deque
+import argparse
 import json
 from pathlib import Path
 import re
 import sys
+import subprocess
 
 
 ERROR_SIGNAL = re.compile(r"traceback|fatal|exception|error", re.IGNORECASE)
-# These redacted metadata fetch failures are expected transient network noise.
-ALLOWED_LP_METADATA_WARNING = re.compile(
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
-    r"(?:Z|[+-]\d{4}|[+-]\d{2}:\d{2}) WARNING "
-    r"open_trader\.polymarket_trading lp_metadata_read_failed "
-    r"stage=(?:market|event) "
-    r"(?:error_types=TransportError>"
-    r"(?P<transport>RemoteProtocolError|LocalProtocolError|ConnectTimeout)"
-    r"(?:>(?P=transport))?|error_types=RequestRejectedError status=400)"
-)
 
 
 def unique_object(pairs):
@@ -33,13 +24,12 @@ def reject_constant(_value):
     raise ValueError("nonstandard_json_constant")
 
 
-def check(path: Path) -> str | None:
-    if not path.is_file():
-        return "log_not_regular_file"
-    with path.open("rb") as stream:
-        lines = deque(stream, maxlen=200)
-    for raw_line in lines:
-        line = raw_line.decode("utf-8")
+def check(text: str, require_text: str | None = None) -> str | None:
+    if not text.strip():
+        return "log_empty"
+    if require_text is not None and require_text not in text:
+        return "log_required_text_missing"
+    for line in text.splitlines():
         start = line.find("{")
         if start >= 0 and line[start + 1:].lstrip().startswith('"'):
             try:
@@ -59,16 +49,37 @@ def check(path: Path) -> str | None:
             ):
                 del payload["last_error"]
             line = line[:start] + json.dumps(payload, ensure_ascii=False)
-        if ERROR_SIGNAL.search(line) and re.fullmatch(
-            ALLOWED_LP_METADATA_WARNING, line.rstrip("\r\n")
-        ) is None:
+        if "RemoteProtocolError" in line:
+            return "log_remote_protocol_error"
+        if ERROR_SIGNAL.search(line):
             return "log_error_signal"
     return None
 
 
 def main() -> int:
     try:
-        reason = check(Path(sys.argv[1])) if len(sys.argv) == 2 else "log_argument_invalid"
+        parser = argparse.ArgumentParser(exit_on_error=False, allow_abbrev=False)
+        parser.add_argument("path", nargs="?")
+        parser.add_argument("--file")
+        parser.add_argument("--journal-unit")
+        parser.add_argument("--since")
+        parser.add_argument("--require-text")
+        args, unknown = parser.parse_known_args()
+        if (unknown or sum(value is not None for value in (args.path, args.file, args.journal_unit)) != 1
+            or args.journal_unit is not None and (not args.journal_unit.strip() or not args.since or not args.since.strip())
+            or args.journal_unit is None and args.since is not None):
+            reason = "log_argument_invalid"
+        elif args.journal_unit is not None:
+            result = subprocess.run(
+                ["journalctl", "-u", args.journal_unit, "--since", args.since, "--no-pager", "-o", "cat"],
+                check=True, capture_output=True, timeout=15,
+            )
+            reason = check(result.stdout.decode("utf-8"), args.require_text)
+        else:
+            path = Path(args.path or args.file)
+            reason = check(path.read_text(encoding="utf-8"), args.require_text) if path.is_file() else "log_not_regular_file"
+    except argparse.ArgumentError:
+        reason = "log_argument_invalid"
     except Exception:
         reason = "log_read_failed"
     if reason is not None:
