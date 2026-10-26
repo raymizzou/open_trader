@@ -451,7 +451,7 @@ def test_holding_read_failure_retries_without_replay(tmp_path, monkeypatch, fail
     assert exchange.protected_sells == []
 
 
-def current_cost_replacement(tmp_path, monkeypatch, path):
+def current_cost_replacement(tmp_path, monkeypatch, path, *, cost='.50'):
     """BUY100@.30, SELL50, BUY50@.70: remaining100 cost50, not65/150."""
     if path == 'manual':
         from copy import deepcopy
@@ -465,7 +465,7 @@ def current_cost_replacement(tmp_path, monkeypatch, path):
         current = _inventory_snapshot(service.clock(), buy_quantity=Decimal(100), buy_cost=Decimal(30),
             sold_quantity=Decimal(50),sold_revenue=Decimal(36),residual=Decimal(100),residual_value=Decimal(40),
             passive_status='LIVE', orders_terminal=False)
-        current['account']['positions'][0]['average_price'] = Decimal('.50')
+        current['account']['positions'][0]['average_price'] = Decimal(cost) if cost is not None else None
         current['orders'][1].update(original_size=Decimal(100),size_matched=Decimal(50),remaining_size=Decimal(50),price=Decimal('.72'))
         current['orders'].append(dict(order_id='new-buy',status='CANCELED',side='BUY',token_id=session['token_id'],
             original_size=Decimal(50),size_matched=Decimal(50),price=Decimal('.70')))
@@ -477,12 +477,23 @@ def current_cost_replacement(tmp_path, monkeypatch, path):
         assert exchange.cancels==['order-2']
         service.tick()
         assert len([o for o in exchange.posts if o['side']=='SELL'])==1
+        assert exchange.cancels==['order-2']
         current['orders'][1]['status']='CANCELED'
         service.tick()
+        if cost != '.50':
+            assert len([o for o in exchange.posts if o['side']=='SELL'])==1
+            assert exchange.cancels==['order-2'] and exchange.protected_sells==[]
+            assert service.store.lp_sessions()[0]['reconciliation']==(
+                'passive_cost_unknown' if cost is None else 'passive_cost_above_maximum')
+            current['account']['positions'][0]['average_price'] = Decimal('.50')
+            service.tick()
         sells=[o for o in exchange.posts if o['side']=='SELL']
         assert len(sells)==2 and sells[-1]['quantity']==100 and sells[-1]['price']==Decimal('.50')
         assert sells[-1]['post_only'] is True and exchange.protected_sells==[]
         assert Decimal(service.store.lp_sessions()[0]['buy_cost'])==65
+        service.tick()
+        assert len([o for o in exchange.posts if o['side']=='SELL'])==2
+        assert exchange.cancels==['order-2']
     else:
         from polymarket.models.clob.order_response import AcceptedOrder
         from tests.test_lp_d2_integration import _d2_protection_runtime
@@ -513,17 +524,85 @@ def current_cost_replacement(tmp_path, monkeypatch, path):
                 o.model_copy(update={'size_matched':Decimal(150),'status':'FILLED'}) for o in sdk.orders)
             sdk.trades+=(_trade('sale50',_maker_order('passive-1','SELL','50','.72'),size='50'),
                 _trade('buy50',_maker_order('entry-A','BUY','50','.70'),size='50'))
-            sdk.positions=(dict(condition_id=CONDITION_ID,token_id=TOKEN_ID,size='100',average_price='.50'),)
+            sdk.positions=(dict(condition_id=CONDITION_ID,token_id=TOKEN_ID,size='100',average_price=cost),)
             public.ask=Decimal('.49')
             d2_tick(live);d2_tick(live)
             assert sdk.cancels==[('passive-1',)]
             d2_tick(live)
             assert len([o for o in sdk.posts if o['side']=='SELL'])==1
+            assert sdk.cancels==[('passive-1',)]
             allow[0]=True
             d2_tick(live);d2_tick(live)
+            if cost != '.50':
+                assert len([o for o in sdk.posts if o['side']=='SELL'])==1
+                assert sdk.cancels==[('passive-1',)] and sdk.market_orders==[]
+                sell, = live.state.snapshot().sells.values()
+                assert sell.passive.state=='terminal'
+                assert ('passive_cost_unknown' if cost is None else 'passive_cost_above_maximum') in sell.inventory_cost_usd.reason_codes
+                sdk.positions=(dict(condition_id=CONDITION_ID,token_id=TOKEN_ID,size='100',average_price='.50'),)
+                d2_tick(live);d2_tick(live)
             sells=[o for o in sdk.posts if o['side']=='SELL']
             assert len(sells)==2 and sells[-1]['size']==100 and sells[-1]['price']==Decimal('.50')
             assert sells[-1]['post_only'] is True and sdk.market_orders==[]
+            d2_tick(live)
+            assert len([o for o in sdk.posts if o['side']=='SELL'])==2
+            assert sdk.cancels==[('passive-1',)]
         finally:
             assert live.close(3)
             live.trading.close()
+
+
+@pytest.mark.parametrize('path', ['manual', 'auto'])
+@pytest.mark.parametrize('cost', [None, '.995'])
+def test_quantity_mismatch_cancels_before_new_cost_validation(tmp_path, monkeypatch, path, cost):
+    current_cost_replacement(tmp_path, monkeypatch, path, cost=cost)
+
+
+def test_historical_protected_fill_waits_for_position_convergence(tmp_path):
+    from tests.test_polymarket_lp import explicit_legacy_protected_tick
+    service, exchange = legacy_holding(tmp_path, cost='30', ask='.31')
+    service.tick()
+    historical = _inventory_snapshot(service.clock(), buy_quantity=Decimal('100'), buy_cost=Decimal('30'),
+        residual=Decimal('100'), residual_value=Decimal('10'), passive_status='LIVE',
+        bids=[dict(price=Decimal('.25'), size=Decimal('40'))])
+    historical['orders'][1]['price'] = Decimal('.31')
+    exchange.snapshot_value = historical
+    explicit_legacy_protected_tick(service)
+    assert exchange.cancels==['order-2'] and exchange.protected_sells==[]
+    historical['orders'][1]['status'] = 'CANCELED'
+    accepted = explicit_legacy_protected_tick(service)
+    assert exchange.protected_sells == [dict(token_id=accepted['token_id'],
+        quantity=Decimal('40'), min_price=Decimal('.25'))]
+    assert accepted['protected_exit_order_id']=='stop-1'
+    assert accepted['protected_exit_attempt_state']=='accepted'
+    assert Decimal(accepted['protected_exit_submit_quantity'])==40
+    assert Decimal(accepted['protected_exit_submit_residual_quantity'])==100
+    assert len([o for o in exchange.posts if o['side']=='SELL'])==1
+
+    settled = _inventory_snapshot(service.clock(), buy_quantity=Decimal('100'), buy_cost=Decimal('30'),
+        sold_quantity=Decimal('40'), sold_revenue=Decimal('10'), residual=Decimal('100'),
+        residual_value=Decimal('25'), passive_status='CANCELED', protected_status='FILLED')
+    settled['orders'][1].update(original_size=Decimal('100'), size_matched=Decimal('0'),
+        remaining_size=Decimal('100'), price=Decimal('.31'))
+    settled['orders'][-1].update(original_size=Decimal('40'), size_matched=Decimal('40'),
+        remaining_size=Decimal('0'), price=Decimal('.25'), average_price=Decimal('.25'))
+    settled['trades'][1]['maker_orders'][0]['order_id'] = 'stop-1'
+    settled['account']['positions'][0]['average_price'] = Decimal('.30')
+    exchange.snapshot_value = settled
+    restarted = PolymarketLPService(service.store, exchange, clock=service.clock)
+    for _ in range(3):
+        pending = restarted.tick()
+        assert pending['protected_exit_order_id']=='stop-1'
+        assert pending['protected_exit_attempt_state']=='terminal'
+        assert pending['residual_quantity']==100 and pending['sold_quantity']==40
+        assert len([o for o in exchange.posts if o['side']=='SELL'])==1
+        assert len(exchange.protected_sells)==1
+
+    settled['account']['positions'][0]['size'] = Decimal('60')
+    for _ in range(3):
+        converged = restarted.tick()
+    assert converged['protected_exit_order_id'] is None
+    sells = [o for o in exchange.posts if o['side']=='SELL']
+    assert [o['quantity'] for o in sells]==[100,60] and sells[-1]['price']==Decimal('.31')
+    assert sells[-1]['post_only'] is True and len(exchange.protected_sells)==1
+    assert converged['residual_quantity']==60 and converged['sold_quantity']==40

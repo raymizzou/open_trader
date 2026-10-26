@@ -3758,6 +3758,13 @@ class LPD2LiveExecution:
             minimum = _maybe_decimal(book.get('min_order_size'))
             if minimum is not None and quantity < minimum:
                 return ()
+            if passive and (passive.state not in ('terminal', 'rejected') or passive.native_state != 'ended'):
+                current = next((o for o in sell.current_sells if o.key == passive.order_key), None)
+                if (current is not None and current.remaining.state == 'known'
+                        and current.remaining.value != quantity and passive.native_state == 'ended'
+                        and not passive.cancel_request_id):
+                    return (self._cancel_exit(scope, passive, origin),)
+                return ()
             asks = sorted((Decimal(str(r['price'])), Decimal(str(r['size']))) for r in book['asks'])
             own_at_price = {}
             for order in sell.current_sells:
@@ -3772,13 +3779,6 @@ class LPD2LiveExecution:
                     self.state.apply_protection(ExitEvidenceUpdate(origin.guard,
                         replace(sell, inventory_cost_usd=blocked_cost)))
                     return ()
-            if passive and (passive.state not in ('terminal', 'rejected') or passive.native_state != 'ended'):
-                current = next((o for o in sell.current_sells if o.key == passive.order_key), None)
-                if (current is not None and current.remaining.state == 'known'
-                        and current.remaining.value != quantity and passive.native_state == 'ended'
-                        and not passive.cancel_request_id):
-                    return (self._cancel_exit(scope, passive, origin),)
-                return ()
             if price and not sell.current_sells:
                 return (self._start_exit(scope, 'passive_exit', residual.value, sold, price, origin),)
         return ()
