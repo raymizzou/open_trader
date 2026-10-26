@@ -70,12 +70,19 @@ def test_fresh_departed_income_role_cannot_reopen_historical_order(tmp_path,monk
     try:
         for n in 'HD':rig.market(n);rig.add_order(n,'1')
         roles(rig,dict(H=('income','old-H'),D=('trial','old-D')))
-        rig.measure(dict(H='2',D='.5'))
+        original=rig.measure(dict(H='2',D='.5'))['observations'][rig.cid('H')]['pool_result']
         rig.release('old-H')
+        # External fixture removal is not publication of current account facts.
+        rig.publish_account({'old-D'})
         result=rig.cycle(pool='income');rig.finish_cancels(result)
         assert result.selection.targets==(rig.cid('D'),)
         assert {o.key[3] for o in result.rotation.victims}=={'old-D'}
         assert all(p['token_id']!='tH' for p in rig.sdk.posts)
+        historical=rig.execution.lp_observed_pool_state()['results'][rig.cid('H')]
+        assert historical['result']==original
+        assert historical['eligible']  # fresh history still grants no membership
+        assert original['source_order']['order_id']=='old-H'
+        assert Decimal(original['yield_pct_per_hour'])==Decimal('2')
     finally:rig.close()
 
 

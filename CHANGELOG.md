@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-26 — Departed income test account publication
+
+- Wait for the real asynchronous account observation to contain only the remaining trial order before testing income selection. Preserve the departed order's unchanged, fresh historical result, exact selection and cancellation identities, and no-reopen assertion. Test synchronization only; production behavior is unchanged.
+
 ## 2026-10-25 — Metadata HTTP/2 task isolation
 
 - Give each concurrent market or event metadata task its own public client through pagination and response consumption. Keep the eight-task limit, 50-market and 10-event batches, failure/absence distinction, valid sibling results and cache rules. Remove task response hooks before closing clients, including failed and cancelled reads.
