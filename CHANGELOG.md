@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-26 — Restore PR CI
+
+- Run formal CI for PRs targeting main and retain main-push and main-only manual runs. Route PR diffs from the PR base SHA and require successful PR `CI / required` before merge; deployment still needs trusted exact-SHA final-main CI.
+- Bind required PR artifacts to the exact PR merge ref, event, candidate SHA, run and attempt. Keep deployment artifact validation and trusted CI selection main-only.
+- Document that formal CI must cover feature/PR work and cannot return to main-push-only without Ray's explicit approval. Trigger changes must verify that PR events still run `required`.
+
 ## 2026-10-26 — LP exit review protections
 
 - Keep historical protected SELL obligations blocking new passive orders until confirmed fills and current position converge, including after restart.

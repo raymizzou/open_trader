@@ -11,8 +11,7 @@ class WorkflowTests(unittest.TestCase):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         self.assertIn('name: CI\n', workflow)
         events = workflow.split('\non:\n', 1)[1].split('\npermissions:', 1)[0]
-        self.assertEqual(events, '  push:\n    branches: [main]\n  workflow_dispatch:\n')
-        self.assertNotIn('pull_request:', workflow)
+        self.assertEqual(events, '  pull_request:\n    branches: [main]\n  push:\n    branches: [main]\n  workflow_dispatch:\n')
         self.assertNotIn('concurrency:', workflow)
         self.assertNotIn('inputs:', workflow)
         guard = "github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'"
@@ -31,8 +30,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow.count('ref: ${{ github.sha }}'), 8)
         self.assertEqual(workflow.count('runs-on: ubuntu-24.04'), 8)
         self.assertEqual(workflow.count('timeout-minutes:'), 8)
-        self.assertNotIn('github.event.pull_request.base.sha', workflow)
-        self.assertIn('BASE_SHA: ${{ github.event.before }}', workflow)
+        self.assertIn('BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}', workflow)
         self.assertIn('Plan active backend checks', workflow)
 
     def test_fixed_required_check_and_all_service_results(self):
