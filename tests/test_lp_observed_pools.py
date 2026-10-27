@@ -2031,11 +2031,21 @@ def test_async_read_protection_precedes_pool_rebuild(tmp_path,monkeypatch,pool_a
         for count in range(1,12):
             rig.tick()
             rig.pump(lambda:failure() is not None and failure().consecutive_failures==count)
-            if count<11:assert rig.sdk.cancels==[]
-        rig.pump(lambda:rig.sdk.cancels==[('old-B',)] and rig.live.status()['native_inflight']==0)
+            if count<11:
+                # #482 partial-fill protection can act before the read counter.
+                # Every such request must still be the exact B remainder.
+                assert all(batch==('old-B',) for batch in rig.sdk.cancels)
+                assert all(t.reason=='buy_partial_fill' for p in rig.live.state.snapshot().progress.values()
+                    for t in p.cancel_targets)
+                assert rig.sdk.posts==[]
+        rig.pump(lambda:failure().protection_key is not None
+            and rig.live.state.snapshot().progress[failure().protection_key].cancel_targets
+            and rig.live.status()['native_inflight']==0)
+        assert all(batch==('old-B',) for batch in rig.sdk.cancels)
+        initial_cancel_count=len(rig.sdk.cancels)
         assert failure().consecutive_failures==11 and failure().protection_key is not None
-        before={t.request_id for p in rig.live.state.snapshot().progress.values() for t in p.cancel_targets
-            if t.order_key[3]=='old-B'}
+        before={t.request_id for t in rig.live.state.snapshot().progress[failure().protection_key].cancel_targets}
+        assert rig.live.state.snapshot().progress[failure().protection_key].reason_codes==('read_failure_limit',)
         assert len(before)==1
         rig.measure(dict(A='.6',B='1.0',C='.4',D='.8'))
         rig.failed_book_tokens.clear();rig.tick()
@@ -2044,7 +2054,8 @@ def test_async_read_protection_precedes_pool_rebuild(tmp_path,monkeypatch,pool_a
                 for k,y in rig.live.state.snapshot().yields.items()))
         for _ in range(3):rig.scheduler.run_due()
         assert failure().protection_key is not None  # later success cannot unlatch
-        assert rig.sdk.cancels==[('old-B',),('old-B',)] and rig.sdk.posts==[]
+        assert len(rig.sdk.cancels)==initial_cancel_count+1
+        assert all(batch==('old-B',) for batch in rig.sdk.cancels) and rig.sdk.posts==[]
         partial=next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-B')
         assert (partial.original_size.value,partial.size_matched.value,partial.remaining.value)==(75,3,72)
         assert not rig.sdk.market_orders  # protection never forces liquidation
@@ -2056,13 +2067,13 @@ def test_async_read_protection_precedes_pool_rebuild(tmp_path,monkeypatch,pool_a
         rig.pump(lambda:any(k[3]=='replacement-B' for k in rig.live.state.snapshot().read_failures))
         new=next(f for k,f in rig.live.state.snapshot().read_failures.items() if k[3]=='replacement-B')
         assert new.consecutive_failures==0 and new.protection_key is None
-        after={t.request_id for p in rig.live.state.snapshot().progress.values() for t in p.cancel_targets
-            if t.order_key[3]=='old-B'}
+        after={t.request_id for t in rig.live.state.snapshot().progress[failure().protection_key].cancel_targets}
         assert before.isdisjoint(after) and len(after)==1
         for request_id in before:
             record,=rig.store.lp_actions('d2:'+request_id)
             assert record['receipt']['outcome']=='unknown'
-        assert rig.sdk.cancels==[('old-B',),('old-B',)] and rig.sdk.posts==[] and not rig.sdk.market_orders
+        assert len(rig.sdk.cancels)==initial_cancel_count+1
+        assert all(batch==('old-B',) for batch in rig.sdk.cancels) and rig.sdk.posts==[] and not rig.sdk.market_orders
     finally:rig.close()
 
 
