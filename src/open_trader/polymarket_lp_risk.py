@@ -52,15 +52,21 @@ def _maybe_decimal(value: object) -> Decimal | None:
     return result
 
 
-def passive_exit_price(ask: object, average_cost: object, tick_size: object) -> Decimal:
-    """Quote at the external ask or the acquisition cost, excluding fees."""
+def passive_cost_floor(average_cost: object, tick_size: object) -> Decimal:
+    """Known acquisition floor, including floors that cannot be newly quoted."""
     cost = _maybe_decimal(average_cost)
     tick = _maybe_decimal(tick_size)
     if cost is None or cost <= 0:
         raise ValueError("passive_cost_unknown")
     if tick is None or not 0 < tick < 1:
         raise ValueError("passive_tick_unknown")
-    floor = (cost / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+    return (cost / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+
+
+def passive_exit_price(ask: object, average_cost: object, tick_size: object) -> Decimal:
+    """Quote at the external ask or the acquisition cost, excluding fees."""
+    floor = passive_cost_floor(average_cost, tick_size)
+    tick = _maybe_decimal(tick_size)
     price = max(_decimal(ask, "passive_ask"), floor)
     if price > 1 - tick:
         raise ValueError("passive_cost_above_maximum")

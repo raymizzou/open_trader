@@ -661,7 +661,7 @@ def test_stop_loss_is_per_opening_and_includes_partial_exits(tmp_path) -> None:
             },
             {
                 "order_id": "order-2", "token_id": "0x" + "1" * 64, "side": "SELL",
-                "status": "LIVE", "price": Decimal("0.29"),
+                "status": "LIVE", "price": Decimal("0.30"),
                 "original_size": Decimal("100"), "size_matched": Decimal("40"),
                 "remaining_size": Decimal("60"),
             },
@@ -756,6 +756,7 @@ def test_stop_trigger_evidence_is_latched_across_restart(tmp_path) -> None:
         residual_value=Decimal("24.99"),
         passive_status="LIVE",
     )
+    exchange.snapshot_value["orders"][1]["price"] = Decimal("0.30")
     triggered_at = current[0].isoformat(timespec="microseconds").replace("+00:00", "Z")
     store.lp_update_session(session_id, patch={
         "stop_loss_latched": True, "stop_loss_triggered_at": triggered_at,
@@ -776,6 +777,7 @@ def test_stop_trigger_evidence_is_latched_across_restart(tmp_path) -> None:
         residual_value=Decimal("25.20"),
         passive_status="LIVE",
     )
+    exchange.snapshot_value["orders"][1]["price"] = Decimal("0.30")
     later = service.tick()
     assert later["opening_loss"] == Decimal("4.80")
     assert later["stop_loss_triggered_at"] == triggered_at
@@ -1174,6 +1176,8 @@ def test_maker_exit_reprices_without_overselling(tmp_path) -> None:
             "asks": [{"price": Decimal("0.32"), "size": Decimal("100")}],
         }
     changed["account"]["positions"][0]["average_price"] = Decimal("0.30")
+    # Observe the price of the actual cost-bounded passive order.
+    changed["orders"][1]["price"] = Decimal("0.30")
     exchange.snapshots = [base, base, filled, changed, changed]
 
     service.tick()
@@ -2686,6 +2690,7 @@ def test_scoring_uses_current_order_cadence_and_status_freshness(tmp_path) -> No
         passive_status="LIVE",
         orders_terminal=False,
     )
+    passive["orders"][1]["price"] = Decimal("0.30")
     exchange.snapshot_value = passive
     next_due = service.tick()
     assert next_due["state"] == "passive_exit"

@@ -4,6 +4,81 @@ from decimal import Decimal
 import pytest
 
 
+def test_all_holdings_summary_reconciles_coverage_and_reasons(tmp_path, monkeypatch):
+    from tests.test_lp_observed_pools import PoolRig
+    from open_trader.polymarket_lp import PolymarketLPService
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from open_trader.polymarket_lp_market_reader import MarketReader
+    from open_trader.polymarket_lp_market_calculation import CalculationPolicy
+    from open_trader.polymarket_lp_current_state import ValidatedStartAdmission
+    from tests.test_lp_d2_execution_bridge import attach
+    rig = PoolRig(tmp_path, monkeypatch, build_owner=False)
+    rig.producer = PolymarketLPService(rig.store, rig.adapter)
+    rig.live = LPD2LiveExecution(rig.store, rig.adapter, account_id=rig.adapter.config.wallet_address,
+        venue='polymarket', process_epoch='holdings-monitor', policy=CalculationPolicy(None),
+        reader=MarketReader(rig.adapter.lp_reader_source_port()))
+    rig.live.initialize(ValidatedStartAdmission('holdings-monitor', 'offline-permit'))
+    rig.execution = attach(rig.live, rig.producer, tmp_path)
+    rig.live.run_once()
+    try:
+        for name in 'ABCDEG':
+            rig.market(name)
+        rig.add_order('A', '4')
+        rig.sdk.orders[0]['side'] = 'SELL'
+        rig.sdk.positions = tuple(dict(condition_id=rig.cid(n), token_id='t'+n,
+            size=q, average_price=cost, current_value='0') for n, q, cost in [
+                ('A', '10', '.3'), ('B', '2.074', '.3'), ('C', '.009', '.3'),
+                ('D', '3', None), ('E', '4', '.3'), ('G', '1', '.995')])
+        book = rig.public.get_order_book
+        rig.public.get_order_book = lambda **kw: book(**kw).model_copy(update={
+            'min_order_size': Decimal(5) if kw['token_id'] == 'tB' else Decimal(1)})
+        market = rig.public.get_market
+        def metadata(**kw):
+            value = market(**kw)
+            return value.model_copy(update={'state': value.state.model_copy(update={'closed': True, 'accepting_orders': False})}) if kw['id'] == 'mE' else value
+        rig.public.get_market = metadata
+        rig.live.run_once()
+        before = (rig.sdk.balance_reads, rig.sdk.order_reads, rig.sdk.position_reads, rig.store.lp_trade_generation())
+        result = rig.execution.lp_monitor_summary(now=rig.live._utc_now())['holdings']
+        assert Decimal(result['position_quantity']) == Decimal('20.083')
+        assert Decimal(result['covered_quantity']) == 10
+        assert Decimal(result['uncovered_quantity']) == Decimal('10.083')
+        assert result['reasoned_quantity'] == result['uncovered_quantity']
+        rows = {r['token_id']: r for r in result['items']}
+        assert {k: r['state'] for k, r in rows.items()} == dict(tA='covered', tB='below_minimum',
+            tC='dust', tD='cost_unknown', tE='market_ended', tG='cost_above_maximum')
+        assert all(r['reason'] and r['current_value'] == '0' for r in rows.values())
+        assert rows['tD']['cost_floor'] is None and rows['tD']['cost_source'] == 'unknown'
+        assert rows['tA']['sells'][0]['quantity'] == '10'
+        assert rig.execution.lp_monitor_summary(now=rig.live._utc_now())['holdings'] == result
+        assert before == (rig.sdk.balance_reads, rig.sdk.order_reads, rig.sdk.position_reads, rig.store.lp_trade_generation())
+        assert rig.sdk.posts == rig.sdk.cancels == []
+        rig.execution._lp_d2 = None
+        missing = rig.execution.lp_monitor_summary(now=rig.live._utc_now())['holdings']
+        assert missing['status'] == 'unknown' and missing['position_quantity'] is None
+    finally:
+        rig.close()
+    from tests.test_lp_all_holdings_sell import mixed_holding, monitored
+    from tests.test_lp_fill_then_hang import d2_tick
+    live, sdk, public, clock, terminals = mixed_holding(tmp_path / 'mixed', monkeypatch)
+    try:
+        execution = monitored(live, tmp_path / 'mixed')
+        for _ in range(6):
+            d2_tick(live)
+        before = (len(sdk.posts), len(sdk.cancels), sdk.order_reads, sdk.position_reads)
+        summary = execution.lp_monitor_summary(now=live._utc_now())['holdings']
+        row, = summary['items']
+        assert Decimal(row['quantity']) == Decimal(row['covered_quantity']) == 110
+        assert Decimal(row['uncovered_quantity']) == 0 and row['state'] == 'covered'
+        assert row['cost_source'] == 'mixed_max' and Decimal(row['cost_floor']) == Decimal('.31')
+        assert Decimal(summary['position_quantity']) == Decimal(summary['covered_quantity']) == 110
+        assert Decimal(summary['reasoned_quantity']) == Decimal(summary['uncovered_quantity']) == 0
+        assert before == (len(sdk.posts), len(sdk.cancels), sdk.order_reads, sdk.position_reads)
+    finally:
+        assert live.close(3)
+        live.trading.close()
+
+
 def test_monitor_orders_and_pools_share_one_snapshot(tmp_path, monkeypatch):
     from tests.test_lp_observed_pools import AsyncPoolRig
     rig = AsyncPoolRig(tmp_path, monkeypatch)
@@ -377,6 +452,66 @@ def test_monitor_http_is_readonly_and_keeps_unknowns(tmp_path, monkeypatch):
             code,body=_response(base+'/api/prediction-arbitrage/lp/monitor')
             assert code==200 and all(body[k]['status']=='unknown' for k in ('orders','cancellations','pools','balance','fills'))
     finally:rig.close()
+
+
+@pytest.mark.parametrize('case', ['below_cost_cancel_unknown', 'current_reason_after_denial'])
+def test_holdings_monitor_reports_current_blockers_and_below_cost_orders(tmp_path, monkeypatch, case):
+    from tests.test_lp_all_holdings_sell import imported_holding, monitored
+    from tests.test_lp_fill_then_hang import d2_tick
+    from tests.test_lp_order_registration_contract import _open_order, TOKEN_ID
+    from open_trader import lp_monitor_readonly as readonly
+    live, sdk, public, clock = imported_holding(tmp_path, monkeypatch, ask='.18')
+    sdk.positions = tuple(dict(p, average_price='.19') for p in sdk.positions)
+    execution = monitored(live, tmp_path)
+    try:
+        if case == 'below_cost_cancel_unknown':
+            sdk.orders = (_open_order('monitor-below-cost', 'SELL', price='.18', original='10'),)
+            def cancel(*, order_ids):
+                sdk.cancels.append(order_ids)
+                raise TimeoutError('offline exact cancellation outcome unknown')
+            sdk.cancel_orders = cancel
+            d2_tick(live)
+            summary = execution.lp_monitor_summary(now=live._utc_now())
+            section = summary['holdings']; row, = section['items']
+            assert row['covered_quantity'] == '10' and row['uncovered_quantity'] == '0'
+            assert row['state'] == 'below_cost_sell' and '低于成本' in row['reason'] and '撤单' in row['reason']
+            assert section['status'] == 'abnormal' and '低于成本' in section['reason']
+            page = readonly.render_page(summary)
+            assert '低于成本' in page and '撤单最终结果未确认' in page
+            assert 'holding-row abnormal' in page
+            assert sdk.cancels == [('monitor-below-cost',)] and sdk.posts == sdk.market_orders == []
+        else:
+            sign = sdk.create_limit_order
+            def denied_sign(**kwargs):
+                signed = sign(**kwargs)
+                live.run_once()  # an actual newer account observation revokes this original quote
+                return signed
+            sdk.create_limit_order = denied_sign
+            d2_tick(live)
+            row, = live.store.lp_holding_sell_orders(live.account_id, 'polymarket')
+            assert row['state'] == 'rejected' and row['reason'] == 'admission_changed'
+            market, book = public.get_market, public.get_order_book
+            ended = [True]
+            def metadata(**kwargs):
+                value = market(**kwargs)
+                return value.model_copy(update={'state': value.state.model_copy(update={
+                    'closed': True, 'accepting_orders': False})}) if ended[0] else value
+            public.get_market = metadata
+            public.get_order_book = lambda **kwargs: book(**kwargs).model_copy(update={'min_order_size': Decimal(5)})
+            sdk.positions = tuple(dict(p, size='2') for p in sdk.positions)
+            for is_ended, state, reason in [(True, 'market_ended', '市场已结束'), (False, 'below_minimum', '低于最小下单量')]:
+                ended[0] = is_ended
+                clock[0] += 43201  # expire the real 12-hour metadata cache before observing the changed market
+                d2_tick(live)
+                summary = execution.lp_monitor_summary(now=live._utc_now())
+                row, = summary['holdings']['items']
+                assert row['token_id'] == TOKEN_ID and row['state'] == state and reason in row['reason']
+                page = readonly.render_page(summary)
+                assert reason in page and '准入时账户观察已改变' not in page
+            assert sdk.posts == sdk.cancels == sdk.market_orders == []
+    finally:
+        assert live.close(3)
+        live.trading.close()
 
 
 def test_monitor_explains_read_cleanup_fault_and_recovery():

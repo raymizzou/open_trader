@@ -700,6 +700,9 @@ def test_all_lp_write_ports_use_one_resolved_database_coordinator(tmp_path):
         'lp_publish_account_financial_facts', 'lp_register_fenced_actions'} <= observed_dynamic
     writes = [lambda: peer.create_preview({'kind': 'LP'}, expires_at='2026-10-19T00:00:10Z',
                     created_at='2026-10-19T00:00:00Z', lp_priority='reliable'),
+              lambda: peer.lp_save_holding_sell(dict(account_id='wallet', venue='polymarket', request_id='holding-port',
+                  condition_id='C', token_id='T', quantity='10', price='.31', observation_id='current',
+                  generation='g', requested_at='2026-10-19T00:00:00Z', state='pending', order_id=None)),
               lambda: peer.save_lp_observation('A', 'C', {'state': 'known'}),
               lambda: peer.lp_save_preparation(dict(state='partial', stage='history', generation=1)),
               lambda: peer.lp_competitiveness_upsert((('C', Decimal('.12'), STAMP),), progress={'next_start_cursor': 'P1'})]

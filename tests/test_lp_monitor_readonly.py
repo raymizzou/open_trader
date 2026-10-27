@@ -84,3 +84,45 @@ def test_monitor_cards_render_unknown_and_escape_details():
     assert 'data-lp-auto-action="enable"' in html and 'data-lp-auto-field="budget_usd"' in html
     css=(Path(__file__).parents[1]/'src/open_trader/dashboard_static/dashboard.css').read_text()
     assert '.lp-monitor-cards' in css and '@media' in css
+
+
+def test_all_holdings_page_is_readonly_and_escapes_details():
+    value = unknown_summary()
+    value['holdings'] = dict(status='abnormal', reason='成本未知，继续跳过', position_quantity='12.074',
+        covered_quantity='10', uncovered_quantity='2.074', reasoned_quantity='2.074',
+        items=[dict(condition_id='<script>bad()</script>', token_id='unknown-token', quantity='10',
+            cost_floor=None, cost_source='unknown', state='cost_unknown', reason='成本未知',
+            current_value='0', minimum_quantity='5', covered_quantity='10', uncovered_quantity='0',
+            private_key='nested-secret', sells=[dict(order_id='<img src=x>', quantity='10', price='.31', secret='order-secret')]),
+            dict(condition_id='minimum-market', token_id='dust-token', quantity='2.074', cost_floor='.31',
+                cost_source='mixed_max', state='below_minimum', reason='低于最小下单量', current_value='0',
+                minimum_quantity='5', covered_quantity='0', uncovered_quantity='2.074', sells=[])])
+    value['secret'] = 'root-secret'
+    upstream = _Upstream()
+    upstream.response_body = json.dumps(value).encode()
+    with _running(upstream):
+        server = readonly.create_readonly_server(host='127.0.0.1', port=0,
+            upstream_url=f'http://127.0.0.1:{upstream.server_address[1]}' + readonly.SUMMARY_PATH)
+        with _running(server):
+            base = f'http://127.0.0.1:{server.server_address[1]}'
+            with urlopen(base + '/', timeout=5) as response:
+                page = response.read().decode()
+            assert '全持仓挂卖' in page and '有原因未挂' in page and '12.074' in page
+            assert '成本未知' in page and '低于最小下单量' in page and '2.074' in page
+            assert 'class="holding-row abnormal"' in page
+            assert '当前价值' in page and '最小下单量' in page
+            assert '账户与会话成本取高' in page
+            assert '&lt;script&gt;bad()' in page and '&lt;img src=x&gt;' in page
+            assert '<script>bad' not in page and '<img src=x>' not in page
+            assert all(secret not in page for secret in ('nested-secret', 'order-secret', 'root-secret'))
+            with urlopen(base + readonly.SUMMARY_PATH, timeout=5) as response:
+                summary = json.load(response)
+            rows = summary['holdings']['items']
+            assert rows[0]['cost_floor'] is None and rows[0]['current_value'] == '0'
+            assert 'private_key' not in rows[0] and 'secret' not in rows[0]['sells'][0]
+            assert rows[1]['minimum_quantity'] == '5'
+            before = len(upstream.requests)
+            with pytest.raises(HTTPError) as error:
+                urlopen(Request(base + readonly.SUMMARY_PATH, method='POST'), timeout=5)
+            assert error.value.code == 405 and len(upstream.requests) == before
+    assert all(r['method'] == 'GET' and r['path'] == readonly.SUMMARY_PATH for r in upstream.requests)

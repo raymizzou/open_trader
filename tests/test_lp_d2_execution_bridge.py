@@ -2016,6 +2016,7 @@ def test_d2_deferred_target_partial_fill_uses_fresh_attempt_revision(tmp_path, m
     releases = {oid: Event() for oid in ('entry-A',)}
     entered = {oid: Event() for oid in releases}
     sql_entered, sql_release = Event(), Event()
+    holding_sign_release, observed_handles = Event(), []
     terminal, exact_reads, handles, old_attempts, errors = {}, [], {}, [], []
     worker = None
     def cancel(*, order_ids):
@@ -2032,16 +2033,52 @@ def test_d2_deferred_target_partial_fill_uses_fresh_attempt_revision(tmp_path, m
         exact_reads.append(order_id)
         return terminal.get(order_id)
     sdk.cancel_orders, sdk.get_order = cancel, exact
+    create = sdk.create_limit_order
+    def sign(**kwargs):
+        if kwargs['side'] == 'SELL':
+            # Keep an unrelated holding receipt from revoking this target's
+            # financial origin before the target behavior has been observed.
+            assert holding_sign_release.wait(8), 'independent holding signer completion watchdog'
+        return create(**kwargs)
+    sdk.create_limit_order = sign
+    def post(signed):
+        from polymarket.models.clob.order_response import AcceptedOrder
+        assert signed['side'] == 'SELL'
+        sdk.posts.append(signed)
+        sdk.orders += (_open_order('holding-partial', 'SELL', price=str(signed['price']),
+            original=str(signed['size'])),)
+        return AcceptedOrder(order_id='holding-partial', status='live', making_amount=Decimal(0),
+            taking_amount=Decimal(0), trade_ids=(), transactions_hashes=())
+    sdk.post_order = post
     def tick():
         clock[0] += 1
         live.run_once()
         return live.run_protection_once()
     def finish(attempts):
-        for handle in attempts:
+        attempts = tuple(attempts)
+        observed_handles.extend(attempts)
+        # Complete targets by identity before releasing the independent SDK
+        # signer, regardless of returned-handle order. No outcome is weakened.
+        for handle in sorted(attempts, key=lambda h: getattr(h.identity, 'kind', None) == 'holding_sell'):
+            if getattr(handle.identity, 'kind', None) == 'holding_sell':
+                holding_sign_release.set()
             outcome = handle.result(timeout=3)
             handle._thread.join(2)
             assert handle.done()
-            assert outcome.status.value == 'accepted'
+            if getattr(handle.identity, 'kind', None) == 'holding_sell':
+                assert outcome is None
+                request, = [r for r in live.store.lp_holding_sell_orders(WALLET, 'polymarket')
+                    if r['request_id'] == handle.identity.request_id]
+                if request['state'] == 'accepted':
+                    assert request['order_id'] == 'holding-partial'
+                else:
+                    # A simultaneous target receipt changes the financial origin;
+                    # the real final gate must reject this holding request.
+                    assert request['state'] == 'rejected' and request['reason'] == 'admission_changed'
+                    assert request['order_id'] is None
+            else:
+                assert handle.identity.target.existing_order_id in ('entry-A', 'original-B')
+                assert outcome.status.value == 'accepted'
     def partial_fill():
         sdk.orders = tuple(o.model_copy(update={'size_matched': Decimal('1')})
             if o.id == 'original-B' else o for o in sdk.orders)
@@ -2126,13 +2163,26 @@ def test_d2_deferred_target_partial_fill_uses_fresh_attempt_revision(tmp_path, m
         assert current.original_size == partial.original_size and current.terminal_proof.original_size.value == 10
         finish(tick())
         assert sdk.cancels.count(('original-B',)) == 1  # attempted UNKNOWN is not another permission
-        assert live.status()['native_inflight'] == 0 and sdk.posts == []
+        assert live.status()['native_inflight'] == 0
+        assert len(sdk.posts) <= 1
+        for sell in sdk.posts:
+            assert sell['side'] == 'SELL' and sell['token_id'] == TOKEN_ID
+            assert sell['size'] == 1 and sell['price'] == Decimal('.32')
+            assert sell['post_only'] is True and sell['order_type'] == 'GTC'
+        accepted = [r for r in live.store.lp_holding_sell_orders(WALLET, 'polymarket')
+            if r['state'] == 'accepted']
+        assert len(accepted) == len(sdk.posts)
+        assert sdk.market_orders == []
+        assert sum(o.remaining.value for o in live.state.snapshot().active_orders if o.side == 'SELL') == len(sdk.posts)
+        assert sum(o['size'] for o in sdk.posts) <= 1
+        assert live.state.snapshot().positions[0].quantity.value == 1
         assert live.state.snapshot().openings == {} and live.state.snapshot().own_fills == {}
     finally:
+        holding_sign_release.set()
         sql_release.set()
         for event in releases.values(): event.set()
         if worker: worker.join(3)
-        for handle in (*handles.values(), *old_attempts): handle._thread.join(3)
+        for handle in (*handles.values(), *old_attempts, *observed_handles): handle._thread.join(3)
         assert live.close(timeout=3)
         live.trading.close()
 

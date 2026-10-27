@@ -56,7 +56,7 @@ def test_passive_exit_never_below_cost(tmp_path, monkeypatch, path, ask, expecte
             d2_tick(live)  # a fresh current account frame can authorize SELL
             sells = [o for o in sdk.posts if o['side'] == 'SELL']
             assert len(sells) == 1
-            assert sells[0]['price'] == Decimal(expected)
+            assert sells[0]['price'] == Decimal('.30' if ask == '.29' else expected)
             assert sells[0]['size'] == 100 and sells[0]['post_only'] is True
             assert sells[0]['order_type'] == 'GTC' and sdk.market_orders == []
         finally:
@@ -81,7 +81,15 @@ def test_passive_exit_blocks_unknown_or_unquotable_cost(tmp_path, monkeypatch, p
         session = service.store.lp_sessions()[0]
         assert session.get('reconciliation') in ('trade_price_unknown', 'owned_fill_price_unknown', 'passive_cost_unknown', 'passive_cost_above_maximum')
     else:
-        live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch, manual_sale=False)
+        if cost == '.995':
+            from tests.test_lp_all_holdings_sell import mixed_holding
+            live, sdk, public, clock, _ = mixed_holding(tmp_path, monkeypatch, average=cost)
+        else:
+            live, sdk, public, clock = _d2_filled_opening(tmp_path, monkeypatch, manual_sale=False)
+            # Neither usable cost remains. Invalid fill price must also retain
+            # the independent quantity/identity proof gate, never fake a zero.
+            sdk.trades = tuple(t.model_copy(update={'maker_orders': tuple(m.model_copy(
+                update={'price': None}) for m in t.maker_orders)}) for t in sdk.trades)
         sdk.positions = tuple(dict(p, average_price=cost) for p in sdk.positions)
         try:
             d2_tick(live)
@@ -89,10 +97,52 @@ def test_passive_exit_blocks_unknown_or_unquotable_cost(tmp_path, monkeypatch, p
             assert not [o for o in sdk.posts if o['side'] == 'SELL']
             assert sdk.market_orders == []
             sell, = live.state.snapshot().sells.values()
-            assert set(sell.inventory_cost_usd.reason_codes) & {'passive_cost_unknown', 'passive_cost_above_maximum'}
+            if cost == '.995':
+                assert 'passive_cost_above_maximum' in sell.inventory_cost_usd.reason_codes
+            else:
+                assert sell.position_reconciled is False and sell.inventory_cost_usd.state == 'unknown'
         finally:
             assert live.close(3)
             live.trading.close()
+
+
+@pytest.mark.parametrize('mode', ['pure', 'mixed', 'fallback', 'quantity_unknown', 'floor_rise'])
+def test_legacy_session_cost_priority_matches_approved_rule(tmp_path, monkeypatch, mode):
+    if mode == 'fallback':
+        return current_cost_replacement(tmp_path, monkeypatch, 'manual')
+    service, exchange = legacy_holding(tmp_path, cost='40' if mode == 'mixed' else '30.5')
+    quantity = Decimal(110 if mode in ('mixed', 'floor_rise') else 100)
+    exchange.snapshot_value['account']['positions'][0].update(size=quantity,
+        average_price=Decimal('.305' if mode in ('mixed', 'floor_rise') else '.40'))
+    if mode == 'quantity_unknown':
+        exchange.snapshot_value['account']['positions_complete'] = False
+    service.tick()
+    sells = [o for o in exchange.posts if o['side'] == 'SELL']
+    if mode == 'quantity_unknown':
+        assert sells == [] and exchange.cancels == exchange.protected_sells == []
+        return
+    assert len(sells) == 1 and sells[0]['quantity'] == quantity
+    assert sells[0]['price'] == Decimal('.40' if mode == 'mixed' else '.31')
+    assert sells[0]['post_only'] is True
+    if mode != 'floor_rise':
+        return
+    expiration = sells[0]['expiration']
+    current = _inventory_snapshot(service.clock(), buy_quantity=Decimal(100), buy_cost=Decimal('30.5'),
+        residual=quantity, residual_value=Decimal(28), passive_status='LIVE', orders_terminal=False)
+    current['orders'][1].update(price=Decimal('.31'), original_size=quantity, remaining_size=quantity)
+    current['account']['positions'][0]['average_price'] = Decimal('.40')
+    current['book']['asks'] = [dict(price=Decimal('.29'), size=Decimal(1000))]
+    exchange.snapshot_value = current
+    service.tick()
+    assert exchange.cancels == ['order-2']
+    service.tick()
+    assert len([o for o in exchange.posts if o['side'] == 'SELL']) == 1
+    current['orders'][1]['status'] = 'CANCELED'
+    service.tick()
+    sells = [o for o in exchange.posts if o['side'] == 'SELL']
+    assert len(sells) == 2 and sells[-1]['price'] == Decimal('.40')
+    assert sells[-1]['quantity'] == quantity and sells[-1]['expiration'] == expiration
+    assert exchange.cancels == ['order-2'] and exchange.protected_sells == []
 
 
 @pytest.mark.parametrize('full_history', [False, True])
@@ -201,8 +251,10 @@ def test_loss_threshold_does_not_dump_position(tmp_path, monkeypatch, path, latc
                     stop_loss_triggered_at=live.state.snapshot().observation.accepted_at))) == 'applied'
             if pending_protected:
                 from open_trader.polymarket_lp_current_state import ExitEvidenceUpdate, ExitAttempt
-                positions = sdk.positions
-                sdk.positions = tuple(dict(p, average_price=None) for p in positions)
+                # Build the historical obligation before any fresh quote can
+                # be admitted. Missing account cost alone no longer blocks a
+                # proved pure session with a valid local cost.
+                public.failed = True
                 d2_tick(live)
                 d2_tick(live)
                 snapshot = live.state.snapshot()
@@ -215,7 +267,7 @@ def test_loss_threshold_does_not_dump_position(tmp_path, monkeypatch, path, latc
                     fact(Decimal(100)), fact(Decimal(0)), fact(Decimal(100)), fact(Decimal('.20')),
                     fact('FOK'), fact(None), None, None, 'ended')
                 assert live.state.apply_protection(ExitEvidenceUpdate(guard, replace(sell, protected=old))) == 'applied'
-                sdk.positions = positions
+                public.failed = False
                 d2_tick(live)
                 d2_tick(live)
                 assert not [o for o in sdk.posts if o['side'] == 'SELL']
@@ -377,7 +429,7 @@ def test_quantity_change_replaces_only_after_finality(tmp_path, monkeypatch, pat
             d2_tick(live)
             sells = [o for o in sdk.posts if o['side']=='SELL']
             assert [o['size'] for o in sells]==[40,100]
-            assert sells[-1]['price'] == Decimal('.31') and sells[-1]['post_only'] is True
+            assert sells[-1]['price'] == Decimal('.30') and sells[-1]['post_only'] is True
             assert sdk.market_orders == []
         finally:
             assert live.close(3)
@@ -386,14 +438,48 @@ def test_quantity_change_replaces_only_after_finality(tmp_path, monkeypatch, pat
 
 @pytest.mark.parametrize('failure', ['failed', 'stale', 'wrong_token'])
 def test_holding_read_failure_retries_without_replay(tmp_path, monkeypatch, failure):
-    from tests.test_lp_async_live_contract import sdk_boundary, pump_live, LPReadRuntime
+    from tests.test_lp_async_live_contract import sdk_boundary, LPReadRuntime
     from tests.test_lp_order_registration_contract import TOKEN_ID
     from datetime import timedelta
+    from threading import Event, current_thread
+    import json
+    import time
     live, sdk, public, values = _d2_filled_opening(tmp_path/'auto', monkeypatch, manual_sale=False)
+    posted, release_post, observed, outcomes, post_threads = Event(), Event(), {}, {}, []
+    def native_key(handle):
+        # Re-observing one real native is not another attempt. Distinct
+        # requests, Futures or threads must never disappear through dedup.
+        return (handle.identity.request_id, handle._future, handle._thread)
+    def collect_protection():
+        handles = tuple(h for h in live.run_protection_once() if h is not None)
+        for handle in handles:
+            observed.setdefault(native_key(handle), handle)
+        return handles
+    def finish(handle):
+        key = native_key(handle)
+        if key not in outcomes:
+            outcome = handle.result(3)
+            handle._thread.join(3)
+            assert handle.done()
+            outcomes[key] = outcome
+        return outcomes[key]
+    def observe_until(predicate, reason):
+        end = time.monotonic()+4
+        while True:
+            live.run_once()
+            collect_protection()
+            if predicate():
+                return
+            left = end-time.monotonic()
+            assert left > 0, reason
+            with boundary.changed:
+                boundary.changed.wait(min(.01, left))
     try:
         public.failed = True
-        d2_tick(live)
-        d2_tick(live)  # prove actual fills, with no usable book or submission
+        for _ in range(2):
+            live.run_once()
+            for handle in collect_protection(): finish(handle)
+        # Prove actual fills, with no usable book or submission.
         public.failed = False
         original_book = public.get_order_book
         bad = [True]
@@ -413,33 +499,77 @@ def test_holding_read_failure_retries_without_replay(tmp_path, monkeypatch, fail
             status = live.read_runtime.status()
             return bool(status['scopes'] and not any(s['active'] for s in status['scopes'])
                 and status['next_dependency_monotonic'] is not None and status['next_dependency_monotonic'] > clock())
-        pump_live(live,boundary,lambda:settled() and any(e[0]=='entered' and e[2]=='book' for e in boundary.events))
+        observe_until(lambda:settled() and any(e[0]=='entered' and e[2]=='book' for e in boundary.events),
+            'failed holding read / settlement watchdog')
         assert not [o for o in sdk.posts if o['side']=='SELL']
         reads = len([e for e in boundary.events if e[0]=='entered' and e[2]=='book'])
         values[0] = 5  # before the five-second read cooldown from t=1
         live.read_runtime.wake()
         for _ in range(3):
-            live.run_once(); live.run_protection_once()
+            live.run_once(); collect_protection()
         assert len([e for e in boundary.events if e[0]=='entered' and e[2]=='book']) == reads
         bad[0] = False
         def unknown_post(signed):
             sdk.posts.append(signed)
+            post_threads.append(current_thread())
+            posted.set()
+            assert release_post.wait(5), 'external post completion release watchdog'
             raise TimeoutError('unknown passive receipt')
         sdk.post_order = unknown_post
         values[0] = 6;live.read_runtime.wake()
-        pump_live(live,boundary,lambda:bool([o for o in sdk.posts if o['side']=='SELL']) and settled())
+        observe_until(lambda:posted.is_set() and settled(), 'post entry / reader settlement watchdog')
+        # Current request/native identity owns this actual held POST. Earlier
+        # distinct attempts are real rejected sends, not extra POST permission.
+        in_flight, = live.state.snapshot().sells.values()
+        request_id = in_flight.passive.request_id
+        target, = [h for h in observed.values() if h.identity.request_id == request_id]
+        assert len(post_threads) == 1 and post_threads[0] is target._thread
+        assert not target.done() and in_flight.passive.native_state == 'running'
+        for handle in observed.values():
+            if native_key(handle) != native_key(target):
+                prior = finish(handle)
+                assert prior.request_id == handle.identity.request_id and prior.status == 'not_sent'
+        release_post.set()
+        result = finish(target)
+        assert result.request_id == request_id and result.status == 'unknown'
+        sell, = live.state.snapshot().sells.values()
+        assert sell.passive.request_id == request_id
+        assert sell.passive.state == 'unknown' and sell.passive.native_state == 'ended'
         for _ in range(3):
             live.run_once()
-            for handle in live.run_protection_once():
-                handle.result(3);handle._thread.join(3)
+            for handle in collect_protection():
+                # A new native for this passive scope would be a replay even
+                # if it subsequently rejected before reaching the SDK.
+                if (getattr(handle.identity, 'kind', None) == 'passive_exit'
+                        and handle.identity.scope == target.identity.scope):
+                    assert native_key(handle) == native_key(target)
+                finish(handle)
+        for handle in observed.values():
+            if native_key(handle) != native_key(target):
+                prior = finish(handle)
+                assert prior.request_id == handle.identity.request_id and prior.status == 'not_sent'
         sells = [o for o in sdk.posts if o['side']=='SELL']
-        assert len(sells)==1 and sells[0]['post_only'] is True and sells[0]['token_id']==TOKEN_ID
-        assert sdk.market_orders == []
+        assert len(sells)==1 and sells[0]['size']==100
+        assert sells[0]['post_only'] is True and sells[0]['token_id']==TOKEN_ID
+        assert len(post_threads) == 1 and post_threads[0] is target._thread
+        assert sdk.cancels == [] and sdk.market_orders == []
         sell, = live.state.snapshot().sells.values()
+        assert sell.passive.request_id == request_id
         assert sell.passive.state=='unknown' and sell.passive.native_state=='ended'
+        print('ci04_native_identity ' + json.dumps(dict(failure=failure,
+            current_request_id=request_id, post_request_id=target.identity.request_id,
+            actual_post_owner_is_target=post_threads[0] is target._thread,
+            sell_post_count=len(sells), sell_quantity=str(sells[0]['size']),
+            observed=[dict(request_id=h.identity.request_id, kind=getattr(h.identity, 'kind', None),
+                thread_identity=id(h._thread), target=native_key(h)==native_key(target),
+                result=outcomes[native_key(h)].status, done=h.done()) for h in observed.values()])))
     finally:
-        assert live.close(4)
-        live.trading.close()
+        release_post.set()
+        try:
+            for handle in observed.values(): finish(handle)
+        finally:
+            assert live.close(4)
+            live.trading.close()
     # A new legacy service instance sees the durable UNKNOWN and cannot replay.
     service, exchange = legacy_holding(tmp_path/'manual', cost='30')
     exchange.post_failures = [TimeoutError('unknown passive receipt')]

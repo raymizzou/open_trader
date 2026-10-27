@@ -83,6 +83,8 @@ def unknown_summary(now=None):
                           today=dict(count=None, amount_usd=None), items=[], inventory_cost_usd=None)
     result['cancellations'].update(hour=dict.fromkeys(('success','rejected','unknown','blocked')),
         today=dict.fromkeys(('success','rejected','unknown','blocked')), items=[], stuck=[])
+    result['holdings'] = section(items=[], position_quantity=None, covered_quantity=None,
+        uncovered_quantity=None, reasoned_quantity=None)
     return result
 
 
@@ -101,9 +103,11 @@ class LPMonitorSummary:
             return 0
         return (now - start).total_seconds()
 
-    def summarize(self, *, auto, dashboard, trades, audits, account_id, now):
+    def summarize(self, *, auto, dashboard, trades, audits, account_id, now, holdings=None):
         with self.lock:
             result = unknown_summary(now)
+            if isinstance(holdings, Mapping):
+                result['holdings'] = dict(holdings)
             auto, dashboard, trades = mapping(auto), mapping(dashboard), mapping(trades)
             membership = mapping(mapping(auto.get('observed_pools')).get('current_membership'))
             stamp = moment(membership.get('observed_at'))

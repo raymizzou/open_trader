@@ -283,7 +283,7 @@ if port:
     def __exit__(self,*args):
         self.timings['scenario']=time.monotonic()-self.scenario_started
         exiting=time.monotonic()
-        for resource in ('post','reader','reader-shutdown','notready','business','metadata','http','control','settings','manual','optional',
+        for resource in ('post','reader','reader-shutdown','notready','business','metadata','http','control','settings','manual','optional','optional-d2-reader',
                          'business-native','metadata-native','settings-native'):self.release(resource)
         for name in self.http_handles:self.release(name)
         if self.process and self.process.poll() is None:
@@ -811,6 +811,8 @@ def child(runtime_root,port,scenario,config_path,*,control=None):
         if 'optional-share' in scenario and threading.current_thread().name=='prediction-lp-share-watch':hold_optional()
         if ('optional-' in scenario or 'producer-' in scenario) and threading.current_thread().name=='lp-reader-source':
             mark('optional-current-read-'+str(len(list(events.glob('optional-current-read-*')))+1))
+            if (events/'optional-d2-reader-arm').exists():
+                hold('optional-d2-reader')
         if scenario.endswith('consumer-nleg-paused-run') and threading.current_thread().name=='lp-reader-source':
             number=len(list(events.glob('nleg-current-read-*')))+1
             mark('nleg-current-read-'+str(number))
@@ -1091,8 +1093,14 @@ def child(runtime_root,port,scenario,config_path,*,control=None):
             # restores each committed-but-unreturned/native-BEGIN boundary,
             # released serially by the lifecycle regression.
             name = threading.current_thread().name
-            resource = {'lp-business-writer': 'business',
-                        'lp-metadata-writer': 'metadata'}.get(name)
+            resource = {'lp-metadata-writer': 'metadata'}.get(name)
+            if name == 'lp-business-writer':
+                caller=sys._getframe(1)
+                while caller is not None:
+                    if caller.f_code.co_name == 'lp_log_business_record':
+                        resource='business'  # Intended request/receipt audit, not inventory anchors.
+                        break
+                    caller=caller.f_back
             if name == 'lp-settings-save' and scenario == 'reader':
                 resource = 'settings'
             if resource and not (events/(resource+'-entered')).exists():
@@ -1413,13 +1421,37 @@ def child(runtime_root,port,scenario,config_path,*,control=None):
             def optional_stopped(runtime):
                 try:
                     result=native_stop(runtime)
-                except RuntimeError:
+                except RuntimeError as error:
+                    source_label=('share watch' if 'optional-share' in scenario else
+                        'candidate maintenance monitor' if 'producer-trial' in scenario else
+                        'candidate scan monitor' if 'producer-candidate' in scenario else 'history monitor')
+                    d2_stopping=str(error)=='prediction runtime cleanup failed: RuntimeError: D2 native resources are still stopping'
+                    source_stopping=str(error)==('prediction runtime cleanup failed: RuntimeError: prediction LP '+source_label+' thread did not stop')
+                    if not (d2_stopping or source_stopping):
+                        raise  # No unrelated cleanup failure is a completion observation.
+                    if d2_stopping:
+                        live=runtime.lp_d2
+                        with live.reader._lock:
+                            pending_reads=sum(not job.done() for job in live.reader._jobs.values())
+                        publish_snapshot(events/'optional-d2-resources.json',json.dumps(dict(
+                            error=str(error), optional_ended=(events/'optional-ended').exists(),
+                            reader_jobs=pending_reads,native_inflight=live.status()['native_inflight'],
+                            writer_alive=live.writer.status()['thread_alive'],
+                            control_inflight=live.control.status().native_save_in_flight)))
+                        mark('optional-d2-stop-observed')
                     assert runtime.state=='STOPPING' and runtime.production_owner
                     assert runtime.lp is not None and runtime.execution is not None
                     assert runtime.store is not None and runtime._prediction_trading is adapter
-                    worker=(runtime._lp_share_thread if 'optional-share' in scenario else runtime._candidate_maintenance_thread if 'producer-trial' in scenario else runtime._candidate_scan_thread if 'producer-candidate' in scenario else runtime._history_thread)
-                    assert worker is not None and worker.is_alive()
-                    assert not (events/'optional-ended').exists()
+                    if d2_stopping:
+                        assert runtime.lp_d2 is not None and runtime.lp_d2.status()['closed'] is True
+                    else:
+                        worker=(runtime._lp_share_thread if 'optional-share' in scenario else runtime._candidate_maintenance_thread if 'producer-trial' in scenario else runtime._candidate_scan_thread if 'producer-candidate' in scenario else runtime._history_thread)
+                        assert worker is not None
+                        if not (events/'optional-ended').exists():
+                            assert worker.is_alive()
+                    # Rethrow the specific STOPPING result. The real service
+                    # owner loop must recollect, then publish STOPPED only after
+                    # every independent native resource has actually ended.
                     mark('optional-stopping-retained')
                     raise
                 assert runtime.state=='STOPPED'

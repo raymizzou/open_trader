@@ -34,7 +34,7 @@ from .polymarket_lp_current_state import (
 from .polymarket_lp_market_calculation import CalculationPolicy, calculate_current, select_current_composition
 from .polymarket_lp_market_reader import MarketReader, ReadScope, freeze
 from .polymarket_lp_risk import (estimate_lp_queue_position, first_observation_baseline,
-    passive_exit_price, _executable_bid_value, _projected_taker_fee, _freshness, _levels, _maybe_decimal, TERMINAL_ORDER_STATES)
+    passive_exit_price, passive_cost_floor, _executable_bid_value, _projected_taker_fee, _freshness, _levels, _maybe_decimal, TERMINAL_ORDER_STATES)
 from .polymarket_lp import SCORING_POLL_SECONDS, SCORING_STALE_SECONDS, SCORING_FAILURE_WINDOW_SECONDS
 from .polymarket_lp_round import (
     LPRoundCoordinator, CycleStatus, FixedBuyPlan, StartStatus, CancelTarget,
@@ -216,6 +216,7 @@ class _SellCalculationOrigin:
     trade_version: int
     residual: Decimal
     sold: Decimal
+    account_quantity: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -353,6 +354,7 @@ class LPD2LiveExecution:
         self._read_store_owners={}
         self._read_store_values={}
         self._read_store_cancels={}
+        self._restored_read_cancels=set()
         self._read_store_error=None
         self._async_financial_ticket=None
         self._async_market_results=[]
@@ -428,6 +430,8 @@ class LPD2LiveExecution:
         self._rotation_cancel_backoffs = {}
         self._pool_next = 'trial'
         self._pool_pending = set()
+        from .polymarket_lp_holdings import HoldingSells
+        self._holding_sells = HoldingSells(self)
 
     def _is_local_order(self, order):
         if self.lp_instance_id is None:
@@ -1443,7 +1447,9 @@ class LPD2LiveExecution:
                         raise ValueError('read_owner_mismatch')
                     self.state.restore_read_protection(order.key,record['consecutive_failures'],record['reason_codes'])
                     self._read_store_values[order.key]=record
-                    if record.get('cancel_request_id'):self._read_store_cancels[order.key]=record['cancel_request_id']
+                    if record.get('cancel_request_id'):
+                        self._read_store_cancels[order.key]=record['cancel_request_id']
+                        self._restored_read_cancels.add(order.key)
                 self._read_store_owners[order.key]=owner['session_id']
             except Exception as exc:
                 self._read_store_error=type(exc).__name__
@@ -1508,6 +1514,15 @@ class LPD2LiveExecution:
         attempts=[];snapshot=self.state.snapshot()
         for key,failure in snapshot.read_failures.items():
             if key not in self._read_store_owners:continue
+            # A restored request is an unresolved prior-process obligation,
+            # not permission to submit it again from a fresh account frame.
+            # New requests in this process keep their existing retry policy.
+            if key in self._restored_read_cancels:
+                # A fresh account listing alone cannot replay a boot marker.
+                # An actual successful current-process market attempt resets
+                # the cause and permits a new, independently guarded decision.
+                if failure.last_attempt is None or failure.consecutive_failures != 0:continue
+                self._restored_read_cancels.discard(key)
             progress=snapshot.progress.get(failure.protection_key)
             if failure.protection_key is None or progress is None:continue
             order=next((o for o in snapshot.active_orders if o.key==key and o.side=='BUY'),None)
@@ -1684,6 +1699,7 @@ class LPD2LiveExecution:
                     captured_candidates, as_of, attempted_at, capture_failed=capture_failed)
                 return RunResult(accepted)
             observation = accepted.observation
+            self._holding_sells.observe_frame(self.state.snapshot())
             source = observation.order_view.orders_source
             orders_current = (accepted.status in ('accepted', 'partial')
                 and observation.read_ticket == ticket and source.state == 'known'
@@ -3395,6 +3411,8 @@ class LPD2LiveExecution:
                 key = (self.account_id, raw['condition_id'], raw['token_id'], raw['order_id'])
                 if raw['side'] != 'SELL' or key in self._opening_order_associations:
                     continue
+                if self._holding_sells.is_holding_order(key):
+                    continue
                 active = tuple(o for o in snapshot.openings.values() if o.scope[:3] == key[:3] and o.phase != 'closed')
                 if len(active) != 1:
                     continue
@@ -3599,9 +3617,13 @@ class LPD2LiveExecution:
             # Same-frame complete threshold0 coverage plus fully resolved exact
             # obligations projects zero locally; never invent a canonical row.
             residual = Fact('known', Decimal(0), (position_source,))
+        account_quantity = residual
+        account_converged = self._holding_sells.observe_account(snapshot, position) if position else absent_zero
         reconciled = bool(complete and bought is not None and sold is not None and bought >= sold
             and (position is not None or absent_zero) and observation.positions_complete and observation.orders_complete
-            and residual.state == 'known' and residual.value == bought-sold)
+            and account_converged and residual.state == 'known' and residual.value >= bought-sold)
+        if reconciled:
+            residual = Fact('known', bought-sold, residual.sources)
         source = observation.source_frame.sources.get(f'market:{scope[1]}:{scope[2]}')
         data = source.value if source and source.complete and not source.error and isinstance(source.value, Mapping) else {}
         book, market = data.get('book'), data.get('metadata')
@@ -3703,7 +3725,7 @@ class LPD2LiveExecution:
             snapshot = self.state.snapshot()
             opening, sell = snapshot.openings[scope], snapshot.sells[scope]
             origin = _SellCalculationOrigin(self._protection_guard(snapshot, scope, orders, observation=True),
-                snapshot.trade_version, residual.value, sold)
+                snapshot.trade_version, residual.value, sold, account_quantity.value)
             attempts = tuple(a for a in (sell.passive, sell.protected) if a)
             final_orders = bool(orders) and all(o.terminal_proof is not None
                 and o.terminal_proof.identity_verified and o.terminal_proof.matched.state == 'known'
@@ -3741,14 +3763,18 @@ class LPD2LiveExecution:
                     if restored != 'applied':
                         raise RuntimeError('exit_retirement_refusal_not_restored:' + restored)
                 return ()
-        if not reconciled or residual.state != 'known' or residual.value <= 0 or not book:
+        self._holding_sells.sync_session_terminals(self.state.snapshot())
+        if (not reconciled or residual.state != 'known' or residual.value <= 0 or not book
+                or self._holding_sells.attribution_uncertain(scope[:3])):
             return ()
         passive = sell.passive
         if (sell.protected is not None and (sell.protected.native_state != 'ended'
                 or sell.protected.state not in ('terminal', 'rejected'))):
             return ()
         if not opening.stop_requested:
-            quantity = residual.value
+            quantity = min(residual.value, self._holding_sells._available(snapshot, position,
+                ignore_request=passive.request_id if passive else None,
+                exclude_order=passive.order_key[3] if passive and passive.order_key else None))
             if self.lp_instance_id is not None:
                 from .lp_order_ownership import normalize_sell_quantity
                 try:
@@ -3760,8 +3786,14 @@ class LPD2LiveExecution:
                 return ()
             if passive and (passive.state not in ('terminal', 'rejected') or passive.native_state != 'ended'):
                 current = next((o for o in sell.current_sells if o.key == passive.order_key), None)
+                average, _ = self._holding_sells._cost(snapshot, position) if position else (None, 'unknown')
+                try:
+                    floor = passive_cost_floor(average, book.get('tick_size'))
+                except ValueError:
+                    floor = None
                 if (current is not None and current.remaining.state == 'known'
-                        and current.remaining.value != quantity and passive.native_state == 'ended'
+                        and (current.remaining.value != quantity or floor is not None and current.price.value < floor)
+                        and passive.native_state == 'ended'
                         and not passive.cancel_request_id):
                     return (self._cancel_exit(scope, passive, origin),)
                 return ()
@@ -3772,15 +3804,16 @@ class LPD2LiveExecution:
             price = next((p for p,size in asks if size > own_at_price.get(p, 0)), None)
             if price is not None:
                 try:
-                    price = passive_exit_price(price, position.average_price.value if position else None,
+                    average, _ = self._holding_sells._cost(snapshot, position) if position else (None, 'unknown')
+                    price = passive_exit_price(price, average,
                         book.get('tick_size'))
                 except ValueError as exc:
                     blocked_cost = replace(sell.inventory_cost_usd, reason_codes=(str(exc),))
                     self.state.apply_protection(ExitEvidenceUpdate(origin.guard,
                         replace(sell, inventory_cost_usd=blocked_cost)))
                     return ()
-            if price and not sell.current_sells:
-                return (self._start_exit(scope, 'passive_exit', residual.value, sold, price, origin),)
+            if price:
+                return (self._start_exit(scope, 'passive_exit', quantity, sold, price, origin),)
         return ()
 
     def _publish_sell_attempt(self, scope, attempt, *, observation=False):
@@ -3818,9 +3851,9 @@ class LPD2LiveExecution:
                 and attempt.submit_residual_quantity.state == 'known' and attempt.submit_residual_quantity.value == origin.residual
                 and attempt.submit_sold_quantity.state == 'known' and attempt.submit_sold_quantity.value == origin.sold
                 and attempt.submit_quantity.state == 'known' and 0 < attempt.submit_quantity.value <= origin.residual
-                and len(positions) == 1 and positions[0].quantity.state == 'known' and positions[0].quantity.value == origin.residual
-                and not sell.current_sells
-                and not any(o.side == 'SELL' and o.key[:3] == scope[:3] for o in snapshot.active_orders))
+                and len(positions) == 1 and positions[0].quantity.state == 'known'
+                and positions[0].quantity.value == (origin.account_quantity if origin.account_quantity is not None else origin.residual)
+                and self._holding_sells._available(snapshot, positions[0], ignore_request=attempt.request_id) >= attempt.submit_quantity.value)
 
     def _start_exit(self, scope, kind, quantity, sold, price, origin):
         if self.lp_instance_id is not None:
@@ -3841,10 +3874,11 @@ class LPD2LiveExecution:
                 sell = snapshot.sells.get(scope)
                 positions = tuple(p for p in snapshot.positions if (p.account_id, p.condition_id, p.token_id) == scope[:3])
                 if (sell is None or not sell.position_reconciled or len(positions) != 1
-                        or positions[0].quantity.state != 'known' or positions[0].quantity.value != origin.residual
+                        or positions[0].quantity.state != 'known'
+                        or positions[0].quantity.value != (origin.account_quantity if origin.account_quantity is not None else origin.residual)
                         or sell.residual_quantity.state != 'known' or sell.residual_quantity.value != origin.residual
                         or sold != origin.sold or not 0 < quantity <= origin.residual
-                        or any(o.side == 'SELL' and o.key[:3] == scope[:3] for o in snapshot.active_orders)):
+                        or self._holding_sells._available(snapshot, positions[0]) < quantity):
                     return None
                 if self._control_view().fatal or len(self._placement_owners()) >= 2:
                     return None
@@ -3874,6 +3908,7 @@ class LPD2LiveExecution:
                     scope[1], scope[2], 'SELL', price, quantity, self._utc_now(), None, self.venue, generation,
                     'protection:'+identity.request_id, self.rounds.snapshot().round_number,
                     snapshot.observation.observation_id, attempt.order_type.value, None, kind == 'passive_exit', ())
+                self._holding_sells.session_intent(scope, attempt, record, dispatch_origin)
                 self.writer.offer(record)
                 handle = self._start_protection_native(identity,
                     lambda: self._execute_exit(scope, attempt, record, generation, lease, dispatch_origin),
@@ -3915,11 +3950,15 @@ class LPD2LiveExecution:
 
     def _execute_exit(self, scope, attempt, record, generation, lease, origin):
         outcome, venue_id, signed = 'not_sent', None, None
+        row = self._holding_sells.requests[attempt.request_id]
+        denied = False
         try:
             if not lease.allowed('SELL') or not self._sell_dispatch_current(scope, attempt, generation, origin):
+                denied = True
                 with self.state._lock:
                     self._publish_sell_attempt(scope, replace(attempt, state='rejected', native_state='ended'))
                 return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
+            self._holding_sells._save(row)
             if self.lp_instance_id is not None:
                 prepared = (self.trading.lp_prepare_limit_order(token_id=scope[2], side='SELL',price=attempt.price.value,
                     quantity=attempt.submit_quantity.value, expiration=None, post_only=True)
@@ -3934,6 +3973,14 @@ class LPD2LiveExecution:
                     quantity=attempt.submit_quantity.value, expiration=None, post_only=True)
                     if attempt.kind == 'passive_exit' else None)
             if not lease.allowed('SELL') or not self._sell_dispatch_current(scope, attempt, generation, origin):
+                denied = True
+                with self.state._lock:
+                    self._publish_sell_attempt(scope, replace(attempt, state='rejected', native_state='ended'))
+                return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
+            row = dict(row, state='unknown', order_id=prepared.order_id if self.lp_instance_id is not None else None)
+            self._holding_sells._save(row)
+            if not lease.allowed('SELL') or not self._sell_dispatch_current(scope, attempt, generation, origin):
+                denied = True
                 with self.state._lock:
                     self._publish_sell_attempt(scope, replace(attempt, state='rejected', native_state='ended'))
                 return _ProtectionOutcome(attempt.request_id, outcome, venue_id)
@@ -3984,6 +4031,7 @@ class LPD2LiveExecution:
         except Exception:
             pass  # actual post uncertainty retains this exact attempt; never replay it
         finally:
+            self._holding_sells.finish_session(row, outcome, venue_id or row.get('order_id'), denied=denied)
             self.writer.offer(ReceiptRecord(self.account_id, self.process_epoch, attempt.request_id,
                 record.session_id, scope[1], scope[2], venue_id, outcome, self._utc_now()))
         with self.state._lock:
@@ -4153,6 +4201,9 @@ class LPD2LiveExecution:
             self._native_completion_consumed = max(self._native_completion_consumed, completed)
         return result
 
+    def holdings_summary(self, *, now=None):
+        return self._holding_sells.project(now or self._utc_now())
+
     def _run_protection_once(self, *, timeout=2):
         """Evaluate the accepted raw frame; protection never acquires a new book."""
         with self._protection_lock:
@@ -4262,6 +4313,7 @@ class LPD2LiveExecution:
             for scope in tuple(self.state.snapshot().openings):
                 attempts.extend(self._evaluate_opening(scope))
             attempts.extend(self._cancel_review_entries())
+            attempts.extend(self._holding_sells.evaluate())
             return tuple(a for a in attempts if a is not None)
 
     def close(self, timeout=5):
