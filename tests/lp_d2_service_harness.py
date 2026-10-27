@@ -2066,7 +2066,13 @@ def run_no_reconcile_runtime(root,config_path,scenario,sdk,publish,mark,clock,ut
         return observe
     sys.setprofile(observe);threading.setprofile(observe)
     stopped=threading.Event() if control is None else control.stopped
-    if control is None:signal.signal(signal.SIGTERM,lambda *_:stopped.set())
+    stop_requested=False
+    def request_stop(*_):
+        # A Python signal can interrupt Event.wait with its Condition lock held.
+        # Record intent only; never reacquire that non-reentrant lock here.
+        nonlocal stop_requested
+        stop_requested=True
+    if control is None:signal.signal(signal.SIGTERM,request_stop)
     mark('service-starting')
     code=0
     try:
@@ -2080,7 +2086,7 @@ def run_no_reconcile_runtime(root,config_path,scenario,sdk,publish,mark,clock,ut
         # Remain observable even on the expected pre-admission RED. No second start.
         deadline=time.monotonic()+40
         fresh=False;buy_checked=False
-        while not stopped.wait(.01):
+        while not stopped.wait(.01) and not stop_requested:
             assert time.monotonic()<deadline,'runtime-only child independent real watchdog'
             if not fresh and (events/'release-fresh-facts').exists():
                 fresh=True

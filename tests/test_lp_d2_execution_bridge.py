@@ -2016,6 +2016,7 @@ def test_d2_deferred_target_partial_fill_uses_fresh_attempt_revision(tmp_path, m
     releases = {oid: Event() for oid in ('entry-A',)}
     entered = {oid: Event() for oid in releases}
     sql_entered, sql_release = Event(), Event()
+    holding_sign_release, observed_handles = Event(), []
     terminal, exact_reads, handles, old_attempts, errors = {}, [], {}, [], []
     worker = None
     def cancel(*, order_ids):
@@ -2032,6 +2033,14 @@ def test_d2_deferred_target_partial_fill_uses_fresh_attempt_revision(tmp_path, m
         exact_reads.append(order_id)
         return terminal.get(order_id)
     sdk.cancel_orders, sdk.get_order = cancel, exact
+    create = sdk.create_limit_order
+    def sign(**kwargs):
+        if kwargs['side'] == 'SELL':
+            # Keep an unrelated holding receipt from revoking this target's
+            # financial origin before the target behavior has been observed.
+            assert holding_sign_release.wait(8), 'independent holding signer completion watchdog'
+        return create(**kwargs)
+    sdk.create_limit_order = sign
     def post(signed):
         from polymarket.models.clob.order_response import AcceptedOrder
         assert signed['side'] == 'SELL'
@@ -2046,7 +2055,13 @@ def test_d2_deferred_target_partial_fill_uses_fresh_attempt_revision(tmp_path, m
         live.run_once()
         return live.run_protection_once()
     def finish(attempts):
-        for handle in attempts:
+        attempts = tuple(attempts)
+        observed_handles.extend(attempts)
+        # Complete targets by identity before releasing the independent SDK
+        # signer, regardless of returned-handle order. No outcome is weakened.
+        for handle in sorted(attempts, key=lambda h: getattr(h.identity, 'kind', None) == 'holding_sell'):
+            if getattr(handle.identity, 'kind', None) == 'holding_sell':
+                holding_sign_release.set()
             outcome = handle.result(timeout=3)
             handle._thread.join(2)
             assert handle.done()
@@ -2163,10 +2178,11 @@ def test_d2_deferred_target_partial_fill_uses_fresh_attempt_revision(tmp_path, m
         assert live.state.snapshot().positions[0].quantity.value == 1
         assert live.state.snapshot().openings == {} and live.state.snapshot().own_fills == {}
     finally:
+        holding_sign_release.set()
         sql_release.set()
         for event in releases.values(): event.set()
         if worker: worker.join(3)
-        for handle in (*handles.values(), *old_attempts): handle._thread.join(3)
+        for handle in (*handles.values(), *old_attempts, *observed_handles): handle._thread.join(3)
         assert live.close(timeout=3)
         live.trading.close()
 
