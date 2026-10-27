@@ -9,7 +9,7 @@ expand the subscription. Arbitrage monitoring is unchanged.
 | Mode | Protection book | New-entry pricing | WS |
 | --- | --- | --- | --- |
 | `off` | Original REST path | REST | Stopped; actual cleanup retains ownership |
-| `shadow` | REST; compare the copied existing queue decision | REST | Maintain and audit books |
+| `shadow` | REST; compare the same frozen bid-level decision | REST | Maintain and audit books |
 | `use` | Synchronized WS for eligible current BUYs; otherwise REST | REST, including detached income reads and fresh manual previews | Maintain and audit books |
 
 Use the existing authenticated, loopback-only operator command on the selected
@@ -49,10 +49,17 @@ Retry diagnostics also include `failure_streak`, `next_retry_monotonic` and
 
 Review all of the following:
 
-- The unchanged rule is `front_estimate / level_total <= 0.5`.
-  **REST can cancel ⇒ WS can cancel** is mandatory. With baseline 100 and own
-  remaining 20, REST total 30 gives front 10 and ratio 1/3; WS total 120 gives
-  front 100 and ratio 5/6 and must be recorded as a mismatch.
+- REST and WS use the existing #488 fixed bid-level price/quantity contract.
+  Both receive the same captured `bid_level`, frozen `bid_levels`, own remaining
+  quantity, condition and token identity. Do not recapture the baseline from the
+  changed book. A change in price or external quantity within levels 1 through N,
+  or movement of the own price away from its fixed rank, triggers cancellation;
+  a percentage threshold is not used.
+  **REST can cancel ⇒ WS can cancel** is mandatory. At level 1, initial public
+  quantity 120 and own remaining 20 freeze external quantity 100. Identical REST
+  and WS books with public quantity 140 must both cancel; unchanged 120 must
+  both monitor. At level 2, a change to the upper bid price or quantity must also
+  agree. Shadow only records the comparison; REST owns the real cancellation.
 - UNKNOWN on either side is **not comparable**, never consistent. No samples
   produce `UNKNOWN`, not PASS. Any mismatch or not-comparable sample produces
   FAIL for the current process report. Start a fresh, explicitly managed trial

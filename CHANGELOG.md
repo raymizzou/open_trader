@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-28 — Align LP shadow comparison with fixed BUY bid levels (#487 / PR #489)
+
+- Preserve the #488 fixed bid-level cancellation path and compare WS with the same frozen level basis, own quantity and condition/token identity. Quantity increases and buy-two upper price/depth changes now agree with REST; unchanged books remain monitoring and unavailable WS remains UNKNOWN. Shadow adds no cancellation sender or financial/read-failure authority.
+- Preserve both #486 and #487 history during the normal main merge. No risk-rule change, deployment or mode activation is included.
+
 ## 2026-10-27 — LP order-book WS review repairs (#487 / PR #489)
 
 - Preserve complete pending and accepted REST books during WS outages. Invalidate an accepted WS version without adding or clearing real read failures; retain exact order identity, UNKNOWN, financial and no-replay protections.
@@ -11,6 +16,20 @@
 - Add default-off `off`/`shadow`/`use` settings on the existing authenticated LP config command. Maintain one LP-owned connection for exact current trial/income pool tokens, validate Decimal books, fail closed on invalid updates or queue gaps, and audit synchronized tokens every 60 seconds. Preserve original REST cadence, Retry-After and actual cleanup when WS is unavailable.
 - In use mode, deliver eligible current BUY protection books through the existing identity/watermark/freshness acceptance and coalesce bid-depth wakeups until protection completes. Keep new-entry pricing, including detached income candidates, on REST. Preserve financial UNKNOWN, native send ownership and no replay.
 - Add independent shadow cancellation comparisons and bounded route/fallback/reconciliation/latency diagnostics. A broken log sink cannot block REST cancellation. Document the separately authorized two-hour Tokyo shadow trial, explicit live switch and off rollback; this change does not deploy or enable production.
+
+## 2026-10-27 — Income rebuild test source ordering (#486 / PR #488)
+
+- Make the manual-preservation rebuild fixture publish the required fresh D candidate through ordinary account/read observations before it executes income selection. This prevents a pending candidate response from turning the fixture preparation into an unintended partial rebuild. Keep exact manual-order, capital/slot, no-replay and real four-second watchdog assertions; add an event-controlled delayed-response regression. Production pool selection and cancellation authority are unchanged.
+
+## 2026-10-27 — BUY protection review repairs (#486 / PR #488)
+
+- Ignore exchange-timestamped books that predate a known local BUY acceptance when capturing or comparing bid-level baselines. Keep the original automatic baseline and do not add unreadable-book failures for those older snapshots; missing or untrusted times remain UNKNOWN. Preserve recovered-order handling and exact-order cancellation.
+- Correct the stable manual-order service fixture to include its actual resting price, and observe enough accepted reads to exercise the unreadable-book boundary before restart assertions. Preserve real child/in-process shutdown watchdogs and native resource ownership. No deployment is included.
+
+## 2026-10-27 — Fixed BUY bid-level protection (#486)
+
+- Protect automatic trial/income BUYs and web-manual BUYs against any price or quantity change in bids 1 through their fixed entry level, including the order level. Exclude known own remaining quantity from public depth; cancel through the existing exact-order channel with `bid_level_changed`, without a percentage threshold or cooldown.
+- Keep the automatic submission level and first baseline immutable. Recover missing baselines once; recovered managed automatic orders use the current configured level, while manual or unclassified orders use their first observed rank. Unreadable or missing-price books stay UNKNOWN until ten distinct consecutive failures; partial-fill protection and buy-one/buy-two settings remain unchanged. No deployment is included.
 
 ## 2026-10-27 — Observed-pool stress estimates and concurrent income reads (#482 C+D)
 

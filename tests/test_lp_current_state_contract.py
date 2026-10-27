@@ -318,7 +318,7 @@ def test_protection_view_uses_current_terms_and_honest_baseline():
     key = cs.ProtectionKey('queue_bucket', ('A', 'M', 'TOKEN', 'group'), D('0.40'), None)
     stamp = cs.SourceStamp('current-book', checked_at=T, source_timestamp=T, complete=True, state='known')
     baseline = cs.ProtectionBaseline(key, ('O1',), D('0.40'), cs.Fact('known', D('12'), (stamp,)),
-        'submit', T, T, 'hash-1', 1, T, D('0.5'), stamp)
+        'submit', T, T, 'hash-1', 1, T, D('0.5'), stamp, 1, ((D('.40'), D('12')),))
     guard = cs.ProtectionGuard(key, 'opaque-generation', 0, ((KEY, 1),),
         snapshot.observation.observation_id, 'baseline-event')
     assert current.apply_protection(cs.SetBaseline(guard, baseline)) == 'applied'
@@ -327,6 +327,11 @@ def test_protection_view_uses_current_terms_and_honest_baseline():
     assert protected.orders[0].remaining.value == D('7')
     assert protected.orders[0].source.checked_at == T
     assert protected.baselines[key] == baseline
+    changed_guard = cs.ProtectionGuard(key, 'opaque-generation', 1, ((KEY, 1),),
+        snapshot.observation.observation_id, 'replace-fixed-levels')
+    changed = replace(baseline, bid_level=2, bid_levels=((D('.41'), D('1')), (D('.40'), D('12'))))
+    assert current.apply_protection(cs.SetBaseline(changed_guard, changed)) == 'stale'
+    assert current.snapshot().baselines[key] is baseline
     assert all('O2' not in b.anchor_order_ids for b in protected.baselines.values())
     # Audit payloads have no state restoration entry point.
     audit_sink = [{'order_id': 'O2', 'baseline_front': '999'}]

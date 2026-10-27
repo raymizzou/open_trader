@@ -220,7 +220,11 @@ Retry-After 与清理所有权。已同步 token 每 60 秒 REST 全档对账一
 同步状态、路由、最近回退原因/时间、全档对账差异及有界耗时/影子计数只读发布。
 同 token 的买盘 >=己方 BUY 价格变化只保留一次未完成检查，保护前经原 MarketAttempt
 接纳最新本地结果。账户/epoch/generation/order/terms、水位、UNKNOWN、财务准入、
-原 <=0.5 撤单规则、native 所有权和 no-replay 不变。
+撤单遵循 #488 已合入的固定买档价量合同；native 所有权和 no-replay 不变。
+REST 与 WS 对照必须传入相同的冻结 bid_level/bid_levels、己方剩余量和 condition/token 身份，
+调用现有 evaluate_lp_bid_levels，不重取基准、不使用旧比例阈值。买一外部量100后公开量
+120→140（己方20）时两边均撤，120不变时均不撤；买二上档价格或数量变化也必须一致。
+该同步只修对照合同，不修改风控模块、真实撤单规则或影子诊断验收口径。
 
 shadow 使用复制的保护输入对照，不改变 REST 决策、失败计数或 native 发送；UNKNOWN 不算一致。
 先由东京实际日志证明两小时可比较覆盖及“REST 能撤 => WS 也能撤”，再由 Ray 单独批准切 use；

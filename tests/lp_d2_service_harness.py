@@ -670,7 +670,11 @@ def child(runtime_root,port,scenario,config_path,*,control=None):
         def get_order_book(self,*,token_id):
             if token_id==NO_TOKEN_ID and scenario=='reader' and threading.current_thread().name=='lp-reader-source':hold('reader')
             book=super().get_order_book(token_id=token_id)
-            return book.model_copy(update={'timestamp':utc_clock(),'bids':(OrderBookLevel(price=Decimal('.39'),size=Decimal('1000')),OrderBookLevel(price=Decimal('.38'),size=Decimal('1000'))),'asks':(OrderBookLevel(price=Decimal('.41'),size=Decimal('1000')),)})
+            bids=(OrderBookLevel(price=Decimal('.39'),size=Decimal('1000')),OrderBookLevel(price=Decimal('.38'),size=Decimal('1000')))
+            if 'manual-preserved' in scenario:
+                # A stable manual-order book includes the actual resting price.
+                bids+=(OrderBookLevel(price=Decimal('.36') if token_id==NO_TOKEN_ID else Decimal('.27'),size=Decimal('1000')),)
+            return book.model_copy(update={'timestamp':utc_clock(),'bids':bids,'asks':(OrderBookLevel(price=Decimal('.41'),size=Decimal('1000')),)})
     if scenario.startswith(('consumer-ci-current-','automatic-consumer-ci-current-')):
         # Immutable external SDK fixture data for the current counterpart of
         # the restart cases. Fresh source reads are made by the real Reader.

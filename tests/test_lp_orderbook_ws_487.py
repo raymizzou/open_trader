@@ -383,7 +383,7 @@ def test_synced_use_mode_only_fetches_rest_book_each_sixty_seconds(audit_advance
     asyncio.run(scenario())
 
 
-def ws_live(tmp_path, url=None, mode='use'):
+def ws_live(tmp_path, url=None, mode='use', buy_level=1):
     from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
     from open_trader.polymarket_lp_current_state import ValidatedStartAdmission
     from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
@@ -395,7 +395,7 @@ def ws_live(tmp_path, url=None, mode='use'):
     store.lp_save_current_settings(account,expected_config_version=0,changes=dict(api_retry_interval_seconds=60))
     runtime=LPReadRuntime(boundary.factory,clock=clock,utc_now=clock.utc,orderbook_url=url)
     live=LPD2LiveExecution(store,trading,account_id='account',venue='polymarket',process_epoch='epoch',
-        policy=CalculationPolicy(Decimal(100),allocation_mode='observed_pools',orderbook_mode=mode),
+        policy=CalculationPolicy(Decimal(100),allocation_mode='observed_pools',orderbook_mode=mode,buy_price_level=buy_level),
         read_runtime=runtime,clock=clock,utc_now=clock.utc)
     live.initialize(ValidatedStartAdmission('epoch','offline-permit'))
     return clock,boundary,trading,live,store,account
@@ -961,3 +961,99 @@ def test_shutdown_retains_owner_until_ws_and_rest_cleanup_finish(monkeypatch):
         value.subscribe({});assert value.status()['retained_tokens']==0
     finally:
         release_ws.set();boundary.release.set();runtime.close(4)
+
+
+@pytest.mark.parametrize('case',['quantity_increase','unchanged','buy_two_price_change','buy_two_depth_change','ws_unknown','wrong_condition','wrong_token'])
+def test_shadow_uses_fixed_bid_level_contract_after_main_merge(tmp_path,monkeypatch,case):
+    import asyncio,json,httpx
+    from websockets.asyncio.server import serve
+    initial=(('.40','120'),)
+    current=(('.40','120' if case=='unchanged' else '140'),)
+    level=1;should_cancel=case!='unchanged';ws_known=case!='ws_unknown'
+    basis=((Decimal('.40'),Decimal(100)),)
+    if case in ('buy_two_price_change','buy_two_depth_change'):
+        level=2;initial=(('.45','50'),('.40','120'))
+        current=((('.46','50') if case=='buy_two_price_change' else ('.45','51')),('.40','120'))
+        basis=((Decimal('.45'),Decimal(50)),(Decimal('.40'),Decimal(100)))
+    external_levels=list(initial)
+    actual_transport=httpx.MockTransport
+    def transport(handler):
+        async def response(request):
+            result=await handler(request)
+            if request.headers.get('x-lp-source')=='book' and result.status_code==200:
+                payload=result.json();payload['bids']=[dict(price=p,size=q) for p,q in external_levels]
+                return httpx.Response(200,json=payload)
+            return result
+        return actual_transport(response)
+    monkeypatch.setattr(httpx,'MockTransport',transport)  # only the external HTTP boundary
+    async def scenario():
+        outbound=asyncio.Queue()
+        async def server(ws):
+            await ws.recv();await ws.send(json.dumps(wire_book(bids=initial)))
+            while True:
+                message=await outbound.get()
+                if message is None:return
+                await ws.send(json.dumps(message))
+        async with serve(server,'127.0.0.1',0) as listener:
+            clock,boundary,trading,live,store,account=ws_live(tmp_path,
+                f'ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}',mode='shadow',buy_level=level)
+            store.lp_save_observed_pool_roles(account,expected_revision=0,roles={CID:dict(pool='trial',episode='A')})
+            async def pump(predicate):
+                async with asyncio.timeout(4):
+                    while not predicate():live.run_once();await asyncio.sleep(.001)
+            async def wait(predicate):
+                async with asyncio.timeout(3):
+                    while not predicate():await asyncio.sleep(.001)
+            try:
+                key=('account',CID,'yes','A')
+                await pump(lambda:live.read_runtime.status()['orderbook']['synced']==1
+                    and key in live.state.snapshot().yields
+                    and live.state.snapshot().yields[key].yield_pct_per_hour.state=='known')
+                live.run_protection_once()
+                baseline,=live.state.snapshot().baselines.values()
+                assert baseline.bid_level==level and baseline.bid_levels==basis
+                assert trading.cancels==[]
+                external_levels[:]=current
+                if ws_known:
+                    await outbound.put(wire_book(timestamp=1001,bids=current))
+                    await wait(lambda:tuple((r['price'],r['size']) for r in live.read_runtime.orderbook_snapshot('yes')['bids'])
+                        ==tuple((Decimal(p),Decimal(q)) for p,q in current))
+                else:
+                    await outbound.put(dict(event_type='tick_size_change',market=CID,asset_id='yes',timestamp='1001'))
+                    await wait(lambda:live.read_runtime.orderbook_snapshot('yes') is None)
+                clock.value=5;live.read_runtime.wake()
+                key=('account',CID,'yes','A')
+                await pump(lambda:key in live.state.snapshot().yields
+                    and live.state.snapshot().yields[key].evaluated_at==clock.utc())
+                if not ws_known:
+                    # The ordinary REST fallback may seed the unavailable token; invalidate the WS leg again.
+                    await outbound.put(dict(event_type='tick_size_change',market=CID,asset_id='yes',timestamp='1002'))
+                    await wait(lambda:live.read_runtime.orderbook_snapshot('yes') is None)
+                handles=live.run_protection_once()
+                if should_cancel:assert await asyncio.to_thread(trading.cancelled.wait,1)
+                for handle in handles:
+                    await asyncio.to_thread(handle.result,3);await asyncio.to_thread(handle._thread.join,3)
+                    assert handle.done()
+                shadow=live.read_runtime.status()['orderbook']['shadow']['last']
+                assert shadow['rest_can_cancel'] is should_cancel
+                assert shadow['comparable'] is ws_known
+                assert shadow['ws_can_cancel'] is (should_cancel and ws_known)
+                assert shadow['consistent'] is ws_known
+                assert trading.cancels==([('A',)] if should_cancel else [])
+                assert live.state.snapshot().baselines[baseline.key] is baseline
+                assert live.state.snapshot().read_failures[key].consecutive_failures==0
+                assert all(f.data_failures==0 for f in live.state.snapshot().failure_states.values())
+                if case in ('wrong_condition','wrong_token'):
+                    before=live.state.snapshot()
+                    negative=live.read_runtime.compare_shadow('other' if case=='wrong_token' else 'yes',
+                        dict(state='triggered'),price=Decimal('.40'),own_remaining=Decimal(20),
+                        bid_level=baseline.bid_level,baseline_levels=baseline.bid_levels,
+                        condition_id='other' if case=='wrong_condition' else CID)
+                    assert not negative['comparable'] and not negative['ws_can_cancel'] and not negative['consistent']
+                    assert live.state.snapshot()==before
+                    assert trading.cancels==[('A',)]
+                live.run_protection_once()
+                assert trading.cancels==([('A',)] if should_cancel else [])
+            finally:
+                await outbound.put(None);assert await asyncio.to_thread(live.close,4)
+    asyncio.run(scenario())

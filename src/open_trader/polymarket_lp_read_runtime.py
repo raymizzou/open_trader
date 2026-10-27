@@ -220,13 +220,13 @@ class LPReadRuntime:
         with self._lock:
             for stamp in self._ws_woken_at.values():self._shadow.decision_latency(self.clock()-stamp)
 
-    def compare_shadow(self, token, rest, *, price, own_remaining, baseline_front):
-        from .polymarket_lp_risk import estimate_lp_queue_position
+    def compare_shadow(self, token, rest, *, price, own_remaining, bid_level, baseline_levels, condition_id):
+        from .polymarket_lp_risk import evaluate_lp_bid_levels
         with self._lock:
             if self._orderbook_mode!='shadow':return None
             book=self._books.market_book(token)
-            ws=estimate_lp_queue_position(book,price=price,own_remaining=own_remaining,
-                baseline_front=baseline_front,token_id=token)
+            ws=evaluate_lp_bid_levels(book,price=price,own_remaining=own_remaining,
+                bid_level=bid_level,baseline_levels=baseline_levels,condition_id=condition_id,token_id=token)
             row=self._shadow.record(rest,ws)
             row.update(observed_at=self.utc_now().isoformat(),coverage_seconds=self._shadow.snapshot()['coverage_seconds'])
         import logging

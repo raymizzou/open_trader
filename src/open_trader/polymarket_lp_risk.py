@@ -1492,6 +1492,42 @@ def estimate_lp_queue_position(
     }
 
 
+def evaluate_lp_bid_levels(book, *, price, own_remaining, bid_level=None,
+                           baseline_levels=(), condition_id=None, token_id=None):
+    """Capture or compare fixed bid depth, excluding known own size at its price."""
+    result = dict(state='unknown', front_estimate=None, level_total=None, ratio=None,
+        reason_codes=['book_unknown'], data_time=book.get('received_at') if isinstance(book, Mapping) else None,
+        bid_level=bid_level, bid_levels=())
+    if not isinstance(book, Mapping):
+        return result
+    if any(expected is not None and book.get(name) != expected
+           for name, expected in (('condition_id', condition_id), ('token_id', token_id))):
+        return dict(result, reason_codes=['book_identity_mismatch'])
+    captured = first_observation_baseline(book, price=price, own_remaining=own_remaining)
+    if captured['state'] != 'known':
+        return dict(result, reason_codes=captured['reason_codes'])
+    # Invalid rows must not masquerade as disappearing levels.
+    for row in _items(book.get('bids')):
+        p, q = _maybe_decimal(_field(row, 'price')), _maybe_decimal(_field(row, 'size', _field(row, 'quantity')))
+        if p is None or q is None or not 0 < p <= 1 or q < 0:
+            return result
+    totals = {}
+    for p, q in _levels(book.get('bids'), 'bids'):
+        totals[p] = totals.get(p, Decimal(0)) + q
+    ranked = tuple(sorted(totals, reverse=True))
+    rank = ranked.index(price) + 1
+    n = rank if bid_level is None else bid_level
+    if type(n) is not int or n < 1:
+        return result
+    levels = tuple((p, totals[p] - (own_remaining if p == price else Decimal(0)))
+        for p in ranked[:n])
+    changed = rank != n or bool(baseline_levels and levels != baseline_levels)
+    total, front = totals[price], captured['baseline_front']
+    return dict(result, state='triggered' if changed else 'monitoring',
+        front_estimate=front, level_total=total, ratio=front / total,
+        reason_codes=['bid_level_changed'] if changed else [], bid_level=n, bid_levels=levels)
+
+
 def first_observation_baseline(
     book: object,
     *,
