@@ -1516,7 +1516,12 @@ def _assert_current_manual_preserved(root: Path, service=None) -> dict:
         child.release('metadata')
         child.start(expected_running=False)
         for run in range(2):
-            state = child.wait_state(lambda state: state.get('buy_reserved_usd') == '63.00')
+            state = child.wait_state(lambda state: state.get('buy_reserved_usd') == '63.00'
+                and state['diagnostics']['accepted_observation'] is not None)
+            first_read = state['diagnostics']['accepted_observation']['read_ticket']['read_sequence']
+            # Observe beyond the unreadable-book limit before asserting preservation.
+            state = child.wait_state(lambda current: current['diagnostics']['accepted_observation'][
+                'read_ticket']['read_sequence'] >= first_read + 12)
             assert child.request('/healthz')['runtime_state'] == 'RUNNING'
             assert state['desired_running'] is False and state['effective_running'] is False
             actual = sorted((row['key'][3], row['side'], row['price']['value'],

@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-27 — Income rebuild test source ordering (#486 / PR #488)
+
+- Make the manual-preservation rebuild fixture publish the required fresh D candidate through ordinary account/read observations before it executes income selection. This prevents a pending candidate response from turning the fixture preparation into an unintended partial rebuild. Keep exact manual-order, capital/slot, no-replay and real four-second watchdog assertions; add an event-controlled delayed-response regression. Production pool selection and cancellation authority are unchanged.
+
+## 2026-10-27 — BUY protection review repairs (#486 / PR #488)
+
+- Ignore exchange-timestamped books that predate a known local BUY acceptance when capturing or comparing bid-level baselines. Keep the original automatic baseline and do not add unreadable-book failures for those older snapshots; missing or untrusted times remain UNKNOWN. Preserve recovered-order handling and exact-order cancellation.
+- Correct the stable manual-order service fixture to include its actual resting price, and observe enough accepted reads to exercise the unreadable-book boundary before restart assertions. Preserve real child/in-process shutdown watchdogs and native resource ownership. No deployment is included.
+
+## 2026-10-27 — Fixed BUY bid-level protection (#486)
+
+- Protect automatic trial/income BUYs and web-manual BUYs against any price or quantity change in bids 1 through their fixed entry level, including the order level. Exclude known own remaining quantity from public depth; cancel through the existing exact-order channel with `bid_level_changed`, without a percentage threshold or cooldown.
+- Keep the automatic submission level and first baseline immutable. Recover missing baselines once; recovered managed automatic orders use the current configured level, while manual or unclassified orders use their first observed rank. Unreadable or missing-price books stay UNKNOWN until ten distinct consecutive failures; partial-fill protection and buy-one/buy-two settings remain unchanged. No deployment is included.
+
 ## 2026-10-27 — Observed-pool stress estimates and concurrent income reads (#482 C+D)
 
 - Keep stress-exit estimates and their unknown/insufficient-depth reasons visible, while automatic observed-pool trial and income candidates bypass only that rejection gate, including producer maintenance and final full-quantity checks. Manual and single-pool entries remain strict. Preserve other entry guards, budgets and fixed 50/30/20 weights.

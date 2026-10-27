@@ -256,11 +256,11 @@ def test_d2_diagnostics_are_bounded_redacted_and_read_only(tmp_path, monkeypatch
         'qualification_expired', 'qualification_time_unknown', 'qualification_unknown',
         'qualification_identity_mismatch', 'book_freshness_stale', 'current_account_facts_unknown',
         'invalid_identity', 'stale', 'capacity', 'timeout', 'in_progress', 'closed', 'provider_error',
-        'buy_yield_unknown_timeout', 'queue_threshold', 'queue_data_failure_limit',
+        'buy_yield_unknown_timeout', 'queue_threshold', 'bid_level_changed', 'queue_data_failure_limit',
         'book_identity_mismatch', 'book_unknown', 'market_metadata_stale', 'market_fees_stale',
         'history_summary_unknown', 'history_summary_expired']
     counts = bounded_reason_counts(safe+[f'untrusted-{i}' for i in range(24)]+[str(RuntimeError(sentinel))])
-    assert len(counts) == 21 and counts['other'] == 30 and sum(counts.values()) == 50
+    assert len(counts) == 21 and counts['other'] == 31 and sum(counts.values()) == 51
     assert set(counts) <= set(safe) | {'other'} and sentinel not in json.dumps(counts)
     live, producer, sdk, public, now = bridge_runtime(tmp_path, monkeypatch)
     try:
@@ -1743,7 +1743,7 @@ def test_d2_deferred_cancel_revalidates_original_trigger_after_admission_io(tmp_
         public.level, clock[0] = Decimal('5000'), 1
         assert tick() == ()
         progress = live.state.snapshot().progress[baseline.key]
-        assert progress.state == 'triggered' and progress.ratio.value == Decimal('.50') and progress.cancel_targets == ()
+        assert progress.state == 'triggered' and progress.ratio.value == Decimal('5000')/Decimal('7500') and progress.cancel_targets == ()
         assert sdk.cancels == [] and live.status()['native_inflight'] == 0
         execution._breaker_open = False
         clock[0] += 1; live.run_once()
