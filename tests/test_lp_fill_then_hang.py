@@ -438,17 +438,48 @@ def test_quantity_change_replaces_only_after_finality(tmp_path, monkeypatch, pat
 
 @pytest.mark.parametrize('failure', ['failed', 'stale', 'wrong_token'])
 def test_holding_read_failure_retries_without_replay(tmp_path, monkeypatch, failure):
-    from tests.test_lp_async_live_contract import sdk_boundary, pump_live, LPReadRuntime
+    from tests.test_lp_async_live_contract import sdk_boundary, LPReadRuntime
     from tests.test_lp_order_registration_contract import TOKEN_ID
     from datetime import timedelta
-    from threading import Event
+    from threading import Event, current_thread
+    import json
     import time
     live, sdk, public, values = _d2_filled_opening(tmp_path/'auto', monkeypatch, manual_sale=False)
-    posted, release_post, pending = Event(), Event(), []
+    posted, release_post, observed, outcomes, post_threads = Event(), Event(), {}, {}, []
+    def native_key(handle):
+        # Re-observing one real native is not another attempt. Distinct
+        # requests, Futures or threads must never disappear through dedup.
+        return (handle.identity.request_id, handle._future, handle._thread)
+    def collect_protection():
+        handles = tuple(h for h in live.run_protection_once() if h is not None)
+        for handle in handles:
+            observed.setdefault(native_key(handle), handle)
+        return handles
+    def finish(handle):
+        key = native_key(handle)
+        if key not in outcomes:
+            outcome = handle.result(3)
+            handle._thread.join(3)
+            assert handle.done()
+            outcomes[key] = outcome
+        return outcomes[key]
+    def observe_until(predicate, reason):
+        end = time.monotonic()+4
+        while True:
+            live.run_once()
+            collect_protection()
+            if predicate():
+                return
+            left = end-time.monotonic()
+            assert left > 0, reason
+            with boundary.changed:
+                boundary.changed.wait(min(.01, left))
     try:
         public.failed = True
-        d2_tick(live)
-        d2_tick(live)  # prove actual fills, with no usable book or submission
+        for _ in range(2):
+            live.run_once()
+            for handle in collect_protection(): finish(handle)
+        # Prove actual fills, with no usable book or submission.
         public.failed = False
         original_book = public.get_order_book
         bad = [True]
@@ -468,56 +499,77 @@ def test_holding_read_failure_retries_without_replay(tmp_path, monkeypatch, fail
             status = live.read_runtime.status()
             return bool(status['scopes'] and not any(s['active'] for s in status['scopes'])
                 and status['next_dependency_monotonic'] is not None and status['next_dependency_monotonic'] > clock())
-        pump_live(live,boundary,lambda:settled() and any(e[0]=='entered' and e[2]=='book' for e in boundary.events))
+        observe_until(lambda:settled() and any(e[0]=='entered' and e[2]=='book' for e in boundary.events),
+            'failed holding read / settlement watchdog')
         assert not [o for o in sdk.posts if o['side']=='SELL']
         reads = len([e for e in boundary.events if e[0]=='entered' and e[2]=='book'])
         values[0] = 5  # before the five-second read cooldown from t=1
         live.read_runtime.wake()
         for _ in range(3):
-            live.run_once(); live.run_protection_once()
+            live.run_once(); collect_protection()
         assert len([e for e in boundary.events if e[0]=='entered' and e[2]=='book']) == reads
         bad[0] = False
         def unknown_post(signed):
             sdk.posts.append(signed)
+            post_threads.append(current_thread())
             posted.set()
             assert release_post.wait(5), 'external post completion release watchdog'
             raise TimeoutError('unknown passive receipt')
         sdk.post_order = unknown_post
         values[0] = 6;live.read_runtime.wake()
-        end = time.monotonic()+4
-        while True:
-            live.run_once()
-            pending.extend(h for h in live.run_protection_once() if h is not None)
-            if posted.is_set() and settled():
-                break
-            left = end-time.monotonic()
-            assert left > 0, 'post entry / reader settlement watchdog'
-            with boundary.changed:
-                boundary.changed.wait(min(.01, left))
-        # Reader settlement and an entered POST do not imply native completion.
-        # Keep the original request identity and wait for its actual result.
+        observe_until(lambda:posted.is_set() and settled(), 'post entry / reader settlement watchdog')
+        # Current request/native identity owns this actual held POST. Earlier
+        # distinct attempts are real rejected sends, not extra POST permission.
         in_flight, = live.state.snapshot().sells.values()
-        assert len(pending) == 1 and pending[0].identity.request_id == in_flight.passive.request_id
-        assert not pending[0].done() and in_flight.passive.native_state == 'running'
+        request_id = in_flight.passive.request_id
+        target, = [h for h in observed.values() if h.identity.request_id == request_id]
+        assert len(post_threads) == 1 and post_threads[0] is target._thread
+        assert not target.done() and in_flight.passive.native_state == 'running'
+        for handle in observed.values():
+            if native_key(handle) != native_key(target):
+                prior = finish(handle)
+                assert prior.request_id == handle.identity.request_id and prior.status == 'not_sent'
         release_post.set()
-        for handle in pending:
-            handle.result(3); handle._thread.join(3)
-            assert handle.done()
+        result = finish(target)
+        assert result.request_id == request_id and result.status == 'unknown'
+        sell, = live.state.snapshot().sells.values()
+        assert sell.passive.request_id == request_id
+        assert sell.passive.state == 'unknown' and sell.passive.native_state == 'ended'
         for _ in range(3):
             live.run_once()
-            for handle in live.run_protection_once():
-                handle.result(3);handle._thread.join(3)
+            for handle in collect_protection():
+                # A new native for this passive scope would be a replay even
+                # if it subsequently rejected before reaching the SDK.
+                if (getattr(handle.identity, 'kind', None) == 'passive_exit'
+                        and handle.identity.scope == target.identity.scope):
+                    assert native_key(handle) == native_key(target)
+                finish(handle)
+        for handle in observed.values():
+            if native_key(handle) != native_key(target):
+                prior = finish(handle)
+                assert prior.request_id == handle.identity.request_id and prior.status == 'not_sent'
         sells = [o for o in sdk.posts if o['side']=='SELL']
-        assert len(sells)==1 and sells[0]['post_only'] is True and sells[0]['token_id']==TOKEN_ID
-        assert sdk.market_orders == []
+        assert len(sells)==1 and sells[0]['size']==100
+        assert sells[0]['post_only'] is True and sells[0]['token_id']==TOKEN_ID
+        assert len(post_threads) == 1 and post_threads[0] is target._thread
+        assert sdk.cancels == [] and sdk.market_orders == []
         sell, = live.state.snapshot().sells.values()
+        assert sell.passive.request_id == request_id
         assert sell.passive.state=='unknown' and sell.passive.native_state=='ended'
+        print('ci04_native_identity ' + json.dumps(dict(failure=failure,
+            current_request_id=request_id, post_request_id=target.identity.request_id,
+            actual_post_owner_is_target=post_threads[0] is target._thread,
+            sell_post_count=len(sells), sell_quantity=str(sells[0]['size']),
+            observed=[dict(request_id=h.identity.request_id, kind=getattr(h.identity, 'kind', None),
+                thread_identity=id(h._thread), target=native_key(h)==native_key(target),
+                result=outcomes[native_key(h)].status, done=h.done()) for h in observed.values()])))
     finally:
         release_post.set()
-        for handle in pending:
-            handle._thread.join(3)
-        assert live.close(4)
-        live.trading.close()
+        try:
+            for handle in observed.values(): finish(handle)
+        finally:
+            assert live.close(4)
+            live.trading.close()
     # A new legacy service instance sees the durable UNKNOWN and cannot replay.
     service, exchange = legacy_holding(tmp_path/'manual', cost='30')
     exchange.post_failures = [TimeoutError('unknown passive receipt')]
