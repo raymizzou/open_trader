@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-27 — LP config recovery SOP for filled automatic BUYs
+
+- Document the saved-pause, same-version restart, fresh-account-facts, config and separately authorized enable sequence when a filled automatic BUY opening blocks settings. Require Ray's explicit approval of the restart and loss of the old process's opening-level protection; preserve SELL, UNKNOWN and no-replay guards. Documentation only; no deployed code change or standing restart/trading authorization.
+
 ## 2026-10-27 — LP all-holding passive sells with cost floors
 
 - Keep sale-credit reversal correct when a balance rebound includes a proven BUY. Preserve exact readonly terms for disappeared peer SELLs so overlapping cancellations converge only after every fill proof and fresh account quantity agree. Read legacy startup obligations as reservation identities only; unavailable evidence remains blocked and visible. Warn explicitly about live below-cost SELLs and unresolved cancellation, and show current market blockers instead of stale admission failures.
