@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-27 — Income rebuild test source ordering (#486 / PR #488)
+
+- Make the manual-preservation rebuild fixture publish the required fresh D candidate through ordinary account/read observations before it executes income selection. This prevents a pending candidate response from turning the fixture preparation into an unintended partial rebuild. Keep exact manual-order, capital/slot, no-replay and real four-second watchdog assertions; add an event-controlled delayed-response regression. Production pool selection and cancellation authority are unchanged.
+
 ## 2026-10-27 — BUY protection review repairs (#486 / PR #488)
 
 - Ignore exchange-timestamped books that predate a known local BUY acceptance when capturing or comparing bid-level baselines. Keep the original automatic baseline and do not add unreadable-book failures for those older snapshots; missing or untrusted times remain UNKNOWN. Preserve recovered-order handling and exact-order cancellation.

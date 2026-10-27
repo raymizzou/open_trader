@@ -1461,8 +1461,10 @@ class AsyncPoolRig(PoolRig):
             if (row['market'],row['asset_id'])==(condition,token)}
         self.advance_idle_read()
         while True:
-            result=self.live.dispatch_rotation(self.live.run_once(
-                self.producer.capture_qualified_pool(),pool='income'))
+            # Publish the candidate before exercising the intended full rebuild.
+            result=self.live.run_once(self.producer.capture_qualified_pool() if candidate_seen else None,
+                pool='income' if candidate_seen else 'trial')
+            if candidate_seen:result=self.live.dispatch_rotation(result)
             self.finish_cancels(result)
             if result.outcomes or result.rotation_outcomes:
                 # A later income turn must see the exact account after this receipt.
@@ -2694,3 +2696,68 @@ def test_manual_income_rebuild_waits_for_candidate_publication(tmp_path,monkeypa
     assert rigs[0].observer_errors==[]
     assert len(rigs)==1 and len(rigs[0].boundaries)==1
     request.node.user_properties.append(('account_before_D_candidate',repr(rigs[0].boundaries)))
+
+
+def test_income_rebuild_handles_delayed_candidate_completion(tmp_path,monkeypatch,pool_async_watchdog,request):
+    """A partial candidate publication is not the complete rebuild test setup."""
+    import asyncio,sys
+    from threading import Event
+    rigs=[]
+    class DelayedCandidateRig(AsyncPoolRig):
+        def __init__(self,*args,**kwargs):
+            self.removed_at=None;self.candidate_entered=Event();self.candidate_release=Event()
+            self.account_ready=Event();self.boundaries=[];self.prior_book=None
+            super().__init__(*args,**kwargs);rigs.append(self)
+
+        def release(self,*ids):
+            if 'manual-extra-D' in ids:
+                def current_manual_book():
+                    observation=self.live.state.snapshot().observation
+                    source=observation.source_frame.sources.get('market_order:manual-extra-D')
+                    return (source is not None and source.complete and source.error is None
+                        and source.checked_at==self.utc())
+                self.converge_current(current_manual_book,drive=lambda:self.live.run_once(pool='trial'))
+                source=self.live.state.snapshot().observation.source_frame.sources['market_order:manual-extra-D']
+                self.prior_book=dict(id=source.source_id,checked=str(source.checked_at),seconds=self.seconds)
+                self.tick(1)  # The still-fresh real book precedes external manual removal.
+                self.removed_at=self.utc()
+            super().release(*ids)
+
+        async def http(self,req):
+            response=await super().http(req)
+            if self.removed_at is None:return response
+            source=req.headers['x-lp-source']
+            if (source=='open_orders' and self.utc()>=self.removed_at
+                    and all(row['id']!='manual-extra-D' for row in response.json()['data'])):
+                self.account_ready.set()
+            if (source=='book' and req.url.params['token_id']=='tD'
+                    and not self.candidate_release.is_set()):
+                self.candidate_entered.set()
+                assert await asyncio.get_running_loop().run_in_executor(
+                    None,self.candidate_release.wait,4),'external candidate completion watchdog'
+            return response
+
+        def finish_cancels(self,result):
+            super().finish_cancels(result)
+            if not (self.candidate_entered.is_set() and self.account_ready.is_set()
+                    and not self.candidate_release.is_set()):return
+            snapshot=self.live.state.snapshot();observation=snapshot.observation
+            if observation is None or not observation.orders_complete:return
+            # Release after an actual owner evaluation of the newer account,
+            # while the D HTTP response is still withheld.
+            if any(r['order_id']=='manual-extra-D' for r in observation.source_frame.current_buys):return
+            self.boundaries.append(dict(prior_book=self.prior_book,seconds=self.seconds,account_id=observation.observation_id,
+                account_checked=str(observation.components['open_orders'].checked_at),
+                outcomes=[(o.identity.target.token_id,o.status.value) for o in result.outcomes],
+                sources={k:dict(id=v.source_id,checked=str(v.checked_at),complete=v.complete,error=v.error)
+                    for k,v in observation.source_frame.sources.items() if k.startswith('market_income:')},
+                posts=[p['token_id'] for p in self.sdk.posts]))
+            assert result.outcomes==() and len(self.sdk.posts)==2
+            self.candidate_release.set()
+
+        def close(self):
+            self.candidate_release.set();super().close()
+    monkeypatch.setattr(sys.modules[__name__],'AsyncPoolRig',DelayedCandidateRig)
+    test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monkeypatch,'D',pool_async_watchdog)
+    assert len(rigs)==1 and len(rigs[0].boundaries)==1
+    request.node.user_properties.append(('delayed_candidate_completion',repr(rigs[0].boundaries)))
