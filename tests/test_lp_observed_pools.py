@@ -2299,9 +2299,12 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
         capitals=dict(A='50',B='30',C='20',D='5',E='5',F='5',G='5',H='5',J='1')
         for name in 'ABCDEFGHJ':
             rig.market(name,minimum='1',pool=pools[name]);rig.add_order(name,capitals[name])
+        # Keep partial J unclassified to isolate all-BUY read protection from
+        # managed-pool partial-fill protection without changing its quantities.
         rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
             roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n,
-                **({'evicted':True} if n in 'FGH' else {})) for n in 'ABCDEFGHJ'})
+                **({'evicted':True} if n in 'FGH' else {})) for n in 'ABCDEFGH'})
+        assert rig.cid('J') not in rig.store.lp_load_observed_pool_roles(rig.account)['roles']
         rig.measure(dict(A='.6',B='1',C='.4',D='.8',E='.7',F='.5',G='.3',H='.2'))
         def cancel(*,order_ids):
             ids=set(order_ids);rig.sdk.cancels.append(tuple(order_ids))
