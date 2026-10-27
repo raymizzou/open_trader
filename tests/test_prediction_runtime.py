@@ -4680,6 +4680,109 @@ def test_reconcile_failure_keeps_runtime_locked_and_does_not_start_monitors(
         child.assert_owned()
 
 
+@pytest.mark.parametrize('scenario,expected_exit', [('nr-control-fatal', 78), ('nr-unknown', 0)])
+def test_runtime_child_sigterm_during_wait_exits_without_deadlock(tmp_path, monkeypatch, scenario, expected_exit):
+    """A real OS signal interrupts Event.wait while its Condition lock is held."""
+    import signal
+    import subprocess
+    from tests.lp_d2_service_harness import ServiceChild
+
+    native_popen = subprocess.Popen
+    injection = """
+import faulthandler, runpy, signal, sys, threading, time
+from pathlib import Path
+_events = Path(sys.argv[2]) / 'events'
+_native_signal = signal.signal
+_gated = False
+
+def _install_signal(signum, handler):
+    if signum == signal.SIGTERM:
+        def observed_handler(*args):
+            (_events / 'sigterm-handler-entered').touch()
+            handler(*args)
+            (_events / 'sigterm-handler-returned').touch()
+        handler_to_install = observed_handler
+    else:
+        handler_to_install = handler
+    return _native_signal(signum, handler_to_install)
+
+signal.signal = _install_signal
+
+def _hold_wait_lock(frame, event, arg):
+    global _gated
+    if event == 'call' and frame.f_code is threading.Condition.wait.__code__ and not _gated:
+        caller = frame.f_back
+        owner = caller.f_back if caller else None
+        if (caller and caller.f_code is threading.Event.wait.__code__
+                and owner and owner.f_code.co_name == 'run_no_reconcile_runtime'
+                and caller.f_locals['self'] is owner.f_locals.get('stopped')
+                and (_events / 'release-arm-wait-gate').exists()):
+            _gated = True
+            # Event.wait has acquired this real non-reentrant lock and has
+            # not yet called Condition.wait's native lock release.
+            assert frame.f_locals['self']._lock.locked()
+            faulthandler.dump_traceback_later(3)
+            (_events / 'wait-lock-held').touch()
+            deadline = time.monotonic() + 15
+            while not (_events / 'release-wait-boundary').exists():
+                assert time.monotonic() < deadline, 'signal boundary real watchdog'
+                time.sleep(.001)
+            faulthandler.cancel_dump_traceback_later()
+    return None  # Observe call boundaries only; do not trace runtime Python lines.
+
+sys.settrace(_hold_wait_lock)
+runpy.run_module('tests.lp_d2_service_harness', run_name='__main__')
+"""
+
+    def launch_with_wait_gate(args, *a, **kw):
+        if len(args) > 2 and args[1:3] == ['-m', 'tests.lp_d2_service_harness']:
+            args = [args[0], '-c', injection, *args[3:]]
+        return native_popen(args, *a, **kw)
+
+    with ServiceChild(tmp_path, scenario=scenario) as child:
+        with monkeypatch.context() as launch_patch:
+            launch_patch.setattr(subprocess, 'Popen', launch_with_wait_gate)
+            started = _nr_start(child)
+        if scenario == 'nr-control-fatal':
+            assert started['state'] == 'FAILED' and started['production_owner'] is False
+            assert started['writer_thread_alive'] is False
+            _assert_startup_failure_safety(child, started)
+        else:
+            unknown = _nr_cycle(child, 'unknown')
+            assert started['state'] == unknown['state'] == 'RUNNING'
+            assert unknown['orders_complete'] is False and unknown['reserved_state'] == 'unknown'
+            assert unknown['scheduler_starts'] == 1
+            assert unknown['reconcile_calls'] == unknown['legacy_ticks'] == 0
+            assert unknown['posts'] == child.actual_posts() == 0 and unknown['cancels'] == []
+            assert unknown['permit'] == started['permit']
+            assert unknown['history'] == json.loads(child.marker('nr-history-before.json').read_text())
+            child.assert_owned()
+        assert started['permit']['state'] == 'CLAIMED'
+        try:
+            child.release('arm-wait-gate')
+            child.wait('wait-lock-held')
+            child.process.send_signal(signal.SIGTERM)
+            child.wait('sigterm-handler-entered')
+            child.release('wait-boundary')
+            assert child.wait_exit() == expected_exit, child.output.read_text()
+            assert child.marker('sigterm-handler-returned').exists()
+            stopped = json.loads(child.marker('nr-stop.json').read_text())
+            assert stopped['state'] == 'STOPPED'
+            expected_permit = dict(started['permit'])
+            if scenario == 'nr-unknown':
+                expected_permit.update(state='ARMED', claim_id=None, process_epoch=None, pid=None)
+            assert stopped['permit'] == expected_permit == json.loads(child.permit_path.read_text())
+            assert child.actual_posts() == 0
+            child.assert_owner_available()
+        finally:
+            child.release('wait-boundary')
+            # Only this disposable child may be killed after the unchanged
+            # process watchdog fails; never strand a deliberately deadlocked RED.
+            if child.process.poll() is None:
+                child.process.kill()
+                child.process.wait(timeout=5)
+
+
 
 @contextmanager
 def _startup_failure_with_controlled_writer(tmp_path, monkeypatch, *, budget=None, scenario='nr-settings-fatal'):

@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-27 — SIGTERM test readiness identity
+
+- Let the SIGTERM test child bind its own ephemeral port and verify the actual child PID and runtime health before signaling. Preserve real clean exit, STOPPED marker, owner-lock release and the existing startup/shutdown watchdogs when another process is listening.
+
+## 2026-10-27 — Observed-pool test clock
+
+- Seed the shared observed-pool fixture at a fixed UTC business time so unrelated pool tests remain independent of the daily review cutoff. Preserve mutable clock advances, expiry boundary checks and the real minimum-expiration rejection guard.
+
+## 2026-10-27 — Runtime test child shutdown
+
+- Record runtime-only offline child SIGTERM intent without acquiring the wait event lock. Prevent cleanup deadlocks while preserving real fatal-start exit codes, native drain, owner locks, UNKNOWN and no-replay checks. Production runtime behavior and watchdog budgets are unchanged.
+
 ## 2026-10-26 — Restore PR CI
 
 - Run formal CI for PRs targeting main and retain main-push and main-only manual runs. Route PR diffs from the PR base SHA and require successful PR `CI / required` before merge; deployment still needs trusted exact-SHA final-main CI.
