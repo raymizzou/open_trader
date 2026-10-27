@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-27 — Observed-pool stress estimates and concurrent income reads (#482 C+D)
+
+- Keep stress-exit estimates and their unknown/insufficient-depth reasons visible, while automatic observed-pool trial and income candidates bypass only that rejection gate, including producer maintenance and final full-quantity checks. Manual and single-pool entries remain strict. Preserve other entry guards, budgets and fixed 50/30/20 weights.
+- Preserve the historical guidance payload for default and enforced entry checks. Include detailed stress-exit diagnostics only for an explicit observed-pool bypass; keep the existing loss and loss-ratio display fields in both paths.
+- Read income candidates concurrently with BUYs under the same 64-scope limit and first-waited admission, including retiring resources. Keep the two I/O loops, five-second deadline/cadence, source timestamps, physical close ownership and BUY-style income cleanup latches. Low-lane faults still block new BUY sends while income reads proceed. Update ADRs for A+B+C+D; no deployment is included.
+
+## 2026-10-27 — Observed-pool review repairs (#482 A+B)
+
+- Record failed account-refresh attempts as current UNKNOWN measurement diagnostics without replacing retained valid samples, renewing their measurement time, or advancing the last successful observation refresh. Preserve detached, bounded, read-only state and pre-work cancellation semantics.
+- Read pool-role and measured-sample SQL outside the current-state lock during exact protection cancellation. Recheck captured account/order/token, source, generation, trade/terms versions, remaining quantity and current permission before dispatch; slow reads must not block independent state, account updates or bounded close. Preserve native ownership, UNKNOWN and no-replay.
+- Keep group completion/wakeup regressions focused on the existing all-BUY read protection by making their partial E fixture explicitly unclassified. Retain its exact quantities, eleventh-failure threshold, real native overlap, physical-exit ordering, finality and no duplicate cancellation checks.
+
+## 2026-10-27 — Observed-pool income diagnostics and exact BUY protection (#482 A+B)
+
+- Show bounded income selection skip reasons, each trial's latest raw measurement attempt, and observation refresh age in auto state and the read-only monitor. Keep retained valid samples and original timestamps. Warn after 120 seconds without a completed refresh. Preserve shortage timing across UNKNOWN; a new monitor reports unknown duration until fresh process evidence establishes continuity.
+- In observed-pools mode, cancel the exact managed trial or income BUY remainder after a confirmed partial fill. Preserve cost-floor passive SELLs, current account identity, native ownership, UNKNOWN and no-replay protections. Cancel a managed trial BUY after 600 monotonic seconds without a current same-order sample aged at most 120 seconds; a valid sample (including zero yield) resets this process-local timer. Income and single-pool measured-timeout behavior stays unchanged. No deployment is included.
+
 ## 2026-10-27 — LP config recovery SOP for filled automatic BUYs
 
 - Document the saved-pause, same-version restart, fresh-account-facts, config and separately authorized enable sequence when a filled automatic BUY opening blocks settings. Require Ray's explicit approval of the restart and loss of the old process's opening-level protection; preserve SELL, UNKNOWN and no-replay guards. Documentation only; no deployed code change or standing restart/trading authorization.

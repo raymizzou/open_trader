@@ -54,8 +54,8 @@ def read_health(auto, now):
         lane, kind, reason = (row.get(key) for key in ('lane', 'kind', 'reason'))
         since = moment(row.get('since'))
         if (lane not in ('buy', 'financial', 'exact', 'low')
-                or kind not in dict(buy=('buy',), financial=('financial',), exact=('exact',),
-                    low=('sell', 'position', 'holding', 'income', 'unknown')).get(lane, ())
+                or kind not in dict(buy=('buy','income'), financial=('financial',), exact=('exact',),
+                    low=('sell', 'position', 'holding', 'unknown')).get(lane, ())
                 or reason not in ('delayed_read_cleanup', 'port_close_failure')
                 or row.get('active') is not True or type(row.get('blocks_new_buy')) is not bool
                 or row['blocks_new_buy'] != (lane != 'buy') or since is None or since > now):
@@ -92,6 +92,7 @@ class LPMonitorSummary:
     def __init__(self):
         self.lock = RLock()
         self.since = {}
+        self.shortages = {}
 
     def duration(self, key, active, now):
         if not active:
@@ -102,6 +103,21 @@ class LPMonitorSummary:
             self.since[key] = now
             return 0
         return (now - start).total_seconds()
+
+    def shortage_duration(self, pool, account, known, lacking, stamp, now):
+        if not known:
+            return None  # one UNKNOWN cannot disprove an observed shortage
+        if not lacking:
+            self.shortages.pop(pool, None)
+            return None
+        previous = self.shortages.get(pool)
+        if previous is None or previous[0] != account or now < previous[1]:
+            self.shortages[pool] = (account, now, stamp, False)
+            return None
+        owner, start, first_stamp, confirmed = previous
+        confirmed = confirmed or stamp > first_stamp
+        self.shortages[pool] = (owner, start, first_stamp, confirmed)
+        return (now-start).total_seconds() if confirmed else None
 
     def summarize(self, *, auto, dashboard, trades, audits, account_id, now, holdings=None):
         with self.lock:
@@ -139,8 +155,8 @@ class LPMonitorSummary:
                 valid_target = type(target) is int and target >= 0
                 count = counts[pool] if known else None
                 lacking = known and valid_target and count < target
-                age = self.duration('shortage:'+pool, lacking, now)
-                state = ('abnormal' if age >= 300 else 'attention') if lacking else 'normal'
+                age = self.shortage_duration(pool, account_id, known and valid_target, lacking, stamp, now)
+                state = ('abnormal' if age is not None and age >= 300 else 'attention') if lacking else 'normal'
                 if not known or not valid_target:
                     state = 'unknown'
                 shortage |= lacking
@@ -192,7 +208,34 @@ class LPMonitorSummary:
                     pool_state, pool_reason = 'attention', '候选刷新失败，等待恢复'
                 elif not all(type(auto.get(k)) is bool for k in ('desired_running','effective_running')):
                     pool_state, pool_reason = 'unknown', '做市开关状态未知'
+            observed = mapping(auto.get('observed_pools'))
+            success = moment(mapping(observed.get('observation_refresh')).get('last_success_at'))
+            refresh_age = (now-success).total_seconds() if success is not None and success <= now else None
+            refresh = dict(last_success_at=success.isoformat() if success else None,
+                age_seconds=refresh_age, stalled=refresh_age > 120 if refresh_age is not None else None)
+            raw_gaps = mapping(observed.get('income_gaps'))
+            gap_items = raw_gaps.get('items')
+            gaps = dict(total=None, omitted=None, items=[])
+            if (isinstance(gap_items, list) and len(gap_items) <= 20
+                    and type(raw_gaps.get('total')) is int and type(raw_gaps.get('omitted')) is int
+                    and 0 <= raw_gaps['omitted'] and raw_gaps['total'] == len(gap_items)+raw_gaps['omitted']):
+                gaps = dict(total=raw_gaps['total'], omitted=raw_gaps['omitted'],
+                    checked_at=raw_gaps.get('checked_at'), items=[{k: row.get(k) for k in
+                        ('condition_id','order_id','token_id','reason','age_seconds','quantity','minimum_quantity')}
+                        for row in gap_items if isinstance(row, Mapping)])
+            attempts = []
+            raw_attempts = mapping(observed.get('measurement_attempts'))
+            roles = mapping(observed.get('roles'))
+            for cid, attempt in raw_attempts.items():
+                if mapping(roles.get(cid)).get('pool') != 'trial':
+                    continue
+                raw = mapping(mapping(attempt).get('result'))
+                attempts.append(dict(condition_id=str(cid)[:96], checked_at=mapping(attempt).get('checked_at'),
+                    state=raw.get('state'), reason=raw.get('reason'), yield_pct_per_hour=raw.get('yield_pct_per_hour')))
+                if len(attempts) >= 64:
+                    break
             result['pools'] = section(pool_state, pool_reason, items=pools,
+                income_gaps=gaps, measurement_attempts=attempts, observation_refresh=refresh,
                 desired_running=auto.get('desired_running'), effective_running=auto.get('effective_running'),
                 fatal=bool(auto.get('fatal')), eligible_candidates=candidate_count if candidate_source else None,
                 candidate_last_success_at=candidate_stamp.isoformat() if candidate_stamp else None,

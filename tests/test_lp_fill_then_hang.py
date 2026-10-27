@@ -446,6 +446,7 @@ def test_holding_read_failure_retries_without_replay(tmp_path, monkeypatch, fail
     import time
     live, sdk, public, values = _d2_filled_opening(tmp_path/'auto', monkeypatch, manual_sale=False)
     posted, release_post, observed, outcomes, post_threads = Event(), Event(), {}, {}, []
+    signing_entered, release_signing, signing_trace = Event(), Event(), []
     def native_key(handle):
         # Re-observing one real native is not another attempt. Distinct
         # requests, Futures or threads must never disappear through dedup.
@@ -466,12 +467,21 @@ def test_holding_read_failure_retries_without_replay(tmp_path, monkeypatch, fail
     def observe_until(predicate, reason):
         end = time.monotonic()+4
         while True:
-            live.run_once()
-            collect_protection()
+            pending = any(not h.done() for h in observed.values())
+            if pending and not posted.is_set():
+                # A real sender owns the captured observation until SDK entry
+                # or NOT_SENT. Re-projecting it here can invalidate that sender.
+                if signing_entered.is_set():
+                    release_signing.set()
+            else:
+                live.run_once()
+                collect_protection()
             if predicate():
                 return
             left = end-time.monotonic()
-            assert left > 0, reason
+            assert left > 0, (reason, clock(), live.status(), live.read_runtime.status(),
+                live.state.snapshot(), boundary.events,
+                [(h.identity.request_id, h.done()) for h in observed.values()])
             with boundary.changed:
                 boundary.changed.wait(min(.01, left))
     try:
@@ -516,8 +526,20 @@ def test_holding_read_failure_retries_without_replay(tmp_path, monkeypatch, fail
             assert release_post.wait(5), 'external post completion release watchdog'
             raise TimeoutError('unknown passive receipt')
         sdk.post_order = unknown_post
+        original_create = sdk.create_limit_order
+        def delayed_create(**kwargs):
+            before = dict(live.state.snapshot().scope_versions)
+            signing_entered.set()
+            with boundary.changed:
+                boundary.changed.notify_all()
+            assert release_signing.wait(4), 'external signing release watchdog'
+            signing_trace.append((before, dict(live.state.snapshot().scope_versions)))
+            return original_create(**kwargs)
+        sdk.create_limit_order = delayed_create
         values[0] = 6;live.read_runtime.wake()
         observe_until(lambda:posted.is_set() and settled(), 'post entry / reader settlement watchdog')
+        assert signing_entered.is_set() and signing_trace
+        assert all(before == after for before, after in signing_trace)
         # Current request/native identity owns this actual held POST. Earlier
         # distinct attempts are real rejected sends, not extra POST permission.
         in_flight, = live.state.snapshot().sells.values()
@@ -564,6 +586,7 @@ def test_holding_read_failure_retries_without_replay(tmp_path, monkeypatch, fail
                 thread_identity=id(h._thread), target=native_key(h)==native_key(target),
                 result=outcomes[native_key(h)].status, done=h.done()) for h in observed.values()])))
     finally:
+        release_signing.set()
         release_post.set()
         try:
             for handle in observed.values(): finish(handle)

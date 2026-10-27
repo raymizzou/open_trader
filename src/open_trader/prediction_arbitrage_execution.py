@@ -843,6 +843,8 @@ class PredictionExecutionService:
         self._lp_dashboard_cache: dict[str, object] | None = None
         self._lp_account_trades_cache: dict[str, object] | None = None
         self._lp_reward_percentage_cache: dict[str, object] | None = None
+        self._lp_observation_last_success_at = None
+        self._lp_measurement_attempts = {}
         self._lp_reward_share_observations: dict[str, dict[str, object]] = {}
         self._lp_reward_share_active: dict[str, bool] = {}
         self._lp_reward_cache: dict[tuple[str, str], dict[str, object]] = {}
@@ -897,6 +899,8 @@ class PredictionExecutionService:
             self._lp._facts_validator = self._validate_lp_facts
             self._lp._facts_attention_flusher = self._auto_pool.flush_attention
         elif self._lp is not None:
+            self._lp.set_candidate_allocation_mode_reader(lambda: (
+                self._lp_d2.policy.allocation_mode if self._lp_d2.settings_status()['loaded'] else None))
             self._lp.set_candidate_buy_price_level_reader(lambda:self._lp_d2.policy.buy_price_level)
             self._lp.set_candidate_current_reservations_reader(lp_d2.candidate_current_reservations)
         self._threads: dict[str, threading.Thread] = {}
@@ -1101,6 +1105,8 @@ class PredictionExecutionService:
                     snapshot, observed_pools.get('roles', {}), dict(live._pool_transfers),
                     account_id=live.account_id, settings_account=self._lp_account_id(),
                     epoch=live.process_epoch, as_of=live._utc_now()))
+                observed_pools['income_gaps'] = json_value(live._income_gaps)
+                observed_pools['income_estimates'] = json_value(live._income_estimates)
                 result['observed_pools'] = observed_pools
             result['diagnostics'] = diagnostic_view('iteration', live.diagnostics)
             result['diagnostics']['rotation'] = diagnostic_view('rotation', live.rotation_diagnostics)
@@ -3781,7 +3787,9 @@ class PredictionExecutionService:
     def lp_observed_pool_state(self, *, as_of=None):
         from .polymarket_lp_observed_pools import result_projection
         account = self._lp_account_id()
-        return dict(results=result_projection(self._store.lp_observations(account), account, as_of or _utc_now()))
+        return dict(results=result_projection(self._store.lp_observations(account), account, as_of or _utc_now()),
+            measurement_attempts=diagnostic_json_copy(self._lp_measurement_attempts),
+            observation_refresh=dict(last_success_at=self._lp_observation_last_success_at))
 
     def refresh_lp_observations(
         self, *, stop_event: threading.Event | None = None
@@ -3798,8 +3806,15 @@ class PredictionExecutionService:
         now = _utc_now()
 
         def mark_stale(reason: str) -> dict[str, dict[str, object]]:
+            attempts = dict(self._lp_measurement_attempts)
             stale_rows: dict[str, dict[str, object]] = {}
             for condition_id, saved in previous.items():
+                if condition_id in attempts or isinstance(saved.get('pool_result'), Mapping):
+                    attempts.pop(condition_id, None)
+                    attempts[condition_id] = dict(checked_at=_timestamp(now), result=dict(
+                        state='unknown', reason=reason, yield_pct_per_hour=None))
+                    if len(attempts) > 64:
+                        attempts.pop(next(iter(attempts)))
                 stale = {
                     **_mask_lp_observation(saved, reason),
                     "checked_at": now,
@@ -3808,6 +3823,7 @@ class PredictionExecutionService:
                 stale_rows[condition_id] = save_observation(
                     account_id, condition_id, stale
                 )
+            self._lp_measurement_attempts = attempts
             with self._lp_dashboard_lock:
                 cached = self._lp_dashboard_cache
                 if cached is not None:
@@ -3870,6 +3886,7 @@ class PredictionExecutionService:
         active_market_ids = set(orders_by_market) | set(positions_by_market)
         market_ids = active_market_ids | set(previous)
         if not market_ids:
+            self._lp_observation_last_success_at = _timestamp(now)
             return {"state": "ready", "checked_at": _timestamp(now), "observations": {}}
 
         rates: Mapping[str, object] = {}
@@ -4278,8 +4295,19 @@ class PredictionExecutionService:
             observation['pool_result'] = measured_result(account_id, condition_id, market_orders,
                 hourly_reward, reward_known=reward_known, measured_at=now,
                 reward_checked_at=rates_checked_at, account_checked_at=account_checked_at)
+            # Keep the raw attempt before the Store retains an older known sample.
+            # Replace the bounded process-local mapping atomically for readers.
+            attempts = dict(self._lp_measurement_attempts)
+            attempts.pop(condition_id, None)
+            raw_result = dict(observation['pool_result'])
+            for key in ('measured_at', 'reward_checked_at', 'account_checked_at'):
+                if isinstance(raw_result.get(key), datetime):
+                    raw_result[key] = _timestamp(raw_result[key])
+            attempts[condition_id] = dict(checked_at=_timestamp(now), result=raw_result)
+            self._lp_measurement_attempts = dict(list(attempts.items())[-64:])
             result[condition_id] = save_observation(account_id, condition_id, observation)
 
+        self._lp_observation_last_success_at = _timestamp(now)
         return {"state": "ready", "checked_at": _timestamp(now), "observations": result}
 
     def _lp_market_explicitly_negative(

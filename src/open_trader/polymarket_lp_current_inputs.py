@@ -79,7 +79,8 @@ def _prepare_qualified(frame, capture, policy, as_of):
                     condition_id=cid, token_id=token)
             evaluated = (dict(state='unknown', reason_codes=(reason,), guidance=None) if reason else
                 evaluate_lp_entry(direction, account=selection_account, now=as_of, reservations=(),
-                    candidate=True, bid_level=policy.buy_price_level))
+                    candidate=True, bid_level=policy.buy_price_level,
+                    stress_exit_check=policy.allocation_mode != 'observed_pools'))
             eligibility[key] = evaluated
             income_evaluated = None
             if policy.allocation_mode == 'observed_pools' and not reason and selection_account:
@@ -88,7 +89,7 @@ def _prepare_qualified(frame, capture, policy, as_of):
                 income_evaluated = evaluate_lp_entry(direction, account={**selection_account,
                     'open_orders': tuple(o for o in selection_account['open_orders']
                         if o.get('condition_id') != cid)}, now=as_of, reservations=(),
-                    candidate=True, bid_level=policy.buy_price_level)
+                    candidate=True, bid_level=policy.buy_price_level, stress_exit_check=False)
             guide = evaluated.get('guidance')
             if evaluated.get('state') == 'eligible' and isinstance(guide, Mapping):
                 review = _next_review_at(as_of)
@@ -176,7 +177,8 @@ def _income_inputs(frame, directions, names, policy, as_of):
             'balance':account.value['balance']+frame.buy_reserved,
             'allowance':account.value['allowance']+frame.buy_reserved,
             'open_orders':tuple(o for o in account.value['open_orders'] if o['condition_id'] != cid)},
-            now=as_of,reservations=(),candidate=True,bid_level=policy.buy_price_level)
+            now=as_of,reservations=(),candidate=True,bid_level=policy.buy_price_level,
+            stress_exit_check=policy.allocation_mode != 'observed_pools')
         if evaluation['state'] != 'eligible':
             continue
         guide = evaluation['guidance']

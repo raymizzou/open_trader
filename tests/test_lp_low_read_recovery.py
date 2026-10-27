@@ -74,7 +74,7 @@ def scope_for(runtime, order='L'):
     return next(s for s in runtime.status()['scopes'] if s['key'][4] == order)
 
 
-@pytest.mark.parametrize('kind', ['sell', 'position', 'holding', 'income'])
+@pytest.mark.parametrize('kind', ['sell', 'position', 'holding'])
 def test_low_cleanup_completion_restores_existing_reader(kind):
     clock = Clock()
     boundary = LowBoundary(clock)
@@ -104,7 +104,7 @@ def test_low_cleanup_completion_restores_existing_reader(kind):
         boundary.wait(lambda: not scope_for(runtime)['active'])
         assert runtime.status()['cleanup_faults'] == 0
         assert runtime.status()['new_buy_allowed']
-        expected = {'L', 'peer'} if kind in ('holding', 'income') else {'peer'}
+        expected = {'L', 'peer'} if kind == 'holding' else {'peer'}
         resumed = collect(runtime, boundary, lambda rows: expected <= {r.demand.order_id for r in rows})
         assert all(r.complete for r in resumed)
         assert not expired.complete and expired.reason == 'timeout'  # late close never repairs old facts

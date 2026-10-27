@@ -1059,7 +1059,21 @@ def test_fill_and_protection_remain_authoritative_during_pool_changes(tmp_path,m
             assert record['order_id']==record['receipt']['order_id']==h.identity.target.existing_order_id
             assert record['kind']=='CANCEL'
             assert record['receipt']['outcome']==('accepted' if record['order_id']=='old-C' else 'rejected')
-        assert rig.sdk.cancels==[('old-A','old-B','old-C','old-D')]
+        assert rig.sdk.cancels[0]==('old-A','old-B','old-C','old-D')
+        assert len(rig.sdk.cancels)==3 and set(rig.sdk.cancels[1:])=={('old-A',),('old-D',)}
+        # Later authoritative partial facts create new exact protection decisions.
+        # They do not replay the original group request or acquire SELL authority.
+        partial_targets=[t for p in rig.live.state.snapshot().progress.values() for t in p.cancel_targets
+            if t.reason=='buy_partial_fill']
+        assert {t.order_key[3] for t in partial_targets}=={'old-A','old-D'}
+        assert len(partial_targets)==2
+        assert {t.requested_remaining.value for t in partial_targets}=={Decimal('120'),Decimal('20')}
+        assert {t.request_id for t in partial_targets}.isdisjoint({h.identity.request_id for h in handles})
+        for target in partial_targets:
+            record,=rig.store.lp_actions('d2:'+target.request_id)
+            assert record['kind']=='CANCEL' and record['order_id']==target.order_key[3]
+            assert record['receipt']['request_id']==target.request_id
+            assert record['receipt']['outcome']=='rejected'
     finally:release.set();rig.close()
 
     unreadable=AsyncPoolRig(tmp_path/'unknown-incumbent-market',monkeypatch)
@@ -1654,9 +1668,11 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
         for name,capital in [('A','50'),('B','30'),('C','20'),('D','10'),('E','1'),('F','1')]:
             rig.add_order(name,capital)
         rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
-            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n) for n in 'ABCDEF'})
-        # A partially matched BUY has no queue-baseline cancellation path;
-        # isolate the existing 11th read failure without disabling its guard.
+            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n) for n in 'ABCDF'})
+        # E is explicitly unclassified, so the managed-partial rule does not
+        # preempt the existing all-BUY 11th read-failure/wakeup contract. Its
+        # real partial fill still excludes unrelated queue protection.
+        assert rig.cid('E') not in rig.store.lp_load_observed_pool_roles(rig.account)['roles']
         rig.history['old-E']['size_matched']=Decimal('.5')
         rig.failed_book_tokens={'tE'}
         # Ten real failures are below the existing read-failure cancellation
@@ -1761,9 +1777,11 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
         for name,capital in [('A','50'),('B','30'),('C','20'),('D','10'),('E','1'),('F','1')]:
             rig.add_order(name,capital)
         rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
-            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n) for n in 'ABCDEF'})
-        # A partially matched BUY has no queue-baseline cancellation path;
-        # isolate the existing 11th read failure without disabling its guard.
+            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n) for n in 'ABCDF'})
+        # E is explicitly unclassified, so the managed-partial rule does not
+        # preempt the existing all-BUY 11th read-failure/wakeup contract. Its
+        # real partial fill still excludes unrelated queue protection.
+        assert rig.cid('E') not in rig.store.lp_load_observed_pool_roles(rig.account)['roles']
         rig.history['old-E']['size_matched']=Decimal('.5')
         rig.failed_book_tokens={'tE'}
         # Ten real failures are below the existing read-failure cancellation
@@ -2017,11 +2035,21 @@ def test_async_read_protection_precedes_pool_rebuild(tmp_path,monkeypatch,pool_a
         for count in range(1,12):
             rig.tick()
             rig.pump(lambda:failure() is not None and failure().consecutive_failures==count)
-            if count<11:assert rig.sdk.cancels==[]
-        rig.pump(lambda:rig.sdk.cancels==[('old-B',)] and rig.live.status()['native_inflight']==0)
+            if count<11:
+                # #482 partial-fill protection can act before the read counter.
+                # Every such request must still be the exact B remainder.
+                assert all(batch==('old-B',) for batch in rig.sdk.cancels)
+                assert all(t.reason=='buy_partial_fill' for p in rig.live.state.snapshot().progress.values()
+                    for t in p.cancel_targets)
+                assert rig.sdk.posts==[]
+        rig.pump(lambda:failure().protection_key is not None
+            and rig.live.state.snapshot().progress[failure().protection_key].cancel_targets
+            and rig.live.status()['native_inflight']==0)
+        assert all(batch==('old-B',) for batch in rig.sdk.cancels)
+        initial_cancel_count=len(rig.sdk.cancels)
         assert failure().consecutive_failures==11 and failure().protection_key is not None
-        before={t.request_id for p in rig.live.state.snapshot().progress.values() for t in p.cancel_targets
-            if t.order_key[3]=='old-B'}
+        before={t.request_id for t in rig.live.state.snapshot().progress[failure().protection_key].cancel_targets}
+        assert rig.live.state.snapshot().progress[failure().protection_key].reason_codes==('read_failure_limit',)
         assert len(before)==1
         rig.measure(dict(A='.6',B='1.0',C='.4',D='.8'))
         rig.failed_book_tokens.clear();rig.tick()
@@ -2030,7 +2058,8 @@ def test_async_read_protection_precedes_pool_rebuild(tmp_path,monkeypatch,pool_a
                 for k,y in rig.live.state.snapshot().yields.items()))
         for _ in range(3):rig.scheduler.run_due()
         assert failure().protection_key is not None  # later success cannot unlatch
-        assert rig.sdk.cancels==[('old-B',),('old-B',)] and rig.sdk.posts==[]
+        assert len(rig.sdk.cancels)==initial_cancel_count+1
+        assert all(batch==('old-B',) for batch in rig.sdk.cancels) and rig.sdk.posts==[]
         partial=next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-B')
         assert (partial.original_size.value,partial.size_matched.value,partial.remaining.value)==(75,3,72)
         assert not rig.sdk.market_orders  # protection never forces liquidation
@@ -2042,13 +2071,13 @@ def test_async_read_protection_precedes_pool_rebuild(tmp_path,monkeypatch,pool_a
         rig.pump(lambda:any(k[3]=='replacement-B' for k in rig.live.state.snapshot().read_failures))
         new=next(f for k,f in rig.live.state.snapshot().read_failures.items() if k[3]=='replacement-B')
         assert new.consecutive_failures==0 and new.protection_key is None
-        after={t.request_id for p in rig.live.state.snapshot().progress.values() for t in p.cancel_targets
-            if t.order_key[3]=='old-B'}
+        after={t.request_id for t in rig.live.state.snapshot().progress[failure().protection_key].cancel_targets}
         assert before.isdisjoint(after) and len(after)==1
         for request_id in before:
             record,=rig.store.lp_actions('d2:'+request_id)
             assert record['receipt']['outcome']=='unknown'
-        assert rig.sdk.cancels==[('old-B',),('old-B',)] and rig.sdk.posts==[] and not rig.sdk.market_orders
+        assert len(rig.sdk.cancels)==initial_cancel_count+1
+        assert all(batch==('old-B',) for batch in rig.sdk.cancels) and rig.sdk.posts==[] and not rig.sdk.market_orders
     finally:rig.close()
 
 
@@ -2270,9 +2299,12 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
         capitals=dict(A='50',B='30',C='20',D='5',E='5',F='5',G='5',H='5',J='1')
         for name in 'ABCDEFGHJ':
             rig.market(name,minimum='1',pool=pools[name]);rig.add_order(name,capitals[name])
+        # Keep partial J unclassified to isolate all-BUY read protection from
+        # managed-pool partial-fill protection without changing its quantities.
         rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
             roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n,
-                **({'evicted':True} if n in 'FGH' else {})) for n in 'ABCDEFGHJ'})
+                **({'evicted':True} if n in 'FGH' else {})) for n in 'ABCDEFGH'})
+        assert rig.cid('J') not in rig.store.lp_load_observed_pool_roles(rig.account)['roles']
         rig.measure(dict(A='.6',B='1',C='.4',D='.8',E='.7',F='.5',G='.3',H='.2'))
         def cancel(*,order_ids):
             ids=set(order_ids);rig.sdk.cancels.append(tuple(order_ids))

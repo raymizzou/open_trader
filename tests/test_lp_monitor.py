@@ -128,7 +128,7 @@ def test_monitor_orders_and_pools_share_one_snapshot(tmp_path, monkeypatch):
             return monitor.summarize(auto=auto,dashboard={},trades={},audits=[],account_id=rig.live.account_id,now=at)['orders']
         for seconds,expected,options in [(0,'attention',{}),(299,'attention',{}),(300,'abnormal',{}),
                 (301,'normal',{'full':True}),(400,'attention',{}),(699,'attention',{}),(700,'abnormal',{}),
-                (701,'unknown',{'missing':True}),(1000,'attention',{}),(1299,'attention',{}),(1300,'abnormal',{})]:
+                (701,'unknown',{'missing':True}),(1000,'abnormal',{}),(1299,'abnormal',{}),(1300,'abnormal',{})]:
             assert observe(seconds,**options)['status']==expected
         assert observe(1301,targets={'trial_target_buy_count':3,'income_target_buy_count':2})['status']=='normal'
     finally:
