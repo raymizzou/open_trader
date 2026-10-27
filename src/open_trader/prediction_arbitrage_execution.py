@@ -3803,8 +3803,15 @@ class PredictionExecutionService:
         now = _utc_now()
 
         def mark_stale(reason: str) -> dict[str, dict[str, object]]:
+            attempts = dict(self._lp_measurement_attempts)
             stale_rows: dict[str, dict[str, object]] = {}
             for condition_id, saved in previous.items():
+                if condition_id in attempts or isinstance(saved.get('pool_result'), Mapping):
+                    attempts.pop(condition_id, None)
+                    attempts[condition_id] = dict(checked_at=_timestamp(now), result=dict(
+                        state='unknown', reason=reason, yield_pct_per_hour=None))
+                    if len(attempts) > 64:
+                        attempts.pop(next(iter(attempts)))
                 stale = {
                     **_mask_lp_observation(saved, reason),
                     "checked_at": now,
@@ -3813,6 +3820,7 @@ class PredictionExecutionService:
                 stale_rows[condition_id] = save_observation(
                     account_id, condition_id, stale
                 )
+            self._lp_measurement_attempts = attempts
             with self._lp_dashboard_lock:
                 cached = self._lp_dashboard_cache
                 if cached is not None:

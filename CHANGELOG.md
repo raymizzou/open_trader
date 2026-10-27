@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-27 — Observed-pool review repairs (#482 A+B)
+
+- Record failed account-refresh attempts as current UNKNOWN measurement diagnostics without replacing retained valid samples, renewing their measurement time, or advancing the last successful observation refresh. Preserve detached, bounded, read-only state and pre-work cancellation semantics.
+- Read pool-role and measured-sample SQL outside the current-state lock during exact protection cancellation. Recheck captured account/order/token, source, generation, trade/terms versions, remaining quantity and current permission before dispatch; slow reads must not block independent state, account updates or bounded close. Preserve native ownership, UNKNOWN and no-replay.
+- Keep group completion/wakeup regressions focused on the existing all-BUY read protection by making their partial E fixture explicitly unclassified. Retain its exact quantities, eleventh-failure threshold, real native overlap, physical-exit ordering, finality and no duplicate cancellation checks.
+
 ## 2026-10-27 — Observed-pool income diagnostics and exact BUY protection (#482 A+B)
 
 - Show bounded income selection skip reasons, each trial's latest raw measurement attempt, and observation refresh age in auto state and the read-only monitor. Keep retained valid samples and original timestamps. Warn after 120 seconds without a completed refresh. Preserve shortage timing across UNKNOWN; a new monitor reports unknown duration until fresh process evidence establishes continuity.

@@ -1668,9 +1668,11 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
         for name,capital in [('A','50'),('B','30'),('C','20'),('D','10'),('E','1'),('F','1')]:
             rig.add_order(name,capital)
         rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
-            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n) for n in 'ABCDEF'})
-        # A partially matched BUY has no queue-baseline cancellation path;
-        # isolate the existing 11th read failure without disabling its guard.
+            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n) for n in 'ABCDF'})
+        # E is explicitly unclassified, so the managed-partial rule does not
+        # preempt the existing all-BUY 11th read-failure/wakeup contract. Its
+        # real partial fill still excludes unrelated queue protection.
+        assert rig.cid('E') not in rig.store.lp_load_observed_pool_roles(rig.account)['roles']
         rig.history['old-E']['size_matched']=Decimal('.5')
         rig.failed_book_tokens={'tE'}
         # Ten real failures are below the existing read-failure cancellation
@@ -1775,9 +1777,11 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
         for name,capital in [('A','50'),('B','30'),('C','20'),('D','10'),('E','1'),('F','1')]:
             rig.add_order(name,capital)
         rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
-            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n) for n in 'ABCDEF'})
-        # A partially matched BUY has no queue-baseline cancellation path;
-        # isolate the existing 11th read failure without disabling its guard.
+            roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n) for n in 'ABCDF'})
+        # E is explicitly unclassified, so the managed-partial rule does not
+        # preempt the existing all-BUY 11th read-failure/wakeup contract. Its
+        # real partial fill still excludes unrelated queue protection.
+        assert rig.cid('E') not in rig.store.lp_load_observed_pool_roles(rig.account)['roles']
         rig.history['old-E']['size_matched']=Decimal('.5')
         rig.failed_book_tokens={'tE'}
         # Ten real failures are below the existing read-failure cancellation

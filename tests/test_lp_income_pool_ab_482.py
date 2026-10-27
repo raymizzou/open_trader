@@ -406,3 +406,55 @@ def test_measured_timeout_never_cancels_income_manual_or_single_pool(tmp_path, m
                 assert rig.sdk.cancels==[('old-A',)]
             assert rig.sdk.posts==rig.sdk.market_orders==[]
         finally:rig.close()
+
+
+def test_latest_measurement_attempt_records_failed_refresh_without_refreshing_sample(tmp_path,monkeypatch):
+    from datetime import datetime
+    from threading import Event
+    from open_trader import prediction_arbitrage_execution as module
+    service,external=_measured_service(tmp_path,monkeypatch)
+    try:
+        known=service.refresh_lp_observations()['observations']['condition-1']['pool_result']
+        previous=service.lp_observed_pool_state()
+        original_success=previous['observation_refresh']['last_success_at']
+        clock=[datetime.fromisoformat(known['measured_at'].replace('Z','+00:00'))+timedelta(seconds=1)]
+        monkeypatch.setattr(module,'_utc_now',lambda:clock[0])
+        calls=[]
+        sdk=service._trading._client
+        for name in ('get_balance_allowance','list_open_orders','list_account_trades','list_positions','get_order_scoring'):
+            method=getattr(sdk,name)
+            def counted(*args,_method=method,_name=name,**kwargs):
+                calls.append(_name)
+                return _method(*args,**kwargs)
+            monkeypatch.setattr(sdk,name,counted)
+        original_id=external['orders'][0]['id']
+        external['orders'][0]['id']=''
+        assert service._store.lp_advance_trade_generation(service._store.lp_trade_generation())
+        failed=service.refresh_lp_observations()
+        assert failed['state']=='unknown' and failed['reason']=='account_snapshot_stale'
+        state=service.lp_observed_pool_state(as_of=clock[0])
+        attempt=state['measurement_attempts']['condition-1']
+        assert attempt['result']==dict(state='unknown',reason='account_snapshot_stale',yield_pct_per_hour=None)
+        assert attempt['checked_at']==clock[0].isoformat().replace('+00:00','Z')
+        assert state['results']['condition-1']['result']==known
+        assert state['observation_refresh']['last_success_at']==original_success
+        assert len(state['measurement_attempts'])<=64
+        detached=deepcopy(state)
+        attempt['result']['reason']='reader mutation'
+        before=deepcopy(external);before_calls=list(calls)
+        generation=service._store.lp_trade_generation()
+        assert service.lp_observed_pool_state(as_of=clock[0])==detached
+        assert service._store.lp_trade_generation()==generation and external==before and calls==before_calls
+        stop=Event();stop.set();clock[0]+=timedelta(seconds=1)
+        assert service.refresh_lp_observations(stop_event=stop)['state']=='cancelled'
+        assert service.lp_observed_pool_state(as_of=clock[0])['measurement_attempts']==detached['measurement_attempts']
+        assert external==before and calls==before_calls and service._store.lp_trade_generation()==generation
+        external['orders'][0]['id']=original_id
+        assert service._store.lp_advance_trade_generation(service._store.lp_trade_generation())
+        recovered=service.refresh_lp_observations()
+        assert recovered['state']=='ready'
+        refreshed=service.lp_observed_pool_state(as_of=clock[0])
+        assert refreshed['measurement_attempts']['condition-1']['result']['state']=='known'
+        assert refreshed['measurement_attempts']['condition-1']['checked_at']==clock[0].isoformat().replace('+00:00','Z')
+        assert refreshed['observation_refresh']['last_success_at']!=original_success
+    finally:service._trading.close()

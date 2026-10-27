@@ -2925,6 +2925,19 @@ class LPD2LiveExecution:
         if (order.key[0] != self.account_id or order.key[2:] != (target.token_id, target.existing_order_id)
                 or order.side != 'BUY'):
             return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='independent_cancel_identity')
+        pool_inputs = None
+        if protection_target is not None and protection_target.reason in ('buy_partial_fill', 'measured_yield_unknown_timeout'):
+            # SQL belongs to this native request, never to CurrentLPState's lock.
+            # The final memory-only guard must reject facts changed during I/O.
+            captured = self.state.snapshot()
+            try:
+                role = self.store.lp_load_observed_pool_roles(self._settings_account())['roles'].get(order.key[1], {})
+                sample = (self.store.lp_observations(self._settings_account()).get(order.key[1], {}).get('pool_result')
+                    if protection_target.reason == 'measured_yield_unknown_timeout' else None)
+            except Exception:
+                return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='protection_cancel_not_current')
+            pool_inputs = (captured, role, sample)
+        # Permission SQL is also outside the lock and follows any pool-input wait.
         if not lease.allowed('ROTATION_CANCEL' if rotation_origin is not None else 'CANCEL'):
             return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='mutation_lease_not_current')
         with self.state._lock:
@@ -2935,11 +2948,16 @@ class LPD2LiveExecution:
             if protection_origin is not None and not self._protection_cancel_origin_current(
                     self.state.snapshot(), protection_key, protection_origin):
                 return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='protection_cancel_not_current')
-            if protection_target is not None and protection_target.reason in ('buy_partial_fill', 'measured_yield_unknown_timeout'):
+            if pool_inputs is not None:
+                captured, role, sample = pool_inputs
                 snapshot = self.state.snapshot()
                 current_order = next((o for o in snapshot.active_orders if o.key == order.key), None)
-                if (current_order is None or current_order.remaining != order.remaining
-                        or not self._pool_cancel_reason_current(snapshot, current_order, protection_target.reason)):
+                if (snapshot.trade_version != captured.trade_version
+                        or snapshot.current.cycle_generation != captured.current.cycle_generation
+                        or snapshot.observation is not captured.observation
+                        or current_order is None or current_order.terms_version != order.terms_version
+                        or current_order.remaining != order.remaining
+                        or not self._pool_cancel_reason_current(snapshot, current_order, protection_target.reason, role, sample)):
                     return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='protection_cancel_not_current')
             if protection_target is not None:
                 snapshot = self.state.snapshot()
@@ -4228,8 +4246,8 @@ class LPD2LiveExecution:
         except Exception:
             logger.exception('prediction_lp_native_completion_wakeup_failed')
 
-    def _managed_pool_role(self, snapshot, order):
-        """A role only applies to its exact BUY in the current account frame."""
+    def _managed_pool_role(self, snapshot, order, role):
+        """Pure validation of a captured role against the current exact BUY."""
         observation = snapshot.observation
         if (self.policy.allocation_mode != 'observed_pools' or order.side != 'BUY'
                 or order.key[0] != self.account_id or not self._is_local_order(order)
@@ -4240,16 +4258,15 @@ class LPD2LiveExecution:
                 or not any((r['condition_id'],r['token_id'],r['order_id']) == order.key[1:]
                     for r in observation.source_frame.current_buys)):
             return None
-        role = self.store.lp_load_observed_pool_roles(self._settings_account())['roles'].get(order.key[1], {})
         if (role.get('pool') not in ('trial', 'income') or role.get('episode') != order.key[3]
                 or role.get('account_id', self.account_id) != self.account_id
                 or role.get('token_id', order.key[2]) != order.key[2]):
             return None
         return role['pool']
 
-    def _usable_pool_sample(self, order):
+    def _usable_pool_sample(self, order, sample):
         from .polymarket_lp_observed_pools import result_projection
-        values = result_projection(self.store.lp_observations(self._settings_account()),
+        values = result_projection({order.key[1]:dict(pool_result=sample)},
             self._settings_account(), self._utc_now())
         value = values.get(order.key[1], {})
         sample = value.get('result', {})
@@ -4257,31 +4274,37 @@ class LPD2LiveExecution:
         return (value.get('eligible') is True and source.get('order_id') == order.key[3]
             and source.get('token_id') == order.key[2] and source.get('side') == 'BUY')
 
-    def _pool_cancel_reason_current(self, snapshot, order, reason):
-        role = self._managed_pool_role(snapshot, order)
+    def _pool_cancel_reason_current(self, snapshot, order, reason, captured_role, sample):
+        role = self._managed_pool_role(snapshot, order, captured_role)
         if role is None:
             return False
         if reason == 'buy_partial_fill':
             return order.size_matched.state == 'known' and order.size_matched.value > 0
         since = self._measured_unknown_since.get(order.key)
         return (reason == 'measured_yield_unknown_timeout' and role == 'trial'
-            and since is not None and self._clock()-since >= 600 and not self._usable_pool_sample(order))
+            and since is not None and self._clock()-since >= 600 and not self._usable_pool_sample(order, sample))
 
     def _evaluate_pool_buy_protection(self):
         attempts = []
+        if self.policy.allocation_mode != 'observed_pools':
+            return attempts
+        roles = self.store.lp_load_observed_pool_roles(self._settings_account())['roles']
+        observations = self.store.lp_observations(self._settings_account())
         snapshot = self.state.snapshot()
         self._measured_unknown_since = {key: since for key, since in self._measured_unknown_since.items()
             if any(o.key == key for o in snapshot.active_orders)}
         for order in snapshot.active_orders:
-            role = self._managed_pool_role(snapshot, order)
+            captured_role = roles.get(order.key[1], {})
+            sample = observations.get(order.key[1], {}).get('pool_result')
+            role = self._managed_pool_role(snapshot, order, captured_role)
             if role is None:
                 continue
-            if role == 'trial' and not self._usable_pool_sample(order):
+            if role == 'trial' and not self._usable_pool_sample(order, sample):
                 self._measured_unknown_since.setdefault(order.key, self._clock())
             else:
                 self._measured_unknown_since.pop(order.key, None)
             reason = next((reason for reason in ('buy_partial_fill', 'measured_yield_unknown_timeout')
-                if self._pool_cancel_reason_current(snapshot,order,reason)), None)
+                if self._pool_cancel_reason_current(snapshot,order,reason,captured_role,sample)), None)
             if reason is None:
                 continue
             if (any(t.order_key == order.key and t.native_state != 'ended'
