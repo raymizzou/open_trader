@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-27 — LP order-book WS review repairs (#487 / PR #489)
+
+- Preserve complete pending and accepted REST books during WS outages. Invalidate an accepted WS version without adding or clearing real read failures; retain exact order identity, UNKNOWN, financial and no-replay protections.
+- Keep a pending queue getter across receive polling deadlines so a dequeued update cannot disappear at cancellation. Preserve generation invalidation, bounded queues and actual shutdown drain.
+- Back off reconnects exponentially from 250 ms to 30 seconds with bounded jitter. Reset only after valid data or text PONG, expose retry diagnostics, and interrupt pending waits on off/close.
+
 ## 2026-10-27 — LP pool order-book WebSocket (#487 A+B)
 
 - Add default-off `off`/`shadow`/`use` settings on the existing authenticated LP config command. Maintain one LP-owned connection for exact current trial/income pool tokens, validate Decimal books, fail closed on invalid updates or queue gaps, and audit synchronized tokens every 60 seconds. Preserve original REST cadence, Retry-After and actual cleanup when WS is unavailable.

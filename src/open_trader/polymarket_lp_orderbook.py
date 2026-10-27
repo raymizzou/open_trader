@@ -1,5 +1,6 @@
 """LP-owned, value-only order books. No execution or financial authority."""
 import time
+import random
 import threading
 from functools import wraps
 from decimal import Decimal, InvalidOperation
@@ -39,6 +40,7 @@ class OrderBooks:
         self.buy_prices={};self.diagnostics=ShadowDiagnostics(clock=clock)
         self._fallbacks={};self._mismatches={}
         self._members={};self._member_sequence=0
+        self.failure_streak=0;self.next_retry=None;self.retry_reason=None
 
     @synchronized
     def subscribe(self, tokens, *, buy_prices=None):
@@ -93,6 +95,7 @@ class OrderBooks:
                 fallback_reason=fallback.get('reason'),fallback_at=fallback.get('at'),
                 reconciliation_mismatches=self._mismatches.get(token,0)))
         return dict(connected=self.online,generation=self.generation,reason=self.last_reason,
+            failure_streak=self.failure_streak,next_retry_monotonic=self.next_retry,retry_reason=self.retry_reason,
             tokens=dict(total=len(self.tokens),omitted=max(0,len(self.tokens)-16),items=items),
             reconciliation_mismatches=self.reconciliation_mismatches,
             last_reconciliation=dict(self.last_reconciliation) if self.last_reconciliation else None,
@@ -101,10 +104,15 @@ class OrderBooks:
             queue_overflows=self.queue_overflows,subscribed=len(self.tokens),synced=sum(self.snapshot(t) is not None for t in self.tokens))
 
     @synchronized
+    def retry_state(self, streak, deadline, reason):
+        self.failure_streak=streak;self.next_retry=deadline;self.retry_reason=reason
+
+    @synchronized
     def market_book(self, token):
         value=self.snapshot(token)
         if value is None:return None
         return dict(value,transport='ws',connection_generation=self.generation,
+            book_version=(self.generation,self._members[token],self._revision.get(token,0)),
             **{side:tuple(MappingProxyType(dict(price=p,size=s)) for p,s in value[side])
             for side in ('bids','asks')})
 
@@ -227,6 +235,7 @@ class OrderBookWebSocket:
     def __init__(self, books, *, url='wss://ws-subscriptions-clob.polymarket.com/ws/market', queue_limit=256, on_update=lambda tokens:None):
         self.books=books;self.url=url;self.queue_limit=queue_limit;self.stopping=False;self.closed=False;self.socket=None
         self.on_update=on_update;self._runner=None;self._reader=None;self._waiter=None
+        self._failure_streak=0;self._stop_event=None
 
     async def run(self):
         import asyncio
@@ -234,7 +243,7 @@ class OrderBookWebSocket:
         from websockets.asyncio.client import connect
         from .prediction_websocket_compat import install_proxy_cleanup
         install_proxy_cleanup()
-        self._runner=asyncio.current_task()
+        self._runner=asyncio.current_task();self._stop_event=asyncio.Event()
         try:
             while not self.stopping:
                 if not self.books.tokens:
@@ -258,16 +267,27 @@ class OrderBookWebSocket:
                                     await socket.send('PING');last_ping=self.books.clock()
                                 self.books.check_liveness()
                                 if not self.books.online or self.books.generation!=generation:break
-                                self._waiter=asyncio.create_task(queue.get())
-                                try:event,received,membership=await asyncio.wait_for(self._waiter,.02)
-                                except TimeoutError:
+                                if self._waiter is None:self._waiter=asyncio.create_task(queue.get())
+                                ready,_=await asyncio.wait((self._waiter,),timeout=.02)
+                                if not ready:
                                     if reader.done():break
                                     continue
-                                finally:self._waiter=None
+                                event,received,membership=self._waiter.result()
+                                self._waiter=None
                                 if self.books.online and self.books.generation==generation:
-                                    self.on_update(self.books.handle(event,connection_data=False,membership=membership))
+                                    rows=event.get('price_changes',()) if event.get('event_type')=='price_change' else (event,)
+                                    before={row.get('asset_id'):self.books.seed_ticket(row.get('asset_id')) for row in rows}
+                                    changed=self.books.handle(event,connection_data=False,membership=membership)
+                                    if any(self.books.seed_ticket(token)!=ticket and self.books.snapshot(token) is not None
+                                            for token,ticket in before.items()):
+                                        self._valid_data()
+                                    self.on_update(changed)
                                     self.books.diagnostics.update_latency(self.books.clock()-received)
                         finally:
+                            if self._waiter is not None:
+                                if not self._waiter.done():self._waiter.cancel()
+                                await asyncio.gather(self._waiter,return_exceptions=True)
+                                self._waiter=None
                             if not reader.done():reader.cancel()
                             await asyncio.gather(reader,return_exceptions=True)
                 except asyncio.CancelledError:raise
@@ -275,9 +295,19 @@ class OrderBookWebSocket:
                 finally:
                     self.socket=None
                     if self.books.online:self.books.disconnected('disconnect')
-                if not self.stopping:await asyncio.sleep(.1)
+                if not self.stopping:
+                    self._failure_streak+=1
+                    base=min(30,.25*2**min(7,self._failure_streak-1))
+                    deadline=self.books.clock()+min(30,base*(1+random.uniform(0,.2)))
+                    self.books.retry_state(self._failure_streak,deadline,self.books.last_reason or 'disconnect')
+                    while not self.stopping and self.books.tokens and self.books.clock()<deadline:
+                        try:
+                            # Await in the accounted resident runner; no hidden Event.wait task.
+                            async with asyncio.timeout(min(.02,deadline-self.books.clock())):
+                                await self._stop_event.wait()
+                        except asyncio.TimeoutError:pass
         finally:
-            self.books.disconnected('closed');self.closed=True
+            self.books.disconnected('closed');self.books.retry_state(self._failure_streak,None,'closed');self.closed=True
 
     async def _receive(self, socket, queue, generation):
         import asyncio
@@ -286,7 +316,8 @@ class OrderBookWebSocket:
             async for raw in socket:
                 if self.books.generation!=generation:return
                 self.books.proof()
-                if raw=='PONG':continue
+                if raw=='PONG':
+                    self._valid_data();continue
                 parsed=json.loads(raw)
                 for event in parsed if isinstance(parsed,list) else (parsed,):
                     if not isinstance(event,dict):raise ValueError('invalid_message')
@@ -300,11 +331,16 @@ class OrderBookWebSocket:
         finally:
             if self.books.generation==generation and self.books.online:self.books.disconnected('disconnect')
 
+    def _valid_data(self):
+        self._failure_streak=0
+        self.books.retry_state(0,None,None)
+
     def managed_tasks(self):
         return sum(task is not None and not task.done() for task in (self._runner,self._reader,self._waiter))
 
     async def aclose(self):
         self.stopping=True
+        if self._stop_event is not None:self._stop_event.set()
         if self.socket is not None:await self.socket.close()
 
 

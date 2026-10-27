@@ -113,6 +113,7 @@ class MarketAttempt:
     complete: bool
     reason: str | None = None
     cleanup_fault: bool = False
+    ws_invalidation: bool = False
 
 class _Loop:
     def __init__(self,name):
@@ -135,6 +136,7 @@ class _Scope:
         self.financial_wait_capture=None
         self.fault_detail=None
         self.last_sources=None
+        self.delivered_ws=None
 
 class LPReadRuntime:
     def __init__(self, source_factory, *, clock=time.monotonic, utc_now=lambda:datetime.now(UTC), buy_cap=BUY_SCOPE_CAP,
@@ -193,17 +195,23 @@ class LPReadRuntime:
             for scope in self._scopes.values():
                 token=scope.demand.token_id
                 book=self._books.market_book(token)
+                if book is None and scope.delivered_ws is not None:
+                    results.append(replace(scope.delivered_ws,complete=False,reason='ws_invalidated',ws_invalidation=True))
+                    scope.delivered_ws=None
                 if ((token not in self._ws_pending and book is not None) or scope.demand.kind!='buy'
                         or scope.demand.key not in self._ws_eligible or scope.active
                         or scope.retiring or scope.fault or scope.last_sources is None):continue
+                if scope.result is not None and not _ws_source(scope.result.sources.get('book')):continue
+                if book is None:continue
                 ticket=self._books.seed_ticket(token)
                 if self._ws_delivered.get(scope.demand.key)==ticket:continue
                 self._attempt_sequence+=1;now=self.clock();sources=dict(scope.last_sources)
                 sources['book']=SourceResult(str(scope.demand.key)+':ws:'+str(self._attempt_sequence),
                     freeze(book) if book else None,complete=book is not None,checked_at=book['received_at'] if book else None,
                     error=None if book else 'ws_invalidated')
-                results.append(MarketAttempt(scope.demand,self._attempt_sequence,now,now+5,now,
-                    freeze_sources(sources),book is not None))
+                result=MarketAttempt(scope.demand,self._attempt_sequence,now,now+5,now,
+                    freeze_sources(sources),True)
+                results.append(result);scope.delivered_ws=result
                 self._ws_delivered[scope.demand.key]=ticket
                 scope.result=None
         return tuple(results)
@@ -238,7 +246,11 @@ class LPReadRuntime:
                     if (scope.demand.token_id!=token or scope.demand.kind!='buy'
                             or scope.demand.key not in self._ws_eligible or scope.retiring):continue
                     book=self._books.market_book(token)
+                    if book is None:
+                        notify=True
+                        continue
                     if scope.result is not None:
+                        if not _ws_source(scope.result.sources.get('book')):continue
                         sources=dict(scope.result.sources)
                         sources['book']=SourceResult(str(scope.demand.key)+':ws:'+str(scope.result.attempt),book,
                             complete=book is not None,checked_at=book['received_at'] if book else None,error=None if book else 'ws_invalidated')
@@ -319,7 +331,7 @@ class LPReadRuntime:
                         except Exception:
                             pass
                     if self._closed:
-                        scope.result=None;scope.fault_pending=False
+                        scope.result=None;scope.fault_pending=False;scope.delivered_ws=None
                     if key not in self._demands:
                         scope.retiring=True
                     if scope.active and (scope.retiring or self.clock()>=scope.deadline):
@@ -625,9 +637,9 @@ class LPReadRuntime:
                         book=self._books.market_book(scope.demand.token_id)
                         if (book is None or book['connection_generation']!=source.value.get('connection_generation')
                                 or scope.demand.key not in self._ws_eligible or self._orderbook_mode!='use'):
-                            sources=dict(scope.result.sources)
-                            sources['book']=replace(source,value=None,complete=False,error='ws_invalidated')
-                            scope.result=replace(scope.result,sources=freeze_sources(sources),complete=False,reason='ws_invalidated')
+                            # Loss of a WS fact is confidence loss, not another HTTP attempt.
+                            if scope.result.complete:
+                                scope.result=replace(scope.result,complete=False,reason='ws_invalidated',ws_invalidation=True)
                         elif self.clock()<scope.result.deadline:
                             sources=dict(scope.result.sources)
                             sources['book']=replace(source,value=freeze(book),checked_at=book['received_at'])
@@ -635,6 +647,8 @@ class LPReadRuntime:
                     result.append(replace(scope.result,cleanup_fault=scope.result.cleanup_fault or scope.fault))
                     if source is not None and isinstance(source.value,Mapping) and source.value.get('transport')=='ws':
                         self._ws_delivered[scope.demand.key]=self._books.seed_ticket(scope.demand.token_id)
+                    delivered=result[-1]
+                    scope.delivered_ws=delivered if delivered.complete and _ws_source(delivered.sources.get('book')) else None
                     scope.result=None;scope.fault_pending=False
                 elif scope.fault_pending:
                     result.append(MarketAttempt(scope.demand,scope.attempt,scope.started,scope.deadline,
@@ -719,6 +733,10 @@ class LPReadRuntime:
 
 def freeze_sources(sources):
     return MappingProxyType(dict(sources))
+
+
+def _ws_source(source):
+    return source is not None and isinstance(source.value,Mapping) and source.value.get('transport')=='ws'
 
 
 def _json_value(value):

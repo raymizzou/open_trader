@@ -648,10 +648,15 @@ def test_ws_market_results_keep_identity_watermark_and_unknown_guards(bad_source
                 await wait(lambda:runtime.status()['ready_count']==1)
                 await outbound.put(dict(event_type='tick_size_change',asset_id='yes',market=CID,timestamp='1001'))
                 await wait(lambda:runtime.orderbook_snapshot('yes') is None)
-                invalid,=runtime.drain_results()
-                assert not invalid.complete
-                owner.apply_market_attempt(replace(invalid,attempt=result.attempt+102))
-                assert owner.snapshot().yields[('account',CID,'yes','A')].yield_pct_per_hour.state=='unknown'
+                rest,=runtime.drain_results()
+                # WS invalidation cannot overwrite this genuine complete REST mailbox.
+                assert rest.complete and rest.sources['book'].value.get('transport') is None
+                assert owner.apply_market_attempt(replace(rest,attempt=result.attempt+102))=='applied'
+                restored=owner.snapshot()
+                assert restored.yields[('account',CID,'yes','A')].yield_pct_per_hour.state=='known'
+                assert restored.read_failures[('account',CID,'yes','A')].consecutive_failures==0
+                assert owner.apply_market_attempt(replace(invalid_now[0],attempt=result.attempt+103))=='stale'
+                assert owner.snapshot()==restored
                 clock.value=10.001
                 assert owner.snapshot().new_capacity.state=='unknown'
             finally:
