@@ -568,6 +568,33 @@ class PredictionArbitrageStore:
                 'SELECT payload FROM lp_order_provenance WHERE account_id=? AND venue=? ORDER BY order_id',
                 (account_id.casefold(),venue)))
 
+    def lp_holding_sell_orders(self, account_id, venue, *, include_inventory=False):
+        """Durable holding requests, including unresolved pre-post intents."""
+        with self._read_connection() as connection:
+            rows = tuple(json.loads(row[0]) for row in connection.execute(
+                'SELECT payload FROM lp_holding_sells WHERE account_id=? AND venue=? ORDER BY request_id',
+                (account_id.casefold(), venue)))
+        return rows if include_inventory else tuple(r for r in rows if r.get('kind') != 'inventory')
+
+    def lp_save_holding_sell(self, row):
+        payload = json.dumps(row, sort_keys=True, separators=(',', ':'), allow_nan=False)
+        key = (row['account_id'].casefold(), row['venue'], row['request_id'])
+        with self._transaction(lp_priority='reliable') as connection:
+            previous = connection.execute('SELECT payload FROM lp_holding_sells '
+                'WHERE account_id=? AND venue=? AND request_id=?', key).fetchone()
+            if previous is not None:
+                old = json.loads(previous[0])
+                immutable = ('account_id', 'venue', 'request_id', 'condition_id', 'token_id',
+                    'quantity', 'price', 'observation_id', 'generation', 'requested_at')
+                if (any(old[k] != row[k] for k in immutable)
+                        or old.get('order_id') and old['order_id'] != row.get('order_id')
+                        or row['state'] == 'pending' and old['state'] != 'pending'):
+                    raise ValueError('holding_sell_identity_conflict')
+            connection.execute('INSERT INTO lp_holding_sells VALUES (?,?,?,?) '
+                'ON CONFLICT(account_id,venue,request_id) DO UPDATE SET payload=excluded.payload',
+                (*key, payload))
+        return json.loads(payload)
+
     @contextmanager
     def _native_transaction(self, *, immediate, prepared_at, diagnostics, prepare_seconds,
                             commit_guard, after_commit, operation, admission=None, telemetry=False, retry_chain=None):
@@ -713,6 +740,13 @@ class PredictionArbitrageStore:
                 order_id TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 PRIMARY KEY (account_id, venue, order_id)
+            );
+            CREATE TABLE IF NOT EXISTS lp_holding_sells (
+                account_id TEXT NOT NULL,
+                venue TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (account_id, venue, request_id)
             );
             CREATE TABLE IF NOT EXISTS lp_auto_pool (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),

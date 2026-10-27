@@ -510,8 +510,17 @@ def test_runtime_resume_and_shutdown_keep_owner_until_real_drain(tmp_path):
     try:
         pump_live(newer,newer_boundary,lambda:any(o.key[3]=='new' for o in newer.state.snapshot().active_orders))
         assert count(newer)==11 and count(newer,'new')==0
-        newer.run_protection_once();newer.run_once()
+        attempts = newer.run_protection_once()
+        # An admitted native request can still be committing its audit before
+        # entering the SDK. Observe its actual completion before asserting no
+        # replay; a momentarily empty SDK list is not completion evidence.
+        for attempt in attempts:
+            attempt.result(4)
+            attempt._thread.join(4)
+            assert attempt.done()
+        newer.run_once()
         assert newer_trading.cancels==[]
+        assert newer.store.lp_session(saved[0]['session_id'])['lp_read_protection']['A']==committed
         assert newer.state.snapshot().read_failures[('account',CID,'yes','A')].reason_codes==('read_failure_limit',)
     finally:newer_boundary.release.set();assert newer.close(4)
 

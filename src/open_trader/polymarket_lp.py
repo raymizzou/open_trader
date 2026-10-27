@@ -18774,6 +18774,31 @@ class PolymarketLPService:
             )
         )
 
+    @staticmethod
+    def _passive_average_cost(session, snapshot, quantity):
+        positions = [p for p in _items(snapshot.get('account', {}).get('positions'))
+            if str(_field(p, 'token_id', _field(p, 'asset_id', ''))) == str(session['token_id'])]
+        account = _maybe_decimal(_field(positions[0], 'average_price')) if len(positions) == 1 else None
+        if account is None and len(positions) == 1 and quantity > 0:
+            cost = _maybe_decimal(_field(positions[0], 'inventory_cost_usd', _field(positions[0], 'cost_usd')))
+            account = cost / quantity if cost is not None else None
+        account = account if account is not None and account > 0 else None
+        bought, sold = _maybe_decimal(session.get('buy_filled_quantity')), _maybe_decimal(session.get('sold_quantity'))
+        verified = session.get('verified_order_fills') or {}
+        proved = all(f.get('quantity_known') is True for f in verified.values())
+        local = None
+        cost = _maybe_decimal(session.get('buy_cost'))
+        buy_events = [e for e in _items(session.get('trade_events')) if e.get('side') == 'BUY']
+        if (proved and bought and cost is not None and cost > 0 and sold is not None
+                and (sold == 0 or len(buy_events) <= 1)):
+            local = cost / bought
+        if proved and bought is not None and sold is not None:
+            if bought - sold < quantity:
+                return max(account, local) if account is not None and local is not None else account
+            if bought - sold == quantity and local is not None:
+                return local
+        return account if proved and session.get('position_reconciled') is True else None
+
     def _ensure_passive_exit(
         self,
         session: Mapping[str, object],
@@ -18844,7 +18869,16 @@ class PolymarketLPService:
             if not old_terminal:
                 row = self._queue_level_rows(snapshot).get(old_order)
                 remaining = self._queue_row_remaining(row) if row is not None else None
-                if remaining is not None and remaining != quantity and not session.get("passive_cancel_requested"):
+                below_floor = False
+                try:
+                    from .polymarket_lp_risk import passive_cost_floor
+                    floor = passive_cost_floor(self._passive_average_cost(session, snapshot, quantity),
+                        snapshot.get('market', {}).get('tick_size'))
+                    old_price = _maybe_decimal(_field(row, 'price')) if row is not None else None
+                    below_floor = old_price is not None and old_price < floor
+                except ValueError:
+                    pass
+                if remaining is not None and (remaining != quantity or below_floor) and not session.get("passive_cancel_requested"):
                     self._request_passive_cancel(session,
                         expected_generation=trade_generation if trade_generation is not None else snapshot.get("_lp_trade_generation"),
                         expected_trade_revision=expected_trade_revision if expected_trade_revision is not None else trade_revision)
@@ -18853,18 +18887,7 @@ class PolymarketLPService:
             # Its GTD facts remain the only source for replacement expiration.
             old_passive_record = dict(history.get(old_order) or {})
         try:
-            positions = [p for p in _items(snapshot.get("account", {}).get("positions"))
-                if str(_field(p, "token_id", _field(p, "asset_id", ""))) == str(session["token_id"])]
-            average = _maybe_decimal(_field(positions[0], "average_price")) if len(positions) == 1 else None
-            if average is None and len(positions) == 1:
-                cost = _maybe_decimal(_field(positions[0], "inventory_cost_usd", _field(positions[0], "cost_usd")))
-                average = cost / quantity if cost is not None and quantity > 0 else None
-            # Historical cost proves current cost only when it covers all inventory without sales.
-            bought = _maybe_decimal(session.get("buy_filled_quantity"))
-            if (average is None and _maybe_decimal(session.get("sold_quantity")) == 0
-                    and bought == quantity):
-                cost = _maybe_decimal(session.get("buy_cost"))
-                average = cost / bought if cost is not None and bought else None
+            average = self._passive_average_cost(session, snapshot, quantity)
             price = passive_exit_price(asks[0][0], average, snapshot.get("market", {}).get("tick_size"))
         except ValueError as exc:
             self.store.lp_update_session(str(session["session_id"]), state="needs_attention",

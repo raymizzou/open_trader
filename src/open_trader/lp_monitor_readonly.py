@@ -23,6 +23,8 @@ FIELDS = {
     'success','rejected','unknown','blocked','stuck','basis','request_id','order_id','condition_id','token_id','side',
     'pool','outcome','requested_at','id','trade_id','market','price','quantity','time','coverage','boot_reference',
     'total','by_reason','available',
+    'position_quantity','covered_quantity','uncovered_quantity','reasoned_quantity',
+    'cost_floor','cost_source','current_value','minimum_quantity','state','sells',
 }
 
 
@@ -38,6 +40,10 @@ def safe_summary(value):
         return str(v)[:2000]
     result={k:clean(value[k]) for k in SECTIONS} | {k:clean(value.get(k)) for k in ('as_of','timezone')}
     defaults=unknown_summary()
+    holdings=value.get('holdings')
+    result['holdings'] = clean(holdings) if (isinstance(holdings,dict)
+        and holdings.get('status') in STATUS and isinstance(holdings.get('reason'),str)
+        and isinstance(holdings.get('items'),list)) else defaults['holdings']
     for key in SECTIONS:
         data=result[key]
         mapping_fields={'orders':('counts',),'cancellations':('hour','today'),
@@ -106,6 +112,25 @@ def _table(rows,columns):
         '<tr>'+''.join('<td>'+_text(mapping(row).get(key))+'</td>' for key,_ in columns)+'</tr>' for row in rows)+'</tbody></table></div>'
 
 
+def _holdings_section(data):
+    totals=_pairs([(label,data.get(key)) for key,label in [('position_quantity','应挂（持仓）'),
+        ('covered_quantity','已挂'),('reasoned_quantity','有原因未挂')]])
+    columns=[('token_id','持仓 token'),('quantity','持仓数'),('current_value','当前价值'),
+        ('cost_floor','成本底线（不含手续费）'),('cost_source','成本来源'),
+        ('minimum_quantity','最小下单量'),('covered_quantity','已挂数'),('uncovered_quantity','未挂数'),('reason','状态原因')]
+    rows=[]
+    sources=dict(session_ledger='会话记账',account_average='账户均价',mixed_max='账户与会话成本取高',unknown='未知')
+    for raw in data.get('items',[]):
+        row=mapping(raw)
+        cells=''.join('<td>'+_text(sources.get(row.get(key),'未知') if key=='cost_source' else row.get(key))+'</td>' for key,_ in columns)
+        orders=_table(row.get('sells') if isinstance(row.get('sells'),list) else [],
+            [('order_id','在挂卖单'),('quantity','剩余数'),('price','价格')])
+        state='abnormal' if row.get('state')=='cost_unknown' else 'unknown' if row.get('state') in ('account_unknown','market_unknown') else 'attention'
+        rows.append('<tr class="holding-row '+state+'">'+cells+'<td>'+_text(row.get('condition_id'))+orders+'</td></tr>')
+    table='<div class="table-wrap"><table><thead><tr>'+''.join('<th scope="col">'+_text(label)+'</th>' for _,label in columns)+'<th scope="col">市场与卖单明细</th></tr></thead><tbody>'+''.join(rows)+'</tbody></table></div>'
+    return '<section aria-label="全持仓挂卖"><h2>全持仓挂卖</h2><p>'+_text(data.get('reason'))+'</p>'+totals+table+'</section>'
+
+
 def render_page(value):
     value=safe_summary(value)
     cards=[]
@@ -150,7 +175,8 @@ def render_page(value):
 :root{color-scheme:light dark;--bg:#f6f5f2;--card:#fff;--ink:#1f2328;--line:#c5c9d0;--ok:#166534;--warn:#854d0e;--bad:#b91c1c;--unk:#475569}
 @media(prefers-color-scheme:dark){:root{--bg:#16181b;--card:#20242a;--ink:#eee;--line:#667085;--ok:#86efac;--warn:#fde047;--bad:#fca5a5;--unk:#cbd5e1}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,sans-serif}main{max-width:1440px;margin:auto;padding:16px}.monitor-cards{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;align-items:start}.monitor-card{min-width:0;padding:16px;background:var(--card);border:1px solid var(--line);border-top:5px solid var(--unk);border-radius:10px;overflow-wrap:anywhere}.normal{border-top-color:var(--ok)}.attention{border-top-color:var(--warn)}.abnormal{border-top-color:var(--bad)}summary{cursor:pointer;min-height:48px}summary:focus-visible{outline:3px solid #4c8eff;outline-offset:4px}summary>*{display:block}summary strong{font-size:20px}summary b{font-size:16px}h1{font-size:24px}h3{font-size:16px}dl{margin:8px 0}dt{font-weight:600}dd{margin:0 0 8px}.table-wrap{overflow:auto}table{border-collapse:collapse}th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left}small{font-size:14px}@media(max-width:1000px){.monitor-cards{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:600px){.monitor-cards{grid-template-columns:1fr}}
-</style></head><body><main><h1>东京做市现况 · 只读</h1><p>今天按 Asia/Tokyo 零点统计。每分钟刷新。未知不代表零。</p><p>读取时间：'''+_text(value.get('as_of'))+'</p><section class="monitor-cards" aria-label="做市五项现况">'+''.join(cards)+'</section></main></body></html>'
+.holding-row.abnormal{color:var(--bad)}.holding-row.unknown{color:var(--unk)}
+</style></head><body><main><h1>东京做市现况 · 只读</h1><p>今天按 Asia/Tokyo 零点统计。每分钟刷新。未知不代表零。</p><p>读取时间：'''+_text(value.get('as_of'))+'</p><section class="monitor-cards" aria-label="做市五项现况">'+''.join(cards)+'</section>'+_holdings_section(value['holdings'])+'</main></body></html>'
 
 
 def validate_bind(host):

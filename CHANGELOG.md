@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-27 — LP all-holding passive sells with cost floors
+
+- Cover session, imported and same-token mixed holdings through one guarded account-quantity admission. Pure sessions use verified local cost first; imported holdings use account average, and mixed holdings use the higher known account/session basis. Round up to the market tick, exclude fees, and keep unknown cost, ended/unknown markets, minimum-size limits and precision dust visible.
+- Record holding requests before submission and preserve unresolved exposure across restart. Replace registered holding orders, and cancel only exact below-floor manual SELLs under the approved exception, after authoritative finality and a fresh converged position observation.
+- Keep a restored automatic read-failure cancellation request unresolved after restart, rather than sending the same target again from a new account observation. Preserve current-process retry decisions and native cleanup ownership.
+- Keep session and holding fills distinct. Confirmed sells must converge with current account quantity before their exposure can be reused, including across restart. Correct managed orders newly below cost through exact cancellation/finality; mere book movement still does not chase session orders.
+- Add read-only holding quantities, actual cost sources, live SELL details and coverage totals to the monitor. Known below-floor SELLs are cancelled even when their cost cannot be newly quoted; no replacement is sent above the maximum quote. Unknown cost grants no cancellation or hand-entry override. No deployment is included.
+
 ## 2026-10-26 — Restore PR CI
 
 - Run formal CI for PRs targeting main and retain main-push and main-only manual runs. Route PR diffs from the PR base SHA and require successful PR `CI / required` before merge; deployment still needs trusted exact-SHA final-main CI.

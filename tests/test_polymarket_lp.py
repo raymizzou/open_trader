@@ -661,7 +661,7 @@ def test_stop_loss_is_per_opening_and_includes_partial_exits(tmp_path) -> None:
             },
             {
                 "order_id": "order-2", "token_id": "0x" + "1" * 64, "side": "SELL",
-                "status": "LIVE", "price": Decimal("0.29"),
+                "status": "LIVE", "price": Decimal("0.30"),
                 "original_size": Decimal("100"), "size_matched": Decimal("40"),
                 "remaining_size": Decimal("60"),
             },
@@ -1174,6 +1174,8 @@ def test_maker_exit_reprices_without_overselling(tmp_path) -> None:
             "asks": [{"price": Decimal("0.32"), "size": Decimal("100")}],
         }
     changed["account"]["positions"][0]["average_price"] = Decimal("0.30")
+    # Observe the price of the actual cost-bounded passive order.
+    changed["orders"][1]["price"] = Decimal("0.30")
     exchange.snapshots = [base, base, filled, changed, changed]
 
     service.tick()

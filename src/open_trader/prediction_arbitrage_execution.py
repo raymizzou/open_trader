@@ -2306,8 +2306,9 @@ class PredictionExecutionService:
                 instance_id=getattr(self._lp_d2, 'lp_instance_id', None))
         except Exception:
             audits = None
+        holdings = self._lp_d2.holdings_summary(now=moment) if self._lp_d2 is not None else None
         return self._lp_monitor_summary.summarize(auto=auto, dashboard=dashboard,
-            trades=trades, audits=audits, account_id=account_id, now=moment)
+            trades=trades, audits=audits, account_id=account_id, now=moment, holdings=holdings)
 
     def lp_account_trades_page(self, *, offset: int, limit: int) -> dict[str, object]:
         """Serve bounded display details from the shared background round."""

@@ -1721,7 +1721,7 @@ def test_d2_manual_sell_disappearance_preserves_opening_attribution(tmp_path, mo
     post = sdk.post_order
     def manual(signed):
         sdk.posts.append(signed)
-        sdk.orders += (_open_order('disappearing-manual', 'SELL', price='.25', original='40').model_copy(
+        sdk.orders += (_open_order('disappearing-manual', 'SELL', price='.25', original='100').model_copy(
             update={'created_at': live.state.snapshot().observation.components['positions'].checked_at}),)
         return AcceptedOrder(order_id='disappearing-manual', status='live', making_amount=Decimal('0'),
             taking_amount=Decimal('0'), trade_ids=(), transactions_hashes=())
@@ -1731,15 +1731,15 @@ def test_d2_manual_sell_disappearance_preserves_opening_attribution(tmp_path, mo
         return live.state.snapshot()
     try:
         sdk.post_order = manual
-        manual(sdk.create_limit_order(token_id=TOKEN_ID, side='SELL', price=Decimal('.25'), size=Decimal('40'),
+        manual(sdk.create_limit_order(token_id=TOKEN_ID, side='SELL', price=Decimal('.25'), size=Decimal('100'),
             expiration=None, post_only=False))
         sdk.post_order = post
-        tick()  # current-process BUY proof and first live manual40 association
+        tick()  # current-process BUY proof and first fully covering manual order
         snapshot = tick()
         assert {o.key[3] for o in snapshot.sells[scope].current_sells} == {'disappearing-manual'}
         assert len(sdk.posts) == 2
         actual = next(o for o in sdk.orders if o.id == 'disappearing-manual')
-        terminal = actual.model_copy(update={'status': 'FILLED', 'size_matched': Decimal('40')})
+        terminal = actual.model_copy(update={'status': 'CANCELED', 'size_matched': Decimal('40')})
         sdk.orders = tuple(o for o in sdk.orders if o.id != actual.id)
         sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='60', average_price='.30'),)
         public.bid = Decimal('.251')
