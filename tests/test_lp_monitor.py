@@ -377,3 +377,66 @@ def test_monitor_http_is_readonly_and_keeps_unknowns(tmp_path, monkeypatch):
             code,body=_response(base+'/api/prediction-arbitrage/lp/monitor')
             assert code==200 and all(body[k]['status']=='unknown' for k in ('orders','cancellations','pools','balance','fills'))
     finally:rig.close()
+
+
+def test_monitor_explains_read_cleanup_fault_and_recovery():
+    from copy import deepcopy
+    from open_trader.polymarket_lp_monitor import LPMonitorSummary
+    now = datetime(2026, 10, 27, 3, tzinfo=UTC)
+    auto = dict(desired_running=True, effective_running=True, fatal=None,
+        effective_settings=dict(trial_target_buy_count=1, income_target_buy_count=0),
+        observed_pools=dict(current_membership=dict(state='known', account_id='ours',
+            observed_at=now.isoformat(), orders=[])))
+    dashboard = dict(account_id='ours', candidate_valid_count=3, candidate_state='ready',
+        candidate_stale=False, candidate_last_success_at=now.isoformat())
+    item = dict(lane='low', kind='position', since=(now-timedelta(minutes=8)).isoformat(),
+        active=True, blocks_new_buy=True, reason='delayed_read_cleanup')
+    runtime = dict(cleanup_faults=1, new_buy_allowed=False, new_buy_block_reasons=['cleanup_fault'],
+        cleanup_fault_details=dict(total=1, omitted=0, items=[item]))
+    monitor = LPMonitorSummary()
+    def summary(a=auto, d=dashboard):
+        return monitor.summarize(auto=a, dashboard=d, trades={}, audits=[], account_id='ours', now=now)
+    healthy = summary()
+    blocked_auto = {**auto, 'diagnostics': {'async_reads': runtime}}
+    blocked = summary(blocked_auto)
+    assert blocked['pools']['status'] == 'abnormal'
+    assert blocked['pools']['reason'] == '读取清理故障，暂停新增 BUY'
+    assert blocked['pools']['read_health'] == dict(status='abnormal', reason='读取清理故障，暂停新增 BUY',
+        cleanup_fault_details=dict(total=1, omitted=0, items=[item]), new_buy_block_reasons=['cleanup_fault'])
+    assert blocked['orders'] == healthy['orders'] and blocked['balance'] == healthy['balance']
+    retained = deepcopy(blocked)
+    runtime['cleanup_faults'] = 0
+    runtime['new_buy_allowed'] = True
+    runtime['new_buy_block_reasons'] = []
+    runtime['cleanup_fault_details'] = dict(total=0, omitted=0, items=[])
+    recovered = summary(blocked_auto)
+    assert recovered['pools']['status'] == healthy['pools']['status']
+    assert recovered['pools']['reason'] == healthy['pools']['reason']
+    assert recovered['pools']['read_health']['status'] == 'normal'
+    assert blocked == retained  # no references to subsequently changed input
+    assert summary()['pools']['read_health']['status'] == 'unknown'
+    good = dict(cleanup_faults=1, new_buy_allowed=False, new_buy_block_reasons=['cleanup_fault'],
+        cleanup_fault_details=dict(total=1, omitted=0, items=[item]))
+    for patch in [None, [], {'total': 1, 'items': []},
+            dict(total=1, omitted=0, items=[{**item, 'since': None}]),
+            dict(total=1, omitted=0, items=[{**item, 'since': '2026-10-27T03:00:00'}]),
+            dict(total=1, omitted=0, items=[{**item, 'lane': 'secret-url'}]),
+            dict(total=1, omitted=0, items=[{**item, 'blocks_new_buy': 'yes'}]),
+            dict(total=17, omitted=0, items=[item]*17)]:
+        value = summary({**auto, 'diagnostics': {'async_reads': {**good, 'cleanup_fault_details': patch}}})
+        assert value['pools']['read_health']['status'] == 'unknown'
+        assert value['pools']['read_health']['cleanup_fault_details'] is None
+        assert value['pools']['reason'] == healthy['pools']['reason']
+    for patch, reason in [(dict(fatal={'origin': 'startup'}), '致命'),
+            (dict(desired_running=True, effective_running=False), '想开')]:
+        value = summary({**auto, **patch, 'diagnostics': {'async_reads': good}})
+        assert reason in value['pools']['reason']
+    stopped = summary({**auto, 'desired_running': False, 'effective_running': False,
+        'diagnostics': {'async_reads': good}})
+    assert '读取清理' not in stopped['pools']['reason']
+    foreign = deepcopy(auto)
+    foreign['observed_pools']['current_membership']['account_id'] = 'foreign'
+    foreign['diagnostics'] = {'async_reads': good}
+    assert summary(foreign)['pools']['status'] == 'unknown'
+    failed_candidates = {**dashboard, 'candidate_valid_count': 0}
+    assert summary(blocked_auto, failed_candidates)['pools']['reason'] == '有效候选为零'

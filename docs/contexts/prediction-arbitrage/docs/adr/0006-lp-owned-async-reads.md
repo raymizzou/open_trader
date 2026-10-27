@@ -33,7 +33,7 @@ live/execution 将其接入既有 `plan_wait.dependencies`，Scheduler 不在纯
 清理故障/退役资源没有可运行结果或有限下一期限时，明确发布 `plan_wait.kind=events`，不编造未来日期。
 Scheduler 此时无定时检查期限，仅等待真实完成、显式命令或停止事件；既有错误退避保持。
 若健康 BUY 等仍有有限下一期限，则继续优先使用该期限，不被故障通道的事件等待遮挡。
-实际 I/O 退出会唤醒 owner；BUY、exact、低频通道及端口关闭失败仍保留原锁存故障语义，
+实际 I/O 退出会唤醒 owner；BUY、exact 通道及端口关闭失败仍保留原锁存故障语义，
 不提前释放池或恢复资金权限。
 
 2026-10-23，LP-CANCEL-20261023 / LPCANCEL-FINANCIAL-P2：仅 financial 的延迟取消清理故障，
@@ -47,6 +47,28 @@ Scheduler 此时无定时检查期限，仅等待真实完成、显式命令或�
 `last_financial_cleanup_fault` 只保留最近 attempt、未结束 source 名称、故障及实际结束的 monotonic 时间。
 历史固定大小，不含账户、订单、凭证或响应内容，scope 退役后仍可观察；查询不驱动网络或状态变更。
 本修订不重建端口、不增加撤单前查询，不改变 UNKNOWN、不重放、重启或其他通道的合同。
+
+2026-10-27，#475：将 financial 的实际退出恢复边界扩展到 low 通道（sell / position / holding / income）。
+全部来源读取（含响应关闭）真正结束后，解除该 scope 当前的延迟清理故障；原客户端、连接池、
+起点间隔（SELL 30 秒、position 60 秒、其他 5 秒）、provider/account Retry-After 保持不变。
+原 timeout 或 fault-only 邮箱未收取前，不替换 demand 的观察身份，也不启动同 scope 新 attempt；
+通知只收一次，旧 UNKNOWN 不变为完整事实。其他低频 scope 可在真实清理结束后按原规则继续读取。
+该解除不清除 BUY、exact 或端口关闭失败的锁存，也不授予财务权限；财务 UNKNOWN 仍禁止新增 BUY，
+必须有新鲜且通过原接纳的财务事实、有效候选及其他既有资格，才能按原策略发送新请求。
+本修订不处理首次超时根因，不扫描取消点、不重建池、不改变超时、容量或依赖。
+
+新增只读 `cleanup_fault_details={total,omitted,items}`，仅列出当前故障，最多 16 项，
+优先保留阻止新增 BUY 的固定通道。每项只含 lane、kind、since、active、blocks_new_buy、reason：
+lane 为 buy / financial / exact / low；kind 为固定需求枚举（无法确定时 unknown）；
+since 在故障发生时记录为 UTC 时间，无法取得有效时间时为 null，不在查询时补造。
+active 表示该故障当前仍存在，BUY/exact 读取实际结束后的锁存仍属当前故障；
+blocks_new_buy 表示该故障自身是否触发固定通道门禁，BUY 故障本身不冒充全局阻塞。
+reason 区分 delayed_read_cleanup 与 port_close_failure。`new_buy_block_reasons` 分别报告
+cleanup_fault / capacity / deferred，不改变 `new_buy_allowed` 的判断。原 financial 历史诊断保持不变。
+快照脱离可变状态，不含账户、订单、请求、token、端点或异常正文；GET 不发网络请求、不唤醒 Scheduler。
+auto/state 通过现有 diagnostics 投影发布这些字段；monitor 的 pools.read_health 验证并复制有界数据，
+当前固定通道清理故障明确说明「读取清理故障，暂停新增 BUY」，恢复后回到原池/候选状态。
+缺失或畸形诊断保持 unknown；不覆盖致命错误、未实际运行或未确认账户身份，不改变订单和财务真值。
 
 第 5 秒封存 UNKNOWN 并取消未完请求，第 6 秒仍未实际退出则锁存 cleanup fault，
 停止该单重试并请求 exact BUY 保护撤单。独立监督线程不依赖市场 loop 的合作。

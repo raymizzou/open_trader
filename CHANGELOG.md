@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-27 — LP low-read cleanup recovery
+
+- Resume sell, position, holding and income reads after all delayed request cleanup and response closing actually finish, using the existing clients and pools. Keep the original timeout UNKNOWN, one-time mailbox identity, cadence and Retry-After. BUY, exact and port-close fault latches remain; recovery grants no financial or order authority.
+- Show bounded, secret-free current cleanup fault lane, demand kind, UTC start time and BUY-blocking reason in auto state and monitor. Explain a current fixed-lane cleanup block explicitly, then restore the original pool/candidate status after recovery. Status queries add no reads or scheduler wakeups.
+
 ## 2026-10-27 — SIGTERM test readiness identity
 
 - Let the SIGTERM test child bind its own ephemeral port and verify the actual child PID and runtime health before signaling. Preserve real clean exit, STOPPED marker, owner-lock release and the existing startup/shutdown watchdogs when another process is listening.
