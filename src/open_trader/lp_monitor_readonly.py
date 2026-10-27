@@ -10,7 +10,7 @@ import socket
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from .polymarket_lp_monitor import SECTIONS, mapping, moment, unknown_summary
+from .polymarket_lp_monitor import SECTIONS, mapping, moment, number, unknown_summary
 
 SUMMARY_PATH = '/api/prediction-arbitrage/lp/monitor'
 LABELS = dict(orders='当前挂单', cancellations='撤单情况', pools='双池运行', balance='余额与可用资金', fills='本钱包成交')
@@ -22,7 +22,8 @@ FIELDS = {
     'balance_usd','allowance_usd','capacity_usd','checked_at','inventory_cost_usd','hour','today','amount_usd',
     'success','rejected','unknown','blocked','stuck','basis','request_id','order_id','condition_id','token_id','side',
     'pool','outcome','requested_at','id','trade_id','market','price','quantity','time','coverage','boot_reference',
-    'total','by_reason','available',
+    'total','by_reason','available','omitted','income_gaps','measurement_attempts','observation_refresh',
+    'last_success_at','age_seconds','stalled','minimum_quantity','yield_pct_per_hour',
     'position_quantity','covered_quantity','uncovered_quantity','reasoned_quantity',
     'cost_floor','cost_source','current_value','minimum_quantity','state','sells',
 }
@@ -151,6 +152,20 @@ def render_page(value):
                 details+='<h3>'+label+'</h3>'+_pairs([(name,row.get(field)) for field,name in [
                     ('count','当前挂单'),('target','目标'),('budget_usd','预算（USD）'),('used_usd','已占用（USD）'),
                     ('last_change_at','最近补位或换单'),('last_change_reason','时间来源说明')]])
+            refresh=mapping(data.get('observation_refresh'))
+            refresh_age=number(refresh.get('age_seconds'))
+            if refresh.get('stalled') is True and refresh_age is not None:
+                details+='<p>观测刷新停滞 '+_text(int(refresh_age))+' 秒</p>'
+            elif refresh.get('last_success_at') is None:
+                details+='<p>观测刷新时间未知</p>'
+            gaps=mapping(data.get('income_gaps'))
+            details+='<h3>收益池缺单原因</h3>'+_table(gaps.get('items') or [],
+                [('condition_id','市场'),('order_id','订单'),('reason','原因'),('age_seconds','样本秒数'),
+                 ('quantity','数量'),('minimum_quantity','最小数量')])
+            details+=_pairs([('原因总数',gaps.get('total')),('未展示',gaps.get('omitted'))])
+            details+='<h3>试挂最近一次实测尝试</h3>'+_table(data.get('measurement_attempts') or [],
+                [('condition_id','市场'),('checked_at','尝试时间'),('state','结果'),('reason','原因'),
+                 ('yield_pct_per_hour','收益（%/小时）')])
         elif key=='balance':
             big='可用 $'+_text(data.get('capacity_usd'))
             details=_pairs([(label,data.get(field)) for field,label in [('balance_usd','余额（USD）'),('allowance_usd','授权额度（USD）'),

@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-27 — Observed-pool income diagnostics and exact BUY protection (#482 A+B)
+
+- Show bounded income selection skip reasons, each trial's latest raw measurement attempt, and observation refresh age in auto state and the read-only monitor. Keep retained valid samples and original timestamps. Warn after 120 seconds without a completed refresh. Preserve shortage timing across UNKNOWN; a new monitor reports unknown duration until fresh process evidence establishes continuity.
+- In observed-pools mode, cancel the exact managed trial or income BUY remainder after a confirmed partial fill. Preserve cost-floor passive SELLs, current account identity, native ownership, UNKNOWN and no-replay protections. Cancel a managed trial BUY after 600 monotonic seconds without a current same-order sample aged at most 120 seconds; a valid sample (including zero yield) resets this process-local timer. Income and single-pool measured-timeout behavior stays unchanged. No deployment is included.
+
 ## 2026-10-27 — LP config recovery SOP for filled automatic BUYs
 
 - Document the saved-pause, same-version restart, fresh-account-facts, config and separately authorized enable sequence when a filled automatic BUY opening blocks settings. Require Ray's explicit approval of the restart and loss of the old process's opening-level protection; preserve SELL, UNKNOWN and no-replay guards. Documentation only; no deployed code change or standing restart/trading authorization.

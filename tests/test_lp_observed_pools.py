@@ -1059,7 +1059,21 @@ def test_fill_and_protection_remain_authoritative_during_pool_changes(tmp_path,m
             assert record['order_id']==record['receipt']['order_id']==h.identity.target.existing_order_id
             assert record['kind']=='CANCEL'
             assert record['receipt']['outcome']==('accepted' if record['order_id']=='old-C' else 'rejected')
-        assert rig.sdk.cancels==[('old-A','old-B','old-C','old-D')]
+        assert rig.sdk.cancels[0]==('old-A','old-B','old-C','old-D')
+        assert len(rig.sdk.cancels)==3 and set(rig.sdk.cancels[1:])=={('old-A',),('old-D',)}
+        # Later authoritative partial facts create new exact protection decisions.
+        # They do not replay the original group request or acquire SELL authority.
+        partial_targets=[t for p in rig.live.state.snapshot().progress.values() for t in p.cancel_targets
+            if t.reason=='buy_partial_fill']
+        assert {t.order_key[3] for t in partial_targets}=={'old-A','old-D'}
+        assert len(partial_targets)==2
+        assert {t.requested_remaining.value for t in partial_targets}=={Decimal('120'),Decimal('20')}
+        assert {t.request_id for t in partial_targets}.isdisjoint({h.identity.request_id for h in handles})
+        for target in partial_targets:
+            record,=rig.store.lp_actions('d2:'+target.request_id)
+            assert record['kind']=='CANCEL' and record['order_id']==target.order_key[3]
+            assert record['receipt']['request_id']==target.request_id
+            assert record['receipt']['outcome']=='rejected'
     finally:release.set();rig.close()
 
     unreadable=AsyncPoolRig(tmp_path/'unknown-incumbent-market',monkeypatch)
