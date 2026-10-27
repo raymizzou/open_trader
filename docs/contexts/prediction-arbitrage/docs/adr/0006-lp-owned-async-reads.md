@@ -18,7 +18,7 @@ status: accepted
 manual status 和 dashboard 只发布内存快照；重启后的命名组需显式命令核验身份，GET 不绑定组或恢复旧财务。
 
 每个当前自动或手动 BUY、双池收益候选各有独立 attempt，最多一个实际在途。起点间隔至少 5 秒，
-整轮必需读取共用 5 秒期限；book 每轮重读。metadata、fees、event、native 和 sponsored 奖励
+整轮必需读取共用 5 秒期限；默认 off 时 book 每轮经 REST 重读。metadata、fees、event、native 和 sponsored 奖励
 只共享已完成事实，30 秒到期刷新，保留原时间且不延长 60 秒可用期限。必要刷新失败即 UNKNOWN。
 provider/account 的真实 Retry-After、实际清理及 owner 未 ACK 均可延后下一轮，不能产生空失败。
 
@@ -199,3 +199,31 @@ service 仅在实际持有的独占手动 lease 释放并完成全局/文件锁�
 正常 exact/终态事实更新每次原请求的审计；旧 receipt 不改写、旧 progress 不覆盖新事实。
 启动恢复保护事实和原审计，但不重放旧 request，只有新接纳账户事实可产生新决定。
 本规则只改变撤单流程；读取五秒期限、清理所有权、BUY 不确定性、金融接纳和手动/SELL 安全边界保留。
+
+
+## LP 盘口 WS（2026-10-27，#487 A+B）
+
+LP 在现有 lp-market-io 上拥有一条直接 websockets 15.0.1 连接及其接收/消费任务，
+复用代理清理补丁，不增加线程，不借用套利订阅。只订阅当前候场/收益池的确切 token；
+候选池扩订和新挂单 WS 定价（批次 C）不在本次范围。现有 JSON 设置 orderbook_mode
+支持 off/shadow/use，缺省 off；经现有授权设置/CAS 热更新，不改变预算、交易配置版本或开关。
+
+use 下仅当前合格 BUY 的保护读取可用已同步本地盘口；新入场、独立 income 候选定价、
+metadata 和奖励仍走原 REST/引用路径。失去同步时恢复原 5 秒起点节奏、5 秒期限、
+Retry-After 与清理所有权。已同步 token 每 60 秒 REST 全档对账一次，同 token 去重；
+旧 REST 不覆盖新 WS。WS 整本替换或 REST 底加时间戳 >=T 的绝对数量变动可建立同步；
+整本 WS、订阅代际和连接代际阻止迟到 REST/旧队列覆盖。
+
+只有实际收到的数据/PONG 证明连接存活；安静的已同步盘口沿用 10 秒可用边界，15 秒静默失效。
+消费队列和预同步缓冲各有 256 上限，满时使整连接失效，不静默丢消息。
+逐 token 身份/时间戳/价格/数量/买卖一/交叉/tick 校验失败则退回 REST。
+同步状态、路由、最近回退原因/时间、全档对账差异及有界耗时/影子计数只读发布。
+同 token 的买盘 >=己方 BUY 价格变化只保留一次未完成检查，保护前经原 MarketAttempt
+接纳最新本地结果。账户/epoch/generation/order/terms、水位、UNKNOWN、财务准入、
+原 <=0.5 撤单规则、native 所有权和 no-replay 不变。
+
+shadow 使用复制的保护输入对照，不改变 REST 决策、失败计数或 native 发送；UNKNOWN 不算一致。
+先由东京实际日志证明两小时可比较覆盖及“REST 能撤 => WS 也能撤”，再由 Ray 单独批准切 use；
+本地受控时间测试不构成生产试验。日志复用现有有界诊断队列，日志故障不阻止真实撤单。
+WS/REST 实际排空前保留 owner；off 原资源计数不变，启用时显式计入 WS 任务和一条连接。
+操作、证据和 off 回退见 [LP 盘口 WS](../../../../operations/lp-orderbook-ws.md)。

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-27 — LP pool order-book WebSocket (#487 A+B)
+
+- Add default-off `off`/`shadow`/`use` settings on the existing authenticated LP config command. Maintain one LP-owned connection for exact current trial/income pool tokens, validate Decimal books, fail closed on invalid updates or queue gaps, and audit synchronized tokens every 60 seconds. Preserve original REST cadence, Retry-After and actual cleanup when WS is unavailable.
+- In use mode, deliver eligible current BUY protection books through the existing identity/watermark/freshness acceptance and coalesce bid-depth wakeups until protection completes. Keep new-entry pricing, including detached income candidates, on REST. Preserve financial UNKNOWN, native send ownership and no replay.
+- Add independent shadow cancellation comparisons and bounded route/fallback/reconciliation/latency diagnostics. A broken log sink cannot block REST cancellation. Document the separately authorized two-hour Tokyo shadow trial, explicit live switch and off rollback; this change does not deploy or enable production.
+
 ## 2026-10-27 — Observed-pool stress estimates and concurrent income reads (#482 C+D)
 
 - Keep stress-exit estimates and their unknown/insufficient-depth reasons visible, while automatic observed-pool trial and income candidates bypass only that rejection gate, including producer maintenance and final full-quantity checks. Manual and single-pool entries remain strict. Preserve other entry guards, budgets and fixed 50/30/20 weights.

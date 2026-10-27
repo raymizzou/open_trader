@@ -134,10 +134,11 @@ class _Scope:
         self.financial_cleanup_delayed=False
         self.financial_wait_capture=None
         self.fault_detail=None
+        self.last_sources=None
 
 class LPReadRuntime:
     def __init__(self, source_factory, *, clock=time.monotonic, utc_now=lambda:datetime.now(UTC), buy_cap=BUY_SCOPE_CAP,
-                 cache_entries=REFERENCE_CACHE_ENTRIES, cache_bytes=REFERENCE_CACHE_BYTES):
+                 cache_entries=REFERENCE_CACHE_ENTRIES, cache_bytes=REFERENCE_CACHE_BYTES, orderbook_url=None):
         self.source_factory=source_factory;self.clock=clock;self.utc_now=utc_now
         self.buy_cap=buy_cap;self.cache_entries=cache_entries;self.cache_bytes=cache_bytes;self._cache=OrderedDict();self._cache_size=0;self._lock=threading.RLock();self._scopes={};self._demands={}
         self._fixed_ports={};self._fixed_closing=set();self._fixed_closed=set();self._fixed_faults=set()
@@ -152,6 +153,121 @@ class LPReadRuntime:
         self._close_lock=threading.Lock()
         self._last_notice=None
         self._observed=-1;self._closed=False;self._started=False;self._signal=threading.Event();self._wakeup=lambda:None
+        from .polymarket_lp_orderbook import OrderBooks
+        self._books=OrderBooks(clock=clock,utc_now=utc_now);self._orderbook_url=orderbook_url
+        self._orderbook_mode='off';self._ws=None;self._ws_future=None;self._ws_close=None;self._ws_eligible=set()
+        self._audit_at={}
+        self._ws_pending=set()
+        self._ws_wake_requests=0
+        self._shadow=self._books.diagnostics
+        self._ws_woken_at={}
+        self._ws_delivered={}
+
+    def configure_orderbook(self, mode, tokens, *, eligible_keys=(), buy_prices=None):
+        if mode not in ('off','shadow','use'):raise ValueError('orderbook_mode_invalid')
+        with self._lock:
+            self._orderbook_mode=mode;self._ws_eligible=set(eligible_keys)
+            self._books.subscribe(tokens if mode!='off' else {},buy_prices=buy_prices or {})
+            self._ws_pending.intersection_update(tokens if mode!='off' else ())
+            self._ws_delivered={k:v for k,v in self._ws_delivered.items() if k in self._ws_eligible}
+            if mode=='off':
+                for scope in self._scopes.values():scope.last_sources=None
+        self.wake()
+
+    def orderbook_snapshot(self, token):
+        with self._lock:return freeze(self._books.market_book(token))
+
+    def complete_orderbook_check(self):
+        with self._lock:
+            changed={t for t in self._ws_pending if any(s.demand.token_id==t and s.demand.key in self._ws_eligible
+                and self._ws_delivered.get(s.demand.key)!=self._books.seed_ticket(t)
+                for s in self._scopes.values())}
+            self._ws_pending.clear();self._ws_woken_at.clear()
+        if changed:self._ws_changed(changed)
+
+    def drain_orderbook_results(self):
+        """Complete local reads before protection, through the original identity path."""
+        results=[]
+        with self._lock:
+            if self._orderbook_mode!='use':return ()
+            for scope in self._scopes.values():
+                token=scope.demand.token_id
+                book=self._books.market_book(token)
+                if ((token not in self._ws_pending and book is not None) or scope.demand.kind!='buy'
+                        or scope.demand.key not in self._ws_eligible or scope.active
+                        or scope.retiring or scope.fault or scope.last_sources is None):continue
+                ticket=self._books.seed_ticket(token)
+                if self._ws_delivered.get(scope.demand.key)==ticket:continue
+                self._attempt_sequence+=1;now=self.clock();sources=dict(scope.last_sources)
+                sources['book']=SourceResult(str(scope.demand.key)+':ws:'+str(self._attempt_sequence),
+                    freeze(book) if book else None,complete=book is not None,checked_at=book['received_at'] if book else None,
+                    error=None if book else 'ws_invalidated')
+                results.append(MarketAttempt(scope.demand,self._attempt_sequence,now,now+5,now,
+                    freeze_sources(sources),book is not None))
+                self._ws_delivered[scope.demand.key]=ticket
+                scope.result=None
+        return tuple(results)
+
+    def protection_started(self):
+        with self._lock:
+            for stamp in self._ws_woken_at.values():self._shadow.decision_latency(self.clock()-stamp)
+
+    def compare_shadow(self, token, rest, *, price, own_remaining, baseline_front):
+        from .polymarket_lp_risk import estimate_lp_queue_position
+        with self._lock:
+            if self._orderbook_mode!='shadow':return None
+            book=self._books.market_book(token)
+            ws=estimate_lp_queue_position(book,price=price,own_remaining=own_remaining,
+                baseline_front=baseline_front,token_id=token)
+            row=self._shadow.record(rest,ws)
+            row.update(observed_at=self.utc_now().isoformat(),coverage_seconds=self._shadow.snapshot()['coverage_seconds'])
+        import logging
+        from .polymarket_trading import _lp_capture_read_log
+        _lp_capture_read_log(lambda:logging.getLogger(__name__).info(
+            'prediction_lp_orderbook_shadow %s',json.dumps(row,sort_keys=True)))
+        return freeze(row)
+
+    def _ws_changed(self, tokens):
+        notify=False
+        with self._lock:
+            if self._orderbook_mode!='use':return
+            for token in tokens:
+                first=token not in self._ws_pending;self._ws_pending.add(token)
+                if first:self._ws_woken_at[token]=self.clock()
+                for scope in self._scopes.values():
+                    if (scope.demand.token_id!=token or scope.demand.kind!='buy'
+                            or scope.demand.key not in self._ws_eligible or scope.retiring):continue
+                    book=self._books.market_book(token)
+                    if scope.result is not None:
+                        sources=dict(scope.result.sources)
+                        sources['book']=SourceResult(str(scope.demand.key)+':ws:'+str(scope.result.attempt),book,
+                            complete=book is not None,checked_at=book['received_at'] if book else None,error=None if book else 'ws_invalidated')
+                        scope.result=replace(scope.result,sources=freeze_sources(sources),complete=scope.result.complete and book is not None)
+                    elif first and not scope.active and not scope.fault and scope.last_sources is not None:
+                        self._attempt_sequence+=1
+                        sources=dict(scope.last_sources)
+                        sources['book']=SourceResult(str(scope.demand.key)+':ws:'+str(self._attempt_sequence),book,
+                            complete=book is not None,checked_at=book['received_at'] if book else None,error=None if book else 'ws_invalidated')
+                        now=self.clock()
+                        scope.result=MarketAttempt(scope.demand,self._attempt_sequence,now,now+5,now,freeze_sources(sources),book is not None)
+                        notify=True
+        if notify:
+            self._ws_wake_requests+=1;self._notify()
+
+    def _maintain_orderbook(self):
+        valid={(self._books.generation,t) for t in self._books.tokens}
+        self._audit_at={k:v for k,v in self._audit_at.items() if k in valid}
+        for key in valid:
+            if key not in self._audit_at and self._books.snapshot(key[1]) is not None:self._audit_at[key]=self._books.synced_since(key[1])+60
+        if self._ws_future is not None and self._ws_future.done() and (self._ws_close is None or self._ws_close.done()):
+            self._ws=None;self._ws_future=None;self._ws_close=None
+        wanted=not self._closed and self._orderbook_mode!='off' and bool(self._books.tokens)
+        if not wanted and self._ws is not None and self._ws_close is None:
+            self._ws_close=self._market.submit(self._ws.aclose())
+        if wanted and self._ws is None:
+            from .polymarket_lp_orderbook import OrderBookWebSocket
+            self._ws=OrderBookWebSocket(self._books,on_update=self._ws_changed,**({'url':self._orderbook_url} if self._orderbook_url else {}))
+            self._ws_future=self._market.submit(self._ws.run())
 
     def start(self,wakeup=lambda:None):
         with self._lock:
@@ -183,6 +299,7 @@ class LPReadRuntime:
             self._signal.wait(.01);self._signal.clear()
             with self._lock:
                 self._observed=self.clock()
+                self._maintain_orderbook()
                 for key,scope in tuple(self._scopes.items()):
                     # The owning loop stages only copied values. Publish on
                     # the existing supervisor tick, under its existing lock;
@@ -272,7 +389,7 @@ class LPReadRuntime:
                     for name,(port,lane) in self._fixed_ports.items():
                         if name not in self._fixed_closing:
                             self._fixed_closing.add(name);lane.submit(self._close_fixed(name,port))
-                done=self._closed and not self._scopes and len(self._fixed_closed)==len(self._fixed_ports)
+                done=self._closed and not self._scopes and len(self._fixed_closed)==len(self._fixed_ports) and self._ws_future is None
                 # A completion/deadline/coverage change wakes the business
                 # owner. Polling the clock alone must not create a 100 Hz loop.
                 notice=tuple((key,s.attempt,s.active,s.fault,s.retiring,s.closed,
@@ -322,6 +439,7 @@ class LPReadRuntime:
 
     def _expire(self,scope):
         scope.expired=True
+        scope.last_sources=None
         if scope.demand.kind=='financial':
             self._last_financial_timeout=dict(attempt=scope.attempt,
                 observation_id=_location_text(scope.demand.observation_id,96),
@@ -340,13 +458,35 @@ class LPReadRuntime:
         key=(scope.demand.account,scope.demand.process_epoch,scope.demand.generation,
             scope.demand.condition_id,scope.demand.token_id,source)
         reference=source in ('metadata','native_rewards','sponsored_rewards')
+        seed_ticket=None;audit=False;seed_unsynced=False
         with self._lock:
+            eligible=source=='book' and self._orderbook_mode!='off' and scope.demand.key in self._ws_eligible
+            if eligible:
+                seed_ticket=self._books.seed_ticket(scope.demand.token_id)
+                book=self._books.market_book(scope.demand.token_id)
+                seed_unsynced=book is None
+                audit_key=(self._books.generation,scope.demand.token_id)
+                if book is not None and self.clock()>=self._audit_at.get(audit_key,self.clock()+60):
+                    audit=True;self._audit_at[audit_key]=self.clock()+60
+                if book is not None and self._orderbook_mode=='use' and scope.demand.kind=='buy' and not audit:
+                    return self._completed(scope,source,SourceResult(request.request_id,book,checked_at=book['received_at']))
             cached=self._cache.get(key) if reference else None
             if cached is not None and cached[0].checked_at is not None:
                 age=(self.utc_now()-cached[0].checked_at).total_seconds()
                 if 0<=age<30:
                     self._cache.move_to_end(key);return self._completed(scope,source,cached[0])
         result=await scope.port.read(request,scope.deadline)
+        if eligible:
+            from .polymarket_lp_orderbook import rest_event
+            with self._lock:
+                if (scope.demand.key in self._ws_eligible and self._orderbook_mode!='off'
+                        and seed_ticket[:4]==self._books.seed_ticket(scope.demand.token_id)[:4]):
+                    if result.complete and not result.error and isinstance(result.value,Mapping):
+                        if audit:self._books.reconcile(scope.demand.token_id,rest_event(result.value))
+                        elif seed_unsynced:self._books.seed(scope.demand.token_id,rest_event(result.value),seed_ticket)
+                        if audit and self._orderbook_mode=='use' and scope.demand.kind=='buy':
+                            latest=self._books.market_book(scope.demand.token_id)
+                            if latest is not None:result=replace(result,value=freeze(latest),checked_at=latest['received_at'])
         if reference and result.complete and not result.error and result.checked_at is not None:
             with self._lock:
                 if not scope.retiring and not scope.expired and self.clock()<scope.deadline:
@@ -419,6 +559,13 @@ class LPReadRuntime:
 
     def _ended(self,scope,sources):
         scope.active=False;scope.actual_end=self.clock()
+        # A book-only completion cannot heal a failed required refresh, an
+        # expired attempt, or an incomplete reward catalog using older facts.
+        scope.last_sources=None
+        if (self._orderbook_mode!='off' and scope.demand.key in self._ws_eligible and not scope.expired
+                and not scope.retiring and scope.result is not None and scope.result.complete
+                and sources and all(s.complete and not s.error for s in sources.values())):
+            scope.last_sources=freeze_sources(sources)
         # gather has collected the actual children, including response.aclose.
         # Financial and low delay faults block only while that ownership is
         # live. Their original result mailbox survives until owner collection.
@@ -473,7 +620,21 @@ class LPReadRuntime:
             result=[]
             for scope in self._scopes.values():
                 if scope.result is not None:
+                    source=scope.result.sources.get('book')
+                    if source is not None and isinstance(source.value,Mapping) and source.value.get('transport')=='ws':
+                        book=self._books.market_book(scope.demand.token_id)
+                        if (book is None or book['connection_generation']!=source.value.get('connection_generation')
+                                or scope.demand.key not in self._ws_eligible or self._orderbook_mode!='use'):
+                            sources=dict(scope.result.sources)
+                            sources['book']=replace(source,value=None,complete=False,error='ws_invalidated')
+                            scope.result=replace(scope.result,sources=freeze_sources(sources),complete=False,reason='ws_invalidated')
+                        elif self.clock()<scope.result.deadline:
+                            sources=dict(scope.result.sources)
+                            sources['book']=replace(source,value=freeze(book),checked_at=book['received_at'])
+                            scope.result=replace(scope.result,sources=freeze_sources(sources))
                     result.append(replace(scope.result,cleanup_fault=scope.result.cleanup_fault or scope.fault))
+                    if source is not None and isinstance(source.value,Mapping) and source.value.get('transport')=='ws':
+                        self._ws_delivered[scope.demand.key]=self._books.seed_ticket(scope.demand.token_id)
                     scope.result=None;scope.fault_pending=False
                 elif scope.fault_pending:
                     result.append(MarketAttempt(scope.demand,scope.attempt,scope.started,scope.deadline,
@@ -506,7 +667,8 @@ class LPReadRuntime:
             ports=[s.port for s in owned if s.port is not None and not s.closed]
             ports.extend(p for key,(p,_) in self._fixed_ports.items() if key not in self._fixed_closed)
             pools=sum(len(set(port.clients.values())) for port in ports)
-            managed=sum(s.active+sum(not t.done() for t in s.tasks)+(s.closing and not s.closed)
+            ws_tasks=(self._ws.managed_tasks() if self._ws is not None else 0)+int(self._ws_close is not None and not self._ws_close.done())
+            managed=ws_tasks+sum(s.active+sum(not t.done() for t in s.tasks)+(s.closing and not s.closed)
                 for s in self._scopes.values())+len(self._fixed_closing-self._fixed_closed)
             faults=sum(s.fault for s in self._scopes.values())+len(self._fixed_faults)
             fixed_faults=bool(self._fixed_faults) or any(s.fault and s.demand.kind not in ('buy','income') for s in self._scopes.values())
@@ -518,6 +680,7 @@ class LPReadRuntime:
                 ('cleanup_fault',fixed_faults),('capacity',len(owned)>=self.buy_cap),
                 ('deferred',bool(deferred))) if active)
             return freeze(dict(cache_entries=len(self._cache),cache_bytes=self._cache_size,
+                orderbook=dict(mode=self._orderbook_mode,shadow=self._shadow.snapshot(),pending_checks=len(self._ws_pending),wake_requests=self._ws_wake_requests,owned_tasks=ws_tasks,**self._books.status(mode=self._orderbook_mode)),
                 next_dependency_monotonic=min(dependencies) if dependencies else None,
                 waiting_for_event=not dependencies and (bool(self._fixed_faults)
                     or any(s.fault or s.retiring or s.closing for s in self._scopes.values())),
@@ -533,7 +696,7 @@ class LPReadRuntime:
                 deferred_order_ids=tuple(d.order_id for d in deferred[:64]),new_buy_allowed=len(owned)<self.buy_cap and not deferred and not fixed_faults,
                 ready_buy_count=sum(s.result is not None or s.fault_pending for s in owned),
                 ready_count=sum(s.result is not None or s.fault_pending for s in self._scopes.values()),
-                pool_count=pools,pool_limit=2*self.buy_cap+5,connection_limit=4*self.buy_cap+9,managed_tasks=managed,
+                pool_count=pools,pool_limit=2*self.buy_cap+5,connection_limit=4*self.buy_cap+9+int(self._ws_future is not None),managed_tasks=managed,
                 scopes=tuple(dict(key=s.demand.key,attempt=s.attempt,started=s.started,next_start=s.next_start,
                     active=s.active,retiring=s.retiring,cleanup_fault=s.fault) for s in self._scopes.values())))
 
