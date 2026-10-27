@@ -54,8 +54,8 @@ def read_health(auto, now):
         lane, kind, reason = (row.get(key) for key in ('lane', 'kind', 'reason'))
         since = moment(row.get('since'))
         if (lane not in ('buy', 'financial', 'exact', 'low')
-                or kind not in dict(buy=('buy',), financial=('financial',), exact=('exact',),
-                    low=('sell', 'position', 'holding', 'income', 'unknown')).get(lane, ())
+                or kind not in dict(buy=('buy','income'), financial=('financial',), exact=('exact',),
+                    low=('sell', 'position', 'holding', 'unknown')).get(lane, ())
                 or reason not in ('delayed_read_cleanup', 'port_close_failure')
                 or row.get('active') is not True or type(row.get('blocks_new_buy')) is not bool
                 or row['blocks_new_buy'] != (lane != 'buy') or since is None or since > now):

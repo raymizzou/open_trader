@@ -899,6 +899,8 @@ class PredictionExecutionService:
             self._lp._facts_validator = self._validate_lp_facts
             self._lp._facts_attention_flusher = self._auto_pool.flush_attention
         elif self._lp is not None:
+            self._lp.set_candidate_allocation_mode_reader(lambda: (
+                self._lp_d2.policy.allocation_mode if self._lp_d2.settings_status()['loaded'] else None))
             self._lp.set_candidate_buy_price_level_reader(lambda:self._lp_d2.policy.buy_price_level)
             self._lp.set_candidate_current_reservations_reader(lp_d2.candidate_current_reservations)
         self._threads: dict[str, threading.Thread] = {}
@@ -1104,6 +1106,7 @@ class PredictionExecutionService:
                     account_id=live.account_id, settings_account=self._lp_account_id(),
                     epoch=live.process_epoch, as_of=live._utc_now()))
                 observed_pools['income_gaps'] = json_value(live._income_gaps)
+                observed_pools['income_estimates'] = json_value(live._income_estimates)
                 result['observed_pools'] = observed_pools
             result['diagnostics'] = diagnostic_view('iteration', live.diagnostics)
             result['diagnostics']['rotation'] = diagnostic_view('rotation', live.rotation_diagnostics)

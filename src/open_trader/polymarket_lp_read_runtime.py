@@ -230,8 +230,8 @@ class LPReadRuntime:
                         self._scopes.pop(key,None)
                 for key,demand in sorted(self._demands.items(),key=lambda item:self._ages[item[0]]):
                     if key not in self._scopes:
-                        if demand.kind=='buy' and (sum(s.demand.kind=='buy' for s in self._scopes.values())>=self.buy_cap
-                                or any(s.demand.kind=='buy' and (s.demand.account,s.demand.order_id)==(demand.account,demand.order_id)
+                        if demand.kind in ('buy','income') and (sum(s.demand.kind in ('buy','income') for s in self._scopes.values())>=self.buy_cap
+                                or any(s.demand.kind in ('buy','income') and (s.demand.account,s.demand.order_id)==(demand.account,demand.order_id)
                                     for s in self._scopes.values())):continue
                         lane=self._control if demand.kind in ('financial','exact') else self._market
                         self._scopes[key]=_Scope(demand,lane)
@@ -435,7 +435,7 @@ class LPReadRuntime:
 
     async def _close_scope(self,scope):
         try:
-            if scope.port is not None and scope.demand.kind=='buy':await scope.port.aclose()
+            if scope.port is not None and scope.demand.kind in ('buy','income'):await scope.port.aclose()
         except BaseException:
             with self._lock:
                 scope.fault=True;scope.fault_pending=True
@@ -499,21 +499,21 @@ class LPReadRuntime:
                         continue  # actual peer completion/deadline owns admission
                     dependencies.append(scope.next_start)
             # Newly requested fixed scopes need supervisor admission first.
-            if any(key not in self._scopes and d.kind!='buy' for key,d in self._demands.items()):
+            if any(key not in self._scopes and d.kind not in ('buy','income') for key,d in self._demands.items()):
                 dependencies.append(now)
-            deferred=[d for key,d in self._demands.items() if d.kind=='buy' and key not in self._scopes]
-            owned=[s for s in self._scopes.values() if s.demand.kind=='buy']
+            deferred=[d for key,d in self._demands.items() if d.kind in ('buy','income') and key not in self._scopes]
+            owned=[s for s in self._scopes.values() if s.demand.kind in ('buy','income')]
             ports=[s.port for s in owned if s.port is not None and not s.closed]
             ports.extend(p for key,(p,_) in self._fixed_ports.items() if key not in self._fixed_closed)
             pools=sum(len(set(port.clients.values())) for port in ports)
             managed=sum(s.active+sum(not t.done() for t in s.tasks)+(s.closing and not s.closed)
                 for s in self._scopes.values())+len(self._fixed_closing-self._fixed_closed)
             faults=sum(s.fault for s in self._scopes.values())+len(self._fixed_faults)
-            fixed_faults=bool(self._fixed_faults) or any(s.fault and s.demand.kind!='buy' for s in self._scopes.values())
+            fixed_faults=bool(self._fixed_faults) or any(s.fault and s.demand.kind not in ('buy','income') for s in self._scopes.values())
             # Put blockers first so a full BUY lane cannot hide a fixed fault.
             details=[self._fixed_fault_details[name] for name in sorted(self._fixed_faults)]
             details.extend(s.fault_detail for buy in (False,True) for s in self._scopes.values()
-                if s.fault and (s.demand.kind=='buy')==buy)
+                if s.fault and (s.demand.kind in ('buy','income'))==buy)
             block_reasons=tuple(reason for reason,active in (
                 ('cleanup_fault',fixed_faults),('capacity',len(owned)>=self.buy_cap),
                 ('deferred',bool(deferred))) if active)
@@ -565,5 +565,5 @@ def _json_value(value):
 
 
 def _fixed_lane(kind):
-    if kind=='buy':return None
+    if kind in ('buy','income'):return None
     return kind if kind in ('financial','exact') else 'low'

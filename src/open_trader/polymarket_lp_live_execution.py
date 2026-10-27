@@ -365,6 +365,7 @@ class LPD2LiveExecution:
         self._async_low_sources={}
         self._pool_transfers = {}
         self._measured_unknown_since = {}
+        self._income_estimates = []
         self._income_gaps = dict(total=0, omitted=0, items=[], checked_at=None)
         self._async_income_demands=()
         self._async_income_updated=False
@@ -2192,6 +2193,7 @@ class LPD2LiveExecution:
         ranked = sorted((cid for cid, result in results.items() if result['eligible']),
             key=lambda cid: (-Decimal(str(results[cid]['result']['yield_pct_per_hour'])), cid not in income, cid))
         sized = {}
+        estimates = []
         for cid in ranked:
             if len(sized) >= 3: break
             matches = [r for r in rows if r['condition_id'] == cid]
@@ -2210,10 +2212,7 @@ class LPD2LiveExecution:
             from .polymarket_lp_risk import estimate_lp_stress_exit
             risk = estimate_lp_stress_exit(row['direction']['book'],market=market,
                 price=row['price'],quantity=quantity,bid_level=self.policy.buy_price_level)
-            if risk['state'] != 'eligible':
-                for reason in risk.get('reason_codes') or ('stress_exit_unknown',):
-                    gap(cid, reason, quantity=quantity)
-                continue
+            estimates.append(dict(condition_id=cid,quantity=quantity,stress_exit=risk))
             sized[cid] = {**row,'quantity':quantity}
         decision = select_income_results({cid:results[cid] for cid in sized}, members=tuple(sorted(members_before)))
         failed_directions = prepared.sources['direction_failures'].value
@@ -2231,6 +2230,7 @@ class LPD2LiveExecution:
 
             # Existing income stays live; trial work remains independent.
             decision = dict(members=tuple(sorted(members_before)),cancel_members=())
+        self._income_estimates = estimates
         self._income_gaps = gaps
         members = decision['members'] if local_policy.budget > 0 else tuple(sorted(income))
         if orders_accepted and not comparison_deferred and (members or sized or local_policy.budget <= 0):
@@ -2356,7 +2356,8 @@ class LPD2LiveExecution:
                     from .polymarket_lp_risk import evaluate_lp_entry
                     account = _current_account(prepared,self._utc_now())
                     evaluated = evaluate_lp_entry(row['direction'], account=account.value if account.complete else {},
-                        now=self._utc_now(),candidate=True,bid_level=policy.buy_price_level,quantity=terms.quantity)
+                        now=self._utc_now(),candidate=True,bid_level=policy.buy_price_level,quantity=terms.quantity,
+                        stress_exit_check=policy.allocation_mode != 'observed_pools')
                     if evaluated['state'] != 'eligible' or evaluated['guidance']['price'] != terms.price:
                         continue
                 targets.append(BuyTarget(row.get('venue', self.venue), row['token_id'], row['market_id'], terms))

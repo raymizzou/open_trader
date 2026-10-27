@@ -960,6 +960,7 @@ class PolymarketLPService:
         self._candidate_preparation_wakeup = None
         self.owner_lock = owner_lock
         self._mutation_guard = mutation_guard
+        self._candidate_allocation_mode_reader = None
         self._candidate_buy_price_level_reader: Callable[[], int] | None = None
         self._candidate_current_reservations_reader: Callable[[Mapping[str, object] | None], tuple[dict[str, object], ...]] | None = None
         listener = getattr(store, "set_lp_trade_change_listener", None)
@@ -2573,6 +2574,17 @@ class PolymarketLPService:
         )
         if reason is not None:
             raise ValueError(reason)
+
+    def set_candidate_allocation_mode_reader(self, reader: Callable[[], str]) -> None:
+        """Bind only the effective automatic policy; manual entry stays strict."""
+        self._candidate_allocation_mode_reader = reader
+
+    def _candidate_stress_exit_check(self):
+        reader = self._candidate_allocation_mode_reader
+        try:
+            return reader is None or reader() != 'observed_pools'
+        except Exception:
+            return True
 
     def set_candidate_buy_price_level_reader(self, reader: Callable[[], int]) -> None:
         """Use the effective persisted Auto quote level for strategy estimates."""
@@ -6480,6 +6492,7 @@ class PolymarketLPService:
                             reservations=reservations,
                             candidate=True,
                             bid_level=bid_level,
+                            stress_exit_check=self._candidate_stress_exit_check(),
                         )
                     qualified_directions.append(qualified_direction)
                     result = {
@@ -7385,6 +7398,7 @@ class PolymarketLPService:
                                 reservations=reservations,
                                 candidate=True,
                                 bid_level=bid_level,
+                                stress_exit_check=self._candidate_stress_exit_check(),
                             )
                     updated_directions.append(maintenance_direction)
                     result: dict[str, object] = {

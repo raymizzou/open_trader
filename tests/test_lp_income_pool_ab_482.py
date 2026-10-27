@@ -72,12 +72,18 @@ def test_income_gap_reports_each_skip_without_changing_selection(tmp_path, monke
                 'expired':'sample_expired','old_source':'source_not_current','missing_row':'candidate_row_missing',
                 'minimum':'below_minimum','stress':'exit_liquidity_insufficient','comparison':'comparison_deferred',
                 'bounded':'sample_unknown:reward_attribution_unknown'}[scenario]
-            assert expected in {r['reason'] for r in items}, (scenario,gaps)
+            if scenario=='stress':
+                assert expected not in {r['reason'] for r in items}
+                estimate,=state['income_estimates']
+                assert estimate['stress_exit']['reason_codes']==['exit_liquidity_insufficient']
+                assert estimate['stress_exit']['loss_ratio'] is None
+            else:
+                assert expected in {r['reason'] for r in items}, (scenario,gaps)
             assert all(r['condition_id'] and len(r['condition_id'])<=96 for r in items)
             if scenario=='bounded':
                 assert gaps['total']==25 and len(items)==20 and gaps['omitted']==5
             assert gaps['total']==len(items)+gaps['omitted']
-            if scenario=='minimum':
+            if scenario in ('minimum','stress'):
                 assert {o.key[3] for o in outcome.rotation.victims}=={'old-A'}
                 assert set(oid for batch in rig.sdk.cancels for oid in batch)=={'old-A'}
             else:

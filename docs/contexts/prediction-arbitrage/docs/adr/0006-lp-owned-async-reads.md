@@ -17,7 +17,7 @@ status: accepted
 显式手动 preview、entry、augment、cancel 保持原有新鲜身份、财务及权限校验。
 manual status 和 dashboard 只发布内存快照；重启后的命名组需显式命令核验身份，GET 不绑定组或恢复旧财务。
 
-每个当前自动或手动 BUY 有独立 attempt，最多一个实际在途。起点间隔至少 5 秒，
+每个当前自动或手动 BUY、双池收益候选各有独立 attempt，最多一个实际在途。起点间隔至少 5 秒，
 整轮必需读取共用 5 秒期限；book 每轮重读。metadata、fees、event、native 和 sponsored 奖励
 只共享已完成事实，30 秒到期刷新，保留原时间且不延长 60 秒可用期限。必要刷新失败即 UNKNOWN。
 provider/account 的真实 Retry-After、实际清理及 owner 未 ACK 均可延后下一轮，不能产生空失败。
@@ -48,7 +48,7 @@ Scheduler 此时无定时检查期限，仅等待真实完成、显式命令或�
 历史固定大小，不含账户、订单、凭证或响应内容，scope 退役后仍可观察；查询不驱动网络或状态变更。
 本修订不重建端口、不增加撤单前查询，不改变 UNKNOWN、不重放、重启或其他通道的合同。
 
-2026-10-27，#475：将 financial 的实际退出恢复边界扩展到 low 通道（sell / position / holding / income）。
+2026-10-27，#475：将 financial 的实际退出恢复边界扩展到 low 通道（sell / position / holding）。
 全部来源读取（含响应关闭）真正结束后，解除该 scope 当前的延迟清理故障；原客户端、连接池、
 起点间隔（SELL 30 秒、position 60 秒、其他 5 秒）、provider/account Retry-After 保持不变。
 原 timeout 或 fault-only 邮箱未收取前，不替换 demand 的观察身份，也不启动同 scope 新 attempt；
@@ -71,7 +71,7 @@ auto/state 通过现有 diagnostics 投影发布这些字段；monitor 的 pools
 缺失或畸形诊断保持 unknown；不覆盖致命错误、未实际运行或未确认账户身份，不改变订单和财务真值。
 
 第 5 秒封存 UNKNOWN 并取消未完请求，第 6 秒仍未实际退出则锁存 cleanup fault，
-停止该单重试并请求 exact BUY 保护撤单。独立监督线程不依赖市场 loop 的合作。
+停止该 scope 重试；仅实际 BUY 请求 exact BUY 保护撤单，收益候选读取身份不是撤单目标。独立监督线程不依赖市场 loop 的合作。
 两个 I/O loop 分别承担市场和账户/精确保护读取；局部市场 loop 阻塞时 C/O 仍可前进。
 这不构成对 GIL、操作系统停顿、DNS 或真实交易所的硬实时保证。
 
@@ -143,11 +143,13 @@ book 超过原有 10 秒 freshness 时降为 UNKNOWN；实际超时或旧身份�
 
 ## 有界资源与退出
 
-默认 BUY scope 上限 64，包含 active、retiring、cleanup fault 及未退出旧 generation。
+2026-10-27，#482：income 收益候选与 BUY 共用并发市场通道和 64 个真实 scope 上限，按首次等待年龄跨两类统一准入，不再进入串行 low 通道。仍只有两个 I/O loop 和一个期限监督线程，5 秒轮次期限、5 秒起点节奏、缓存原始时间和真实关闭边界不变。端口实际关闭前保留 retiring 容量；income 的延迟清理与 BUY 同样锁存，不能套用 low 的自动恢复。low 仅服务 sell / position / holding，其清理故障仍阻止新增 BUY 发送，但不阻止独立 income 读取；恢复读取不恢复任何财务或发送权限。
+
+默认 BUY 与 income 共用 scope 上限 64，包含两类的 active、retiring、cleanup fault 及未退出旧 generation。
 同一 exact BUY 的旧 scope 未退出前不创建替代。满额、存在 deferred 或固定通道 cleanup fault 时停止新增 BUY；
 deferred 不是失败，不宣称已覆盖。按等待年龄准入，保留所有未结束实际所有者。
 
-每 BUY 最多 4 个来源分支，两池 Gamma 1 + CLOB 3。固定 O 两池/3连接、C 一池/2连接、
+每 BUY 或 income 最多 4 个来源分支，两池 Gamma 1 + CLOB 3。固定 O 两池/3连接、C 一池/2连接、
 低频两池/4连接；总池数 ≤2B+5，连接 ≤4B+9，受管 async task ≤8B+32。
 低频同刻先 position 后 SELL；C 的 fills 与其他精确读取分别保留服务机会。
 completed reference cache 为 LRU，最多 256 条/8 MiB 编码值。解压后 response ≤4 MiB，

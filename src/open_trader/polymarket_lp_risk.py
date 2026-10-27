@@ -962,6 +962,7 @@ def evaluate_lp_entry(
     bid_level: int = 1,
     _account_observed_at: datetime | None = None,
     quantity: Decimal | None = None,
+    stress_exit_check: bool = True,
 ) -> dict[str, object]:
     """Return a manual LP entry guide when current input facts pass risk checks."""
 
@@ -1166,7 +1167,7 @@ def evaluate_lp_entry(
         quantity=quantity,
         bid_level=bid_level,
     )
-    if stress["state"] != "eligible":
+    if stress_exit_check is not False and stress["state"] != "eligible":
         return {"state": stress["state"], "reason_codes": list(stress["reason_codes"]), "guidance": None}
     guidance: dict[str, object] = {
         key: market.get(key)
@@ -1184,6 +1185,7 @@ def evaluate_lp_entry(
             "required_capital": capital,
             "minimum_order_size": minimum,
             "reward_min_size": reward_minimum,
+            "stress_exit": stress,
             "estimated_exit_loss": stress["net_loss"],
             "estimated_exit_loss_ratio": stress["loss_ratio"],
             "checked_at": checked_at.isoformat(timespec="microseconds").replace("+00:00", "Z"),
