@@ -349,6 +349,8 @@ class ProtectionBaseline:
     registered_at: datetime
     threshold: Decimal
     source: SourceStamp
+    bid_level: int | None = None
+    bid_levels: tuple[tuple[Decimal, Decimal], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1062,14 +1064,20 @@ class CurrentLPState:
             version = g.expected_scope_version + 1
             if isinstance(update, SetBaseline):
                 b = update.baseline
-                if (b.key != g.scope or b.baseline_price != b.key.price or b.threshold != Decimal('0.5')
+                if (b.key != g.scope or b.baseline_price != b.key.price
+                        or (b.bid_level is not None and (type(b.bid_level) is not int or b.bid_level < 1))
+                        or (b.bid_levels and (b.bid_level != len(b.bid_levels)
+                            or b.bid_levels[-1][0] != b.baseline_price
+                            or any(not p.is_finite() or not q.is_finite() or not 0 < p <= 1 or q < 0 for p,q in b.bid_levels)
+                            or any(a[0] <= c[0] for a,c in zip(b.bid_levels,b.bid_levels[1:]))))
                         or (b.baseline_front.state == 'known' and (b.baseline_front.value is None
                             or b.baseline_front.value < 0 or b.source.state != 'known'))
                         or not b.anchor_order_ids or b.baseline_source not in ('submit', 'account_sync', 'first_observation')
                         or any(not any(k[3] == oid and self._orders[k].side == 'BUY' for k, _ in g.expected_order_terms_versions)
                             for oid in b.anchor_order_ids)):
                     return 'invalid_identity'
-                if b.key in self._baselines and self._baselines[b.key].baseline_front.state == 'known':
+                old = self._baselines.get(b.key)
+                if old and (old.bid_levels or old.bid_level is not None and b.bid_level != old.bid_level):
                     return 'stale'
                 self._baselines[b.key] = b
             elif isinstance(update, QueueProgressUpdate):

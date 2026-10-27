@@ -33,7 +33,7 @@ from .polymarket_lp_current_state import (
 )
 from .polymarket_lp_market_calculation import CalculationPolicy, calculate_current, select_current_composition
 from .polymarket_lp_market_reader import MarketReader, ReadScope, freeze
-from .polymarket_lp_risk import (estimate_lp_queue_position, first_observation_baseline,
+from .polymarket_lp_risk import (evaluate_lp_bid_levels,
     passive_exit_price, passive_cost_floor, _executable_bid_value, _projected_taker_fee, _freshness, _levels, _maybe_decimal, TERMINAL_ORDER_STATES)
 from .polymarket_lp import SCORING_POLL_SECONDS, SCORING_STALE_SECONDS, SCORING_FAILURE_WINDOW_SECONDS
 from .polymarket_lp_round import (
@@ -1044,17 +1044,6 @@ class LPD2LiveExecution:
                 self._manual_groups[command['session_id']] = (scope, MappingProxyType(dict(command)))
             self._opening_order_associations[order_key] = _OpeningOrderAssociation(scope,order_key,command['request_id'],
                 record.observation_id,stamp,requested_at=record.requested_at)
-            book = source.value.get('book') if source and source.complete and not source.error else None
-            if not isinstance(book,Mapping):
-                return
-            baseline = first_observation_baseline(book,price=order.price.value,own_remaining=Decimal(0))
-            if baseline['state'] != 'known':
-                return
-            key = ProtectionKey('queue_bucket',scope,order.price.value,None)
-            book_stamp = self._source_stamp(source)
-            fact = ProtectionBaseline(key,(order_key[3],),order.price.value,Fact('known',baseline['baseline_front'],(book_stamp,)),
-                'submit',book.get('received_at'),book.get('timestamp'),book.get('hash'),1,record.requested_at,Decimal('.5'),book_stamp)
-            self.state.apply_protection(SetBaseline(self._protection_guard(self.state.snapshot(),key,(order,)),fact))
 
     def bind_mutation_admission(self, owner, acquire):
         if self._mutation_owner is not None or not callable(acquire):
@@ -1755,7 +1744,7 @@ class LPD2LiveExecution:
                 captured_candidates, as_of, attempted_at, capture_failed=capture_failed)
             if start.status != StartStatus.BATCH:
                 return RunResult(accepted, start, selection=selection)
-            self._sealed_candidates = {(start.token.batch_id, a.request_id): row
+            self._sealed_candidates = {(start.token.batch_id, a.request_id): {**row, 'protection_bid_level': plan_policy.buy_price_level}
                 for a in start.token.actions if isinstance(a.target, BuyTarget)
                 for row in prepared.sources['candidates'].value
                 if not row.get('existing') and (row['condition_id'], row['token_id']) in selection.new_target_keys
@@ -3291,23 +3280,23 @@ class LPD2LiveExecution:
         source = self._sealed_candidate_sources.get(
             f'{record.condition_id}:{record.token_id}', self._sealed_candidate_source)
         book = row.get('direction', {}).get('book')
-        if (source is None or not source.complete or source.error or not isinstance(book, Mapping)
-                or book.get('condition_id') != record.condition_id or book.get('token_id') != record.token_id):
-            return
-        baseline = first_observation_baseline(book, price=record.price, own_remaining=Decimal(0))
-        if baseline['state'] != 'known':
-            return
+        if (source is None or not source.complete or source.error):
+            book = None
+        baseline = evaluate_lp_bid_levels(book, price=record.price, own_remaining=Decimal(0),
+            bid_level=row['protection_bid_level'], condition_id=record.condition_id, token_id=record.token_id)
         with self.state._lock:
             snapshot = self.state.snapshot()
             order = next(o for o in snapshot.orders if o.key == order_key)
             scope = (self.account_id, record.condition_id, record.token_id, self.process_epoch)
             key = ProtectionKey('queue_bucket', scope, record.price, None)
-            stamp = SourceStamp(source.source_id, checked_at=source.checked_at,
-                source_timestamp=book.get('timestamp'), complete=True, state='known')
+            stamp = SourceStamp(source.source_id if source else '', checked_at=source.checked_at if source else None,
+                source_timestamp=book.get('timestamp') if book else None, complete=bool(source and source.complete),
+                state='known' if baseline['state'] != 'unknown' else 'unknown')
             fact = ProtectionBaseline(key, (order_key[3],), record.price,
-                Fact('known', baseline['baseline_front'], (stamp,)), 'submit',
-                book.get('received_at'), book.get('timestamp'), book.get('hash'), 1,
-                self._utc_now(), Decimal('.5'), stamp)
+                Fact('known', baseline['front_estimate'], (stamp,)) if baseline['state'] != 'unknown' else Fact('unknown', sources=(stamp,)), 'submit',
+                book.get('received_at') if book else None, book.get('timestamp') if book else None, book.get('hash') if book else None, 1,
+                self._utc_now(), Decimal('.5'), stamp, row['protection_bid_level'],
+                baseline['bid_levels'] if baseline['state'] == 'monitoring' else ())
             self.state.apply_protection(SetBaseline(self._protection_guard(snapshot, key, (order,)), fact))
 
     def _register_opening(self, order_key):
@@ -4181,7 +4170,7 @@ class LPD2LiveExecution:
             if disposition != 'applied':
                 raise ValueError('protection_cancel_completion_not_applied:' + disposition)
 
-    def _register_first_seen(self, snapshot):
+    def _register_first_seen(self, snapshot, roles):
         observation = snapshot.observation
         buckets = {}
         for order in snapshot.active_orders:
@@ -4192,7 +4181,7 @@ class LPD2LiveExecution:
             ids = {o.key[3] for o in orders}
             existing = tuple(b for b in current.baselines.values() if b.key.scope[:3] == identity
                 and b.key.price == price and ids.intersection(b.anchor_order_ids))
-            if any(b.key.kind == 'queue_bucket' or b.baseline_front.state == 'known' for b in existing):
+            if any(b.bid_levels for b in existing):
                 continue
             old = next(iter(existing), None)
             key = old.key if old else ProtectionKey('first_seen_episode', (*identity, self.process_epoch),
@@ -4203,15 +4192,19 @@ class LPD2LiveExecution:
                 and isinstance(source.value, Mapping) else None)
             if isinstance(book, Mapping) and (book.get('condition_id') != identity[1] or book.get('token_id') != identity[2]):
                 book = None
-            result = first_observation_baseline(book, price=price,
-                own_remaining=sum((o.remaining.value for o in orders), Decimal(0)))
+            level = old.bid_level if old else (self.policy.buy_price_level
+                if any(self._managed_pool_role(current, o, roles.get(identity[1], {})) for o in orders) else None)
+            result = evaluate_lp_bid_levels(book, price=price,
+                own_remaining=sum((o.remaining.value for o in orders), Decimal(0)),
+                bid_level=level, condition_id=identity[1], token_id=identity[2])
             stamp = SourceStamp(source.source_id if source else '', checked_at=source.checked_at if source else None,
-                complete=bool(source and source.complete), state='known' if result['state'] == 'known' else 'unknown')
-            front = Fact('known', result['baseline_front'], (stamp,)) if result['state'] == 'known' else Fact('unknown', sources=(stamp,))
+                complete=bool(source and source.complete), state='known' if result['state'] != 'unknown' else 'unknown')
+            front = Fact('known', result['front_estimate'], (stamp,)) if result['state'] != 'unknown' else Fact('unknown', sources=(stamp,))
             baseline = ProtectionBaseline(key, old.anchor_order_ids if old else (orders[0].key[3],), price,
-                front, 'first_observation', result['baseline_book_received_at'],
-                book.get('timestamp') if book else None, result['baseline_book_hash'],
-                current.scope_versions.get(key, 0)+1, old.registered_at if old else self._utc_now(), Decimal('.5'), stamp)
+                front, 'first_observation', book.get('received_at') if book else None,
+                book.get('timestamp') if book else None, book.get('hash') if book else None,
+                current.scope_versions.get(key, 0)+1, old.registered_at if old else self._utc_now(), Decimal('.5'), stamp,
+                result['bid_level'], result['bid_levels'] if result['state'] == 'monitoring' else ())
             self.state.apply_protection(SetBaseline(
                 self._protection_guard(current, key, orders, observation=True), baseline))
 
@@ -4285,11 +4278,10 @@ class LPD2LiveExecution:
         return (reason == 'measured_yield_unknown_timeout' and role == 'trial'
             and since is not None and self._clock()-since >= 600 and not self._usable_pool_sample(order, sample))
 
-    def _evaluate_pool_buy_protection(self):
+    def _evaluate_pool_buy_protection(self, roles):
         attempts = []
         if self.policy.allocation_mode != 'observed_pools':
             return attempts
-        roles = self.store.lp_load_observed_pool_roles(self._settings_account())['roles']
         observations = self.store.lp_observations(self._settings_account())
         snapshot = self.state.snapshot()
         self._measured_unknown_since = {key: since for key, since in self._measured_unknown_since.items()
@@ -4371,7 +4363,9 @@ class LPD2LiveExecution:
             if self._refresh_protection_evidence(deadline):
                 self._record_protection_status(entered=True, disposition='skipped', skip_reason='observation_invalidated')
                 return ()  # receipts invalidate the old observation; ordinary reader supplies the next one
-            self._register_first_seen(snapshot)
+            roles = (self.store.lp_load_observed_pool_roles(self._settings_account())['roles']
+                if self.policy.allocation_mode == 'observed_pools' else {})
+            self._register_first_seen(snapshot, roles)
             snapshot = self.state.snapshot()
             attempts = [*read_attempts,*self._dispatch_protection_cancels()]
             if not self._protection_frame_current(snapshot):
@@ -4393,11 +4387,10 @@ class LPD2LiveExecution:
                     observation.source_frame.sources.get(f'market:{key.scope[1]}:{key.scope[2]}'))
                 book = (source.value.get('book') if source and source.complete and not source.error
                     and isinstance(source.value, Mapping) else None)
-                estimate = estimate_lp_queue_position(book, price=key.price,
+                estimate = evaluate_lp_bid_levels(book, price=key.price,
                     own_remaining=sum((o.remaining.value for o in orders), Decimal(0)),
-                    baseline_front=baseline.baseline_front.value, condition_id=key.scope[1], token_id=key.scope[2]) if baseline.baseline_front.state == 'known' else dict(
-                        state='unknown', front_estimate=None, level_total=None, ratio=None,
-                        reason_codes=('baseline_unknown',), data_time=book.get('received_at') if book else None)
+                    bid_level=baseline.bid_level, baseline_levels=baseline.bid_levels,
+                    condition_id=key.scope[1], token_id=key.scope[2])
                 stamp = SourceStamp(source.source_id if source else '',
                     checked_at=source.checked_at if source else None,
                     complete=bool(source and source.complete), state='known' if book else 'unknown')
@@ -4408,7 +4401,9 @@ class LPD2LiveExecution:
                 old_failure = current.failure_states.get(failure_scope)
                 evaluation_id = source.source_id if source and source.source_id else observation.observation_id
                 fresh_failure = (source is not None and bool(source.source_id) and source.failed_at is not None
-                    and source.failed_at >= observation.read_ticket.started_at)
+                    and source.failed_at >= observation.read_ticket.started_at) or (
+                        source is not None and bool(source.source_id) and source.complete and not source.error
+                        and source.checked_at is not None and source.checked_at >= observation.read_ticket.started_at)
                 count = old_failure.data_failures if old_failure else 0
                 if old_failure and old_failure.last_evaluation_id == evaluation_id:
                     failure = old_failure
@@ -4426,7 +4421,7 @@ class LPD2LiveExecution:
                 if disposition != 'applied':
                     continue
                 if triggered:
-                    reason = 'queue_data_failure_limit' if failure.data_failures >= 10 else 'queue_threshold'
+                    reason = 'queue_data_failure_limit' if failure.data_failures >= 10 else 'bid_level_changed'
                     self._deferred_protection_cancels[key] = tuple(_DeferredProtectionCancel(
                         order, observation.observation_id, reason) for order in orders)
                     attempts.extend(self._dispatch_protection_cancels())
@@ -4455,7 +4450,7 @@ class LPD2LiveExecution:
                         continue
                 attempts.append(self.cancel_independent(order_key,
                     protection_key=key, reason='buy_yield_unknown_timeout'))
-            attempts.extend(self._evaluate_pool_buy_protection())
+            attempts.extend(self._evaluate_pool_buy_protection(roles))
             self._evaluate_scoring(deadline)
             for scope in tuple(self.state.snapshot().openings):
                 attempts.extend(self._evaluate_opening(scope))

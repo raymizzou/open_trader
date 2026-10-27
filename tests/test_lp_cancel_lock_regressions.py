@@ -436,8 +436,8 @@ def test_recorded_cancel_denial_keeps_actual_gate_reason(tmp_path, monkeypatch, 
             if r['request_id'] == handle.identity.request_id]
         assert detail['reason'] == expected
         if gate == 'protection_origin':
-            assert detail['trigger_reason'] == 'queue_threshold'
-            assert diagnostic['protection']['cancel_outcomes']['queue_threshold']['not_sent'] == 1
+            assert detail['trigger_reason'] == 'bid_level_changed'
+            assert diagnostic['protection']['cancel_outcomes']['bid_level_changed']['not_sent'] == 1
         else:
             rotation = diagnostic['rotation']['outcomes']
             assert rotation['reason_counts'] == {expected: 1}

@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-27 — Fixed BUY bid-level protection (#486)
+
+- Protect automatic trial/income BUYs and web-manual BUYs against any price or quantity change in bids 1 through their fixed entry level, including the order level. Exclude known own remaining quantity from public depth; cancel through the existing exact-order channel with `bid_level_changed`, without a percentage threshold or cooldown.
+- Keep the automatic submission level and first baseline immutable. Recover missing baselines once; recovered managed automatic orders use the current configured level, while manual or unclassified orders use their first observed rank. Unreadable or missing-price books stay UNKNOWN until ten distinct consecutive failures; partial-fill protection and buy-one/buy-two settings remain unchanged. No deployment is included.
+
 ## 2026-10-27 — Observed-pool stress estimates and concurrent income reads (#482 C+D)
 
 - Keep stress-exit estimates and their unknown/insufficient-depth reasons visible, while automatic observed-pool trial and income candidates bypass only that rejection gate, including producer maintenance and final full-quantity checks. Manual and single-pool entries remain strict. Preserve other entry guards, budgets and fixed 50/30/20 weights.

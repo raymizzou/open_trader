@@ -574,7 +574,7 @@ def test_all_uncertain_buy_results_invalidate_financial_authority(tmp_path, monk
 
 
 def _d2_protection_runtime(tmp_path, monkeypatch, *, quantity='2000', submit=True,
-                           budget='10000', bid='.30', ask='.32'):
+                           budget='10000', bid='.30', ask='.32', upper_bids=(), buy_level=1, submit_snapshot_missing=False, depth='10000'):
     """Actual D2 components with only SDK responses and business time controlled."""
     from datetime import timedelta
     from types import SimpleNamespace
@@ -597,9 +597,10 @@ def _d2_protection_runtime(tmp_path, monkeypatch, *, quantity='2000', submit=Tru
     bid_value, ask_value = Decimal(bid), Decimal(ask)
     class Public(_SDKPublicClient):
         level, bid, ask, reward, failed, reward_unknown = (
-            Decimal('10000'), bid_value, ask_value, Decimal('24'), False, False
+            Decimal(depth), bid_value, ask_value, Decimal('24'), False, False
         )
         book_reads = 0
+        extra_bids = upper_bids
         def get_order_book(self, *, token_id):
             self.book_reads += 1
             if self.failed:
@@ -607,7 +608,9 @@ def _d2_protection_runtime(tmp_path, monkeypatch, *, quantity='2000', submit=Tru
                 raise Unavailable('offline current book unavailable')
             return super().get_order_book(token_id=token_id).model_copy(update={
                 'timestamp': BusinessDateTime.now(UTC),
-                'bids': (OrderBookLevel(price=self.bid, size=self.level),),
+                'bids': tuple(OrderBookLevel(price=Decimal(p), size=Decimal(q)) for p,q in self.extra_bids)
+                    + (OrderBookLevel(price=self.bid, size=self.level + sum((o.original_size-o.size_matched
+                        for o in sdk.orders if o.side == 'BUY' and o.price == self.bid), Decimal(0))),),
                 'asks': (OrderBookLevel(price=self.ask, size=Decimal('10000')),),
             })
         def list_market_rewards(self, *, condition_id, sponsored):
@@ -638,12 +641,14 @@ def _d2_protection_runtime(tmp_path, monkeypatch, *, quantity='2000', submit=Tru
     store = PredictionArbitrageStore(tmp_path)
     seed_running(store)
     live = LPD2LiveExecution(store, adapter, account_id=WALLET, venue='polymarket',
-        process_epoch='protection-epoch', policy=CalculationPolicy(Decimal(budget), 1),
+        process_epoch='protection-epoch', policy=CalculationPolicy(Decimal(budget), 1, buy_price_level=buy_level),
         clock=lambda: clock[0], utc_now=lambda: BusinessDateTime.now(UTC))
     live.initialize(ValidatedStartAdmission('protection-epoch', 'offline-permit'))
     live.run_once()  # actual round0 empty cleanup, never seed peer internals
     if submit:
         book = adapter.lp_order_books((TOKEN_ID,))[TOKEN_ID]
+        if submit_snapshot_missing:
+            book = {**book, 'received_at': None}
         captured = polymarket_lp_market_reader.SourceResult('pre-submit-current-book', (
             dict(condition_id=CONDITION_ID, market_id='market-1', token_id=TOKEN_ID,
                 venue='polymarket', price=Decimal(bid), quantity=Decimal(quantity),
@@ -658,7 +663,8 @@ def _d2_protection_runtime(tmp_path, monkeypatch, *, quantity='2000', submit=Tru
 def test_d2_queue_protection_cancels_exact_price_bucket_once(tmp_path, monkeypatch):
     from threading import Event, Condition
     from tests.test_lp_order_registration_contract import _open_order
-    live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch)
+    live, sdk, public, clock = _d2_protection_runtime(tmp_path, monkeypatch,
+        upper_bids=(('.31','100'),), buy_level=2)
     entered, release = Event(), Event()
     changed = Condition()
     def cancel(*, order_ids):
@@ -678,22 +684,22 @@ def test_d2_queue_protection_cancels_exact_price_bucket_once(tmp_path, monkeypat
         baseline = next(b for k,b in snap.baselines.items() if k.kind == 'queue_bucket')
         progress = snap.progress[baseline.key]
         assert baseline.baseline_front.value == 10000 and baseline.baseline_source == 'submit'
-        assert progress.front_estimate.value == 8000 and progress.level_total.value == 10000
-        assert progress.ratio.value == Decimal('.80') and sdk.cancels == []
+        assert progress.front_estimate.value == 10000 and progress.level_total.value == 12000
+        assert progress.ratio.value == Decimal('10000')/Decimal('12000') and sdk.cancels == []
         assert baseline.source.checked_at <= progress.data_time
         assert before == (sdk.balance_reads, sdk.order_reads, sdk.position_reads, public.book_reads)
         sdk.orders += (_open_order('manual-peer', 'BUY', price='.30', original='500'),
             _open_order('other-price', 'BUY', price='.29', original='100'),
             _open_order('sell-inventory', 'SELL', price='.30', original='100'))
-        public.level = Decimal('5000')
+        public.extra_bids = (('.315','100'),)
         live.run_once()
         before = (sdk.order_reads, public.book_reads)
         attempts = live.run_protection_once()
         assert entered.wait(2)
         snap = live.state.snapshot()
         progress = snap.progress[baseline.key]
-        assert progress.front_estimate.value == 2500 and progress.level_total.value == 5000
-        assert progress.ratio.value == Decimal('.50')
+        assert progress.front_estimate.value == 10000 and progress.level_total.value == 12500
+        assert progress.ratio.value == Decimal('.80')
         assert {t.order_key[3] for t in progress.cancel_targets} == {'entry-A', 'manual-peer'}
         assert {oid for ids in sdk.cancels for oid in ids} <= {'entry-A', 'manual-peer'}
         assert before == (sdk.order_reads, public.book_reads)
@@ -809,10 +815,10 @@ def test_d2_first_seen_baseline_and_cancel_scope_remain_current(tmp_path, monkey
         live.run_protection_once()
         snapshot = live.state.snapshot()
         baseline = snapshot.baselines[first.key]
-        assert baseline.baseline_front.value == 8000 and baseline.baseline_source == 'first_observation'
+        assert baseline.baseline_front.value == 10000 and baseline.baseline_source == 'first_observation'
         assert baseline.baseline_book_received_at == valid.acceptance.observation.source_frame.sources[
             'market:'+first.key.scope[1]+':'+first.key.scope[2]].value['book']['received_at']
-        assert snapshot.progress[first.key].ratio.value == Decimal('.80')
+        assert snapshot.progress[first.key].ratio.value == Decimal('10000')/Decimal('12000')
         failure = snapshot.failure_states[first.key]
         assert failure.scope_kind == 'first_seen_episode' and failure.scope_id == first.key
         assert first.key.scope not in snapshot.failure_states  # no queue-group counter alias
@@ -838,8 +844,8 @@ def test_d2_first_seen_baseline_and_cancel_scope_remain_current(tmp_path, monkey
         snapshot = live.state.snapshot()
         assert snapshot.baselines[first.key] is baseline  # never renew the original baseline
         progress = snapshot.progress[first.key]
-        assert progress.front_estimate.value == 8000 and progress.level_total.value == 16000
-        assert progress.ratio.value == Decimal('.50')
+        assert progress.front_estimate.value == 16000 and progress.level_total.value == 18500
+        assert progress.ratio.value == Decimal('16000')/Decimal('18500')
         assert progress.data_time == accepted.acceptance.observation.source_frame.sources[
             'market:'+first.key.scope[1]+':'+first.key.scope[2]].value['book']['received_at']
         assert sorted(oid for ids in sdk.cancels for oid in ids) == ['manual-anchor', 'manual-peer']
@@ -2151,8 +2157,8 @@ def test_d2_deferred_manual_anchor_proof_is_not_gated_by_prior_dispatch(tmp_path
         assert live.run_protection_once() == ()
         snapshot = live.state.snapshot()
         progress = snapshot.progress[baseline.key]
-        assert progress.state == 'triggered' and progress.front_estimate.value == Decimal('1400')
-        assert progress.level_total.value == Decimal('4000') and progress.ratio.value == Decimal('.35')
+        assert progress.state == 'triggered' and progress.front_estimate.value == Decimal('4000')
+        assert progress.level_total.value == Decimal('6600') and progress.ratio.value == Decimal('4000')/Decimal('6600')
         assert progress.cancel_targets == () and set(sent()) == set(releases)
         assert snapshot.openings == {} and snapshot.own_fills == {} and sdk.posts == []
         # The external API, not an own cancel request, supplies the terminal fact.
