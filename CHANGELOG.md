@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-27 — SIGTERM test readiness identity
+
+- Let the SIGTERM test child bind its own ephemeral port and verify the actual child PID and runtime health before signaling. Preserve real clean exit, STOPPED marker, owner-lock release and the existing startup/shutdown watchdogs when another process is listening.
+
 ## 2026-10-27 — Observed-pool test clock
 
 - Seed the shared observed-pool fixture at a fixed UTC business time so unrelated pool tests remain independent of the daily review cutoff. Preserve mutable clock advances, expiry boundary checks and the real minimum-expiration rejection guard.

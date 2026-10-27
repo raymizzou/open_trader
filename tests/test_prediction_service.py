@@ -11972,14 +11972,14 @@ def test_sigterm_stops_prediction_runtime_and_releases_its_lock(
 ) -> None:
     lock_path = tmp_path / "prediction_arbitrage" / "runtime.lock"
     marker = tmp_path / "stopped"
+    bound_report = tmp_path / "service-bound.json"
     release_manifest = (
         Path(__file__).resolve().parents[1] / "ops" / "prediction-service-release.json"
     )
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
     script = f'''\
 from pathlib import Path
+import json
+import os
 import time
 # Deliberately exceed the old total startup budget before loading the service.
 time.sleep({startup_delay})
@@ -11988,6 +11988,7 @@ import open_trader.prediction_service as service
 
 data_dir = Path({str(tmp_path)!r})
 marker = Path({str(marker)!r})
+bound_report = Path({str(bound_report)!r})
 
 class FakeRuntime:
     def __init__(self, **kwargs):
@@ -12009,11 +12010,21 @@ class FakeRuntime:
         self._lock.release()
         marker.write_text("stopped", encoding="utf-8")
 
+native_create_server = service.create_prediction_server
+def observe_bound_server(**kwargs):
+    server = native_create_server(**kwargs)
+    host, port = server.server_address[:2]
+    temporary = bound_report.with_suffix(".tmp")
+    temporary.write_text(json.dumps(dict(pid=os.getpid(), host=host, port=port)), encoding="utf-8")
+    temporary.replace(bound_report)
+    return server
+
+service.create_prediction_server = observe_bound_server
 service.PredictionRuntime = FakeRuntime
 raise SystemExit(service.serve_prediction_service(
     data_dir=data_dir,
     prediction_config_path=data_dir / "prediction.json",
-    port={port},
+    port=0,
     mode={mode!r},
     release_manifest_path=Path({str(release_manifest)!r}),
 ))
@@ -12027,18 +12038,29 @@ raise SystemExit(service.serve_prediction_service(
         },
     )
     try:
-        # Initial bind includes cold Python imports; behavior budgets start after it.
+        # The child owns its OS-assigned port; a foreign listener cannot signal readiness.
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise AssertionError(f"service exited before binding: exit={process.returncode}")
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                    break
-            except OSError:
-                time.sleep(0.05)
+            if bound_report.exists():
+                bound = json.loads(bound_report.read_text(encoding="utf-8"))
+                assert bound["pid"] == process.pid, bound
+                try:
+                    status, health = _response(
+                        f"http://{bound['host']}:{bound['port']}/healthz", timeout=0.1
+                    )
+                except OSError:
+                    pass
+                else:
+                    if status == 200 and health.get("pid") == process.pid:
+                        assert health["runtime_state"] == "RUNNING"
+                        assert health["mode"] == mode
+                        assert health["production_owner"] is (mode == "production")
+                        break
+            time.sleep(0.05)
         else:
-            raise AssertionError(f"service did not bind within 30s: exit={process.poll()}")
+            raise AssertionError(f"owned service health not ready within 30s: exit={process.poll()}")
         process.terminate()
         assert process.wait(timeout=5) == 0
     finally:
