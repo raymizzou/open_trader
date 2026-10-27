@@ -1185,13 +1185,14 @@ def evaluate_lp_entry(
             "required_capital": capital,
             "minimum_order_size": minimum,
             "reward_min_size": reward_minimum,
-            "stress_exit": stress,
             "estimated_exit_loss": stress["net_loss"],
             "estimated_exit_loss_ratio": stress["loss_ratio"],
             "checked_at": checked_at.isoformat(timespec="microseconds").replace("+00:00", "Z"),
             "expires_at": expires_at.isoformat(timespec="microseconds").replace("+00:00", "Z"),
         }
     )
+    if stress_exit_check is False:
+        guidance["stress_exit"] = stress
     if bid_level != 1:
         guidance["bid_level"] = bid_level
     return {

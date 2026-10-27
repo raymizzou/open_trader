@@ -3,6 +3,7 @@
 ## 2026-10-27 — Observed-pool stress estimates and concurrent income reads (#482 C+D)
 
 - Keep stress-exit estimates and their unknown/insufficient-depth reasons visible, while automatic observed-pool trial and income candidates bypass only that rejection gate, including producer maintenance and final full-quantity checks. Manual and single-pool entries remain strict. Preserve other entry guards, budgets and fixed 50/30/20 weights.
+- Preserve the historical guidance payload for default and enforced entry checks. Include detailed stress-exit diagnostics only for an explicit observed-pool bypass; keep the existing loss and loss-ratio display fields in both paths.
 - Read income candidates concurrently with BUYs under the same 64-scope limit and first-waited admission, including retiring resources. Keep the two I/O loops, five-second deadline/cadence, source timestamps, physical close ownership and BUY-style income cleanup latches. Low-lane faults still block new BUY sends while income reads proceed. Update ADRs for A+B+C+D; no deployment is included.
 
 ## 2026-10-27 — Observed-pool review repairs (#482 A+B)
