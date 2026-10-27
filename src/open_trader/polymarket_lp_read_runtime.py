@@ -17,6 +17,7 @@ REFERENCE_CACHE_BYTES = 8*1024*1024
 FINANCIAL_WAIT_BYTES = 16*1024
 FINANCIAL_WAIT_FRAMES = 16
 FINANCIAL_WAIT_LINKS = 64
+CLEANUP_FAULT_ITEMS = 16
 _FINANCIAL_SOURCES = ('balance', 'open_orders', 'positions')
 
 
@@ -132,6 +133,7 @@ class _Scope:
         self.started=self.deadline=0;self.actual_end=None;self.expired=False;self.cancel_sent=False;self.fault=False;self.fault_pending=False
         self.financial_cleanup_delayed=False
         self.financial_wait_capture=None
+        self.fault_detail=None
 
 class LPReadRuntime:
     def __init__(self, source_factory, *, clock=time.monotonic, utc_now=lambda:datetime.now(UTC), buy_cap=BUY_SCOPE_CAP,
@@ -139,6 +141,7 @@ class LPReadRuntime:
         self.source_factory=source_factory;self.clock=clock;self.utc_now=utc_now
         self.buy_cap=buy_cap;self.cache_entries=cache_entries;self.cache_bytes=cache_bytes;self._cache=OrderedDict();self._cache_size=0;self._lock=threading.RLock();self._scopes={};self._demands={}
         self._fixed_ports={};self._fixed_closing=set();self._fixed_closed=set();self._fixed_faults=set()
+        self._fixed_kinds={};self._fixed_fault_details={}
         self._ages={};self._age_sequence=0
         # Runtime-lifetime identity, independent of scope retirement. One
         # scalar avoids retaining an unbounded ledger of departed order keys.
@@ -210,6 +213,8 @@ class LPReadRuntime:
                             scope.lane.loop.call_soon_threadsafe(self._cancel_children,scope)
                     if scope.active and scope.cancel_sent and self.clock()>=scope.deadline+1 and not scope.fault:
                         scope.fault=True;scope.fault_pending=True
+                        scope.fault_detail=self._fault_detail(_fixed_lane(scope.demand.kind) or 'buy',
+                            scope.demand.kind,'delayed_read_cleanup')
                         if scope.result is not None:
                             scope.result=replace(scope.result,cleanup_fault=True)
                         if scope.demand.kind=='financial':
@@ -234,10 +239,10 @@ class LPReadRuntime:
                         0 if s.demand.kind=='position' else 1,self._ages.get(s.demand.key,0))):
                     updated=self._demands.get(scope.demand.key)
                     if (updated is not None and not scope.active and scope.result is None
-                            and not (scope.demand.kind=='financial' and scope.fault_pending)):
+                            and not (_fixed_lane(scope.demand.kind) in ('financial','low') and scope.fault_pending)):
                         scope.demand=updated
                     if (not scope.retiring and not scope.fault and not scope.active and scope.result is None
-                            and not (scope.demand.kind=='financial' and scope.fault_pending)
+                            and not (_fixed_lane(scope.demand.kind) in ('financial','low') and scope.fault_pending)
                             and self.clock()>=scope.next_start):
                         kind=scope.demand.kind
                         lane=_fixed_lane(kind)
@@ -375,6 +380,7 @@ class LPReadRuntime:
                             scope.port=self.source_factory(scope.demand)
                             self._fixed_ports[fixed]=(scope.port,scope.lane)
                         else:scope.port=owned[0]
+                        self._fixed_kinds[fixed]=scope.demand.kind
                 else:scope.port=self.source_factory(scope.demand)
             d=scope.demand
             scope.tasks=tuple(OwnedReadTask(self._read_source(scope,source,SourceRequest(source,d.account,
@@ -414,11 +420,13 @@ class LPReadRuntime:
     def _ended(self,scope,sources):
         scope.active=False;scope.actual_end=self.clock()
         # gather has collected the actual children, including response.aclose.
-        # Financial delay faults block only while that ownership remains live;
-        # their mailbox and bounded history survive until the owner collects.
-        # Port-close failures and other lanes retain their existing semantics.
+        # Financial and low delay faults block only while that ownership is
+        # live. Their original result mailbox survives until owner collection.
+        # BUY, exact and port-close faults retain their existing semantics.
+        if _fixed_lane(scope.demand.kind)=='low':
+            scope.fault=False;scope.fault_detail=None
         if scope.financial_cleanup_delayed:
-            scope.fault=False;scope.financial_cleanup_delayed=False
+            scope.fault=False;scope.financial_cleanup_delayed=False;scope.fault_detail=None
             if self._last_financial_cleanup_fault['attempt']==scope.attempt:
                 self._last_financial_cleanup_fault=dict(self._last_financial_cleanup_fault,
                     ended_monotonic=scope.actual_end)
@@ -429,7 +437,9 @@ class LPReadRuntime:
         try:
             if scope.port is not None and scope.demand.kind=='buy':await scope.port.aclose()
         except BaseException:
-            with self._lock:scope.fault=True;scope.fault_pending=True
+            with self._lock:
+                scope.fault=True;scope.fault_pending=True
+                scope.fault_detail=self._fault_detail('buy',scope.demand.kind,'port_close_failure')
         else:
             with self._lock:scope.closed=True
         finally:self.wake()
@@ -437,10 +447,26 @@ class LPReadRuntime:
     async def _close_fixed(self,name,port):
         try:await port.aclose()
         except BaseException:
-            with self._lock:self._fixed_faults.add(name)
+            with self._lock:
+                self._fixed_faults.add(name)
+                self._fixed_fault_details[name]=self._fault_detail(name,
+                    self._fixed_kinds.get(name),'port_close_failure')
         else:
             with self._lock:self._fixed_closed.add(name)
         finally:self.wake()
+
+    def _fault_detail(self,lane,kind,reason):
+        # Only enum values and a captured UTC timestamp leave this boundary.
+        # Diagnostic failure must not alter cleanup ownership or its gate.
+        since=None
+        try:
+            stamp=self.utc_now()
+            if isinstance(stamp,datetime) and stamp.utcoffset() is not None:
+                since=stamp.astimezone(UTC).isoformat()
+        except Exception:pass
+        return dict(lane=lane,kind=kind if kind in
+            ('buy','financial','exact','sell','position','holding','income') else 'unknown',
+            since=since,active=True,blocks_new_buy=lane!='buy',reason=reason)
 
     def drain_results(self):
         with self._lock:
@@ -484,12 +510,21 @@ class LPReadRuntime:
                 for s in self._scopes.values())+len(self._fixed_closing-self._fixed_closed)
             faults=sum(s.fault for s in self._scopes.values())+len(self._fixed_faults)
             fixed_faults=bool(self._fixed_faults) or any(s.fault and s.demand.kind!='buy' for s in self._scopes.values())
+            # Put blockers first so a full BUY lane cannot hide a fixed fault.
+            details=[self._fixed_fault_details[name] for name in sorted(self._fixed_faults)]
+            details.extend(s.fault_detail for buy in (False,True) for s in self._scopes.values()
+                if s.fault and (s.demand.kind=='buy')==buy)
+            block_reasons=tuple(reason for reason,active in (
+                ('cleanup_fault',fixed_faults),('capacity',len(owned)>=self.buy_cap),
+                ('deferred',bool(deferred))) if active)
             return freeze(dict(cache_entries=len(self._cache),cache_bytes=self._cache_size,
                 next_dependency_monotonic=min(dependencies) if dependencies else None,
                 waiting_for_event=not dependencies and (bool(self._fixed_faults)
                     or any(s.fault or s.retiring or s.closing for s in self._scopes.values())),
                 policy=dict(buy_cap=self.buy_cap,cache_entries=self.cache_entries,cache_bytes=self.cache_bytes),
                 observed_monotonic=self._observed,cleanup_faults=faults,owned_buy_scopes=len(owned),
+                cleanup_fault_details=dict(total=faults,omitted=max(0,faults-CLEANUP_FAULT_ITEMS),
+                    items=tuple(details[:CLEANUP_FAULT_ITEMS])),new_buy_block_reasons=block_reasons,
                 financial_cleanup_faults=self._financial_cleanup_faults,
                 last_financial_cleanup_fault=self._last_financial_cleanup_fault,
                 last_financial_timeout=self._last_financial_timeout,
