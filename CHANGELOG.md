@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-27 — Observed-pool test clock
+
+- Seed the shared observed-pool fixture at a fixed UTC business time so unrelated pool tests remain independent of the daily review cutoff. Preserve mutable clock advances, expiry boundary checks and the real minimum-expiration rejection guard.
+
 ## 2026-10-27 — Runtime test child shutdown
 
 - Record runtime-only offline child SIGTERM intent without acquiring the wait event lock. Prevent cleanup deadlocks while preserving real fatal-start exit codes, native drain, owner locks, UNKNOWN and no-replay checks. Production runtime behavior and watchdog budgets are unchanged.

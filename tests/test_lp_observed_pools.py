@@ -903,7 +903,8 @@ def test_ready_trial_progresses_while_income_results_change_or_wait(tmp_path,mon
 def _pool_test_clock(monkeypatch):
     from datetime import UTC,datetime
     from importlib import import_module
-    clock=[datetime.now(UTC)]
+    # Ordinary business time, independent of the host's daily review cutoff.
+    clock=[datetime(2026,10,21,12,tzinfo=UTC)]
     class ClockMeta(type):
         def __instancecheck__(cls,value):return isinstance(value,datetime)
     class ClockDatetime(datetime,metaclass=ClockMeta):
