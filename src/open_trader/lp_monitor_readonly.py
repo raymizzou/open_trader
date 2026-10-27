@@ -125,7 +125,7 @@ def _holdings_section(data):
         cells=''.join('<td>'+_text(sources.get(row.get(key),'未知') if key=='cost_source' else row.get(key))+'</td>' for key,_ in columns)
         orders=_table(row.get('sells') if isinstance(row.get('sells'),list) else [],
             [('order_id','在挂卖单'),('quantity','剩余数'),('price','价格')])
-        state='abnormal' if row.get('state')=='cost_unknown' else 'unknown' if row.get('state') in ('account_unknown','market_unknown') else 'attention'
+        state='abnormal' if row.get('state') in ('cost_unknown', 'below_cost_sell') else 'unknown' if row.get('state') in ('account_unknown','market_unknown') else 'attention'
         rows.append('<tr class="holding-row '+state+'">'+cells+'<td>'+_text(row.get('condition_id'))+orders+'</td></tr>')
     table='<div class="table-wrap"><table><thead><tr>'+''.join('<th scope="col">'+_text(label)+'</th>' for _,label in columns)+'<th scope="col">市场与卖单明细</th></tr></thead><tbody>'+''.join(rows)+'</tbody></table></div>'
     return '<section aria-label="全持仓挂卖"><h2>全持仓挂卖</h2><p>'+_text(data.get('reason'))+'</p>'+totals+table+'</section>'

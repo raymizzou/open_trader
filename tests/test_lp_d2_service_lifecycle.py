@@ -214,6 +214,9 @@ def test_supported_rollback_uses_current_api_without_disposable_record_audit(tmp
     from open_trader.prediction_release import prepare_lp_target
     from open_trader import prediction_start_guard as guard
     from open_trader import prediction_cloud as cloud
+    # Match the child/CI bytecode cache isolation for parent-side real verifier
+    # imports; both tracked and ignored release contamination stay prohibited.
+    monkeypatch.setattr(sys,'pycache_prefix',str(tmp_path/'parent-bytecode'))
     monkeypatch.setattr(cloud,'UNIT_PATH',tmp_path/'absent-installed-systemd.service')
     _assert_foreground_operator_entry(tmp_path/'foreground-operator')
     for scenario in ('rollback-current','rollback-current-incomplete'):

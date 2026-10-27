@@ -115,18 +115,16 @@ class HoldingSells:
                 return True
             sell_credit -= used_sell
             buy_credit -= used_buy
-            if not sold_delta and not buy_delta:
-                decrease = max(Decimal(0), expected-position.quantity.value)
-                increase = max(Decimal(0), position.quantity.value-expected)
-                # A reversed unproved move cancels its earlier credit. It is
-                # not a second independent acquisition/sale of these shares.
-                reversed_buy, reversed_sell = min(decrease, buy_credit), min(increase, sell_credit)
-                buy_credit -= reversed_buy
-                sell_credit -= reversed_sell
-                sell_credit += decrease-reversed_buy
-                buy_credit += increase-reversed_sell
-            elif not sold_delta:
-                buy_credit += max(Decimal(0), position.quantity.value-expected)
+            # Reconcile the unexplained movement AFTER the proven deltas,
+            # including observations that contain a real new BUY or SELL.
+            # A reversal consumes the opposing old credit before any new one.
+            decrease = max(Decimal(0), expected-position.quantity.value)
+            increase = max(Decimal(0), position.quantity.value-expected)
+            reversed_buy, reversed_sell = min(decrease, buy_credit), min(increase, sell_credit)
+            buy_credit -= reversed_buy
+            sell_credit -= reversed_sell
+            sell_credit += decrease-reversed_buy
+            buy_credit += increase-reversed_sell
         row = dict(account_id=self.live.account_id, venue=self.live.venue, condition_id=position.condition_id,
             token_id=position.token_id, request_id=uuid4().hex, kind='inventory', state='terminal', order_id=None,
             quantity=str(position.quantity.value), price='0', observation_id=snapshot.observation.observation_id,
@@ -229,12 +227,7 @@ class HoldingSells:
     def _refresh_legacy_pending(self):
         """Legacy requests reserve exposure; audit-only rows confer no authority."""
         try:
-            rows = self.live.store.lp_sessions()
-            self._legacy_pending = {(r.get('condition_id') or '', r.get('token_id')) for r in rows
-                if not r.get('d2_audit_only') and not r.get('d2_manual_identity_only')
-                and str(r.get('account_id') or '').strip().casefold() in ('', self.live.account_id.casefold())
-                and any(r.get(kind + '_attempt_key') and r.get(kind + '_attempt_state') not in ('terminal', 'rejected')
-                    for kind in ('passive_exit', 'protected_exit'))}
+            self._legacy_pending = set(self.live.store.lp_unresolved_sell_obligations(self.live.account_id))
         except Exception:
             self._legacy_pending = None
 
@@ -331,18 +324,34 @@ class HoldingSells:
                     state = 'account_unknown'
                 elif not self.account_converged(snapshot, position):
                     state = 'position_unreconciled'
-                elif uncovered > 0 and any(self._identity(r) == (identity[0].casefold(), *identity[1:]) and
+                elif any(self._identity(r) == (identity[0].casefold(), *identity[1:]) and
                         r['state'] in ('pending', 'unknown', 'cancel_unknown', 'finality_wait') for r in self.requests.values()):
                     state = 'order_unknown'
-                elif uncovered > 0 and any(r.get('reason') == 'admission_changed' and
-                        (r['account_id'], r['condition_id'], r['token_id']) == identity for r in self.requests.values()):
+                elif state == 'pending' and any(r.get('reason') == 'admission_changed'
+                        and r.get('observation_id') == observation.observation_id
+                        and (r['account_id'], r['condition_id'], r['token_id']) == identity for r in self.requests.values()):
                     state = 'admission_changed'
+                if state == 'pending' and self._legacy_pending is None:
+                    state = 'legacy_obligation_unknown'
+                try:
+                    minimum_cost = passive_cost_floor(cost, book.get('tick_size'))
+                except ValueError:
+                    minimum_cost = None
+                if (state not in ('account_unknown', 'position_unreconciled') and minimum_cost is not None
+                        and any(o.price.value < minimum_cost for o in sells)):
+                    state = 'below_cost_sell'
+                below_cost_cancel = any(r.get('kind') == 'cancel'
+                    and self._identity(r) == (identity[0].casefold(), *identity[1:])
+                    and r['state'] in ('pending', 'cancel_unknown', 'finality_wait') for r in self.requests.values())
                 reasons = dict(cost_unknown='成本未知', covered='已挂全', pending='等待当前挂卖准入',
                     dust='小于精度零头', below_minimum='低于最小下单量',
                     market_ended='市场已结束，不可挂单', market_unknown='市场状态未知',
                     account_unknown='账户观察不完整、身份未确认或已过期', admission_changed='准入时账户观察已改变，等待新一轮核对',
-                    cost_above_maximum='成本过高，暂不挂卖')
+                    cost_above_maximum='成本过高，暂不挂卖',
+                    legacy_obligation_unknown='历史卖单义务未确认，暂不新增挂卖')
                 reasons.update(position_unreconciled='成交已确认，等待账户持仓收敛', order_unknown='卖单请求或撤单最终结果未知，保留数量')
+                reasons['below_cost_sell'] = ('仍有低于成本卖单，撤单最终结果未确认' if below_cost_cancel
+                    else '仍有低于成本卖单，等待安全纠正')
                 raw = next((r for r in observation.source_frame.positions if
                     (r['condition_id'], r['token_id']) == (position.condition_id, position.token_id)), {}) if observation else {}
                 current_value = _maybe_decimal(raw.get('current_value'))
@@ -357,8 +366,12 @@ class HoldingSells:
             total = sum((Decimal(r['quantity']) for r in items), Decimal(0))
             covered = sum((Decimal(r['covered_quantity']) for r in items), Decimal(0))
             uncovered = total - covered
-            status = 'unknown' if not known else 'abnormal' if any(r['state'] == 'cost_unknown' for r in items) else 'attention' if uncovered else 'normal'
-            return dict(status=status, reason='账户持仓的成本与挂卖覆盖' if known else '账户观察未确认，覆盖汇总未知',
+            unsafe = any(r['state'] == 'below_cost_sell' for r in items)
+            status = ('unknown' if not known else 'abnormal' if unsafe or any(r['state'] == 'cost_unknown' for r in items)
+                else 'attention' if uncovered or any(r['state'] != 'covered' for r in items) else 'normal')
+            reason = ('账户观察未确认，覆盖汇总未知' if not known else '仍有低于成本卖单，请核对撤单最终结果'
+                if unsafe else '账户持仓的成本与挂卖覆盖')
+            return dict(status=status, reason=reason,
                 account_id=live.account_id, observed_at=snapshot.observation.accepted_at.isoformat() if snapshot.observation else None,
                 items=items, position_quantity=str(total) if known else None,
                 covered_quantity=str(covered) if known else None, uncovered_quantity=str(uncovered) if known else None,
@@ -458,10 +471,13 @@ class HoldingSells:
                 live.account_id, live.process_epoch, current.current.cycle_generation, key, 'SELL', 0,
                 order_fact=incoming, terminal_proof=proof))
 
-    def _refresh_cancel_buys(self, row):
-        """Resolve missing exact BUY quantities retained by this cancel baseline."""
+    def _refresh_cancel_orders(self, row):
+        """Resolve readonly BUY/SELL quantities retained by this cancel baseline."""
         live = self.live
-        for order_id, terms in row.get('buy_terms', {}).items():
+        targets = [(side, order_id, terms, row.get(baseline, {}).get(order_id, '0'))
+            for side, field, baseline in (('BUY', 'buy_terms', 'buy_matched_baseline'), ('SELL', 'sell_terms', 'matched_baseline'))
+            for order_id, terms in row.get(field, {}).items()]
+        for side, order_id, terms, baseline in targets:
             key = (live.account_id, row['condition_id'], row['token_id'], order_id)
             current = live.state.snapshot()
             order = next((o for o in current.orders if o.key == key), None)
@@ -472,18 +488,18 @@ class HoldingSells:
             value = source.value
             if (not source.complete or source.error or not isinstance(value, Mapping)
                     or (value.get('side'), value.get('price'), value.get('original_size')) !=
-                        ('BUY', Decimal(terms['price']), Decimal(terms['original_size']))
-                    or value['size_matched'] < Decimal(row['buy_matched_baseline'][order_id])):
+                        (side, Decimal(terms['price']), Decimal(terms['original_size']))
+                    or value['size_matched'] < Decimal(baseline)):
                 continue
             stamp = live._source_stamp(source)
             fact = lambda amount: Fact('known', amount, (stamp,))
             proof = TerminalProof(key, value['status'], fact(value['original_size']), fact(value['size_matched']), stamp, True) if value['status'] in TERMINAL_ORDER_STATES else None
-            incoming = CurrentOrderFact(key, 'BUY', value['status'], fact(value['price']), fact(value['original_size']),
+            incoming = CurrentOrderFact(key, side, value['status'], fact(value['price']), fact(value['original_size']),
                 fact(value['size_matched']), fact(value['remaining_size']), 'present', None,
                 fact(value['order_type']), fact(value['expiration']), 1, stamp)
             current = live.state.snapshot()
             live.state.accept_receipt_evidence(ReceiptEvidence(uuid4().hex, row['request_id'],
-                live.account_id, live.process_epoch, current.current.cycle_generation, key, 'BUY', 0,
+                live.account_id, live.process_epoch, current.current.cycle_generation, key, side, 0,
                 order_fact=incoming, terminal_proof=proof))
 
     def _reconcile_cancels(self):
@@ -536,7 +552,7 @@ class HoldingSells:
                     'holding:' + row['request_id'], row['condition_id'], row['token_id'], row['order_id'],
                     value['original_size'], value['size_matched'], value['price'], value['status'], stamp.checked_at))
                 continue
-            self._refresh_cancel_buys(row)
+            self._refresh_cancel_orders(row)
             with live.state._lock:
                 snapshot = live.state.snapshot()
                 observation = snapshot.observation
@@ -553,15 +569,17 @@ class HoldingSells:
                     if o.key[:3] == identity and o.side == 'BUY' and o.size_matched.state == 'known'}
                 buys = {**(anchor.get('buys', {}) if anchor else {}), **buys}
                 bought_delta = sum((Decimal(q)-Decimal(buy_baseline.get(k, '0')) for k,q in buys.items()), Decimal(0)) if 'buy_matched_baseline' in row else Decimal(0)
-                buy_complete = all(any(o.key == (*identity, order_id) and o.side == 'BUY'
+                quantities_complete = all(any(o.key == (*identity, order_id) and o.side == side
                     and o.price.value == Decimal(terms['price']) and o.original_size.value == Decimal(terms['original_size'])
-                    and o.size_matched.state == 'known' and o.size_matched.value >= Decimal(buy_baseline[order_id])
+                    and o.size_matched.state == 'known' and o.size_matched.value >= Decimal(before.get(order_id, '0'))
                     and (o.presence == 'present' or o.terminal_proof is not None and o.terminal_proof.identity_verified)
-                    for o in snapshot.orders) for order_id, terms in row.get('buy_terms', {}).items())
+                    for o in snapshot.orders)
+                    for side, field, before in (('BUY', 'buy_terms', buy_baseline), ('SELL', 'sell_terms', baseline or {}))
+                    for order_id, terms in row.get(field, {}).items())
                 expected = Decimal(row['position_quantity']) - delta + bought_delta
                 siblings_final = all(r['state'] in ('finality_wait', 'terminal', 'rejected')
                     for r in self.requests.values() if r.get('kind') == 'cancel' and self._identity(r) == self._identity(row))
-                fresh = (siblings_final and buy_complete and delta >= 0 and bought_delta >= 0 and observation.observation_id != row['final_observation_id']
+                fresh = (siblings_final and quantities_complete and delta >= 0 and bought_delta >= 0 and observation.observation_id != row['final_observation_id']
                     and observation.components['positions'].checked_at >= datetime.fromisoformat(row['final_checked_at'])
                     and observation.order_view.orders_source.checked_at >= datetime.fromisoformat(row['final_checked_at'])
                     and position is not None and position.quantity.state == 'known' and position.quantity.value == expected
@@ -588,6 +606,8 @@ class HoldingSells:
             cost, _ = self._cost(snapshot, position)
             floor = passive_cost_floor(cost, book.get('tick_size'))
             if row['trigger'] == 'below_floor':
+                # Ray t531u permits verified same-wallet price correction even
+                # without local provenance; this grants no generic ownership.
                 return order.price.value < floor
             registered = any(r.get('kind') not in ('cancel', 'inventory', 'session') and r['order_id'] == order.key[3]
                 and r['state'] == 'accepted' for r in self.requests.values())
@@ -626,6 +646,9 @@ class HoldingSells:
                         and o.side == 'BUY' and o.size_matched.state == 'known'}},
                 buy_terms={o.key[3]: dict(price=str(o.price.value), original_size=str(o.original_size.value))
                     for o in origin.orders if o.key[:3] == order.key[:3] and o.side == 'BUY'},
+                sell_terms={o.key[3]: dict(price=str(o.price.value), original_size=str(o.original_size.value))
+                    for o in origin.orders if o.key[:3] == order.key[:3] and o.side == 'SELL'
+                    and all(f.state == 'known' for f in (o.price, o.original_size, o.size_matched))},
                 observation_id=origin.observation.observation_id,
                 generation=origin.current.cycle_generation, requested_at=live._utc_now().isoformat())
             if not lease.allowed('SELL_CANCEL'):
@@ -650,7 +673,8 @@ class HoldingSells:
                     with live.state._lock:
                         permitted = permitted and self._cancel_current(live.state.snapshot(), position, order, origin, row, lease)
                     if permitted:
-                        # Narrow OQ2 permission: no generic ownership enrollment.
+                        # Ray t531u price-correction permission includes unknown/peer
+                        # same-wallet SELLs, without generic ownership enrollment.
                         response = live.trading.cancel_orders_detailed((order.key[3],))
                         outcome = 'accepted' if order.key[3] in response['canceled'] else 'unknown'
                     else:

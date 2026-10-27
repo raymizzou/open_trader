@@ -3088,6 +3088,12 @@ def _assert_current_progress_with_blocked_optional_source(root: Path, source: st
         assert PredictionArbitrageStore(child.data_dir).lp_sessions() == []
         started = json.loads(child.marker("optional-runtime-started").read_text())
         assert started["obsolete_sampler"] is False and started["scheduler_count"] == 1
+        if source == 'catalog':
+            # Hold a distinct real financial SDK request after the optional
+            # source ends, so its completion cannot imply total native drain.
+            child.marker('optional-d2-reader-arm').touch()
+            child.advance(2)
+            child.wait('optional-d2-reader-entered')
         child.process.terminate()
         child.wait("optional-stopping-retained")
         child.assert_owned()
@@ -3095,6 +3101,14 @@ def _assert_current_progress_with_blocked_optional_source(root: Path, source: st
         assert not child.marker("optional-owner-released").exists()
         child.release("optional")
         child.wait("optional-ended")
+        if source == 'catalog':
+            child.wait('optional-d2-stop-observed')
+            resources=json.loads(child.marker('optional-d2-resources.json').read_text())
+            assert resources['optional_ended'] is True and resources['reader_jobs'] >= 1
+            child.assert_owned()
+            assert not child.marker('optional-trading-closed').exists()
+            assert not child.marker('optional-owner-released').exists()
+            child.release('optional-d2-reader')
         assert child.wait_exit() == 0
         assert child.marker("optional-trading-closed").exists()
         assert child.marker("optional-owner-released").exists()

@@ -4235,3 +4235,38 @@ def test_lp_facts_callback_update_is_atomic_and_returned_current(tmp_path: Path,
     assert returned['facts_note'] == 'second observation'
     assert db.lp_session_revision(sid) == 2
     assert db.lp_session_revision(sid, trading=True) == 0
+
+
+def test_lp_unresolved_sell_obligations_are_identity_only(tmp_path, monkeypatch):
+    db = store(tmp_path)
+    cases = [
+        ('passive-unknown', dict(passive_exit_attempt_key='p', passive_exit_attempt_state='unknown')),
+        ('protected-pending', dict(protected_exit_attempt_key='p', protected_exit_attempt_state='pending')),
+        ('accepted', dict(passive_exit_attempt_key='p', passive_exit_attempt_state='accepted')),
+        ('missing-state', dict(passive_exit_attempt_key='p')),
+        ('null-state', dict(passive_exit_attempt_key='p', passive_exit_attempt_state=None)),
+        ('blank-account', dict(account_id='', protected_exit_attempt_key='p')),
+        ('terminal', dict(passive_exit_attempt_key='p', passive_exit_attempt_state='terminal')),
+        ('rejected', dict(protected_exit_attempt_key='p', protected_exit_attempt_state='rejected')),
+        ('no-key', dict(passive_exit_attempt_state='unknown')),
+        ('audit', dict(d2_audit_only=True, passive_exit_attempt_key='p')),
+        ('identity', dict(d2_manual_identity_only=True, passive_exit_attempt_key='p')),
+        ('foreign', dict(account_id='other-wallet', passive_exit_attempt_key='p')),
+    ]
+    for token, fields in cases:
+        db.lp_create_session(token, token, state='complete', payload=dict(
+            dict(account_id='Wallet-A', condition_id='market', token_id=token,
+                residual_quantity='999', entry_price='.99'), **fields))
+    columns = []
+    connect = sqlite3.connect
+    class IdentityRead(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            cursor = super().execute(sql, *args, **kwargs)
+            if sql.lstrip().startswith('SELECT') and 'FROM lp_sessions' in sql:
+                columns.append(tuple(c[0] for c in cursor.description))
+            return cursor
+    monkeypatch.setattr(sqlite3, 'connect', lambda *a, **kw: connect(*a, **(kw | dict(factory=IdentityRead))))
+    assert set(db.lp_unresolved_sell_obligations(' WALLET-A ')) == {
+        ('market', token) for token in ('passive-unknown', 'protected-pending', 'accepted',
+            'missing-state', 'null-state', 'blank-account')}
+    assert columns == [('condition_id', 'token_id')]

@@ -441,7 +441,10 @@ def test_holding_read_failure_retries_without_replay(tmp_path, monkeypatch, fail
     from tests.test_lp_async_live_contract import sdk_boundary, pump_live, LPReadRuntime
     from tests.test_lp_order_registration_contract import TOKEN_ID
     from datetime import timedelta
+    from threading import Event
+    import time
     live, sdk, public, values = _d2_filled_opening(tmp_path/'auto', monkeypatch, manual_sale=False)
+    posted, release_post, pending = Event(), Event(), []
     try:
         public.failed = True
         d2_tick(live)
@@ -476,10 +479,30 @@ def test_holding_read_failure_retries_without_replay(tmp_path, monkeypatch, fail
         bad[0] = False
         def unknown_post(signed):
             sdk.posts.append(signed)
+            posted.set()
+            assert release_post.wait(5), 'external post completion release watchdog'
             raise TimeoutError('unknown passive receipt')
         sdk.post_order = unknown_post
         values[0] = 6;live.read_runtime.wake()
-        pump_live(live,boundary,lambda:bool([o for o in sdk.posts if o['side']=='SELL']) and settled())
+        end = time.monotonic()+4
+        while True:
+            live.run_once()
+            pending.extend(h for h in live.run_protection_once() if h is not None)
+            if posted.is_set() and settled():
+                break
+            left = end-time.monotonic()
+            assert left > 0, 'post entry / reader settlement watchdog'
+            with boundary.changed:
+                boundary.changed.wait(min(.01, left))
+        # Reader settlement and an entered POST do not imply native completion.
+        # Keep the original request identity and wait for its actual result.
+        in_flight, = live.state.snapshot().sells.values()
+        assert len(pending) == 1 and pending[0].identity.request_id == in_flight.passive.request_id
+        assert not pending[0].done() and in_flight.passive.native_state == 'running'
+        release_post.set()
+        for handle in pending:
+            handle.result(3); handle._thread.join(3)
+            assert handle.done()
         for _ in range(3):
             live.run_once()
             for handle in live.run_protection_once():
@@ -490,6 +513,9 @@ def test_holding_read_failure_retries_without_replay(tmp_path, monkeypatch, fail
         sell, = live.state.snapshot().sells.values()
         assert sell.passive.state=='unknown' and sell.passive.native_state=='ended'
     finally:
+        release_post.set()
+        for handle in pending:
+            handle._thread.join(3)
         assert live.close(4)
         live.trading.close()
     # A new legacy service instance sees the durable UNKNOWN and cannot replay.

@@ -3496,6 +3496,23 @@ class PredictionArbitrageStore:
             ).fetchone()
         return None if row is None else self._lp_row_result(row)
 
+    def lp_unresolved_sell_obligations(self, account_id: str) -> tuple[tuple[str, str], ...]:
+        """Read legacy reservation identities only, never current trading terms."""
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT coalesce(json_extract(payload,'$.condition_id'),'') AS condition_id, "
+                "json_extract(payload,'$.token_id') AS token_id FROM lp_sessions "
+                "WHERE coalesce(json_type(payload,'$.d2_audit_only'),'null') != 'true' "
+                "AND coalesce(json_type(payload,'$.d2_manual_identity_only'),'null') != 'true' "
+                "AND lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?) "
+                "AND ((coalesce(json_extract(payload,'$.passive_exit_attempt_key'),'') != '' "
+                "AND coalesce(json_extract(payload,'$.passive_exit_attempt_state'),'') NOT IN ('terminal','rejected')) "
+                "OR (coalesce(json_extract(payload,'$.protected_exit_attempt_key'),'') != '' "
+                "AND coalesce(json_extract(payload,'$.protected_exit_attempt_state'),'') NOT IN ('terminal','rejected')))",
+                (str(account_id).strip().casefold(),),
+            ).fetchall()
+        return tuple((r['condition_id'], r['token_id']) for r in rows)
+
     def lp_sessions(self) -> list[dict[str, object]]:
         """Return stored LP sessions for a read-only daily report snapshot."""
 
