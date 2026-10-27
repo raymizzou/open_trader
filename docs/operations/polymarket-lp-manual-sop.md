@@ -110,6 +110,7 @@ BUY 目标接受非负整数；0 沿用服务原有语义，不表示撤单。`-
 
 配置写入先读取 `config_version`，再发送 `expected_config_version`。
 版本冲突、运行中或 BUY 尚未清理而被拒绝时，CLI 显示服务原因，不自动暂停、撤单、开启或重试写入。
+自动 BUY 已成交未卖完而挡住改设置时，见[已成交自动 BUY 后改设置](lp-auto-cli.md#configure-after-a-filled-automatic-buy)；同版本重启及开仓级保护变化须由 Ray 为当次操作明确授权。
 失败输出中的 `state` 若存在，是已读取的服务快照；配置拒绝时可能是写入前的快照，
 不能把它当作失败后重新核对的当前状态。
 

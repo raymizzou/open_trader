@@ -190,7 +190,9 @@ allowance and all current account BUY commitments still constrain new entries.
    ACK is not final release. Do not cancel all account orders or sell inventory
    as a shortcut. Visible no-BUY is necessary but insufficient: active work,
    unresolved openings or unknown financial facts still block config. This
-   checklist cannot bypass server guards.
+   checklist cannot bypass server guards. For a filled automatic BUY that has
+   not been fully sold, see [Configure after a filled automatic BUY](#configure-after-a-filled-automatic-buy)
+   for the separately authorized recovery path and its protection changes.
 
 3. **Save the explicitly chosen budgets.** In the 2026-10-23 session the user
    chose 100 USDC for each pool, total 200 USDC. This is a worked example, not a
@@ -254,15 +256,130 @@ missing safety evidence never implies success.
 
 | Result or reason | Safe next action |
 | --- | --- |
-| `pause_and_finish_automatic_buys_before_configuring` | Read status; confirm the saved pause, then investigate relevant existing BUYs, native obligations and opening lifecycles. Let actual release and fresh facts become visible before reassessing config. |
+| `pause_and_finish_automatic_buys_before_configuring` | Read status; confirm the saved pause and investigate BUYs, native obligations and filled openings that have not been fully sold. For that opening barrier, follow [Configure after a filled automatic BUY](#configure-after-a-filled-automatic-buy) only after Ray explicitly authorizes the restart and its protection changes. |
 | `financial_facts_unknown` | Read status and inspect current account identity, completeness, freshness and financial-read blockers. No new write until the facts are confirmed. |
 | `config_version_changed` / `settings_save_pending` | Read current settings/version and pending-save state. Reconcile the intended values; do not replay an old CAS write. |
 | `LP enable result is unconfirmed` / `LP pause result is unconfirmed` | Read status on the same endpoint and check the full saved control conditions. Do not repeat the control POST blindly. |
 | Transport timeout / `UNKNOWN` | The write may have been accepted. Read status and investigate; preserve UNKNOWN and no-replay protections. |
 
-These outcomes are not instructions to restart, reinstall or run automatic
-repair. The commands do not withdraw/deposit funds or guarantee fills/rewards;
-`on` does not change budgets, and pause does not clear inventory.
+These outcomes do not authorize a restart, reinstall or automatic repair. The
+recovery below requires explicit authorization for the current operation; the
+CLI never performs it automatically. The commands do not withdraw/deposit funds
+or guarantee fills/rewards; `on` does not change budgets, and pause does not
+clear inventory.
+
+### Configure after a filled automatic BUY
+
+A current-process automatic BUY that has filled but has not been fully sold
+can retain an in-memory opening and block trading config with
+`pause_and_finish_automatic_buys_before_configuring`. A saved pause and zero live
+BUYs alone do not remove that barrier. Cancelling open BUYs or waiting alone
+does not finish a filled opening; it normally needs confirmed sale and account
+convergence. The existing public API cannot close that automatic opening.
+
+**Before any restart, Ray must explicitly authorize the restart and accept its
+effect for this operation:** the old process's opening-level protection is lost.
+The positions become ordinary account holdings managed by holding-sell logic.
+This does not guarantee SELL coverage. Do not sell inventory or cancel SELLs to
+make config pass. The [#481 execution record](https://github.com/raymizzou/open_trader/issues/481#issuecomment-6436499468)
+is historical evidence, not authorization for another operation. One explicit
+operation approval may cover the restart and protection changes, chosen settings,
+enable and any bounded retry below. Do not ask again for actions already covered;
+actions outside that approval remain forbidden.
+
+The following example is **SSH Tokyo only**, on
+`open-trader-tokyo-experiment`. It uses the existing deployed CLI and Tokyo's
+loopback endpoint. The macOS `lpauto` launcher, including Mini's local command,
+does not target Tokyo. Fill `DEPLOYED_ROOT` from the verified running service
+and `DEPLOYED_PYTHON` from its actual `ExecStart`, not a development checkout,
+a latest-release path or an assumed CLI wrapper. Bind the source explicitly
+with `PYTHONPATH` as below. Record the exact interpreter separately; its runtime
+directory need not have the same SHA name as the source release.
+
+1. **Verify the saved pause and record identity before restart.** Use the same
+   endpoint and instance throughout:
+
+   ```sh
+   # On SSH Tokyo; replace both placeholders with verified deployed paths.
+   DEPLOYED_ROOT=/absolute/verified/source-release
+   DEPLOYED_PYTHON=/absolute/verified/runtime/bin/python
+   export PYTHONPATH="$DEPLOYED_ROOT/src"
+   export PYTHONDONTWRITEBYTECODE=1
+   export OPEN_TRADER_LP_INSTANCE_ID=tokyo
+   cd "$DEPLOYED_ROOT"
+   "$DEPLOYED_PYTHON" -m open_trader prediction-arb lp-auto status --url http://127.0.0.1:8769 --json
+   sudo -n systemctl show open-trader-prediction \
+     --property=MainPID --property=WorkingDirectory --property=ExecStart
+   ```
+
+   Require every saved-pause condition in step 2 of the D2 sequence, zero active
+   BUYs, no pending native submissions/obligations or active execution work,
+   and no pending control/settings save. Use fresh complete account, order and
+   position facts; missing proof is not clearance. Record PID, deployed source
+   SHA/root, exact interpreter, health identity, settings, budgets,
+   `config_version` and `trading_config_version`. Verify the unit, process,
+   source and runtime identities agree with the approved deployed version.
+   Stop on version drift, an unverified target or unverified pending work.
+   Do not restart unless the pause is confirmed saved.
+
+2. **Perform the explicitly authorized same-version restart once.** Do not
+   install, deploy, switch releases or change the runtime:
+
+   ```sh
+   # SSH Tokyo only; requires the current operation's restart/consequence approval.
+   sudo -n systemctl restart open-trader-prediction
+   ```
+
+3. **Wait 1–3 minutes, then read back before config.** Check health, the new
+   PID and the same source SHA/root, exact interpreter, instance and endpoint.
+   Read status again with the command in step 1. Require all saved-pause
+   conditions, zero active BUYs, no pending work/saves and fresh complete
+   account, order and position facts. Confirm the saved mode, budgets, bid level
+   and both config versions are unchanged. Stop if any proof is missing; elapsed
+   time alone does not prove readiness.
+
+4. **Save the explicitly chosen settings once.** Fill these values from the
+   current approval. If only the bid level changes, use the verified existing
+   budgets unchanged. This D2 example retains `observed_pools`:
+
+   ```sh
+   TRIAL_BUDGET='<approved trial amount>'
+   INCOME_BUDGET='<approved income amount>'
+   BID_LEVEL='<approved 1 or 2>'
+   "$DEPLOYED_PYTHON" -m open_trader prediction-arb lp-auto config \
+     --trial-budget "$TRIAL_BUDGET" --income-budget "$INCOME_BUDGET" \
+     --bid-level "$BID_LEVEL" --url http://127.0.0.1:8769 --timeout 30 --json
+   "$DEPLOYED_PYTHON" -m open_trader prediction-arb lp-auto status --url http://127.0.0.1:8769 --json
+   ```
+
+   Require `result: CONFIGURED`, the chosen saved and effective values, and
+   `config_version` and `trading_config_version` each increased by one from
+   the recorded pre-save values. Require the saved pause and no pending saves;
+   preserve every setting outside the approved change. Do not enable from an
+   unconfirmed config.
+
+5. **Enable only after confirmed config and explicit enable authorization.**
+   The operation approval above may already include this action.
+
+   ```sh
+   "$DEPLOYED_PYTHON" -m open_trader prediction-arb lp-auto on --url http://127.0.0.1:8769 --json
+   "$DEPLOYED_PYTHON" -m open_trader prediction-arb lp-auto status --url http://127.0.0.1:8769 --json
+   ```
+
+   Require `desired_running=true`, `effective_running=true` and all saved
+   control/settings conditions in step 4 of the D2 sequence. Recheck the chosen
+   settings and versions. Running control still does not prove SELL coverage or
+   new BUY execution.
+
+If config still returns `pause_and_finish_automatic_buys_before_configuring`
+after the restart, stop and report. Do not restart again or make a blind third
+config attempt. For an explicit `financial_facts_unknown` rejection, wait for
+fresh complete facts, read current settings/versions to confirm no save, then
+make at most one retry only if explicitly covered by Ray's operation approval
+or a later approval. For any other UNKNOWN outcome, read status and preserve
+the uncertainty; no automatic replay
+or `on`. Do not bypass guards, edit the database or use a code change as the
+default recovery.
 
 ## Verification and failure handling
 
