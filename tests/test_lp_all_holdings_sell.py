@@ -499,6 +499,15 @@ def test_session_and_holding_paths_share_one_reservation(tmp_path, monkeypatch):
         payload=dict(account_id=WALLET, condition_id=CONDITION_ID, token_id=TOKEN_ID,
             residual_quantity='10', protected_exit_attempt_key='historical-unknown',
             protected_exit_attempt_state='unknown'))
+    # Legacy obligations are imported at startup, never read as current
+    # trading authority by each account/protection loop.
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from open_trader.polymarket_lp_current_state import ValidatedStartAdmission
+    assert historical.close(3)
+    previous = historical
+    historical = LPD2LiveExecution(previous.store, previous.trading, account_id=WALLET, venue='polymarket',
+        process_epoch='legacy-obligation-startup', policy=previous.policy, clock=previous._clock, utc_now=previous._utc_now)
+    historical.initialize(ValidatedStartAdmission('legacy-obligation-startup', 'offline-permit'))
     try:
         for _ in range(3):
             d2_tick(historical)
@@ -741,6 +750,421 @@ def test_stale_incomplete_or_foreign_account_blocks_holding_actions(tmp_path, mo
         row, = execution.lp_monitor_summary(now=live._utc_now())['holdings']['items']
         assert row['reason']
         assert row['state'] in ('account_unknown', 'admission_changed')
+    finally:
+        assert live.close(3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('mode', ['in_process', 'reopen', 'tokyo'])
+def test_balance_rebound_does_not_reuse_unproven_sale_credit(tmp_path, monkeypatch, mode):
+    from datetime import timedelta
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from open_trader.polymarket_lp_current_state import ValidatedStartAdmission
+    from tests.test_lp_order_registration_contract import _maker_order, _trade
+    real = None
+    if mode == 'tokyo':
+        from tests.test_lp_instance_ownership_contract import _real_sdk_exit_runtime, _set_real_sdk_exit_fills, _observe_real_sdk_exit
+        from tests.test_lp_d2_manual_bridge import entry
+        execution, live, sdk, public, clock, token, posts, real = _real_sdk_exit_runtime(tmp_path, monkeypatch)
+        assert execution.lp_submit_entry(entry(clock, token_id=token, quantity='10', price='.29'))['submit_status'] == 'accepted'
+        _set_real_sdk_exit_fills(live, sdk, clock, token, bought='10')
+        _observe_real_sdk_exit(live)
+        total, remainder, filled = '10', '6', '4'
+        sell, = [o for o in sdk.orders if o.side == 'SELL']
+        wallet = live.account_id
+        def step():
+            clock[0] += timedelta(seconds=1)
+            d2_tick(live)
+    else:
+        live, sdk, public, clock, _ = mixed_holding(tmp_path, monkeypatch, size='100', average='.30')
+        posts = sdk.posts
+        token, wallet = TOKEN_ID, WALLET
+        total, remainder, filled = '100', '60', '40'
+        d2_tick(live)
+        d2_tick(live)
+        sell, = active_sells(sdk).values()
+        def step():
+            clock[0] += 1
+            d2_tick(live)
+    try:
+        before = len(posts)
+        for quantity in (remainder, total):
+            sdk.positions = tuple(dict(p, size=quantity) for p in sdk.positions)
+            step()
+        if mode == 'reopen':
+            assert live.close(3)
+            previous = live
+            live = LPD2LiveExecution(previous.store, previous.trading, account_id=wallet, venue='polymarket',
+                process_epoch='rebound-reopen', policy=previous.policy, clock=lambda: clock[0], utc_now=previous._utc_now)
+            live.initialize(ValidatedStartAdmission('rebound-reopen', 'offline-permit'))
+        sdk.orders = tuple(o.model_copy(update={'size_matched': Decimal(filled)}) if o.id == sell.id else o for o in sdk.orders)
+        maker = _maker_order(sell.id, 'SELL', filled, str(sell.price)).model_copy(update={
+            'token_id': token, 'maker_address': wallet, 'owner': wallet})
+        sdk.trades += (_trade('rebound-sale', maker, size=filled).model_copy(update={
+            'token_id': token, 'maker_address': wallet, 'owner': wallet,
+            'matched_at': live._utc_now(), 'updated_at': live._utc_now()}),)
+        for _ in range(3):
+            step()
+        assert len(posts) == before, 'a reversed unproved balance decrease is not sale credit or imported inventory'
+        row, = live.holdings_summary(now=live._utc_now())['items']
+        assert row['state'] == 'position_unreconciled'
+        assert sdk.cancels == []
+        sdk.positions = tuple(dict(p, size=remainder) for p in sdk.positions)
+        for _ in range(3):
+            step()
+        assert len(posts) == before and sdk.cancels == []
+        assert sum(o.original_size-o.size_matched for o in active_sells(sdk).values()) == Decimal(remainder)
+    finally:
+        assert live.close(3)
+        live.trading.close()
+        if real is not None:
+            real.close()
+
+
+@pytest.mark.parametrize('mode', ['present_zero', 'absent_zero', 'reopen', 'missing', 'foreign', 'conflicting', 'incomplete', 'stale'])
+def test_natural_holding_fill_retires_only_after_exact_convergence(tmp_path, monkeypatch, mode):
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from open_trader.polymarket_lp_current_state import ValidatedStartAdmission
+    live, sdk, public, clock = imported_holding(tmp_path, monkeypatch)
+    reads = []
+    try:
+        d2_tick(live)
+        d2_tick(live)
+        old, = sdk.orders
+        request, = live.store.lp_holding_sell_orders(WALLET, 'polymarket')
+        exact = old.model_copy(update={'status': 'FILLED', 'size_matched': Decimal(10)})
+        answer = [None if mode == 'missing' else exact.model_copy(update={'token_id': 'foreign-token'})
+            if mode == 'foreign' else exact.model_copy(update={'original_size': Decimal(11)}) if mode == 'conflicting' else exact]
+        def get_order(*, order_id):
+            reads.append(order_id)
+            return answer[0]
+        sdk.get_order = get_order
+        sdk.orders = ()
+        if mode == 'reopen':
+            assert live.close(3)
+            previous = live
+            live = LPD2LiveExecution(previous.store, previous.trading, account_id=WALLET, venue='polymarket',
+                process_epoch='natural-fill-reopen', policy=previous.policy, clock=lambda: clock[0], utc_now=previous._utc_now)
+            live.initialize(ValidatedStartAdmission('natural-fill-reopen', 'offline-permit'))
+        # Exact terminal evidence alone cannot release the old inventory.
+        for _ in range(2):
+            d2_tick(live)
+        assert reads and set(reads) == {old.id}
+        row, = live.store.lp_holding_sell_orders(WALLET, 'polymarket')
+        assert row['state'] != 'terminal' and len(sdk.posts) == 1
+        if mode in ('missing', 'foreign', 'conflicting'):
+            sdk.positions = ()
+            d2_tick(live)
+            assert live.store.lp_holding_sell_orders(WALLET, 'polymarket')[0]['state'] != 'terminal'
+            assert len(sdk.posts) == 1 and sdk.cancels == []
+            answer[0] = exact
+            clock[0] += 61
+        if mode == 'incomplete':
+            sdk.positions = None
+            d2_tick(live)
+            assert live.store.lp_holding_sell_orders(WALLET, 'polymarket')[0]['state'] != 'terminal'
+        if mode == 'stale':
+            clock[0] += 300
+            for handle in live.run_protection_once():
+                handle.result(3); handle._thread.join(3)
+            assert live.store.lp_holding_sell_orders(WALLET, 'polymarket')[0]['state'] != 'terminal'
+        sdk.positions = () if mode == 'absent_zero' else (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='0', average_price='.305'),)
+        for _ in range(3):
+            d2_tick(live)
+        row, = live.store.lp_holding_sell_orders(WALLET, 'polymarket')
+        assert row['request_id'] == request['request_id'] and row['state'] == 'terminal'
+        assert len(sdk.posts) == 1 and sdk.cancels == []
+        if mode == 'absent_zero':
+            assert live.state.snapshot().positions == ()
+        sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='2', average_price='.305'),)
+        for _ in range(3):
+            d2_tick(live)
+        assert len(sdk.posts) == 2 and sdk.posts[-1]['size'] == 2
+        assert sdk.posts[-1]['price'] == Decimal('.31') and sdk.market_orders == sdk.cancels == []
+    finally:
+        assert live.close(3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('other_fill', [False, True])
+def test_concurrent_holding_cancels_reconcile_all_token_fills(tmp_path, monkeypatch, other_fill):
+    from threading import Event, Lock
+    live, sdk, public, clock = imported_holding(tmp_path, monkeypatch, ask='.18')
+    sdk.positions = tuple(dict(p, average_price='.19') for p in sdk.positions)
+    orders = [_open_order(name, 'SELL', price='.18', original='5') for name in ('cancel-A', 'cancel-B')]
+    peer = _open_order('sufficient-other', 'SELL', price='.20', original='1')
+    sdk.orders = tuple(orders + ([peer] if other_fill else []))
+    terminal, entered, release, lock = {}, [Event(), Event()], Event(), Lock()
+    sdk.get_order = lambda *, order_id: terminal.get(order_id)
+    def cancel(*, order_ids):
+        with lock:
+            index = len(sdk.cancels)
+            sdk.cancels.append(order_ids)
+        entered[index].set()
+        assert release.wait(3), 'overlapping cancel SDK release watchdog'
+        with lock:
+            sdk.orders = tuple(o for o in sdk.orders if o.id not in order_ids)
+        return dict(canceled=order_ids, not_canceled={})
+    sdk.cancel_orders = cancel
+    handles = []
+    try:
+        live.run_once()
+        handles = live.run_protection_once()
+        assert all(event.wait(3) for event in entered)
+        assert len(handles) == 2 and sdk.posts == []
+        terminal.update({o.id: o.model_copy(update={'status': 'CANCELED', 'size_matched': Decimal(2)}) for o in orders})
+        if other_fill:
+            sdk.orders = tuple(o.model_copy(update={'status': 'FILLED', 'size_matched': Decimal(1)}) if o.id == peer.id else o for o in sdk.orders)
+        release.set()
+        for handle in handles:
+            handle.result(3); handle._thread.join(3)
+            assert handle.done()
+        for quantity in ('10', '8'):
+            sdk.positions = tuple(dict(p, size=quantity) for p in sdk.positions)
+            for _ in range(2):
+                d2_tick(live)
+            assert sdk.posts == []
+            cancels = [r for r in live.store.lp_holding_sell_orders(WALLET, 'polymarket') if r.get('kind') == 'cancel']
+            assert len(cancels) == 2 and all(r['state'] != 'terminal' for r in cancels)
+        expected = 5 if other_fill else 6
+        sdk.positions = tuple(dict(p, size=str(expected)) for p in sdk.positions)
+        for _ in range(4):
+            d2_tick(live)
+        sell, = sdk.posts
+        assert sell['side'] == 'SELL' and sell['size'] == expected and sell['price'] == Decimal('.19')
+        assert {c for batch in sdk.cancels for c in batch} == {'cancel-A', 'cancel-B'} and len(sdk.cancels) == 2
+        cancels = [r for r in live.store.lp_holding_sell_orders(WALLET, 'polymarket') if r.get('kind') == 'cancel']
+        assert all(r['state'] == 'terminal' for r in cancels) and sdk.market_orders == []
+    finally:
+        release.set()
+        for handle in handles:
+            handle._thread.join(3)
+        assert live.close(3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('action', ['SELL', 'SELL_CANCEL'])
+def test_holding_permission_sql_does_not_hold_current_state(tmp_path, monkeypatch, action):
+    import sqlite3
+    from threading import Event, Thread
+    live, sdk, public, clock = imported_holding(tmp_path, monkeypatch)
+    if action == 'SELL_CANCEL':
+        sdk.orders = (_open_order('permission-cancel', 'SELL', price='.18', original='10'),)
+    execution = monitored(live, tmp_path)
+    live.run_once()
+    entered, release, progressed = Event(), Event(), Event()
+    connect, queries, handles, errors = sqlite3.connect, [], [], []
+    class PermissionRead(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            if sql.startswith('SELECT * FROM incidents WHERE acknowledged_at IS NULL'):
+                queries.append(sql)
+                if len(queries) == 3:
+                    entered.set()
+                    assert release.wait(5), 'permission SQL release watchdog'
+            return super().execute(sql, *args, **kwargs)
+    def dispatch():
+        try:
+            handles.extend(live.run_protection_once())
+        except BaseException as exc:
+            errors.append(exc)
+    def probe():
+        live.state.snapshot()
+        live.request_running(False)
+        progressed.set()
+    worker, observer = Thread(target=dispatch), Thread(target=probe)
+    try:
+        monkeypatch.setattr(sqlite3, 'connect', lambda *a, **k: connect(*a, **(k | dict(factory=PermissionRead))))
+        worker.start()
+        assert entered.wait(3), 'real SQL permission read watchdog'
+        observer.start()
+        assert progressed.wait(3), 'current snapshot/control blocked behind permission SQL'
+        row = live.store.create_recovery_execution(dict(reason='offline permission revoked'), idempotency_key=action)
+        live.store.open_incident(row['execution_id'], dict(reason='offline permission revoked'))
+        release.set()
+        worker.join(3); observer.join(3)
+        assert not worker.is_alive() and not observer.is_alive() and errors == []
+        for handle in handles:
+            handle.result(3); handle._thread.join(3)
+            assert handle.done()
+        assert sdk.posts == sdk.cancels == sdk.market_orders == []
+        assert live.status()['native_inflight'] == 0
+        assert live.store.unacknowledged_incident() is not None
+    finally:
+        release.set()
+        if worker.ident: worker.join(3)
+        if observer.ident: observer.join(3)
+        for handle in handles: handle._thread.join(3)
+        assert live.close(3)
+        live.trading.close()
+
+
+def test_blocked_inventory_persistence_preserves_current_reads_and_denies_uncommitted_send(tmp_path, monkeypatch):
+    from threading import Event, Thread
+    from tests.test_lp_business_writer_contract import blocked_database, wait_status
+    live, sdk, public, clock = imported_holding(tmp_path, monkeypatch)
+    blocker = None
+    handles, errors = [], []
+    read_done = Event()
+    def read():
+        try:
+            live.run_once()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            read_done.set()
+    def protection():
+        try:
+            handles.extend(live.run_protection_once())
+        except BaseException as exc:
+            errors.append(exc)
+    reader, dispatcher = Thread(target=read), Thread(target=protection)
+    try:
+        live.run_once()
+        wait_status(live.writer, lambda state: state['pending_entries'] == state['inflight_entries'] == 0)
+        blocker, entered = blocked_database(live.store, monkeypatch)
+        sdk.positions = tuple(dict(p, size='12') for p in sdk.positions)
+        reader.start()
+        assert read_done.wait(3), 'current account reads must finish independently of ordinary business SQL'
+        assert errors == [] and live.state.snapshot().positions[0].quantity.value == 12
+        dispatcher.start()
+        assert entered.wait(3), 'reliable mutation intent / inventory SQL watchdog'
+        # The database is still locked: a queued or uncommitted reservation
+        # cannot authorize a native send, and control/snapshots remain usable.
+        live.state.snapshot()
+        live.request_running(False)
+        assert sdk.posts == sdk.cancels == []
+        assert live.close(0) is False
+        blocker.execute('ROLLBACK'); blocker.close(); blocker = None
+        dispatcher.join(3); reader.join(3)
+        assert not dispatcher.is_alive() and not reader.is_alive() and errors == []
+        for handle in handles:
+            handle.result(3); handle._thread.join(3)
+            assert handle.done()
+        assert sdk.posts == sdk.cancels == sdk.market_orders == []
+    finally:
+        if blocker is not None:
+            if blocker.in_transaction: blocker.execute('ROLLBACK')
+            blocker.close()
+        if reader.ident: reader.join(3)
+        if dispatcher.ident: dispatcher.join(3)
+        assert live.close(3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize(('reopen', 'buy_baseline', 'buy_final'), [(False, '0', '1'), (True, '2', '3')])
+def test_holding_cancel_convergence_includes_proven_concurrent_buy(tmp_path, monkeypatch, reopen, buy_baseline, buy_final):
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from open_trader.polymarket_lp_current_state import ValidatedStartAdmission
+    live, sdk, public, clock = imported_holding(tmp_path, monkeypatch, ask='.18')
+    sdk.positions = tuple(dict(p, average_price='.19') for p in sdk.positions)
+    sells = [_open_order(name, 'SELL', price='.18', original='5') for name in ('with-buy-A', 'with-buy-B')]
+    buy = _open_order('concurrent-buy', 'BUY', price='.18', original='5', matched=buy_baseline)
+    sdk.orders = (*sells, buy)
+    terminals, reads = {}, []
+    def exact(*, order_id):
+        reads.append(order_id)
+        return terminals.get(order_id)
+    sdk.get_order = exact
+    def cancel(*, order_ids):
+        sdk.cancels.append(order_ids)
+        sdk.orders = tuple(o for o in sdk.orders if o.id not in order_ids)
+        return dict(canceled=order_ids, not_canceled={})
+    sdk.cancel_orders = cancel
+    try:
+        d2_tick(live)
+        assert len(sdk.cancels) == 2 and {x for batch in sdk.cancels for x in batch} == {s.id for s in sells}
+        assert sdk.posts == []
+        # Reopen with the saved cancellation baseline while final quantities
+        # remain unknown. Neither missing BUY nor missing SELL means matched0.
+        sdk.orders = ()
+        if reopen:
+            assert live.close(3)
+            previous = live
+            live = LPD2LiveExecution(previous.store, previous.trading, account_id=WALLET, venue='polymarket',
+                process_epoch='concurrent-buy-reopen', policy=previous.policy, clock=previous._clock, utc_now=previous._utc_now)
+            live.initialize(ValidatedStartAdmission('concurrent-buy-reopen', 'offline-permit'))
+        terminals.update({s.id: s.model_copy(update={'status': 'CANCELED', 'size_matched': Decimal(2)}) for s in sells})
+        for quantity in ('10', '8', '6'):
+            sdk.positions = tuple(dict(p, size=quantity) for p in sdk.positions)
+            for _ in range(3):
+                d2_tick(live)
+            assert sdk.posts == [], 'stale balances cannot replace a missing exact BUY quantity'
+            assert all(r['state'] != 'terminal' for r in live.store.lp_holding_sell_orders(WALLET, 'polymarket')
+                if r.get('kind') == 'cancel')
+        terminals[buy.id] = buy.model_copy(update={'status': 'CANCELED', 'size_matched': Decimal(buy_final)})
+        for _ in range(2):
+            d2_tick(live)  # exact BUY+1 with stale account6 still grants no order
+        assert sdk.posts == []
+        sdk.positions = tuple(dict(p, size='7') for p in sdk.positions)
+        for _ in range(4):
+            d2_tick(live)
+        sell, = sdk.posts
+        assert sell['side'] == 'SELL' and sell['size'] == 7 and sell['price'] == Decimal('.19')
+        assert sell['post_only'] is True and sell['order_type'] == 'GTC'
+        assert buy.id in reads
+        rows = [r for r in live.store.lp_holding_sell_orders(WALLET, 'polymarket') if r.get('kind') == 'cancel']
+        assert len(rows) == 2 and all(r['state'] == 'terminal' for r in rows)
+        assert len(sdk.cancels) == 2 and all(buy.id not in batch for batch in sdk.cancels)
+        assert sdk.market_orders == []
+    finally:
+        assert live.close(3)
+        live.trading.close()
+
+
+@pytest.mark.parametrize('mode', ['complete_absent', 'missing', 'stale'])
+def test_fully_filled_holding_cancels_accept_complete_absent_zero(tmp_path, monkeypatch, mode):
+    live, sdk, public, clock = imported_holding(tmp_path, monkeypatch, ask='.18')
+    sdk.positions = tuple(dict(p, average_price='.19') for p in sdk.positions)
+    orders = [_open_order(name, 'SELL', price='.18', original='5') for name in ('full-cancel-A', 'full-cancel-B')]
+    sdk.orders = tuple(orders)
+    terminals = {}
+    sdk.get_order = lambda *, order_id: terminals.get(order_id)
+    def cancel(*, order_ids):
+        sdk.cancels.append(order_ids)
+        sdk.orders = tuple(o for o in sdk.orders if o.id not in order_ids)
+        return dict(canceled=order_ids, not_canceled={})
+    sdk.cancel_orders = cancel
+    try:
+        d2_tick(live)
+        assert len(sdk.cancels) == 2 and sdk.posts == []
+        # Both native cancels have ended, but ACK/absence cannot stand in for
+        # the exact FILLED5 quantities of their distinct original orders.
+        d2_tick(live)
+        assert all(r['state'] != 'terminal' for r in live.store.lp_holding_sell_orders(WALLET, 'polymarket'))
+        terminals.update({o.id: o.model_copy(update={'status': 'FILLED', 'size_matched': Decimal(5)}) for o in orders})
+        for _ in range(2):
+            d2_tick(live)  # exact full fills with stale account10 cannot retire
+        assert sdk.posts == []
+        assert all(r['state'] != 'terminal' for r in live.store.lp_holding_sell_orders(WALLET, 'polymarket'))
+        if mode == 'missing':
+            sdk.positions = None  # missing/failed source is not complete empty coverage
+            for _ in range(2):
+                d2_tick(live)
+            assert not live.state.snapshot().observation.positions_complete
+            assert all(r['state'] != 'terminal' for r in live.store.lp_holding_sell_orders(WALLET, 'polymarket'))
+        if mode == 'stale':
+            sdk.positions = ()
+            live.run_once()  # complete absent-zero exists but has not authorized retirement
+            assert live.state.snapshot().positions == ()
+            assert live.state.snapshot().observation.positions_complete
+            clock[0] += 300
+            for handle in live.run_protection_once():
+                handle.result(3); handle._thread.join(3)
+            assert all(r['state'] != 'terminal' for r in live.store.lp_holding_sell_orders(WALLET, 'polymarket'))
+        sdk.positions = ()  # fresh COMPLETE threshold0 absence proves zero
+        for _ in range(3):
+            d2_tick(live)
+        rows = live.store.lp_holding_sell_orders(WALLET, 'polymarket')
+        assert len(rows) == 2 and all(r.get('kind') == 'cancel' and r['state'] == 'terminal' for r in rows)
+        assert live.state.snapshot().positions == () and sdk.posts == []
+        sdk.positions = (dict(condition_id=CONDITION_ID, token_id=TOKEN_ID, size='2', average_price='.19'),)
+        for _ in range(3):
+            d2_tick(live)
+        sell, = sdk.posts
+        assert sell['side'] == 'SELL' and sell['size'] == 2 and sell['price'] == Decimal('.19')
+        assert sell['post_only'] is True and sell['order_type'] == 'GTC'
+        assert {x for batch in sdk.cancels for x in batch} == {o.id for o in orders} and len(sdk.cancels) == 2
+        assert sdk.market_orders == []
     finally:
         assert live.close(3)
         live.trading.close()

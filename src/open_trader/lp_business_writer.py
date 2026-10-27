@@ -12,6 +12,17 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class HoldingInventoryRecord:
+    """Best-effort restart guard; never a mutation admission or send intent."""
+    payload: str
+
+    def __post_init__(self):
+        row = json.loads(self.payload)
+        if row.get('kind') != 'inventory' or row.get('state') != 'terminal':
+            raise ValueError('holding_inventory_record_required')
+
+
+@dataclass(frozen=True)
 class RequestRecord:
     account_id: str
     process_epoch: str
@@ -172,7 +183,7 @@ class LPBusinessWriter:
         self._thread.start()
 
     def offer(self, record):
-        if type(record) not in (RequestRecord, ReceiptRecord, ProgressRecord, CancelTerminalRecord):
+        if type(record) not in (RequestRecord, ReceiptRecord, ProgressRecord, CancelTerminalRecord, HoldingInventoryRecord):
             raise TypeError('closed_business_record_required')
         encoded = json.dumps(asdict(record), ensure_ascii=False, separators=(',', ':'), default=_encode_scalar)
         size = len(encoded.encode('utf-8'))
@@ -225,7 +236,11 @@ class LPBusinessWriter:
             failed = False
             saved = False
             try:
-                saved = self._store.lp_log_business_record(record)
+                if type(record) is HoldingInventoryRecord:
+                    self._store.lp_save_holding_sell(json.loads(record.payload))
+                    saved = True
+                else:
+                    saved = self._store.lp_log_business_record(record)
             except Exception as exc:
                 failed = True
                 # A raised transaction can have committed. Never replay it.

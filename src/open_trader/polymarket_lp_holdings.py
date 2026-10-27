@@ -7,11 +7,12 @@ from collections.abc import Mapping
 from decimal import Decimal
 from datetime import datetime
 import time
+import json
 from uuid import uuid4
 
-from .lp_business_writer import RequestRecord, ReceiptRecord, ProgressRecord
+from .lp_business_writer import RequestRecord, ReceiptRecord, ProgressRecord, HoldingInventoryRecord
 from .lp_order_ownership import normalize_sell_quantity
-from .polymarket_lp_current_state import CurrentOrderFact, Fact, ReceiptEvidence, SourceStamp, TerminalProof
+from .polymarket_lp_current_state import CurrentOrderFact, CurrentPositionFact, Fact, ReceiptEvidence, SourceStamp, TerminalProof
 from .polymarket_lp_risk import _freshness, _levels, _maybe_decimal, passive_exit_price, passive_cost_floor, TERMINAL_ORDER_STATES
 
 
@@ -25,6 +26,7 @@ class HoldingSells:
         for row in sorted(self.requests.values(), key=lambda r: r.get('sequence', 0)):
             if row.get('kind') == 'inventory':
                 self.anchors[self._identity(row)] = row
+        self._refresh_legacy_pending()
 
     def session_inventory(self, snapshot, identity):
         """Exact episode fills determine owned shares, independent of API inventory."""
@@ -114,8 +116,16 @@ class HoldingSells:
             sell_credit -= used_sell
             buy_credit -= used_buy
             if not sold_delta and not buy_delta:
-                sell_credit += max(Decimal(0), expected-position.quantity.value)
-            if not sold_delta:
+                decrease = max(Decimal(0), expected-position.quantity.value)
+                increase = max(Decimal(0), position.quantity.value-expected)
+                # A reversed unproved move cancels its earlier credit. It is
+                # not a second independent acquisition/sale of these shares.
+                reversed_buy, reversed_sell = min(decrease, buy_credit), min(increase, sell_credit)
+                buy_credit -= reversed_buy
+                sell_credit -= reversed_sell
+                sell_credit += decrease-reversed_buy
+                buy_credit += increase-reversed_sell
+            elif not sold_delta:
                 buy_credit += max(Decimal(0), position.quantity.value-expected)
         row = dict(account_id=self.live.account_id, venue=self.live.venue, condition_id=position.condition_id,
             token_id=position.token_id, request_id=uuid4().hex, kind='inventory', state='terminal', order_id=None,
@@ -123,15 +133,28 @@ class HoldingSells:
             generation=snapshot.current.cycle_generation, requested_at=self.live._utc_now().isoformat(),
             sales=sales, buys=buys, sell_credit=str(sell_credit), buy_credit=str(buy_credit),
             sequence=(old.get('sequence', 0)+1 if old else 1))
-        self._save(row)
         self.anchors[identity] = row
+        self.live.writer.offer(HoldingInventoryRecord(json.dumps(row, sort_keys=True)))
         return True
 
+    def _position(self, snapshot, identity):
+        positions = [p for p in snapshot.positions if (p.account_id.casefold(), p.condition_id, p.token_id)
+            == (identity[0].casefold(), *identity[1:])]
+        if len(positions) == 1:
+            return positions[0]
+        if not positions and self.live._positions_full_coverage and self._account_known(snapshot, self.live._utc_now()):
+            stamp = snapshot.observation.components['positions']
+            # Local proof projection only; never add a fabricated canonical row.
+            return CurrentPositionFact(self.live.account_id, *identity[1:], Fact('known', Decimal(0), (stamp,)),
+                Fact('unknown'), Fact('unknown'), Fact('unknown'), stamp)
+        return None
+
     def observe_frame(self, snapshot):
-        for position in snapshot.positions:
-            if position.quantity.state == 'known':
+        identities = {(p.account_id.casefold(), p.condition_id, p.token_id) for p in snapshot.positions} | set(self.anchors)
+        for identity in identities:
+            position = self._position(snapshot, identity)
+            if position is not None and position.quantity.state == 'known':
                 self.observe_account(snapshot, position)
-        self.sync_session_terminals(snapshot)
 
     def account_converged(self, snapshot, position):
         anchor = self.anchors.get((position.account_id.casefold(), position.condition_id, position.token_id))
@@ -180,7 +203,7 @@ class HoldingSells:
             if row.get('kind') == 'session' or order is None or order.terminal_proof is None:
                 continue
             proof = order.terminal_proof
-            position = next((p for p in snapshot.positions if (p.account_id, p.condition_id, p.token_id) == order.key[:3]), None)
+            position = self._position(snapshot, order.key[:3])
             observation = snapshot.observation
             if (proof.identity_verified and proof.matched.state == 'known'
                     and proof.original_size.value == Decimal(row['quantity'])
@@ -394,9 +417,74 @@ class HoldingSells:
         return True
 
     def _save(self, row):
+        # Current observations are memory-owned and audited asynchronously.
+        # A mutation/release still requires its latest restart guard and intent
+        # durably committed outside CurrentLPState before any external action.
+        anchor = self.anchors.get(self._identity(row))
+        if anchor is not None:
+            self.live.store.lp_save_holding_sell(anchor)
         self.live.store.lp_save_holding_sell(row)
         with self.live.state._lock:
             self.requests[row['request_id']] = row
+
+    def _refresh_orders(self):
+        """Read exact registered holding targets through the existing read lane."""
+        live = self.live
+        for row in tuple(self.requests.values()):
+            if (row.get('kind') in ('inventory', 'cancel', 'session') or row['state'] in ('terminal', 'rejected')
+                    or not row.get('order_id') or any(h.identity.request_id == row['request_id']
+                        and h._thread.is_alive() for h in live._native_jobs.values())):
+                continue
+            snapshot = live.state.snapshot()
+            key = (live.account_id, row['condition_id'], row['token_id'], row['order_id'])
+            order = next((o for o in snapshot.orders if o.key == key), None)
+            if order is not None:
+                live._refresh_protection_order(order, time.monotonic()+2)
+                continue
+            source = live._read_protection('order', key[1:], time.monotonic()+2)
+            value = source.value
+            if (not source.complete or source.error or not isinstance(value, Mapping)
+                    or (value.get('side'), value.get('price'), value.get('original_size')) !=
+                        ('SELL', Decimal(row['price']), Decimal(row['quantity']))):
+                continue
+            stamp = live._source_stamp(source)
+            fact = lambda amount: Fact('known', amount, (stamp,))
+            proof = TerminalProof(key, value['status'], fact(value['original_size']), fact(value['size_matched']), stamp, True) if value['status'] in TERMINAL_ORDER_STATES else None
+            incoming = CurrentOrderFact(key, 'SELL', value['status'], fact(value['price']), fact(value['original_size']),
+                fact(value['size_matched']), fact(value['remaining_size']), 'present', None,
+                fact(value['order_type']), fact(value['expiration']), 1, stamp)
+            current = live.state.snapshot()
+            live.state.accept_receipt_evidence(ReceiptEvidence(uuid4().hex, row['request_id'],
+                live.account_id, live.process_epoch, current.current.cycle_generation, key, 'SELL', 0,
+                order_fact=incoming, terminal_proof=proof))
+
+    def _refresh_cancel_buys(self, row):
+        """Resolve missing exact BUY quantities retained by this cancel baseline."""
+        live = self.live
+        for order_id, terms in row.get('buy_terms', {}).items():
+            key = (live.account_id, row['condition_id'], row['token_id'], order_id)
+            current = live.state.snapshot()
+            order = next((o for o in current.orders if o.key == key), None)
+            if order is not None:
+                live._refresh_protection_order(order, time.monotonic()+2)
+                continue
+            source = live._read_protection('order', key[1:], time.monotonic()+2)
+            value = source.value
+            if (not source.complete or source.error or not isinstance(value, Mapping)
+                    or (value.get('side'), value.get('price'), value.get('original_size')) !=
+                        ('BUY', Decimal(terms['price']), Decimal(terms['original_size']))
+                    or value['size_matched'] < Decimal(row['buy_matched_baseline'][order_id])):
+                continue
+            stamp = live._source_stamp(source)
+            fact = lambda amount: Fact('known', amount, (stamp,))
+            proof = TerminalProof(key, value['status'], fact(value['original_size']), fact(value['size_matched']), stamp, True) if value['status'] in TERMINAL_ORDER_STATES else None
+            incoming = CurrentOrderFact(key, 'BUY', value['status'], fact(value['price']), fact(value['original_size']),
+                fact(value['size_matched']), fact(value['remaining_size']), 'present', None,
+                fact(value['order_type']), fact(value['expiration']), 1, stamp)
+            current = live.state.snapshot()
+            live.state.accept_receipt_evidence(ReceiptEvidence(uuid4().hex, row['request_id'],
+                live.account_id, live.process_epoch, current.current.cycle_generation, key, 'BUY', 0,
+                order_fact=incoming, terminal_proof=proof))
 
     def _reconcile_cancels(self):
         live = self.live
@@ -406,7 +494,7 @@ class HoldingSells:
             with live.state._lock:
                 snapshot = live.state.snapshot()
                 identity = (live.account_id, row['condition_id'], row['token_id'])
-                if not self._eligible(snapshot, identity, allow_session=True):
+                if not self._account_known(snapshot, live._utc_now()):
                     continue
                 if any(h.identity.request_id == row['request_id'] and not h.done() for h in live._native_jobs.values()):
                     continue
@@ -448,15 +536,36 @@ class HoldingSells:
                     'holding:' + row['request_id'], row['condition_id'], row['token_id'], row['order_id'],
                     value['original_size'], value['size_matched'], value['price'], value['status'], stamp.checked_at))
                 continue
+            self._refresh_cancel_buys(row)
             with live.state._lock:
                 snapshot = live.state.snapshot()
                 observation = snapshot.observation
-                position = next((p for p in snapshot.positions if (p.account_id, p.condition_id, p.token_id) == identity), None)
-                expected = Decimal(row['position_quantity']) - (Decimal(row['final_matched']) - Decimal(row['matched_before']))
-                fresh = (observation.observation_id != row['final_observation_id']
+                position = self._position(snapshot, identity)
+                baseline = row.get('matched_baseline')
+                sales = {o.key[3]: str(o.size_matched.value) for o in snapshot.orders
+                    if o.key[:3] == identity and o.side == 'SELL' and o.size_matched.state == 'known'}
+                anchor = self.anchors.get((identity[0].casefold(), *identity[1:]))
+                sales = {**(anchor.get('sales', {}) if anchor else {}), **sales}
+                delta = (sum((Decimal(q)-Decimal(baseline.get(k, '0')) for k,q in sales.items()), Decimal(0))
+                    if baseline is not None else Decimal(row['final_matched']) - Decimal(row['matched_before']))
+                buy_baseline = row.get('buy_matched_baseline', {})
+                buys = {o.key[3]: str(o.size_matched.value) for o in snapshot.orders
+                    if o.key[:3] == identity and o.side == 'BUY' and o.size_matched.state == 'known'}
+                buys = {**(anchor.get('buys', {}) if anchor else {}), **buys}
+                bought_delta = sum((Decimal(q)-Decimal(buy_baseline.get(k, '0')) for k,q in buys.items()), Decimal(0)) if 'buy_matched_baseline' in row else Decimal(0)
+                buy_complete = all(any(o.key == (*identity, order_id) and o.side == 'BUY'
+                    and o.price.value == Decimal(terms['price']) and o.original_size.value == Decimal(terms['original_size'])
+                    and o.size_matched.state == 'known' and o.size_matched.value >= Decimal(buy_baseline[order_id])
+                    and (o.presence == 'present' or o.terminal_proof is not None and o.terminal_proof.identity_verified)
+                    for o in snapshot.orders) for order_id, terms in row.get('buy_terms', {}).items())
+                expected = Decimal(row['position_quantity']) - delta + bought_delta
+                siblings_final = all(r['state'] in ('finality_wait', 'terminal', 'rejected')
+                    for r in self.requests.values() if r.get('kind') == 'cancel' and self._identity(r) == self._identity(row))
+                fresh = (siblings_final and buy_complete and delta >= 0 and bought_delta >= 0 and observation.observation_id != row['final_observation_id']
                     and observation.components['positions'].checked_at >= datetime.fromisoformat(row['final_checked_at'])
                     and observation.order_view.orders_source.checked_at >= datetime.fromisoformat(row['final_checked_at'])
-                    and position is not None and position.quantity.state == 'known' and position.quantity.value == expected)
+                    and position is not None and position.quantity.state == 'known' and position.quantity.value == expected
+                    and self.account_converged(snapshot, position))
             if fresh:
                 for parent in tuple(self.requests.values()):
                     if parent.get('kind') != 'cancel' and parent.get('order_id') == row['order_id']:
@@ -466,7 +575,7 @@ class HoldingSells:
     def _cancel_current(self, snapshot, position, order, origin, row, lease):
         live = self.live
         identity = (position.account_id, position.condition_id, position.token_id)
-        if (not lease.allowed('SELL_CANCEL') or not self._eligible(snapshot, identity, allow_session=True)
+        if (not self._eligible(snapshot, identity, allow_session=True)
                 or snapshot.observation is not origin.observation or snapshot.trade_version != origin.trade_version
                 or position not in snapshot.positions or order not in snapshot.active_orders
                 or order.side != 'SELL' or order.key[:3] != identity
@@ -507,8 +616,20 @@ class HoldingSells:
                 condition_id=position.condition_id, token_id=position.token_id, quantity=str(order.remaining.value),
                 price=str(order.price.value), state='pending', order_id=order.key[3], kind='cancel', trigger=trigger,
                 original_size=str(order.original_size.value), matched_before=str(order.size_matched.value),
-                position_quantity=str(position.quantity.value), observation_id=origin.observation.observation_id,
+                position_quantity=str(position.quantity.value), matched_baseline={
+                    **self.anchors.get((position.account_id.casefold(), position.condition_id, position.token_id), {}).get('sales', {}),
+                    **{o.key[3]: str(o.size_matched.value) for o in origin.orders if o.key[:3] == order.key[:3]
+                        and o.side == 'SELL' and o.size_matched.state == 'known'}},
+                buy_matched_baseline={
+                    **self.anchors.get((position.account_id.casefold(), position.condition_id, position.token_id), {}).get('buys', {}),
+                    **{o.key[3]: str(o.size_matched.value) for o in origin.orders if o.key[:3] == order.key[:3]
+                        and o.side == 'BUY' and o.size_matched.state == 'known'}},
+                buy_terms={o.key[3]: dict(price=str(o.price.value), original_size=str(o.original_size.value))
+                    for o in origin.orders if o.key[:3] == order.key[:3] and o.side == 'BUY'},
+                observation_id=origin.observation.observation_id,
                 generation=origin.current.cycle_generation, requested_at=live._utc_now().isoformat())
+            if not lease.allowed('SELL_CANCEL'):
+                return None
             with live.state._lock:
                 if (not self._cancel_current(live.state.snapshot(), position, order, origin, row, lease)
                         or any(r.get('kind') == 'cancel' and r['order_id'] == row['order_id']
@@ -525,9 +646,9 @@ class HoldingSells:
                 from .polymarket_lp_live_execution import _ProtectionOutcome
                 outcome = 'unknown'
                 try:
-                    self._refresh_legacy_pending()
+                    permitted = lease.allowed('SELL_CANCEL')
                     with live.state._lock:
-                        permitted = self._cancel_current(live.state.snapshot(), position, order, origin, row, lease)
+                        permitted = permitted and self._cancel_current(live.state.snapshot(), position, order, origin, row, lease)
                     if permitted:
                         # Narrow OQ2 permission: no generic ownership enrollment.
                         response = live.trading.cancel_orders_detailed((order.key[3],))
@@ -552,9 +673,10 @@ class HoldingSells:
     def evaluate(self):
         live = self.live
         handles = []
-        self._refresh_legacy_pending()
         self._reconcile_cancels()
+        self._refresh_orders()
         self.observe_frame(live.state.snapshot())
+        self.sync_session_terminals(live.state.snapshot())
         for position in live.state.snapshot().positions:
             identity = (position.account_id, position.condition_id, position.token_id)
             snapshot = live.state.snapshot()
@@ -617,7 +739,7 @@ class HoldingSells:
                         generation=snapshot.current.cycle_generation, requested_at=live._utc_now().isoformat())
                     self.requests[request_id] = row
                 # SQL admission occurs outside the state owner lock.
-                live.store.lp_save_holding_sell(row)
+                self._save(row)
                 from .polymarket_lp_live_execution import _ProtectionAction
                 scope = (*identity, 'holding:' + request_id)
                 action = _ProtectionAction(request_id, live.account_id, scope, 'holding_sell')
@@ -638,11 +760,11 @@ class HoldingSells:
 
     def _current(self, origin, position, row, lease):
         live = self.live
-        self._refresh_legacy_pending()
+        permitted = lease.allowed('SELL')
         with live.state._lock:
             current = live.state.snapshot()
             identity = (position.account_id, position.condition_id, position.token_id)
-            return (lease.allowed('SELL') and self._eligible(current, identity)
+            return (permitted and self._eligible(current, identity)
                 and self._market(current, position) is not None
                 and current.observation is origin.observation and current.trade_version == origin.trade_version
                 and position in current.positions and self.requests.get(row['request_id']) == row

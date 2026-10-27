@@ -756,6 +756,7 @@ def test_stop_trigger_evidence_is_latched_across_restart(tmp_path) -> None:
         residual_value=Decimal("24.99"),
         passive_status="LIVE",
     )
+    exchange.snapshot_value["orders"][1]["price"] = Decimal("0.30")
     triggered_at = current[0].isoformat(timespec="microseconds").replace("+00:00", "Z")
     store.lp_update_session(session_id, patch={
         "stop_loss_latched": True, "stop_loss_triggered_at": triggered_at,
@@ -776,6 +777,7 @@ def test_stop_trigger_evidence_is_latched_across_restart(tmp_path) -> None:
         residual_value=Decimal("25.20"),
         passive_status="LIVE",
     )
+    exchange.snapshot_value["orders"][1]["price"] = Decimal("0.30")
     later = service.tick()
     assert later["opening_loss"] == Decimal("4.80")
     assert later["stop_loss_triggered_at"] == triggered_at
@@ -2688,6 +2690,7 @@ def test_scoring_uses_current_order_cadence_and_status_freshness(tmp_path) -> No
         passive_status="LIVE",
         orders_terminal=False,
     )
+    passive["orders"][1]["price"] = Decimal("0.30")
     exchange.snapshot_value = passive
     next_due = service.tick()
     assert next_due["state"] == "passive_exit"

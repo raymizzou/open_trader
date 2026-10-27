@@ -2773,6 +2773,19 @@ def test_persistently_invalid_incumbent_qualification_preserves_existing_protect
         tmp_path / 'runtime', monkeypatch, quantity='10', submit=True,
         budget='7', bid='.40', ask='.42'
     )
+    # The independent holding lane must receive its own real venue identity;
+    # invalid candidate capture still grants no new BUY/session authority.
+    from polymarket.models.clob.order_response import AcceptedOrder
+    from tests.test_lp_order_registration_contract import _open_order
+    initial_post = sdk.post_order
+    def post(signed):
+        if signed['side'] != 'SELL':
+            return initial_post(signed)
+        sdk.posts.append(signed)
+        sdk.orders += (_open_order('holding-independent', 'SELL', price=str(signed['price']), original=str(signed['size'])),)
+        return AcceptedOrder(order_id='holding-independent', status='live', making_amount=Decimal(0),
+            taking_amount=Decimal(0), trade_ids=(), transactions_hashes=())
+    sdk.post_order = post
     origin = public.now
     producer, direction = _qualified_service(
         tmp_path / 'capture', origin, condition=CONDITION_ID, token=TOKEN_ID
@@ -2798,7 +2811,7 @@ def test_persistently_invalid_incumbent_qualification_preserves_existing_protect
         template = deepcopy(direction)
         previous_observation_id = None
         previous_read_sequence = None
-        cancel_requests = set()
+        cancel_requests, all_requests = set(), set()
         for second in (0, 599, 600, 601, 1200):
             clock[0] = second
             current = origin + timedelta(seconds=second)
@@ -2833,8 +2846,15 @@ def test_persistently_invalid_incumbent_qualification_preserves_existing_protect
             for attempt in attempts:
                 attempt.result(timeout=3)
                 attempt._thread.join(3)
-                assert attempt.done() and attempt.identity.request_id not in cancel_requests
-                cancel_requests.add(attempt.identity.request_id)
+                assert attempt.done() and attempt.identity.request_id not in all_requests
+                all_requests.add(attempt.identity.request_id)
+                if getattr(attempt.identity, 'kind', None) != 'holding_sell':
+                    cancel_requests.add(attempt.identity.request_id)
+            if any(getattr(attempt.identity, 'kind', None) == 'holding_sell' for attempt in attempts):
+                # An actual independent holding receipt invalidates financial
+                # authority. Only a fresh complete account read restores it.
+                assert live.state.snapshot().new_capacity.state == 'unknown'
+                assert live.run_once(invalid_capture).outcomes == ()
             assert live.run_protection_once()==()  # no new request from the consumed raw source
             assert result.outcomes == ()
             observation = result.acceptance.observation
@@ -2849,10 +2869,12 @@ def test_persistently_invalid_incumbent_qualification_preserves_existing_protect
                                 f'market:{CONDITION_ID}:{TOKEN_ID}'):
                 source = observation.source_frame.sources[source_name]
                 assert source.checked_at == current
-            assert tuple(order.id for order in sdk.orders) == ('entry-A',)
-            assert sdk.posts == [dict(token_id=TOKEN_ID, price=Decimal('.40'),
+            assert {order.id for order in sdk.orders} == {'entry-A', 'holding-independent'}
+            assert [o for o in sdk.posts if o['side'] == 'BUY'] == [dict(token_id=TOKEN_ID, price=Decimal('.40'),
                                       size=Decimal('10'), side='BUY', post_only=True,
                                       expiration=None, order_type='GTC')]
+            holding, = [o for o in sdk.posts if o['side'] == 'SELL']
+            assert holding['price'] == Decimal('.42') and holding['size'] == 10 and holding['post_only'] is True
             assert sdk.market_orders == []
             assert sdk.positions[0]['size'] == '10'
             snapshot = live.state.snapshot()
@@ -2862,18 +2884,19 @@ def test_persistently_invalid_incumbent_qualification_preserves_existing_protect
             assert snapshot.new_capacity.value == Decimal('3')
             baseline = next(iter(snapshot.baselines.values()))
             assert baseline is baseline_before
-            assert snapshot.orders[0].key[3] == 'entry-A'
-            assert snapshot.orders[0].price.value == Decimal('.40')
-            assert snapshot.orders[0].remaining.value == Decimal('10')
+            entry_order = next(o for o in snapshot.orders if o.side == 'BUY')
+            assert entry_order.key[3] == 'entry-A'
+            assert entry_order.price.value == Decimal('.40')
+            assert entry_order.remaining.value == Decimal('10')
             yield_key = (WALLET, CONDITION_ID, TOKEN_ID, 'entry-A')
             assert yield_key in snapshot.yields
             yield_state = snapshot.yields[yield_key]
             assert all(failure.data_failures == 0
                        for failure in snapshot.failure_states.values())
-            assert tuple(order for order in snapshot.orders if order.side == 'SELL') == ()
+            assert {order.key[3] for order in snapshot.orders if order.side == 'SELL'} == {'holding-independent'}
             assert len(snapshot.sells) == 1
             sell_state = next(iter(snapshot.sells.values()))
-            assert tuple(sell_state.current_sells) == ()
+            assert {o.key[3] for o in sell_state.current_sells} <= {'holding-independent'}
             assert sell_state.passive is None and sell_state.protected is None
             if yield_mode == 'known_current_yield':
                 assert yield_state.yield_pct_per_hour.state == 'known'

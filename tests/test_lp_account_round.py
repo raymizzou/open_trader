@@ -2669,7 +2669,9 @@ def test_stale_passive_exit_intent_fails_closed_before_post(tmp_path) -> None:
 
     # The entry is already durably resolved, so only the stale shared bundle
     # can block this new passive-exit authorization.
-    store.lp_update_session("session-01", patch={"submit_status": "accepted"})
+    store.lp_update_session("session-01", patch={"submit_status": "accepted",
+        "buy_filled_quantity": "2", "sold_quantity": "0", "buy_cost": ".60",
+        "position_reconciled": True, "verified_order_fills": {"order-01": {"quantity_known": True}}})
     # A concurrent trade makes the captured shared bundle stale before the
     # new passive-exit intent is authorized.
     store.lp_register_trade_change("session-02")

@@ -1517,7 +1517,12 @@ class LPD2LiveExecution:
             # A restored request is an unresolved prior-process obligation,
             # not permission to submit it again from a fresh account frame.
             # New requests in this process keep their existing retry policy.
-            if key in self._restored_read_cancels:continue
+            if key in self._restored_read_cancels:
+                # A fresh account listing alone cannot replay a boot marker.
+                # An actual successful current-process market attempt resets
+                # the cause and permits a new, independently guarded decision.
+                if failure.last_attempt is None or failure.consecutive_failures != 0:continue
+                self._restored_read_cancels.discard(key)
             progress=snapshot.progress.get(failure.protection_key)
             if failure.protection_key is None or progress is None:continue
             order=next((o for o in snapshot.active_orders if o.key==key and o.side=='BUY'),None)

@@ -163,7 +163,7 @@ def write_priority(operation):
 
 LP_WRITE_OPERATIONS = frozenset({
     'lp_bind_instance',
-    'lp_register_order_provenance',
+    'lp_register_order_provenance', 'lp_save_holding_sell',
     'consume_lp_preview', 'lp_claim_manual_command', 'lp_finish_manual_command',
     'lp_record_book_samples', 'lp_save_price_history_batch', 'lp_record_market_exclusion',
     'lp_prune_market_exclusions', 'lp_clear_ended_market_exclusions', '_ensure_lp_metadata_cache_schema',
