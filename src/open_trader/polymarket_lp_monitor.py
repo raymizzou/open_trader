@@ -33,6 +33,45 @@ def section(status='unknown', reason='数据未读全，当前情况未知', **v
     return dict(status=status, reason=reason, **values)
 
 
+def read_health(auto, now):
+    """Copy only the bounded public cleanup schema; absent evidence is unknown."""
+    unknown = section(reason='读取清理状态未知', cleanup_fault_details=None, new_buy_block_reasons=None)
+    runtime = mapping(mapping(auto.get('diagnostics')).get('async_reads'))
+    details = mapping(runtime.get('cleanup_fault_details'))
+    total, omitted, items = (details.get(key) for key in ('total', 'omitted', 'items'))
+    reasons = runtime.get('new_buy_block_reasons')
+    if (type(total) is not int or type(omitted) is not int or min(total, omitted) < 0
+            or not isinstance(items, (list, tuple)) or len(items) > 16 or total != omitted+len(items)
+            or type(runtime.get('cleanup_faults')) is not int or runtime['cleanup_faults'] != total
+            or not isinstance(reasons, (list, tuple)) or len(reasons) > 3
+            or any(type(r) is not str or r not in ('cleanup_fault', 'capacity', 'deferred') for r in reasons)
+            or len(set(reasons)) != len(reasons) or type(runtime.get('new_buy_allowed')) is not bool
+            or runtime['new_buy_allowed'] != (not reasons)):
+        return unknown
+    copied = []
+    for raw in items:
+        row = mapping(raw)
+        lane, kind, reason = (row.get(key) for key in ('lane', 'kind', 'reason'))
+        since = moment(row.get('since'))
+        if (lane not in ('buy', 'financial', 'exact', 'low')
+                or kind not in dict(buy=('buy',), financial=('financial',), exact=('exact',),
+                    low=('sell', 'position', 'holding', 'income', 'unknown')).get(lane, ())
+                or reason not in ('delayed_read_cleanup', 'port_close_failure')
+                or row.get('active') is not True or type(row.get('blocks_new_buy')) is not bool
+                or row['blocks_new_buy'] != (lane != 'buy') or since is None or since > now):
+            return unknown
+        copied.append(dict(lane=lane, kind=kind, reason=reason, since=since.isoformat(),
+            active=True, blocks_new_buy=row['blocks_new_buy']))
+    if any(row['blocks_new_buy'] for row in copied) and 'cleanup_fault' not in reasons:
+        return unknown
+    blocked = 'cleanup_fault' in reasons
+    reason = ('读取清理故障，暂停新增 BUY' if blocked else '读取容量已满，暂停新增 BUY' if 'capacity' in reasons
+        else '读取需求排队，暂停新增 BUY' if 'deferred' in reasons else '已有 BUY 读取清理故障' if total
+        else '读取清理正常')
+    return section('abnormal' if blocked else 'attention' if total or reasons else 'normal', reason,
+        cleanup_fault_details=dict(total=total, omitted=omitted, items=copied), new_buy_block_reasons=list(reasons))
+
+
 def unknown_summary(now=None):
     result = dict(as_of=(now or datetime.now(UTC)).isoformat(), timezone='Asia/Tokyo',
                   **{key: section() for key in SECTIONS})
@@ -134,10 +173,14 @@ class LPMonitorSummary:
                 or dashboard.get('candidate_state') in ('stale','failed','error'))
             failure_age = self.duration('candidate_failure', failed, now)
             pool_state, pool_reason = state, reason
+            health = read_health(auto, now)
             if auto.get('fatal'):
                 pool_state, pool_reason = 'abnormal', '做市出现致命错误'
             elif auto.get('desired_running') is True and auto.get('effective_running') is False:
                 pool_state, pool_reason = 'abnormal', '做市想开但实际没开'
+            elif (known and auto.get('desired_running') is True and auto.get('effective_running') is True
+                    and health['status'] == 'abnormal'):
+                pool_state, pool_reason = 'abnormal', health['reason']
             elif candidate_source and candidate_count == 0 and auto.get('desired_running') is True:
                 pool_state, pool_reason = 'abnormal', '有效候选为零'
             elif failed and failure_age >= 600:
@@ -153,7 +196,7 @@ class LPMonitorSummary:
                 desired_running=auto.get('desired_running'), effective_running=auto.get('effective_running'),
                 fatal=bool(auto.get('fatal')), eligible_candidates=candidate_count if candidate_source else None,
                 candidate_last_success_at=candidate_stamp.isoformat() if candidate_stamp else None,
-                candidate_failure_seconds=failure_age if failed else None)
+                candidate_failure_seconds=failure_age if failed else None, read_health=health)
             checked = moment(dashboard.get('checked_at'))
             balance, allowance = number(dashboard.get('balance')), number(dashboard.get('allowance'))
             capacity = number(auto.get('new_capacity_usd'))
