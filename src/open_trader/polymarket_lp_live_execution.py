@@ -1043,7 +1043,7 @@ class LPD2LiveExecution:
             if command['session_id'] not in self._manual_groups:
                 self._manual_groups[command['session_id']] = (scope, MappingProxyType(dict(command)))
             self._opening_order_associations[order_key] = _OpeningOrderAssociation(scope,order_key,command['request_id'],
-                record.observation_id,stamp,requested_at=record.requested_at)
+                record.observation_id,order.source,requested_at=record.requested_at)
 
     def bind_mutation_admission(self, owner, acquire):
         if self._mutation_owner is not None or not callable(acquire):
@@ -4170,6 +4170,21 @@ class LPD2LiveExecution:
             if disposition != 'applied':
                 raise ValueError('protection_cancel_completion_not_applied:' + disposition)
 
+    def _book_after_local_buy_acceptance(self, book, orders):
+        accepted = tuple(association.source.checked_at for order in orders
+            if (association := self._opening_order_associations.get(order.key)) is not None
+            and association.requested_at is not None and association.source.checked_at is not None)
+        if not accepted:
+            return True  # Recovered orders have no proven local acceptance time.
+        if not isinstance(book, Mapping) or any(
+                book.get('condition_id') != order.key[1] or book.get('token_id') != order.key[2]
+                for order in orders):
+            return None
+        timestamp = book.get('timestamp')
+        if not isinstance(timestamp, datetime) or timestamp.tzinfo is None:
+            return None
+        return timestamp >= max(accepted)
+
     def _register_first_seen(self, snapshot, roles):
         observation = snapshot.observation
         buckets = {}
@@ -4191,6 +4206,11 @@ class LPD2LiveExecution:
             book = (source.value.get('book') if source and source.complete and not source.error
                 and isinstance(source.value, Mapping) else None)
             if isinstance(book, Mapping) and (book.get('condition_id') != identity[1] or book.get('token_id') != identity[2]):
+                book = None
+            after_acceptance = self._book_after_local_buy_acceptance(book, orders)
+            if after_acceptance is False:
+                continue
+            if after_acceptance is None:
                 book = None
             level = old.bid_level if old else (self.policy.buy_price_level
                 if any(self._managed_pool_role(current, o, roles.get(identity[1], {})) for o in orders) else None)
@@ -4387,6 +4407,11 @@ class LPD2LiveExecution:
                     observation.source_frame.sources.get(f'market:{key.scope[1]}:{key.scope[2]}'))
                 book = (source.value.get('book') if source and source.complete and not source.error
                     and isinstance(source.value, Mapping) else None)
+                after_acceptance = self._book_after_local_buy_acceptance(book, orders)
+                if after_acceptance is False:
+                    continue
+                if after_acceptance is None:
+                    book = None
                 estimate = evaluate_lp_bid_levels(book, price=key.price,
                     own_remaining=sum((o.remaining.value for o in orders), Decimal(0)),
                     bid_level=baseline.bid_level, baseline_levels=baseline.bid_levels,

@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-27 — BUY protection review repairs (#486 / PR #488)
+
+- Ignore exchange-timestamped books that predate a known local BUY acceptance when capturing or comparing bid-level baselines. Keep the original automatic baseline and do not add unreadable-book failures for those older snapshots; missing or untrusted times remain UNKNOWN. Preserve recovered-order handling and exact-order cancellation.
+- Correct the stable manual-order service fixture to include its actual resting price, and observe enough accepted reads to exercise the unreadable-book boundary before restart assertions. Preserve real child/in-process shutdown watchdogs and native resource ownership. No deployment is included.
+
 ## 2026-10-27 — Fixed BUY bid-level protection (#486)
 
 - Protect automatic trial/income BUYs and web-manual BUYs against any price or quantity change in bids 1 through their fixed entry level, including the order level. Exclude known own remaining quantity from public depth; cancel through the existing exact-order channel with `bid_level_changed`, without a percentage threshold or cooldown.

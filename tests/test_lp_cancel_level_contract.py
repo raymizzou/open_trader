@@ -238,3 +238,88 @@ def test_buy_three_setting_remains_rejected(tmp_path,monkeypatch):
     finally:
         assert live.close(timeout=3)
         live.trading.close()
+
+
+@pytest.mark.parametrize('origin',['auto','manual'])
+@pytest.mark.parametrize('external',['100','10'],ids=['external-ge-own','external-lt-own'])
+def test_pre_acceptance_book_does_not_cancel_new_buy(tmp_path,monkeypatch,origin,external):
+    from datetime import timedelta
+    from polymarket.models.clob.order_book import OrderBookLevel
+    from tests.test_lp_d2_manual_bridge import manual_runtime,entry
+    from tests.test_lp_order_registration_contract import TOKEN_ID
+    if origin=='auto':
+        live,sdk,public,clock=_d2_protection_runtime(tmp_path,monkeypatch,
+            quantity='20',submit=False,depth=external)
+        post=sdk.post_order
+        def accept(signed):
+            clock[0]+=2
+            return post(signed)
+        sdk.post_order=accept
+        book=live.trading.lp_order_books((TOKEN_ID,))[TOKEN_ID]
+        from open_trader.polymarket_lp_market_reader import SourceResult
+        from tests.test_lp_order_registration_contract import CONDITION_ID
+        result=live.run_once(SourceResult('accepted-auto-fixture',(
+            dict(condition_id=CONDITION_ID,market_id='market-1',token_id=TOKEN_ID,
+                venue='polymarket',price=D('.30'),quantity=D('20'),order_type='GTC',
+                expiration=None,post_only=True,send_options=(),direction=dict(
+                    market=dict(reward_min_size=D('1'),reward_max_spread=D('.10')),
+                    book=book,daily_pool_usd=D('24'))),),checked_at=book['received_at']))
+        assert [o.status.value for o in result.outcomes]==['accepted']
+        oid='entry-A'
+        before=next(iter(live.state.snapshot().baselines.values()))
+        acceptance=live.state.snapshot().orders[0].source.checked_at
+        def tick():clock[0]+=.01
+    else:
+        execution,live,sdk,public,clock=manual_runtime(tmp_path,monkeypatch)
+        public.lower_bids=(OrderBookLevel(price=D('.29'),size=D('1000')),)
+        post=sdk.post_order
+        def accept(signed):
+            clock[0]+=timedelta(seconds=2)
+            return post(signed)
+        sdk.post_order=accept
+        result=execution.lp_submit_entry(entry(clock,price='.30'))
+        assert result['state']=='entry_open'
+        oid=result['entry_order_id'];before=None
+        acceptance=live.state.snapshot().orders[0].source.checked_at
+        def tick():clock[0]+=timedelta(milliseconds=10)
+    get_book=public.get_order_book
+    valid=[False];moved=[False]
+    def observed_book(*,token_id):
+        original=get_book(token_id=token_id)
+        total=D(external)+(D('20') if valid[0] else D('0'))+(D('1') if moved[0] else D('0'))
+        return original.model_copy(update=dict(timestamp=acceptance+(timedelta(milliseconds=1) if valid[0] else -timedelta(seconds=1)),
+            bids=(OrderBookLevel(price=D('.30'),size=total),
+                  OrderBookLevel(price=D('.29'),size=D('1000')))))
+    public.get_order_book=observed_book
+    try:
+        for _ in range(11):
+            tick();live.run_once();live.run_protection_once()
+            snapshot=live.state.snapshot()
+            assert sdk.cancels==[]
+            assert all(f.data_failures==0 for f in snapshot.failure_states.values())
+            if before is None:assert not snapshot.baselines
+            else:assert snapshot.baselines[before.key] is before
+        valid[0]=True
+        tick();live.run_once();live.run_protection_once()
+        baseline=next(iter(live.state.snapshot().baselines.values()))
+        assert baseline.bid_levels==((D('.30'),D(external)),)
+        assert before is None or baseline is before
+        assert sdk.cancels==[]
+        if origin=='manual':
+            duplicate=execution.lp_submit_augment(dict(session_id=result['session_id'],
+                price='.30',quantity='20',idempotency_key='same-price-new-local'))
+            assert duplicate==dict(state='rejected',reason='price_level_active')
+            assert len(sdk.posts)==1 and live.state.snapshot().baselines[baseline.key] is baseline
+        moved[0]=True
+        tick();live.run_once()
+        for handle in live.run_protection_once():
+            assert handle.result(timeout=3).status.value=='accepted'
+            handle._thread.join(timeout=2)
+        assert sdk.cancels==[(oid,)]
+        targets=[t for p in live.state.snapshot().progress.values() for t in p.cancel_targets]
+        assert len(targets)==1 and targets[0].reason=='bid_level_changed'
+        live.run_protection_once()
+        assert sdk.cancels==[(oid,)]
+    finally:
+        assert live.close(timeout=3)
+        live.trading.close()
