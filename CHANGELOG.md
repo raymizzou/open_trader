@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-28 — D2 income samples and shared yield display (#482 v4)
+
+- Calculate managed BUY income samples in D2 from each order's reward pool, exact scoring/account facts and a bounded authenticated open-order reward-share read. Native and sponsored shares refresh every 30 seconds with a 10-second deadline; their failure leaves samples UNKNOWN and does not block other trading reads. Keep input timestamps and the 120-second sample limit.
+- Make D2 the sample writer and decision source. Preserve last valid archives, independent risk/share-watch updates, exact identities and restart/no-replay guards. Current BUY yield display uses the same samples; monitor cards show per-order sample and reward-share ages. Legacy session rewards remain for history and position/risk display.
+- Keep the 600-second trial protection timer running through unavailable reward shares, and consume a newly known zero sample before the same round's cancellation decision. Preserve v2 A–D, budgets, weights and BUY price/size protection. No deployment is included.
+
 ## 2026-10-27 — Income rebuild test source ordering (#486 / PR #488)
 
 - Make the manual-preservation rebuild fixture publish the required fresh D candidate through ordinary account/read observations before it executes income selection. This prevents a pending candidate response from turning the fixture preparation into an unintended partial rebuild. Keep exact manual-order, capital/slot, no-replay and real four-second watchdog assertions; add an event-controlled delayed-response regression. Production pool selection and cancellation authority are unchanged.

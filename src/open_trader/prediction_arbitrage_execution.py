@@ -844,7 +844,6 @@ class PredictionExecutionService:
         self._lp_account_trades_cache: dict[str, object] | None = None
         self._lp_reward_percentage_cache: dict[str, object] | None = None
         self._lp_observation_last_success_at = None
-        self._lp_measurement_attempts = {}
         self._lp_reward_share_observations: dict[str, dict[str, object]] = {}
         self._lp_reward_share_active: dict[str, bool] = {}
         self._lp_reward_cache: dict[tuple[str, str], dict[str, object]] = {}
@@ -2281,6 +2280,58 @@ class PredictionExecutionService:
                     result["candidate_state"] = strategy.get("state", "unknown")
             if getattr(self, "_display_only", False) and self._lp_account_snapshot_expired(result.get("checked_at")):
                 result.update(state="stale", stale=True, reason="account_snapshot_expired")
+            if self._lp_d2 is not None and self._lp_d2.policy.allocation_mode=='observed_pools':
+                live=self._lp_d2
+                snapshot=live.state.snapshot()
+                roles=self._store.lp_load_observed_pool_roles(self._lp_account_id())['roles']
+                samples=live.pool_result_projection(as_of=_utc_now())
+                attempts=live.pool_measurement_state()['measurement_attempts']
+                observations=dict(result.get('lp_observations') or {})
+                account_at=_aware_datetime(result.get('checked_at'))
+                account_age=(_utc_now()-account_at).total_seconds() if account_at is not None else None
+                financial_known=(result.get('authenticated') is True and result.get('stale') is not True
+                    and result.get('open_orders_complete') is True and result.get('positions_complete') is True
+                    and str(result.get('account_id') or '').strip().casefold()==live.account_id.strip().casefold()
+                    and account_age is not None and 0<=account_age<=LP_OBSERVATION_FRESHNESS_SECONDS
+                    and snapshot.observation is not None and snapshot.observation.orders_complete
+                    and all(snapshot.observation.components[k].state=='known' and snapshot.observation.components[k].complete
+                        for k in ('balance','open_orders','positions'))
+                    and snapshot.observation.read_ticket.trade_version_at_start==snapshot.trade_version)
+                for order in snapshot.active_orders:
+                    cid,token,oid=order.key[1:]
+                    role=roles.get(cid,{})
+                    if (order.side!='BUY' or role.get('pool') not in ('trial','income')
+                            or role.get('episode')!=oid):continue
+                    projected=samples.get(cid,{})
+                    sample=projected.get('result',{})
+                    source=sample.get('source_order',{})
+                    rows=result.get('orders') or []
+                    cached_order=next((row for row in rows if row.get('order_id')==oid and row.get('condition_id')==cid
+                        and row.get('token_id')==token and row.get('side')=='BUY'),{})
+                    prior=observations.get(cid,{})
+                    account_reason=prior.get('reason') if prior.get('reason') in (
+                        'account_facts_stale','account_facts_unknown','account_snapshot_stale','exposure_changed') else None
+                    if not financial_known and account_reason is None:
+                        account_reason='account_facts_stale' if account_age is None or not 0<=account_age<=120 else 'account_facts_unknown'
+                    valid=(financial_known and account_reason is None and cached_order
+                        and _decimal(cached_order.get('price'))==order.price.value
+                        and _decimal(cached_order.get('remaining_quantity',cached_order.get('remaining_size')))==order.remaining.value
+                        and projected.get('eligible') and source.get('order_id')==oid
+                        and source.get('token_id')==token and source.get('side')=='BUY'
+                        and order.price.state=='known' and order.remaining.state=='known'
+                        and _decimal(source.get('price'))==order.price.value
+                        and _decimal(source.get('remaining_quantity'))==order.remaining.value)
+                    raw=attempts.get(cid,{}).get('result',{})
+                    reason=None if valid else (account_reason or ('sample_expired' if sample and not projected.get('eligible')
+                        else raw.get('reason','terms_unknown')))
+                    observations[cid]={**observations.get(cid,{}), 'yield_source':'d2_order_sample',
+                        'state':'known' if valid else 'unknown', 'reason':reason,
+                        'current_hourly_reward_usd':str(sample['hourly_reward_usd']) if valid else None,
+                        'occupied_capital_usd':str(sample['buy_capital_usd']) if valid else None,
+                        'current_yield_pct_per_hour':str(sample['yield_pct_per_hour']) if valid else None,
+                        'measured_at':_timestamp(sample['measured_at']) if isinstance(sample.get('measured_at'),datetime)
+                            else sample.get('measured_at')}
+                result['lp_observations']=observations
             return result
         return self._lp_dashboard_pending_payload()
 
@@ -3788,7 +3839,8 @@ class PredictionExecutionService:
         from .polymarket_lp_observed_pools import result_projection
         account = self._lp_account_id()
         return dict(results=result_projection(self._store.lp_observations(account), account, as_of or _utc_now()),
-            measurement_attempts=diagnostic_json_copy(self._lp_measurement_attempts),
+            **(self._lp_d2.pool_measurement_state(as_of=as_of) if self._lp_d2 is not None else
+                dict(measurement_attempts={}, reward_share=dict(state='unknown',checked_at=None,age_seconds=None))),
             observation_refresh=dict(last_success_at=self._lp_observation_last_success_at))
 
     def refresh_lp_observations(
@@ -3802,19 +3854,17 @@ class PredictionExecutionService:
         if account_id is None or not callable(observations_reader) or not callable(save_observation):
             return {"state": "unknown", "reason": "lp_observation_store_unavailable", "observations": {}}
 
+        legacy_save = save_observation
+        def save_observation(account, condition, payload):
+            return legacy_save(account, condition, {k:v for k,v in payload.items()
+                if k not in ('pool_result', 'pool_measurement_attempt')})
+
         previous = observations_reader(account_id)
         now = _utc_now()
 
         def mark_stale(reason: str) -> dict[str, dict[str, object]]:
-            attempts = dict(self._lp_measurement_attempts)
             stale_rows: dict[str, dict[str, object]] = {}
             for condition_id, saved in previous.items():
-                if condition_id in attempts or isinstance(saved.get('pool_result'), Mapping):
-                    attempts.pop(condition_id, None)
-                    attempts[condition_id] = dict(checked_at=_timestamp(now), result=dict(
-                        state='unknown', reason=reason, yield_pct_per_hour=None))
-                    if len(attempts) > 64:
-                        attempts.pop(next(iter(attempts)))
                 stale = {
                     **_mask_lp_observation(saved, reason),
                     "checked_at": now,
@@ -3823,7 +3873,6 @@ class PredictionExecutionService:
                 stale_rows[condition_id] = save_observation(
                     account_id, condition_id, stale
                 )
-            self._lp_measurement_attempts = attempts
             with self._lp_dashboard_lock:
                 cached = self._lp_dashboard_cache
                 if cached is not None:
@@ -4291,20 +4340,6 @@ class PredictionExecutionService:
                 "last_success_at": now if rate_pct is not None else previous_market.get("last_success_at"),
                 "last_attempt_at": now,
             }
-            from .polymarket_lp_observed_pools import measured_result
-            observation['pool_result'] = measured_result(account_id, condition_id, market_orders,
-                hourly_reward, reward_known=reward_known, measured_at=now,
-                reward_checked_at=rates_checked_at, account_checked_at=account_checked_at)
-            # Keep the raw attempt before the Store retains an older known sample.
-            # Replace the bounded process-local mapping atomically for readers.
-            attempts = dict(self._lp_measurement_attempts)
-            attempts.pop(condition_id, None)
-            raw_result = dict(observation['pool_result'])
-            for key in ('measured_at', 'reward_checked_at', 'account_checked_at'):
-                if isinstance(raw_result.get(key), datetime):
-                    raw_result[key] = _timestamp(raw_result[key])
-            attempts[condition_id] = dict(checked_at=_timestamp(now), result=raw_result)
-            self._lp_measurement_attempts = dict(list(attempts.items())[-64:])
             result[condition_id] = save_observation(account_id, condition_id, observation)
 
         self._lp_observation_last_success_at = _timestamp(now)

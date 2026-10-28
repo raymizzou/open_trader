@@ -160,6 +160,44 @@ def measured_result(account_id, condition_id, orders, rate, *, reward_known,
         return {**unknown, 'reason': 'measured_terms_unknown'}
 
 
+def d2_measured_result(account_id, condition_id, orders, pool, shares, *,
+                       pool_checked_at, share_checked_at, account_checked_at, as_of):
+    """Use the catalog's sponsored increment, never add the combined pool twice."""
+    unknown = dict(state='unknown', yield_pct_per_hour=None)
+    def fresh(stamp, limit):
+        return isinstance(stamp, datetime) and stamp.utcoffset() is not None and 0 <= (as_of-stamp).total_seconds() <= limit
+    if not fresh(pool_checked_at, 10):
+        return dict(unknown, reason='reward_pool_stale')
+    if not isinstance(shares, Mapping) or not fresh(share_checked_at, 60):
+        return dict(unknown, reason='reward_share_unknown')
+    active = [o for o in orders if str(o.get('status', '')).upper() not in
+        {'FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'}]
+    if len(active) > 1:return dict(unknown, reason='multiple_orders')
+    if not active:return dict(unknown, reason='terms_unknown')
+    row = active[0]
+    if row.get('scoring_status') != 'true' or not fresh(row.get('scoring_checked_at'), 60):
+        return dict(unknown, reason='not_scoring')
+    if not fresh(account_checked_at, 10):return dict(unknown, reason='terms_unknown')
+    try:
+        native = _number(pool['native_daily_pool_usd'])
+        sponsored = _number(pool['sponsored_daily_pool_usd'])
+        hourly = Decimal(0)
+        for source, amount in (('native', native), ('sponsored', sponsored)):
+            if not amount:continue
+            try:percentage = _number(shares[source])
+            except (KeyError, ValueError, InvalidOperation):return dict(unknown, reason='reward_share_unknown')
+            if percentage > 100:return dict(unknown, reason='reward_share_unknown')
+            hourly += amount * percentage / 2400
+        measured_at = min(pool_checked_at, share_checked_at, account_checked_at, row['scoring_checked_at'])
+        result = measured_result(account_id, condition_id, active, hourly, reward_known=True,
+            measured_at=measured_at, reward_checked_at=share_checked_at,
+            account_checked_at=account_checked_at)
+        return result if result['state']=='known' else dict(unknown, reason='terms_unknown')
+    except (KeyError, ValueError, TypeError, InvalidOperation):
+        return dict(unknown, reason='terms_unknown')
+
+
+
 def dashboard_affiliation(order, role, actions, *, snapshot, settings_account):
     """Project an existing exact accepted BUY; grant no financial authority."""
     import hashlib

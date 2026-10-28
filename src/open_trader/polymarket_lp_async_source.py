@@ -308,7 +308,7 @@ class LPAsyncSourcePort:
         params={k:('true' if v else 'false') if type(v) is bool else v
             for k,v in (params or {}).items() if v is not None}
         headers={'x-lp-order':request.order_id,'x-lp-source':request.source,'accept-encoding':'identity'}
-        if request.source in ('balance','open_orders','order','fills','scoring') and self.auth_resolver is not None:
+        if request.source in ('balance','open_orders','order','fills','scoring','reward_share') and self.auth_resolver is not None:
             headers.update(self.auth_resolver('GET',path,None))
         owner = asyncio.current_task()
         owner.cleanup = False
@@ -441,6 +441,47 @@ class LPAsyncSourcePort:
             cursor=page.next_cursor
             await asyncio.sleep(0)
 
+    async def _reward_share(self, request, deadline):
+        from decimal import Decimal
+        markets = {}
+        checked_at = self.utc_now()
+        for sponsored in (False, True):
+            source = 'sponsored' if sponsored else 'native'
+            cursor = None
+            seen = set()
+            while True:
+                payload = await self._json('clob', '/rewards/user/markets', dict(
+                    signature_type=self.signature_type, maker_address=request.account,
+                    sponsored=sponsored, only_open_orders=True, only_open_positions=False,
+                    page_size=500, next_cursor=cursor), request, deadline)
+                rows = payload['data']
+                if not isinstance(rows, list):raise ValueError('reward_share_rows')
+                _budget.get().take_items(len(rows))
+                for row in rows:
+                    cid = row['condition_id']
+                    raw = row['earning_percentage']
+                    if not isinstance(cid, str) or not cid or isinstance(raw, bool):
+                        raise ValueError('reward_share_identity')
+                    percentage = Decimal(str(raw))
+                    if not percentage.is_finite() or not 0 <= percentage <= 100:
+                        raise ValueError('reward_share_percentage')
+                    if row.get('checked_at') is not None:
+                        checked = datetime.fromisoformat(row['checked_at'].replace('Z', '+00:00'))
+                        if checked.utcoffset() is None or checked > self.utc_now():
+                            raise ValueError('reward_share_time')
+                        checked_at=min(checked_at,checked)
+                    values = markets.setdefault(cid, {})
+                    if source in values and values[source] != percentage:
+                        raise ValueError('reward_share_conflict')
+                    values[source] = percentage
+                cursor = payload['next_cursor']
+                if cursor == 'LTE=':break
+                if not isinstance(cursor, str) or not cursor or cursor in seen:
+                    raise ValueError('reward_share_pagination')
+                seen.add(cursor)
+                await asyncio.sleep(0)
+        return dict(account_id=request.account, markets=markets, checked_at=checked_at)
+
     async def _metadata(self, request, deadline):
         from polymarket._internal.actions import gamma
         from .polymarket_trading import project_lp_market_metadata, _model_dict, _collect
@@ -530,6 +571,7 @@ class LPAsyncSourcePort:
                 value=market_value(request.condition_id,dict(zip(
                     ('book','metadata','native_rewards','sponsored_rewards'),results)))
                 if value['rewards']['complete'] is not True:raise ValueError('rewards_unknown')
+            elif request.source=='reward_share':value=await self._reward_share(request,deadline)
             elif request.source=='metadata':value=await self._metadata(request,deadline)
             elif request.source in ('native_rewards','sponsored_rewards'):
                 value=await self._rewards(request,deadline,request.source=='sponsored_rewards')
@@ -624,7 +666,7 @@ class LPAsyncSourcePort:
                         await asyncio.sleep(0)
                     value=tuple(rows)
             else:raise ValueError('unsupported_source')
-            return SourceResult(identity,freeze(value),checked_at=self.utc_now())
+            return SourceResult(identity,freeze(value),checked_at=value['checked_at'] if request.source=='reward_share' else self.utc_now())
         except Exception as exc:
             return SourceResult(identity,complete=False,error=type(exc).__name__,failed_at=self.utc_now(),
                 retry_at=getattr(exc,'retry_at',None),error_facts=freeze(getattr(exc,'facts',{})),

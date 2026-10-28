@@ -18,8 +18,9 @@ status: accepted
 manual status 和 dashboard 只发布内存快照；重启后的命名组需显式命令核验身份，GET 不绑定组或恢复旧财务。
 
 每个当前自动或手动 BUY、双池收益候选各有独立 attempt，最多一个实际在途。起点间隔至少 5 秒，
-整轮必需读取共用 5 秒期限；book 每轮重读。metadata、fees、event、native 和 sponsored 奖励
-只共享已完成事实，30 秒到期刷新，保留原时间且不延长 60 秒可用期限。必要刷新失败即 UNKNOWN。
+整轮必需读取共用 5 秒期限；book 每轮重读。metadata、fees、event 只共享已完成事实，30 秒到期刷新。
+双池受管 BUY 的 native/sponsored 奖励池每 5 秒重新取得已完成事实，以满足实测的 10 秒边界；
+其他市场读取保留原 30 秒共享期限。缓存保留原时间，必要刷新失败即 UNKNOWN。
 provider/account 的真实 Retry-After、实际清理及 owner 未 ACK 均可延后下一轮，不能产生空失败。
 
 5 秒期限判断实际 I/O 完成时间，而非业务 owner 收集时间。期限内完整成功的结果迟收仍按成功计数；
@@ -199,3 +200,22 @@ service 仅在实际持有的独占手动 lease 释放并完成全局/文件锁�
 正常 exact/终态事实更新每次原请求的审计；旧 receipt 不改写、旧 progress 不覆盖新事实。
 启动恢复保护事实和原审计，但不重放旧 request，只有新接纳账户事实可产生新决定。
 本规则只改变撤单流程；读取五秒期限、清理所有权、BUY 不确定性、金融接纳和手动/SELL 安全边界保留。
+
+
+## 账户奖励占比读取（2026-10-28，#482 v4）
+
+`reward_share` 使用已有市场 I/O loop，不新增 OS 线程或业务 owner。它从已有 owner 借用
+L2 GET 签名，只访问 `/rewards/user/markets`，native 与 sponsored 各完整分页一次；
+`only_open_orders=true`、`only_open_positions=false`，不遍历 session。缺页、循环游标、
+冲突/畸形占比或未来时间均为 UNKNOWN；百分比为 0 至 100，重复相同市场/来源占比只计一次。
+读取保留开始时间及可验证的更旧来源时间，完成或 GET 不刷新这个时间。
+
+| 需求 | 同时在途 | 起点间隔 | 整轮期限 | 资源归属 | 故障影响 |
+|---|---:|---:|---:|---|---|
+| reward_share | 账户级 1 | 30 秒 | 10 秒 | 固定 clob 池/连接各 1，现有市场 loop | 仅收益样本 UNKNOWN，不设置 blocks_new_buy |
+
+该通道单独排队，不占 BUY/income 的 64 个逐单 scope，也不占 low/financial/exact 的并发许可。
+包括取消后的响应清理在内，实际任务/连接仍由原 runtime 持有；真正退出前不重试、不提前释放。
+延迟清理故障在真实退出后解除，端口关闭失败仍保留资源及诊断，二者均不因 reward_share
+自身故障阻止新 BUY、SELL 或精确保护。其他来源原有门禁保持。最大全局连接池/连接预算
+分别为 `2*buy_cap+6` / `4*buy_cap+10`，没有扩大逐单 64 上限。

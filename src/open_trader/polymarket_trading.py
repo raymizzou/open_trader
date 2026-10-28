@@ -2727,13 +2727,13 @@ class PolymarketTradingClient:
         limits=ProviderLimits()
         wallet=self.config.wallet_address
         def auth(method,path,body):
-            if (method!='GET' or body is not None or not (path in ('/balance-allowance','/data/orders','/data/trades','/order-scoring')
+            if (method!='GET' or body is not None or not (path in ('/balance-allowance','/data/orders','/data/trades','/order-scoring','/rewards/user/markets')
                     or re.fullmatch(r'/data/order/[A-Za-z0-9_-]+',path))):raise ValueError('lp_read_auth_scope')
             return resolver(method,path,body)
         def factory(demand):
             if demand.account.casefold()!=wallet.casefold():raise ValueError('lp_read_account_mismatch')
             sizes=({'clob':2,'data':1} if demand.kind=='financial' else {'clob':2}
-                if demand.kind=='exact' else {'gamma':1,'clob':3})
+                if demand.kind=='exact' else {'clob':1} if demand.kind=='reward_share' else {'gamma':1,'clob':3})
             clients={service:httpx.AsyncClient(base_url=getattr(environment,service+'_url'),
                 limits=httpx.Limits(max_connections=size,max_keepalive_connections=size),
                 timeout=None,transport=transport,follow_redirects=False) for service,size in sizes.items()}

@@ -98,6 +98,7 @@ class ReadDemand:
     sources: tuple = ('book','metadata','native_rewards','sponsored_rewards')
     observation_id: str = ''
     target_order_id: str = ''
+    reward_pool_fresh: bool = False
     @property
     def key(self):
         return (self.account,self.process_epoch,self.generation,self.kind,self.order_id,self.terms_version)
@@ -165,6 +166,12 @@ class LPReadRuntime:
     def reconcile(self,demands):
         with self._lock:
             incoming={} if self._closed else {d.key:d for d in demands}
+            share_accounts=set()
+            for key,demand in tuple(incoming.items()):
+                if demand.kind=='reward_share':
+                    account=demand.account.casefold()
+                    if account in share_accounts:incoming.pop(key)
+                    share_accounts.add(account)
             for key in incoming:
                 if key not in self._ages:
                     self._age_sequence+=1;self._ages[key]=self._age_sequence
@@ -261,7 +268,7 @@ class LPReadRuntime:
                                 scope.next_start=max(scope.next_start,not_before);continue
                         scope.completed_sources={}
                         self._attempt_sequence+=1;scope.attempt=self._attempt_sequence
-                        scope.started=self.clock();scope.deadline=scope.started+5
+                        scope.started=self.clock();scope.deadline=scope.started+(10 if kind=='reward_share' else 5)
                         scope.active=True;scope.actual_end=None;scope.expired=False;scope.cancel_sent=False
                         scope.lane.submit(self._attempt(scope))
                 needed={(d.account,d.process_epoch,d.generation,d.condition_id,d.token_id,n)
@@ -344,7 +351,7 @@ class LPReadRuntime:
             cached=self._cache.get(key) if reference else None
             if cached is not None and cached[0].checked_at is not None:
                 age=(self.utc_now()-cached[0].checked_at).total_seconds()
-                if 0<=age<30:
+                if 0<=age<(5 if source in ('native_rewards','sponsored_rewards') and scope.demand.reward_pool_fresh else 30):
                     self._cache.move_to_end(key);return self._completed(scope,source,cached[0])
         result=await scope.port.read(request,scope.deadline)
         if reference and result.complete and not result.error and result.checked_at is not None:
@@ -423,14 +430,14 @@ class LPReadRuntime:
         # Financial and low delay faults block only while that ownership is
         # live. Their original result mailbox survives until owner collection.
         # BUY, exact and port-close faults retain their existing semantics.
-        if _fixed_lane(scope.demand.kind)=='low':
+        if _fixed_lane(scope.demand.kind) in ('low','reward_share'):
             scope.fault=False;scope.fault_detail=None
         if scope.financial_cleanup_delayed:
             scope.fault=False;scope.financial_cleanup_delayed=False;scope.fault_detail=None
             if self._last_financial_cleanup_fault['attempt']==scope.attempt:
                 self._last_financial_cleanup_fault=dict(self._last_financial_cleanup_fault,
                     ended_monotonic=scope.actual_end)
-        scope.next_start=max(scope.started+({'sell':30,'position':60}.get(scope.demand.kind,5)),
+        scope.next_start=max(scope.started+({'sell':30,'position':60,'reward_share':30}.get(scope.demand.kind,5)),
             scope.actual_end,*(s.retry_at or 0 for s in sources.values()))
 
     async def _close_scope(self,scope):
@@ -465,8 +472,8 @@ class LPReadRuntime:
                 since=stamp.astimezone(UTC).isoformat()
         except Exception:pass
         return dict(lane=lane,kind=kind if kind in
-            ('buy','financial','exact','sell','position','holding','income') else 'unknown',
-            since=since,active=True,blocks_new_buy=lane!='buy',reason=reason)
+            ('buy','financial','exact','sell','position','holding','income','reward_share') else 'unknown',
+            since=since,active=True,blocks_new_buy=lane not in ('buy','reward_share'),reason=reason)
 
     def drain_results(self):
         with self._lock:
@@ -509,7 +516,7 @@ class LPReadRuntime:
             managed=sum(s.active+sum(not t.done() for t in s.tasks)+(s.closing and not s.closed)
                 for s in self._scopes.values())+len(self._fixed_closing-self._fixed_closed)
             faults=sum(s.fault for s in self._scopes.values())+len(self._fixed_faults)
-            fixed_faults=bool(self._fixed_faults) or any(s.fault and s.demand.kind not in ('buy','income') for s in self._scopes.values())
+            fixed_faults=bool(self._fixed_faults-{'reward_share'}) or any(s.fault and s.demand.kind not in ('buy','income','reward_share') for s in self._scopes.values())
             # Put blockers first so a full BUY lane cannot hide a fixed fault.
             details=[self._fixed_fault_details[name] for name in sorted(self._fixed_faults)]
             details.extend(s.fault_detail for buy in (False,True) for s in self._scopes.values()
@@ -533,8 +540,8 @@ class LPReadRuntime:
                 deferred_order_ids=tuple(d.order_id for d in deferred[:64]),new_buy_allowed=len(owned)<self.buy_cap and not deferred and not fixed_faults,
                 ready_buy_count=sum(s.result is not None or s.fault_pending for s in owned),
                 ready_count=sum(s.result is not None or s.fault_pending for s in self._scopes.values()),
-                pool_count=pools,pool_limit=2*self.buy_cap+5,connection_limit=4*self.buy_cap+9,managed_tasks=managed,
-                scopes=tuple(dict(key=s.demand.key,attempt=s.attempt,started=s.started,next_start=s.next_start,
+                pool_count=pools,pool_limit=2*self.buy_cap+6,connection_limit=4*self.buy_cap+10,managed_tasks=managed,
+                scopes=tuple(dict(key=s.demand.key,kind=s.demand.kind,attempt=s.attempt,started=s.started,next_start=s.next_start,
                     active=s.active,retiring=s.retiring,cleanup_fault=s.fault) for s in self._scopes.values())))
 
     def close(self,timeout=0):
@@ -566,4 +573,4 @@ def _json_value(value):
 
 def _fixed_lane(kind):
     if kind in ('buy','income'):return None
-    return kind if kind in ('financial','exact') else 'low'
+    return kind if kind in ('financial','exact','reward_share') else 'low'

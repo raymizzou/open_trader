@@ -36,6 +36,7 @@ def test_income_candidate_rejects_sample_from_old_trial_episode(tmp_path,monkeyp
         roles(rig,{n:('trial','old-'+n) for n in 'CD'})
         rig.measure(dict(C='.4',D='2',M='3'))
         rig.release('old-D');rig.add_order('D','1',order_id='D-new')
+        rig.publish_account({'old-C','D-new','manual-M'})
         result=rig.cycle(pool='income');rig.finish_cancels(result)
         assert result.selection.targets==(rig.cid('C'),)
         assert {o.key[3] for o in result.rotation.victims}=={'old-C'}
@@ -143,6 +144,8 @@ def test_public_pool_membership_uses_current_exact_order_facts(tmp_path,monkeypa
                 and status['observed_monotonic']>=rig.seconds
                 and (due is None or due>rig.seconds))
         rig.pump(reads_settled)
+        rig.publish_account({'old-A','old-C','income-B','manual-A'})
+        rig.pump(reads_settled,drive=lambda:rig.live.run_once(pool='trial'))
         before=(rig.live.state.snapshot(),len(rig.requests),rig.store.lp_load_observed_pool_roles(rig.account))
         state=rig.execution.lp_auto_state()['observed_pools']['current_membership']
         again=rig.execution.lp_auto_state()['observed_pools']['current_membership']

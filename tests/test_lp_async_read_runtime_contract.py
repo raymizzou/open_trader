@@ -360,7 +360,7 @@ def test_retiring_resources_mailboxes_and_cache_are_bounded():
         status=runtime.status()
         assert status['owned_buy_scopes']==2 and status['retiring_buy_scopes']==2
         assert status['ready_buy_count']==2 and status['ready_count']<=5 and status['new_buy_allowed'] is False
-        assert status['pool_count']<=9 and status['connection_limit']==17
+        assert status['pool_count']<=9 and status['connection_limit']==18
         assert status['managed_tasks']<=48 and status['cache_entries']<=2 and status['cache_bytes']<=2048
         before=list(boundary.events)
         assert not any(e[0]=='entered' and e[1]=='C' for e in before)
