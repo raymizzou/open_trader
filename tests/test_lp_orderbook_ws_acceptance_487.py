@@ -152,7 +152,16 @@ async def publish_book(rig,outbound,when,upper,mode,*,ws_when=None):
             and observation.order_view.orders_source.checked_at==rig.utc() and value is not None
             and value['timestamp']==when and {r['price']:r['size'] for r in value['bids']}=={D('.41'):D(upper),D('.40'):D(120)}
             and (value.get('transport')=='ws')==(mode=='use'))
-    try:await wait_for(settled,rig.live.run_once)
+    def drive_publication():
+        rig.live.run_once()
+        if settled():return
+        status=rig.live.read_runtime.status();due=status['next_dependency_monotonic']
+        # Current account proof may require the next owned read deadline.
+        if (status['ready_count']==0 and not any(s['active'] for s in status['scopes'])
+                and status['observed_monotonic']>=rig.seconds and rig.live.status()['native_inflight']==0
+                and due is not None and due>rig.seconds):
+            rig.tick(max(due-rig.seconds,.000001))  # The fixture UTC clock has microsecond resolution.
+    try:await wait_for(settled,drive_publication)
     except TimeoutError:
         state=rig.live.state.snapshot();observation=state.observation
         source=observation.source_frame.sources.get(f'market_book:{rig.cid("A")}:tA') if observation else None
