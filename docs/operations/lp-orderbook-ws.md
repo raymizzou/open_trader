@@ -74,6 +74,10 @@ that token synchronization identity; a validated frame can also supply its own
 original message confirmation. An older quiet book still needs a real proof
 strictly after local acceptance. A first qualifying proof after the fixed
 cancellation deadline remains late, even when the book itself arrived earlier.
+Temporary freshness expiry keeps this captured proof only while the actual
+connection, member and synchronization era remain unchanged. The unavailable
+book remains UNKNOWN and cannot authorize use. Invalidation, reconnect or member
+retirement clears the proof, including when the book was already unavailable.
 
 A removed order's frozen comparison context and subscription remain observed for
 two seconds. A new order cannot inherit that context. The current limits are

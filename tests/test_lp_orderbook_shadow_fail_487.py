@@ -1396,3 +1396,91 @@ def test_initial_sync_preserves_same_batch_pending_receipts(monkeypatch,phase):
                     await client.aclose();await asyncio.wait_for(task,4)
                     assert client.managed_tasks()==0 and books.status()['pending_receipts']==0
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('phase',['expired','no-expiry','late-first-proof','connection-loss'])
+def test_temporary_book_expiry_preserves_qualified_shadow_evidence(monkeypatch,phase):
+    import asyncio,threading
+    received=threading.Event();release=threading.Event();actual_wait=asyncio.wait
+    async def held_apply(tasks,**options):
+        result=await actual_wait(tasks,**options)
+        for task in result[0]:
+            if task.cancelled() or task.exception() is not None:continue
+            item=task.result()
+            if isinstance(item,tuple) and len(item)==5 and isinstance(item[0],dict) and item[0].get('timestamp')=='1002':
+                received.set()
+                while not release.is_set():await asyncio.sleep(.001)
+        return result
+    async def scenario():
+        monkeypatch.setattr(asyncio,'wait',held_apply)
+        try:
+            async with shadow_runtime() as rig:
+                try:
+                    runtime=rig.runtime
+                    runtime.reconcile((rig.demand,))
+                    await rig.wait(lambda:runtime.status()['ready_count']==1);runtime.drain_results()
+                    rig.clock.value=3
+                    context=dict(comparison_context(rig.demand,basis='freshness-proof'),
+                        accepted_at=rig.clock.utc()+timedelta(seconds=1.5))
+                    runtime.configure_orderbook('shadow',{'yes':CID},eligible_keys=(rig.demand.key,),comparison_contexts=(context,))
+                    original=runtime.orderbook_snapshot('yes')
+                    rig.clock.value=4
+                    await rig.outbound.put(wire_book(timestamp='1002',bids=(('.40','99'),)))
+                    await rig.wait(received.is_set)
+                    assert runtime.status()['orderbook']['pending_receipts']==1
+                    rig.boundary.book_depth=99;rig.clock.value=5;runtime.wake()
+                    await rig.wait(lambda:runtime.status()['ready_count']==1)
+                    rest,=runtime.drain_results()
+                    assert rest.complete and rest.sources['book'].checked_at==rig.clock.utc()
+                    assert rest.sources['book'].value.get('transport')!='ws'
+                    assert runtime.status()['orderbook']['shadow']['rest_cancel_observations']==1
+                    runtime.reconcile(())  # Freeze the one actual REST sample; no later periodic read.
+                    if phase!='late-first-proof':
+                        rig.clock.value=6;await rig.outbound.put('PONG')
+                        await rig.wait(lambda:runtime.status()['orderbook']['last_proof_monotonic']==6)
+                        await rig.wait(lambda:runtime.status()['orderbook']['shadow']['coverage_seconds']>=6)
+                        proof=runtime.orderbook_snapshot('yes')
+                        assert proof['sync_identity']==original['sync_identity']
+                        assert book_after_buy_acceptance(proof,condition_id=CID,token_id='yes',
+                            accepted_at=context['accepted_at']) is True
+                    if phase=='no-expiry':
+                        rig.clock.value=12;await rig.outbound.put('PONG')
+                        await rig.wait(lambda:runtime.status()['orderbook']['last_proof_monotonic']==12)
+                        assert runtime.orderbook_snapshot('yes') is not None
+                    else:
+                        rig.clock.value=16.001;runtime.wake()
+                        await rig.wait(lambda:runtime.status()['orderbook']['shadow']['coverage_seconds']==0)
+                        unavailable=runtime.status()['orderbook']
+                        assert runtime.orderbook_snapshot('yes') is None
+                        assert unavailable['connected'] and unavailable['disconnects']==0
+                        assert unavailable['tokens']['items'][0]['ws_available'] is False
+                        assert unavailable['shadow']['cancel_matches']==0
+                        assert unavailable['shadow']['cancel_pending']==1
+                        assert evaluate_lp_bid_levels(runtime.orderbook_snapshot('yes'),price=D('.40'),own_remaining=D(20),
+                            bid_level=1,baseline_levels=((D('.40'),D(80)),),condition_id=CID,token_id='yes')['state']=='unknown'
+                    if phase=='connection-loss':
+                        # Real reader disconnect while both available-book signatures are None.
+                        await rig.outbound.put(None)
+                        await rig.wait(lambda:not runtime.status()['orderbook']['connected'])
+                        await rig.wait(lambda:runtime.status()['orderbook']['shadow']['cancel_pending']==0)
+                        assert runtime.orderbook_snapshot('yes') is None
+                        assert runtime.status()['orderbook']['generation']!=original['connection_generation']
+                        assert runtime.status()['orderbook']['pending_receipts']==0
+                        release.set()
+                    else:
+                        rig.clock.value=18;await rig.outbound.put('PONG')
+                        await rig.wait(lambda:runtime.status()['orderbook']['last_proof_monotonic']==18)
+                        recovered=runtime.orderbook_snapshot('yes')
+                        assert recovered['sync_identity']==original['sync_identity']
+                        assert runtime.status()['orderbook']['disconnects']==0
+                        release.set()
+                        await rig.wait(lambda:(book:=runtime.orderbook_snapshot('yes')) is not None and book['source_timestamp']==1002)
+                        await rig.wait(lambda:runtime.status()['orderbook']['shadow']['cancel_pending']==0)
+                    report=runtime.status()['orderbook']['shadow']
+                    timely=phase in ('expired','no-expiry')
+                    assert report['cancel_matches']==(1 if timely else 0)
+                    assert report['ws_missed_cancels']==(0 if timely else 1)
+                    if timely:assert report['cancel_timing']['last_seconds']==1
+                finally:release.set()
+        finally:release.set()
+    asyncio.run(scenario())

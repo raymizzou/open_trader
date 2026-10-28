@@ -408,10 +408,12 @@ class LPReadRuntime:
             for key,state in self._shadow_states.items():
                 context=state['context'];book=self._books.market_book(context['token_id'])
                 signature=(book['book_version'],book['confirmation_at']) if book else None
-                if state['signature']==signature:continue
-                identity=book['sync_identity'] if book else None
+                # Freshness can hide a book without changing its actual continuity.
+                # Check real identity even across consecutive unavailable snapshots.
+                identity=self._books.continuity_ticket(context['token_id'])
                 if state['qualification_identity']!=identity:
                     state['qualification_identity']=identity;state['qualified_at']=None
+                if state['signature']==signature:continue
                 if book is not None:
                     cutoff=context['accepted_at']
                     for stamp,at in ((book.get('confirmation_at'),book.get('confirmation_monotonic')),
