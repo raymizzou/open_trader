@@ -2208,12 +2208,29 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
             # Model actual venue removal for these new exact cancel IDs, rather
             # than leaving contradictory LIVE rows after their accepted receipt.
             rig.cancel_removes=True
-            rig.finish_income_rebuild(rig.cid('D'),'tD',after=rig.utc())
-            assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts if p['token_id']=='tD']==[('tD',Decimal('30'))]
+            after=rig.utc()
+            def candidates_current():
+                snapshot=rig.live.state.snapshot();observation=snapshot.observation
+                status=rig.live.read_runtime.status();due=status['next_dependency_monotonic']
+                sources=[observation.source_frame.sources.get('market:'+rig.cid(n)+':t'+n) for n in 'ABD']
+                return (observation.orders_complete and observation.components['open_orders'].checked_at>=after
+                    and observation.read_ticket.trade_version_at_start==snapshot.trade_version
+                    and snapshot.new_capacity.state=='known' and status['ready_count']==0
+                    and not any(s['active'] for s in status['scopes']) and status['observed_monotonic']>=rig.seconds
+                    and (due is None or due>rig.seconds) and all(s is not None and s.complete and not s.error
+                        and s.checked_at is not None and s.checked_at>=after
+                        and 0<=(rig.utc()-s.checked_at).total_seconds()<=10 for s in sources))
             # A cycle can finish only one part of this asynchronous rebuild.
             # Wait for the three real slots, not for the expected money values.
             end=time.monotonic()+4
             while True:
+                # D publication alone does not establish the higher-ranked B input.
+                while not candidates_current():
+                    prepared=rig.live.run_once(pool='trial');rig.finish_cancels(prepared)
+                    assert time.monotonic()<end,'income candidate publication watchdog'
+                    if candidates_current():break
+                    rig.advance_idle_read()
+                    rig.wake.wait(.01);rig.wake.clear()
                 rebuilt=rig.live.dispatch_rotation(rig.live.run_once(
                     rig.producer.capture_qualified_pool(),pool='income'))
                 rig.finish_cancels(rebuilt)
@@ -2224,6 +2241,7 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
                 assert time.monotonic()<end,'income group completion watchdog'
                 rig.advance_idle_read()
                 rig.wake.wait(.01);rig.wake.clear()
+            assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts if p['token_id']=='tD']==[('tD',Decimal('30'))]
             assert {(row['asset_id'],row['price']*(row['original_size']-row['size_matched']))
                 for row in rig.sdk.orders}=={('tB',Decimal('50')),('tD',Decimal('30')),('tA',Decimal('20'))}
             assert len(rig.sdk.orders)==3

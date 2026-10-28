@@ -1029,7 +1029,10 @@ def test_shadow_uses_fixed_bid_level_contract_after_main_merge(tmp_path,monkeypa
                 clock.value=5;live.read_runtime.wake()
                 key=('account',CID,'yes','A')
                 await pump(lambda:key in live.state.snapshot().yields
-                    and live.state.snapshot().yields[key].evaluated_at==clock.utc())
+                    and live.state.snapshot().yields[key].evaluated_at==clock.utc()
+                    and live.state.snapshot().observation.source_frame.sources[f'market_book:{CID}:yes'].checked_at==clock.utc()
+                    and sorted((r['price'],r['size']) for r in live.state.snapshot().observation.source_frame.sources[
+                        f'market_book:{CID}:yes'].value['book']['bids'])==sorted((Decimal(p),Decimal(q)) for p,q in current))
                 if not ws_known:
                     # The ordinary REST fallback may seed the unavailable token; invalidate the WS leg again.
                     await outbound.put(dict(event_type='tick_size_change',market=CID,asset_id='yes',timestamp='1002'))
