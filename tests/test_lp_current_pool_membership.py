@@ -36,6 +36,7 @@ def test_income_candidate_rejects_sample_from_old_trial_episode(tmp_path,monkeyp
         roles(rig,{n:('trial','old-'+n) for n in 'CD'})
         rig.measure(dict(C='.4',D='2',M='3'))
         rig.release('old-D');rig.add_order('D','1',order_id='D-new')
+        rig.publish_account({'old-C','D-new','manual-M'})
         result=rig.cycle(pool='income');rig.finish_cancels(result)
         assert result.selection.targets==(rig.cid('C'),)
         assert {o.key[3] for o in result.rotation.victims}=={'old-C'}
@@ -50,7 +51,14 @@ def test_expired_departed_income_member_cannot_block_current_trial(tmp_path,monk
         for n in 'HD':rig.market(n);rig.add_order(n,'1')
         roles(rig,dict(H=('income','old-H'),D=('trial','old-D')))
         original=rig.measure(dict(H='2'))['observations'][rig.cid('H')]['pool_result']
+        # Drain actual scoring reads before the two large fixture clock jumps.
+        def reads_idle():
+            status=rig.live.read_runtime.status();due=status['next_dependency_monotonic']
+            return (status['ready_count']==0 and not any(s['active'] for s in status['scopes'])
+                and status['observed_monotonic']>=rig.seconds and due is not None and due>rig.seconds)
+        rig.pump(reads_idle,drive=lambda:rig.live.run_once(pool='trial'))
         rig.release('old-H');rig.tick(121)
+        rig.pump(reads_idle,drive=lambda:rig.live.run_once(pool='trial'))
         rig.measure(dict(D='.5'))
         rig.observe_initial_measurement(dict(D='.5'))  # publish actual H departure before comparison
         result=rig.cycle(pool='income');rig.finish_cancels(result)
@@ -143,6 +151,8 @@ def test_public_pool_membership_uses_current_exact_order_facts(tmp_path,monkeypa
                 and status['observed_monotonic']>=rig.seconds
                 and (due is None or due>rig.seconds))
         rig.pump(reads_settled)
+        rig.publish_account({'old-A','old-C','income-B','manual-A'})
+        rig.pump(reads_settled,drive=lambda:rig.live.run_once(pool='trial'))
         before=(rig.live.state.snapshot(),len(rig.requests),rig.store.lp_load_observed_pool_roles(rig.account))
         state=rig.execution.lp_auto_state()['observed_pools']['current_membership']
         again=rig.execution.lp_auto_state()['observed_pools']['current_membership']
@@ -183,14 +193,33 @@ def test_trial_refills_after_source_release_before_income_post(tmp_path,monkeypa
         trial=rig.cycle(pool='trial');rig.finish_cancels(trial)
         assert rig.cid('A') not in trial.selection.targets
         assert rig.sdk.posts==[]  # ACK leaves the three actual BUY resources occupied.
+        # Refresh candidate inputs, while retaining A's original measured sample.
+        rig.market('A');rig.market('E',pool='1000')
         rig.release('old-A')
         held[0]=True
         rig.tick(11)
-        rig.converge_current(lambda:any(p['token_id']=='tE' for p in rig.sdk.posts))
+        # The held income request must not freeze unrelated financial deadlines.
+        import time
+        end=time.monotonic()+4
+        while not any(p['token_id']=='tE' for p in rig.sdk.posts):
+            rig.scheduler.run_due()
+            assert not rig.scheduler.snapshot()['last_check_error'],rig.live.diagnostics()
+            if any(p['token_id']=='tE' for p in rig.sdk.posts):break
+            status=rig.live.read_runtime.status();due=status['next_dependency_monotonic']
+            other_active=any(scope['active'] and not (entered.is_set() and scope['kind']=='income'
+                and scope['key'][4]=='income:'+rig.cid('A')+':tA') for scope in status['scopes'])
+            if (status['ready_count']==0 and not other_active and status['observed_monotonic']>=rig.seconds
+                    and rig.live.status()['native_inflight']==0 and due is not None and due>rig.seconds):
+                rig.tick(due-rig.seconds)
+            assert time.monotonic()<end,(rig.live.status(),rig.live.rotation_diagnostics())
+            rig.wake.wait(.01);rig.wake.clear()
         assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts]==[('tE',Decimal('1'))]
         assert {'old-B','old-C'} <= {o['id'] for o in rig.sdk.orders}
         assert entered.wait(2),'income-book external boundary watchdog'
+        assert held[0] and not gate.is_set() and all(p['token_id']!='tA' for p in rig.sdk.posts)
         held[0]=False;gate.set()
+        rig.pump(lambda:not any(s['active'] and s['kind']=='income' and s['key'][4]=='income:'+rig.cid('A')+':tA'
+            for s in rig.live.read_runtime.status()['scopes']))
         rig.tick()
         rig.converge_current(lambda:any(p['token_id']=='tA' for p in rig.sdk.posts))
         assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts if p['token_id']=='tA']==[('tA',Decimal('50'))]

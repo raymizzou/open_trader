@@ -53,12 +53,12 @@ def read_health(auto, now):
         row = mapping(raw)
         lane, kind, reason = (row.get(key) for key in ('lane', 'kind', 'reason'))
         since = moment(row.get('since'))
-        if (lane not in ('buy', 'financial', 'exact', 'low')
+        if (lane not in ('buy', 'financial', 'exact', 'low','reward_share')
                 or kind not in dict(buy=('buy','income'), financial=('financial',), exact=('exact',),
-                    low=('sell', 'position', 'holding', 'unknown')).get(lane, ())
+                    low=('sell', 'position', 'holding', 'unknown'),reward_share=('reward_share',)).get(lane, ())
                 or reason not in ('delayed_read_cleanup', 'port_close_failure')
                 or row.get('active') is not True or type(row.get('blocks_new_buy')) is not bool
-                or row['blocks_new_buy'] != (lane != 'buy') or since is None or since > now):
+                or row['blocks_new_buy'] != (lane not in ('buy','reward_share')) or since is None or since > now):
             return unknown
         copied.append(dict(lane=lane, kind=kind, reason=reason, since=since.isoformat(),
             active=True, blocks_new_buy=row['blocks_new_buy']))
@@ -209,10 +209,11 @@ class LPMonitorSummary:
                 elif not all(type(auto.get(k)) is bool for k in ('desired_running','effective_running')):
                     pool_state, pool_reason = 'unknown', '做市开关状态未知'
             observed = mapping(auto.get('observed_pools'))
-            success = moment(mapping(observed.get('observation_refresh')).get('last_success_at'))
-            refresh_age = (now-success).total_seconds() if success is not None and success <= now else None
-            refresh = dict(last_success_at=success.isoformat() if success else None,
-                age_seconds=refresh_age, stalled=refresh_age > 120 if refresh_age is not None else None)
+            share = mapping(observed.get('reward_share'))
+            share_checked = moment(share.get('checked_at'))
+            share_age = (now-share_checked).total_seconds() if share_checked is not None and share_checked <= now else None
+            reward_share = dict(state='known' if share.get('state')=='known' and share_age is not None
+                and 0<=share_age<=60 else 'unknown',checked_at=share.get('checked_at'),age_seconds=share_age)
             raw_gaps = mapping(observed.get('income_gaps'))
             gap_items = raw_gaps.get('items')
             gaps = dict(total=None, omitted=None, items=[])
@@ -227,15 +228,24 @@ class LPMonitorSummary:
             raw_attempts = mapping(observed.get('measurement_attempts'))
             roles = mapping(observed.get('roles'))
             for cid, attempt in raw_attempts.items():
-                if mapping(roles.get(cid)).get('pool') != 'trial':
+                if mapping(roles.get(cid)).get('pool') not in ('trial','income'):
                     continue
                 raw = mapping(mapping(attempt).get('result'))
-                attempts.append(dict(condition_id=str(cid)[:96], checked_at=mapping(attempt).get('checked_at'),
-                    state=raw.get('state'), reason=raw.get('reason'), yield_pct_per_hour=raw.get('yield_pct_per_hour')))
+                retained = mapping(mapping(mapping(observed.get('results')).get(cid)).get('result'))
+                measured = moment(raw.get('measured_at') or retained.get('measured_at'))
+                sample_age = (now-measured).total_seconds() if measured is not None and measured <= now else None
+                source = mapping(raw.get('source_order') or retained.get('source_order'))
+                order_id=mapping(attempt).get('order_id') or source.get('order_id')
+                if source.get('order_id')!=order_id:sample_age=None
+                expired=raw.get('state')=='known' and (sample_age is None or sample_age>120)
+                attempts.append(dict(order_id=order_id,token_id=mapping(attempt).get('token_id') or source.get('token_id'),
+                    sample_age_seconds=sample_age,condition_id=str(cid)[:96], checked_at=mapping(attempt).get('checked_at'),
+                    state='unknown' if expired else raw.get('state'), reason='sample_expired' if expired else raw.get('reason'),
+                    yield_pct_per_hour=None if expired else raw.get('yield_pct_per_hour')))
                 if len(attempts) >= 64:
                     break
             result['pools'] = section(pool_state, pool_reason, items=pools,
-                income_gaps=gaps, measurement_attempts=attempts, observation_refresh=refresh,
+                income_gaps=gaps, measurement_attempts=attempts, reward_share=reward_share,
                 desired_running=auto.get('desired_running'), effective_running=auto.get('effective_running'),
                 fatal=bool(auto.get('fatal')), eligible_candidates=candidate_count if candidate_source else None,
                 candidate_last_success_at=candidate_stamp.isoformat() if candidate_stamp else None,

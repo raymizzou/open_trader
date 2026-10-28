@@ -86,82 +86,93 @@ def _measured_service(tmp_path, monkeypatch, *, variant='valid'):
 
 
 def test_trial_result_uses_official_reward_and_exact_measured_buy(tmp_path, monkeypatch):
+    from datetime import datetime
+    import httpx
     for variant in ('valid','zero','missing','wrong_order','wrong_terms','mixed','inventory'):
-        service, state = _measured_service(tmp_path/variant, monkeypatch, variant=variant)
+        rig=AsyncPoolRig(tmp_path/variant,monkeypatch)
         try:
-            refreshed = service.refresh_lp_observations()
-            row = refreshed['observations'].get('condition-1', {})
-            result = row.get('pool_result')
-            if variant in ('wrong_order', 'wrong_terms') and result is None:
-                # The real account adapter rejects these invalid facts before
-                # observation projection. UNKNOWN cannot manufacture a result.
-                assert refreshed['state'] == 'unknown'
-                assert not row or row.get('state') == 'unknown'
-                continue
-            assert result is not None, (variant, refreshed)
-            if variant in ('valid','zero','inventory'):
-                assert result['state'] == 'known', (variant, result)
-                assert Decimal(result['yield_pct_per_hour']) == Decimal('0' if variant == 'zero' else '.1')
-                assert Decimal(result['buy_capital_usd']) == 10
-                assert Decimal(result['hourly_reward_usd']) == Decimal('0' if variant == 'zero' else '.01')
-                assert result['source_order']['order_id'] == 'trial-D'
-                assert result['source_order']['token_id'] == 'yes-token'
-                assert result['source_order']['side'] == 'BUY'
-                assert Decimal(result['source_order']['price']) == Decimal('.5')
-                assert Decimal(result['source_order']['remaining_quantity']) == 20
-                assert result['measured_at'] and result['reward_checked_at']
-                assert result['basis'] == 'official_hourly_reward_per_measured_buy'
+            rig.market('A',pool='240');rig.add_order('A','10')
+            rig.sdk.orders[0].update(price=Decimal('.5'),original_size=Decimal(20))
+            rig.hourly['A']=Decimal(0) if variant=='zero' else Decimal('.01')
+            if variant=='wrong_order':rig.sdk.orders[0]['id']=''
+            if variant=='wrong_terms':rig.sdk.orders[0]['price']=Decimal('-.5')
+            if variant=='mixed':rig.add_order('A','10',order_id='other-A')
+            if variant=='inventory':
+                rig.sdk.positions=(dict(condition_id=rig.cid('A'),token_id='tA',size='30',average_price='.5'),)
+            if variant=='missing':
+                original=rig.http
+                async def missing_reward(req):
+                    if req.headers['x-lp-source']=='native_rewards':return httpx.Response(503)
+                    return await original(req)
+                rig.http=missing_reward
+            rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
+                roles={rig.cid('A'):dict(pool='trial',episode='old-A')})
+            rig.tick(30)
+            def drive():rig.live.run_once(pool='trial')
+            if variant in ('wrong_order','wrong_terms'):
+                rig.converge_current(lambda:rig.live.state.snapshot().observation is not None
+                    and not rig.live.state.snapshot().observation.orders_complete,drive=drive)
+                assert rig.live.state.snapshot().new_capacity.state=='unknown'
+                result=rig.execution.lp_observed_pool_state()['results'].get(rig.cid('A'),{}).get('result',{})
+                assert result.get('state')!='known'
             else:
-                assert result['state'] == 'unknown', (variant, result)
-                assert result.get('yield_pct_per_hour') is None
-        finally:
-            service._trading.close()
+                expected='unknown' if variant in ('missing','mixed') else 'known'
+                rig.converge_current(lambda:rig.execution.lp_observed_pool_state()['measurement_attempts'].get(
+                    rig.cid('A'),{}).get('result',{}).get('state')==expected and (expected=='known' or
+                        rig.execution.lp_observed_pool_state()['measurement_attempts'][rig.cid('A')]['result'].get('reason')==
+                            ('multiple_orders' if variant=='mixed' else 'reward_pool_stale')),drive=drive)
+                result=rig.execution.lp_observed_pool_state()['measurement_attempts'][rig.cid('A')]['result']
+                if expected=='known':
+                    assert result['account_id']==rig.account and result['condition_id']==rig.cid('A')
+                    assert Decimal(result['yield_pct_per_hour'])==Decimal(0 if variant=='zero' else '.1')
+                    assert Decimal(result['buy_capital_usd'])==10
+                    assert Decimal(result['hourly_reward_usd'])==Decimal(0 if variant=='zero' else '.01')
+                    source=result['source_order']
+                    assert source['order_id']=='old-A' and source['token_id']=='tA' and source['side']=='BUY'
+                    assert Decimal(source['price'])==Decimal('.5')
+                    assert Decimal(source['remaining_quantity'])==20 and Decimal(source['original_quantity'])==20
+                    assert Decimal(source['filled_quantity'])==0
+                    assert datetime.fromisoformat(source['scoring_checked_at']).utcoffset() is not None
+                    assert datetime.fromisoformat(result['measured_at']).utcoffset() is not None
+                    assert datetime.fromisoformat(result['reward_checked_at']).utcoffset() is not None
+                    assert result['basis']=='official_hourly_reward_per_measured_buy'
+                    if variant=='inventory':assert rig.live.state.snapshot().inventory_cost.value==15
+                else:
+                    assert result['yield_pct_per_hour'] is None
+                    assert result['reason']==('multiple_orders' if variant=='mixed' else 'reward_pool_stale')
+            assert rig.sdk.posts==rig.sdk.cancels==[]
+        finally:rig.close()
 
 
 def test_trial_result_survives_order_removal_until_120_seconds(tmp_path, monkeypatch):
-    from datetime import datetime, timedelta
-    from open_trader import prediction_arbitrage_execution as execution_module
+    from datetime import datetime,timedelta
     from open_trader.polymarket_lp_observed_pools import select_income_results
     from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
-    service, external = _measured_service(tmp_path, monkeypatch)
+    rig=AsyncPoolRig(tmp_path,monkeypatch)
     try:
-        first = service.refresh_lp_observations()['observations']['condition-1']['pool_result']
-        service.refresh_lp_share_watch()  # sibling publisher must preserve sample identity/time
-        assert service.lp_observed_pool_state()['results']['condition-1']['result'] == first
-        t0 = datetime.fromisoformat(first['measured_at'].replace('Z','+00:00'))
-        clock = [t0 + timedelta(seconds=1)]
-        monkeypatch.setattr(execution_module, '_utc_now', lambda: clock[0])
-        external['orders'] = []  # authoritative account removal, not cancel ACK
-        assert service._store.lp_advance_trade_generation(service._store.lp_trade_generation())
-        flat = service.refresh_lp_observations()
-        assert flat['observations']['condition-1']['stage'] == 'flat'
-        at120 = service.lp_observed_pool_state(as_of=t0+timedelta(seconds=120))
-        saved = at120['results']['condition-1']
-        assert saved['eligible'] is True and saved['result'] == first
-        assert select_income_results(at120['results'])['members'] == ('condition-1',)
-        after = service.lp_observed_pool_state(as_of=t0+timedelta(seconds=120,microseconds=1))
-        assert after['results']['condition-1']['eligible'] is False
-        assert select_income_results(after['results'])['members'] == ()
-        assert select_income_results(after['results'], members=('condition-1',))['cancel_members'] == ()
-        # A new Store object reads the same detached original result. Neither
-        # read/copy nor process restart grants new measured time.
-        reopened = PredictionArbitrageStore(tmp_path/'data')
-        original = reopened.lp_observations(service._lp_account_id())['condition-1']['pool_result']
-        assert original == first
-        assert service.lp_observed_pool_state(as_of=t0+timedelta(seconds=120)) == at120
-        external['orders'] = [dict(id='trial-D-new', market='condition-1', asset_id='yes-token',
-            side='BUY', status='LIVE', price=Decimal('.5'), original_size=Decimal('20'),
-            size_matched=Decimal('0'), remaining_size=Decimal('20'))]
-        external['reward_markets'][0]['rewards_config'][0]['rate_per_day'] = Decimal('.12')
-        assert service._store.lp_advance_trade_generation(service._store.lp_trade_generation())
-        clock[0] = t0 + timedelta(seconds=2)
-        lower = service.refresh_lp_observations()['observations']['condition-1']['pool_result']
-        assert Decimal(lower['yield_pct_per_hour']) == Decimal('.05')
-        assert lower['source_order']['order_id'] == 'trial-D-new'
-        assert lower['measured_at'] != first['measured_at']
-        assert service.lp_observed_pool_state(as_of=clock[0])['results']['condition-1']['result'] == lower
-    finally:
-        service._trading.close()
+        rig.market('A');rig.add_order('A','10')
+        first=rig.measure(dict(A='.1'))['observations'][rig.cid('A')]['pool_result']
+        t0=datetime.fromisoformat(first['measured_at'].replace('Z','+00:00'))
+        rig.release('old-A');rig.publish_account(set())
+        rig.execution.refresh_lp_observations()
+        at120=rig.execution.lp_observed_pool_state(as_of=t0+timedelta(seconds=120))
+        saved=at120['results'][rig.cid('A')]
+        assert saved['eligible'] is True and saved['result']==first
+        assert select_income_results(at120['results'])['members']==(rig.cid('A'),)
+        after=rig.execution.lp_observed_pool_state(as_of=t0+timedelta(seconds=120,microseconds=1))
+        assert not after['results'][rig.cid('A')]['eligible']
+        assert select_income_results(after['results'])['members']==()
+        assert select_income_results(after['results'],members=(rig.cid('A'),))['cancel_members']==()
+        reopened=PredictionArbitrageStore(tmp_path)
+        assert reopened.lp_observations(rig.account)[rig.cid('A')]['pool_result']==first
+        rig.add_order('A','10',order_id='trial-A-new')
+        roles=rig.store.lp_load_observed_pool_roles(rig.account)
+        rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=roles['revision'],
+            roles={rig.cid('A'):dict(pool='trial',episode='trial-A-new')})
+        lower=rig.measure(dict(A='.05'))['observations'][rig.cid('A')]['pool_result']
+        assert Decimal(lower['yield_pct_per_hour'])==Decimal('.05')
+        assert lower['source_order']['order_id']=='trial-A-new' and lower['measured_at']!=first['measured_at']
+    finally:rig.close()
 
 
 class PoolRig:
@@ -182,6 +193,7 @@ class PoolRig:
         import hashlib
         self.now = clock() if clock else datetime.now(UTC)
         self.markets, self.hourly = {}, {}
+        self.measured_order_ids = {}
         self.wallet, self.allowance = Decimal(wallet), Decimal(wallet)
         self.cancel_removes = False
         self.counter = 0
@@ -315,6 +327,15 @@ class PoolRig:
             if cid not in roles and any(o['id'] == 'old-'+name and o['market'] == cid
                     for o in self.sdk.orders):
                 roles[cid] = dict(pool='trial', episode='old-'+name)
+        changed_rates=False
+        for name,rate in rates.items():
+            orders=tuple(o for o in self.sdk.orders if o['market']==self.cid(name) and o['side']=='BUY')
+            capital=sum((o['price']*(o['original_size']-o['size_matched']) for o in orders),Decimal(0))
+            hourly=Decimal(rate)*capital/100
+            ids=frozenset(o['id'] for o in orders)
+            changed_rates=changed_rates or self.hourly.get(name)!=hourly or self.measured_order_ids.get(name)!=ids
+            self.hourly[name]=hourly
+            self.measured_order_ids[name]=ids
         if hasattr(self,'observe_initial_measurement') and not getattr(self,'_measurement_primed',False):
             self.observe_initial_measurement(rates)
             self._measurement_primed=True
@@ -324,10 +345,24 @@ class PoolRig:
         if roles != current_roles['roles']:
             self.store.lp_save_observed_pool_roles(self.account,
                 expected_revision=current_roles['revision'], roles=roles)
-        for name,rate in rates.items():
-            capital=sum((o['price']*(o['original_size']-o['size_matched']) for o in self.sdk.orders
-                if o['market']==self.cid(name) and o['side']=='BUY'),Decimal(0))
-            self.hourly[name]=Decimal(rate)*capital/100
+        if hasattr(self,'observe_initial_measurement'):
+            if changed_rates:self.tick(30)
+            def measured():
+                attempts=self.execution.lp_observed_pool_state()['measurement_attempts']
+                current=self.store.lp_load_observed_pool_roles(self.account)['roles']
+                return all(attempts.get(self.cid(name),{}).get('result',{}).get('state')=='known'
+                    and Decimal(str(attempts[self.cid(name)]['result']['yield_pct_per_hour']))==Decimal(rate)
+                    for name,rate in rates.items() if current.get(self.cid(name),{}).get('pool') in ('trial','income')
+                    and any(o['id']==current[self.cid(name)].get('episode') for o in self.sdk.orders
+                        if o['market']==self.cid(name) and o['side']=='BUY'))
+            import time
+            end=time.monotonic()+4
+            while not measured():
+                self.live.run_once(pool='trial')
+                if measured():break
+                assert time.monotonic()<end,self.live.diagnostics()
+                self.advance_idle_read()
+                self.wake.wait(.01);self.wake.clear()
         assert self.store.lp_advance_trade_generation(self.store.lp_trade_generation())
         return self.execution.refresh_lp_observations()
 
@@ -576,10 +611,12 @@ def test_promotion_excludes_trial_market_until_actual_release(tmp_path,monkeypat
         released_trial=rig.cycle(pool='trial')
         rig.finish_cancels(released_trial)
         assert rig.sdk.posts==[]
+        after=rig.utc()
         new=rig.cycle(pool='income')
         rig.finish_cancels(new)
+        if not rig.sdk.posts:rig.finish_income_rebuild(rig.cid('D'),'tD',after=after)
         assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts]==[('tD',Decimal('50'))]
-        new_id=new.outcomes[0].venue_order_id
+        new_id=next(o['id'] for o in rig.sdk.orders if o['asset_id']=='tD')
         assert new_id!='old-D'
         assert all(o.identity.request_id!=old.rotation_outcomes[0].handle.identity.request_id for o in new.outcomes)
         # A historical rotation result has no current observation authority.
@@ -813,8 +850,15 @@ def test_income_cycle_consumes_one_result_snapshot_and_next_cycle_gets_updates(t
             pending=workers.submit(rig.cycle,pool='income')
             try:
                 assert entered.wait(2)
-                new=rig.measure(dict(E='1.2'))['observations'][rig.cid('E')]['pool_result']
-                assert new['source_order']['order_id']=='old-E'
+                # Publish external facts while the native BUY owns the business round.
+                rig.hourly['E']=Decimal('1.2')/100
+                rig.tick(30)
+                end=monotonic()+4
+                while not (any(source=='reward_share' and stamp==rig.seconds for source,_,stamp in rig.requests)
+                        and all(not scope['active'] for scope in rig.live.read_runtime.status()['scopes']
+                            if scope['kind']=='reward_share')):
+                    assert monotonic()<end,'external share publication watchdog'
+                    rig.wake.wait(.01);rig.wake.clear()
             finally:release.set()
             fixed=pending.result(timeout=4)
         assert fixed.selection.targets==(rig.cid('D'),)
@@ -854,7 +898,8 @@ def test_income_cycle_consumes_one_result_snapshot_and_next_cycle_gets_updates(t
                     and due is not None and due>rig.seconds):
                 rig.tick(due-rig.seconds)
             rig.wake.wait(.01);rig.wake.clear()
-        assert rig.execution.lp_observed_pool_state()['results'][rig.cid('D')]['result']==old
+        new=rig.measure(dict(E='1.2'))['observations'][rig.cid('E')]['pool_result']
+        assert new['source_order']['order_id']=='old-E'
         following=rig.cycle(pool='income');rig.finish_cancels(following)
         assert following.selection.targets==(rig.cid('E'),rig.cid('D'))
         assert {o.key[3] for o in following.rotation.victims}=={fixed.outcomes[0].venue_order_id,'old-E'}
@@ -892,7 +937,7 @@ def test_ready_trial_progresses_while_income_results_change_or_wait(tmp_path,mon
             scheduler.request_check();assert scheduler.run_due()
         rig.pump(lambda:len(rig.sdk.posts)==1)
         rig.publish_account({'old-D','new-E-1'})  # exact receipt-current publication
-        if measured:assert measured[0]!=measured[1]
+        if measured:assert measured[0]<=measured[1]  # oldest share time does not renew each BUY read
         assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts]==[('tE',Decimal('1'))]
         assert rig.sdk.cancels==[]
         assert {o['id'] for o in rig.sdk.orders}=={'old-D','new-E-1'}
@@ -1087,6 +1132,10 @@ def test_fill_and_protection_remain_authoritative_during_pool_changes(tmp_path,m
             if token_id=='tC':raise TimeoutError('offline current incumbent market unavailable')
             return read(token_id=token_id)
         unreadable.public.get_order_book=missing
+        unreadable.tick()
+        unreadable.pump(lambda:any(key[3]=='old-C' and failure.consecutive_failures>0
+            for key,failure in unreadable.live.state.snapshot().read_failures.items()),
+            drive=lambda:unreadable.live.run_once(pool='trial'))
         waiting=unreadable.cycle(pool='income');unreadable.finish_cancels(waiting)
         assert unreadable.sdk.cancels==[] and unreadable.sdk.posts==[]
         assert set(waiting.selection.targets)=={rig.cid('A'),rig.cid('B'),rig.cid('C')}
@@ -1365,6 +1414,12 @@ class AsyncPoolRig(PoolRig):
             value=dict(data=rows,next_cursor='LTE=')
         elif source=='positions':value=[dict(conditionId=row['condition_id'],asset=row['token_id'],
             size=str(row['size']),avgPrice=str(row['average_price'])) for row in self.sdk.positions]
+        elif source=='reward_share':
+            value=dict(data=[dict(condition_id=self.cid(name),earning_percentage=str(
+                hourly*24*100/self.markets[name]['pool'])) for name,hourly in self.hourly.items()
+                if name not in self.measured_order_ids or self.measured_order_ids[name]==frozenset(
+                    o['id'] for o in self.sdk.orders if o['market']==self.cid(name) and o['side']=='BUY')]
+                if req.url.params['sponsored']=='false' else [],next_cursor='LTE=')
         elif source=='metadata':
             if req.url.path=='/events/keyset':value=dict(events=[dict(id='7',slug='event',title='Event')],next_cursor=None)
             else:
@@ -1676,6 +1731,7 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
         # real partial fill still excludes unrelated queue protection.
         assert rig.cid('E') not in rig.store.lp_load_observed_pool_roles(rig.account)['roles']
         rig.history['old-E']['size_matched']=Decimal('.5')
+        rig.measure(dict(A='.6',B='1.0',C='.4',D='.8'))
         rig.failed_book_tokens={'tE'}
         # Ten real failures are below the existing read-failure cancellation
         # threshold. All current facts are owned runtime publications.
@@ -1684,11 +1740,10 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
                 if k[3]=='old-E'),0)
         for expected in range(1,11):
             rig.tick()
-            rig.pump(lambda:failures()==expected)
+            rig.pump(lambda:failures()==expected,drive=lambda:rig.live.run_once(pool='trial'))
         assert rig.sdk.cancels==[] and failures()==10
         partial=next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-E')
         assert (partial.original_size.value,partial.size_matched.value,partial.remaining.value)==(Decimal('2.5'),Decimal('.5'),Decimal('2'))
-        rig.measure(dict(A='.6',B='1.0',C='.4',D='.8'))
         actual_cancel=rig.sdk.cancel_orders
         def cancel(*,order_ids):
             if len(order_ids)>1:
@@ -1707,6 +1762,16 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
         # Public D2 pool planning is used to retain the real group result/IDs;
         # the subsequent protection and wakeup use the real service scheduler.
         rig.tick()
+        # Settle this round's account source before counting held native owners.
+        def account_published():
+            snapshot=rig.live.state.snapshot();status=rig.live.read_runtime.status()
+            return (snapshot.observation.components['open_orders'].checked_at==rig.utc()
+                and snapshot.observation.read_ticket.trade_version_at_start==snapshot.trade_version
+                and snapshot.new_capacity.state=='known' and status['ready_count']==0
+                and not any(s['active'] for s in status['scopes'])
+                and status['observed_monotonic']>=rig.seconds)
+        rig.pump(account_published,drive=lambda:rig.live.run_once(pool='trial'))
+        assert rig.sdk.cancels==[] and failures()==11
         end=time.monotonic()+4
         while not planned:
             result=rig.live.dispatch_rotation(rig.live.run_once(rig.producer.capture_qualified_pool(),pool='income'))
@@ -1785,6 +1850,7 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
         # real partial fill still excludes unrelated queue protection.
         assert rig.cid('E') not in rig.store.lp_load_observed_pool_roles(rig.account)['roles']
         rig.history['old-E']['size_matched']=Decimal('.5')
+        rig.measure(dict(A='.6',B='1.0',C='.4',D='.8'))
         rig.failed_book_tokens={'tE'}
         # Ten real failures are below the existing read-failure cancellation
         # threshold. All current facts are owned runtime publications.
@@ -1793,11 +1859,10 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
                 if k[3]=='old-E'),0)
         for expected in range(1,11):
             rig.tick()
-            rig.pump(lambda:failures()==expected)
+            rig.pump(lambda:failures()==expected,drive=lambda:rig.live.run_once(pool='trial'))
         assert rig.sdk.cancels==[] and failures()==10
         partial=next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-E')
         assert (partial.original_size.value,partial.size_matched.value,partial.remaining.value)==(Decimal('2.5'),Decimal('.5'),Decimal('2'))
-        rig.measure(dict(A='.6',B='1.0',C='.4',D='.8'))
         actual_cancel=rig.sdk.cancel_orders
         def cancel(*,order_ids):
             if len(order_ids)>1:
@@ -1987,6 +2052,7 @@ def test_pool_restart_and_expiry_preserve_owned_async_holds(tmp_path,monkeypatch
         # Only real resource drain permits a replacement owner. It starts from
         # current Store facts, never from an old income group/BUY request plan.
         rig.http_mode='ok'
+        rig.hourly.clear()
         hold_old_owner[0] = False
         rig.live=LPD2LiveExecution(rig.store,rig.adapter,account_id=old.account_id,venue='polymarket',
             process_epoch='async-pool-restart',policy=CalculationPolicy(None),load_settings_on_start=True,
@@ -2053,7 +2119,7 @@ def test_async_read_protection_precedes_pool_rebuild(tmp_path,monkeypatch,pool_a
         before={t.request_id for t in rig.live.state.snapshot().progress[failure().protection_key].cancel_targets}
         assert rig.live.state.snapshot().progress[failure().protection_key].reason_codes==('read_failure_limit',)
         assert len(before)==1
-        rig.measure(dict(A='.6',B='1.0',C='.4',D='.8'))
+        rig.measure(dict(A='.6',C='.4',D='.8'))
         rig.failed_book_tokens.clear();rig.tick()
         rig.pump(lambda:rig.live.state.snapshot().observation.components['open_orders'].checked_at==rig.utc()
             and any(k[3]=='old-B' and y.yield_pct_per_hour.state=='known'
@@ -2097,6 +2163,16 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
         manual='manual-extra-'+manual_market
         rig.add_order(manual_market,'5',order_id=manual)
         rig.publish_account({'old-A','old-B','old-C','old-D',manual})
+        # In-flight reads can publish one last valid sample before the manual
+        # order's account publication; freeze the archive at that real boundary.
+        pool_state=rig.execution.lp_observed_pool_state()
+        retained=pool_state['results'][rig.cid(manual_market)]['result']
+        assert pool_state['measurement_attempts'][rig.cid(manual_market)]['result']['reason']=='multiple_orders'
+        original=measured['observations'][rig.cid(manual_market)]['pool_result']
+        for field in ('account_id','condition_id','hourly_reward_usd','buy_capital_usd','yield_pct_per_hour'):
+            assert retained[field]==original[field]
+        for field in ('order_id','token_id','side','price','remaining_quantity','original_quantity','filled_quantity'):
+            assert retained['source_order'][field]==original['source_order'][field]
         planned=rig.cycle(pool='income',qualified=True,settle_reads=True);rig.finish_cancels(planned)
         sent={oid for batch in rig.sdk.cancels for oid in batch}
         assert manual not in sent,'pool authority must never cancel an unclassified same-market BUY'
@@ -2124,7 +2200,7 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
         snapshot=rig.live.state.snapshot()
         assert snapshot.buy_reserved.value==Decimal('5')+sum((capital for _,capital in expected),Decimal(0))
         assert len([o for o in snapshot.active_orders if o.key[1]==rig.cid(manual_market)])==1
-        assert rig.execution.lp_observed_pool_state()['results'][rig.cid(manual_market)]['result']==measured['observations'][rig.cid(manual_market)]['pool_result']
+        assert rig.execution.lp_observed_pool_state()['results'][rig.cid(manual_market)]['result']==retained
         if manual_market=='D':
             assert all(p['token_id']!='tD' for p in rig.sdk.posts)
             rig.release(manual)
@@ -2132,12 +2208,29 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
             # Model actual venue removal for these new exact cancel IDs, rather
             # than leaving contradictory LIVE rows after their accepted receipt.
             rig.cancel_removes=True
-            rig.finish_income_rebuild(rig.cid('D'),'tD',after=rig.utc())
-            assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts if p['token_id']=='tD']==[('tD',Decimal('30'))]
+            after=rig.utc()
+            def candidates_current():
+                snapshot=rig.live.state.snapshot();observation=snapshot.observation
+                status=rig.live.read_runtime.status();due=status['next_dependency_monotonic']
+                sources=[observation.source_frame.sources.get('market:'+rig.cid(n)+':t'+n) for n in 'ABD']
+                return (observation.orders_complete and observation.components['open_orders'].checked_at>=after
+                    and observation.read_ticket.trade_version_at_start==snapshot.trade_version
+                    and snapshot.new_capacity.state=='known' and status['ready_count']==0
+                    and not any(s['active'] for s in status['scopes']) and status['observed_monotonic']>=rig.seconds
+                    and (due is None or due>rig.seconds) and all(s is not None and s.complete and not s.error
+                        and s.checked_at is not None and s.checked_at>=after
+                        and 0<=(rig.utc()-s.checked_at).total_seconds()<=10 for s in sources))
             # A cycle can finish only one part of this asynchronous rebuild.
             # Wait for the three real slots, not for the expected money values.
             end=time.monotonic()+4
             while True:
+                # D publication alone does not establish the higher-ranked B input.
+                while not candidates_current():
+                    prepared=rig.live.run_once(pool='trial');rig.finish_cancels(prepared)
+                    assert time.monotonic()<end,'income candidate publication watchdog'
+                    if candidates_current():break
+                    rig.advance_idle_read()
+                    rig.wake.wait(.01);rig.wake.clear()
                 rebuilt=rig.live.dispatch_rotation(rig.live.run_once(
                     rig.producer.capture_qualified_pool(),pool='income'))
                 rig.finish_cancels(rebuilt)
@@ -2148,6 +2241,7 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
                 assert time.monotonic()<end,'income group completion watchdog'
                 rig.advance_idle_read()
                 rig.wake.wait(.01);rig.wake.clear()
+            assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts if p['token_id']=='tD']==[('tD',Decimal('30'))]
             assert {(row['asset_id'],row['price']*(row['original_size']-row['size_matched']))
                 for row in rig.sdk.orders}=={('tB',Decimal('50')),('tD',Decimal('30')),('tA',Decimal('20'))}
             assert len(rig.sdk.orders)==3
@@ -2202,6 +2296,12 @@ def test_pool_group_permission_wait_keeps_current_state_responsive(tmp_path,monk
                 end=time.monotonic()+4
                 while not any(o.key[3]=='replacement-A' for o in rig.live.state.snapshot().active_orders):
                     rig.live.run_once(rig.producer.capture_qualified_pool(),pool='income')
+                    # The held SQL owner must not freeze account read deadlines.
+                    status=rig.live.read_runtime.status();due=status['next_dependency_monotonic']
+                    if (status['ready_count']==0 and not any(s['active'] for s in status['scopes'])
+                            and status['observed_monotonic']>=rig.seconds and due is not None and due>rig.seconds):
+                        assert not sql_release.is_set() and rig.sdk.cancels==[]
+                        rig.tick(due-rig.seconds)
                     assert time.monotonic()<end,'public replacement publication watchdog'
                     time.sleep(.001)
             pool.submit(publish).result(timeout=5)
@@ -2355,6 +2455,9 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
         rig.live.run_once(rig.producer.capture_qualified_pool(),pool='income')
         rig.pump(lambda:rig.live.read_runtime.status()['ready_count']==0 and
             not any(s['active'] for s in rig.live.read_runtime.status()['scopes']))
+        group_calls=sum(len(batch)>1 for batch in rig.sdk.cancels)
+        groups=[h for h in rig.live._native_jobs.values() if h._thread.name=='lp-pool-group-cancel' and h._thread.is_alive()]
+        assert len(groups)==group_calls
         partial=next(o for o in rig.live.state.snapshot().active_orders if o.key[3]=='old-J')
         assert (partial.original_size.value,partial.size_matched.value,partial.remaining.value)==(Decimal('2.5'),Decimal('.5'),Decimal('2'))
         def wake():

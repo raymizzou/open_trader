@@ -5493,6 +5493,10 @@ class PredictionArbitrageStore:
             ).fetchone()
             if current is not None:
                 previous = _load_payload(str(current["payload"]))
+                for key in ('pool_result', 'pool_measurement_attempt'):
+                    if key not in payload and key in previous:
+                        payload = {**payload, key:previous[key]}
+                        encoded = _dump_execution_payload(payload)
                 previous_result = previous.get('pool_result')
                 incoming_result = payload.get('pool_result')
                 if isinstance(previous_result, Mapping) and previous_result.get('state') == 'known':
@@ -5561,6 +5565,13 @@ class PredictionArbitrageStore:
                             'updated_at': current['updated_at'] if current is not None else None}
             merged = dict(previous)
             for key, value in updates.items():
+                if key in ('pool_result', 'pool_measurement_attempt'):
+                    if (key=='pool_result' and isinstance(previous.get(key),Mapping)
+                            and previous[key].get('state')=='known' and isinstance(value,Mapping)
+                            and value.get('state')!='known'):
+                        continue  # a new owner's UNKNOWN keeps the last valid archive
+                    merged[str(key)] = value
+                    continue
                 old_value = merged.get(str(key))
                 if isinstance(old_value, Mapping) and isinstance(value, Mapping):
                     merged[str(key)] = {**old_value, **value}

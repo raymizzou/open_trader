@@ -252,6 +252,8 @@ def test_disconnect_and_silence_restore_rest_cadence(failure):
                 await wait(lambda:bool(rows.extend(runtime.drain_results()) or rows))
                 assert rows[0].complete
                 assert [e[3] for e in boundary.events if e[:3]==('entered','B','book')]==[20]
+                # Await physical close before later clock jumps can strand backoff.
+                await wait(lambda:runtime.status()['orderbook']['next_retry_monotonic'] is not None)
                 clock.value=24.99;runtime.wake();assert runtime.drain_results()==()
                 boundary.mode[('B','book')]='cooling'
                 clock.value=25;runtime.wake();rows=[]
@@ -760,7 +762,10 @@ def test_shadow_rest_cancel_implies_ws_cancel_without_sending_shadow(tmp_path,ws
                     async with asyncio.timeout(3):
                         while live.read_runtime.orderbook_snapshot('yes')['bids'][0]['size']!=Decimal(ws_total):await asyncio.sleep(.01)
                 boundary.book_depth=30;clock.value=5;live.read_runtime.wake()
-                await pump(lambda:live.state.snapshot().yields[('account',CID,'yes','A')].evaluated_at==clock.utc())
+                # Financial recomputation does not prove a new book was accepted.
+                await pump(lambda:live.state.snapshot().yields[('account',CID,'yes','A')].evaluated_at==clock.utc()
+                    and live.state.snapshot().observation.source_frame.sources[f'market_book:{CID}:yes'].checked_at==clock.utc()
+                    and live.state.snapshot().observation.source_frame.sources[f'market_book:{CID}:yes'].value['book']['bids'][0]['size']==Decimal(30))
                 if ws_total is None:
                     await outbound.put(dict(event_type='tick_size_change',market=CID,asset_id='yes',timestamp='1002'))
                     async with asyncio.timeout(3):
@@ -1024,7 +1029,10 @@ def test_shadow_uses_fixed_bid_level_contract_after_main_merge(tmp_path,monkeypa
                 clock.value=5;live.read_runtime.wake()
                 key=('account',CID,'yes','A')
                 await pump(lambda:key in live.state.snapshot().yields
-                    and live.state.snapshot().yields[key].evaluated_at==clock.utc())
+                    and live.state.snapshot().yields[key].evaluated_at==clock.utc()
+                    and live.state.snapshot().observation.source_frame.sources[f'market_book:{CID}:yes'].checked_at==clock.utc()
+                    and sorted((r['price'],r['size']) for r in live.state.snapshot().observation.source_frame.sources[
+                        f'market_book:{CID}:yes'].value['book']['bids'])==sorted((Decimal(p),Decimal(q)) for p,q in current))
                 if not ws_known:
                     # The ordinary REST fallback may seed the unavailable token; invalidate the WS leg again.
                     await outbound.put(dict(event_type='tick_size_change',market=CID,asset_id='yes',timestamp='1002'))

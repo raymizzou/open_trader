@@ -710,8 +710,8 @@ def test_owned_request_tasks_are_counted_and_drained():
         assert status['managed_tasks'] == len(observed) == expected_sources + cap + 3
         assert status['managed_tasks'] <= 8 * cap + 32
         assert status['pool_count'] == len(clients) == 2 * cap + 5
-        assert status['pool_limit'] == 2 * cap + 5
-        assert status['connection_limit'] == 4 * cap + 9
+        assert status['pool_limit'] == 2 * cap + 6
+        assert status['connection_limit'] == 4 * cap + 10
         runtime.reconcile(())
         observer.wait(lambda: len(closing) == expected_sources)
         assert not runtime.close(0.01)

@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-28 — Keep D2 yield separate from account exposure (#482 / PR #490)
+
+- Preserve actual occupied capital, exposure state/reason and risk/qualification fields when projecting D2 yield. Publish yield state/reason and measured BUY principal separately; yield, hourly reward, details and sorting use those fields with legacy payload compatibility.
+- Let valid current account/order/sample facts restore yield after account recovery or inventory change while the legacy reward thread is still waiting. Keep incomplete, stale or mismatched current account facts UNKNOWN. No trading policy or deployment change is included.
+
+## 2026-10-28 — D2 income samples and shared yield display (#482 v4)
+
+- Calculate managed BUY income samples in D2 from each order's reward pool, exact scoring/account facts and a bounded authenticated open-order reward-share read. Native and sponsored shares refresh every 30 seconds with a 10-second deadline; their failure leaves samples UNKNOWN and does not block other trading reads. Keep input timestamps and the 120-second sample limit.
+- Make D2 the sample writer and decision source. Preserve last valid archives, independent risk/share-watch updates, exact identities and restart/no-replay guards. Current BUY yield display uses the same samples; monitor cards show per-order sample and reward-share ages. Legacy session rewards remain for history and position/risk display.
+- Keep the 600-second trial protection timer running through unavailable reward shares, and consume a newly known zero sample before the same round's cancellation decision. Preserve v2 A–D, budgets, weights and BUY price/size protection. No deployment is included.
+
 ## 2026-10-28 — LP WS local BUY acceptance time (#487 / P1-C)
 
 - Export WS exchange timestamps as aware UTC values while retaining numeric internal ordering and raw precision. Reject invalid or unrepresentable times; never replace exchange time with local arrival or round an older source past acceptance.

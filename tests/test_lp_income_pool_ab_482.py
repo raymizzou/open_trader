@@ -38,18 +38,15 @@ def test_income_gap_reports_each_skip_without_changing_selection(tmp_path, monke
                 measured=None
             else:
                 measured = rig.measure({n:'1' for n in names if scenario!='comparison' or n!='A'})
-            if scenario in ('bounded','comparison','unknown'):
-                for n in ('A' if scenario=='comparison' else names):
-                    raw = dict(state='unknown', reason='reward_attribution_unknown', yield_pct_per_hour=None)
-                    # Save observation data through the Store's public external fact seam.
-                    rig.store.save_lp_observation(rig.account,rig.cid(n),dict(pool_result=raw))
-            elif scenario=='expired':
+            if scenario=='expired':
+                rig.hourly.clear()  # current share source lacks this positive-pool market
                 rig.tick(121)
             elif scenario=='old_source':
-                row = deepcopy(measured['observations'][rig.cid('A')])
-                row['pool_result']['source_order']['order_id']='previous-A'
-                row['pool_result']['measured_at']=(rig.utc()+timedelta(microseconds=1)).isoformat()
-                rig.store.save_lp_observation(rig.account,rig.cid('A'),row)
+                rig.release('old-A');rig.add_order('A','1',order_id='replacement-A')
+                rig.publish_account({'replacement-A'})
+                saved=rig.store.lp_load_observed_pool_roles(rig.account)
+                rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=saved['revision'],
+                    roles={rig.cid('A'):dict(pool='trial',episode='replacement-A')})
             elif scenario=='stress':
                 from polymarket.models.clob.order_book import OrderBookLevel
                 rig.markets['A']['direction']['book']['bids']=[dict(price='.4',size='10000'),dict(price='.39',size='3')]
@@ -68,10 +65,10 @@ def test_income_gap_reports_each_skip_without_changing_selection(tmp_path, monke
             state=rig.execution.lp_auto_state()['observed_pools']
             assert 'income_gaps' in state, scenario
             gaps=state['income_gaps']; items=gaps['items']
-            expected={'no_sample':'sample_unknown:no_sample','unknown':'sample_unknown:reward_attribution_unknown',
+            expected={'no_sample':'sample_unknown:reward_share_unknown','unknown':'sample_unknown:reward_share_unknown',
                 'expired':'sample_expired','old_source':'source_not_current','missing_row':'candidate_row_missing',
                 'minimum':'below_minimum','stress':'exit_liquidity_insufficient','comparison':'comparison_deferred',
-                'bounded':'sample_unknown:reward_attribution_unknown'}[scenario]
+                'bounded':'sample_unknown:reward_share_unknown'}[scenario]
             if scenario=='stress':
                 assert expected not in {r['reason'] for r in items}
                 estimate,=state['income_estimates']
@@ -97,81 +94,62 @@ def test_income_gap_reports_each_skip_without_changing_selection(tmp_path, monke
 
 
 def test_latest_measurement_attempt_does_not_replace_retained_valid_sample(tmp_path, monkeypatch):
-    from open_trader import prediction_arbitrage_execution as module
-    from tests.test_prediction_service import _lp_reward_order
-    service, external = _measured_service(tmp_path, monkeypatch)
-    try:
-        known=service.refresh_lp_observations()['observations']['condition-1']['pool_result']
-        from datetime import datetime
-        at=datetime.fromisoformat(known['measured_at'].replace('Z','+00:00'))+timedelta(seconds=1)
-        monkeypatch.setattr(module,'_utc_now',lambda:at)
-        external['orders'].append(_lp_reward_order('other',remaining=Decimal('20'),matched=Decimal('0')))
-        assert service._store.lp_advance_trade_generation(service._store.lp_trade_generation())
-        refreshed=service.refresh_lp_observations()
-        assert refreshed['observations']['condition-1']['pool_result']==known
-        state=service.lp_observed_pool_state(as_of=at)
-        assert state['results']['condition-1']['result']==known
-        assert 'measurement_attempts' in state
-        attempt=state['measurement_attempts']['condition-1']
-        assert attempt['result']['state']=='unknown'
-        assert attempt['result']['reason']=='reward_attribution_unknown'
-        assert attempt['checked_at']==at.isoformat().replace('+00:00','Z')
-        assert attempt['checked_at']!=known['measured_at']
-        attempt['result']['reason']='changed by reader'
-        assert service.lp_observed_pool_state(as_of=at)['measurement_attempts']['condition-1']['result']['reason']=='reward_attribution_unknown'
-        assert len(state['measurement_attempts'])<=64
-        restarted, _ = _measured_service(tmp_path,monkeypatch)
-        try:
-            assert restarted.lp_observed_pool_state(as_of=at)['measurement_attempts']=={}
-            assert restarted.lp_observed_pool_state(as_of=at)['results']['condition-1']['result']==known
-        finally: restarted._trading.close()
-    finally: service._trading.close()
-
-
-def test_monitor_shows_observation_stall_after_120_and_clears_on_refresh(tmp_path, monkeypatch):
-    from open_trader.lp_monitor_readonly import safe_summary, render_page
+    from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
+    from open_trader.polymarket_lp_market_calculation import CalculationPolicy
+    from tests.test_lp_d2_execution_bridge import attach
+    from open_trader.polymarket_lp import PolymarketLPService
     rig=AsyncPoolRig(tmp_path,monkeypatch)
     try:
         rig.market('A');rig.add_order('A','1')
-        initial=rig.execution.lp_auto_state()['observed_pools']
-        assert 'observation_refresh' in initial
-        assert initial['observation_refresh']['last_success_at'] is None
-        rig.measure({'A':'1'})
-        at=rig.utc()
-        rig.finish_cancels(rig.cycle(pool='income'))
-        before=(rig.store.lp_trade_generation(),len(rig.sdk.posts),len(rig.sdk.cancels))
-        for delta, stalled in [(120,False),(121,True)]:
-            # Observation-only clock; GET must not start a read or shift success time.
-            now=at+timedelta(seconds=delta)
-            raw=rig.execution.lp_monitor_summary(now=now)
-            safe=safe_summary(raw)
-            health=safe['pools']['observation_refresh']
-            assert health['stalled'] is stalled
-            assert health['age_seconds']==delta
-            page=render_page(safe)
-            assert ('观测刷新停滞 121 秒' in page) is stalled
-            assert '收益池缺单原因' in page
-            assert before==(rig.store.lp_trade_generation(),len(rig.sdk.posts),len(rig.sdk.cancels))
-        rig.tick(121)
-        # A completed refresh with unknown measurement is still successful refresh work.
+        known=rig.measure(dict(A='1'))['observations'][rig.cid('A')]['pool_result']
         rig.add_order('A','1',order_id='other-A')
-        assert rig.store.lp_advance_trade_generation(rig.store.lp_trade_generation())
-        rig.execution.refresh_lp_observations()
-        new=rig.execution.lp_auto_state()['observed_pools']
-        assert new['measurement_attempts'][rig.cid('A')]['result']['state']=='unknown'
-        safe=safe_summary(rig.execution.lp_monitor_summary(now=rig.utc()))
-        assert safe['pools']['observation_refresh']['stalled'] is False
-        assert safe['pools']['observation_refresh']['age_seconds']==0
-        assert '观测刷新停滞' not in render_page(safe)
-        attempt,=safe['pools']['measurement_attempts']
-        assert attempt['reason']=='reward_attribution_unknown'
-        injected=deepcopy(safe)
-        injected['pools']['measurement_attempts'][0]['reason']='<script>secret</script>'
-        injected['pools']['observation_refresh'].update(stalled=True,age_seconds=None)
-        rendered=render_page(injected)
+        rig.tick()
+        def drive():rig.live.run_once(pool='trial')
+        rig.converge_current(lambda:rig.execution.lp_observed_pool_state()['measurement_attempts'].get(
+            rig.cid('A'),{}).get('result',{}).get('reason')=='multiple_orders',drive=drive)
+        state=rig.execution.lp_observed_pool_state()
+        assert state['results'][rig.cid('A')]['result']==known
+        attempt=state['measurement_attempts'][rig.cid('A')]
+        assert attempt['result']['state']=='unknown' and attempt['result']['reason']=='multiple_orders'
+        assert attempt['checked_at']!=known['measured_at']
+        attempt['result']['reason']='changed by reader'
+        assert rig.execution.lp_observed_pool_state()['measurement_attempts'][rig.cid('A')]['result']['reason']=='multiple_orders'
+        assert len(state['measurement_attempts'])<=64
+        assert rig.live.close(3)
+        new=LPD2LiveExecution(rig.store,rig.adapter,account_id=rig.adapter.config.wallet_address,
+            venue='polymarket',process_epoch='measurement-restart',policy=CalculationPolicy(None))
+        rig.live=new
+        execution=attach(new,PolymarketLPService(rig.store,rig.adapter),tmp_path)
+        assert execution.lp_observed_pool_state()['measurement_attempts']=={}
+        assert execution.lp_observed_pool_state()['results'][rig.cid('A')]['result']==known
+        assert new.pool_result_projection()=={}  # disk history grants no new process authority
+    finally:rig.close()
+
+
+def test_monitor_shows_observation_stall_after_120_and_clears_on_refresh(tmp_path, monkeypatch):
+    from open_trader.lp_monitor_readonly import safe_summary,render_page
+    rig=AsyncPoolRig(tmp_path,monkeypatch)
+    try:
+        rig.market('A');rig.add_order('A','1')
+        rig.measure(dict(A='1'))
+        before=(rig.store.lp_trade_generation(),len(rig.sdk.posts),len(rig.sdk.cancels),len(rig.requests))
+        for delta in (120,121):
+            summary=safe_summary(rig.execution.lp_monitor_summary(now=rig.utc()+timedelta(seconds=delta)))
+            attempt,=summary['pools']['measurement_attempts']
+            assert attempt['sample_age_seconds']>=delta
+            assert summary['pools']['reward_share']['age_seconds']>=delta
+            assert '观测刷新停滞' not in render_page(summary)
+            assert '每单样本年龄' in render_page(summary)
+            assert before==(rig.store.lp_trade_generation(),len(rig.sdk.posts),len(rig.sdk.cancels),len(rig.requests))
+        rig.add_order('A','1',order_id='other-A');rig.tick()
+        rig.converge_current(lambda:rig.execution.lp_observed_pool_state()['measurement_attempts'][rig.cid('A')][
+            'result'].get('reason')=='multiple_orders',drive=lambda:rig.live.run_once(pool='trial'))
+        summary=safe_summary(rig.execution.lp_monitor_summary(now=rig.utc()))
+        attempt,=summary['pools']['measurement_attempts']
+        assert attempt['reason']=='multiple_orders'
+        attempt['reason']='<script>secret</script>'
+        rendered=render_page(summary)
         assert '<script>' not in rendered and '&lt;script&gt;' in rendered
-        new['observation_refresh']['last_success_at']='mutated'
-        assert rig.execution.lp_auto_state()['observed_pools']['observation_refresh']['last_success_at']!='mutated'
     finally:rig.close()
 
 
@@ -339,21 +317,9 @@ def test_trial_measurement_unknown_cancels_at_600_once(tmp_path, monkeypatch):
 
 
 def test_trial_measurement_timer_resets_on_valid_sample_and_restart(tmp_path, monkeypatch):
-    rig=_timed_rig(tmp_path/'zero-reset',monkeypatch)
-    try:
-        _protect_at(rig,0)
-        rig.store.save_lp_observation(rig.account,rig.cid('A'),dict(pool_result=_sample(rig,value='0')))
-        _protect_at(rig,500)
-        _protect_at(rig,600)
-        assert rig.sdk.cancels==[]
-        _protect_at(rig,601,utc_delta=121)
-        assert rig.sdk.cancels==[]
-        _protect_at(rig,1200)
-        assert rig.sdk.cancels==[]
-        _protect_at(rig,1201)
-        assert rig.sdk.cancels==[('old-A',)]
-        assert ('old-A','measured_yield_unknown_timeout') in _cancel_reasons(rig)
-    finally:rig.close()
+    from tests.test_lp_income_pool_v4_482 import _zero_at_600
+    with monkeypatch.context() as scoped:
+        _zero_at_600(tmp_path/'zero-reset',scoped)
     rig=_timed_rig(tmp_path/'restart',monkeypatch)
     try:
         _protect_at(rig,0);_protect_at(rig,599)
@@ -385,7 +351,7 @@ def test_trial_measurement_timer_resets_on_valid_sample_and_restart(tmp_path, mo
 
 
 def test_measured_timeout_never_cancels_income_manual_or_single_pool(tmp_path, monkeypatch):
-    for case in ('income','manual','unclassified','order','token','account','single','boundary'):
+    for case in ('income','manual','unclassified','order','token','account','single'):
         rig=_timed_rig(tmp_path/case,monkeypatch,pool='income' if case=='income' else 'trial')
         try:
             if case in ('manual','unclassified','order','token','account'):
@@ -415,52 +381,37 @@ def test_measured_timeout_never_cancels_income_manual_or_single_pool(tmp_path, m
 
 
 def test_latest_measurement_attempt_records_failed_refresh_without_refreshing_sample(tmp_path,monkeypatch):
-    from datetime import datetime
     from threading import Event
-    from open_trader import prediction_arbitrage_execution as module
-    service,external=_measured_service(tmp_path,monkeypatch)
+    rig=AsyncPoolRig(tmp_path,monkeypatch)
     try:
-        known=service.refresh_lp_observations()['observations']['condition-1']['pool_result']
-        previous=service.lp_observed_pool_state()
+        rig.market('A');rig.add_order('A','1')
+        known=rig.measure(dict(A='1'))['observations'][rig.cid('A')]['pool_result']
+        previous=rig.execution.lp_observed_pool_state()
+        attempts=deepcopy(previous['measurement_attempts'])
         original_success=previous['observation_refresh']['last_success_at']
-        clock=[datetime.fromisoformat(known['measured_at'].replace('Z','+00:00'))+timedelta(seconds=1)]
-        monkeypatch.setattr(module,'_utc_now',lambda:clock[0])
-        calls=[]
-        sdk=service._trading._client
+        sdk=rig.sdk;calls=[]
         for name in ('get_balance_allowance','list_open_orders','list_account_trades','list_positions','get_order_scoring'):
             method=getattr(sdk,name)
             def counted(*args,_method=method,_name=name,**kwargs):
-                calls.append(_name)
-                return _method(*args,**kwargs)
+                calls.append(_name);return _method(*args,**kwargs)
             monkeypatch.setattr(sdk,name,counted)
-        original_id=external['orders'][0]['id']
-        external['orders'][0]['id']=''
-        assert service._store.lp_advance_trade_generation(service._store.lp_trade_generation())
-        failed=service.refresh_lp_observations()
-        assert failed['state']=='unknown' and failed['reason']=='account_snapshot_stale'
-        state=service.lp_observed_pool_state(as_of=clock[0])
-        attempt=state['measurement_attempts']['condition-1']
-        assert attempt['result']==dict(state='unknown',reason='account_snapshot_stale',yield_pct_per_hour=None)
-        assert attempt['checked_at']==clock[0].isoformat().replace('+00:00','Z')
-        assert state['results']['condition-1']['result']==known
+        original_id=rig.sdk.orders[0]['id'];rig.sdk.orders[0]['id']=''
+        assert rig.store.lp_advance_trade_generation(rig.store.lp_trade_generation())
+        failed=rig.execution.refresh_lp_observations()
+        assert failed['state']=='unknown' and failed['reason']=='account_facts_unknown'
+        state=rig.execution.lp_observed_pool_state()
+        assert state['measurement_attempts']==attempts
+        assert state['results'][rig.cid('A')]['result']==known
         assert state['observation_refresh']['last_success_at']==original_success
-        assert len(state['measurement_attempts'])<=64
-        detached=deepcopy(state)
-        attempt['result']['reason']='reader mutation'
-        before=deepcopy(external);before_calls=list(calls)
-        generation=service._store.lp_trade_generation()
-        assert service.lp_observed_pool_state(as_of=clock[0])==detached
-        assert service._store.lp_trade_generation()==generation and external==before and calls==before_calls
-        stop=Event();stop.set();clock[0]+=timedelta(seconds=1)
-        assert service.refresh_lp_observations(stop_event=stop)['state']=='cancelled'
-        assert service.lp_observed_pool_state(as_of=clock[0])['measurement_attempts']==detached['measurement_attempts']
-        assert external==before and calls==before_calls and service._store.lp_trade_generation()==generation
-        external['orders'][0]['id']=original_id
-        assert service._store.lp_advance_trade_generation(service._store.lp_trade_generation())
-        recovered=service.refresh_lp_observations()
-        assert recovered['state']=='ready'
-        refreshed=service.lp_observed_pool_state(as_of=clock[0])
-        assert refreshed['measurement_attempts']['condition-1']['result']['state']=='known'
-        assert refreshed['measurement_attempts']['condition-1']['checked_at']==clock[0].isoformat().replace('+00:00','Z')
-        assert refreshed['observation_refresh']['last_success_at']!=original_success
-    finally:service._trading.close()
+        detached=deepcopy(state);state['measurement_attempts'][rig.cid('A')]['result']['state']='reader mutation'
+        before=deepcopy(rig.sdk.orders);before_calls=list(calls);generation=rig.store.lp_trade_generation()
+        assert rig.execution.lp_observed_pool_state()==detached
+        stop=Event();stop.set()
+        assert rig.execution.refresh_lp_observations(stop_event=stop)['state']=='cancelled'
+        assert rig.execution.lp_observed_pool_state()['measurement_attempts']==attempts
+        assert rig.sdk.orders==before and calls==before_calls and rig.store.lp_trade_generation()==generation
+        rig.sdk.orders[0]['id']=original_id
+        assert rig.store.lp_advance_trade_generation(rig.store.lp_trade_generation())
+        assert rig.execution.refresh_lp_observations()['state']=='ready'
+        assert rig.execution.lp_observed_pool_state()['measurement_attempts']==attempts
+    finally:rig.close()

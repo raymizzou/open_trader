@@ -3305,6 +3305,13 @@ function lpDashboardAccountFactsStale(observation) {
   ].includes(reason);
 }
 
+function lpDashboardYieldStatus(observation) {
+  if (observation && Object.prototype.hasOwnProperty.call(observation, "current_yield_state")) {
+    return {state: observation.current_yield_state, reason: observation.current_yield_reason};
+  }
+  return observation || {};
+}
+
 function lpDashboardObservationDetail(observation, reward, risk) {
   const baseline = observation.trial_baseline && typeof observation.trial_baseline === "object"
     ? observation.trial_baseline
@@ -3331,9 +3338,12 @@ function lpDashboardObservationDetail(observation, reward, risk) {
   const qualificationBasis = accountFactsStale
     ? "依据：未知"
     : qualificationBasisLabels[observation.qualification_basis] || "依据：未知";
-  const currentReward = observation.state === "known" && !accountFactsStale
+  const yieldStatus = lpDashboardYieldStatus(observation);
+  const currentReward = yieldStatus.state === "known" && !lpDashboardAccountFactsStale(yieldStatus)
     ? lpDashboardMoney(observation.current_hourly_reward_usd)
-    : "UNKNOWN";
+    : observation.current_yield_reason
+      ? `UNKNOWN（${lpDashboardObservationReason(yieldStatus.reason)}）`
+      : "UNKNOWN";
   const capital = accountFactsStale ? "UNKNOWN" : lpDashboardMoney(observation.occupied_capital_usd);
   const addRoom = !accountFactsStale && observation.add_room && observation.add_room.available === true ? "有" : "无";
   const addRoomReason = addRoom === "无"
@@ -3369,7 +3379,8 @@ function lpDashboardRatePercent(value) {
 
 function lpDashboardYieldCell(observation) {
   const source = observation && typeof observation === "object" ? observation : null;
-  const accountFactsStale = source ? lpDashboardAccountFactsStale(source) : false;
+  const yieldStatus = lpDashboardYieldStatus(source);
+  const accountFactsStale = lpDashboardAccountFactsStale(yieldStatus);
   const baselineSource = source
     && source.trial_baseline && typeof source.trial_baseline === "object"
     ? source.trial_baseline
@@ -3382,7 +3393,7 @@ function lpDashboardYieldCell(observation) {
     && Number.isFinite(Number(baselineSource.yield_pct_per_hour))
     ? lpDashboardRatePercent(baselineSource.yield_pct_per_hour)
     : "—";
-  const yieldKnown = source && source.state === "known" && !accountFactsStale
+  const yieldKnown = source && yieldStatus.state === "known" && !accountFactsStale
     && Number.isFinite(Number(source.current_yield_pct_per_hour));
   const actual = yieldKnown
     ? lpDashboardRatePercent(source.current_yield_pct_per_hour)
@@ -3402,7 +3413,7 @@ function lpDashboardYieldCell(observation) {
 // USD → predictionExactMoney 绿色金额；非 USD → 原始币种串；
 // state 非 known（含读失败保留旧值与 usd_value_unknown 条目）一律
 // UNKNOWN，但保留上次值/上次成功时间，绝不按 0 计。小时行与
-// lpDashboardYieldCell 同一已知判定（state=known 且账户事实未过期），
+// lpDashboardYieldCell 同一已知判定（独立收益状态，兼容旧载荷），
 // 金额经 lpDashboardMoney。
 function lpDashboardTodayRewardCell(firstOrder, rewards, observation) {
   const identity = String(firstOrder?.condition_id || "");
@@ -3449,8 +3460,9 @@ function lpDashboardTodayRewardCell(firstOrder, rewards, observation) {
       : "<span class=\"sub\">奖励数据未知 · 不按 0 计</span>";
   }
   const source = observation && typeof observation === "object" ? observation : null;
-  const hourlyKnown = Boolean(source) && source.state === "known"
-    && !lpDashboardAccountFactsStale(source)
+  const yieldStatus = lpDashboardYieldStatus(source);
+  const hourlyKnown = Boolean(source) && yieldStatus.state === "known"
+    && !lpDashboardAccountFactsStale(yieldStatus)
     && predictionHasValue(source.current_hourly_reward_usd)
     && Number.isFinite(Number(source.current_hourly_reward_usd));
   const hourlyLine = hourlyKnown
@@ -3742,9 +3754,10 @@ function lpDashboardTodayMarketOrder(groups, observations) {
     const observation = observations[group.conditionId]
       && typeof observations[group.conditionId] === "object"
       ? observations[group.conditionId] : null;
+    const yieldStatus = lpDashboardYieldStatus(observation);
     const known = Boolean(observation)
-      && observation.state === "known"
-      && !lpDashboardAccountFactsStale(observation)
+      && yieldStatus.state === "known"
+      && !lpDashboardAccountFactsStale(yieldStatus)
       && Number.isFinite(Number(observation.current_yield_pct_per_hour));
     return {
       // 完结沉底：组内任一委托仍有在挂余量才算活跃；活跃区在前，

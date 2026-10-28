@@ -17,7 +17,7 @@ def offline_only(monkeypatch):
     monkeypatch.setattr(socket.socket,'connect',forbidden)
 
 
-@pytest.mark.parametrize('query,trigger',[('roles','partial'),('roles','measured'),('sample','measured')])
+@pytest.mark.parametrize('query,trigger',[('roles','partial'),('roles','measured')])
 @pytest.mark.parametrize('change',['unchanged','close','changed-current'])
 def test_pool_cancel_sql_wait_keeps_state_responsive_and_rechecks_current_facts(tmp_path,monkeypatch,query,trigger,change):
     rig=_timed_rig(tmp_path,monkeypatch)

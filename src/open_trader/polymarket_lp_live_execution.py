@@ -367,6 +367,12 @@ class LPD2LiveExecution:
         self._measured_unknown_since = {}
         self._income_estimates = []
         self._income_gaps = dict(total=0, omitted=0, items=[], checked_at=None)
+        self._pool_sample_lock = threading.Lock()
+        self._pool_samples = {}
+        self._pool_measurement_attempts = {}
+        self._pool_order_seen = {}
+        self._pool_reward_reads = {}
+        self._reward_share = None
         self._async_income_demands=()
         self._async_income_updated=False
         self._read_wakeup=lambda:None
@@ -1340,10 +1346,14 @@ class LPD2LiveExecution:
         ticket=self._async_financial_ticket
         demands=[ReadDemand(self.account_id,self.process_epoch,generation,'O',snapshot.trade_version,
             kind='financial',sources=('balance','open_orders','positions'),observation_id=ticket.observation_id)]
+        if self.policy.allocation_mode=='observed_pools':
+            demands.append(ReadDemand(self.account_id,self.process_epoch,generation,'reward-share',0,
+                kind='reward_share',sources=('reward_share',)))
         for order in snapshot.active_orders:
             if not self._is_local_order(order):continue
             demands.append(ReadDemand(self.account_id,self.process_epoch,generation,order.key[3],order.terms_version,
-                order.key[1],order.key[2],kind='buy' if order.side=='BUY' else 'sell'))
+                order.key[1],order.key[2],kind='buy' if order.side=='BUY' else 'sell',
+                reward_pool_fresh=order.side=='BUY' and self.policy.allocation_mode=='observed_pools'))
         for position in snapshot.positions:
             if position.quantity.state=='known' and position.quantity.value>0:
                 sells=tuple(o for o in snapshot.active_orders if o.key[:3]==(
@@ -1401,6 +1411,9 @@ class LPD2LiveExecution:
                         sources.update({k:v for k,v in previous.source_frame.sources.items() if k.startswith('market')})
                     financial=(ticket,MarketReader.from_captured_sources(CapturedSources(self.account_id,sources)))
                     self._async_financial_ticket=None
+            elif result.demand.kind=='reward_share':
+                self._reward_share=result.sources.get('reward_share')
+                self._pool_pending.update(('trial','income'))
             elif result.demand.kind=='buy':markets.append(result)
             elif result.demand.kind in ('sell','position','holding','income'):
                 from .polymarket_lp_async_source import market_value,closed_position_value
@@ -1511,8 +1524,24 @@ class LPD2LiveExecution:
     def _apply_async_market_results(self,results):
         self._ensure_read_persistence()
         for result in results:
-            self.state.apply_market_attempt(result)
+            disposition=self.state.apply_market_attempt(result)
+            if disposition=='applied' and self.policy.allocation_mode=='observed_pools':
+                from .polymarket_lp_async_source import market_value
+                demand=result.demand
+                pool=None
+                try:
+                    if all(result.sources[name].complete and not result.sources[name].error
+                            for name in ('native_rewards','sponsored_rewards')):
+                        reward=market_value(demand.condition_id,result.sources)['rewards']['markets'][0]
+                        if reward['complete']:
+                            pool={k:reward[k] for k in ('native_daily_pool_usd','sponsored_daily_pool_usd','reward_checked_at')}
+                except (KeyError,TypeError,ValueError):pass
+                key=(demand.account,demand.condition_id,demand.token_id,demand.order_id)
+                self._pool_reward_reads=dict(list({**self._pool_reward_reads,key:dict(
+                    terms_version=demand.terms_version,generation=demand.generation,pool=pool)}.items())[-64:])
             if result.cleanup_fault:self.state.apply_read_cleanup_fault(result)
+        active={order.key for order in self.state.snapshot().active_orders}
+        self._pool_reward_reads={key:value for key,value in self._pool_reward_reads.items() if key in active}
         self._persist_read_protection()
         self._reconcile_async_reads()
 
@@ -1634,7 +1663,7 @@ class LPD2LiveExecution:
             if observed:
                 from .polymarket_lp_observed_pools import result_projection, current_result_eligible
                 # One detached result snapshot per round, before any local attempt.
-                pool_results = result_projection(self.store.lp_observations(self._settings_account()),
+                pool_results = result_projection({cid:dict(pool_result=sample) for cid,sample in self._pool_samples.items()},
                     self._settings_account(), self._utc_now())
                 pool_results = self._current_pool_results(pool_results, roles, self.state.snapshot())
                 measured_results = pool_results
@@ -1709,6 +1738,10 @@ class LPD2LiveExecution:
                     captured_candidates, as_of, attempted_at, capture_failed=capture_failed)
                 return RunResult(accepted)
             observation = accepted.observation
+            if observed:
+                self._evaluate_scoring(time.monotonic()+timeout)
+                self._measure_pool_orders(roles['roles'])
+                measured_results=self.pool_result_projection(as_of=as_of)
             self._holding_sells.observe_frame(self.state.snapshot())
             source = observation.order_view.orders_source
             orders_current = (accepted.status in ('accepted', 'partial')
@@ -2108,6 +2141,86 @@ class LPD2LiveExecution:
         self._pool_transfers = transfers
         return merged
 
+    def _measure_pool_orders(self, roles):
+        if not self._pool_sample_lock.acquire(blocking=False):return
+        try:
+            from .polymarket_lp_observed_pools import d2_measured_result
+            snapshot=self.state.snapshot()
+            observation=snapshot.observation
+            if observation is None:return
+            now=self._utc_now()
+            self._pool_order_seen={key:stamp for key,stamp in self._pool_order_seen.items()
+                if any(order.key==key for order in snapshot.active_orders)}
+            for order in snapshot.active_orders:
+                role=roles.get(order.key[1],{})
+                if order.side!='BUY' or self._managed_pool_role(snapshot,order,role) is None:continue
+                cid=order.key[1]
+                if order.key not in self._pool_order_seen:
+                    self._pool_order_seen=dict(list({**self._pool_order_seen,order.key:order.source.checked_at}.items())[-64:])
+                first_seen=self._pool_order_seen[order.key]
+                market=self._pool_reward_reads.get(order.key,{})
+                share=self._reward_share
+                scoring=next((o.scoring for o in snapshot.openings.values()
+                    if o.scoring.order_key==order.key),None)
+                if scoring is None:
+                    source=self._read_protection('scoring',(order.key[3],),time.monotonic()+2)
+                    value=source.value if source.complete and not source.error else None
+                    stamp=self._source_stamp(source)
+                    scoring=ScoringState(order.key,'entry',Fact('known',value,(stamp,))
+                        if type(value) is bool else Fact('unknown',sources=(stamp,)),
+                        source.checked_at,None,None,stamp)
+                sample=dict(state='unknown',reason='reward_share_unknown',yield_pct_per_hour=None)
+                accepted_buy=self._opening_order_associations.get(order.key)
+                if (not market.get('pool') or market['terms_version']!=order.terms_version
+                        or market['generation']!=snapshot.current.cycle_generation):
+                    sample=dict(sample,reason='reward_pool_stale')
+                elif (share is not None and share.complete and not share.error and share.value.get('account_id')==self.account_id
+                        and first_seen is not None and share.checked_at is not None and share.checked_at>=first_seen
+                        and (accepted_buy is None or accepted_buy.source.checked_at is not None
+                            and share.checked_at is not None and share.checked_at>accepted_buy.source.checked_at)):
+                    rewards=market['pool']
+                    percentages=share.value['markets'].get(cid,{})
+                    rows=[dict(row,remaining_quantity=row.get('remaining'),quantity=row.get('original_size'),
+                            filled_quantity=row.get('size_matched'),scoring_status='true' if scoring.scoring.value is True else 'unknown',
+                            scoring_checked_at=scoring.checked_at) for row in observation.source_frame.orders
+                            if row['condition_id']==cid]
+                    sample=d2_measured_result(self._settings_account(),cid,rows,rewards,percentages,
+                        pool_checked_at=rewards['reward_checked_at'],share_checked_at=share.checked_at,
+                        account_checked_at=observation.components['open_orders'].checked_at,as_of=now)
+                sample=diagnostic_json_copy(sample)
+                previous=self._pool_samples.get(cid)
+                if previous is not None and sample.get('state')=='known':
+                    # Newer non-limiting inputs do not replace the same measured sample.
+                    values=[{**value,'account_checked_at':None,'source_order':{
+                        **value['source_order'],'scoring_checked_at':None}} for value in (previous,sample)]
+                    if values[0]==values[1]:sample=previous
+                attempt=dict(checked_at=now,order_id=order.key[3],token_id=order.key[2],result=sample)
+                updates={}
+                if self._pool_measurement_attempts.get(cid,{}).get('result')!=sample:
+                    updates['pool_measurement_attempt']=attempt
+                self._pool_measurement_attempts=dict(list({**self._pool_measurement_attempts,cid:attempt}.items())[-64:])
+                if sample.get('state')=='known':
+                    self._pool_samples=dict(list({**self._pool_samples,cid:sample}.items())[-64:])
+                    if previous!=sample:updates['pool_result']=sample
+                elif previous is None and updates:
+                    updates['pool_result']=sample
+                if updates:self.store.update_lp_observation(self._settings_account(),cid,updates)
+        finally:self._pool_sample_lock.release()
+
+    def pool_measurement_state(self, *, as_of=None):
+        now=as_of or self._utc_now()
+        share=self._reward_share
+        age=(now-share.checked_at).total_seconds() if share is not None and share.checked_at else None
+        return diagnostic_json_copy(dict(measurement_attempts=self._pool_measurement_attempts,
+            reward_share=dict(state='known' if share is not None and share.complete and not share.error
+                and age is not None and 0<=age<=60 else 'unknown',
+                checked_at=share.checked_at if share else None,age_seconds=age)))
+
+    def pool_result_projection(self, *, as_of=None):
+        from .polymarket_lp_observed_pools import result_projection
+        return result_projection(diagnostic_json_copy({cid:dict(pool_result=sample) for cid,sample in self._pool_samples.items()}),
+            self._settings_account(),as_of or self._utc_now())
+
     def _pool_composition(self, pool, prepared, calculation, snapshot, roles, results, as_of, orders_accepted, *, financial_accepted):
         from .polymarket_lp_market_reader import SourceResult
         from .polymarket_lp_observed_pools import select_income_results, income_order, current_result_eligible
@@ -2149,7 +2262,7 @@ class LPD2LiveExecution:
             else:
                 gaps['omitted'] += 1
         if pool == 'income':
-            observations = self.store.lp_observations(self._settings_account())
+            observations = {cid:dict(pool_result=attempt['result']) for cid,attempt in self._pool_measurement_attempts.items()}
             for order in prepared.current_buys:
                 cid, oid = order['condition_id'], order['order_id']
                 role = roles['roles'].get(cid, {})
@@ -2161,7 +2274,8 @@ class LPD2LiveExecution:
                 if not sample:
                     raw = observations.get(cid, {}).get('pool_result', {})
                     reason = raw.get('reason', 'no_sample')
-                    if reason not in ('no_sample', 'reward_attribution_unknown', 'measured_order_unknown', 'measured_terms_unknown'):
+                    if reason not in ('no_sample', 'reward_attribution_unknown', 'measured_order_unknown', 'measured_terms_unknown',
+                            'reward_share_unknown','reward_pool_stale','not_scoring','multiple_orders','terms_unknown'):
                         reason = 'measured_unknown'
                     gap(cid, 'sample_unknown:'+reason, **context)
                 elif not current_result_eligible(roles['roles'], sample, prepared.current_buys) and cid not in self._pool_transfers:
@@ -2940,11 +3054,9 @@ class LPD2LiveExecution:
             captured = self.state.snapshot()
             try:
                 role = self.store.lp_load_observed_pool_roles(self._settings_account())['roles'].get(order.key[1], {})
-                sample = (self.store.lp_observations(self._settings_account()).get(order.key[1], {}).get('pool_result')
-                    if protection_target.reason == 'measured_yield_unknown_timeout' else None)
             except Exception:
                 return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='protection_cancel_not_current')
-            pool_inputs = (captured, role, sample)
+            pool_inputs = (captured, role)
         # Permission SQL is also outside the lock and follows any pool-input wait.
         if not lease.allowed('ROTATION_CANCEL' if rotation_origin is not None else 'CANCEL'):
             return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='mutation_lease_not_current')
@@ -2957,7 +3069,7 @@ class LPD2LiveExecution:
                     self.state.snapshot(), protection_key, protection_origin):
                 return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='protection_cancel_not_current')
             if pool_inputs is not None:
-                captured, role, sample = pool_inputs
+                captured, role = pool_inputs
                 snapshot = self.state.snapshot()
                 current_order = next((o for o in snapshot.active_orders if o.key == order.key), None)
                 if (snapshot.trade_version != captured.trade_version
@@ -2965,7 +3077,7 @@ class LPD2LiveExecution:
                         or snapshot.observation is not captured.observation
                         or current_order is None or current_order.terms_version != order.terms_version
                         or current_order.remaining != order.remaining
-                        or not self._pool_cancel_reason_current(snapshot, current_order, protection_target.reason, role, sample)):
+                        or not self._pool_cancel_reason_current(snapshot, current_order, protection_target.reason, role)):
                     return LocalOutcome(action, LocalStatus.NOT_SENT, True, reason_code='protection_cancel_not_current')
             if protection_target is not None:
                 snapshot = self.state.snapshot()
@@ -4303,7 +4415,7 @@ class LPD2LiveExecution:
         return (value.get('eligible') is True and source.get('order_id') == order.key[3]
             and source.get('token_id') == order.key[2] and source.get('side') == 'BUY')
 
-    def _pool_cancel_reason_current(self, snapshot, order, reason, captured_role, sample):
+    def _pool_cancel_reason_current(self, snapshot, order, reason, captured_role):
         role = self._managed_pool_role(snapshot, order, captured_role)
         if role is None:
             return False
@@ -4311,19 +4423,18 @@ class LPD2LiveExecution:
             return order.size_matched.state == 'known' and order.size_matched.value > 0
         since = self._measured_unknown_since.get(order.key)
         return (reason == 'measured_yield_unknown_timeout' and role == 'trial'
-            and since is not None and self._clock()-since >= 600 and not self._usable_pool_sample(order, sample))
+            and since is not None and self._clock()-since >= 600 and not self._usable_pool_sample(order, self._pool_samples.get(order.key[1])))
 
     def _evaluate_pool_buy_protection(self, roles):
         attempts = []
         if self.policy.allocation_mode != 'observed_pools':
             return attempts
-        observations = self.store.lp_observations(self._settings_account())
         snapshot = self.state.snapshot()
         self._measured_unknown_since = {key: since for key, since in self._measured_unknown_since.items()
             if any(o.key == key for o in snapshot.active_orders)}
         for order in snapshot.active_orders:
             captured_role = roles.get(order.key[1], {})
-            sample = observations.get(order.key[1], {}).get('pool_result')
+            sample = self._pool_samples.get(order.key[1])
             role = self._managed_pool_role(snapshot, order, captured_role)
             if role is None:
                 continue
@@ -4332,7 +4443,7 @@ class LPD2LiveExecution:
             else:
                 self._measured_unknown_since.pop(order.key, None)
             reason = next((reason for reason in ('buy_partial_fill', 'measured_yield_unknown_timeout')
-                if self._pool_cancel_reason_current(snapshot,order,reason,captured_role,sample)), None)
+                if self._pool_cancel_reason_current(snapshot,order,reason,captured_role)), None)
             if reason is None:
                 continue
             if (any(t.order_key == order.key and t.native_state != 'ended'
@@ -4504,8 +4615,9 @@ class LPD2LiveExecution:
                         continue
                 attempts.append(self.cancel_independent(order_key,
                     protection_key=key, reason='buy_yield_unknown_timeout'))
-            attempts.extend(self._evaluate_pool_buy_protection(roles))
             self._evaluate_scoring(deadline)
+            if self.policy.allocation_mode=='observed_pools':self._measure_pool_orders(roles)
+            attempts.extend(self._evaluate_pool_buy_protection(roles))
             for scope in tuple(self.state.snapshot().openings):
                 attempts.extend(self._evaluate_opening(scope))
             attempts.extend(self._cancel_review_entries())
