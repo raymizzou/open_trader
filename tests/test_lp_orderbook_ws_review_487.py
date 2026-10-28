@@ -37,7 +37,7 @@ def test_receive_deadline_never_loses_a_dequeued_update(monkeypatch):
             actual_put=asyncio.Queue.put_nowait
             def instrument_put(queue,item):
                 actual_put(queue,item)  # real queue semantics, no replaced get/timer/cancellation
-                if (isinstance(item,tuple) and len(item)==3 and isinstance(item[0],dict)
+                if (isinstance(item,tuple) and len(item)==5 and isinstance(item[0],dict)
                         and item[0].get('timestamp')=='1100' and not stalls):
                     queues.append(queue)
                     getter=client._waiter  # observation only; never alter this real task

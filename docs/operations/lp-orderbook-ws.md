@@ -29,49 +29,114 @@ projection also means `off`; runtime diagnostics publish the effective mode.
 
 ## Two-hour shadow evidence
 
+Deployment, a Tokyo shadow run and any mode activation need separate approval.
+Local controlled-clock tests do not establish actual two-hour coverage, latency,
+CI success or deployment readiness. Local boundary tests include a frame actually
+received at the inclusive two-second deadline and applied later, with a separate
+2.001-second negative case. The original deadline remains fixed: only relevant
+already-received evidence can hold a comparison pending application.
+
 After separately approved deployment and shadow activation, retain the service's
-`prediction_lp_orderbook_shadow` records for at least 7,200 comparable seconds.
-The records contain only decision booleans, fixed reasons, a UTC observation time
-and coverage; no account/order payload or credentials. They use the existing
-bounded best-effort diagnostic queue, so a broken or blocked sink cannot delay a
-real REST cancellation. Lost or missing evidence is not a passing trial.
+`prediction_lp_orderbook_shadow` records and the selected code identity, trial
+start/end, restart and mode boundaries. The existing status JSON publishes
+`state.diagnostics.async_reads.orderbook`. Save **only that subtree**, for example
+to a host-local `lp487-shadow-summary.json`; full LP status can include private
+account/order facts. Status and owner drains only copy existing observations.
+They do not perform a new comparison, fetch a book or renew source timestamps.
 
-The existing status JSON publishes
-`state.diagnostics.async_reads.orderbook`. Save **only that subtree** to a
-host-local evidence file, for example `lp487-shadow-summary.json`; the full LP
-status can contain account/order information. Record the selected code identity,
-trial start/end and restart/mode boundaries alongside this sanitized file.
-The subtree contains bounded per-token routes, latest fallback reason/time,
-reconciliation mismatch counts, connection state, comparison counts/reasons,
-and arrival-to-update / wake-to-decision latency distributions (last 256 values).
-Retry diagnostics also include `failure_streak`, `next_retry_monotonic` and
-`retry_reason`. A status read copies memory and does not issue network requests.
+Each comparison starts at an actual eligible BUY REST completion on the existing
+market I/O loop. It captures the exact order/terms, process/cycle, baseline,
+condition/token, local acceptance cutoff, own remaining quantity and fixed N.
+The owner later reads that observation by source/context identity. A cached REST
+book cannot become a fresh sample through repeated owner evaluation.
 
-Review all of the following:
+Two separate checks apply:
 
-- REST and WS use the existing #488 fixed bid-level price/quantity contract.
-  Both receive the same captured `bid_level`, frozen `bid_levels`, own remaining
-  quantity, condition and token identity. Do not recapture the baseline from the
-  changed book. A change in price or external quantity within levels 1 through N,
-  or movement of the own price away from its fixed rank, triggers cancellation;
-  a percentage threshold is not used.
-  **REST can cancel ⇒ WS can cancel** is mandatory. At level 1, initial public
-  quantity 120 and own remaining 20 freeze external quantity 100. Identical REST
-  and WS books with public quantity 140 must both cancel; unchanged 120 must
-  both monitor. At level 2, a change to the upper bid price or quantity must also
-  agree. Shadow only records the comparison; REST owns the real cancellation.
-- UNKNOWN on either side is **not comparable**, never consistent. No samples
-  produce `UNKNOWN`, not PASS. Any mismatch or not-comparable sample produces
-  FAIL for the current process report. Start a fresh, explicitly managed trial
-  after investigating failures; do not hide old logs or automatically retry.
-- Comparable samples must be no more than ten seconds apart to build continuous
-  coverage. The report records the longest continuous segment. A 7,200-second
-  segment alone does not prove every token or market condition was exercised;
-  inspect current-token coverage and the retained logs, including intervals
-  without active protected orders. A process restart resets in-memory coverage.
-- Review full-book reconciliation differences, fallback reasons and measured
-  latencies. Local controlled-clock tests do not establish Tokyo latency or a
-  two-hour production result. No performance number is promised.
+- **Public book check:** sort both bid vectors by price descending, then select
+  the first N public price/quantity levels. Compare against immutable independent
+  WS versions in the recent two-second history, including a quiet active anchor,
+  and allow a matching future WS receipt through REST completion +2 seconds.
+  Levels below N do not change the compared prefix. REST synchronization alone
+  is not independent WS evidence. Missing continuity or retained history is
+  reasoned not-comparable evidence, never an assumed match.
+- **Cancellation check:** evaluate the existing #488 fixed-level rule with the
+  same frozen inputs. REST cancellation requires an earlier WS cancellation or
+  one received within two seconds, inclusive. Signed timing is WS receipt minus
+  REST completion: negative means WS led, positive means WS lagged. A later
+  successful frame cannot erase a missed cancellation. Earlier or transient
+  WS-only changes are report-only counters, not failures by themselves. REST
+  remains the real cancellation owner; shadow sends no native cancellation.
+
+A removed order's frozen comparison context and subscription remain observed for
+two seconds. A new order cannot inherit that context. The current limits are
+64 history versions per token, 64 active plus 64 retired comparison contexts,
+256 pending comparison windows, 512 remembered cancel source identities and
+256 retained timing values. Capacity eviction, continuity gaps, close and mode
+changes produce explicit unavailable/incomplete reasons instead of fabricated
+agreement. Pending/incomplete evidence prevents PASS. Close still waits for
+actual existing WS/REST cleanup.
+
+Receipt metadata belongs to the existing application queue and its single queue
+waiter, capped at queue capacity +1 (257 for the normal 256-event queue). It holds
+only token/continuity and receive-time metadata, not an extra replay payload.
+Receipt alone cannot validate a book or cancellation. At equality an empty real
+consumer poll accounts for receive progress; already queued eligible evidence
+keeps the window and its retired context pending until actual application or
+explicit invalidation. Later-than-deadline receipts cannot hold that window.
+Disconnect, member retirement, invalid updates, overflow and close clear the
+relevant markers; a newly registered context does not wait for older markers.
+Read-only status exposes `pending_receipts` and `receipt_capacity` without
+advancing deadlines or consuming a frame.
+
+An eligible actual REST completion with no registered baseline comparison context
+increments `eligible_rest_reads`, `context_missing_reads` and the finite reason
+`missing_comparison_context` once. It does not increment `samples`, invent a REST
+cancel observation or claim a book match. A later actual read with a context can
+be compared; repeated status/drain calls cannot repair or recount the earlier
+gap. The UNKNOWN sample denominator is `samples + context_missing_reads`; its
+numerator is `comparison_unknown_samples + context_missing_reads`. Per-context
+samples and actual eligible reads are published separately because a REST read
+can serve more than one frozen context.
+
+The process report requires all of the following:
+
+- At least 7,200 continuous seconds in shadow in the same process, observed at
+  intervals no greater than ten seconds, plus at least 30 distinct actual REST
+  cancel source observations and at least one comparison sample. Coverage is
+  maintained independently of status reads and order turnover. Process restart,
+  mode change or an observation gap breaks continuity; historical maximum
+  coverage is diagnostic and cannot qualify a new segment.
+- Zero book mismatches, audit mismatches, missed WS cancellations or unexplained
+  WS UNKNOWN. UNKNOWN is never agreement. Explained UNKNOWN samples must be at
+  most 2% by the published denominator, with no continuous unavailable segment
+  longer than 15 seconds. Exactly 2% and 15 seconds are inclusive boundaries.
+- No unresolved book/cancel windows or incomplete observations. No more than six
+  unexpected disconnects in any observed one-hour window; exceeding six latches
+  a failure for investigation even after the events leave the short display tail.
+  Voluntary close has its own counter and does not count as an unexpected outage.
+
+Mode changes and coverage restarts do not erase hard failures or original logs.
+The report is `PENDING` until its prerequisites are met, `FAIL` for a hard failure
+(or a qualified UNKNOWN fraction above the limit), and `PASS` only when all
+implemented gates hold. A pristine unused diagnostic is `UNKNOWN`. No report
+automatically enables use; inspect actual token coverage and retained evidence,
+including unavailable intervals and times without active protected orders.
+
+Connection logs publish connected/disconnected time, a finite reason, optional
+numeric close code and sanitized exception class. Full cumulative counts remain
+available after the bounded latest-16 event tail rolls over. Reasons distinguish
+server close, invalid JSON, silence, queue overflow, send failure, other exception
+and voluntary close. Audits publish attempts, compared/equal/different,
+REST-older-skipped and unavailable counts. An attempt is not a completed match;
+older REST data is skipped and never replaces a newer WS book.
+
+Comparison logs contain decision booleans, token prefix, finite reason/outcome,
+public first-N bid vectors, REST exchange/read times, WS exchange/confirmation/
+actual receipt times, version and signed timing where available. They exclude
+account/order/request IDs, credentials, quantities from private account state,
+raw socket bodies and raw exception messages. The records use only the existing
+bounded Queue32 best-effort diagnostic sink. A throwing or blocked sink cannot
+block the real REST cancellation; missing logs are not successful trial evidence.
 
 Only after Ray reviews the actual evidence and separately authorizes the live
 switch, run the same command with `--orderbook-mode use`. Shadow→use keeps the
@@ -88,7 +153,7 @@ Do not restart, deploy or change trading controls as an implied rollback action.
 
 There is one explicitly owned WS connection on the existing `lp-market-io` loop,
 using direct `websockets==15.0.1` and the existing proxy cleanup compatibility
-patch. It sends text `PING` every ten seconds. Actual received data or `PONG`
+patch. It sends text `PING` every five seconds. Actual received data or `PONG`
 proves liveness. Processing a queued message does not renew that proof. A quiet
 synchronized book is usable through ten seconds since proof; fifteen seconds of
 silence invalidates the connection. Reads and diagnostics never renew timestamps.
@@ -105,13 +170,22 @@ float and floors sub-microsecond fractions, so an older source cannot round up
 past a local acceptance cutoff. Missing, nonfinite or out-of-range exchange times
 invalidate the token; local arrival time never substitutes for exchange time.
 
-For BUYs accepted in the current process, both actual use and shadow apply the
-same captured condition/token and local acceptance cutoff. A source before
-acceptance is skipped without adding a failed HTTP read; an absent or untrusted
-source is UNKNOWN. Equal or later valid sources are eligible for the existing
-fixed-level rule. First manual baselines follow the same check. Shadow receives
-an immutable cutoff value for that evaluation, with no later callback into the
-live owner. It cannot claim comparable agreement from a pre-acceptance WS book.
+For BUYs accepted in the current process, use, first-baseline capture and shadow
+share exact condition/token and captured local acceptance identity. REST keeps
+its inclusive exchange-time check (timestamp >= acceptance). WS instead needs a
+synchronized current connection/token identity plus genuine received message or
+PONG confirmation strictly after acceptance. Quiet unchanged books can qualify;
+an older exchange change time alone does not make them unusable. Conversely,
+handshake, sent PING, cached owner reads and processing time cannot supply that
+confirmation. The exchange `timestamp` and raw `source_timestamp` remain unchanged.
+
+Until confirmation qualifies, eligible use falls back to ordinary REST without
+inventing an HTTP failure or replacing a synchronized WS book with that fallback.
+A later real PONG may qualify the existing quiet book and wake the existing
+market-result path; normal healthy use adds no REST dual insurance between
+60-second audits. Recovered orders with no local acceptance cutoff retain their
+existing behavior. Invalid/untrusted sources remain UNKNOWN; captured cutoffs
+never call back into future mutable owner state.
 
 Full books replace all levels. BUY/SELL changes replace absolute quantities;
 zero removes a level. Identity, timestamp, Decimal validity, crossing and supplied

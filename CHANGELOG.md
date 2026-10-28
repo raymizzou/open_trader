@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-28 — LP shadow observation windows and diagnostics (#487, local candidate)
+
+- Separate genuine post-acceptance WS confirmation from exchange change time. Compare actual REST completions against descending public first-N WS history, retain removed-order observations for two seconds, and expose missing-baseline coverage instead of silently dropping reads. REST keeps its existing cancellation and source-time authority.
+- Add bounded signed cancellation timing, connection/audit reason counts and public-only asynchronous result logs. Send PING every five seconds; preserve the ten-second freshness and fifteen-second silence rules. Assess continuous two-hour coverage, thirty distinct REST cancel observations and the approved UNKNOWN/disconnect limits without automatic activation.
+- Account for relevant already-received frames through actual application or invalidation using bounded metadata on the existing queue/waiter. Preserve the inclusive two-second deadline, the 2.001-second negative case, current continuity and cleanup ownership. Local evidence does not establish actual Tokyo acceptance, CI, external review or deployment; no mode activation is included.
+
 ## 2026-10-28 — Keep D2 yield separate from account exposure (#482 / PR #490)
 
 - Preserve actual occupied capital, exposure state/reason and risk/qualification fields when projecting D2 yield. Publish yield state/reason and measured BUY principal separately; yield, hourly reward, details and sorting use those fields with legacy payload compatibility.

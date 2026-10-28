@@ -1,4 +1,4 @@
-"""WS exchange time and actual local BUY acceptance at public production seams."""
+"""WS confirmation and unchanged REST exchange-time acceptance at public seams."""
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 
@@ -203,6 +203,23 @@ def test_local_buy_use_respects_exchange_acceptance_time(tmp_path,monkeypatch,mo
                 rig=await local_rig(tmp_path,monkeypatch,mode,f'ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}')
                 when=rig.accepted_at+timedelta(milliseconds={'equal':0,'after':1,'before':-1}[timing])
                 key=await publish_book(rig,outbound,when,101 if timing=='before' else 100,mode)
+                if timing=='before' and mode=='use':
+                    # t630u: receipt-confirmed upper depth change must cancel,
+                    # even when its exchange change preceded local acceptance.
+                    handles=rig.live.run_protection_once()
+                    for handle in handles:
+                        await asyncio.to_thread(handle.result,3);await asyncio.to_thread(handle._thread.join,3)
+                        assert handle.done()
+                    await wait_for(lambda:bool(rig.sdk.cancels))
+                    snapshot=rig.live.state.snapshot()
+                    assert snapshot.baselines[rig.original_baseline.key] is rig.original_baseline
+                    assert snapshot.read_failures[key].consecutive_failures==0
+                    assert all(f.data_failures==0 for f in snapshot.failure_states.values())
+                    targets=[t for p in snapshot.progress.values() for t in p.cancel_targets]
+                    assert len(targets)==1 and targets[0].reason=='bid_level_changed'
+                    assert rig.sdk.cancels==[(rig.oid,)] and len(rig.sdk.posts)==1
+                    rig.live.run_protection_once();assert rig.sdk.cancels==[(rig.oid,)]
+                    return
                 handles=rig.live.run_protection_once();assert handles==() and rig.sdk.cancels==[]
                 snapshot=rig.live.state.snapshot()
                 if timing=='before':assert rig.original_baseline.key not in snapshot.progress
@@ -232,7 +249,7 @@ def test_local_buy_use_respects_exchange_acceptance_time(tmp_path,monkeypatch,mo
 
 @pytest.mark.parametrize('timing',['before','equal','after','missing','bad','out-of-range','wrong-condition','wrong-token'])
 def test_shadow_matches_use_local_buy_acceptance_gate(tmp_path,monkeypatch,timing):
-    import asyncio,json
+    import asyncio,json,threading
     from websockets.asyncio.server import serve
     async def scenario():
         outbound=asyncio.Queue()
@@ -243,17 +260,38 @@ def test_shadow_matches_use_local_buy_acceptance_gate(tmp_path,monkeypatch,timin
                 if message is None:return
                 await ws.send(json.dumps(message))
         async with serve(server,'127.0.0.1',0) as listener:
-            rig=None
+            rig=None;publication=None;release=threading.Event()
             try:
                 rig=await local_rig(tmp_path,monkeypatch,'shadow',f'ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}')
                 ws_time=rig.accepted_at+timedelta(milliseconds={'before':-1,'equal':0}.get(timing,1))
                 await publish_book(rig,outbound,rig.accepted_at+timedelta(milliseconds=2),100,'shadow',ws_when=ws_time)
                 rig.live.run_protection_once();assert rig.sdk.cancels==[]
-                key=await publish_book(rig,outbound,rig.accepted_at+timedelta(milliseconds=3),101,'shadow',ws_when=ws_time)
                 if timing in ('missing','bad','out-of-range','wrong-condition','wrong-token'):
+                    # Hold the exact external book response. No valid upper101 WS
+                    # frame may precede this negative sample in the frozen context.
+                    rig.tick(.001)  # Fix the business time before launching the held request.
+                    entered=threading.Event();timeline=[];held=[]
+                    original_http=rig.http
+                    previous=rig.live.state.snapshot().observation.source_frame.sources[
+                        f'market_book:{rig.cid("A")}:tA']
+                    async def held_http(request):
+                        if (request.headers.get('x-lp-source')=='book'
+                                and request.headers.get('x-lp-order')==rig.oid
+                                and request.url.params.get('token_id')=='tA' and not held):
+                            held.append(request);timeline.append(('rest_held',rig.utc().isoformat()))
+                            entered.set()
+                            while not release.is_set():await asyncio.sleep(.001)
+                            timeline.append(('rest_returned',rig.utc().isoformat()))
+                        return await original_http(request)
+                    rig.http=held_http  # External transport handler, not the evaluator/owner.
+                    publication=asyncio.create_task(publish_book(rig,outbound,
+                        rig.accepted_at+timedelta(milliseconds=3),101,'off'))
+                    await wait_for(entered.is_set)
+                    assert len(held)==1 and not release.is_set()
+                    assert rig.live.state.snapshot().observation.source_frame.sources[
+                        f'market_book:{rig.cid("A")}:tA'].source_id==previous.source_id
                     await outbound.put(dict(event_type='tick_size_change',market=rig.cid('A'),asset_id='tA',timestamp='1'))
                     await wait_for(lambda:rig.live.read_runtime.orderbook_snapshot('tA') is None)
-                    rig.tick(.001)
                     invalid=packet(rig,ws_time,101)
                     if timing=='missing':invalid.pop('timestamp')
                     elif timing=='bad':invalid['timestamp']='NaN'
@@ -266,6 +304,22 @@ def test_shadow_matches_use_local_buy_acceptance_gate(tmp_path,monkeypatch,timin
                     await wait_for(lambda:(item:=rig.live.read_runtime.status()['orderbook']['tokens']['items'][0])['fallback_reason']=='tick_size_change'
                         and item['fallback_at']==rig.utc().isoformat())
                     assert rig.live.read_runtime.orderbook_snapshot('tA') is None
+                    assert rig.live.read_runtime.status()['orderbook']['shadow']['ws_early_events']==0
+                    timeline.append(('invalid_observed',rig.utc().isoformat()))
+                    release.set()
+                    key=await publication;publication=None
+                    source=rig.live.state.snapshot().observation.source_frame.sources[
+                        f'market_book:{rig.cid("A")}:tA']
+                    assert source.complete and source.source_id!=previous.source_id
+                    assert source.checked_at==rig.utc()
+                    assert source.value['book']['condition_id']==rig.cid('A') and source.value['book']['token_id']=='tA'
+                    assert source.value['book']['timestamp']==rig.accepted_at+timedelta(milliseconds=3)
+                    assert {row['price']:row['size'] for row in source.value['book']['bids']}[D('.41')]==101
+                    assert [event for event,_ in timeline]==['rest_held','invalid_observed','rest_returned']
+                    assert source.checked_at.isoformat()==timeline[-1][1]
+                    print('negative sample order:',timing,timeline,'actual REST checked_at:',source.checked_at.isoformat())
+                else:
+                    key=await publish_book(rig,outbound,rig.accepted_at+timedelta(milliseconds=3),101,'shadow',ws_when=ws_time)
                 before=rig.live.state.snapshot()
                 rig.live.read_runtime.compare_shadow('tA',dict(state='triggered'),price=D('.40'),own_remaining=D(20),
                     bid_level=rig.original_baseline.bid_level,baseline_levels=rig.original_baseline.bid_levels,
@@ -279,7 +333,7 @@ def test_shadow_matches_use_local_buy_acceptance_gate(tmp_path,monkeypatch,timin
                 await wait_for(lambda:bool(rig.sdk.cancels))
                 report=rig.live.read_runtime.status()['orderbook']['shadow'];last=report['last']
                 assert last['rest_can_cancel']
-                usable=timing in ('equal','after')
+                usable=timing in ('before','equal','after')
                 assert last['ws_can_cancel'] is usable and last['consistent'] is usable and last['comparable'] is usable
                 assert report['assessment']!='PASS'
                 after=rig.live.state.snapshot()
@@ -289,6 +343,10 @@ def test_shadow_matches_use_local_buy_acceptance_gate(tmp_path,monkeypatch,timin
                 assert rig.sdk.cancels==[(rig.oid,)] and len(rig.sdk.posts)==1
                 rig.live.run_protection_once();assert rig.sdk.cancels==[(rig.oid,)]
             finally:
+                release.set()
+                if publication is not None:
+                    if not publication.done():publication.cancel()
+                    await asyncio.gather(publication,return_exceptions=True)
                 await outbound.put(None)
                 if rig:assert await asyncio.to_thread(rig.close) is None
     asyncio.run(scenario())
@@ -311,14 +369,11 @@ def test_local_manual_buy_first_baseline_uses_ws_exchange_time(tmp_path,monkeypa
                 rig=await local_rig(tmp_path,monkeypatch,'use',f'ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}',manual=True)
                 key=await publish_book(rig,outbound,rig.accepted_at-timedelta(milliseconds=1),101,'use')
                 assert rig.live.run_protection_once()==()
-                assert not rig.live.state.snapshot().baselines and rig.sdk.cancels==[]
+                baseline,=rig.live.state.snapshot().baselines.values()
+                assert baseline.bid_level==2 and baseline.bid_levels==((D('.41'),D(101)),(D('.40'),D(100)))
+                assert rig.sdk.cancels==[] and len(rig.sdk.posts)==1
                 assert rig.live.state.snapshot().read_failures[key].consecutive_failures==0
                 await publish_book(rig,outbound,rig.accepted_at+timedelta(milliseconds=1),100,'use')
-                assert rig.live.run_protection_once()==()
-                baseline,=rig.live.state.snapshot().baselines.values()
-                assert baseline.bid_level==2 and baseline.bid_levels==((D('.41'),D(100)),(D('.40'),D(100)))
-                assert rig.sdk.cancels==[] and len(rig.sdk.posts)==1
-                await publish_book(rig,outbound,rig.accepted_at+timedelta(milliseconds=2),101,'use')
                 handles=rig.live.run_protection_once()
                 for handle in handles:
                     await asyncio.to_thread(handle.result,3);await asyncio.to_thread(handle._thread.join,3)
