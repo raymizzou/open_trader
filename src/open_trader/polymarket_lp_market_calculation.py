@@ -27,6 +27,11 @@ class CalculationPolicy:
     trial_target_buy_count: int = 3
     income_target_buy_count: int = 3
     income_weights: tuple[str, ...] = ('0.5', '0.3', '0.2')
+    orderbook_mode: str = 'off'
+
+    def __post_init__(self):
+        if type(self.orderbook_mode) is not str or self.orderbook_mode not in ('off','shadow','use'):
+            raise ValueError('orderbook_mode_invalid')
 
 
 @dataclass(frozen=True)

@@ -8318,6 +8318,10 @@ class PredictionArbitrageStore:
         for key in ('round_interval_seconds', 'api_retry_interval_seconds', 'order_check_interval_seconds'):
             if type(values[key]) is not int or values[key] <= 0:
                 raise ValueError('lp_settings_timing_invalid')
+        if 'orderbook_mode' in document:
+            if type(document['orderbook_mode']) is not str or document['orderbook_mode'] not in ('off','shadow','use'):
+                raise ValueError('orderbook_mode_invalid')
+            values['orderbook_mode']=document['orderbook_mode']
         return MappingProxyType(dict(account_id=account_id, **values, **(allocation_settings(document) if validate_allocation else {})))
 
     def lp_load_observed_pool_roles(self, account_id):
@@ -8363,7 +8367,7 @@ class PredictionArbitrageStore:
         from .polymarket_lp_accounting import default_account_pool_document
         from .polymarket_lp_accounting import ALLOCATION_FIELDS, pool_settings_changes
         fields = {'budget_usd', 'target_buy_count', 'buy_price_level',
-                  'api_retry_interval_seconds', 'order_check_interval_seconds'}
+                  'api_retry_interval_seconds', 'order_check_interval_seconds', 'orderbook_mode'}
         if (not isinstance(changes, Mapping) or not changes or set(changes) - fields - set(ALLOCATION_FIELDS)
                 or type(expected_config_version) is not int or expected_config_version < 0
                 or actor is not None and type(actor) is not str
@@ -8382,7 +8386,7 @@ class PredictionArbitrageStore:
                         'trading_config_version': current['trading_config_version'] + int(trading)}
             saved = self._lp_current_settings_values(proposed, account_id)
             # Merge fields only, preserving any concurrent control/legacy data.
-            document.update({key: saved[key] for key in (*fields, 'config_version', 'trading_config_version')})
+            document.update({key: saved[key] for key in (*fields, 'config_version', 'trading_config_version') if key in saved})
             document.update({key: saved[key] for key in ALLOCATION_FIELDS if key in saved})
             document.update(settings_updated_at=datetime.now(timezone.utc).isoformat(), settings_actor=actor)
             connection.execute('INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?) '

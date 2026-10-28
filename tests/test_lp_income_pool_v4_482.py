@@ -650,3 +650,67 @@ def test_d2_unknown_yield_preserves_known_exposure_and_risk(tmp_path,monkeypatch
                 release.set()
                 if worker is not None:worker.join(4);assert not worker.is_alive() and not errors
                 if rig is not None:rig.close()
+
+
+def test_reward_share_and_ws_keep_combined_resource_bounds():
+    import json
+    from websockets.asyncio.server import serve
+    from tests.test_lp_async_read_runtime_contract import Clock,Boundary,demand
+    from tests.test_lp_orderbook_ws_487 import wire_book
+    from open_trader.polymarket_lp_async_source import LPAsyncSourcePort
+    from open_trader.polymarket_lp_read_runtime import LPReadRuntime
+    async def scenario():
+        clock=Clock();boundary=Boundary(clock);fail_share=[False];share_requests=[]
+        connected=asyncio.Event();closed=asyncio.Event()
+        def factory(d):
+            if d.kind!='reward_share':return boundary.factory(d)
+            async def http(req):
+                share_requests.append(req)
+                if fail_share[0]:return httpx.Response(503)
+                return httpx.Response(200,json=dict(data=[dict(condition_id=CID,
+                    earning_percentage='25' if req.url.params['sponsored']=='true' else '50')],next_cursor='LTE='))
+            return LPAsyncSourcePort(dict(clob=httpx.AsyncClient(base_url='http://127.0.0.1',
+                transport=httpx.MockTransport(http))),clock=clock,utc_now=clock.utc)
+        async def server(ws):
+            try:
+                await ws.recv();connected.set()
+                await ws.send(json.dumps(wire_book(timestamp=int(clock.utc().timestamp()*1000))))
+                async for raw in ws:
+                    if raw=='PING':await ws.send('PONG')
+            finally:closed.set()
+        async def wait(predicate):
+            async with asyncio.timeout(3):
+                while not predicate():await asyncio.sleep(.01)
+        async with serve(server,'127.0.0.1',0) as listener:
+            runtime=LPReadRuntime(factory,clock=clock,utc_now=clock.utc,buy_cap=2,
+                orderbook_url=f'ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}')
+            runtime.start();buy=demand('A');share=demand('share',kind='reward_share',sources=('reward_share',))
+            try:
+                runtime.reconcile((buy,share));rows=[]
+                await wait(lambda:len(rows.extend(runtime.drain_results()) or rows)==2)
+                assert all(row.complete for row in rows) and len(share_requests)==2
+                status=runtime.status()
+                assert (status['pool_limit'],status['connection_limit'])==(10,18)
+                assert status['new_buy_allowed'] and status['orderbook']['owned_tasks']==0
+                assert sum(s['kind']=='reward_share' for s in status['scopes'])==1
+                runtime.configure_orderbook('use',{'yes':CID},eligible_keys=(buy.key,))
+                await wait(lambda:connected.is_set() and runtime.status()['orderbook']['synced']==1)
+                status=runtime.status()
+                assert (status['pool_limit'],status['connection_limit'])==(10,19)
+                assert status['orderbook']['owned_tasks']>0 and status['managed_tasks']>0
+                fail_share[0]=True;clock.value=30;runtime.wake();rows=[]
+                await wait(lambda:{'A','share'}<={row.demand.order_id for row in rows.extend(runtime.drain_results()) or rows})
+                assert any(row.demand.order_id=='A' and row.complete for row in rows)
+                assert any(row.demand.kind=='reward_share' and not row.complete for row in rows)
+                status=runtime.status()
+                assert status['new_buy_allowed'] and status['pool_count']<=10
+                assert (status['pool_limit'],status['connection_limit'])==(10,19)
+                runtime.configure_orderbook('off',{})
+                await wait(lambda:closed.is_set() and runtime.status()['orderbook']['owned_tasks']==0
+                    and runtime.status()['connection_limit']==18)
+                assert runtime.status()['pool_limit']==10
+            finally:
+                runtime.configure_orderbook('off',{});runtime.reconcile(())
+                assert await asyncio.to_thread(runtime.close,4)
+                assert runtime.status()['pool_count']==runtime.status()['managed_tasks']==0
+    asyncio.run(scenario())

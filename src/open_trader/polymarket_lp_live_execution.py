@@ -376,6 +376,7 @@ class LPD2LiveExecution:
         self._async_income_demands=()
         self._async_income_updated=False
         self._read_wakeup=lambda:None
+        self._orderbook_roles={};self._orderbook_income_tokens=set()
         self._risk_next={}
         self._risk_seen={}
         self._positions_full_coverage = reader is None  # owned adapter requests threshold0
@@ -1108,6 +1109,7 @@ class LPD2LiveExecution:
             api_retry_interval_seconds=saved['api_retry_interval_seconds'],
             order_check_interval_seconds=saved['order_check_interval_seconds'],
             round_interval_seconds=saved['round_interval_seconds'],
+            orderbook_mode=saved.get('orderbook_mode','off'),
             allocation_mode=saved.get('allocation_mode', 'minimum'),
             allocation_weights=tuple(saved.get('allocation_weights', ())),
             allocation_shadow_enabled=saved.get('allocation_shadow_enabled', False),
@@ -1188,7 +1190,7 @@ class LPD2LiveExecution:
         if not isinstance(payload, Mapping) or not payload:
             raise ValueError('auto_config_invalid')
         fields = {'budget_usd', 'target_buy_count', 'buy_price_level',
-                  'api_retry_interval_seconds', 'order_check_interval_seconds', *ALLOCATION_FIELDS}
+                  'api_retry_interval_seconds', 'order_check_interval_seconds', 'orderbook_mode', *ALLOCATION_FIELDS}
         if 'round_interval_seconds' in payload:
             raise ValueError('round_interval_seconds_retired_in_continuous_mode')
         if set(payload) - fields - {'expected_config_version'}:
@@ -1210,7 +1212,7 @@ class LPD2LiveExecution:
                 config_version=policy.config_version, trading_config_version=policy.trading_config_version,
                 api_retry_interval_seconds=policy.api_retry_interval_seconds,
                 order_check_interval_seconds=policy.order_check_interval_seconds,
-                round_interval_seconds=policy.round_interval_seconds)
+                round_interval_seconds=policy.round_interval_seconds,orderbook_mode=policy.orderbook_mode)
             values.update({key: list(getattr(policy, key)) if key in ('allocation_weights', 'income_weights')
                 else getattr(policy, key) for key in policy.allocation_fields})
             if 'budget_usd' in changes and changes['budget_usd'] is None:
@@ -1377,6 +1379,18 @@ class LPD2LiveExecution:
         self._async_exact_used={k:v for k,v in self._async_exact_used.items() if k in valid}
         self._async_exact_results={k:v for k,v in self._async_exact_results.items() if k in valid}
         demands.extend(valid.values())
+        eligible=[];tokens={}
+        for d in demands:
+            role=self._orderbook_roles.get(d.condition_id,{})
+            if (d.kind in ('buy','income') and role.get('pool') in ('trial','income')
+                    and not role.get('evicted') and (role.get('episode')==d.order_id
+                        or d.kind=='income' and (d.condition_id,d.token_id) in self._orderbook_income_tokens)):
+                eligible.append(d.key);tokens[d.token_id]=d.condition_id
+        prices={}
+        for order in snapshot.active_orders:
+            if order.side=='BUY' and self._is_local_order(order) and order.key[2] in tokens:
+                prices.setdefault(order.key[2],[]).append(order.price.value)
+        self.read_runtime.configure_orderbook(self.policy.orderbook_mode,tokens,eligible_keys=eligible,buy_prices=prices)
         self.read_runtime.reconcile(demands)
 
     def _collect_async_reads(self):
@@ -1644,6 +1658,8 @@ class LPD2LiveExecution:
                 raise ValueError('pool_invalid')
             requested_pool = pool
             roles = self.store.lp_load_observed_pool_roles(self._settings_account()) if observed else None
+            self._orderbook_roles=dict(roles['roles']) if roles else {}
+            self._orderbook_income_tokens=set()
             if observed:
                 from .polymarket_lp_observed_pools import result_projection, current_result_eligible
                 # One detached result snapshot per round, before any local attempt.
@@ -1671,6 +1687,8 @@ class LPD2LiveExecution:
                     for cid,row in sorted(pool_results.items(),key=lambda item:(
                         -Decimal(str(item[1]['result'].get('yield_pct_per_hour') or 0)),item[0]))
                     if row['eligible'])[:self.read_runtime.buy_cap]
+                self._orderbook_income_tokens={(cid,token) for cid,token in self._async_income_demands
+                    if roles['roles'].get(cid,{}).get('episode')==pool_results[cid]['result']['source_order']['order_id']}
             pool = pool or 'trial'
             self.poll()
             current = self.state.snapshot().current
@@ -4282,20 +4300,17 @@ class LPD2LiveExecution:
             if disposition != 'applied':
                 raise ValueError('protection_cancel_completion_not_applied:' + disposition)
 
+    def _local_buy_acceptance_cutoff(self, orders):
+        with self.state._lock:
+            accepted = tuple(association.source.checked_at for order in orders
+                if (association := self._opening_order_associations.get(order.key)) is not None
+                and association.requested_at is not None and association.source.checked_at is not None)
+        return max(accepted) if accepted else None
+
     def _book_after_local_buy_acceptance(self, book, orders):
-        accepted = tuple(association.source.checked_at for order in orders
-            if (association := self._opening_order_associations.get(order.key)) is not None
-            and association.requested_at is not None and association.source.checked_at is not None)
-        if not accepted:
-            return True  # Recovered orders have no proven local acceptance time.
-        if not isinstance(book, Mapping) or any(
-                book.get('condition_id') != order.key[1] or book.get('token_id') != order.key[2]
-                for order in orders):
-            return None
-        timestamp = book.get('timestamp')
-        if not isinstance(timestamp, datetime) or timestamp.tzinfo is None:
-            return None
-        return timestamp >= max(accepted)
+        from .polymarket_lp_orderbook import book_after_buy_acceptance
+        return book_after_buy_acceptance(book,condition_id=orders[0].key[1],token_id=orders[0].key[2],
+            accepted_at=self._local_buy_acceptance_cutoff(orders))
 
     def _register_first_seen(self, snapshot, roles):
         observation = snapshot.observation
@@ -4453,6 +4468,10 @@ class LPD2LiveExecution:
         return attempts
 
     def run_protection_once(self, *, timeout=2):
+        if self.read_runtime is not None and self.policy.orderbook_mode=='use':
+            latest=self.read_runtime.drain_orderbook_results()
+            if latest:self._apply_async_market_results(latest)
+            self.read_runtime.protection_started()
         with self.state._lock:
             completed = self._native_completion_consumed
             if not any(h._future.done() and h._thread.is_alive() for h in self._native_jobs.values()):
@@ -4463,6 +4482,8 @@ class LPD2LiveExecution:
         except BaseException:
             self._record_protection_status(entered=True, disposition='failed')
             raise
+        finally:
+            if self.read_runtime is not None:self.read_runtime.complete_orderbook_check()
         if self._protection_diagnostics['disposition'] == 'entered':
             self._record_protection_status(entered=True, disposition='completed')
         with self.state._lock:
@@ -4518,7 +4539,10 @@ class LPD2LiveExecution:
                     observation.source_frame.sources.get(f'market:{key.scope[1]}:{key.scope[2]}'))
                 book = (source.value.get('book') if source and source.complete and not source.error
                     and isinstance(source.value, Mapping) else None)
-                after_acceptance = self._book_after_local_buy_acceptance(book, orders)
+                from .polymarket_lp_orderbook import book_after_buy_acceptance
+                acceptance_cutoff = self._local_buy_acceptance_cutoff(orders)
+                after_acceptance = book_after_buy_acceptance(book,condition_id=key.scope[1],token_id=key.scope[2],
+                    accepted_at=acceptance_cutoff)
                 if after_acceptance is False:
                     continue
                 if after_acceptance is None:
@@ -4527,6 +4551,11 @@ class LPD2LiveExecution:
                     own_remaining=sum((o.remaining.value for o in orders), Decimal(0)),
                     bid_level=baseline.bid_level, baseline_levels=baseline.bid_levels,
                     condition_id=key.scope[1], token_id=key.scope[2])
+                if self.read_runtime is not None and self.policy.orderbook_mode=='shadow':
+                    self.read_runtime.compare_shadow(key.scope[2],estimate,price=key.price,
+                        own_remaining=sum((o.remaining.value for o in orders),Decimal(0)),
+                        bid_level=baseline.bid_level,baseline_levels=baseline.bid_levels,condition_id=key.scope[1],
+                        accepted_at=acceptance_cutoff)
                 stamp = SourceStamp(source.source_id if source else '',
                     checked_at=source.checked_at if source else None,
                     complete=bool(source and source.complete), state='known' if book else 'unknown')
