@@ -274,6 +274,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
             command.add_argument("--income-budget")
             command.add_argument("--target-buys")
             command.add_argument("--bid-level")
+            command.add_argument("--orderbook-mode", choices=("off", "shadow", "use"))
             command.add_argument("--allocation-mode", choices=("minimum", "rank_weights", "observed_pools"))
             command.add_argument("--allocation-weights", help="Comma-separated Decimal strings; no normalization")
             command.add_argument("--allocation-shadow-enabled", choices=("true", "false"))
@@ -292,6 +293,7 @@ def run_namespace(args: argparse.Namespace) -> int:
                income_budget=getattr(args, "income_budget", None),
                target_buys=getattr(args, "target_buys", None),
                bid_level=getattr(args, "bid_level", None),
+               orderbook_mode=getattr(args, "orderbook_mode", None),
                allocation_mode=getattr(args, "allocation_mode", None),
                allocation_weights=getattr(args, "allocation_weights", None),
                allocation_shadow_enabled=getattr(args, "allocation_shadow_enabled", None),
@@ -368,6 +370,8 @@ def _control_pending(state: dict[str, object], running: bool, version: object) -
 
 def _config_confirmed(state: dict[str, object], payload: dict[str, object], previous: dict[str, object]) -> bool:
     from .polymarket_lp_accounting import ALLOCATION_FIELDS
+    if 'orderbook_mode' in payload and state.get('orderbook_mode','off')!=payload['orderbook_mode']:
+        return False
     for key in ALLOCATION_FIELDS:
         if key in payload or key in previous:
             expected = payload.get(key, previous.get(key))
@@ -410,6 +414,7 @@ def run(action: str, url: str, timeout: float | str, *, json_output: bool = Fals
         budget: str | None = None, target_buys: str | None = None, bid_level: str | None = None,
         round_interval_seconds: str | None = None, api_retry_interval_seconds: str | None = None,
         order_check_interval_seconds: str | None = None,
+        orderbook_mode: str | None = None,
         allocation_mode: str | None = None, allocation_weights: str | None = None,
         allocation_shadow_enabled: str | None = None) -> int:
     state = None
@@ -453,6 +458,9 @@ def run(action: str, url: str, timeout: float | str, *, json_output: bool = Fals
                     raise ValueError('timing intervals must be positive integer seconds')
                 payload[key] = seconds
             from .polymarket_lp_accounting import ALLOCATION_FIELDS, allocation_settings
+            if orderbook_mode is not None:
+                if orderbook_mode not in ('off','shadow','use'):raise ValueError('orderbook_mode_invalid')
+                payload['orderbook_mode']=orderbook_mode
             if allocation_mode is not None:
                 payload['allocation_mode'] = allocation_mode
             if allocation_weights is not None:
@@ -482,7 +490,7 @@ def run(action: str, url: str, timeout: float | str, *, json_output: bool = Fals
                 allocation_settings({**previous, **payload})
             payload['expected_config_version'] = version
             state = client.write('config', payload)
-            while dual and (state.get('settings_pending') is True or state.get('settings_native_inflight') is True):
+            while (dual or orderbook_mode is not None) and (state.get('settings_pending') is True or state.get('settings_native_inflight') is True):
                 remaining = client.deadline-time.monotonic()
                 if remaining <= 0: raise TimeoutError('LP configuration confirmation timed out')
                 time.sleep(min(.01,remaining))

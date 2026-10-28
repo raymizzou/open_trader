@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-10-28 — LP WS local BUY acceptance time (#487 / P1-C)
+
+- Export WS exchange timestamps as aware UTC values while retaining numeric internal ordering and raw precision. Reject invalid or unrepresentable times; never replace exchange time with local arrival or round an older source past acceptance.
+- Apply the same captured local BUY acceptance cutoff and exact condition/token check in use, first-baseline capture and shadow comparison. Preserve pre-acceptance skip, UNKNOWN, real read-failure counts, immutable bid levels and REST-owned cancellation. Add actual automatic/manual native-acceptance regressions; no risk-rule or production activation change.
+
+## 2026-10-28 — Align LP shadow comparison with fixed BUY bid levels (#487 / PR #489)
+
+- Preserve the #488 fixed bid-level cancellation path and compare WS with the same frozen level basis, own quantity and condition/token identity. Quantity increases and buy-two upper price/depth changes now agree with REST; unchanged books remain monitoring and unavailable WS remains UNKNOWN. Shadow adds no cancellation sender or financial/read-failure authority.
+- Preserve both #486 and #487 history during the normal main merge. No risk-rule change, deployment or mode activation is included.
+
+## 2026-10-27 — LP order-book WS review repairs (#487 / PR #489)
+
+- Preserve complete pending and accepted REST books during WS outages. Invalidate an accepted WS version without adding or clearing real read failures; retain exact order identity, UNKNOWN, financial and no-replay protections.
+- Keep a pending queue getter across receive polling deadlines so a dequeued update cannot disappear at cancellation. Preserve generation invalidation, bounded queues and actual shutdown drain.
+- Back off reconnects exponentially from 250 ms to 30 seconds with bounded jitter. Reset only after valid data or text PONG, expose retry diagnostics, and interrupt pending waits on off/close.
+
+## 2026-10-27 — LP pool order-book WebSocket (#487 A+B)
+
+- Add default-off `off`/`shadow`/`use` settings on the existing authenticated LP config command. Maintain one LP-owned connection for exact current trial/income pool tokens, validate Decimal books, fail closed on invalid updates or queue gaps, and audit synchronized tokens every 60 seconds. Preserve original REST cadence, Retry-After and actual cleanup when WS is unavailable.
+- In use mode, deliver eligible current BUY protection books through the existing identity/watermark/freshness acceptance and coalesce bid-depth wakeups until protection completes. Keep new-entry pricing, including detached income candidates, on REST. Preserve financial UNKNOWN, native send ownership and no replay.
+- Add independent shadow cancellation comparisons and bounded route/fallback/reconciliation/latency diagnostics. A broken log sink cannot block REST cancellation. Document the separately authorized two-hour Tokyo shadow trial, explicit live switch and off rollback; this change does not deploy or enable production.
+
 ## 2026-10-27 — Income rebuild test source ordering (#486 / PR #488)
 
 - Make the manual-preservation rebuild fixture publish the required fresh D candidate through ordinary account/read observations before it executes income selection. This prevents a pending candidate response from turning the fixture preparation into an unintended partial rebuild. Keep exact manual-order, capital/slot, no-replay and real four-second watchdog assertions; add an event-controlled delayed-response regression. Production pool selection and cancellation authority are unchanged.

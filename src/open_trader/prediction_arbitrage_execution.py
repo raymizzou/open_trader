@@ -1054,6 +1054,7 @@ class PredictionExecutionService:
                 api_retry_interval_seconds=policy.api_retry_interval_seconds,
                 order_check_interval_seconds=policy.order_check_interval_seconds,
                 round_interval_seconds=policy.round_interval_seconds)
+            if policy.orderbook_mode!='off':result['orderbook_mode']=policy.orderbook_mode
             result.update({key: list(getattr(policy, key)) if key in ('allocation_weights', 'income_weights')
                 else getattr(policy, key) for key in policy.allocation_fields})
             return result

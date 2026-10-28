@@ -909,7 +909,11 @@ class CurrentLPState:
                 or order.terms_version!=d.terms_version or order.remaining.state!='known' or order.remaining.value<=0):
             return None,'stale'
         old=self._market_attempts.get(key)
-        if old is not None and old[0]==d.key and result.attempt<=old[1]:return None,'stale'
+        if old is not None and old[0]==d.key and not result.ws_invalidation:
+            if result.attempt<=old[1]:return None,'stale'
+            book=result.sources.get('book')
+            version=book.value.get('book_version') if book is not None and isinstance(book.value,Mapping) else None
+            if len(old)>2 and old[2] is not None and version is not None and tuple(version)<=old[2]:return None,'stale'
         return order,None
 
     def apply_market_attempt(self, result):
@@ -921,6 +925,7 @@ class CurrentLPState:
         with self._lock:
             order,error=self._market_order(result)
             if error:return error
+            if result.ws_invalidation:return self._invalidate_ws_source(order,result)
             if not result.complete or result.completed>=result.deadline:
                 return self.invalidate_market_attempt(result)
             try:
@@ -952,10 +957,41 @@ class CurrentLPState:
             self._yields[order.key]=BuyYieldState(order.key,_fact(rate,*stamps),stamps,self._utc_now(),
                 self._current.cycle_generation,current_risk_request_id=previous.current_risk_request_id if previous else None)
             self._record_read_attempt(order,result,True)
-            self._market_attempts[order.key]=(result.demand.key,result.attempt)
+            self._advance_market_attempt(order.key,result)
             self._market_books[order.key]=(result,source)
             self._publish_market_values(order.key,source,result.sources.get('book'))
             return 'applied'
+
+    def _advance_market_attempt(self,key,result):
+        old=self._market_attempts.get(key)
+        floor=old[2] if old is not None and old[0]==result.demand.key and len(old)>2 else None
+        self._market_attempts[key]=(result.demand.key,result.attempt,floor)
+
+    def _invalidate_ws_source(self,order,result):
+        """Retire accepted WS facts through the invalidated version, without an I/O outcome."""
+        from .polymarket_lp_market_reader import SourceResult
+        accepted=self._market_books.get(order.key)
+        source=result.sources.get('book')
+        current=accepted[0].sources.get('book') if accepted else None
+        if (source is None or current is None or not isinstance(source.value,Mapping)
+                or not isinstance(current.value,Mapping) or current.value.get('transport')!='ws'
+                or source.value.get('transport')!='ws' or current.value.get('book_version') is None
+                or source.value.get('condition_id')!=order.key[1] or source.value.get('token_id')!=order.key[2]
+                or current.value.get('condition_id')!=order.key[1] or current.value.get('token_id')!=order.key[2]
+                or source.value.get('book_version') is None
+                or tuple(current.value['book_version'])>tuple(source.value['book_version'])):return 'stale'
+        previous=self._yields.get(order.key)
+        since=previous.unknown_since_monotonic if previous else None
+        since_at=previous.unknown_since_at if previous else None
+        if since is None:since,since_at=self._clock(),self._utc_now()
+        self._yields[order.key]=BuyYieldState(order.key,Fact('unknown'),(),self._utc_now(),
+            self._current.cycle_generation,since,since_at,previous.current_risk_request_id if previous else None)
+        old=self._market_attempts[order.key]
+        self._market_attempts[order.key]=(old[0],old[1],tuple(source.value['book_version']))
+        self._market_books.pop(order.key,None)
+        self._publish_market_values(order.key,SourceResult('',complete=False,error='ws_invalidated'),
+            replace(source,value=None,complete=False,error='ws_invalidated'))
+        return 'applied'
 
     def restore_read_protection(self, order_key, count, reasons):
         """Restore committed exact-order facts, never an interrupted attempt."""
@@ -1039,7 +1075,7 @@ class CurrentLPState:
             self._yields[order.key]=BuyYieldState(order.key,Fact('unknown'),(),self._utc_now(),
                 self._current.cycle_generation,since,since_at,previous.current_risk_request_id if previous else None)
             self._record_read_attempt(order,expiry,read_succeeded)
-            self._market_attempts[order.key]=(expiry.demand.key,expiry.attempt)
+            self._advance_market_attempt(order.key,expiry)
             self._market_books.pop(order.key,None)
             self._publish_market_values(order.key,SourceResult('',complete=False,error=expiry.reason or 'market_incomplete'),expiry.sources.get('book'))
             return 'applied'

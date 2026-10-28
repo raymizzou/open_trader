@@ -1391,6 +1391,7 @@ dependencies = [
     { name = "polymarket-client" },
     { name = "predict-sdk" },
     { name = "tigeropen" },
+    { name = "websockets" },
 ]
 
 [package.optional-dependencies]
@@ -1426,6 +1427,7 @@ requires-dist = [
     { name = "tencentcloud-sdk-python-common", marker = "extra == 'cloud-ssm'", specifier = "==3.1.182" },
     { name = "tencentcloud-sdk-python-ssm", marker = "extra == 'cloud-ssm'", specifier = "==3.1.160" },
     { name = "tigeropen" },
+    { name = "websockets", specifier = "==15.0.1" },
 ]
 provides-extras = ["cloud-ssm", "browser", "dev"]
 
