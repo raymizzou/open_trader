@@ -98,6 +98,21 @@ book data (including row-level price changes after REST synchronization) or text
 `PONG` resets the failure streak; handshake success and malformed
 messages do not. Off and close interrupt a pending retry wait.
 
+At the LP delivery boundary, `timestamp` is an aware UTC `datetime` for the
+exchange time, matching REST. Internal ordering remains Decimal milliseconds;
+`source_timestamp` retains the original numeric precision. Conversion uses no
+float and floors sub-microsecond fractions, so an older source cannot round up
+past a local acceptance cutoff. Missing, nonfinite or out-of-range exchange times
+invalidate the token; local arrival time never substitutes for exchange time.
+
+For BUYs accepted in the current process, both actual use and shadow apply the
+same captured condition/token and local acceptance cutoff. A source before
+acceptance is skipped without adding a failed HTTP read; an absent or untrusted
+source is UNKNOWN. Equal or later valid sources are eligible for the existing
+fixed-level rule. First manual baselines follow the same check. Shadow receives
+an immutable cutoff value for that evaluation, with no later callback into the
+live owner. It cannot claim comparable agreement from a pre-acceptance WS book.
+
 Full books replace all levels. BUY/SELL changes replace absolute quantities;
 zero removes a level. Identity, timestamp, Decimal validity, crossing and supplied
 best prices are checked. Invalid updates invalidate only their token. A disconnect,

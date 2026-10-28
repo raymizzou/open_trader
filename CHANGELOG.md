@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-28 — LP WS local BUY acceptance time (#487 / P1-C)
+
+- Export WS exchange timestamps as aware UTC values while retaining numeric internal ordering and raw precision. Reject invalid or unrepresentable times; never replace exchange time with local arrival or round an older source past acceptance.
+- Apply the same captured local BUY acceptance cutoff and exact condition/token check in use, first-baseline capture and shadow comparison. Preserve pre-acceptance skip, UNKNOWN, real read-failure counts, immutable bid levels and REST-owned cancellation. Add actual automatic/manual native-acceptance regressions; no risk-rule or production activation change.
+
 ## 2026-10-28 — Align LP shadow comparison with fixed BUY bid levels (#487 / PR #489)
 
 - Preserve the #488 fixed bid-level cancellation path and compare WS with the same frozen level basis, own quantity and condition/token identity. Quantity increases and buy-two upper price/depth changes now agree with REST; unchanged books remain monitoring and unavailable WS remains UNKNOWN. Shadow adds no cancellation sender or financial/read-failure authority.

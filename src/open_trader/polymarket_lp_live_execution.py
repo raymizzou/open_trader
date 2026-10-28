@@ -4188,20 +4188,17 @@ class LPD2LiveExecution:
             if disposition != 'applied':
                 raise ValueError('protection_cancel_completion_not_applied:' + disposition)
 
+    def _local_buy_acceptance_cutoff(self, orders):
+        with self.state._lock:
+            accepted = tuple(association.source.checked_at for order in orders
+                if (association := self._opening_order_associations.get(order.key)) is not None
+                and association.requested_at is not None and association.source.checked_at is not None)
+        return max(accepted) if accepted else None
+
     def _book_after_local_buy_acceptance(self, book, orders):
-        accepted = tuple(association.source.checked_at for order in orders
-            if (association := self._opening_order_associations.get(order.key)) is not None
-            and association.requested_at is not None and association.source.checked_at is not None)
-        if not accepted:
-            return True  # Recovered orders have no proven local acceptance time.
-        if not isinstance(book, Mapping) or any(
-                book.get('condition_id') != order.key[1] or book.get('token_id') != order.key[2]
-                for order in orders):
-            return None
-        timestamp = book.get('timestamp')
-        if not isinstance(timestamp, datetime) or timestamp.tzinfo is None:
-            return None
-        return timestamp >= max(accepted)
+        from .polymarket_lp_orderbook import book_after_buy_acceptance
+        return book_after_buy_acceptance(book,condition_id=orders[0].key[1],token_id=orders[0].key[2],
+            accepted_at=self._local_buy_acceptance_cutoff(orders))
 
     def _register_first_seen(self, snapshot, roles):
         observation = snapshot.observation
@@ -4431,7 +4428,10 @@ class LPD2LiveExecution:
                     observation.source_frame.sources.get(f'market:{key.scope[1]}:{key.scope[2]}'))
                 book = (source.value.get('book') if source and source.complete and not source.error
                     and isinstance(source.value, Mapping) else None)
-                after_acceptance = self._book_after_local_buy_acceptance(book, orders)
+                from .polymarket_lp_orderbook import book_after_buy_acceptance
+                acceptance_cutoff = self._local_buy_acceptance_cutoff(orders)
+                after_acceptance = book_after_buy_acceptance(book,condition_id=key.scope[1],token_id=key.scope[2],
+                    accepted_at=acceptance_cutoff)
                 if after_acceptance is False:
                     continue
                 if after_acceptance is None:
@@ -4443,7 +4443,8 @@ class LPD2LiveExecution:
                 if self.read_runtime is not None and self.policy.orderbook_mode=='shadow':
                     self.read_runtime.compare_shadow(key.scope[2],estimate,price=key.price,
                         own_remaining=sum((o.remaining.value for o in orders),Decimal(0)),
-                        bid_level=baseline.bid_level,baseline_levels=baseline.bid_levels,condition_id=key.scope[1])
+                        bid_level=baseline.bid_level,baseline_levels=baseline.bid_levels,condition_id=key.scope[1],
+                        accepted_at=acceptance_cutoff)
                 stamp = SourceStamp(source.source_id if source else '',
                     checked_at=source.checked_at if source else None,
                     complete=bool(source and source.complete), state='known' if book else 'unknown')

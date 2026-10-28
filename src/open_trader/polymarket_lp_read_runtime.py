@@ -220,11 +220,15 @@ class LPReadRuntime:
         with self._lock:
             for stamp in self._ws_woken_at.values():self._shadow.decision_latency(self.clock()-stamp)
 
-    def compare_shadow(self, token, rest, *, price, own_remaining, bid_level, baseline_levels, condition_id):
+    def compare_shadow(self, token, rest, *, price, own_remaining, bid_level, baseline_levels, condition_id,
+                       accepted_at=None):
         from .polymarket_lp_risk import evaluate_lp_bid_levels
+        from .polymarket_lp_orderbook import book_after_buy_acceptance
         with self._lock:
             if self._orderbook_mode!='shadow':return None
             book=self._books.market_book(token)
+            if book_after_buy_acceptance(book,condition_id=condition_id,token_id=token,accepted_at=accepted_at) is not True:
+                book=None
             ws=evaluate_lp_bid_levels(book,price=price,own_remaining=own_remaining,
                 bid_level=bid_level,baseline_levels=baseline_levels,condition_id=condition_id,token_id=token)
             row=self._shadow.record(rest,ws)

@@ -4,7 +4,7 @@ import random
 import threading
 from functools import wraps
 from decimal import Decimal, InvalidOperation
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 
 
@@ -13,6 +13,24 @@ def number(value, *, price=False):
     if not value.is_finite() or value<0 or (price and not 0<value<1):
         raise ValueError('invalid_level')
     return value
+
+
+def exchange_datetime(stamp):
+    """Export venue milliseconds without float rounding across an acceptance cutoff."""
+    if not 0 <= stamp < Decimal('253402300800000'):
+        raise ValueError('invalid_timestamp')
+    return datetime(1970,1,1,tzinfo=UTC)+timedelta(microseconds=int(stamp // Decimal('.001')))
+
+
+def book_after_buy_acceptance(book, *, condition_id, token_id, accepted_at):
+    """One value-only acceptance predicate for live and shadow books."""
+    if accepted_at is None:return True  # Recovered orders have no proven local cutoff.
+    from collections.abc import Mapping
+    if (not isinstance(book,Mapping) or book.get('condition_id')!=condition_id
+            or book.get('token_id')!=token_id):return None
+    stamp=book.get('timestamp')
+    if not isinstance(stamp,datetime) or stamp.tzinfo is None or stamp.utcoffset() is None:return None
+    return stamp>=accepted_at
 
 
 def rest_event(value):
@@ -111,7 +129,8 @@ class OrderBooks:
     def market_book(self, token):
         value=self.snapshot(token)
         if value is None:return None
-        return dict(value,transport='ws',connection_generation=self.generation,
+        return dict(value,timestamp=exchange_datetime(value['timestamp']),source_timestamp=value['timestamp'],
+            transport='ws',connection_generation=self.generation,
             book_version=(self.generation,self._members[token],self._revision.get(token,0)),
             **{side:tuple(MappingProxyType(dict(price=p,size=s)) for p,s in value[side])
             for side in ('bids','asks')})
@@ -161,6 +180,7 @@ class OrderBooks:
     def _validate(self, token, event, value, row=None):
         if event.get('market')!=self.tokens[token]:raise ValueError('identity')
         stamp=number(event['timestamp'])
+        exchange_datetime(stamp)  # Reject unrepresentable exchange times at message admission.
         old=self._books.get(token)
         if old and stamp<old['timestamp']:raise ValueError('timestamp_regression')
         if value['bids'] and value['asks'] and value['bids'][0][0]>=value['asks'][0][0]:
