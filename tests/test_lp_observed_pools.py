@@ -1762,6 +1762,16 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
         # Public D2 pool planning is used to retain the real group result/IDs;
         # the subsequent protection and wakeup use the real service scheduler.
         rig.tick()
+        # Settle this round's account source before counting held native owners.
+        def account_published():
+            snapshot=rig.live.state.snapshot();status=rig.live.read_runtime.status()
+            return (snapshot.observation.components['open_orders'].checked_at==rig.utc()
+                and snapshot.observation.read_ticket.trade_version_at_start==snapshot.trade_version
+                and snapshot.new_capacity.state=='known' and status['ready_count']==0
+                and not any(s['active'] for s in status['scopes'])
+                and status['observed_monotonic']>=rig.seconds)
+        rig.pump(account_published,drive=lambda:rig.live.run_once(pool='trial'))
+        assert rig.sdk.cancels==[] and failures()==11
         end=time.monotonic()+4
         while not planned:
             result=rig.live.dispatch_rotation(rig.live.run_once(rig.producer.capture_qualified_pool(),pool='income'))
@@ -2268,6 +2278,12 @@ def test_pool_group_permission_wait_keeps_current_state_responsive(tmp_path,monk
                 end=time.monotonic()+4
                 while not any(o.key[3]=='replacement-A' for o in rig.live.state.snapshot().active_orders):
                     rig.live.run_once(rig.producer.capture_qualified_pool(),pool='income')
+                    # The held SQL owner must not freeze account read deadlines.
+                    status=rig.live.read_runtime.status();due=status['next_dependency_monotonic']
+                    if (status['ready_count']==0 and not any(s['active'] for s in status['scopes'])
+                            and status['observed_monotonic']>=rig.seconds and due is not None and due>rig.seconds):
+                        assert not sql_release.is_set() and rig.sdk.cancels==[]
+                        rig.tick(due-rig.seconds)
                     assert time.monotonic()<end,'public replacement publication watchdog'
                     time.sleep(.001)
             pool.submit(publish).result(timeout=5)
