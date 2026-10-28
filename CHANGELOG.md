@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-29 — LP shadow evidence ordering and CI fixture phases (#487 / PR #492)
+
+- Preserve original queued-frame confirmation and the first post-acceptance proof for each frozen context. A newer PONG keeps liveness fresh without turning timely cancellation evidence into a late observation; a genuinely late first proof remains late.
+- Retain same-batch pending receipts through normal initial synchronization, with an explicit synchronization era for invalidation, reconnect and member isolation. Keep existing queue, deadline, cleanup and native ownership bounds.
+- Drain prior offline read phases before changing fixture inputs and await actual REST book acceptance during WS outages. Preserve all cancellation, identity, UNKNOWN and failure-count expectations. Historical PR CI remains failed until a repaired published head completes formal CI; local tests do not establish Tokyo acceptance or authorize deployment/mode activation.
+
 ## 2026-10-28 — LP shadow observation windows and diagnostics (#487, local candidate)
 
 - Separate genuine post-acceptance WS confirmation from exchange change time. Compare actual REST completions against descending public first-N WS history, retain removed-order observations for two seconds, and expose missing-baseline coverage instead of silently dropping reads. REST keeps its existing cancellation and source-time authority.

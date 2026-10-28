@@ -65,7 +65,7 @@ class OrderBooks:
         self.online=False;self.last_proof=None;self.proof_at=None;self.last_reason=None;self.queue_overflows=0
         self.reconciliation_mismatches=0;self.last_reconciliation=None
         self._synced_at={}
-        self._sync_sequence=0;self._sync_identity={};self._confirmations={}
+        self._sync_sequence=0;self._sync_identity={};self._confirmations={};self._sync_eras={}
         self._history={};self._history_gaps={}
         self._version_at={}
         self._receipts={};self._receipt_sequence=0;self._receipt_limit=257;self._receive_drained_at=None
@@ -131,6 +131,7 @@ class OrderBooks:
             else:self._member_sequence+=1;members[token]=self._member_sequence
         self._members=members
         self.tokens=dict(tokens)
+        self._sync_eras={t:v for t,v in self._sync_eras.items() if t in tokens}
         self._prune_receipts()
 
     @synchronized
@@ -141,7 +142,7 @@ class OrderBooks:
     def connected(self):
         """Start a new connection generation, initially unsynchronized."""
         self.generation+=1;self._books={};self._buffer={};self._synced_at={}
-        self._sync_identity={};self._confirmations={}
+        self._sync_identity={};self._confirmations={};self._sync_eras={}
         self._history={};self._history_gaps={}
         self._version_at={}
         self._receipts.clear();self._receive_drained_at=None
@@ -167,10 +168,17 @@ class OrderBooks:
         """Capture token continuity at actual receive, before queued application."""
         return dict(self._sync_identity)
 
+    @staticmethod
+    def _same_sync_era(previous,current):
+        # Only normal initial synchronization may promote a None sync identity.
+        # An explicit invalidation advances the era even while unsynchronized.
+        return (previous[:2]==current[:2] and previous[3:]==current[3:]
+            and (previous[2] is None or previous[2]==current[2]))
+
     def _prune_receipts(self):
         for key,(sequence,received,identities) in tuple(self._receipts.items()):
-            current={t:identity for t,identity in identities.items()
-                if identity==self.continuity_ticket(t) and t in self.tokens and self.online}
+            current={t:self.continuity_ticket(t) for t,identity in identities.items()
+                if self._same_sync_era(identity,self.continuity_ticket(t)) and t in self.tokens and self.online}
             if current:self._receipts[key]=(sequence,received,current)
             else:self._receipts.pop(key,None)
 
@@ -183,7 +191,7 @@ class OrderBooks:
         rows=event.get('price_changes',()) if event.get('event_type')=='price_change' else (event,)
         tokens={row.get('asset_id') for row in rows if isinstance(row,dict)
             and isinstance(row.get('asset_id'),str)} if isinstance(rows,(tuple,list)) else set()
-        continuity={t:(self.generation,self._members[t],identities.get(t))
+        continuity={t:(self.generation,self._members[t],identities.get(t),self._sync_eras.get(t,0))
             for t in tokens if t in self.tokens}
         queue.put_nowait((event,received,self.delivery_ticket(),received_at,identities))
         self._receipt_sequence+=1
@@ -205,8 +213,8 @@ class OrderBooks:
     @synchronized
     def pending_receipt(self, token, *, until, continuity, after=0):
         current=self.continuity_ticket(token)
-        if not self.online or token not in self.tokens or current!=continuity:return False
-        return any(sequence>after and received<=until and identities.get(token)==current
+        if not self.online or token not in self.tokens or not self._same_sync_era(continuity,current):return False
+        return any(sequence>after and received<=until and token in identities and self._same_sync_era(identities[token],current)
             for sequence,received,identities in self._receipts.values())
 
     @synchronized
@@ -223,7 +231,7 @@ class OrderBooks:
         self._receipts.clear();self._receive_drained_at=None
         self.online=False;self.generation+=1;self._books={};self._buffer={};self.last_reason=reason
         self._synced_at={}
-        self._sync_identity={};self._confirmations={}
+        self._sync_identity={};self._confirmations={};self._sync_eras={}
         self._history={};self._history_gaps={}
         self._version_at={}
         for token in self.tokens:self._fallbacks[token]=dict(reason=reason,at=self.utc_now().isoformat())
@@ -364,6 +372,8 @@ class OrderBooks:
                 else:continue
                 self._books[token]=self._validate(token,event,value,row)
                 if receipt is not None:self._books[token]['received_at']=receipt[1]
+                self._books[token]['message_confirmed_at']=(receipt[1] if receipt is not None else self.utc_now()) if connection_data else None
+                self._books[token]['message_confirmed_monotonic']=(receipt[0] if receipt is not None else self.clock()) if connection_data else None
                 if token not in self._sync_identity:
                     self._synced_at[token]=self.clock();self._sync_sequence+=1
                     self._sync_identity[token]=(self.generation,self._members[token],self._sync_sequence)
@@ -379,6 +389,7 @@ class OrderBooks:
             except (ValueError,InvalidOperation,KeyError,TypeError) as exc:
                 self._books.pop(token,None)
                 self._sync_identity.pop(token,None);self._confirmations.pop(token,None);self._synced_at.pop(token,None)
+                self._sync_eras[token]=self._sync_eras.get(token,0)+1
                 self._history.pop(token,None)
                 self._version_at.pop(token,None)
                 self._prune_receipts()
@@ -409,14 +420,14 @@ class OrderBooks:
 
     @synchronized
     def continuity_ticket(self, token):
-        return (self.generation,self._members.get(token),self._sync_identity.get(token))
+        return (self.generation,self._members.get(token),self._sync_identity.get(token),self._sync_eras.get(token,0))
 
     @synchronized
     def comparison_versions(self, token, *, since, until, continuity=None):
         current=self.continuity_ticket(token);reason=None
         if token not in self.tokens:reason='not_subscribed'
         elif continuity is not None and continuity[:2]!=current[:2]:reason='connection_gap'
-        elif continuity is not None and continuity[2] is not None and continuity[2]!=current[2]:reason='token_sync_gap'
+        elif continuity is not None and not self._same_sync_era(continuity,current):reason='token_sync_gap'
         elif not self.online or token not in self._books:reason='ws_unsynced'
         elif self._history_gaps.get(token,float('-inf'))>since:reason='history_capacity'
         rows=self.recent_versions(token,since=since,until=until)

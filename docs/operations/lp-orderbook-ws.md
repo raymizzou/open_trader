@@ -67,6 +67,14 @@ Two separate checks apply:
   WS-only changes are report-only counters, not failures by themselves. REST
   remains the real cancellation owner; shadow sends no native cancellation.
 
+The newest connection proof and the earliest qualified cancellation evidence are
+separate facts. A later PONG keeps liveness current but cannot retime a valid
+queued frame. Each frozen context retains its first qualifying confirmation for
+that token synchronization identity; a validated frame can also supply its own
+original message confirmation. An older quiet book still needs a real proof
+strictly after local acceptance. A first qualifying proof after the fixed
+cancellation deadline remains late, even when the book itself arrived earlier.
+
 A removed order's frozen comparison context and subscription remain observed for
 two seconds. A new order cannot inherit that context. The current limits are
 64 history versions per token, 64 active plus 64 retired comparison contexts,
@@ -86,7 +94,11 @@ explicit invalidation. Later-than-deadline receipts cannot hold that window.
 Disconnect, member retirement, invalid updates, overflow and close clear the
 relevant markers; a newly registered context does not wait for older markers.
 Read-only status exposes `pending_receipts` and `receipt_capacity` without
-advancing deadlines or consuming a frame.
+advancing deadlines or consuming a frame. Normal initial synchronization may promote
+same-connection/member queued markers from unsynchronized to synchronized within
+the same synchronization era. An invalid frame advances that era even if no
+full book had synchronized yet. Reconnects and member changes remain separate
+identities; their old markers cannot hold or qualify a new observation.
 
 An eligible actual REST completion with no registered baseline comparison context
 increments `eligible_rest_reads`, `context_missing_reads` and the finite reason

@@ -198,7 +198,8 @@ class LPReadRuntime:
                     state['retire_continuity']=self._books.continuity_ticket(state['context']['token_id'])
             for key,context in self._shadow_contexts.items():
                 state=self._shadow_states.setdefault(key,dict(context=context,triggered_at=None,
-                    signature=None,ws=dict(state='unknown'),retire_at=None,receipt_cursor=self._books.receipt_cursor()))
+                    signature=None,ws=dict(state='unknown'),retire_at=None,receipt_cursor=self._books.receipt_cursor(),
+                    qualification_identity=None,qualified_at=None))
                 state['retire_at']=None
             retired=[key for key,state in self._shadow_states.items() if state['retire_at'] is not None]
             for key in retired[:-64]:self._discard_shadow_context(key,'context_capacity')
@@ -408,14 +409,23 @@ class LPReadRuntime:
                 context=state['context'];book=self._books.market_book(context['token_id'])
                 signature=(book['book_version'],book['confirmation_at']) if book else None
                 if state['signature']==signature:continue
+                identity=book['sync_identity'] if book else None
+                if state['qualification_identity']!=identity:
+                    state['qualification_identity']=identity;state['qualified_at']=None
+                if book is not None:
+                    cutoff=context['accepted_at']
+                    for stamp,at in ((book.get('confirmation_at'),book.get('confirmation_monotonic')),
+                            (book.get('message_confirmed_at'),book.get('message_confirmed_monotonic'))):
+                        if stamp is not None and at is not None and (cutoff is None or stamp>cutoff):
+                            state['qualified_at']=at if state['qualified_at'] is None else min(state['qualified_at'],at)
                 previous=state['ws']['state']
                 state['signature']=signature;state['ws']=self._shadow_evaluate(book,context)
                 if state['ws']['state']=='triggered' and previous!='triggered' and state.get('rest_state')!='triggered':
                     self._shadow.ws_excursion();state['early_unmatched']=True
                 elif state['ws']['state']=='monitoring' and previous=='triggered' and state.get('early_unmatched'):
                     self._shadow.ws_excursion(transient=True);state['early_unmatched']=False
-                if state['ws']['state']=='triggered' and state['triggered_at'] is None:
-                    state['triggered_at']=max(book['book_received_monotonic'],book['confirmation_monotonic'])
+                if state['ws']['state']=='triggered' and state['triggered_at'] is None and state['qualified_at'] is not None:
+                    state['triggered_at']=max(book['book_received_monotonic'],state['qualified_at'])
                     state['triggered_book']=freeze(book)
             for key,sample in tuple(self._shadow_books.items()):
                 context=sample['context'];token=context['token_id']

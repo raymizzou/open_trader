@@ -135,7 +135,15 @@ def packet(rig,when,upper=100):
         asks=[dict(price='.42',size='10000')])
 
 
+async def read_phase_idle(rig):
+    """Collect prior real completions before changing external book/time inputs."""
+    await wait_for(lambda:(s:=rig.live.read_runtime.status())['ready_count']==0
+        and not any(row['active'] or row.get('retiring') for row in s['scopes'])
+        and s['observed_monotonic']>=rig.seconds,rig.live.run_once)
+
+
 async def publish_book(rig,outbound,when,upper,mode,*,ws_when=None):
+    await read_phase_idle(rig)
     rig.book_time=when;rig.upper=D(upper);rig.tick(6)
     if mode!='off':
         await outbound.put(packet(rig,when,upper))
@@ -153,14 +161,9 @@ async def publish_book(rig,outbound,when,upper,mode,*,ws_when=None):
             and value['timestamp']==when and {r['price']:r['size'] for r in value['bids']}=={D('.41'):D(upper),D('.40'):D(120)}
             and (value.get('transport')=='ws')==(mode=='use'))
     def drive_publication():
+        # Hold this business instant until actual account and book completion;
+        # a cached yield or a late prior attempt cannot advance another deadline.
         rig.live.run_once()
-        if settled():return
-        status=rig.live.read_runtime.status();due=status['next_dependency_monotonic']
-        # Current account proof may require the next owned read deadline.
-        if (status['ready_count']==0 and not any(s['active'] for s in status['scopes'])
-                and status['observed_monotonic']>=rig.seconds and rig.live.status()['native_inflight']==0
-                and due is not None and due>rig.seconds):
-            rig.tick(max(due-rig.seconds,.000001))  # The fixture UTC clock has microsecond resolution.
     try:await wait_for(settled,drive_publication)
     except TimeoutError:
         state=rig.live.state.snapshot();observation=state.observation
@@ -181,6 +184,7 @@ async def publish_book(rig,outbound,when,upper,mode,*,ws_when=None):
         await wait_for(lambda:(value:=rig.live.read_runtime.orderbook_snapshot('tA')) is not None
             and value['timestamp']==(ws_when if ws_when is not None else when)
             and value['bids'][0]['size']==upper)
+    await read_phase_idle(rig)
     return key
 
 
