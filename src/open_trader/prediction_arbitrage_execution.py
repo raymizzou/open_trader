@@ -2308,12 +2308,9 @@ class PredictionExecutionService:
                     rows=result.get('orders') or []
                     cached_order=next((row for row in rows if row.get('order_id')==oid and row.get('condition_id')==cid
                         and row.get('token_id')==token and row.get('side')=='BUY'),{})
-                    prior=observations.get(cid,{})
-                    account_reason=prior.get('reason') if prior.get('reason') in (
-                        'account_facts_stale','account_facts_unknown','account_snapshot_stale','exposure_changed') else None
-                    if not financial_known and account_reason is None:
-                        account_reason='account_facts_stale' if account_age is None or not 0<=account_age<=120 else 'account_facts_unknown'
-                    valid=(financial_known and account_reason is None and cached_order
+                    account_reason=None if financial_known else (
+                        'account_facts_stale' if account_age is None or not 0<=account_age<=120 else 'account_facts_unknown')
+                    valid=(financial_known and cached_order
                         and _decimal(cached_order.get('price'))==order.price.value
                         and _decimal(cached_order.get('remaining_quantity',cached_order.get('remaining_size')))==order.remaining.value
                         and projected.get('eligible') and source.get('order_id')==oid
@@ -2325,9 +2322,9 @@ class PredictionExecutionService:
                     reason=None if valid else (account_reason or ('sample_expired' if sample and not projected.get('eligible')
                         else raw.get('reason','terms_unknown')))
                     observations[cid]={**observations.get(cid,{}), 'yield_source':'d2_order_sample',
-                        'state':'known' if valid else 'unknown', 'reason':reason,
+                        'current_yield_state':'known' if valid else 'unknown', 'current_yield_reason':reason,
                         'current_hourly_reward_usd':str(sample['hourly_reward_usd']) if valid else None,
-                        'occupied_capital_usd':str(sample['buy_capital_usd']) if valid else None,
+                        'measurement_buy_capital_usd':str(sample['buy_capital_usd']) if valid else None,
                         'current_yield_pct_per_hour':str(sample['yield_pct_per_hour']) if valid else None,
                         'measured_at':_timestamp(sample['measured_at']) if isinstance(sample.get('measured_at'),datetime)
                             else sample.get('measured_at')}

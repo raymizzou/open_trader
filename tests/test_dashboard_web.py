@@ -24792,3 +24792,39 @@ def test_lp_sections_match_canonical_account_identity(variant) -> None:
         assert '1 笔' in sections['trial']
         assert 'data-lp-order-id="CaseOrder"' not in sections['income']
         assert '转入中' not in sections['trial'] and '订单归属数据错误' not in html
+
+
+def test_lp_d2_yield_status_is_separate_from_exposure() -> None:
+    rendered=json.loads(run_dashboard_js(r'''
+const known = {state:"unknown",reason:"account_snapshot_stale",occupied_capital_usd:null,
+  current_yield_state:"known",current_yield_reason:null,
+  current_yield_pct_per_hour:"50",current_hourly_reward_usd:"1"};
+const unknown = {state:"known",reason:null,occupied_capital_usd:"17",risk_state:"known",
+  current_yield_state:"unknown",current_yield_reason:"not_scoring",
+  current_yield_pct_per_hour:"99",current_hourly_reward_usd:"99"};
+const legacy = {state:"known",reason:null,occupied_capital_usd:"17",
+  current_yield_pct_per_hour:"20",current_hourly_reward_usd:"0.5"};
+const order={order_id:"o",condition_id:"unknown",token_id:"t",side:"BUY",status:"LIVE",
+  price:".4",quantity:"5",filled_quantity:"0",remaining_quantity:"5"};
+const observations={known,unknown,legacy};
+const row=lpDashboardTodayMarketRow({conditionId:"unknown",orders:[order]}, {}, {}, observations, []);
+console.log(JSON.stringify({
+  known:lpDashboardYieldCell(known),knownHourly:lpDashboardTodayRewardCell(order,{},known),
+  knownDetail:lpDashboardObservationDetail(known,"",""),
+  unknown:lpDashboardYieldCell(unknown),unknownHourly:lpDashboardTodayRewardCell(order,{},unknown),
+  unknownDetail:lpDashboardObservationDetail(unknown,"",""),
+  capital:row.split('data-label="实际占用资金" class="num">')[1].split("</td>")[0],
+  legacy:lpDashboardYieldCell(legacy),legacyHourly:lpDashboardTodayRewardCell(order,{},legacy),
+  sort:lpDashboardTodayMarketOrder(["unknown","legacy","known"].map(conditionId=>({
+    conditionId,orders:[order]})),observations).map(group=>group.conditionId)
+}));
+'''))
+    assert '实际 <strong>50%' in rendered['known']
+    assert '$1.00</strong>/小时' in rendered['knownHourly']
+    assert '预计小时奖励 $1.00' in rendered['knownDetail']
+    assert '待更新' in rendered['unknown'] and '99%' not in rendered['unknown']
+    assert 'UNKNOWN</span>/小时' in rendered['unknownHourly'] and '$99.00' not in rendered['unknownHourly']
+    assert 'not scoring' in rendered['unknownDetail']
+    assert '$17.00' in rendered['capital']
+    assert '实际 <strong>20%' in rendered['legacy'] and '$0.50</strong>/小时' in rendered['legacyHourly']
+    assert rendered['sort']==['known','legacy','unknown']

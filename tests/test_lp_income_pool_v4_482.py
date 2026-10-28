@@ -286,7 +286,9 @@ def test_yield_display_uses_d2_sample(tmp_path,monkeypatch):
         observation=dashboard['lp_observations'][cid]
         assert observation['yield_source']=='d2_order_sample'
         assert Decimal(observation['current_hourly_reward_usd'])==Decimal(sample['hourly_reward_usd'])==1
-        assert Decimal(observation['occupied_capital_usd'])==Decimal(sample['buy_capital_usd'])==2
+        assert Decimal(observation['occupied_capital_usd'])==2
+        assert Decimal(observation['measurement_buy_capital_usd'])==Decimal(sample['buy_capital_usd'])==2
+        assert observation['current_yield_state']=='known' and observation['current_yield_reason'] is None
         assert Decimal(observation['current_yield_pct_per_hour'])==Decimal(sample['yield_pct_per_hour'])==50
         import json
         from tests.test_dashboard_web import run_dashboard_js
@@ -301,9 +303,12 @@ def test_yield_display_uses_d2_sample(tmp_path,monkeypatch):
         def unavailable(**kwargs):raise OSError('offline incomplete account boundary')
         rig.sdk.list_open_orders=unavailable
         assert rig.store.lp_advance_trade_generation(rig.store.lp_trade_generation())
-        rig.execution.refresh_lp_dashboard_snapshot()
+        failed_dashboard=rig.execution.refresh_lp_dashboard_snapshot()
         incomplete=rig.execution.lp_dashboard()['lp_observations'][cid]
-        assert incomplete['state']=='unknown' and incomplete['current_yield_pct_per_hour'] is None
+        assert failed_dashboard['stale'] is True and incomplete['current_yield_pct_per_hour'] is None
+        assert all(incomplete[field]==failed_dashboard['lp_observations'][cid][field]
+            for field in ('state','reason','occupied_capital_usd','risk_directions'))
+        assert incomplete['current_yield_state']=='unknown' and incomplete['current_yield_reason']=='account_facts_unknown'
         html=rendered(incomplete)
         assert '待更新' in html['yield'] and 'UNKNOWN' in html['hourly']
         rig.sdk.list_open_orders=original_orders
@@ -312,15 +317,20 @@ def test_yield_display_uses_d2_sample(tmp_path,monkeypatch):
         rig.execution.refresh_lp_dashboard_snapshot()
         mismatch=rig.execution.lp_dashboard()['lp_observations'][cid]
         assert mismatch['state']=='unknown' and mismatch['current_yield_pct_per_hour'] is None
+        assert mismatch['current_yield_state']=='unknown' and mismatch['current_yield_reason']=='terms_unknown'
         rig.sdk.orders[0]['price']=Decimal('.4')
         assert rig.store.lp_advance_trade_generation(rig.store.lp_trade_generation())
         rig.execution.refresh_lp_dashboard_snapshot()
         before=(len(rig.requests),deepcopy(rig.sdk.posts),deepcopy(rig.sdk.cancels),rig.store.lp_trade_generation())
+        fresh=rig.execution.lp_dashboard()['lp_observations'][cid]
         from open_trader import prediction_arbitrage_execution as execution_module
         monkeypatch.setattr(execution_module,'_utc_now',lambda:rig.utc()+timedelta(seconds=121))
         expired=rig.execution.lp_dashboard()['lp_observations'][cid]
-        assert expired['state']=='unknown' and expired['current_yield_pct_per_hour'] is None
-        assert expired['reason']=='account_facts_stale'
+        assert expired['current_yield_state']=='unknown' and expired['current_yield_pct_per_hour'] is None
+        assert expired['current_yield_reason']=='account_facts_stale'
+        assert all(expired[field]==fresh[field] for field in ('state','reason','occupied_capital_usd','risk_directions'))
+        html=rendered(expired)
+        assert '待更新' in html['yield'] and 'UNKNOWN' in html['hourly']
         assert before==(len(rig.requests),rig.sdk.posts,rig.sdk.cancels,rig.store.lp_trade_generation())
     finally:rig.close()
 
@@ -386,6 +396,7 @@ def test_air_income_sample_end_to_end(tmp_path,monkeypatch):
                 assert '每单样本年龄' in page and '奖励占比读取年龄' in page
                 with urlopen(upstream+'/api/prediction-arbitrage/lp/dashboard',timeout=3) as response:dashboard=json.load(response)
                 assert dashboard['lp_observations'][rig.cid('A')]['current_yield_pct_per_hour']=='50.0'
+                assert dashboard['lp_observations'][rig.cid('A')]['current_yield_state']=='known'
                 result=rig.cycle(pool='income');rig.finish_cancels(result)
                 assert rig.sdk.cancels==[('old-A',)] and not release.is_set()
     finally:
@@ -492,3 +503,150 @@ def _zero_in_protection_at_600(tmp_path,monkeypatch):
         assert Decimal(sample['hourly_reward_usd'])==Decimal(sample['yield_pct_per_hour'])==0
         assert sample['source_order']['order_id']=='old-A'
     finally:release.set();rig.close()
+
+
+def _position_d2_sample_rig(tmp_path,monkeypatch):
+    rig=_d2_sample_rig(tmp_path,monkeypatch)
+    rig.sdk.positions=(dict(condition_id=rig.cid('A'),token_id='tA',size='30',average_price='.5'),)
+    rig.tick(5);rig.publish_account({'old-A'})
+    rig.execution.refresh_lp_observations()
+    rig.execution.refresh_lp_dashboard_snapshot()
+    return rig
+
+
+def _d2_display_html(dashboard,cid):
+    import json
+    from tests.test_dashboard_web import run_dashboard_js
+    return json.loads(run_dashboard_js('const dashboard='+json.dumps(dashboard,default=str)+';'
+        'const cid='+json.dumps(cid)+';const observation=dashboard.lp_observations[cid];'
+        'const order=dashboard.orders.find(row=>row.condition_id===cid);'
+        'console.log(JSON.stringify({yield:lpDashboardYieldCell(observation),'
+        'hourly:lpDashboardTodayRewardCell(order,dashboard.market_rewards||{},observation),'
+        'risk:lpDashboardExposureRiskCell(order,null,observation),'
+        'row:lpDashboardTodayMarketRow({conditionId:cid,orders:[order]},dashboard.market_rewards||{},'
+        'dashboard.reward_shares||{},dashboard.lp_observations,[])}));'))
+
+
+def test_d2_yield_overlay_preserves_position_and_buy_capital(tmp_path,monkeypatch):
+    from copy import deepcopy
+    rig=_position_d2_sample_rig(tmp_path,monkeypatch)
+    try:
+        cid=rig.cid('A');original=rig.store.lp_observations(rig.account)[cid]
+        assert Decimal(original['occupied_capital_usd'])==17
+        assert Decimal(original['risk_directions'][0]['risk_principal'])==17
+        before=(len(rig.requests),deepcopy(rig.sdk.posts),deepcopy(rig.sdk.cancels),
+            rig.store.lp_trade_generation(),deepcopy(rig.store.lp_observations(rig.account)))
+        dashboard=rig.execution.lp_dashboard();observation=dashboard['lp_observations'][cid]
+        assert Decimal(observation['occupied_capital_usd'])==17
+        assert (observation['state'],observation['reason'])==(original['state'],original['reason'])
+        assert observation['risk_directions']==original['risk_directions']
+        assert observation['current_yield_state']=='known' and observation['current_yield_reason'] is None
+        assert Decimal(observation['measurement_buy_capital_usd'])==2
+        assert Decimal(observation['current_yield_pct_per_hour'])==50
+        assert Decimal(observation['current_hourly_reward_usd'])==1
+        html=_d2_display_html(dashboard,cid)
+        capital=html['row'].split('data-label="实际占用资金" class="num">')[1].split('</td>')[0]
+        assert '$17.00' in capital and '持仓均成本 + 在挂买单' in capital
+        assert '占用本金 $17.00' in html['row'] and '预计小时奖励 $1.00' in html['row']
+        assert '实际 <strong>50%' in html['yield'] and '$1.00</strong>/小时' in html['hourly']
+        prior=deepcopy(dashboard);prior['lp_observations'][cid]=original
+        assert html['risk']==_d2_display_html(prior,cid)['risk']
+        assert before==(len(rig.requests),rig.sdk.posts,rig.sdk.cancels,
+            rig.store.lp_trade_generation(),rig.store.lp_observations(rig.account))
+        assert rig.sdk.posts==rig.sdk.cancels==[]
+    finally:rig.close()
+
+
+def test_d2_unknown_yield_preserves_known_exposure_and_risk(tmp_path,monkeypatch):
+    import threading
+    from copy import deepcopy
+    from tests.test_lp_observed_pools import AsyncPoolRig
+    for variant in ('unavailable','expired','account_recovery','inventory_change'):
+        with monkeypatch.context() as scoped:
+            rig=None;worker=None;release=threading.Event();entered=threading.Event();errors=[]
+            try:
+                if variant=='unavailable':
+                    rig=AsyncPoolRig(tmp_path/variant,scoped)
+                    rig.market('A',minimum='2',pool='240');rig.add_order('A','2');rig.hourly['A']=Decimal(1)
+                    rig.sdk.positions=(dict(condition_id=rig.cid('A'),token_id='tA',size='30',average_price='.5'),)
+                    rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
+                        roles={rig.cid('A'):dict(pool='trial',episode='old-A')})
+                elif variant=='inventory_change':
+                    rig=_d2_sample_rig(tmp_path/variant,scoped)
+                    rig.execution.refresh_lp_observations()
+                    rig.sdk.positions=(dict(condition_id=rig.cid('A'),token_id='tA',size='30',average_price='.5'),)
+                else:
+                    rig=_position_d2_sample_rig(tmp_path/variant,scoped)
+                cid=rig.cid('A')
+                if variant in ('unavailable','expired'):
+                    original_http=rig.http
+                    async def failed_share(req):
+                        if req.headers['x-lp-source']=='reward_share':return httpx.Response(503)
+                        return await original_http(req)
+                    rig.http=failed_share
+                    rig.tick(121 if variant=='expired' else 30)
+                    rig.publish_account({'old-A'})
+                    rig.pump(lambda:rig.live.pool_measurement_state()['measurement_attempts'].get(cid,{}).
+                        get('result',{}).get('reason')=='reward_share_unknown',drive=lambda:rig.live.run_once(pool='trial'))
+                    assert rig.store.lp_advance_trade_generation(rig.store.lp_trade_generation())
+                    rig.execution.refresh_lp_observations()
+                else:
+                    if variant=='account_recovery':
+                        original_orders=rig.sdk.list_open_orders
+                        def unavailable(**kwargs):raise OSError('offline account outage')
+                        rig.sdk.list_open_orders=unavailable
+                        assert rig.store.lp_advance_trade_generation(rig.store.lp_trade_generation())
+                        assert rig.execution.refresh_lp_observations()['state']=='unknown'
+                        rig.sdk.list_open_orders=original_orders
+                    assert rig.store.lp_advance_trade_generation(rig.store.lp_trade_generation())
+                    rig.tick(30);rig.publish_account({'old-A'})
+                    rig.pump(lambda:rig.live.pool_measurement_state()['measurement_attempts'][cid]['result']['state']=='known',
+                        drive=lambda:rig.live.run_once(pool='trial'))
+                    original_rewards=rig.sdk._ctx.secure_clob.get_json
+                    def held_rewards(path,**kwargs):
+                        if path=='/rewards/user/markets':
+                            entered.set();assert release.wait(8),'blocked legacy reward watchdog'
+                        return original_rewards(path,**kwargs)
+                    rig.sdk._ctx.secure_clob.get_json=held_rewards
+                    def legacy_refresh():
+                        try:rig.execution.refresh_lp_observations()
+                        except BaseException as exc:errors.append(repr(exc))
+                    worker=threading.Thread(target=legacy_refresh);worker.start();assert entered.wait(2)
+                base=rig.execution.refresh_lp_dashboard_snapshot();original=base['lp_observations'][cid]
+                before=(len(rig.requests),deepcopy(rig.sdk.posts),deepcopy(rig.sdk.cancels),
+                    rig.store.lp_trade_generation(),deepcopy(rig.store.lp_observations(rig.account)))
+                dashboard=rig.execution.lp_dashboard();row=dashboard['lp_observations'][cid]
+                assert dashboard['authenticated'] and not dashboard['stale']
+                assert dashboard['open_orders_complete'] and dashboard['positions_complete']
+                for field in ('occupied_capital_usd','state','reason','risk_state','risk_warning','risk_directions','add_room','qualified'):
+                    assert row[field]==original[field],(variant,field)
+                html=_d2_display_html(dashboard,cid)
+                assert html['risk']==_d2_display_html(base,cid)['risk']
+                if variant in ('unavailable','expired'):
+                    assert original['state']=='known' and Decimal(original['occupied_capital_usd'])==17
+                    assert Decimal(original['risk_directions'][0]['risk_principal'])==17
+                    assert row['current_yield_state']=='unknown'
+                    assert row['current_yield_reason']==('sample_expired' if variant=='expired' else 'reward_share_unknown')
+                    assert row['current_yield_pct_per_hour'] is row['current_hourly_reward_usd'] is row['measurement_buy_capital_usd'] is None
+                    assert '待更新' in html['yield'] and 'UNKNOWN</span>/小时' in html['hourly']
+                    assert '占用本金 $17.00' in html['row'] and '预计小时奖励 UNKNOWN' in html['row']
+                    assert '$0.00</strong>/小时' not in html['hourly']
+                    print(variant+': independent exposure/risk UNKNOWN-yield invariant PASS')
+                else:
+                    assert not release.is_set() and not errors
+                    assert original['state']=='unknown' and original['reason']==(
+                        'account_snapshot_stale' if variant=='account_recovery' else 'exposure_changed')
+                    assert rig.live.pool_result_projection()[cid]['eligible']
+                    assert row['current_yield_state']=='known',(variant,row['current_yield_reason'])
+                    assert row['current_yield_reason'] is None
+                    assert Decimal(row['current_yield_pct_per_hour'])==50 and Decimal(row['current_hourly_reward_usd'])==1
+                    assert Decimal(row['measurement_buy_capital_usd'])==2
+                    assert '实际 <strong>50%' in html['yield'] and '$1.00</strong>/小时' in html['hourly']
+                    assert '预计小时奖励 $1.00' in html['row']
+                assert before==(len(rig.requests),rig.sdk.posts,rig.sdk.cancels,
+                    rig.store.lp_trade_generation(),rig.store.lp_observations(rig.account))
+                assert rig.sdk.posts==rig.sdk.cancels==[]
+            finally:
+                release.set()
+                if worker is not None:worker.join(4);assert not worker.is_alive() and not errors
+                if rig is not None:rig.close()
