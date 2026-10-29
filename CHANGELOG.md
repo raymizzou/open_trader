@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-29 — LP telemetry test log synchronization (#495)
+
+- Wait for each missing-context read's asynchronous log capture before checking diagnostic reasons and public fields. Preserve all existing assertions and production behavior; REST completion does not imply that its queued log has been emitted.
+
 ## 2026-10-29 — LP missing-context rejection telemetry (#495)
 
 - Partition actual shadow BUY REST completions without comparison context into nine finite diagnostic causes. Publish counts and fractions of missing reads, and add the chosen cause to the existing safe missing-context log event.
