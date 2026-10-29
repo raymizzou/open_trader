@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-29 — Income-gap read-only test synchronization (#482 / PR #500)
+
+- Wait for previously admitted asynchronous reads to finish and publish at the frozen business clock before checking that read-only snapshots cause no new requests or trading changes. Preserve all diagnostic, detached-copy and negative assertions; production behavior is unchanged.
+
 ## 2026-10-29 — LP reward pool promotion and monitor history (#482)
 
 - Show the last confirmed same-account pool counts, original confirmation time and current unconfirmed reason during UNKNOWN membership. Both monitor pages label historical counts; current order details and financial authority remain UNKNOWN.

@@ -66,6 +66,17 @@ def test_income_gap_reports_each_skip_without_changing_selection(tmp_path, monke
                 rig.capture=lambda:replace(original(),value=())
             outcome = rig.cycle(pool='income')
             rig.finish_cancels(outcome)
+            def reads_settled():
+                status=rig.live.read_runtime.status()
+                due=status['next_dependency_monotonic']
+                return (status['ready_count']==0 and status['deferred_count']==0
+                    and status['managed_tasks']==0 and not any(scope['active'] for scope in status['scopes'])
+                    and status['observed_monotonic']>=rig.seconds
+                    and (due is None or due>rig.seconds))
+            # Previously admitted HTTP must finish and publish before testing GET isolation.
+            stamp=rig.seconds
+            rig.pump(reads_settled,drive=lambda:rig.live.run_once(pool='trial'))
+            assert rig.seconds==stamp
             before=(len(rig.requests),deepcopy(rig.sdk.posts),deepcopy(rig.sdk.cancels),rig.store.lp_trade_generation())
             state=rig.execution.lp_auto_state()['observed_pools']
             assert 'income_gaps' in state, scenario
