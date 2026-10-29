@@ -1399,25 +1399,40 @@ class LPD2LiveExecution:
                 cohort=tuple(o for o in snapshot.active_orders if o.key[:3]==order.key[:3]
                     and o.side=='BUY' and o.price.value==order.price.value and self._is_local_order(o))
                 cutoffs[d.key]=self._local_buy_acceptance_cutoff(cohort)
-        contexts=[]
+        contexts=[];missing_reasons={}
         if self.policy.orderbook_mode=='shadow':
+            from .polymarket_lp_orderbook import CONTEXT_MISSING_REASON_PRIORITY
+            missing_reasons={d.key:'baseline_absent' for d in demands if d.kind=='buy' and d.key in eligible}
             for key,baseline in snapshot.baselines.items():
-                context=self._orderbook_shadow_context(snapshot,key,baseline)
-                if context is None:continue
-                keys=tuple(d.key for d in demands if d.key in eligible and d.order_id in context['order_ids'])
-                if keys:
-                    contexts.append({**context,'demand_key':keys[0],'demand_keys':keys})
+                context,reason,order_ids=self._orderbook_shadow_context_capture(snapshot,key,baseline)
+                if context is None:
+                    keys=tuple(d.key for d in demands if d.key in missing_reasons and d.order_id in order_ids
+                        and (d.account,d.condition_id,d.token_id)==key.scope[:3])
+                    for demand_key in keys:
+                        if CONTEXT_MISSING_REASON_PRIORITY[reason]>CONTEXT_MISSING_REASON_PRIORITY[missing_reasons[demand_key]]:
+                            missing_reasons[demand_key]=reason
+                else:
+                    keys=tuple(d.key for d in demands if d.key in eligible and d.order_id in context['order_ids'])
+                    if keys:contexts.append({**context,'demand_key':keys[0],'demand_keys':keys})
         self.read_runtime.configure_orderbook(self.policy.orderbook_mode,tokens,eligible_keys=eligible,
-            buy_prices=prices,comparison_contexts=contexts,accepted_cutoffs=cutoffs)
+            buy_prices=prices,comparison_contexts=contexts,accepted_cutoffs=cutoffs,
+            missing_context_reasons=missing_reasons)
         self.read_runtime.reconcile(demands)
 
     def _orderbook_shadow_context(self,snapshot,key,baseline):
-        """Capture read-only values; no callback into mutable future owner facts."""
+        """Compatibility wrapper used by protection; admission and values are unchanged."""
+        return self._orderbook_shadow_context_capture(snapshot,key,baseline)[0]
+
+    def _orderbook_shadow_context_capture(self,snapshot,key,baseline):
+        """Capture admission and its first rejection from the same owner facts."""
         orders=tuple(o for o in snapshot.active_orders if o.key[:3]==key.scope[:3]
             and o.side=='BUY' and o.price.value==key.price and self._is_local_order(o))
-        if (not baseline.bid_levels or not baseline.bid_level
-                or not any(o.key[3] in baseline.anchor_order_ids for o in orders)
-                or any(o.remaining.state!='known' for o in orders)):return None
+        from .polymarket_lp_orderbook import shadow_context_rejection
+        reason=shadow_context_rejection(bid_levels=baseline.bid_levels,bid_level=baseline.bid_level,
+                has_current_anchor=any(o.key[3] in baseline.anchor_order_ids for o in orders),
+                remaining_known=all(o.remaining.state=='known' for o in orders))
+        order_ids=tuple(o.key[3] for o in orders)
+        if reason is not None:return None,reason,order_ids
         own=sum((o.remaining.value for o in orders),Decimal(0))
         cutoff=self._local_buy_acceptance_cutoff(orders)
         basis_key=(key.kind,key.scope,key.price,key.episode_id)
@@ -1425,7 +1440,7 @@ class LPD2LiveExecution:
             tuple((o.key,o.terms_version) for o in orders),own,baseline.bid_level,baseline.bid_levels,cutoff)
         return dict(key=identity,order_ids=tuple(o.key[3] for o in orders),condition_id=key.scope[1],
             token_id=key.scope[2],price=key.price,own_remaining=own,bid_level=baseline.bid_level,
-            baseline_levels=baseline.bid_levels,accepted_at=cutoff)
+            baseline_levels=baseline.bid_levels,accepted_at=cutoff),None,order_ids
 
     def _collect_async_reads(self):
         self._reconcile_async_reads()
