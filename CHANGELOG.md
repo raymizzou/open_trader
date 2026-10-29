@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-29 — Publish native-cancel fixture JSON atomically (#491 / PR #493)
+
+- Write the independent-cancel shutdown fixture marker to a same-directory temporary file before replacing its final JSON path. Preserve the existing payload, lifecycle assertions, watchdogs and timeouts; readers no longer see a partially written marker. Production behavior is unchanged.
+
 ## 2026-10-29 — Seal queued exact reads during pool rotation (#491 / PR #493)
 
 - Bind fixed-lane ownership at admission, including exact reads whose coroutine has not yet bound an HTTP port. Seal queued peers when their generation rotates, and recheck generation before client binding or child-read registration. Keep original timeout mailboxes and complete results unchanged; sealed attempts cannot issue late reads or publish complete facts.
