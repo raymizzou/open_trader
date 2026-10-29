@@ -35,6 +35,11 @@ def test_income_gap_reports_each_skip_without_changing_selection(tmp_path, monke
             if scenario in ('no_sample','unknown','bounded'):
                 rig.observe_initial_measurement({n:'1' for n in names})
                 _roles(rig,names)
+                rig.tick(120)
+                # Keep the missing-share negative case after the new rest window.
+                rig.converge_current(lambda: all(rig.live.pool_measurement_state()['measurement_attempts'].get(
+                    rig.cid(n),{}).get('result',{}).get('reason')=='reward_share_unknown' for n in names),
+                    drive=lambda:rig.live.run_once(pool='trial'))
                 measured=None
             else:
                 measured = rig.measure({n:'1' for n in names if scenario!='comparison' or n!='A'})

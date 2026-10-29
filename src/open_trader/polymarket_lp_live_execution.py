@@ -1867,7 +1867,8 @@ class LPD2LiveExecution:
                                 'accepted_order_id':outcome.venue_order_id}
                     if outcome.status == LocalStatus.ACCEPTED and outcome.venue_order_id:
                         changed[row['condition_id']] = dict(pool=pool, episode=outcome.venue_order_id,
-                            request_id=outcome.identity.request_id, account_id=self.account_id, token_id=row['token_id'])
+                            request_id=outcome.identity.request_id, account_id=self.account_id, token_id=row['token_id'],
+                            **({'income_slot':row['income_slot']} if pool=='income' else {}))
                     elif pool == 'income':
                         cid = row['condition_id']
                         sample = measured_results[cid]['result']
@@ -2205,8 +2206,8 @@ class LPD2LiveExecution:
                 if order.side!='BUY' or self._managed_pool_role(snapshot,order,role) is None:continue
                 cid=order.key[1]
                 if order.key not in self._pool_order_seen:
-                    self._pool_order_seen=dict(list({**self._pool_order_seen,order.key:order.source.checked_at}.items())[-64:])
-                first_seen=self._pool_order_seen[order.key]
+                    self._pool_order_seen=dict(list({**self._pool_order_seen,order.key:(order.source.checked_at,self._clock())}.items())[-64:])
+                first_seen,seen_monotonic=self._pool_order_seen[order.key]
                 market=self._pool_reward_reads.get(order.key,{})
                 share=self._reward_share
                 scoring=next((o.scoring for o in snapshot.openings.values()
@@ -2220,7 +2221,9 @@ class LPD2LiveExecution:
                         source.checked_at,None,None,stamp)
                 sample=dict(state='unknown',reason='reward_share_unknown',yield_pct_per_hour=None)
                 accepted_buy=self._opening_order_associations.get(order.key)
-                if (not market.get('pool') or market['terms_version']!=order.terms_version
+                if self._clock()-seen_monotonic < 120:
+                    sample=dict(sample,reason='sample_warming_up')
+                elif (not market.get('pool') or market['terms_version']!=order.terms_version
                         or market['generation']!=snapshot.current.cycle_generation):
                     sample=dict(sample,reason='reward_pool_stale')
                 elif (share is not None and share.complete and not share.error and share.value.get('account_id')==self.account_id
@@ -2272,7 +2275,7 @@ class LPD2LiveExecution:
 
     def _pool_composition(self, pool, prepared, calculation, snapshot, roles, results, as_of, orders_accepted, *, financial_accepted):
         from .polymarket_lp_market_reader import SourceResult
-        from .polymarket_lp_observed_pools import select_income_results, income_order, current_result_eligible
+        from .polymarket_lp_observed_pools import select_income_results, income_order, current_result_eligible, positive_yield
         from decimal import ROUND_DOWN
         active_markets = {r['condition_id'] for r in prepared.current_buys}
         results = self._current_pool_results(results, roles, snapshot)
@@ -2302,7 +2305,8 @@ class LPD2LiveExecution:
         income = {cid for cid, role in roles['roles'].items() if role['pool'] == 'income'
             and ((cid,role.get('episode')) in exact_current or cid in self._pool_transfers
                 or not account_known or self._placement_owners())}
-        members_before = {cid for cid in income if not roles['roles'][cid].get('evicted')}
+        pending_income = {cid for cid,t in self._pool_transfers.items() if not t.get('accepted_order_id')}
+        members_before = {cid for cid in income if not roles['roles'][cid].get('evicted')} | pending_income
         gaps = dict(total=0, omitted=0, items=[], checked_at=as_of)
         def gap(cid, reason, **context):
             gaps['total'] += 1
@@ -2324,13 +2328,15 @@ class LPD2LiveExecution:
                     raw = observations.get(cid, {}).get('pool_result', {})
                     reason = raw.get('reason', 'no_sample')
                     if reason not in ('no_sample', 'reward_attribution_unknown', 'measured_order_unknown', 'measured_terms_unknown',
-                            'reward_share_unknown','reward_pool_stale','not_scoring','multiple_orders','terms_unknown'):
+                            'reward_share_unknown','reward_pool_stale','not_scoring','multiple_orders','terms_unknown','sample_warming_up'):
                         reason = 'measured_unknown'
                     gap(cid, 'sample_unknown:'+reason, **context)
                 elif not current_result_eligible(roles['roles'], sample, prepared.current_buys) and cid not in self._pool_transfers:
                     gap(cid, 'source_not_current', **context)
                 elif not value.get('eligible'):
                     gap(cid, 'sample_expired', age_seconds=value.get('age_seconds'), **context)
+                elif sample.get('yield_pct_per_hour') is not None and not positive_yield(sample):
+                    gap(cid, 'zero_yield', **context)
         results = {cid:{**value,'eligible':value['eligible'] and (
             current_result_eligible(roles['roles'], value['result'], prepared.current_buys)
             or cid in self._pool_transfers)}
@@ -2360,19 +2366,60 @@ class LPD2LiveExecution:
                 financial_authority=snapshot.new_capacity.state == 'known', as_of=as_of,
                 budget_exempt_reserved=other_pool_reserved)
             return local_frame, selection, local_policy, roles
-        ranked = sorted((cid for cid, result in results.items() if result['eligible']),
+        ranked = sorted((cid for cid, result in results.items() if result['eligible'] and (cid in members_before or positive_yield(result['result']))),
             key=lambda cid: (-Decimal(str(results[cid]['result']['yield_pct_per_hour'])), cid not in income, cid))
+        weights = (Decimal('.5'), Decimal('.3'), Decimal('.2'))
+        free_slots = set(range(3))
+        member_slots = {}
+        for cid in sorted(members_before):
+            role = roles['roles'].get(cid,{})
+            current_order = next((r for r in prepared.current_buys
+                if r['condition_id']==cid and r['order_id']==role.get('episode')), None)
+            slot = self._pool_transfers.get(cid,{}).get('income_slot',role.get('income_slot'))
+            if type(slot) is not int or slot not in free_slots:
+                # Older roles have no slot label; reserve a slot that covers their original commitment.
+                cost = (current_order['price']*current_order['original_size'] if current_order else None)
+                slot = next((i for i in sorted(free_slots,reverse=True)
+                    if cost is not None and cost<=local_policy.budget*weights[i]), None)
+            if slot is not None:
+                member_slots[cid]=slot
+                free_slots.remove(slot)
+        worst = min(members_before, key=lambda cid: (
+            Decimal(str(results[cid]['result']['yield_pct_per_hour'])),cid)) if members_before and all(
+                results.get(cid,{}).get('eligible') for cid in members_before) else None
         sized = {}
         estimates = []
+        entrants_sized = 0
         for cid in ranked:
-            if len(sized) >= 3: break
+            if cid in members_before:
+                matches = [r for r in rows if r['condition_id']==cid]
+                if len(matches)==1:
+                    row=matches[0]
+                    if cid in pending_income and cid in member_slots:
+                        slot=member_slots[cid]
+                        quantity=(local_policy.budget*weights[slot]/row['price']).quantize(Decimal('.01'),rounding=ROUND_DOWN)
+                        from .polymarket_lp_risk import estimate_lp_stress_exit
+                        estimates.append(dict(condition_id=cid,quantity=quantity,stress_exit=estimate_lp_stress_exit(
+                            row['direction']['book'],market=row['direction']['market'],price=row['price'],
+                            quantity=quantity,bid_level=self.policy.buy_price_level)))
+                        sized[cid]={**row,'quantity':quantity,'income_slot':slot}
+                    else:sized[cid]=row
+                continue
+            if len(member_slots)!=len(members_before):continue
+            replacing = len(members_before)>=3
+            if replacing:
+                if (entrants_sized or worst is None or Decimal(str(results[cid]['result']['yield_pct_per_hour']))
+                        <=Decimal(str(results[worst]['result']['yield_pct_per_hour']))):continue
+                slot=member_slots[worst]
+            else:
+                if not free_slots:continue
+                slot=min(free_slots)
             matches = [r for r in rows if r['condition_id'] == cid]
             if len(matches) != 1:
                 gap(cid, 'candidate_row_missing')
                 continue
             row = matches[0]
-            quantity = (local_policy.budget*(Decimal('.5'),Decimal('.3'),Decimal('.2'))[len(sized)]
-                / row['price']).quantize(Decimal('.01'),rounding=ROUND_DOWN)
+            quantity = (local_policy.budget*weights[slot] / row['price']).quantize(Decimal('.01'),rounding=ROUND_DOWN)
             market = row.get('direction',{}).get('market',{})
             minimum = max(Decimal(str(market.get('reward_min_size','Infinity'))),
                 Decimal(str(market.get('minimum_order_size','Infinity'))))
@@ -2383,7 +2430,9 @@ class LPD2LiveExecution:
             risk = estimate_lp_stress_exit(row['direction']['book'],market=market,
                 price=row['price'],quantity=quantity,bid_level=self.policy.buy_price_level)
             estimates.append(dict(condition_id=cid,quantity=quantity,stress_exit=risk))
-            sized[cid] = {**row,'quantity':quantity}
+            sized[cid] = {**row,'quantity':quantity,'income_slot':slot}
+            entrants_sized+=1
+            free_slots.discard(slot)
         decision = select_income_results({cid:results[cid] for cid in sized}, members=tuple(sorted(members_before)))
         failed_directions = prepared.sources['direction_failures'].value
         unsafe_incumbent = any(r['condition_id'] in members_before and (
@@ -2411,7 +2460,7 @@ class LPD2LiveExecution:
                 previous = self._pool_transfers.get(cid)
                 if previous is not None:
                     transfer = dict(previous)
-                    if decision['cancel_members'] and transfer.get('accepted_order_id'):
+                    if cid in decision['cancel_members'] and transfer.get('accepted_order_id'):
                         oid = transfer.pop('accepted_order_id')
                         source_order = next((r for r in prepared.current_buys
                             if r['condition_id'] == cid and r['order_id'] == oid), None)
@@ -2419,10 +2468,10 @@ class LPD2LiveExecution:
                             continue
                         transfer['source_order'] = dict(order_id=oid, token_id=source_order['token_id'])
                     transfers[cid] = transfer
-                elif cid not in income or decision['cancel_members']:
+                elif cid not in income:
                     transfers[cid] = dict(sample=results[cid]['result'],
                         source_order=results[cid]['result']['source_order'], epoch=self.process_epoch,
-                        generation=snapshot.current.cycle_generation)
+                        generation=snapshot.current.cycle_generation, income_slot=sized[cid]['income_slot'])
             self._pool_transfers = transfers
         changes = dict(roles['roles'])
         for cid in income-set(members):
@@ -2439,13 +2488,13 @@ class LPD2LiveExecution:
         new_rows = []
         for cid in members:
             if cid in sized: new_rows.append(sized[cid])
-        rebuild = bool(decision['cancel_members'])
         # Pool authority follows exact role episodes and measured trial sources.
         # Other BUYs in the same condition remain real account commitments.
         entrants = {cid:results[cid]['result']['source_order'] for cid in set(members)-income
             if results.get(cid,{}).get('result')}
         victims = tuple(r['order_id'] for r in prepared.current_buys
-            if (rebuild and income_order(roles['roles'],r['condition_id'],r['order_id']))
+            if (r['condition_id'] in decision['cancel_members']
+                and income_order(roles['roles'],r['condition_id'],r['order_id']))
             or (r['condition_id'] in entrants
                 and entrants[r['condition_id']].get('order_id') == r['order_id']
                 and entrants[r['condition_id']].get('token_id') == r['token_id']))

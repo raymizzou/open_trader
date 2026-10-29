@@ -363,8 +363,33 @@ class PoolRig:
                 assert time.monotonic()<end,self.live.diagnostics()
                 self.advance_idle_read()
                 self.wake.wait(.01);self.wake.clear()
+        # The two-minute sample window outlives candidate reward/book freshness.
+        # Publish fresh external fixture reads without renewing the measured sample.
+        self.publish_candidates()
         assert self.store.lp_advance_trade_generation(self.store.lp_trade_generation())
         return self.execution.refresh_lp_observations()
+
+    def publish_candidates(self):
+        from copy import deepcopy
+        roles=self.store.lp_load_observed_pool_roles(self.account)['roles']
+        for name,row in self.markets.items():
+            if self.cid(name) in roles and not any(o['market']==self.cid(name) for o in self.sdk.orders):
+                continue  # Measuring another order does not requalify a departed episode.
+            try:
+                self.public.get_market(id='m'+name)
+                book=self.public.get_order_book(token_id='t'+name)
+                self.public.list_market_rewards(condition_id=self.cid(name))
+            except (OSError,TimeoutError):continue
+            direction=deepcopy(row['direction'])
+            direction['market'].update(metadata_checked_at=self.now,fees_checked_at=self.now)
+            direction.update(reward_checked_at=self.now)
+            direction['book'].update(received_at=self.now,timestamp=book.timestamp,
+                bids=[dict(price=level.price,size=level.size) for level in book.bids],
+                asks=[dict(price=level.price,size=level.size) for level in book.asks])
+            row['direction']=direction
+            self.producer._candidate_pool_record_success(self.cid(name),
+                dict(condition_id=self.cid(name),state='eligible',selected_direction=dict(token_id='t'+name)),
+                judged_at=self.now,facts=dict(checked_at=self.now,directions=[direction]),global_recovery_generation=7)
 
     def capture(self):
         from open_trader.polymarket_lp_market_reader import SourceResult
@@ -407,25 +432,25 @@ def test_trial_candidate_rebuilds_income_as_measured_top_three(tmp_path,monkeypa
         planned=rig.cycle(pool='income')
         release.set()
         rig.finish_cancels(planned)
-        assert {o.key[3] for o in planned.rotation.victims}=={'old-A','old-B','old-C','old-D'}
+        assert {o.key[3] for o in planned.rotation.victims}=={'old-C','old-D'}
         # Local native capacity is two; a fresh round can attempt a previously
         # unadmitted exact cancellation. ACK still releases no cash or slot.
         sent={oid for batch in rig.sdk.cancels for oid in batch}
-        if sent != {'old-A','old-B','old-C','old-D'}:
+        if sent != {'old-C','old-D'}:
             again=rig.cycle(pool='income')
             rig.finish_cancels(again)
             assert again.selection.selection_state=='DECISION', (
                 again.acceptance.status, [(o.key[3],o.venue_status,o.price.value,o.original_size.value,
                     o.size_matched.value,o.order_type.value,o.expiration.value) for o in again.acceptance.observation.orders],
                 rig.sdk.orders)
-        assert {oid for batch in rig.sdk.cancels for oid in batch}=={'old-A','old-B','old-C','old-D'}, (
+        assert {oid for batch in rig.sdk.cancels for oid in batch}=={'old-C','old-D'}, (
             rig.live.rotation_diagnostics(), rig.live._cancel_blocks)
-        assert rig.sdk.posts==[]  # all old exact BUYs still occupy account capacity
-        rig.release('old-A','old-B','old-C','old-D')
+        assert rig.sdk.posts==[]  # the old entrant/victim still occupy actual account capacity
+        rig.release('old-C','old-D')
         bought=rig.cycle(pool='income')
         assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts]==[
-            ('tB',Decimal('50')),('tD',Decimal('30')),('tA',Decimal('20'))]
-        assert len(bought.outcomes)==3 and all(o.status.value=='accepted' for o in bought.outcomes)
+            ('tD',Decimal('20'))]
+        assert len(bought.outcomes)==1 and all(o.status.value=='accepted' for o in bought.outcomes)
     finally:
         release.set()
         rig.close()
@@ -450,8 +475,8 @@ def test_income_member_rates_alone_do_not_reorder_and_ties_keep_incumbents(tmp_p
         rig.measure({'0':'.6000001'})
         improved=rig.cycle(pool='income')
         rig.finish_cancels(improved)
-        assert {o.key[3] for o in improved.rotation.victims}=={'old-A','old-B','old-C','old-0'}
-        assert {oid for batch in rig.sdk.cancels for oid in batch}=={'old-A','old-B','old-C','old-0'}
+        assert {o.key[3] for o in improved.rotation.victims}=={'old-C','old-0'}
+        assert {oid for batch in rig.sdk.cancels for oid in batch}=={'old-C','old-0'}
         assert rig.sdk.posts==[]
     finally:
         rig.close()
@@ -488,46 +513,39 @@ def test_income_bootstrap_leaves_empty_weights_and_filters_final_minimum(tmp_pat
 def test_next_income_cycle_reselects_after_cancels_without_locked_group(tmp_path,monkeypatch):
     rig=AsyncPoolRig(tmp_path,monkeypatch)
     try:
-        for name in 'ABCD': rig.market(name)
-        for name,capital in [('A','50'),('B','30'),('C','20'),('D','1')]: rig.add_order(name,capital)
+        for name in 'ABCDE':rig.market(name)
+        for name,capital in [('A','50'),('B','30'),('C','20'),('D','1'),('E','1')]:rig.add_order(name,capital)
         rig.store.lp_save_observed_pool_roles(rig.account,expected_revision=0,
             roles={rig.cid(n):dict(pool='income',episode='old-'+n) for n in 'ABC'})
-        rig.measure(dict(A='.6',B='1',C='.4',D='.8'))
-        rig.tick()
-        from time import monotonic,sleep
-        end=monotonic()+4
-        while True:
-            first=rig.execution.lp_auto_scheduled_check()
-            if first.rotation_outcomes:break
-            assert monotonic()<end,rig.live.rotation_diagnostics()
-            sleep(.001)
-        rig.finish_cancels(first)
+        rig.measure(dict(A='.6',B='1',C='.4',D='.8',E='.2'))
+        first=rig.cycle(pool='income');rig.finish_cancels(first)
         assert first.selection.targets==(rig.cid('B'),rig.cid('D'),rig.cid('A'))
+        assert {o.key[3] for o in first.rotation.victims}=={'old-C','old-D'}
         assert rig.sdk.posts==[]
-        rig.market('E');rig.add_order('E','1')
+        rig.release('old-C','old-D')
         rig.measure(dict(E='1.2'))
-        observed_e=rig.cycle(pool='trial',qualified=True);rig.finish_cancels(observed_e)
-        rig.converge_current(lambda:any(o.key[3]=='old-E' for o in rig.live.state.snapshot().active_orders)
-            and rig.live.state.snapshot().observation.source_frame.sources.get('market_order:old-E') is not None)
-        rig.allowance=Decimal('1')  # E retains the only currently permitted USDC until actual release
-        rig.release('old-A','old-B','old-C','old-D')  # earlier exact sources really departed; E stays current
+        # Retained A/B plus E consume 81. D is pending, with no BUY capacity.
+        rig.allowance=Decimal('81')
+        rig.tick()  # The next account publication must include the changed allowance.
+        rig.publish_account({'old-A','old-B','old-E'})
         reselection=rig.cycle(pool='income',qualified=True);rig.finish_cancels(reselection)
-        rig.converge_current(lambda:any(p['order_id']=='old-E' for p in
-            rig.execution.lp_auto_state()['observed_pools']['current_membership']['pending_promotions']))
+        assert reselection.selection.targets==(rig.cid('E'),rig.cid('B'),rig.cid('D'))
+        assert reselection.rotation is not None, (
+            reselection.selection,rig.execution.lp_auto_state()['observed_pools']['income_gaps'],
+            rig.execution.lp_auto_state()['observed_pools']['current_membership'])
+        assert {o.key[3] for o in reselection.rotation.victims}=={'old-A','old-E'}
         pending=rig.execution.lp_auto_state()['observed_pools']['current_membership']['pending_promotions']
-        assert {p['order_id'] for p in pending}=={'old-E','old-B','old-D'}
+        assert {p['order_id'] for p in pending}=={'old-E','old-D'}
         assert rig.sdk.posts==[]
-        rig.release('old-E');rig.allowance=Decimal('200')
-        # The next income business opportunity uses a fresh qualified capture.
-        # Automatic trial fairness is covered independently by P214-progress.
-        second=rig.cycle(pool='income',qualified=True)
-        rig.finish_cancels(second)
+        rig.release('old-A','old-E');rig.allowance=Decimal('200')
+        second=rig.cycle(pool='income',qualified=True);rig.finish_cancels(second)
         assert second.selection.targets==(rig.cid('E'),rig.cid('B'),rig.cid('D'))
         assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts]==[
-            ('tE',Decimal('50')),('tB',Decimal('30')),('tD',Decimal('20'))]
-        assert len({o.identity.request_id for o in second.outcomes})==3
-    finally:
-        rig.close()
+            ('tE',Decimal('50')),('tD',Decimal('20'))]
+        assert len({o.identity.request_id for o in second.outcomes})==2
+        assert rig.history['old-B']['original_size']*rig.history['old-B']['price']==30
+        assert 'old-B' not in {oid for batch in rig.sdk.cancels for oid in batch}
+    finally:rig.close()
 
 
 def test_both_pool_cycles_share_actual_capacity_without_borrowing(tmp_path,monkeypatch):
@@ -547,6 +565,7 @@ def test_both_pool_cycles_share_actual_capacity_without_borrowing(tmp_path,monke
         rig.sdk.positions=(dict(condition_id=rig.cid('B'),token_id='tB',size='20',average_price='.4'),)
         sell={**rig.history['old-B'],'id':'inventory-SELL','side':'SELL','original_size':Decimal('20')}
         rig.sdk.orders=(*rig.sdk.orders,sell)
+        rig.publish_account({'old-A','manual-extra-A','old-B'})
         bounded=rig.cycle(pool='trial')
         assert rig.sdk.posts==[]  # trial15 + unclassified manual5 exhaust trial20
         assert rig.live.state.snapshot().inventory_cost.value==8
@@ -640,40 +659,45 @@ def test_partial_income_submission_keeps_successes_and_unknown_identity(tmp_path
                     roles={rig.cid('A'):dict(pool='income',episode='old-A')})
             rig.measure(dict(B='1',D='.8',A='.6'))
             admission=rig.cycle(pool='income');rig.finish_cancels(admission)
-            rig.converge_current(lambda: {'old-B','old-D','old-A'} <=
+            sources={'old-B','old-D'} if previous_member else {'old-B','old-D','old-A'}
+            fail_token='tD' if previous_member else 'tA'
+            total_posts=2 if previous_member else 3
+            retained_tokens={'tA','tB'} if previous_member else {'tB','tD'}
+            rig.converge_current(lambda: sources <=
                 {p['order_id'] for p in rig.execution.lp_auto_state()['observed_pools']['current_membership']['pending_promotions']})
-            assert {oid for batch in rig.sdk.cancels for oid in batch}=={'old-B','old-D','old-A'}
+            assert {oid for batch in rig.sdk.cancels for oid in batch}==sources
             rig.sdk.cancels.clear()
-            rig.release('old-B','old-D','old-A')
+            rig.release(*sources)
             original_post=rig.sdk.post_order
             def partial(signed):
-                if signed['token_id']!='tA': return original_post(signed)
+                if signed['token_id']!=fail_token: return original_post(signed)
                 rig.sdk.posts.append(signed)
                 if disposition=='unknown': raise TimeoutError('offline last income response lost')
                 return dict(accepted=False,status='REJECTED')
             rig.sdk.post_order=partial
             first=rig.cycle(pool='income')
-            assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts]==[
-                ('tB',Decimal('50')),('tD',Decimal('30')),('tA',Decimal('20'))]
+            assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts]==([
+                ('tB',Decimal('50')),('tD',Decimal('30'))]+([] if previous_member else [('tA',Decimal('20'))]))
             by_token={o.identity.target.token_id:o for o in first.outcomes}
-            assert by_token['tB'].status.value==by_token['tD'].status.value=='accepted'
-            assert by_token['tA'].status.value==('unknown_timeout' if disposition=='unknown' else 'rejected')
-            request_id=by_token['tA'].identity.request_id
-            assert {o['asset_id'] for o in rig.sdk.orders}=={'tB','tD'}
+            assert by_token['tB'].status.value=='accepted'
+            if not previous_member:assert by_token['tD'].status.value=='accepted'
+            assert by_token[fail_token].status.value==('unknown_timeout' if disposition=='unknown' else 'rejected')
+            request_id=by_token[fail_token].identity.request_id
+            assert {o['asset_id'] for o in rig.sdk.orders}==retained_tokens
             assert rig.sdk.cancels==[]
             if disposition=='unknown':
                 assert rig.live.state.snapshot().new_capacity.state=='unknown'
                 current_orders=rig.sdk.orders
                 rig.sdk.orders=None
                 blocked=rig.cycle(pool='income')
-                assert not blocked.outcomes and len(rig.sdk.posts)==3
+                assert not blocked.outcomes and len(rig.sdk.posts)==total_posts
                 rig.sdk.orders=current_orders
             next_cycle=rig.cycle(pool='income')
             rig.finish_cancels(next_cycle)
-            assert rig.sdk.cancels==[]  # retain B/D; no teardown to retry the failed A slot
-            assert len(rig.sdk.posts)==3  #20 stays cash; no old-sample replay
+            assert rig.sdk.cancels==[]  # retain successful exact orders; no teardown to retry the failed slot
+            assert len(rig.sdk.posts)==total_posts  #failed slot stays cash; no old-sample replay
             assert all(o.identity.request_id!=request_id for o in next_cycle.outcomes)
-            assert {o['asset_id'] for o in rig.sdk.orders}=={'tB','tD'}
+            assert {o['asset_id'] for o in rig.sdk.orders}==retained_tokens
         finally:
             rig.close()
 
@@ -687,9 +711,9 @@ def test_evicted_income_market_requires_new_trial_sample(tmp_path,monkeypatch):
             roles={rig.cid(n):dict(pool='income',episode='old-'+n) for n in 'ABC'})
         rig.measure(dict(A='.6',B='1',C='.4',D='.8'))
         replacing=rig.cycle(pool='income');rig.finish_cancels(replacing)
-        rig.release('old-A','old-B','old-C','old-D')
+        rig.release('old-C','old-D')
         bought=rig.cycle(pool='income');rig.finish_cancels(bought)
-        assert {o.identity.target.token_id for o in bought.outcomes}=={'tA','tB','tD'}
+        assert {o.identity.target.token_id for o in bought.outcomes}=={'tD'}
         assert not any(o['asset_id']=='tC' for o in rig.sdk.orders)
         old_c=rig.execution.lp_observed_pool_state()['results'][rig.cid('C')]['result']
         assert Decimal(old_c['yield_pct_per_hour'])==Decimal('.4')
@@ -697,7 +721,7 @@ def test_evicted_income_market_requires_new_trial_sample(tmp_path,monkeypatch):
         before=list(rig.sdk.cancels)
         no_old_promotion=rig.cycle(pool='income');rig.finish_cancels(no_old_promotion)
         assert rig.sdk.cancels==before
-        assert len(rig.sdk.posts)==3
+        assert len(rig.sdk.posts)==1
         reentered=rig.cycle(pool='trial');rig.finish_cancels(reentered)
         assert [(o.identity.target.token_id,o.identity.target.terms.price*o.identity.target.terms.quantity)
             for o in reentered.outcomes]==[('tC',Decimal('1'))]
@@ -709,7 +733,7 @@ def test_evicted_income_market_requires_new_trial_sample(tmp_path,monkeypatch):
         new_sample=rig.execution.lp_observed_pool_state()['results'][rig.cid('C')]['result']
         assert new_sample['source_order']['order_id']==new_c
         promoted=rig.cycle(pool='income');rig.finish_cancels(promoted)
-        assert {o.key[3] for o in promoted.rotation.victims}=={o['id'] for o in rig.sdk.orders}
+        assert {o.key[3] for o in promoted.rotation.victims}=={'old-A',new_c}
         assert promoted.selection.targets==(rig.cid('C'),rig.cid('B'),rig.cid('D'))
     finally:
         rig.close()
@@ -745,7 +769,7 @@ def test_promoted_size_uses_new_measurement_without_automatic_reshuffle(tmp_path
         rig.measure(dict(E='.2'))
         new_trial=rig.cycle(pool='income');rig.finish_cancels(new_trial)
         assert new_trial.selection.targets==(rig.cid('E'),rig.cid('D'))
-        assert {o.key[3] for o in new_trial.rotation.victims}=={new_d,'old-E'}
+        assert {o.key[3] for o in new_trial.rotation.victims}=={'old-E'}
         assert len(rig.sdk.posts)==1  # no anticipatory release/re-sizing
     finally:
         rig.close()
@@ -902,7 +926,7 @@ def test_income_cycle_consumes_one_result_snapshot_and_next_cycle_gets_updates(t
         assert new['source_order']['order_id']=='old-E'
         following=rig.cycle(pool='income');rig.finish_cancels(following)
         assert following.selection.targets==(rig.cid('E'),rig.cid('D'))
-        assert {o.key[3] for o in following.rotation.victims}=={fixed.outcomes[0].venue_order_id,'old-E'}
+        assert {o.key[3] for o in following.rotation.victims}=={'old-E'}
         assert len(rig.sdk.posts)==1
     finally:release.set();rig.close()
 
@@ -1058,7 +1082,7 @@ def test_fill_and_protection_remain_authoritative_during_pool_changes(tmp_path,m
         try:
             assert entered.wait(2)
             handles=[o.handle for o in changing.rotation_outcomes]
-            assert len(handles)==4 and len({h.identity.request_id for h in handles})==4
+            assert len(handles)==2 and len({h.identity.request_id for h in handles})==2
             assert all(not h.done() for h in handles)
             # A live shared native lease prevents another manual spending owner.
             busy=rig.execution.lp_start('unused-preview','manual-during-pool-cancel')
@@ -1079,7 +1103,7 @@ def test_fill_and_protection_remain_authoritative_during_pool_changes(tmp_path,m
         finally:release.set()
         rig.finish_cancels(changing)
         by_order={h.identity.target.existing_order_id:h.result(timeout=3).status.value for h in handles}
-        assert by_order=={'old-A':'rejected','old-B':'rejected','old-C':'accepted','old-D':'rejected'}
+        assert by_order=={'old-C':'accepted','old-D':'rejected'}
         reconciled=rig.cycle(pool='trial')
         assert not reconciled.outcomes
         reservations=rig.execution.lp_auto_reservations()
@@ -1104,7 +1128,7 @@ def test_fill_and_protection_remain_authoritative_during_pool_changes(tmp_path,m
             assert record['order_id']==record['receipt']['order_id']==h.identity.target.existing_order_id
             assert record['kind']=='CANCEL'
             assert record['receipt']['outcome']==('accepted' if record['order_id']=='old-C' else 'rejected')
-        assert rig.sdk.cancels[0]==('old-A','old-B','old-C','old-D')
+        assert rig.sdk.cancels[0]==('old-C','old-D')
         assert len(rig.sdk.cancels)==3 and set(rig.sdk.cancels[1:])=={('old-A',),('old-D',)}
         # Later authoritative partial facts create new exact protection decisions.
         # They do not replay the original group request or acquire SELL authority.
@@ -1747,7 +1771,7 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
         actual_cancel=rig.sdk.cancel_orders
         def cancel(*,order_ids):
             if len(order_ids)>1:
-                assert set(order_ids)=={'old-A','old-B','old-C','old-D'}
+                assert set(order_ids)=={'old-C','old-D'}
                 group_entered.set();assert group_release.wait(8),'held group external watchdog'
                 rig.sdk.cancels.append(tuple(order_ids))
                 return dict(canceled=tuple(oid for oid in order_ids if oid!='old-C'),not_canceled={'old-C':'offline unknown'})
@@ -1780,8 +1804,8 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
             if not planned:time.sleep(.001)
         assert group_entered.wait(2)
         group=planned[0];handle=group.rotation_outcomes[0].handle
-        assert len(group.rotation_outcomes)==4
-        assert len({out.handle.identity.request_id for out in group.rotation_outcomes})==4
+        assert len(group.rotation_outcomes)==2
+        assert len({out.handle.identity.request_id for out in group.rotation_outcomes})==2
         other=rig.live.cancel_independent((rig.live.account_id,rig.cid('F'),'tF','old-F'))
         assert other is not None and other_entered.wait(2)
         assert rig.live.status()['native_inflight']==2
@@ -1810,15 +1834,15 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
         assert all(t==stamp for _,_,t in rig.requests[len(before):])
         assert not other_release.is_set() and rig.sdk.posts==[]
         outcomes=[out.handle.result(0) for out in group.rotation_outcomes]
-        assert {out.venue_order_id for out in outcomes}=={'old-A','old-B','old-C','old-D'}
-        assert {out.venue_order_id for out in outcomes if out.status.value=='accepted'}=={'old-A','old-B','old-D'}
+        assert {out.venue_order_id for out in outcomes}=={'old-C','old-D'}
+        assert {out.venue_order_id for out in outcomes if out.status.value=='accepted'}=={'old-D'}
         assert next(out for out in outcomes if out.venue_order_id=='old-C').status.value=='rejected'
         snapshot=rig.live.state.snapshot()
         partial=next(o for o in snapshot.orders if o.key[3]=='old-E')
         assert (partial.original_size.value,partial.size_matched.value)==(Decimal('2.5'),Decimal('.5'))
         assert partial.remaining.state=='unknown'  # final quantity awaits exact venue proof
         for order in snapshot.orders:
-            if order.key[3] in {'old-A','old-B','old-D'}:
+            if order.key[3] in {'old-D'}:
                 assert order.terminal_proof.matched.state=='unknown'  # cancel ACK is not final fill
         assert sum(batch==('old-E',) for batch in rig.sdk.cancels)==1
         rig.tick()
@@ -1866,7 +1890,7 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
         actual_cancel=rig.sdk.cancel_orders
         def cancel(*,order_ids):
             if len(order_ids)>1:
-                assert set(order_ids)=={'old-A','old-B','old-C','old-D'}
+                assert set(order_ids)=={'old-C','old-D'}
                 group_entered.set();assert group_release.wait(8),'held group external watchdog'
                 rig.sdk.cancels.append(tuple(order_ids))
                 return dict(canceled=tuple(oid for oid in order_ids if oid!='old-C'),not_canceled={'old-C':'offline unknown'})
@@ -1889,8 +1913,8 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
             if not planned:time.sleep(.001)
         assert group_entered.wait(2)
         group=planned[0];handle=group.rotation_outcomes[0].handle
-        assert len(group.rotation_outcomes)==4
-        assert len({out.handle.identity.request_id for out in group.rotation_outcomes})==4
+        assert len(group.rotation_outcomes)==2
+        assert len({out.handle.identity.request_id for out in group.rotation_outcomes})==2
         other=rig.live.cancel_independent((rig.live.account_id,rig.cid('F'),'tF','old-F'))
         assert other is not None and other_entered.wait(2)
         assert rig.live.status()['native_inflight']==2
@@ -1931,15 +1955,15 @@ def test_pool_group_completion_preserves_early_wake_until_physical_exit(tmp_path
         assert all(t==stamp for _,_,t in rig.requests[len(before):])
         assert not other_release.is_set() and rig.sdk.posts==[]
         outcomes=[out.handle.result(0) for out in group.rotation_outcomes]
-        assert {out.venue_order_id for out in outcomes}=={'old-A','old-B','old-C','old-D'}
-        assert {out.venue_order_id for out in outcomes if out.status.value=='accepted'}=={'old-A','old-B','old-D'}
+        assert {out.venue_order_id for out in outcomes}=={'old-C','old-D'}
+        assert {out.venue_order_id for out in outcomes if out.status.value=='accepted'}=={'old-D'}
         assert next(out for out in outcomes if out.venue_order_id=='old-C').status.value=='rejected'
         snapshot=rig.live.state.snapshot()
         partial=next(o for o in snapshot.orders if o.key[3]=='old-E')
         assert (partial.original_size.value,partial.size_matched.value)==(Decimal('2.5'),Decimal('.5'))
         assert partial.remaining.state=='unknown'  # final quantity awaits exact venue proof
         for order in snapshot.orders:
-            if order.key[3] in {'old-A','old-B','old-D'}:
+            if order.key[3] in {'old-D'}:
                 assert order.terminal_proof.matched.state=='unknown'  # cancel ACK is not final fill
         assert sum(batch==('old-E',) for batch in rig.sdk.cancels)==1
         http_release.set();rig.http_gate=None
@@ -2176,15 +2200,20 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
         planned=rig.cycle(pool='income',qualified=True,settle_reads=True);rig.finish_cancels(planned)
         sent={oid for batch in rig.sdk.cancels for oid in batch}
         assert manual not in sent,'pool authority must never cancel an unclassified same-market BUY'
-        assert sent=={'old-A','old-B','old-C','old-D'}
+        assert sent=={'old-C','old-D'}
         assert rig.sdk.posts==[]
         snapshot=rig.live.state.snapshot()
         assert sum((o.price.value*o.remaining.value for o in planned.acceptance.observation.orders),Decimal(0))==Decimal('115')
-        assert snapshot.buy_reserved.value==Decimal('5')
+        assert snapshot.buy_reserved.value==Decimal('85')
         assert next(o for o in snapshot.active_orders if o.key[3]==manual).remaining.value==Decimal('12.5')
-        rig.release('old-A','old-B','old-C','old-D')
+        rig.release('old-C','old-D')
+        released_ids={row['id'] for row in rig.sdk.orders}
+        rig.converge_current(lambda:rig.live.state.snapshot().observation.read_ticket.trade_version_at_start
+            ==rig.live.state.snapshot().trade_version
+            and {row['order_id'] for row in rig.live.state.snapshot().observation.source_frame.current_buys}==released_ids,
+            drive=lambda:rig.live.run_once(pool='trial'))
         rig.cycle(pool='income',qualified=True,settle_reads=True)
-        expected=[('tB',Decimal('50')),('tD',Decimal('30')),('tA',Decimal('20'))]
+        expected=[('tD',Decimal('20'))]
         expected=[row for row in expected if row[0]!='t'+manual_market]
         assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts]==expected
         assert manual in {row['id'] for row in rig.sdk.orders}
@@ -2198,8 +2227,8 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
             and {row['order_id'] for row in rig.live.state.snapshot().observation.source_frame.current_buys}==published_ids,
             drive=lambda:rig.live.run_once(pool='trial'))
         snapshot=rig.live.state.snapshot()
-        assert snapshot.buy_reserved.value==Decimal('5')+sum((capital for _,capital in expected),Decimal(0))
-        assert len([o for o in snapshot.active_orders if o.key[1]==rig.cid(manual_market)])==1
+        assert snapshot.buy_reserved.value==Decimal('85')+sum((capital for _,capital in expected),Decimal(0))
+        assert len([o for o in snapshot.active_orders if o.key[1]==rig.cid(manual_market)])==(2 if manual_market=='A' else 1)
         assert rig.execution.lp_observed_pool_state()['results'][rig.cid(manual_market)]['result']==retained
         if manual_market=='D':
             assert all(p['token_id']!='tD' for p in rig.sdk.posts)
@@ -2241,9 +2270,9 @@ def test_income_rebuild_preserves_unclassified_same_market_orders(tmp_path,monke
                 assert time.monotonic()<end,'income group completion watchdog'
                 rig.advance_idle_read()
                 rig.wake.wait(.01);rig.wake.clear()
-            assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts if p['token_id']=='tD']==[('tD',Decimal('30'))]
+            assert [(p['token_id'],p['price']*p['size']) for p in rig.sdk.posts if p['token_id']=='tD']==[('tD',Decimal('20'))]
             assert {(row['asset_id'],row['price']*(row['original_size']-row['size_matched']))
-                for row in rig.sdk.orders}=={('tB',Decimal('50')),('tD',Decimal('30')),('tA',Decimal('20'))}
+                for row in rig.sdk.orders}=={('tB',Decimal('30')),('tD',Decimal('20')),('tA',Decimal('50'))}
             assert len(rig.sdk.orders)==3
         assert all(manual not in batch for batch in rig.sdk.cancels)
         assert not rig.sdk.market_orders
@@ -2267,7 +2296,7 @@ def test_pool_group_permission_wait_keeps_current_state_responsive(tmp_path,monk
         end=time.monotonic()+4
         while True:
             planned=rig.live.run_once(rig.producer.capture_qualified_pool(),pool='income')
-            if planned.rotation and len(planned.rotation.victims)==4:break
+            if planned.rotation and len(planned.rotation.victims)==2:break
             assert time.monotonic()<end,'public income decision watchdog'
             time.sleep(.001)
         assert rig.sdk.cancels==rig.sdk.posts==[]
@@ -2291,10 +2320,10 @@ def test_pool_group_permission_wait_keeps_current_state_responsive(tmp_path,monk
             assert control.result(timeout=2)['desired_running'] is False
             settle_control(rig.live)
         elif change=='identity':
-            rig.release('old-A');rig.add_order('A','50',order_id='replacement-A');rig.tick()
+            rig.release('old-C');rig.add_order('C','20',order_id='replacement-C');rig.tick()
             def publish():
                 end=time.monotonic()+4
-                while not any(o.key[3]=='replacement-A' for o in rig.live.state.snapshot().active_orders):
+                while not any(o.key[3]=='replacement-C' for o in rig.live.state.snapshot().active_orders):
                     rig.live.run_once(rig.producer.capture_qualified_pool(),pool='income')
                     # The held SQL owner must not freeze account read deadlines.
                     status=rig.live.read_runtime.status();due=status['next_dependency_monotonic']
@@ -2311,11 +2340,11 @@ def test_pool_group_permission_wait_keeps_current_state_responsive(tmp_path,monk
         assert not sql_release.is_set() and rig.sdk.cancels==[]
         sql_release.set();dispatched=pending.result(timeout=3);rig.finish_cancels(dispatched)
         outcomes=[out.handle.result(0) for out in dispatched.rotation_outcomes]
-        assert len(outcomes)==4 and len({out.identity.request_id for out in outcomes})==4
+        assert len(outcomes)==2 and len({out.identity.request_id for out in outcomes})==2
         if change=='unchanged':
-            assert len(rig.sdk.cancels)==1 and set(rig.sdk.cancels[0])=={'old-A','old-B','old-C','old-D'}
+            assert len(rig.sdk.cancels)==1 and set(rig.sdk.cancels[0])=={'old-C','old-D'}
             assert all(out.status.value=='accepted' for out in outcomes)
-            assert all(o.terminal_proof.matched.state=='unknown' for o in rig.live.state.snapshot().orders)
+            assert all(o.terminal_proof.matched.state=='unknown' for o in rig.live.state.snapshot().orders if o.key[3] in {'old-C','old-D'})
         else:
             assert rig.sdk.cancels==[]
             assert all(out.status.value=='not_sent' for out in outcomes)
@@ -2407,11 +2436,11 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
             roles={rig.cid(n):dict(pool='income' if n in 'ABC' else 'trial',episode='old-'+n,
                 **({'evicted':True} if n in 'FGH' else {})) for n in 'ABCDEFGH'})
         assert rig.cid('J') not in rig.store.lp_load_observed_pool_roles(rig.account)['roles']
-        rig.measure(dict(A='.6',B='1',C='.4',D='.8',E='.7',F='.5',G='.3',H='.2'))
+        rig.measure(dict(A='.6',B='1',C='.4',D='.8',E='.5',F='.5',G='.3',H='.2'))
         def cancel(*,order_ids):
             ids=set(order_ids);rig.sdk.cancels.append(tuple(order_ids))
             if ids=={'old-F','old-G','old-H'}:trial_entered.set()
-            elif ids=={'old-A','old-B','old-C','old-D','old-E'}:income_entered.set()
+            elif ids=={'old-C','old-D'}:income_entered.set()
             elif ids=={'old-J'}:
                 # Delay only the external cancel boundary. Publishing the
                 # logical protection key does not prove this callback ran.
@@ -2428,7 +2457,7 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
         trial=rig.cycle(pool='trial');assert trial_entered.wait(2)
         income=rig.cycle(pool='income');assert income_entered.wait(2)
         assert {o.key[3] for o in trial.rotation.victims}=={'old-F','old-G','old-H'}
-        assert {o.key[3] for o in income.rotation.victims}=={'old-A','old-B','old-C','old-D','old-E'}
+        assert {o.key[3] for o in income.rotation.victims}=={'old-C','old-D'}
         groups=[trial.rotation_outcomes[0].handle.parent,income.rotation_outcomes[0].handle.parent]
         assert rig.live.status()['native_inflight']==2 and rig.execution._lp_d2_lease_users==2
         assert rig.sdk.posts==[]
@@ -2497,7 +2526,7 @@ def test_last_pool_group_exit_keeps_deferred_protection_runnable(tmp_path,monkey
         assert rig.seconds==stamp
         assert sum(batch==('old-J',) for batch in rig.sdk.cancels)==1
         outcomes=[o.handle.result(0) for result in (trial,income) for o in result.rotation_outcomes]
-        assert len(outcomes)==8 and len({o.identity.request_id for o in outcomes})==8
+        assert len(outcomes)==5 and len({o.identity.request_id for o in outcomes})==5
         assert all(o.status.value=='rejected' for o in outcomes)
         snapshot=rig.live.state.snapshot()
         assert all(o.terminal_proof is None and o.presence=='present' for o in snapshot.orders if o.key[3]!='old-J')
@@ -2652,7 +2681,8 @@ def _exercise_postreceipt_publication(
         async def http(self,req):
             response=await super().http(req)
             canceled=(target in self.history and self.history[target]['status']=='CANCELED')
-            after_receipt=bool(self.sdk.posts) if case.startswith('manual-') else canceled
+            after_receipt=(all(self.history.get(oid,{}).get('status')=='CANCELED' for oid in ('old-C','old-D'))
+                if case.startswith('manual-') else canceled)
             if (after_receipt and req.headers['x-lp-source']==source
                     and (source!='order' or req.headers['x-lp-order']==target)
                     and not self.proof_release.is_set()):
@@ -2667,6 +2697,8 @@ def _exercise_postreceipt_publication(
             return response
 
         def converge_current(self,predicate,*,timeout=4,drive=None):
+            if self.proof_release.is_set():
+                return super().converge_current(predicate,timeout=timeout,drive=drive)
             end=time.monotonic()+timeout
             if defer_admission:
                 def deferred_until_next_read():
@@ -2855,7 +2887,8 @@ def test_income_rebuild_handles_delayed_candidate_completion(tmp_path,monkeypatc
                 sources={k:dict(id=v.source_id,checked=str(v.checked_at),complete=v.complete,error=v.error)
                     for k,v in observation.source_frame.sources.items() if k.startswith('market_income:')},
                 posts=[p['token_id'] for p in self.sdk.posts]))
-            assert result.outcomes==() and len(self.sdk.posts)==2
+            assert result.outcomes==() and self.sdk.posts==[]
+            assert {'old-A','old-B'} <= {row['id'] for row in self.sdk.orders}
             self.candidate_release.set()
 
         def close(self):

@@ -113,7 +113,9 @@ def test_monitor_orders_and_pools_share_one_snapshot(tmp_path, monkeypatch):
         rig.sdk.get_balance_allowance = lambda **kw: (_ for _ in ()).throw(OSError('offline'))
         rig.tick(11)
         rig.converge_current(lambda: rig.execution.lp_auto_state()['observed_pools']['current_membership']['state'] == 'unknown')
-        assert rig.execution.lp_monitor_summary(now=rig.utc())['orders']['counts'] is None
+        historical=rig.execution.lp_monitor_summary(now=rig.utc())['orders']
+        assert historical['counts']==dict(trial=3,income=2,unassigned=1,sell=1)
+        assert historical['status']=='unknown' and historical['counts_basis']=='last_confirmed'
         from copy import deepcopy
         from open_trader.polymarket_lp_monitor import LPMonitorSummary
         monitor=LPMonitorSummary();origin=datetime.fromisoformat(captured['observed_pools']['current_membership']['observed_at'])
