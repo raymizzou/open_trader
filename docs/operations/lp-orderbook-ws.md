@@ -114,6 +114,59 @@ numerator is `comparison_unknown_samples + context_missing_reads`. Per-context
 samples and actual eligible reads are published separately because a REST read
 can serve more than one frozen context.
 
+The additive `context_missing_reason_counts` partitions those missing reads.
+`context_missing_reason_fractions` divides each count by `context_missing_reads`,
+not by all eligible reads, comparison samples or elapsed time. Both maps are
+empty before the first missing read; thereafter counts sum to
+`context_missing_reads` and fractions sum to one, subject to floating-point
+rounding. Each missing completion contributes exactly one diagnostic cause.
+Accepted contexts take precedence over every competing rejection or hint.
+
+| Diagnostic cause | Captured rejection |
+| --- | --- |
+| `baseline_absent` | No baseline candidate for this current local BUY account, condition, token and price. |
+| `baseline_incomplete` | A candidate has no bid levels or a falsey bid level. |
+| `anchor_changed` | A complete candidate has no anchor among current same-price local BUYs. |
+| `remaining_unknown` | A candidate passes the preceding guards but current own remaining quantity is unknown. |
+| `demand_filter` | A supplied context's primary demand is not eligible; the reason can apply to its linked eligible secondary demands. |
+| `token_filter` | An eligible primary context has a condition/token subscription mismatch. |
+| `invalid_bid_level` | The existing runtime guard rejects a bid level that is not an integer in 1–64. |
+| `context_capacity` | The existing 64-context admission cap rejects another context identity. |
+| `unattributed` | No retained provenance, including absent, invalid or overflowed hints. |
+
+The owner preserves its original first-rejecting-guard order within each
+candidate. When several owner candidates reject the same read, choose
+`remaining_unknown` over `anchor_changed` over `baseline_incomplete` over
+`baseline_absent`. Runtime rejections take precedence over owner causes, in the
+order `context_capacity`, `invalid_bid_level`, `token_filter`, `demand_filter`.
+This selects one actionable cause; it does not assert that only one candidate
+rejected. Existing context admission, invalid-level/capacity abandon accounting,
+retired-context grace and history bounds are unchanged.
+
+`configure_orderbook` accepts optional `missing_context_reasons` metadata keyed
+by the full current `ReadDemand.key` (account, process epoch, cycle generation,
+kind, order and terms version). Every configure replaces the advisory map and
+filters out ineligible identities. At most 64 current hints are retained; an
+unretained hint supplies no cause. The public orderbook status exposes only the
+integer `context_missing_reason_hints_retained`, never the map or its identities.
+Completion uses the current decision for that same demand; a departed demand
+still follows the existing completion-eligibility guard. Changing hints, contexts
+or modes, and repeated configure/status/drain calls neither add missing reads nor
+reclassify or erase history. Off/use modes add no shadow observations.
+
+Only the nine literal diagnostic values above can appear in the new maps or in
+the added `context_missing_reason` field on the existing
+`missing_comparison_context` log event. Unknown strings and non-string values
+normalize to `unattributed` without stringification or raw-value logging. Existing
+log marker, reason, token prefix and timestamps stay intact. Telemetry does not
+refresh source timestamps, change UNKNOWN accounting or alter acceptance gates.
+The t662 collector forwards this diagnostics subtree unchanged.
+
+These fields describe reads exercised by code that captures provenance. Existing
+8200 live counters cannot be split retroactively: that deployed version did not
+capture these reasons. Offline synthetic count/fraction examples establish no
+historical ratios, live acceptance, two-hour qualification or deployment result.
+
 The process report requires all of the following:
 
 - At least 7,200 continuous seconds in shadow in the same process, observed at

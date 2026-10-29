@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-29 — LP telemetry test log synchronization (#495)
+
+- Wait for each missing-context read's asynchronous log capture before checking diagnostic reasons and public fields. Preserve all existing assertions and production behavior; REST completion does not imply that its queued log has been emitted.
+
+## 2026-10-29 — LP missing-context rejection telemetry (#495)
+
+- Partition actual shadow BUY REST completions without comparison context into nine finite diagnostic causes. Publish counts and fractions of missing reads, and add the chosen cause to the existing safe missing-context log event.
+- Capture unchanged owner/runtime rejection guards with bounded, current-demand provenance. Preserve context admission, all existing counters, UNKNOWN and acceptance gates, source timestamps and off/use behavior. Earlier 8200 live counts cannot be split retroactively; no deployment, mode activation or acceptance claim is included.
+
 ## 2026-10-29 — Publish native-cancel fixture JSON atomically (#491 / PR #493)
 
 - Write the independent-cancel shutdown fixture marker to a same-directory temporary file before replacing its final JSON path. Preserve the existing payload, lifecycle assertions, watchdogs and timeouts; readers no longer see a partially written marker. Production behavior is unchanged.

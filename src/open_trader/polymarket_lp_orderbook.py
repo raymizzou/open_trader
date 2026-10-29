@@ -584,6 +584,29 @@ class OrderBookWebSocket:
         if self.socket is not None:await self.socket.close()
 
 
+def shadow_context_rejection(*, bid_levels, bid_level, has_current_anchor, remaining_known):
+    """First rejecting owner guard, evaluated from already captured facts."""
+    if not bid_levels or not bid_level:return 'baseline_incomplete'
+    if not has_current_anchor:return 'anchor_changed'
+    if not remaining_known:return 'remaining_unknown'
+    return None
+
+
+CONTEXT_MISSING_REASONS = (
+    'baseline_absent', 'baseline_incomplete', 'anchor_changed', 'remaining_unknown',
+    'demand_filter', 'token_filter', 'invalid_bid_level', 'context_capacity', 'unattributed',
+)
+
+
+CONTEXT_MISSING_REASON_PRIORITY = {reason: index for index,reason in enumerate(
+    ('unattributed', *CONTEXT_MISSING_REASONS[:-1]))}
+
+
+def context_missing_reason(value):
+    """Normalize advisory input without inspecting or stringifying private data."""
+    return value if type(value) is str and value in CONTEXT_MISSING_REASONS else 'unattributed'
+
+
 class ShadowDiagnostics:
     """Bounded measurements; a report grants no trading or switch authority."""
     def __init__(self, *, clock=time.monotonic):
@@ -596,6 +619,7 @@ class ShadowDiagnostics:
         self.rest_cancel_observations=0;self.cancel_pending=0;self.cancel_matches=0;self.ws_missed_cancels=0
         self._cancel_timing=deque(maxlen=256)
         self.eligible_rest_reads=0;self.context_missing_reads=0
+        self.context_missing_reason_counts={}
         self.incomplete_observations=0
         self.ws_early_events=0;self.ws_transient_events=0
         self._disconnect_window=deque(maxlen=7);self.disconnect_hour_exceeded=False
@@ -672,10 +696,12 @@ class ShadowDiagnostics:
         self.reasons[reason]=self.reasons.get(reason,0)+1
 
     @synchronized
-    def eligible_read(self, *, has_context):
+    def eligible_read(self, *, has_context, missing_context_reason=None):
         self.eligible_rest_reads+=1
         if not has_context:
             self.context_missing_reads+=1;self.not_comparable+=1
+            diagnostic=context_missing_reason(missing_context_reason)
+            self.context_missing_reason_counts[diagnostic]=self.context_missing_reason_counts.get(diagnostic,0)+1
             self._note_unknown('missing_comparison_context')
             reason='missing_comparison_context'
             self.reasons[reason]=self.reasons.get(reason,0)+1
@@ -772,6 +798,8 @@ class ShadowDiagnostics:
             rest_cancel_observations=self.rest_cancel_observations,cancel_pending=self.cancel_pending,
             cancel_obligations=self.cancel_obligations,
             eligible_rest_reads=self.eligible_rest_reads,context_missing_reads=self.context_missing_reads,
+            context_missing_reason_counts=dict(self.context_missing_reason_counts),
+            context_missing_reason_fractions={k:v/self.context_missing_reads for k,v in self.context_missing_reason_counts.items()},
             incomplete_observations=self.incomplete_observations,
             ws_early_events=self.ws_early_events,ws_transient_events=self.ws_transient_events,
             audit_mismatches=self.audit_mismatches,
