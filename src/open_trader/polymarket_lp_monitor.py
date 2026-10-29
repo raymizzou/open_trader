@@ -93,6 +93,8 @@ class LPMonitorSummary:
         self.lock = RLock()
         self.since = {}
         self.shortages = {}
+        self.account_id = None
+        self.last_counts = None
 
     def duration(self, key, active, now):
         if not active:
@@ -136,6 +138,10 @@ class LPMonitorSummary:
                     and r.get('side') in ('BUY', 'SELL')
                     and r.get('pool') in ('trial','income','unclassified','promotion') for r in rows)
                 and len({r['order_id'] for r in rows}) == len(rows))
+            if self.account_id != account_id:
+                self.account_id = account_id
+                self.last_counts = None
+                self.shortages.clear()
             counts = dict(trial=0, income=0, unassigned=0, sell=0) if known else None
             items = []
             if known:
@@ -148,12 +154,20 @@ class LPMonitorSummary:
                     pool = row.get('pool') if row.get('pool') in ('trial', 'income') else 'unassigned'
                     counts['sell' if row['side'] == 'SELL' else pool] += 1
                     items.append({k: row.get(k) for k in ('condition_id', 'token_id', 'order_id', 'side', 'pool')})
+            if known:
+                self.last_counts = (dict(counts), stamp)
+            confirmed_at = self.last_counts[1].isoformat() if self.last_counts else None
+            display_counts = counts if known else dict(self.last_counts[0]) if self.last_counts else None
+            unconfirmed_reason = None if known else (
+                'account_identity_mismatch' if membership.get('account_id') != account_id else
+                'membership_stale' if stamp is not None and not 0 <= (now-stamp).total_seconds() <= 60 else
+                membership.get('reason') or 'membership_unconfirmed')
             pools = {}
             shortage = False
             for pool in ('trial', 'income'):
                 target = mapping(auto.get('effective_settings', auto)).get(pool+'_target_buy_count')
                 valid_target = type(target) is int and target >= 0
-                count = counts[pool] if known else None
+                count = display_counts[pool] if display_counts is not None else None
                 lacking = known and valid_target and count < target
                 age = self.shortage_duration(pool, account_id, known and valid_target, lacking, stamp, now)
                 state = ('abnormal' if age is not None and age >= 300 else 'attention') if lacking else 'normal'
@@ -179,7 +193,9 @@ class LPMonitorSummary:
                 'attention' if shortage else 'normal')
             reason = {'normal':'挂单已达到当前配置目标', 'attention':'池内缺单，正在等待补位',
                       'abnormal':'池内连续五分钟缺单', 'unknown':'当前挂单或池归属未确认'}[state]
-            result['orders'] = section(state, reason, counts=counts, items=items, observed_at=stamp.isoformat() if stamp else None)
+            result['orders'] = section(state, reason, counts=display_counts, items=items, observed_at=stamp.isoformat() if stamp else None,
+                confirmed_at=confirmed_at, counts_basis='current' if known else 'last_confirmed' if self.last_counts else 'unknown',
+                unconfirmed_reason=unconfirmed_reason)
             candidate_count = dashboard.get('candidate_valid_count')
             candidate_stamp = moment(dashboard.get('candidate_last_success_at'))
             candidate_source = (account_id and dashboard.get('account_id') == account_id

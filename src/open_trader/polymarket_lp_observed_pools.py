@@ -41,12 +41,15 @@ def current_result_eligible(roles, sample, orders):
 def current_membership(snapshot, roles, transfers, *, account_id, settings_account, epoch, as_of):
     """A read-only view of one accepted snapshot; history never creates rows."""
     observation = snapshot.observation
-    known = (observation is not None and observation.orders_complete
-        and all(observation.components[k].state == 'known'
-            and observation.components[k].complete for k in ('balance','open_orders','positions'))
-        and observation.read_ticket.trade_version_at_start == snapshot.trade_version
-        and observation.cycle_generation == snapshot.current.cycle_generation
-        and 0 <= (as_of - observation.accepted_at).total_seconds() <= 10)
+    reason = (
+        'observation_missing' if observation is None else
+        'orders_not_current_complete' if not observation.orders_complete else
+        next((k+'_not_current_complete' for k in ('balance','open_orders','positions')
+            if observation.components[k].state != 'known' or not observation.components[k].complete), None)
+        or ('trade_version_changed' if observation.read_ticket.trade_version_at_start != snapshot.trade_version else
+            'cycle_generation_changed' if observation.cycle_generation != snapshot.current.cycle_generation else
+            'observation_stale' if not 0 <= (as_of-observation.accepted_at).total_seconds() <= 10 else None))
+    known = reason is None
     promotions = []
     for cid, transfer in transfers.items():
         if transfer.get('accepted_order_id'):
@@ -74,7 +77,7 @@ def current_membership(snapshot, roles, transfers, *, account_id, settings_accou
             order_id=oid, side=order['side'], pool=pool,
             price=order.get('price'), remaining=order.get('remaining'),
             last_change_at=role.get('assigned_at')))
-    return dict(state='known' if known else 'unknown', account_id=account_id,
+    return dict(state='known' if known else 'unknown', reason=reason, account_id=account_id,
         observation_id=observation.observation_id if observation else None,
         observed_at=observation.accepted_at if observation else None,
         orders=orders, pending_promotions=promotions)
@@ -100,16 +103,36 @@ def result_projection(observations, account_id, as_of):
     return projected
 
 
+def positive_yield(sample):
+    try:
+        value = Decimal(str(sample.get('yield_pct_per_hour')))
+        return value.is_finite() and value > 0
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
 def select_income_results(results, *, members=()):
     """A fresh measured candidate may change the group; expiry never cancels it."""
-    eligible = [cid for cid, value in results.items() if value['eligible']]
+    eligible = [cid for cid, value in results.items() if value['eligible'] and positive_yield(value['result'])]
     eligible.sort(key=lambda cid: (-Decimal(str(results[cid]['result']['yield_pct_per_hour'])),
         cid not in members, cid))
-    chosen = tuple(eligible[:3])
-    new = set(chosen) - set(members)
-    if members and not new:
-        chosen = tuple(members)
-    return dict(members=chosen, cancel_members=tuple(members) if new else ())
+    if not members:
+        return dict(members=tuple(eligible[:3]), cancel_members=())
+    chosen = list(members)
+    entrants = [cid for cid in eligible if cid not in members]
+    cancelled = ()
+    if len(chosen) < 3:
+        chosen.extend(entrants[:3-len(chosen)])
+    elif entrants and all(cid in results and results[cid]['eligible'] for cid in members):
+        worst = min(members, key=lambda cid: (Decimal(str(results[cid]['result']['yield_pct_per_hour'])), cid))
+        best = entrants[0]
+        if Decimal(str(results[best]['result']['yield_pct_per_hour'])) > Decimal(str(results[worst]['result']['yield_pct_per_hour'])):
+            chosen.remove(worst)
+            chosen.append(best)
+            cancelled = (worst,)
+    chosen.sort(key=lambda cid: (-Decimal(str(results[cid]['result']['yield_pct_per_hour'])), cid)
+        if cid in results else (Decimal('Infinity'), cid))
+    return dict(members=tuple(chosen), cancel_members=cancelled)
 
 
 def _number(value):

@@ -371,7 +371,7 @@ def test_air_income_sample_end_to_end(tmp_path,monkeypatch):
     from tests.test_frontend_gateway import _running
     from open_trader.lp_monitor_readonly import create_readonly_server
     from datetime import UTC,datetime
-    rig=_d2_sample_rig(tmp_path,monkeypatch,clock_values=[datetime.now(UTC)-timedelta(seconds=45)])
+    rig=_d2_sample_rig(tmp_path,monkeypatch,clock_values=[datetime.now(UTC)-timedelta(seconds=180)])
     release=threading.Event();held=threading.Event();worker=None
     try:
         original=rig.sdk._ctx.secure_clob.get_json
@@ -579,6 +579,9 @@ def test_d2_unknown_yield_preserves_known_exposure_and_risk(tmp_path,monkeypatch
                     rig=_position_d2_sample_rig(tmp_path/variant,scoped)
                 cid=rig.cid('A')
                 if variant in ('unavailable','expired'):
+                    if variant=='unavailable':
+                        rig.observe_initial_measurement({'A':'50'})
+                        rig.tick(120)
                     original_http=rig.http
                     async def failed_share(req):
                         if req.headers['x-lp-source']=='reward_share':return httpx.Response(503)
@@ -586,7 +589,7 @@ def test_d2_unknown_yield_preserves_known_exposure_and_risk(tmp_path,monkeypatch
                     rig.http=failed_share
                     rig.tick(121 if variant=='expired' else 30)
                     rig.publish_account({'old-A'})
-                    rig.pump(lambda:rig.live.pool_measurement_state()['measurement_attempts'].get(cid,{}).
+                    rig.converge_current(lambda:rig.live.pool_measurement_state()['measurement_attempts'].get(cid,{}).
                         get('result',{}).get('reason')=='reward_share_unknown',drive=lambda:rig.live.run_once(pool='trial'))
                     assert rig.store.lp_advance_trade_generation(rig.store.lp_trade_generation())
                     rig.execution.refresh_lp_observations()

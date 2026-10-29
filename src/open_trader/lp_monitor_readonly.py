@@ -16,7 +16,7 @@ SUMMARY_PATH = '/api/prediction-arbitrage/lp/monitor'
 LABELS = dict(orders='当前挂单', cancellations='撤单情况', pools='双池运行', balance='余额与可用资金', fills='本钱包成交')
 STATUS = dict(normal='正常',attention='注意',abnormal='异常',unknown='未知')
 FIELDS = {
-    'as_of','timezone','status','reason','counts','items','trial','income','unassigned','sell','observed_at',
+    'confirmed_at','counts_basis','unconfirmed_reason','as_of','timezone','status','reason','counts','items','trial','income','unassigned','sell','observed_at',
     'count','target','shortage_seconds','budget_usd','used_usd','last_change_at','last_change_reason',
     'desired_running','effective_running','fatal','eligible_candidates','candidate_last_success_at','candidate_failure_seconds',
     'balance_usd','allowance_usd','capacity_usd','checked_at','inventory_cost_usd','hour','today','amount_usd',
@@ -140,8 +140,8 @@ def render_page(value):
         details=''
         if key=='orders':
             counts=mapping(data.get('counts'))
-            big='试挂 '+_text(counts.get('trial'))+' / 收益 '+_text(counts.get('income'))
-            details=_pairs([('未归池买单',counts.get('unassigned')),('卖单',counts.get('sell')),('确认时间',data.get('observed_at'))])
+            big=('最近确认：' if data.get('counts_basis')=='last_confirmed' else '')+'试挂 '+_text(counts.get('trial'))+' / 收益 '+_text(counts.get('income'))
+            details=_pairs([('未归池买单',counts.get('unassigned')),('卖单',counts.get('sell')),('最近确认时间',data.get('confirmed_at')),('未确认原因',data.get('unconfirmed_reason'))])
             details+=_table(data.get('items'), [('order_id','订单'),('condition_id','市场'),('side','方向'),('pool','所属池')])
         elif key=='pools':
             big='候选 '+_text(data.get('eligible_candidates'))
@@ -150,7 +150,7 @@ def render_page(value):
             for pool,label in [('trial','试挂池'),('income','收益池')]:
                 row=mapping(mapping(data.get('items')).get(pool))
                 details+='<h3>'+label+'</h3>'+_pairs([(name,row.get(field)) for field,name in [
-                    ('count','当前挂单'),('target','目标'),('budget_usd','预算（USD）'),('used_usd','已占用（USD）'),
+                    ('count','最近确认挂单' if value['orders'].get('counts_basis')=='last_confirmed' else '当前挂单'),('target','目标'),('budget_usd','预算（USD）'),('used_usd','已占用（USD）'),
                     ('last_change_at','最近补位或换单'),('last_change_reason','时间来源说明')]])
             share=mapping(data.get('reward_share'))
             details+=_pairs([('奖励占比读取年龄（秒）',share.get('age_seconds')),('奖励占比读取状态',share.get('state'))])

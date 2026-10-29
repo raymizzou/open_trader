@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-29 — Income-gap read-only test synchronization (#482 / PR #500)
+
+- Wait for previously admitted asynchronous reads to finish and publish at the frozen business clock before checking that read-only snapshots cause no new requests or trading changes. Preserve all diagnostic, detached-copy and negative assertions; production behavior is unchanged.
+
+## 2026-10-29 — LP reward pool promotion and monitor history (#482)
+
+- Show the last confirmed same-account pool counts, original confirmation time and current unconfirmed reason during UNKNOWN membership. Both monitor pages label historical counts; current order details and financial authority remain UNKNOWN.
+- Promote only fresh, finite positive measured yields. A mature zero remains a valid measurement and clears the existing 600-second trial timeout, but reports `zero_yield` instead of promoting.
+- Replace only the worst income order when a strictly better trial qualifies. Preserve retained exact orders and amounts; cancel the entrant's old trial order and wait for actual release before buying in the available fixed 50/30/20 slot.
+- Wait 120 process-observed seconds for each exact managed order before counting a D2 sample. New orders start a fresh window; original source timestamps, sample freshness, protection and restart boundaries remain unchanged. No deployment or mode activation is included.
+
 ## 2026-10-29 — LP telemetry test log synchronization (#495)
 
 - Wait for each missing-context read's asynchronous log capture before checking diagnostic reasons and public fields. Preserve all existing assertions and production behavior; REST completion does not imply that its queued log has been emitted.

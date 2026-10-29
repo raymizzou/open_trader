@@ -4911,15 +4911,15 @@ function lpMonitorCards(summary) {
     const data = raw && Object.hasOwn(statuses, raw.status) ? raw : {status:"unknown",reason:"当前来源未读全，情况未知"};
     let big = "未知", detail = "";
     if (key === "orders") {
-      big = `试挂 ${text(data.counts?.trial)} / 收益 ${text(data.counts?.income)}`;
-      detail = pairs([["未归池买单",data.counts?.unassigned],["卖单",data.counts?.sell],["确认时间",data.observed_at]]) +
+      big = `${data.counts_basis === "last_confirmed" ? "最近确认：" : ""}试挂 ${text(data.counts?.trial)} / 收益 ${text(data.counts?.income)}`;
+      detail = pairs([["未归池买单",data.counts?.unassigned],["卖单",data.counts?.sell],["最近确认时间",data.confirmed_at],["未确认原因",data.unconfirmed_reason]]) +
         table(data.items,[["order_id","订单"],["condition_id","市场"],["side","方向"],["pool","所属池"]]);
     } else if (key === "pools") {
       big = `候选 ${text(data.eligible_candidates)}`;
       detail = pairs([["想开",data.desired_running],["实际开",data.effective_running],["致命错误",data.fatal],["候选上次刷新成功",data.candidate_last_success_at]]);
       for (const [pool,name] of [["trial","试挂池"],["income","收益池"]]) {
         const row = data.items?.[pool] || {};
-        detail += `<h4>${name}</h4>` + pairs([["当前 / 目标",`${row.count ?? "未知"} / ${row.target ?? "未知"}`],["预算（USD）",row.budget_usd],
+        detail += `<h4>${name}</h4>` + pairs([[summary?.orders?.counts_basis === "last_confirmed" ? "最近确认 / 目标" : "当前 / 目标",`${row.count ?? "未知"} / ${row.target ?? "未知"}`],["预算（USD）",row.budget_usd],
           ["已占用（USD）",row.used_usd],["最近补位或换单",row.last_change_at],["时间来源说明",row.last_change_reason]]);
       }
     } else if (key === "balance") {
