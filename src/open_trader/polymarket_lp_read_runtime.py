@@ -1,6 +1,7 @@
 """Owned asynchronous LP reads. Business decisions remain with the live owner."""
 from dataclasses import dataclass, replace
 from collections.abc import Mapping
+from contextlib import nullcontext
 import time
 import asyncio
 import threading
@@ -132,6 +133,7 @@ class _Loop:
 class _Scope:
     def __init__(self,demand,lane):
         self.demand,self.lane=demand,lane
+        self.fixed_generation=None
         self.port=None;self.tasks=();self.completed_sources={};self.active=False;self.closing=False;self.closed=False
         self.retiring=False;self.attempt=0;self.next_start=0;self.result=None
         self.started=self.deadline=0;self.actual_end=None;self.expired=False;self.cancel_sent=False;self.fault=False;self.fault_pending=False
@@ -156,7 +158,7 @@ class LPReadRuntime:
         self.buy_cap=buy_cap;self.cache_entries=cache_entries;self.cache_bytes=cache_bytes;self._cache=OrderedDict();self._cache_size=0;self._lock=threading.RLock();self._scopes={};self._demands={}
         self._fixed_ports={};self._fixed_closing=set();self._fixed_closed=set();self._fixed_faults=set()
         self._fixed_kinds={};self._fixed_fault_details={}
-        self._fixed_rotating={};self._fixed_close_started={}
+        self._fixed_rotating={};self._fixed_close_started={};self._fixed_generations={}
         self._ages={};self._age_sequence=0
         # Runtime-lifetime identity, independent of scope retirement. One
         # scalar avoids retaining an unbounded ledger of departed order keys.
@@ -644,6 +646,7 @@ class LPReadRuntime:
                             not_before=max((wait_owner.not_before(p,scope.demand.account) for p in providers),default=0)
                             if self.clock()<not_before:
                                 scope.next_start=max(scope.next_start,not_before);continue
+                        scope.fixed_generation=self._fixed_generations.get(lane,0) if lane in ('financial','exact') else None
                         scope.completed_sources={}
                         self._attempt_sequence+=1;scope.attempt=self._attempt_sequence
                         scope.started=self.clock();scope.deadline=scope.started+(10 if kind=='reward_share' else 5)
@@ -760,6 +763,14 @@ class LPReadRuntime:
         return dict(self._financial_current or dict(identity=None,account_fingerprint=None),state=state,
             elapsed_seconds=elapsed,timeouts=self._financial_timeouts if state=='timed_out' else 0,observed_at=observed)
 
+    def _seal_fixed_peer(self,scope):
+        if scope.expired:return  # Preserve the original timeout/mailbox.
+        scope.expired=True;scope.last_sources=None
+        if not scope.retiring:
+            scope.result=MarketAttempt(scope.demand,scope.attempt,scope.started,scope.deadline,self.clock(),
+                freeze_sources({n:scope.completed_sources.get(n,SourceResult('',complete=False,error='pool_rotated'))
+                    for n in scope.demand.sources}),False,'pool_rotated')
+
     def _maintain_fixed_rotation(self):
         # A fixed port belongs to the whole lane. Never replace it while a
         # source owner or its close is still live, including a concurrent fills
@@ -768,13 +779,12 @@ class LPReadRuntime:
             owned=self._fixed_ports.get(name)
             if owned is None:continue
             port,lane=owned
-            peers=[s for s in self._scopes.values() if s.port is port]
+            generation=self._fixed_generations.get(name,0)
+            peers=[s for s in self._scopes.values() if s.port is port or
+                (s.active and _fixed_lane(s.demand.kind)==name and s.fixed_generation==generation)]
             for peer in peers:
-                if peer.active and not peer.expired and any(not t.done() for t in peer.tasks):
-                    peer.expired=True;peer.last_sources=None
-                    peer.result=MarketAttempt(peer.demand,peer.attempt,peer.started,peer.deadline,self.clock(),
-                        freeze_sources({n:peer.completed_sources.get(n,SourceResult('',complete=False,error='pool_rotated'))
-                            for n in peer.demand.sources}),False,'pool_rotated')
+                if peer.active and not peer.expired:
+                    self._seal_fixed_peer(peer)
                     if not peer.cancel_sent:
                         peer.cancel_sent=True;peer.lane.loop.call_soon_threadsafe(self._cancel_children,peer)
             if name not in self._fixed_closing:
@@ -792,6 +802,7 @@ class LPReadRuntime:
                     self._financial_record_offset=max((r['sequence'] for r in self._financial_retired_cleanup),
                         default=self._financial_record_offset)
                 self._fixed_ports.pop(name)
+                self._fixed_generations[name]=generation+1
                 self._fixed_rotating.pop(name)
                 self._fixed_close_started.pop(name,None)
                 self._fixed_closing.discard(name);self._fixed_closed.discard(name)
@@ -859,23 +870,30 @@ class LPReadRuntime:
         from .polymarket_lp_async_source import SourceRequest, OwnedReadTask
         sources={}
         try:
-            if scope.port is None:
-                fixed=_fixed_lane(scope.demand.kind)
-                if fixed is not None:
-                    with self._lock:
+            fixed=_fixed_lane(scope.demand.kind)
+            # Admission already owns a generation, even before this coroutine
+            # runs. Recheck and register its children atomically with rotation.
+            with self._lock if fixed is not None else nullcontext():
+                if fixed in ('financial','exact') and (scope.expired
+                        or scope.fixed_generation!=self._fixed_generations.get(fixed,0)
+                        or fixed in self._fixed_rotating or fixed in self._fixed_closed):
+                    self._seal_fixed_peer(scope)
+                    return
+                if scope.port is None:
+                    if fixed is not None:
                         owned=self._fixed_ports.get(fixed)
                         if owned is None:
                             scope.port=self.source_factory(scope.demand)
                             self._fixed_ports[fixed]=(scope.port,scope.lane)
                         else:scope.port=owned[0]
                         self._fixed_kinds[fixed]=scope.demand.kind
-                else:scope.port=self.source_factory(scope.demand)
-            d=scope.demand
-            scope.tasks=tuple(OwnedReadTask(self._read_source(scope,source,SourceRequest(source,d.account,
-                d.condition_id,d.token_id,d.target_order_id or d.order_id,':'.join(map(str,(*d.key,scope.attempt,source))),
-                diagnostic_attempt=scope.attempt if d.kind=='financial' else 0)))
-                for source in d.sources)
-            if scope.cancel_sent:self._cancel_children(scope)
+                    else:scope.port=self.source_factory(scope.demand)
+                d=scope.demand
+                scope.tasks=tuple(OwnedReadTask(self._read_source(scope,source,SourceRequest(source,d.account,
+                    d.condition_id,d.token_id,d.target_order_id or d.order_id,':'.join(map(str,(*d.key,scope.attempt,source))),
+                    diagnostic_attempt=scope.attempt if d.kind=='financial' else 0)))
+                    for source in d.sources)
+                if scope.cancel_sent:self._cancel_children(scope)
             values=await asyncio.gather(*scope.tasks,return_exceptions=True)
             sources={name:value if isinstance(value,SourceResult) else SourceResult('',complete=False,error='read_failed')
                 for name,value in zip(d.sources,values)}

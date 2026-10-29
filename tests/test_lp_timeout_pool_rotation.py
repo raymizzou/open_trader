@@ -323,3 +323,116 @@ def test_financial_timeout_streak_resets_only_on_complete_current_success():
     finally:
         runtime.reconcile(())
         assert runtime.close(4)
+
+
+def test_queued_exact_peer_is_sealed_before_port_binding():
+    """An admitted coroutine is an owner before its loop gets CPU or a port."""
+    clock = Clock()
+    boundary = Boundary(clock)
+    order_entered, release_loop, original_exited = (threading.Event() for _ in range(3))
+    queued_admitted, release_supervisor = threading.Event(), threading.Event()
+    rotation_observed, release_rotation_supervisor = threading.Event(), threading.Event()
+    transports, clients, requests = [], [], []
+    exact = demand('exact', kind='exact', sources=('order',), observation_id='original-order')
+    fills = demand('queued-fills', kind='exact', sources=('fills',), observation_id='queued-ticket')
+
+    class Transport(httpx.AsyncBaseTransport):
+        def __init__(self, generation):
+            self.generation = generation
+            self.closed = threading.Event()
+
+        async def handle_async_request(self, request):
+            source = request.headers['x-lp-source']
+            requests.append((source, clock(), self.generation))
+            boundary.record('http_request', request.headers['x-lp-order'], source)
+            if self.generation == 0 and source == 'order':
+                order_entered.set()
+                # External I/O boundary models this loop being descheduled.
+                # The supervisor remains live and can admit queued work.
+                assert release_loop.wait(4), 'external control-loop watchdog'
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    original_exited.set()
+                    boundary.record('original_request_exited', 'exact', source)
+            return PoolBoundary.response(source)
+
+        async def aclose(self):
+            if os.environ.get('LP491_CLOSE_SCHEDULE') == 'yield_first':
+                await asyncio.sleep(0)
+            self.closed.set()
+            boundary.record('transport_closed', str(self.generation), '')
+
+    def factory(d):
+        generation = len(transports)
+        if generation:
+            assert transports[0].closed.is_set() and original_exited.is_set()
+        transport = Transport(generation)
+        client = httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1',
+            timeout=None, trust_env=False,
+            limits=httpx.Limits(max_connections=2, max_keepalive_connections=2))
+        transports.append(transport)
+        clients.append(client)
+        return LPAsyncSourcePort({'clob':client}, clock=clock, utc_now=clock.utc)
+
+    runtime = LPReadRuntime(factory, clock=clock, utc_now=clock.utc)
+    def wakeup():
+        if threading.current_thread().name == 'lp-read-deadlines' and clock() == 2:
+            scopes = runtime.status()['scopes']
+            if any(s['key'] == fills.key and s['active'] and s['started'] == 2 for s in scopes):
+                queued_admitted.set()
+                assert release_supervisor.wait(4), 'external supervisor preemption watchdog'
+        if (threading.current_thread().name == 'lp-read-deadlines' and clock() == 5
+                and runtime.status()['ready_count'] and not rotation_observed.is_set()):
+            rotation_observed.set()
+            # Preserve this legitimate preemption after rotation's first tick;
+            # a second tick must not repair the missed queued owner for the test.
+            assert release_rotation_supervisor.wait(4), 'external post-rotation watchdog'
+    runtime.start(wakeup)
+    results = []
+    try:
+        runtime.reconcile((exact,))
+        assert order_entered.wait(4)
+        first = next(s['attempt'] for s in runtime.status()['scopes'] if s['key'] == exact.key)
+        clock.value = 2
+        runtime.reconcile((exact, fills))
+        assert queued_admitted.wait(4)
+        queued = next(s for s in runtime.status()['scopes'] if s['key'] == fills.key)
+        assert queued['active'] and queued['started'] == 2
+        assert requests == [('order', 0, 0)]  # queued work cannot have bound/read yet
+        clock.value = 5
+        release_supervisor.set()
+        runtime.wake()
+        assert rotation_observed.wait(4)
+        results.extend(runtime.drain_results())
+        original = next(r for r in results if r.attempt == first)
+        assert original.demand == exact and not original.complete and original.reason == 'timeout'
+        assert (original.started, original.deadline) == (0, 5)
+        release_loop.set()
+        boundary.wait(lambda: all(not s['active'] for s in runtime.status()['scopes']))
+        if not any(r.attempt == queued['attempt'] for r in results):
+            results.extend(collect(runtime, boundary, lambda rows: any(r.attempt == queued['attempt'] for r in rows)))
+        sealed = next(r for r in results if r.attempt == queued['attempt'])
+        assert sealed.demand == fills and not sealed.complete and sealed.reason == 'pool_rotated'
+        assert (sealed.started, sealed.deadline) == (2, 7)
+        assert not any(source == 'fills' for source, _, _ in requests)
+        release_rotation_supervisor.set()
+        results.extend(collect(runtime, boundary, lambda rows: any(r.demand == exact and r.complete for r in rows)))
+        assert original_exited.is_set() and transports[0].closed.is_set() and clients[0].is_closed
+        assert len(transports) == 2 and runtime.status()['pool_count'] == 1
+        advance(runtime, boundary, clock, 7)
+        results.extend(collect(runtime, boundary, lambda rows: any(r.demand == fills and r.complete for r in rows)))
+        fresh = next(r for r in results if r.demand == fills and r.complete)
+        assert fresh.attempt > sealed.attempt and fresh.started == 7
+        assert (fresh.demand.observation_id, fresh.deadline) == ('queued-ticket', 12)
+        assert all(stamp >= 7 and generation == 1 for source, stamp, generation in requests if source == 'fills')
+        assert not any(r.complete and r.attempt in (first, queued['attempt']) for r in results)
+        assert not runtime.drain_results()
+        assert (original.reason, original.complete, sealed.reason, sealed.complete) == ('timeout',False,'pool_rotated',False)
+    finally:
+        release_rotation_supervisor.set()
+        release_supervisor.set()
+        release_loop.set()
+        runtime.reconcile(())
+        assert runtime.close(4)
+        assert all(t.closed.is_set() for t in transports) and all(c.is_closed for c in clients)

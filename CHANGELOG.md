@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-29 — Seal queued exact reads during pool rotation (#491 / PR #493)
+
+- Bind fixed-lane ownership at admission, including exact reads whose coroutine has not yet bound an HTTP port. Seal queued peers when their generation rotates, and recheck generation before client binding or child-read registration. Keep original timeout mailboxes and complete results unchanged; sealed attempts cannot issue late reads or publish complete facts.
+- Preserve original request/order identities, actual cleanup/close ownership, resource counts, financial UNKNOWN, cooldown and no replay. Add a controlled public-boundary queued-fills regression; no trading or deployment permission changes.
+
 ## 2026-10-29 — Recover fixed LP read pools after timeouts (#491)
 
 - Close the whole financial or exact-query HTTP client generation when a five-second attempt still owns unfinished reads. Reuse healthy clients; allow replacement only after original reads and full client closure finish. Keep the old generation in resource counts until its original source/response cleanup ends. Preserve pool sizes, provider Retry-After, original timeout identities, UNKNOWN financial admission and actual shutdown ownership. A failed or stalled client close remains a cleanup fault and cannot create unlimited replacements.

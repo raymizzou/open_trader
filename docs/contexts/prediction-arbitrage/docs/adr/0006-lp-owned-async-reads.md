@@ -319,6 +319,13 @@ financial 或 exact 期限到达且仍有来源任务未退出时，封存原 at
 轮换期间不向旧 generation 接纳新读取；同客户端的在途 exact peer 保留自己的请求/订单身份，
 未完成 peer 封存 pool_rotated，不发布关闭后的迟到事实。已经完成的结果和原 timeout/fault 邮箱不被覆盖。
 
+2026-10-29，PR #493 queued-exact 复核：准入时即记录固定通道的代际所有权，不能等协程开始后
+才由 port 判断归属。整代封存包含已 active 但尚无 port/tasks 的排队 owner；其原起点、期限、
+订单/请求身份保持，发布 incomplete/pool_rotated，不运行该 attempt 的迟到 HTTP 读取。
+协程迟启动时在现有锁下复核该代是否已轮换/关闭或 attempt 已封存，再绑定客户端并登记来源任务。
+全部旧 owner 实际结束且客户端关闭成功后才推进代际；原 timeout 与已完成邮箱不改写，
+失败关闭故障、UNKNOWN、Retry-After、资源上限和 no-replay 不因该补充放宽。
+
 只有全部原始子读取（包括响应关闭）实际退出，且整个端口 aclose 成功结束后，下一次符合条件的
 读取才新建客户端。取消、Future 完成或 HTTPX is_closed 标志本身均不替代这一边界。
 即使客户端 aclose 已完成，只要原 source/response 清理仍实际在途，pool_count 仍计入该旧 generation；
