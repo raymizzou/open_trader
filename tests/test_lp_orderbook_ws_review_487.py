@@ -37,7 +37,7 @@ def test_receive_deadline_never_loses_a_dequeued_update(monkeypatch):
             actual_put=asyncio.Queue.put_nowait
             def instrument_put(queue,item):
                 actual_put(queue,item)  # real queue semantics, no replaced get/timer/cancellation
-                if (isinstance(item,tuple) and len(item)==3 and isinstance(item[0],dict)
+                if (isinstance(item,tuple) and len(item)==5 and isinstance(item[0],dict)
                         and item[0].get('timestamp')=='1100' and not stalls):
                     queues.append(queue)
                     getter=client._waiter  # observation only; never alter this real task
@@ -165,10 +165,27 @@ def test_ws_outage_keeps_rest_cancel_and_never_invents_read_failure_limit(tmp_pa
                     and live.read_runtime.status()['orderbook']['synced']==1)
                 assert trading.cancels==[]
                 drop.set();await until(lambda:sockets[0].state.name=='CLOSED')
+                boundary.holds={('A','book')}
                 boundary.book_depth=rest_total;clock.value=5;live.read_runtime.wake()
                 key=('account',CID,'yes','A')
-                await pump(lambda:live.state.snapshot().yields[key].evaluated_at==clock.utc())
-                # The scheduler already ran protection with the actual REST result.
+                await pump(lambda:live.state.snapshot().yields[key].evaluated_at==clock.utc()
+                    and any(e[:3]==('entered','A','book') and e[3]==5 for e in boundary.events))
+                frame=live.state.snapshot().observation.source_frame
+                old=frame.sources.get(f'market_book:{CID}:yes')
+                print('outage held REST vs yield',dict(yield_at=live.state.snapshot().yields[key].evaluated_at,
+                    source_at=old.checked_at if old else None,request_entered=True,rest_response_held=True))
+                assert not boundary.release.is_set() and trading.cancels==[]
+                boundary.release.set()
+                def actual_rest():
+                    observation=live.state.snapshot().observation
+                    source=observation.source_frame.sources.get(f'market_book:{CID}:yes') if observation else None
+                    book=source.value.get('book') if source and source.complete and source.value else None
+                    return (book is not None and source.checked_at==clock.utc()
+                        and book.get('transport') is None
+                        and next(r['size'] for r in book['bids'] if r['price']==Decimal('.40'))==rest_total
+                        and (rest_total!=30 or bool(trading.cancels)))
+                await pump(actual_rest)
+                # The scheduler has collected the actual REST book and run protection.
                 for number in range(12):
                     if rest_total==120:
                         await until(lambda:(live.read_runtime.status()['orderbook']['next_retry_monotonic'] or 0)>clock())
@@ -193,7 +210,7 @@ def test_ws_outage_keeps_rest_cancel_and_never_invents_read_failure_limit(tmp_pa
                 assert live.state.snapshot().observation.source_frame.sources[
                     f'market_book:{CID}:yes'].value['book'].get('transport') is None
             finally:
-                drop.set();assert await asyncio.to_thread(live.close,4)
+                boundary.release.set();drop.set();assert await asyncio.to_thread(live.close,4)
     asyncio.run(scenario())
 
 

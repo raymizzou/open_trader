@@ -164,18 +164,81 @@ class LPReadRuntime:
         self._ws_wake_requests=0
         self._shadow=self._books.diagnostics
         self._ws_woken_at={}
-        self._ws_delivered={}
+        self._ws_delivered={};self._ws_cutoffs={};self._ws_available={}
+        self._shadow_contexts={};self._shadow_books=OrderedDict();self._shadow_tick_scheduled=False
+        self._shadow_seen=OrderedDict()
+        self._shadow_states={}
+        self._shadow_logged={}
+        self._configured_book_tokens={};self._configured_buy_prices={}
 
-    def configure_orderbook(self, mode, tokens, *, eligible_keys=(), buy_prices=None):
+    def configure_orderbook(self, mode, tokens, *, eligible_keys=(), buy_prices=None, comparison_contexts=(), accepted_cutoffs=None):
         if mode not in ('off','shadow','use'):raise ValueError('orderbook_mode_invalid')
         with self._lock:
+            if mode!='shadow':self._drop_shadow_work('mode_changed')
             self._orderbook_mode=mode;self._ws_eligible=set(eligible_keys)
-            self._books.subscribe(tokens if mode!='off' else {},buy_prices=buy_prices or {})
+            cutoffs={k:v for k,v in (accepted_cutoffs or {}).items() if k in self._ws_eligible}
+            changed={k for k in self._ws_eligible if self._ws_cutoffs.get(k)!=cutoffs.get(k)}
+            self._ws_cutoffs=cutoffs
+            self._ws_available={k:v for k,v in self._ws_available.items() if k in self._ws_eligible and k not in changed}
+            for key in changed:self._ws_delivered.pop(key,None)
+            self._shadow.set_mode(mode)
+            self._configured_book_tokens=dict(tokens) if mode!='off' else {}
+            self._configured_buy_prices=dict(buy_prices or {})
+            self._shadow_contexts={}
+            for context in comparison_contexts:
+                if (mode!='shadow' or context['demand_key'] not in self._ws_eligible
+                        or tokens.get(context['token_id'])!=context['condition_id']):continue
+                if (type(context['bid_level']) is not int or not 1<=context['bid_level']<=64
+                        or len(self._shadow_contexts)>=64 and context['key'] not in self._shadow_contexts):
+                    self._shadow.abandon(book_pending=False,cancel_pending=False,reason='context_capacity');continue
+                self._shadow_contexts[context['key']]=freeze(context)
+            for key,state in self._shadow_states.items():
+                if key not in self._shadow_contexts and state['retire_at'] is None:
+                    state['retire_at']=self.clock()+2
+                    state['retire_continuity']=self._books.continuity_ticket(state['context']['token_id'])
+            for key,context in self._shadow_contexts.items():
+                state=self._shadow_states.setdefault(key,dict(context=context,triggered_at=None,
+                    signature=None,ws=dict(state='unknown'),retire_at=None,receipt_cursor=self._books.receipt_cursor(),
+                    qualification_identity=None,qualified_at=None))
+                state['retire_at']=None
+            retired=[key for key,state in self._shadow_states.items() if state['retire_at'] is not None]
+            for key in retired[:-64]:self._discard_shadow_context(key,'context_capacity')
+            self._refresh_shadow_subscriptions()
             self._ws_pending.intersection_update(tokens if mode!='off' else ())
             self._ws_delivered={k:v for k,v in self._ws_delivered.items() if k in self._ws_eligible}
             if mode=='off':
                 for scope in self._scopes.values():scope.last_sources=None
         self.wake()
+
+    def _refresh_shadow_subscriptions(self):
+        tokens=dict(self._configured_book_tokens);prices=dict(self._configured_buy_prices)
+        if self._orderbook_mode=='shadow':
+            for state in self._shadow_states.values():
+                context=state['context'];token=context['token_id']
+                if token not in tokens:
+                    tokens[token]=context['condition_id'];prices[token]=(context['price'],)
+        self._books.subscribe(tokens,buy_prices=prices)
+
+    def _drop_shadow_work(self, reason):
+        for sample in self._shadow_books.values():
+            self._shadow.abandon(book_pending=not sample['book_done'],cancel_pending=not sample['cancel_done'],reason=reason)
+        self._shadow_books.clear();self._shadow_contexts.clear();self._shadow_states.clear()
+        self._shadow_seen.clear();self._shadow_logged.clear()
+
+    def _discard_shadow_context(self, key, reason):
+        samples=tuple(k for k,s in self._shadow_books.items() if s['context']['key']==key)
+        for sample_key in samples:
+            sample=self._shadow_books.pop(sample_key)
+            self._shadow.abandon(book_pending=not sample['book_done'],cancel_pending=not sample['cancel_done'],reason=reason)
+        if not samples:self._shadow.abandon(book_pending=False,cancel_pending=False,reason=reason)
+        self._shadow_states.pop(key,None);self._shadow_seen.pop(key,None);self._shadow_logged.pop(key,None)
+
+    def _usable_ws_book(self, demand):
+        from .polymarket_lp_orderbook import book_after_buy_acceptance
+        book=self._books.market_book(demand.token_id)
+        if book_after_buy_acceptance(book,condition_id=demand.condition_id,token_id=demand.token_id,
+                accepted_at=self._ws_cutoffs.get(demand.key)) is not True:return None
+        return book
 
     def orderbook_snapshot(self, token):
         with self._lock:return freeze(self._books.market_book(token))
@@ -195,7 +258,7 @@ class LPReadRuntime:
             if self._orderbook_mode!='use':return ()
             for scope in self._scopes.values():
                 token=scope.demand.token_id
-                book=self._books.market_book(token)
+                book=self._usable_ws_book(scope.demand)
                 if book is None and scope.delivered_ws is not None:
                     results.append(replace(scope.delivered_ws,complete=False,reason='ws_invalidated',ws_invalidation=True))
                     scope.delivered_ws=None
@@ -222,18 +285,26 @@ class LPReadRuntime:
             for stamp in self._ws_woken_at.values():self._shadow.decision_latency(self.clock()-stamp)
 
     def compare_shadow(self, token, rest, *, price, own_remaining, bid_level, baseline_levels, condition_id,
-                       accepted_at=None):
+                       accepted_at=None, source_id=None, context_key=None):
         from .polymarket_lp_risk import evaluate_lp_bid_levels
         from .polymarket_lp_orderbook import book_after_buy_acceptance
         with self._lock:
             if self._orderbook_mode!='shadow':return None
-            book=self._books.market_book(token)
-            if book_after_buy_acceptance(book,condition_id=condition_id,token_id=token,accepted_at=accepted_at) is not True:
-                book=None
-            ws=evaluate_lp_bid_levels(book,price=price,own_remaining=own_remaining,
-                bid_level=bid_level,baseline_levels=baseline_levels,condition_id=condition_id,token_id=token)
-            row=self._shadow.record(rest,ws)
-            row.update(observed_at=self.utc_now().isoformat(),coverage_seconds=self._shadow.snapshot()['coverage_seconds'])
+            if source_id is not None:
+                previous=self._shadow_seen.get(context_key)
+                if previous is None or previous[0]!=source_id:return None
+                row=dict(previous[1])
+                if self._shadow_logged.get(context_key)==source_id:return freeze(row)
+                self._shadow_logged[context_key]=source_id
+                row=dict(row,observation_reason=row['reason'],reason='owner_projection')
+            else:
+                # An explicit value-only query has no observation/counter power.
+                book=self._books.market_book(token)
+                if book_after_buy_acceptance(book,condition_id=condition_id,token_id=token,accepted_at=accepted_at) is not True:
+                    book=None
+                ws=evaluate_lp_bid_levels(book,price=price,own_remaining=own_remaining,
+                    bid_level=bid_level,baseline_levels=baseline_levels,condition_id=condition_id,token_id=token)
+                row=self._shadow.comparison(rest,ws)
         import logging
         from .polymarket_trading import _lp_capture_read_log
         _lp_capture_read_log(lambda:logging.getLogger(__name__).info(
@@ -243,14 +314,22 @@ class LPReadRuntime:
     def _ws_changed(self, tokens):
         notify=False
         with self._lock:
+            if self._orderbook_mode=='shadow':self._advance_shadow_books();return
             if self._orderbook_mode!='use':return
+            tokens=set(tokens)
+            for scope in self._scopes.values():
+                if scope.demand.key not in self._ws_eligible or scope.demand.kind!='buy':continue
+                available=self._usable_ws_book(scope.demand) is not None
+                if available and not self._ws_available.get(scope.demand.key,False):
+                    tokens.add(scope.demand.token_id);self._ws_delivered.pop(scope.demand.key,None)
+                self._ws_available[scope.demand.key]=available
             for token in tokens:
                 first=token not in self._ws_pending;self._ws_pending.add(token)
                 if first:self._ws_woken_at[token]=self.clock()
                 for scope in self._scopes.values():
                     if (scope.demand.token_id!=token or scope.demand.kind!='buy'
                             or scope.demand.key not in self._ws_eligible or scope.retiring):continue
-                    book=self._books.market_book(token)
+                    book=self._usable_ws_book(scope.demand)
                     if book is None:
                         notify=True
                         continue
@@ -271,7 +350,152 @@ class LPReadRuntime:
         if notify:
             self._ws_wake_requests+=1;self._notify()
 
+    @staticmethod
+    def _public_bids(book, n):
+        bids=sorted(book['bids'],key=lambda row:row['price'],reverse=True)
+        return tuple((row['price'],row['size']) for row in bids[:n])
+
+    def _observe_shadow_book(self, scope, result):
+        """Runs at actual REST completion on market I/O, before owner collection."""
+        if self._orderbook_mode!='shadow' or scope.demand.kind!='buy':return
+        self._advance_shadow_books()
+        contexts=tuple(context for context in self._shadow_contexts.values()
+            if scope.demand.key in context.get('demand_keys',(context['demand_key'],)))
+        self._shadow.eligible_read(has_context=bool(contexts))
+        if not contexts:
+            import logging
+            from .polymarket_trading import _lp_capture_read_log
+            row=dict(reason='missing_comparison_context',token_prefix=scope.demand.token_id[:8],
+                rest_exchange_at=result.value['timestamp'].isoformat(),
+                rest_read_at=result.checked_at.isoformat() if result.checked_at else None)
+            _lp_capture_read_log(lambda:logging.getLogger(__name__).info(
+                'prediction_lp_orderbook_shadow %s',json.dumps(row,sort_keys=True)))
+        for context in contexts:
+            key=(context['key'],result.source_id)
+            if key in self._shadow_books:continue
+            rest=self._shadow_evaluate(result.value,context)
+            state=self._shadow_states[context['key']]
+            row=self._shadow.sample(rest,state['ws'])
+            state['rest_state']=rest['state']
+            if rest['state']=='triggered':state['early_unmatched']=False
+            row.update(observed_at=self.utc_now().isoformat())
+            self._shadow_seen[context['key']]=(result.source_id,row)
+            cancel=rest['state']=='triggered'
+            if cancel:self._shadow.cancel_started(observation_id=result.source_id,obligation=True)
+            self._shadow_books[key]=dict(context=context,rest=result.value,completed=self.clock(),
+                deadline=self.clock()+2,generation=self._books.generation,book_done=False,
+                cancel_done=not cancel,row=row,rest_decision=rest,
+                continuity=self._books.continuity_ticket(context['token_id']),rest_read_at=result.checked_at)
+            self._shadow.book_started()
+            while len(self._shadow_books)>256:
+                _,dropped=self._shadow_books.popitem(last=False)
+                self._shadow.abandon(book_pending=not dropped['book_done'],cancel_pending=not dropped['cancel_done'],reason='pending_capacity')
+        self._advance_shadow_books()
+
+    @staticmethod
+    def _shadow_evaluate(book, context):
+        from .polymarket_lp_risk import evaluate_lp_bid_levels
+        from .polymarket_lp_orderbook import book_after_buy_acceptance
+        if book_after_buy_acceptance(book,condition_id=context['condition_id'],token_id=context['token_id'],
+                accepted_at=context['accepted_at']) is not True:book=None
+        return evaluate_lp_bid_levels(book,price=context['price'],own_remaining=context['own_remaining'],
+            bid_level=context['bid_level'],baseline_levels=context['baseline_levels'],
+            condition_id=context['condition_id'],token_id=context['token_id'])
+
+    def _advance_shadow_books(self):
+        with self._lock:
+            self._shadow_tick_scheduled=False
+            for key,state in self._shadow_states.items():
+                context=state['context'];book=self._books.market_book(context['token_id'])
+                signature=(book['book_version'],book['confirmation_at']) if book else None
+                # Freshness can hide a book without changing its actual continuity.
+                # Check real identity even across consecutive unavailable snapshots.
+                identity=self._books.continuity_ticket(context['token_id'])
+                if state['qualification_identity']!=identity:
+                    state['qualification_identity']=identity;state['qualified_at']=None
+                if state['signature']==signature:continue
+                if book is not None:
+                    cutoff=context['accepted_at']
+                    for stamp,at in ((book.get('confirmation_at'),book.get('confirmation_monotonic')),
+                            (book.get('message_confirmed_at'),book.get('message_confirmed_monotonic'))):
+                        if stamp is not None and at is not None and (cutoff is None or stamp>cutoff):
+                            state['qualified_at']=at if state['qualified_at'] is None else min(state['qualified_at'],at)
+                previous=state['ws']['state']
+                state['signature']=signature;state['ws']=self._shadow_evaluate(book,context)
+                if state['ws']['state']=='triggered' and previous!='triggered' and state.get('rest_state')!='triggered':
+                    self._shadow.ws_excursion();state['early_unmatched']=True
+                elif state['ws']['state']=='monitoring' and previous=='triggered' and state.get('early_unmatched'):
+                    self._shadow.ws_excursion(transient=True);state['early_unmatched']=False
+                if state['ws']['state']=='triggered' and state['triggered_at'] is None and state['qualified_at'] is not None:
+                    state['triggered_at']=max(book['book_received_monotonic'],state['qualified_at'])
+                    state['triggered_book']=freeze(book)
+            for key,sample in tuple(self._shadow_books.items()):
+                context=sample['context'];token=context['token_id']
+                settled=self._books.comparison_settled(token,until=sample['deadline'],
+                    continuity=sample['continuity'],after=self._shadow_states[context['key']]['receipt_cursor'])
+                if not sample['book_done']:
+                    target=self._public_bids(sample['rest'],context['bid_level'])
+                    window=self._books.comparison_versions(token,since=sample['completed']-2,
+                        until=min(self.clock(),sample['deadline']),continuity=sample['continuity'])
+                    matched_book=next((version['book'] for version in window['versions']
+                        if self._public_bids(version['book'],context['bid_level'])==target),None)
+                    matched=matched_book is not None
+                    if matched or settled:
+                        self._shadow.book_result(matched if matched or window['reason'] is None else None,
+                            reason=window['reason']);sample['book_done']=True
+                        self._publish_shadow_result(sample,'book_match' if matched else window['reason'] or 'book_mismatch',
+                            matched_book or self._books.market_book(token),kind='book')
+                if not sample['cancel_done']:
+                    state=self._shadow_states.get(context['key'])
+                    trigger=state['triggered_at'] if state else None
+                    if trigger is not None and trigger<=sample['deadline']:
+                        self._shadow.cancel_result(trigger-sample['completed']);sample['cancel_done']=True
+                        sample['row'].update(self._shadow.comparison(sample['rest_decision'],dict(state='triggered')))
+                        self._publish_shadow_result(sample,'cancel_match',state.get('triggered_book'),kind='cancel',
+                            seconds=trigger-sample['completed'])
+                    elif settled:
+                        self._shadow.cancel_result(None);sample['cancel_done']=True
+                        self._publish_shadow_result(sample,'ws_missed_cancel',self._books.market_book(token),kind='cancel')
+                if sample['book_done'] and sample['cancel_done']:self._shadow_books.pop(key)
+            retired=tuple(key for key,state in self._shadow_states.items()
+                if state['retire_at'] is not None and self.clock()>=state['retire_at']
+                and not self._books.pending_receipt(state['context']['token_id'],until=state['retire_at'],
+                    continuity=state['retire_continuity'],after=state['receipt_cursor']))
+            for key in retired:
+                self._shadow_states.pop(key);self._shadow_seen.pop(key,None);self._shadow_logged.pop(key,None)
+            if retired:self._refresh_shadow_subscriptions()
+            if self._orderbook_mode=='shadow':
+                states=tuple(self._shadow_states.values())
+                unknown=next((s['ws'] for s in states if s['ws']['state']=='unknown'),None)
+                self._shadow.availability(bool(states) and unknown is None,
+                    reason=(unknown.get('reason_codes') or ['book_unknown'])[0] if unknown else
+                        'missing_comparison_context' if self._books.tokens else 'no_subscriptions')
+
+    def _publish_shadow_result(self, sample, reason, book, *, kind, seconds=None):
+        """Whitelist public values before handing a detached record to Queue32."""
+        import logging
+        from .polymarket_trading import _lp_capture_read_log
+        context=sample['context'];rest=sample['rest'];n=context['bid_level']
+        def stamp(value):return value.isoformat() if isinstance(value,datetime) else None
+        def bids(value):
+            return tuple((str(price),str(size)) for price,size in self._public_bids(value,n)) if value else ()
+        row=dict(sample['row'],token_prefix=context['token_id'][:8],comparison_kind=kind,reason=reason,
+            outcome='match' if reason in ('book_match','cancel_match') else 'different' if reason in (
+                'book_mismatch','ws_missed_cancel') else 'not_comparable',signed_seconds=seconds,
+            rest_exchange_at=stamp(rest.get('timestamp')),rest_read_at=stamp(sample['rest_read_at']),
+            rest_confirmation_at=None,ws_exchange_at=stamp(book.get('timestamp')) if book else None,
+            ws_confirmation_at=stamp(book.get('confirmation_at')) if book else None,
+            ws_read_at=stamp(book.get('book_received_at')) if book else None,
+            ws_version=book.get('book_version') if book else None,
+            rest_bids=bids(rest),ws_bids=bids(book),observed_at=self.utc_now().isoformat())
+        sample['row'].update(row);self._shadow.publish(row)
+        encoded=json.dumps(row,sort_keys=True)
+        _lp_capture_read_log(lambda:logging.getLogger(__name__).info('prediction_lp_orderbook_shadow %s',encoded))
+
     def _maintain_orderbook(self):
+        if (self._orderbook_mode=='shadow' or self._shadow_books or any(s['retire_at'] is not None for s in self._shadow_states.values())) and self._started and not self._shadow_tick_scheduled:
+            self._shadow_tick_scheduled=True
+            self._market.loop.call_soon_threadsafe(self._advance_shadow_books)
         valid={(self._books.generation,t) for t in self._books.tokens}
         self._audit_at={k:v for k,v in self._audit_at.items() if k in valid}
         for key in valid:
@@ -491,6 +715,10 @@ class LPReadRuntime:
                 audit_key=(self._books.generation,scope.demand.token_id)
                 if book is not None and self.clock()>=self._audit_at.get(audit_key,self.clock()+60):
                     audit=True;self._audit_at[audit_key]=self.clock()+60
+                    self._books.audit_started(scope.demand.token_id)
+                if self._orderbook_mode=='use' and scope.demand.kind=='buy':
+                    book=self._usable_ws_book(scope.demand)
+                    self._ws_available[scope.demand.key]=book is not None
                 if book is not None and self._orderbook_mode=='use' and scope.demand.kind=='buy' and not audit:
                     return self._completed(scope,source,SourceResult(request.request_id,book,checked_at=book['received_at']))
             cached=self._cache.get(key) if reference else None
@@ -505,10 +733,12 @@ class LPReadRuntime:
                 if (scope.demand.key in self._ws_eligible and self._orderbook_mode!='off'
                         and seed_ticket[:4]==self._books.seed_ticket(scope.demand.token_id)[:4]):
                     if result.complete and not result.error and isinstance(result.value,Mapping):
+                        if not scope.retiring and not scope.expired and self.clock()<scope.deadline:
+                            self._observe_shadow_book(scope,result)
                         if audit:self._books.reconcile(scope.demand.token_id,rest_event(result.value))
                         elif seed_unsynced:self._books.seed(scope.demand.token_id,rest_event(result.value),seed_ticket)
                         if audit and self._orderbook_mode=='use' and scope.demand.kind=='buy':
-                            latest=self._books.market_book(scope.demand.token_id)
+                            latest=self._usable_ws_book(scope.demand)
                             if latest is not None:result=replace(result,value=freeze(latest),checked_at=latest['received_at'])
         if reference and result.complete and not result.error and result.checked_at is not None:
             with self._lock:
@@ -645,7 +875,7 @@ class LPReadRuntime:
                 if scope.result is not None:
                     source=scope.result.sources.get('book')
                     if source is not None and isinstance(source.value,Mapping) and source.value.get('transport')=='ws':
-                        book=self._books.market_book(scope.demand.token_id)
+                        book=self._usable_ws_book(scope.demand)
                         if (book is None or book['connection_generation']!=source.value.get('connection_generation')
                                 or scope.demand.key not in self._ws_eligible or self._orderbook_mode!='use'):
                             # Loss of a WS fact is confidence loss, not another HTTP attempt.
@@ -705,7 +935,10 @@ class LPReadRuntime:
                 ('cleanup_fault',fixed_faults),('capacity',len(owned)>=self.buy_cap),
                 ('deferred',bool(deferred))) if active)
             return freeze(dict(cache_entries=len(self._cache),cache_bytes=self._cache_size,
-                orderbook=dict(mode=self._orderbook_mode,shadow=self._shadow.snapshot(),pending_checks=len(self._ws_pending),wake_requests=self._ws_wake_requests,owned_tasks=ws_tasks,**self._books.status(mode=self._orderbook_mode)),
+                orderbook=dict(mode=self._orderbook_mode,shadow=dict(self._shadow.snapshot(),
+                    retired_contexts=sum(s['retire_at'] is not None for s in self._shadow_states.values()),
+                    active_contexts=len(self._shadow_contexts),pending_observations=len(self._shadow_books)),
+                    pending_checks=len(self._ws_pending),wake_requests=self._ws_wake_requests,owned_tasks=ws_tasks,**self._books.status(mode=self._orderbook_mode)),
                 next_dependency_monotonic=min(dependencies) if dependencies else None,
                 waiting_for_event=not dependencies and (bool(self._fixed_faults)
                     or any(s.fault or s.retiring or s.closing for s in self._scopes.values())),
@@ -733,6 +966,9 @@ class LPReadRuntime:
     def _close_owned(self,timeout):
         with self._lock:
             self._closed=True;self._demands={}
+            self._shadow.set_mode('off')
+            self._drop_shadow_work('closed')
+            self._configured_book_tokens={};self._configured_buy_prices={};self._books.subscribe({})
             for scope in self._scopes.values():
                 scope.result=None;scope.fault_pending=False
             if not self._started:return True

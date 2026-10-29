@@ -754,6 +754,7 @@ def test_shadow_rest_cancel_implies_ws_cancel_without_sending_shadow(tmp_path,ws
                 baseline,=live.state.snapshot().baselines.values()
                 assert baseline.baseline_front.value==100
                 assert trading.cancels==[]
+                live.run_once()  # Register the frozen baseline before the next actual REST completion.
                 if ws_total is None:await outbound.put(dict(event_type='tick_size_change',market=CID,asset_id='yes',timestamp='1001'))
                 else:await outbound.put(change(size=ws_total,timestamp=1001))
                 async with asyncio.timeout(3):
@@ -1018,6 +1019,7 @@ def test_shadow_uses_fixed_bid_level_contract_after_main_merge(tmp_path,monkeypa
                 baseline,=live.state.snapshot().baselines.values()
                 assert baseline.bid_level==level and baseline.bid_levels==basis
                 assert trading.cancels==[]
+                live.run_once()  # Register the frozen baseline before the next actual REST completion.
                 external_levels[:]=current
                 if ws_known:
                     await outbound.put(wire_book(timestamp=1001,bids=current))

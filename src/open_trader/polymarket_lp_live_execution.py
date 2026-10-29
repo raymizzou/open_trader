@@ -1390,8 +1390,42 @@ class LPD2LiveExecution:
         for order in snapshot.active_orders:
             if order.side=='BUY' and self._is_local_order(order) and order.key[2] in tokens:
                 prices.setdefault(order.key[2],[]).append(order.price.value)
-        self.read_runtime.configure_orderbook(self.policy.orderbook_mode,tokens,eligible_keys=eligible,buy_prices=prices)
+        cutoffs={}
+        for d in demands:
+            if d.kind!='buy' or d.key not in eligible:continue
+            order=next((o for o in snapshot.active_orders if o.key[3]==d.order_id
+                and o.key[1:3]==(d.condition_id,d.token_id) and self._is_local_order(o)),None)
+            if order is not None:
+                cohort=tuple(o for o in snapshot.active_orders if o.key[:3]==order.key[:3]
+                    and o.side=='BUY' and o.price.value==order.price.value and self._is_local_order(o))
+                cutoffs[d.key]=self._local_buy_acceptance_cutoff(cohort)
+        contexts=[]
+        if self.policy.orderbook_mode=='shadow':
+            for key,baseline in snapshot.baselines.items():
+                context=self._orderbook_shadow_context(snapshot,key,baseline)
+                if context is None:continue
+                keys=tuple(d.key for d in demands if d.key in eligible and d.order_id in context['order_ids'])
+                if keys:
+                    contexts.append({**context,'demand_key':keys[0],'demand_keys':keys})
+        self.read_runtime.configure_orderbook(self.policy.orderbook_mode,tokens,eligible_keys=eligible,
+            buy_prices=prices,comparison_contexts=contexts,accepted_cutoffs=cutoffs)
         self.read_runtime.reconcile(demands)
+
+    def _orderbook_shadow_context(self,snapshot,key,baseline):
+        """Capture read-only values; no callback into mutable future owner facts."""
+        orders=tuple(o for o in snapshot.active_orders if o.key[:3]==key.scope[:3]
+            and o.side=='BUY' and o.price.value==key.price and self._is_local_order(o))
+        if (not baseline.bid_levels or not baseline.bid_level
+                or not any(o.key[3] in baseline.anchor_order_ids for o in orders)
+                or any(o.remaining.state!='known' for o in orders)):return None
+        own=sum((o.remaining.value for o in orders),Decimal(0))
+        cutoff=self._local_buy_acceptance_cutoff(orders)
+        basis_key=(key.kind,key.scope,key.price,key.episode_id)
+        identity=(self.process_epoch,snapshot.current.cycle_generation,basis_key,baseline.baseline_version,
+            tuple((o.key,o.terms_version) for o in orders),own,baseline.bid_level,baseline.bid_levels,cutoff)
+        return dict(key=identity,order_ids=tuple(o.key[3] for o in orders),condition_id=key.scope[1],
+            token_id=key.scope[2],price=key.price,own_remaining=own,bid_level=baseline.bid_level,
+            baseline_levels=baseline.bid_levels,accepted_at=cutoff)
 
     def _collect_async_reads(self):
         self._reconcile_async_reads()
@@ -4552,10 +4586,12 @@ class LPD2LiveExecution:
                     bid_level=baseline.bid_level, baseline_levels=baseline.bid_levels,
                     condition_id=key.scope[1], token_id=key.scope[2])
                 if self.read_runtime is not None and self.policy.orderbook_mode=='shadow':
+                    context=self._orderbook_shadow_context(current,key,baseline)
                     self.read_runtime.compare_shadow(key.scope[2],estimate,price=key.price,
                         own_remaining=sum((o.remaining.value for o in orders),Decimal(0)),
                         bid_level=baseline.bid_level,baseline_levels=baseline.bid_levels,condition_id=key.scope[1],
-                        accepted_at=acceptance_cutoff)
+                        accepted_at=acceptance_cutoff,source_id=source.source_id if source else None,
+                        context_key=context['key'] if context else None)
                 stamp = SourceStamp(source.source_id if source else '',
                     checked_at=source.checked_at if source else None,
                     complete=bool(source and source.complete), state='known' if book else 'unknown')
