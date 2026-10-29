@@ -165,13 +165,14 @@ class LPReadRuntime:
         self._shadow=self._books.diagnostics
         self._ws_woken_at={}
         self._ws_delivered={};self._ws_cutoffs={};self._ws_available={}
+        self._missing_context_reasons={}
         self._shadow_contexts={};self._shadow_books=OrderedDict();self._shadow_tick_scheduled=False
         self._shadow_seen=OrderedDict()
         self._shadow_states={}
         self._shadow_logged={}
         self._configured_book_tokens={};self._configured_buy_prices={}
 
-    def configure_orderbook(self, mode, tokens, *, eligible_keys=(), buy_prices=None, comparison_contexts=(), accepted_cutoffs=None):
+    def configure_orderbook(self, mode, tokens, *, eligible_keys=(), buy_prices=None, comparison_contexts=(), accepted_cutoffs=None, missing_context_reasons=None):
         if mode not in ('off','shadow','use'):raise ValueError('orderbook_mode_invalid')
         with self._lock:
             if mode!='shadow':self._drop_shadow_work('mode_changed')
@@ -185,11 +186,31 @@ class LPReadRuntime:
             self._configured_book_tokens=dict(tokens) if mode!='off' else {}
             self._configured_buy_prices=dict(buy_prices or {})
             self._shadow_contexts={}
+            from .polymarket_lp_orderbook import context_missing_reason, CONTEXT_MISSING_REASON_PRIORITY
+            self._missing_context_reasons={}
+            if mode=='shadow':
+                for key,value in (missing_context_reasons or {}).items():
+                    if key in self._ws_eligible and len(self._missing_context_reasons)<64:
+                        self._missing_context_reasons[key]=context_missing_reason(value)
+            def rejected(context, reason):
+                # Advisory provenance only; never admit a previously rejected context.
+                for key in context.get('demand_keys',(context['demand_key'],)):
+                    if key not in self._ws_eligible:continue
+                    previous=self._missing_context_reasons.get(key)
+                    if previous is None and len(self._missing_context_reasons)>=64:continue
+                    if CONTEXT_MISSING_REASON_PRIORITY[reason]>CONTEXT_MISSING_REASON_PRIORITY.get(previous,-1):
+                        self._missing_context_reasons[key]=reason
             for context in comparison_contexts:
-                if (mode!='shadow' or context['demand_key'] not in self._ws_eligible
-                        or tokens.get(context['token_id'])!=context['condition_id']):continue
-                if (type(context['bid_level']) is not int or not 1<=context['bid_level']<=64
-                        or len(self._shadow_contexts)>=64 and context['key'] not in self._shadow_contexts):
+                if mode!='shadow':continue
+                if context['demand_key'] not in self._ws_eligible:
+                    rejected(context,'demand_filter');continue
+                if tokens.get(context['token_id'])!=context['condition_id']:
+                    rejected(context,'token_filter');continue
+                if type(context['bid_level']) is not int or not 1<=context['bid_level']<=64:
+                    rejected(context,'invalid_bid_level')
+                    self._shadow.abandon(book_pending=False,cancel_pending=False,reason='context_capacity');continue
+                if len(self._shadow_contexts)>=64 and context['key'] not in self._shadow_contexts:
+                    rejected(context,'context_capacity')
                     self._shadow.abandon(book_pending=False,cancel_pending=False,reason='context_capacity');continue
                 self._shadow_contexts[context['key']]=freeze(context)
             for key,state in self._shadow_states.items():
@@ -361,11 +382,13 @@ class LPReadRuntime:
         self._advance_shadow_books()
         contexts=tuple(context for context in self._shadow_contexts.values()
             if scope.demand.key in context.get('demand_keys',(context['demand_key'],)))
-        self._shadow.eligible_read(has_context=bool(contexts))
+        missing_reason=self._missing_context_reasons.get(scope.demand.key,'unattributed')
+        self._shadow.eligible_read(has_context=bool(contexts),missing_context_reason=missing_reason)
         if not contexts:
             import logging
             from .polymarket_trading import _lp_capture_read_log
-            row=dict(reason='missing_comparison_context',token_prefix=scope.demand.token_id[:8],
+            row=dict(reason='missing_comparison_context',context_missing_reason=missing_reason,
+                token_prefix=scope.demand.token_id[:8],
                 rest_exchange_at=result.value['timestamp'].isoformat(),
                 rest_read_at=result.checked_at.isoformat() if result.checked_at else None)
             _lp_capture_read_log(lambda:logging.getLogger(__name__).info(
@@ -935,7 +958,9 @@ class LPReadRuntime:
                 ('cleanup_fault',fixed_faults),('capacity',len(owned)>=self.buy_cap),
                 ('deferred',bool(deferred))) if active)
             return freeze(dict(cache_entries=len(self._cache),cache_bytes=self._cache_size,
-                orderbook=dict(mode=self._orderbook_mode,shadow=dict(self._shadow.snapshot(),
+                orderbook=dict(mode=self._orderbook_mode,
+                    context_missing_reason_hints_retained=len(self._missing_context_reasons),
+                    shadow=dict(self._shadow.snapshot(),
                     retired_contexts=sum(s['retire_at'] is not None for s in self._shadow_states.values()),
                     active_contexts=len(self._shadow_contexts),pending_observations=len(self._shadow_books)),
                     pending_checks=len(self._ws_pending),wake_requests=self._ws_wake_requests,owned_tasks=ws_tasks,**self._books.status(mode=self._orderbook_mode)),

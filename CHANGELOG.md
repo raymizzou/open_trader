@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-29 — LP missing-context rejection telemetry (#495)
+
+- Partition actual shadow BUY REST completions without comparison context into nine finite diagnostic causes. Publish counts and fractions of missing reads, and add the chosen cause to the existing safe missing-context log event.
+- Capture unchanged owner/runtime rejection guards with bounded, current-demand provenance. Preserve context admission, all existing counters, UNKNOWN and acceptance gates, source timestamps and off/use behavior. Earlier 8200 live counts cannot be split retroactively; no deployment, mode activation or acceptance claim is included.
+
 ## 2026-10-29 — LP shadow evidence ordering and CI fixture phases (#487 / PR #492)
 
 - Retain already qualified shadow proof through temporary book freshness expiry in the same connection/member/synchronization era. Unavailable books remain UNKNOWN; real continuity loss clears the proof even when consecutive snapshots are unavailable.
