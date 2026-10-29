@@ -198,7 +198,7 @@ class LPReadRuntime:
                     state['retire_continuity']=self._books.continuity_ticket(state['context']['token_id'])
             for key,context in self._shadow_contexts.items():
                 state=self._shadow_states.setdefault(key,dict(context=context,triggered_at=None,
-                    signature=None,ws=dict(state='unknown'),retire_at=None,receipt_cursor=self._books.receipt_cursor(),
+                    signature=None,ws=self._shadow_evaluate(None,context),retire_at=None,receipt_cursor=self._books.receipt_cursor(),
                     qualification_identity=None,qualified_at=None))
                 state['retire_at']=None
             retired=[key for key,state in self._shadow_states.items() if state['retire_at'] is not None]

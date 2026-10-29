@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-29 — Explain initial unavailable LP shadow comparisons (#487)
+
+- Classify the initial unavailable WS comparison as `book_unknown` before the first synchronized book. Keep that observation UNKNOWN and retain its count, fraction, duration and all acceptance limits. This narrow classification fix does not establish production quality acceptance or authorize deployment or mode activation.
+
 ## 2026-10-29 — LP shadow evidence ordering and CI fixture phases (#487 / PR #492)
 
 - Retain already qualified shadow proof through temporary book freshness expiry in the same connection/member/synchronization era. Unavailable books remain UNKNOWN; real continuity loss clears the proof even when consecutive snapshots are unavailable.
