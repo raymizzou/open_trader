@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-29 — Synchronize pool fixture account clock phases (#491 / PR #493)
+
+- Finish each setup round's account publication and publish its next read ticket before advancing the fixture clock. Preserve the original cancellation, current-account, wake and final-proof assertions and watchdogs; production behavior is unchanged.
+
 ## 2026-10-29 — LP telemetry test log synchronization (#495)
 
 - Wait for each missing-context read's asynchronous log capture before checking diagnostic reasons and public fields. Preserve all existing assertions and production behavior; REST completion does not imply that its queued log has been emitted.
