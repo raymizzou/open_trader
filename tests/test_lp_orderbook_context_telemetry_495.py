@@ -107,6 +107,14 @@ def missing_logs(caplog):
             and 'missing_comparison_context' in record.getMessage()]
 
 
+def wait_for_missing_log(caplog, *, after, token_id, read_at):
+    # REST completion precedes asynchronous log emission. Wait for capture
+    # progress and this read's public identity, never for an expected reason.
+    wait_until(lambda: any(row['token_prefix'] == token_id[:8]
+                           and row['rest_read_at'] == read_at.isoformat()
+                           for row in missing_logs(caplog)[after:]))
+
+
 def install_baseline(live, clock, *, complete, event):
     from open_trader.polymarket_lp_current_state import (
         ProtectionKey, ProtectionGuard, ProtectionBaseline, SetBaseline, Fact, SourceStamp)
@@ -144,6 +152,7 @@ def test_owner_rejection_provenance_reaches_actual_rest_reads(tmp_path, offline_
                    live.run_once)
         first = runtime.status()['orderbook']['shadow']
         assert first.get('context_missing_reason_counts') == {'baseline_absent': 1}
+        wait_for_missing_log(caplog, after=0, token_id='yes', read_at=clock.utc())
         assert missing_logs(caplog)[-1]['context_missing_reason'] == 'baseline_absent'
         wait_until(lambda: bool(live.state.snapshot().active_orders), live.run_once)
         install_baseline(live, clock, complete=False, event='incomplete')
@@ -153,6 +162,7 @@ def test_owner_rejection_provenance_reaches_actual_rest_reads(tmp_path, offline_
                    live.run_once)
         second = runtime.status()['orderbook']['shadow']
         assert second['context_missing_reason_counts'] == {'baseline_absent': 1, 'baseline_incomplete': 1}
+        wait_for_missing_log(caplog, after=1, token_id='yes', read_at=clock.utc())
         assert missing_logs(caplog)[-1]['context_missing_reason'] == 'baseline_incomplete'
         wait_until(lambda: live.state.snapshot().observation.read_ticket.trade_version_at_start
                    == live.state.snapshot().trade_version, live.run_once)
@@ -201,12 +211,16 @@ def configure(runtime, ds, *, contexts=(), hints=None, mode='shadow', tokens=Non
         missing_context_reasons=hints)
 
 
-def actual_read(runtime, boundary, d):
+def actual_read(runtime, boundary, d, *, caplog=None):
+    log_start = len(missing_logs(caplog)) if caplog is not None else None
     runtime.reconcile((d,))
     results = collect(runtime, boundary, lambda rows: any(r.demand.key == d.key for r in rows))
     result, = [r for r in results if r.demand.key == d.key]
     assert result.complete and result.sources['book'].complete
     assert result.sources['book'].value.get('transport') != 'ws'
+    if caplog is not None:
+        wait_for_missing_log(caplog, after=log_start, token_id=d.token_id,
+                             read_at=result.sources['book'].checked_at)
     return result
 
 
@@ -231,7 +245,7 @@ def test_runtime_rejections_are_partitioned_without_changing_admission(offline_w
             assert before['active_contexts'] == (64 if reason == 'context_capacity' else 0)
             assert before['incomplete_observations'] == int(reason in ('invalid_bid_level', 'context_capacity'))
             assert before['context_missing_reads'] == 0
-            actual_read(runtime, boundary, d)
+            actual_read(runtime, boundary, d, caplog=caplog)
             after = runtime.status()['orderbook']['shadow']
             assert after['context_missing_reason_counts'] == {reason: 1}
             assert after['context_missing_reads'] == 1 and after['samples'] == 0
@@ -258,21 +272,21 @@ def test_reason_hints_do_not_cross_identity_or_recount_history(offline_ws, caplo
             configure(runtime, (original,), hints={original.key: 'baseline_absent'})
             assert runtime.drain_results() == ()
             assert runtime.status()['orderbook']['shadow']['context_missing_reads'] == 0
-        actual_read(runtime, boundary, original)
+        actual_read(runtime, boundary, original, caplog=caplog)
         expected = {'baseline_absent': 1}
         assert runtime.status()['orderbook']['shadow']['context_missing_reason_counts'] == expected
         variants = (replace(original, generation='new-cycle'), replace(original, order_id='new-order'),
                     replace(original, terms_version=2))
         for i, changed in enumerate(variants, 1):
             configure(runtime, (changed,))
-            actual_read(runtime, boundary, changed)
+            actual_read(runtime, boundary, changed, caplog=caplog)
             expected['unattributed'] = i
             assert runtime.status()['orderbook']['shadow']['context_missing_reason_counts'] == expected
         configure(runtime, ())
         runtime.reconcile(())
         wait_until(lambda: runtime.status()['owned_buy_scopes'] == 0)
         configure(runtime, (original,))
-        actual_read(runtime, boundary, original)
+        actual_read(runtime, boundary, original, caplog=caplog)
         expected['unattributed'] += 1
         for mode in ('off', 'use', 'shadow'):
             configure(runtime, (original,), hints={original.key: 'anchor_changed'}, mode=mode)
@@ -281,6 +295,7 @@ def test_reason_hints_do_not_cross_identity_or_recount_history(offline_ws, caplo
         # Reconfigure while a physical read is waiting: use the current hint at
         # completion, rather than a reason captured when this request started.
         boundary.holds = {(original.order_id, 'book')}
+        log_start = len(missing_logs(caplog))
         clock.value = 5; runtime.wake()
         boundary.wait(lambda: ('entered', original.order_id, 'book', 5) in boundary.events)
         configure(runtime, (original,), hints={original.key: 'remaining_unknown'})
@@ -288,6 +303,7 @@ def test_reason_hints_do_not_cross_identity_or_recount_history(offline_ws, caplo
         collect(runtime, boundary, bool)
         expected['remaining_unknown'] = 1
         assert runtime.status()['orderbook']['shadow']['context_missing_reason_counts'] == expected
+        wait_for_missing_log(caplog, after=log_start, token_id=original.token_id, read_at=clock.utc())
         assert missing_logs(caplog)[-1]['context_missing_reason'] == 'remaining_unknown'
         # An old waiting scope cannot use metadata for a new generation/order/terms.
         boundary.release.clear(); clock.value = 10; runtime.wake()
@@ -299,7 +315,7 @@ def test_reason_hints_do_not_cross_identity_or_recount_history(offline_ws, caplo
         # Existing eligibility guard excludes this departed identity entirely.
         assert runtime.status()['orderbook']['shadow']['context_missing_reason_counts'] == expected
         configure(runtime, (fresh,))
-        actual_read(runtime, boundary, fresh)
+        actual_read(runtime, boundary, fresh, caplog=caplog)
         expected['unattributed'] += 1
         assert runtime.status()['orderbook']['shadow']['context_missing_reason_counts'] == expected
         assert missing_logs(caplog)[-1]['context_missing_reason'] == 'unattributed'
@@ -324,7 +340,7 @@ def test_reason_precedence_bounds_and_public_output(offline_ws, caplog):
                 prefix = [comparison_context(filler, str(i)) for i in range(64)] if capacity else []
                 configure(runtime, (d, filler), contexts=(*prefix, *rejected),
                           hints={d.key: 'remaining_unknown'})
-                actual_read(runtime, boundary, d)
+                actual_read(runtime, boundary, d, caplog=caplog)
                 report = runtime.status()['orderbook']['shadow']
                 expected = 'context_capacity' if capacity else ('demand_filter', 'token_filter', 'invalid_bid_level')[candidate_count - 1]
                 assert report['context_missing_reason_counts'] == {expected: 1}
@@ -333,7 +349,7 @@ def test_reason_precedence_bounds_and_public_output(offline_ws, caplog):
         ds = tuple(demand(str(i), sources=('book',)) for i in range(70))
         configure(runtime, ds, hints={x.key: 'baseline_absent' for x in ds})
         assert runtime.status()['orderbook']['context_missing_reason_hints_retained'] == 64
-        actual_read(runtime, boundary, ds[0]); actual_read(runtime, boundary, ds[69])
+        actual_read(runtime, boundary, ds[0], caplog=caplog); actual_read(runtime, boundary, ds[69], caplog=caplog)
         report = runtime.status()['orderbook']['shadow']
         assert report['context_missing_reason_counts'] == {'baseline_absent': 1, 'unattributed': 1}
         assert report['context_missing_reason_fractions'] == {'baseline_absent': .5, 'unattributed': .5}
@@ -348,7 +364,7 @@ def test_reason_precedence_bounds_and_public_output(offline_ws, caplog):
         for i, value in enumerate(hostile):
             current = replace(d, order_id='identity-private-' + str(i))
             configure(runtime, (current,), hints={current.key: value})
-            actual_read(runtime, boundary, current)
+            actual_read(runtime, boundary, current, caplog=caplog)
         report = runtime.status()['orderbook']['shadow']
         assert report['context_missing_reason_counts'] == {'unattributed': 5}
         assert report['context_missing_reason_fractions'] == {'unattributed': 1.0}
@@ -360,7 +376,7 @@ def test_reason_precedence_bounds_and_public_output(offline_ws, caplog):
     for cause in ('anchor_changed', 'remaining_unknown'):
         with offline_runtime() as (_, boundary, runtime):
             configure(runtime, (d,), hints={d.key: cause})
-            actual_read(runtime, boundary, d)
+            actual_read(runtime, boundary, d, caplog=caplog)
             report = runtime.status()['orderbook']['shadow']
             assert report['context_missing_reason_counts'] == {cause: 1}
             assert missing_logs(caplog)[-1]['context_missing_reason'] == cause
