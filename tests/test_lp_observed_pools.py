@@ -1738,9 +1738,20 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
         def failures():
             return next((f.consecutive_failures for k,f in rig.live.state.snapshot().read_failures.items()
                 if k[3]=='old-E'),0)
+        def account_published():
+            snapshot=rig.live.state.snapshot();status=rig.live.read_runtime.status()
+            return (snapshot.observation.components['open_orders'].checked_at==rig.utc()
+                and snapshot.observation.read_ticket.trade_version_at_start==snapshot.trade_version
+                and snapshot.new_capacity.state=='known' and status['ready_count']==0
+                and not any(s['active'] for s in status['scopes'])
+                and status['observed_monotonic']>=rig.seconds)
         for expected in range(1,11):
             rig.tick()
-            rig.pump(lambda:failures()==expected,drive=lambda:rig.live.run_once(pool='trial'))
+            # A failed book can publish before its concurrent account read.
+            # Consume this tick's current account and all completed reads before
+            # advancing time, preserving exactly one E failure per five seconds.
+            rig.pump(lambda:failures()==expected and account_published(),
+                drive=lambda:rig.live.run_once(pool='trial'))
         assert rig.sdk.cancels==[] and failures()==10
         partial=next(o for o in rig.live.state.snapshot().orders if o.key[3]=='old-E')
         assert (partial.original_size.value,partial.size_matched.value,partial.remaining.value)==(Decimal('2.5'),Decimal('.5'),Decimal('2'))
@@ -1763,13 +1774,6 @@ def test_pool_group_cancel_wakes_deferred_async_protection(tmp_path,monkeypatch,
         # the subsequent protection and wakeup use the real service scheduler.
         rig.tick()
         # Settle this round's account source before counting held native owners.
-        def account_published():
-            snapshot=rig.live.state.snapshot();status=rig.live.read_runtime.status()
-            return (snapshot.observation.components['open_orders'].checked_at==rig.utc()
-                and snapshot.observation.read_ticket.trade_version_at_start==snapshot.trade_version
-                and snapshot.new_capacity.state=='known' and status['ready_count']==0
-                and not any(s['active'] for s in status['scopes'])
-                and status['observed_monotonic']>=rig.seconds)
         rig.pump(account_published,drive=lambda:rig.live.run_once(pool='trial'))
         assert rig.sdk.cancels==[] and failures()==11
         end=time.monotonic()+4
