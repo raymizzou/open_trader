@@ -237,7 +237,9 @@ def test_financial_deadline_close_cancel_preserves_actual_cleanup_and_retry():
         assert fresh.sources['positions'].value == ()
         assert len(original_sources) == 1
         assert original_sources[0].cancelled() and original_sources[0].cancelling() == 1
-        assert len(ports) == 1 and len(clients) == 2
+        assert len(ports) == 2 and len(clients) == 4
+        assert all(c.is_closed for c in clients[:2])
+        assert all(not c.is_closed for c in clients[2:])
         server.wait_completed(6)
         assert server.requests.count('positions') == 2
         positions = [i for i, event in enumerate(server.events) if event == ('request', 'positions')]
@@ -594,7 +596,9 @@ def test_financial_error_cleanup_cancel_preserves_supervisor_recovery(phase):
         assert recovered.sources['positions'].source_id != timeout.sources['positions'].source_id
         assert original[0].cancelled() and original[0].cancelling() == 1
         assert runtime.drain_results() == () and runtime.status()['cleanup_faults'] == 0
-        assert server.server.positions == 2 and len(ports) == 1
+        assert server.server.positions == 2 and len(ports) == 2 and len(clients) == 4
+        assert all(c.is_closed for c in clients[:2])
+        assert all(not c.is_closed for c in clients[2:])
         observer.wait(lambda: runtime.status()['financial_request_cleanup']['attempt'] == recovered.attempt
             and not runtime.status()['financial_request_cleanup']['current'])
         normal = [row for row in runtime.status()['financial_request_cleanup']['history']

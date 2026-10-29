@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-29 — Recover fixed LP read pools after timeouts (#491)
+
+- Close the whole financial or exact-query HTTP client generation when a five-second attempt still owns unfinished reads. Reuse healthy clients; allow replacement only after original reads and full client closure finish. Keep the old generation in resource counts until its original source/response cleanup ends. Preserve pool sizes, provider Retry-After, original timeout identities, UNKNOWN financial admission and actual shutdown ownership. A failed or stalled client close remains a cleanup fault and cannot create unlimited replacements.
+- Limit repeated cancellation-refusal logs to one per exact order per rolling minute, with cumulative rejected count while its bounded entry is retained. Continue counting every refusal and preserve stale-fact rejection, native cancellation guards and no replay. Logging runs outside the state lock and cannot grant a mutation.
+- Show `账户挂单/余额读取卡住 N 分钟` in monitor orders and pools after an observed financial timeout streak exceeds one minute. Bind the diagnostic to the current account/process/generation, reject missing or stale evidence and clear it only after fresh complete current reads. Unknown counts and balances stay unknown. No merge, deployment or production activation is included.
+
 ## 2026-10-28 — Keep D2 yield separate from account exposure (#482 / PR #490)
 
 - Preserve actual occupied capital, exposure state/reason and risk/qualification fields when projecting D2 yield. Publish yield state/reason and measured BUY principal separately; yield, hourly reward, details and sorting use those fields with legacy payload compatibility.
