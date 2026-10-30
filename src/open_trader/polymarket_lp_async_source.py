@@ -261,6 +261,28 @@ class LPAsyncSourcePort:
     def not_before(self, provider, account):
         return self.provider_limits.not_before(provider,account)
 
+    def financial_pool_status(self):
+        """Bounded scalars from the pinned HTTPX/HTTPCore pool, never URLs/requests."""
+        rows = []
+        for name, limit in (('clob', 2), ('data', 1)):
+            row = dict(service=name, limit=limit, connections=None, active=None, idle=None, closed=None)
+            try:
+                client = self.clients[name]
+                # HTTPX has no public pool accessor; isolate the pinned transport seam.
+                transport = client._transport_for_url(client.base_url)
+                if type(transport) is not httpx.AsyncHTTPTransport:
+                    raise ValueError('pool_unavailable')
+                connections = transport._pool.connections
+                if len(connections) > limit:
+                    raise ValueError('pool_limit')
+                row.update(connections=len(connections),
+                    active=sum(not c.is_idle() and not c.is_closed() for c in connections),
+                    idle=sum(c.is_idle() for c in connections), closed=client.is_closed)
+            except Exception:
+                pass
+            rows.append(row)
+        return rows
+
     def _stage_cleanup_records(self):
         snapshot = dict(attempt=self._record_attempt,
             current=[dict(record.value) for record in self._current_records.values()],

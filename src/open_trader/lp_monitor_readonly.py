@@ -24,6 +24,7 @@ FIELDS = {
     'pool','outcome','requested_at','id','trade_id','market','price','quantity','time','coverage','boot_reference',
     'total','by_reason','available','omitted','income_gaps','measurement_attempts','observation_refresh',
     'last_success_at','age_seconds','stalled','minimum_quantity','yield_pct_per_hour','reward_share','sample_age_seconds',
+    'read_health','engine_account_read','consecutive_failures','unknown_counts','recent','older',
     'position_quantity','covered_quantity','uncovered_quantity','reasoned_quantity',
     'cost_floor','cost_source','current_value','minimum_quantity','state','sells',
 }
@@ -79,7 +80,7 @@ def validate_upstream(url):
     return url
 
 
-def fetch_summary(url, *, timeout=5):
+def fetch_summary(url, *, timeout=15):
     validate_upstream(url)
     try:
         opener=build_opener(ProxyHandler({}),_NoRedirect())
@@ -147,6 +148,10 @@ def render_page(value):
             big='候选 '+_text(data.get('eligible_candidates'))
             details=_pairs([('想开',data.get('desired_running')),('实际开',data.get('effective_running')),
                 ('致命错误',data.get('fatal')),('候选上次刷新成功',data.get('candidate_last_success_at'))])
+            engine=mapping(mapping(data.get('read_health')).get('engine_account_read'))
+            details+='<h3>引擎账户读取</h3>'+_pairs([('最后成功时间',engine.get('last_success_at')),
+                ('连续失败次数',engine.get('consecutive_failures')),('距上次成功（秒）',engine.get('age_seconds')),
+                ('读取说明',engine.get('reason'))])
             for pool,label in [('trial','试挂池'),('income','收益池')]:
                 row=mapping(mapping(data.get('items')).get(pool))
                 details+='<h3>'+label+'</h3>'+_pairs([(name,row.get(field)) for field,name in [
@@ -163,11 +168,13 @@ def render_page(value):
                 [('condition_id','市场'),('order_id','订单'),('sample_age_seconds','样本年龄（秒）'),('checked_at','尝试时间'),('state','结果'),('reason','原因'),
                  ('yield_pct_per_hour','收益（%/小时）')])
         elif key=='balance':
-            big='可用 $'+_text(data.get('capacity_usd'))
+            big='已确认余额 $'+_text(data.get('balance_usd'))
             details=_pairs([(label,data.get(field)) for field,label in [('balance_usd','余额（USD）'),('allowance_usd','授权额度（USD）'),
-                ('capacity_usd','还能用来挂单（USD）'),('inventory_cost_usd','当前库存成本（USD）'),('checked_at','读取时间')]])
+                ('capacity_usd','引擎可用资金（USD）'),('inventory_cost_usd','当前库存成本（USD）'),('checked_at','读取时间')]])
         elif key=='cancellations':
-            big='卡单 '+_text(len(data.get('stuck',[])) if mapping(data.get('hour')).get('success') is not None else None)
+            big='卡单 '+_text(len(data.get('stuck',[])) if mapping(data.get('hour')).get('success') is not None else None)+' · 结果未知 '+_text(mapping(data.get('unknown_counts')).get('total'))
+            counts=mapping(data.get('unknown_counts'))
+            details+=_pairs([('结果未知：24 小时内',counts.get('recent')),('结果未知：更早',counts.get('older'))])
             for window,label in [('hour','最近一小时'),('today','Tokyo 今天')]:
                 row=mapping(data.get(window));details+='<h3>'+label+'</h3>'+_pairs([(text,row.get(field)) for field,text in
                     [('success','已确认撤完'),('rejected','被拒'),('unknown','结果未知'),('blocked','被拦下')]])

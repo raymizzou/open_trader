@@ -35,7 +35,7 @@ def section(status='unknown', reason='数据未读全，当前情况未知', **v
     return dict(status=status, reason=reason, **values)
 
 
-def read_health(auto, now):
+def _cleanup_health(auto, now):
     """Copy only the bounded public cleanup schema; absent evidence is unknown."""
     unknown = section(reason='读取清理状态未知', cleanup_fault_details=None, new_buy_block_reasons=None)
     runtime = mapping(mapping(auto.get('diagnostics')).get('async_reads'))
@@ -72,6 +72,33 @@ def read_health(auto, now):
         else '读取清理正常')
     return section('abnormal' if blocked else 'attention' if total or reasons else 'normal', reason,
         cleanup_fault_details=dict(total=total, omitted=omitted, items=copied), new_buy_block_reasons=list(reasons))
+
+
+def read_health(auto, now, account_id=None):
+    cleanup = _cleanup_health(auto, now)
+    raw = mapping(mapping(mapping(auto.get('diagnostics')).get('async_reads')).get('engine_account_read'))
+    stamp = moment(raw.get('last_success_at'))
+    failures = raw.get('consecutive_failures')
+    engine = section(reason='做市引擎账户读取状态未知', last_success_at=None,
+        consecutive_failures=None, age_seconds=None)
+    if (isinstance(account_id, str) and account_id and isinstance(raw.get('account_id'), str)
+            and raw['account_id'].casefold() == account_id.casefold()
+            and type(failures) is int and 0 <= failures <= 999999999):
+        engine['consecutive_failures'] = failures
+        if stamp is not None and stamp <= now:
+            age = (now-stamp).total_seconds()
+            elapsed = f'{int(age)} 秒' if age < 120 else f'{int(age//60)} 分钟'
+            engine.update(status='abnormal' if age > 60 else 'attention' if failures else 'normal',
+                reason=f'做市引擎读不到账户，已 {elapsed}' if age > 60 else '做市引擎账户读取最近已成功',
+                last_success_at=stamp.isoformat(), age_seconds=age)
+    result = dict(cleanup, engine_account_read=engine)
+    if cleanup['status'] != 'abnormal':
+        if engine['status'] == 'abnormal':result.update(status='abnormal', reason=engine['reason'])
+        elif engine['status'] == 'unknown' and cleanup['status'] == 'normal':
+            result.update(status='unknown', reason=engine['reason'])
+        elif engine['status'] == 'attention' and cleanup['status'] == 'normal':
+            result.update(status='attention', reason=engine['reason'])
+    return result
 
 
 def financial_timeout_reason(auto, account_id, now):
@@ -111,7 +138,8 @@ def unknown_summary(now=None):
     result['fills'].update(hour=dict(count=None, amount_usd=None),
                           today=dict(count=None, amount_usd=None), items=[], inventory_cost_usd=None)
     result['cancellations'].update(hour=dict.fromkeys(('success','rejected','unknown','blocked')),
-        today=dict.fromkeys(('success','rejected','unknown','blocked')), items=[], stuck=[])
+        today=dict.fromkeys(('success','rejected','unknown','blocked')), items=[], stuck=[],
+        unknown_counts=dict(total=None, recent=None, older=None))
     result['holdings'] = section(items=[], position_quantity=None, covered_quantity=None,
         uncovered_quantity=None, reasoned_quantity=None)
     return result
@@ -171,6 +199,7 @@ class LPMonitorSummary:
                 self.account_id = account_id
                 self.last_counts = None
                 self.shortages.clear()
+                self.since.clear()
             counts = dict(trial=0, income=0, unassigned=0, sell=0) if known else None
             items = []
             if known:
@@ -234,7 +263,10 @@ class LPMonitorSummary:
                 or dashboard.get('candidate_state') in ('stale','failed','error'))
             failure_age = self.duration('candidate_failure', failed, now)
             pool_state, pool_reason = state, reason
-            health = read_health(auto, now)
+            health = read_health(auto, now, account_id)
+            engine = health['engine_account_read']
+            if engine['status'] == 'abnormal':
+                result['orders'].update(status='abnormal', reason=engine['reason'])
             timeout_reason = (financial_timeout_reason(auto, account_id, now)
                 if not auto.get('fatal') and auto.get('desired_running') is True
                 and auto.get('effective_running') is True else None)
@@ -246,9 +278,13 @@ class LPMonitorSummary:
                 pool_state, pool_reason = 'abnormal', '做市想开但实际没开'
             elif timeout_reason:
                 pool_state, pool_reason = 'abnormal', timeout_reason
-            elif (known and auto.get('desired_running') is True and auto.get('effective_running') is True
+            elif ((known or engine['status'] == 'abnormal') and auto.get('desired_running') is True and auto.get('effective_running') is True
                     and health['status'] == 'abnormal'):
                 pool_state, pool_reason = 'abnormal', health['reason']
+            elif candidate_source and (now-candidate_stamp).total_seconds() > 600:
+                age = (now-candidate_stamp).total_seconds()
+                elapsed = f'{int(age//3600)} 小时' if age >= 3600 else f'{int(age//60)} 分钟'
+                pool_state, pool_reason = 'abnormal', f'候选刷新已停 {elapsed}'
             elif candidate_source and candidate_count == 0 and auto.get('desired_running') is True:
                 pool_state, pool_reason = 'abnormal', '有效候选为零'
             elif failed and failure_age >= 600:
@@ -305,6 +341,9 @@ class LPMonitorSummary:
             checked = moment(dashboard.get('checked_at'))
             balance, allowance = number(dashboard.get('balance')), number(dashboard.get('allowance'))
             capacity = number(auto.get('new_capacity_usd'))
+            balance_confirmed = (account_id and dashboard.get('account_id') == account_id
+                and dashboard.get('authenticated') is True and dashboard.get('stale') is False
+                and checked is not None and checked <= now and balance is not None and allowance is not None)
             financial_known = (account_id and dashboard.get('account_id') == account_id
                 and dashboard.get('authenticated') is True and dashboard.get('stale') is False
                 and dashboard.get('positions_complete') is True and dashboard.get('open_orders_complete') is True
@@ -321,6 +360,10 @@ class LPMonitorSummary:
             else:
                 result['balance'].update(status='abnormal' if unknown_age >= 300 else 'unknown',
                     reason='可用资金未知：持仓或余额没读全' + ('，已持续五分钟' if unknown_age >= 300 else ''))
+            if balance_confirmed:
+                result['balance'].update(balance_usd=str(balance), allowance_usd=str(allowance), checked_at=checked.isoformat())
+            if engine['status'] == 'abnormal':
+                result['balance'].update(status='abnormal', reason=engine['reason'])
             result['cancellations'] = self.cancellations(audits, account_id, items, known, now)
             cancels=result['cancellations']
             boot_blocks=mapping(mapping(auto.get('diagnostics')).get('cancel_blocks')).get('total')
@@ -345,6 +388,8 @@ class LPMonitorSummary:
         today = dict(hour)
         details, stuck = [], []
         pending_unknown = False
+        unknown_counts = dict(total=0,recent=0,older=0)
+        unknown_abnormal = False
         for raw in audits:
             row = mapping(raw)
             at = moment(row.get('requested_at'))
@@ -373,19 +418,27 @@ class LPMonitorSummary:
             if outcome in hour:
                 if at >= now-timedelta(hours=1): hour[outcome] += 1
                 if at >= start: today[outcome] += 1
+            if outcome == 'unknown':
+                old = (now-at).total_seconds() > 86400
+                unknown_counts['total'] += 1
+                unknown_counts['older' if old else 'recent'] += 1
+                # Any matching order ID defeats absence, including inconsistent terms.
+                absent = orders_known and not any(o.get('order_id') == row['order_id'] for o in orders)
+                unknown_abnormal |= not (old and absent)
             if outcome == 'pending':
                 live = any(all(o.get(k)==row.get(k) for k in ('condition_id','token_id','order_id')) for o in orders)
                 if live and (now-at).total_seconds() > 120:
                     stuck.append(detail)
                 elif not orders_known:
                     pending_unknown = True
-        abnormal = bool(stuck or any(r['outcome']=='unknown' for r in details))
+        abnormal = bool(stuck or unknown_abnormal)
         return section('abnormal' if abnormal else 'unknown' if pending_unknown else
-            'attention' if any(r['outcome']=='pending' for r in details) else 'normal',
+            'attention' if unknown_counts['total'] or any(r['outcome']=='pending' for r in details) else 'normal',
             '存在结果未知或超过两分钟仍挂着的撤单' if abnormal else
             '当前挂单未确认，无法核对撤单进度' if pending_unknown else
+            '较早的结果未知记录已不在当前完整挂单中，保留审计' if unknown_counts['total'] else
             '撤单回执不代表最终撤完，等待账户确认' if any(r['outcome']=='pending' for r in details) else
-            '持久撤单审计未见结果未知或卡单', hour=hour, today=today, items=details, stuck=stuck,
+            '持久撤单审计未见结果未知或卡单', hour=hour, today=today, items=details, stuck=stuck, unknown_counts=unknown_counts,
             basis='local durable CANCEL requests; accepted receipt is not final cancellation')
 
     def fills(self, trades, auto, account_id, membership, now):

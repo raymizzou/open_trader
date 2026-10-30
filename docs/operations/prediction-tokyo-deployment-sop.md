@@ -738,13 +738,22 @@ Shadow 没有生产自动池来源时返回未知，不把缺失来源作为正�
 挂单/两池共用同一次当前成员投影，目标来自有效配置。缺单先注意，连续
 300 秒异常；读取失败打断连续证据，恢复确认满池后重新计时。
 想开而实际未开、致命错误、有效候选为零、连续 600 秒候选刷新失败均异常。
+最后成功刷新已超过 600 秒时，优先显示「候选刷新已停」，不再用零候选掩盖陈旧来源。
 余额超过 300 秒未更新为注意；可用资金未知连续 300 秒异常，缺失金额保留 null。
-这些计时是当前进程的观察证据，重启不伪造先前连续时长。
+引擎账户读取单列最后完整成功时间和连续失败次数；超过 60 秒没有有效成功，挂单和
+余额卡明确显示「做市引擎读不到账户」及耗时。同账户已认证、未陈旧的后台余额和
+原读取时间仍独立展示；这不确认引擎可用资金，也不授予新增 BUY 权限。没有成功
+时间、时间在未来或账户不匹配时保持未知。上述计时是当前进程的观察证据，重启不
+伪造先前连续时长。
 
 撤单成功只计已确认终态撤完；接受回执仍等待当前账户确认。请求超过
 120 秒且同一账户/市场/token/订单仍确认挂着才列卡单。小时/今天计数来自本机
 持久 CANCEL 请求审计，按请求时间归属，跨进程重启保留；早期拦截只有启动内存
 记录时，拦截总量保留未知，并单列本次启动参考。历史未入审计的拦截不能称为零。
+撤单卡同时显示「卡单 N · 结果未知 M」，未知分为 24 小时内（含边界）和更早。
+只有超过 24 小时且完整、新鲜、同账户的当前名单证明订单不存在时，更早未知记录
+才降为注意；名单未知、仍挂着或订单 ID 的其他身份不一致时不降级。原未知请求
+审计保持原样，不删除、不改写终态。
 没有可归属的原始补位/换单时间时显示未知并说明来源未保存，不用读取时间代替。
 成交只用完整本钱包缓存；按成交及我方订单分配身份去重，保留不同订单的同刻成交。
 只统计已确认成交，失败不计；未确认/不完整来源保持未知。池归属无法确认时保留
@@ -757,7 +766,7 @@ Shadow 没有生产自动池来源时返回未知，不把缺失来源作为正�
 Tailscale 地址（IPv4 `100.64.0.0/10`、IPv6 `fd7a:115c:a1e0::/48`）；拒绝通配、
 公网、LAN 和 DNS 名。上游固定为数字 loopback 的精确汇总 URL，拒绝重定向。
 浏览器必须使用绑定的数字 IP 和实际端口；Host 校验不接受 DNS 别名。
-上游失败时显示未知，不沿用上一份正常结果。
+上游等待上限默认为 15 秒；失败时显示未知，不沿用上一份正常结果。
 
 - 东京本机：批准启动只读监听器后打开 `http://127.0.0.1:8780/`（须选择 loopback 绑定）。
 - Mini / 手机：保持 Ray 已有 Tailscale 网络连接，打开 `http://<东京数字 Tailscale IP>:8780/`。
@@ -772,6 +781,25 @@ Tailscale 地址（IPv4 `100.64.0.0/10`、IPv6 `fd7a:115c:a1e0::/48`）；拒绝
 Host Readiness，再使用现有 wrapper。下面均为操作模板，当前未执行；所有占位值
 须由操作员选择。配置文件需已受信任并绑定相同 SHA，不能用修改路径绕过门禁。
 
+`#498 P3a` 使用现有 `prediction-systemd` 管理配套面板。操作员在同一受信任的
+`prediction-cloud.json` 中明确增加 `"lp_monitor_host": "<东京数字 Tailscale IP>"`
+（也可明确选择 `127.0.0.1`）。没有该字段时保留原默认行为，不新增面板服务。
+地址必须为标准写法的数字 loopback 或 Tailscale IP，不接受公网、通配和 DNS。
+启用后，安装器将主服务及 `open-trader-lp-monitor.service` 一起绑定所选 release
+和 Python，并在停止记录中保存两份 unit 文本；安装保持两者停止，不启用开机交易。
+首次纳管前，先按既有授权停止此前手工启动的 8780 监听器；端口占用或既有配套
+unit 与停止记录不符时安装失败，不自动杀进程或覆盖未知所有者。
+
+配套 unit 的 `PartOf`/`After` 与主服务的 `Wants` 共同管理停止、启动和重启。
+主服务经已授权的 wrapper `start`/`restart` 后，面板一起启动；部署完成检查同时
+核对面板的受信任 unit、PID、用户、源码目录、解释器、环境和私有监听地址。
+面板以清空环境的命令启动，不继承主服务的凭据配置，且不能读取 runtime 目录。
+任何不匹配均不报告运行成功；部分安装失败保留停止/失败证据，不自动回滚。
+若配套面板独立退出，只有 unit/加载配置仍匹配、PID 为 0 且 8780 确认无监听时，
+已获授权的主服务 stop/restart 才可继续；未知或不匹配的所有者仍拒绝操作。
+重新启动后仍须两者健康，start/status/smoke 不把面板缺失报告成运行成功。
+
+
 ```sh
 LP463_SHA='<approved-40hex-main-sha>'
 LP463_RELEASE="/opt/open-trader/releases/$LP463_SHA"
@@ -782,14 +810,17 @@ export OPEN_TRADER_PYTHON="$LP463_PYTHON"
   --runtime-root /var/lib/open-trader/prediction --python "$LP463_PYTHON" \
   prediction-systemd --config /etc/open-trader/prediction-cloud.json --action install
 
-# 正式服务启动仍走已批准的同一 wrapper action start 及 Production Smoke。
-# 以下额外进程须有单独批准，使用前台便于审查，不安装或启用系统服务。
-LP463_TAILNET_IP='<verified-numeric-tailscale-ip>'
-env PYTHONPATH="$LP463_RELEASE/src" "$LP463_PYTHON" \
-  -m open_trader.lp_monitor_readonly --host "$LP463_TAILNET_IP" --port 8780 \
-  --upstream-url http://127.0.0.1:8769/api/prediction-arbitrage/lp/monitor
+# 已明确配置 lp_monitor_host；安装保持停止。启动仍须已有单独批准。
+LP463_TAILNET_IP='<same-verified-numeric-tailscale-ip-as-config>'
+"$LP463_PYTHON" -B "$LP463_RELEASE/scripts/deploy_release.py" \
+  --expected-sha "$LP463_SHA" --release-root "$LP463_RELEASE" \
+  --runtime-root /var/lib/open-trader/prediction --python "$LP463_PYTHON" \
+  prediction-systemd --config /etc/open-trader/prediction-cloud.json --action start
+# 随后执行第 6 节 Production Smoke，并检查手机只读页面。
+# 后续已批准部署重复 install/start；已安装同一配置的重启使用 wrapper action restart。
 ```
 
+P3b（启用通知）未在 #498 P3a 授权中，以下仍是另行批准后的操作模板。
 健康检查保留原默认 7200 秒频率；仅加 `--lp-monitor` 后独立每 60 秒读取 LP，
 包括 N-leg 已暂停时。复用既有飞书 notifier 和既有夜间时钟规则（上海 08:00–23:00
 允许通知），稳定状态不重复；异常/未知变化及恢复、每个新成交分别通知。
@@ -809,9 +840,12 @@ env PYTHONPATH="$LP463_RELEASE/src" "$LP463_PYTHON" -m open_trader \
 先在离线/回放环境验证一次状态变化及逐笔成交通知，不为验收在东京新下单或撤单。
 `--once --no-notify --json` 可在已有授权的只读检查中读取一次，且不会发送通知。
 
-只读访问回滚：对上述前台只读监听器按 Ctrl-C，仅停止本次监听进程；对本次新增健康
-进程按 Ctrl-C，按原调用恢复既有健康检查。保留待发送文件和日志，不改做市开关、不
-取消挂单。若正式源码也需回滚，另选已批准且有有效门禁证据的旧 main SHA，使用同一
-wrapper 的 `prediction-systemd --config <匹配旧发布的受信任配置> --action install/start`
-重新执行 Preflight、Host Readiness 和 Smoke；不手改 current 链接、不绕过失败 CI。
+回滚仍由现有 systemd 发布管理负责：取得明确批准后先按原流程验证并停止主服务，
+配套面板随同停止；保留记录、日志、待发送文件，不取消交易所挂单。选择已批准且有
+有效门禁证据、支持配套面板的旧 main release/interpreter，并准备匹配旧 release 和
+同一私有绑定的受信任配置，先通过精确 SHA 的 Preflight 和 Host Readiness，再使用
+同一 wrapper `prediction-systemd --action install/start` 重建并启动成对 unit，随后执行
+Production Smoke。停止记录保留原候选，
+unit 备份保留旧主服务文本；配套 unit 由匹配配置重建。不要只回滚面板或手改 current
+链接；不支持配套字段的更老 release 需要另定迁移方案，不自动拆分或绕过失败 CI。
 是否回滚正式服务、是否启用任何进程均取决于单独批准，本节不授予生产操作权限。

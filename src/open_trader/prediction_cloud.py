@@ -26,6 +26,7 @@ from uuid import uuid4
 from .prediction_release import RUNTIME_SCHEMA, RELEASE_SCHEMA, inspect_prediction_release_checkout, write_prediction_runtime_record, load_prediction_runtime_record
 
 UNIT = 'open-trader-prediction.service'
+MONITOR_UNIT = 'open-trader-lp-monitor.service'
 UNIT_PATH = Path('/etc/systemd/system') / UNIT
 CONFIG_PATH = Path('/etc/open-trader/prediction-cloud.json')
 OPERATION_LOCK = Path('/run/open-trader-prediction-operation.lock')
@@ -50,6 +51,7 @@ class CloudConfig:
     memory_max_bytes: int = 768 * 1024 * 1024
     candidate_exclusions: bool = False
     lp_instance_id: str | None = None
+    lp_monitor_host: str | None = None
 
     @property
     def effective_n_leg_paused(self) -> int:
@@ -141,6 +143,10 @@ def trusted_layout(c: CloudConfig) -> None:
 
 
 def render_unit(c: CloudConfig) -> str:
+    if c.lp_monitor_host is not None:
+        from .lp_monitor_readonly import validate_bind
+        if validate_bind(c.lp_monitor_host)!=c.lp_monitor_host:
+            raise ValueError('canonical numeric monitor bind required')
     if c.lp_instance_id is not None:
         from .lp_order_ownership import validate_instance_id
         validate_instance_id(c.lp_instance_id)
@@ -206,7 +212,7 @@ def render_unit(c: CloudConfig) -> str:
 Description=OpenTrader Prediction
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=300
+{'Wants='+MONITOR_UNIT+chr(10) if c.lp_monitor_host is not None else ''}StartLimitIntervalSec=300
 StartLimitBurst=3
 
 [Service]
@@ -241,6 +247,102 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 '''
+
+
+def render_monitor_unit(c: CloudConfig) -> str | None:
+    render_unit(c)
+    if c.lp_monitor_host is None:return None
+    return f"""[Unit]
+Description=OpenTrader LP read-only monitor
+PartOf={UNIT}
+After={UNIT}
+
+[Service]
+Type=simple
+User={c.user}
+Group={c.user}
+WorkingDirectory={c.release_root}
+ExecStart=/usr/bin/env -i PATH=/usr/bin:/bin PYTHONPATH={c.release_root}/src PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 {c.python} -m open_trader.lp_monitor_readonly --host {c.lp_monitor_host} --port 8780
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+InaccessiblePaths={c.runtime_root}
+StandardOutput=journal
+StandardError=journal
+"""
+
+
+def _monitor_state():
+    output=run('systemctl','show',MONITOR_UNIT,'--no-pager',
+        '--property=ActiveState,MainPID,FragmentPath,DropInPaths,NeedDaemonReload,User,Group,WorkingDirectory')
+    state=dict(line.split('=',1) for line in output.splitlines() if '=' in line)
+    if not {'ActiveState','MainPID'} <= state.keys():raise ValueError('monitor state unknown')
+    return state
+
+
+def _monitor_absent(c):
+    if c.lp_monitor_host is None:return
+    state=_monitor_state()
+    if state['MainPID']!='0' or state['ActiveState'] not in ('inactive','failed'):
+        raise ValueError('stop the paired monitor before installation')
+    if run('ss','-H','-ltnp','sport = :8780'):
+        raise ValueError('existing monitor listener remains')
+
+
+def _installed_monitor(c):
+    path=UNIT_PATH.with_name(MONITOR_UNIT)
+    if c.lp_monitor_host is None:
+        if path.exists() or path.is_symlink():raise ValueError('installed monitor requires explicit bind configuration')
+        return
+    trusted_root_path(path)
+    if (not stat.S_ISREG(path.lstat().st_mode) or path.lstat().st_nlink!=1
+            or path.read_text()!=render_monitor_unit(c)):
+        raise ValueError('monitor does not match selected release/config')
+
+
+def monitor_identity(c, *, allow_absent=False):
+    if c.lp_monitor_host is None:return None
+    _installed_monitor(c)
+    state=_monitor_state();pid=int(state['MainPID'])
+    if (state.get('DropInPaths')
+            or state.get('FragmentPath')!=str(UNIT_PATH.with_name(MONITOR_UNIT))
+            or state.get('NeedDaemonReload')!='no' or state.get('User')!=c.user
+            or state.get('Group')!=c.user or state.get('WorkingDirectory')!=str(c.release_root)):
+        raise ValueError('monitor loaded identity mismatch')
+    # A proven absent display process must not prevent safe main shutdown.
+    if allow_absent and state['ActiveState'] in ('inactive','failed'):
+        _monitor_absent(c)
+        return None
+    if state['ActiveState']!='active' or pid<=0:
+        raise ValueError('monitor loaded identity mismatch')
+    process=Path('/proc')/str(pid);user=service_user(c)
+    if (process/'cwd').resolve()!=c.release_root.resolve():raise ValueError('monitor cwd mismatch')
+    status=(process/'status').read_text().splitlines()
+    for field,expected in (('Uid:',user.pw_uid),('Gid:',user.pw_gid)):
+        line=next(line for line in status if line.startswith(field))
+        if set(map(int,line.split()[1:]))!={expected}:raise ValueError('monitor user mismatch')
+    command=shlex.split(render_monitor_unit(c).split('ExecStart=',1)[1].splitlines()[0])
+    if (process/'cmdline').read_bytes().decode().rstrip('\0').split('\0')!=command[6:]:
+        raise ValueError('monitor command mismatch')
+    environment=(process/'environ').read_bytes().decode().split('\0')
+    values=dict(item.split('=',1) for item in environment if '=' in item)
+    expected=dict(item.split('=',1) for item in command[2:6])
+    if (any(values.get(k)!=v for k,v in expected.items())
+            or set(values)-set(expected)-{'LC_CTYPE'}):
+        raise ValueError('monitor environment is not isolated')
+    listeners=run('ss','-H','-ltnp','sport = :8780').splitlines()
+    address=f'[{c.lp_monitor_host}]' if ':' in c.lp_monitor_host else c.lp_monitor_host
+    if (len(listeners)!=1 or len(listeners[0].split())<5
+            or listeners[0].split()[3]!=f'{address}:8780'
+            or re.findall(r'pid=(\d+)',listeners[0])!=[str(pid)]):
+        raise ValueError('monitor listener identity mismatch')
+    return dict(pid=pid,git_sha=c.expected_sha,release_root=str(c.release_root),host=c.lp_monitor_host,port=8780)
 
 
 def run(*args: str, timeout=15) -> str:
@@ -304,6 +406,7 @@ def absent(c: CloudConfig) -> dict:
         raise ValueError('stop the existing managed owner before installation/start')
     if listener_pids() or lock_pids(c):
         raise ValueError('listener or runtime owner remains')
+    _monitor_absent(c)
     return state
 
 
@@ -332,6 +435,7 @@ def read_status(port: int, path: str) -> int:
 
 
 def installed_unit(c: CloudConfig, *, contents: bytes | None = None) -> None:
+    _installed_monitor(c)
     trusted_root_path(UNIT_PATH)
     if (not stat.S_ISREG(UNIT_PATH.lstat().st_mode) or UNIT_PATH.lstat().st_nlink != 1
         or (UNIT_PATH.read_text() if contents is None else contents.decode()) != render_unit(c)):
@@ -346,7 +450,7 @@ def installed_unit(c: CloudConfig, *, contents: bytes | None = None) -> None:
         raise ValueError('unknown unit source or drop-in')
 
 
-def live_identity(c: CloudConfig) -> dict:
+def live_identity(c: CloudConfig, *, allow_absent_monitor=False) -> dict:
     user = service_user(c)
     identity = release_identity(c)
     installed_unit(c)
@@ -408,7 +512,8 @@ def live_identity(c: CloudConfig) -> dict:
         isolation={'lp_instance_isolation':{k:v for k,v in capability.items() if k!='observed_at'}|{'stage':'running'}}
     return {'pid': pid, 'git_sha': c.expected_sha, 'candidate_exclusions': effective_exclusions,
             'started_at': health.get('started_at'),
-            'systemd_started_at': state.get('ExecMainStartTimestamp'), **isolation}
+            'systemd_started_at': state.get('ExecMainStartTimestamp'), **isolation,
+            **({'lp_monitor':monitor_identity(c,allow_absent=allow_absent_monitor)} if c.lp_monitor_host is not None else {})}
 
 
 def staged_instance_identity(c: CloudConfig) -> dict:
@@ -480,7 +585,8 @@ def systemd_record_identity(c):
     user=service_user(c)
     return dict(manager='systemd',manager_identity=str(UNIT_PATH),runtime_root=str(c.runtime_root),
         config=str(c.runtime_root/'config/prediction_arbitrage.json'),python=str(c.python),
-        service_identity=dict(user=c.user,uid=user.pw_uid,gid=user.pw_gid),unit_text=render_unit(c))
+        service_identity=dict(user=c.user,uid=user.pw_uid,gid=user.pw_gid),unit_text=render_unit(c),
+        **({'monitor_unit_text':render_monitor_unit(c)} if c.lp_monitor_host is not None else {}))
 
 
 def _same_candidate(candidate,c):
@@ -528,6 +634,7 @@ def record(c: CloudConfig, state: str, *, operation_fd=None, promote_lp_nonce=No
     if same and c.mode=='production':candidate=dict(previous['candidate'])
     if promote_lp_nonce is not None:candidate['lp_validation']=dict(_prepared_lp_validation(c,promote_lp_nonce))
     document=dict(state=state,manager='systemd',candidate=candidate,previous_release=old,unit_text=render_unit(c),**extra)
+    if c.lp_monitor_host is not None:document['monitor_unit_text']=render_monitor_unit(c)
     publication={}
     if c.mode=='production':
         document.update(systemd_record_identity(c))
@@ -543,7 +650,8 @@ def verified_record(c: CloudConfig, states: tuple[str, ...], *, contents: bytes 
     saved = load_prediction_runtime_record(c.record) if contents is None else json.loads(contents)
     if (not isinstance(saved, dict) or saved.get('schema_version') != RUNTIME_SCHEMA or saved.get('manager') != 'systemd' or saved.get('state') not in states
         or (not _same_candidate(saved.get('candidate'),c) if c.mode=='production' else saved.get('candidate')!={'checkout':str(c.release_root),'git_sha':c.expected_sha})
-        or saved.get('unit_text') != render_unit(c)):
+        or saved.get('unit_text') != render_unit(c)
+        or saved.get('monitor_unit_text') != render_monitor_unit(c)):
         raise ValueError('managed release transition record not verified')
     if c.mode=='production' and any(saved.get(k)!=v for k,v in systemd_record_identity(c).items()):
         raise ValueError('managed systemd identity changed')
@@ -685,6 +793,8 @@ def _backup_stopped_preparation(c: CloudConfig, config: Path, backup_root: Path,
             sources = [(path, backup/'runtime'/path.relative_to(c.runtime_root))
                        for path in _recovery_paths(c) if path.exists()]
             sources += [(config, backup/'cloud.json'), (UNIT_PATH, backup/'prediction.service')]
+            if c.lp_monitor_host is not None:
+                sources.append((UNIT_PATH.with_name(MONITOR_UNIT),backup/'lp-monitor.service'))
             for source, target in sources:
                 control = controls.get(source)
                 pin = control[0] if control else opened.enter_context(_recovery_file(source))
@@ -841,8 +951,9 @@ def recover_stopped_preparation(config: Path, *, expected_sha: str,
             str(c.release_root/'scripts/deployment_preflight.py'), str(c.release_root), c.expected_sha,
             timeout=120)
         _recovery_files(c)
-        for path, mode in ((UNIT_PATH, 0o644), (c.record, 0o600)):
-            if path == UNIT_PATH:
+        for path, mode in ([(UNIT_PATH, 0o644), (c.record, 0o600)]
+                           + ([(UNIT_PATH.with_name(MONITOR_UNIT),0o644)] if c.lp_monitor_host is not None else [])):
+            if path == UNIT_PATH or path == UNIT_PATH.with_name(MONITOR_UNIT):
                 trusted_root_path(path)
             if path.resolve().is_relative_to(Path(c.credentials_file).parent.resolve()):
                 raise ValueError('credential alias in recovery controls')
@@ -957,6 +1068,7 @@ def _verified_current_lp_start(c):
 
 
 def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=None, extras=None) -> dict:
+    render_unit(c)  # Validate the explicit companion bind before any OS operation.
     mutations=('install','start','restart')
     if prepare_for is not None and (action!='prepare-target' or prepare_for not in mutations):
         raise ValueError('prepare-for requires a supported prepared operation')
@@ -1073,10 +1185,23 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
                 if saved.get('unit_text') != UNIT_PATH.read_text():
                     raise ValueError('existing unit differs from stopped record')
             unit = render_unit(c)
+            monitor_unit=render_monitor_unit(c)
+            monitor_path=UNIT_PATH.with_name(MONITOR_UNIT)
+            if monitor_unit is None and (monitor_path.exists() or monitor_path.is_symlink()):
+                raise ValueError('installed monitor requires explicit bind configuration')
+            if monitor_path.exists():
+                trusted_root_path(monitor_path)
+                if not stat.S_ISREG(monitor_path.lstat().st_mode) or monitor_path.lstat().st_nlink!=1:
+                    raise ValueError('monitor unit path is not trusted')
+                if not UNIT_PATH.exists() or saved.get('monitor_unit_text')!=monitor_path.read_text():
+                    raise ValueError('existing monitor differs from stopped record')
             with tempfile.TemporaryDirectory() as directory:
                 target = Path(directory)/UNIT
                 target.write_text(unit)
-                run('systemd-analyze', 'verify', str(target))
+                targets=[str(target)]
+                if monitor_unit is not None:
+                    companion=Path(directory)/MONITOR_UNIT;companion.write_text(monitor_unit);targets.append(str(companion))
+                run('systemd-analyze', 'verify', *targets)
             if UNIT_PATH.exists():
                 with tempfile.NamedTemporaryFile(dir=c.runtime_root, prefix='unit-backup-', suffix='.service', mode='wb', delete=False) as backup:
                     backup.write(UNIT_PATH.read_bytes())
@@ -1084,6 +1209,10 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
             temp = UNIT_PATH.with_suffix('.service.tmp')
             temp.write_text(unit)
             temp.chmod(0o644)
+            if monitor_unit is not None:
+                monitor_temp=monitor_path.with_suffix('.service.tmp')
+                monitor_temp.write_text(monitor_unit);monitor_temp.chmod(0o644)
+                os.replace(monitor_temp,monitor_path)
             os.replace(temp, UNIT_PATH)
             run('systemctl', 'daemon-reload')
             record(c, 'stopped', operation_fd=lock.fileno(),promote_lp_nonce=nonce)
@@ -1097,7 +1226,7 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
                     record(c, 'stopped', operation_fd=lock.fileno())
                 return {'status':'STOPPED', 'git_sha':c.expected_sha}
             verified_record(c, ('ready','maintenance','failed'))
-            live = live_identity(c)
+            live = live_identity(c,allow_absent_monitor=True)
             record(c, 'maintenance', ready=live, operation_fd=lock.fileno())
             run('systemctl', 'stop', UNIT, timeout=100)
             absent(c)
@@ -1119,7 +1248,7 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
                     require_prepared=operation_nonce is not None,extras=extras)
             if current['MainPID']!='0':
                 verified_record(c,('ready','maintenance','failed'))
-                live=live_identity(c)
+                live=live_identity(c,allow_absent_monitor=True)
                 record(c,'maintenance',ready=live,operation_fd=lock.fileno())
                 if c.mode=='production':_prepared_lp_validation(c,nonce)
                 run('systemctl','stop',UNIT,timeout=100)
