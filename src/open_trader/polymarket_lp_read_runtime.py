@@ -135,6 +135,7 @@ class _Scope:
         self.started=self.deadline=0;self.actual_end=None;self.expired=False;self.cancel_sent=False;self.fault=False;self.fault_pending=False
         self.financial_cleanup_delayed=False
         self.financial_wait_capture=None
+        self.financial_health_recorded=False
         self.fault_detail=None
         self.last_sources=None
         self.delivered_ws=None
@@ -153,6 +154,9 @@ class LPReadRuntime:
         self._financial_cleanup_faults=0;self._last_financial_cleanup_fault=None
         self._last_financial_timeout=None
         self._financial_request_cleanup=None
+        self._financial_generation=0;self._pool_timeout_streak=0
+        self._engine_account_read=dict(account_id=None,last_success_at=None,consecutive_failures=0)
+        self._last_pool_rotation=None;self._retired_financial=None;self._financial_limits=None
         self._close_lock=threading.Lock()
         self._last_notice=None
         self._observed=-1;self._closed=False;self._started=False;self._signal=threading.Event();self._wakeup=lambda:None
@@ -641,12 +645,17 @@ class LPReadRuntime:
                                 if any(s.active and (s.demand.sources==('fills',))==fills for s in peers):continue
                             elif any(s.active for s in peers):continue
                         wait_owner=scope.port if scope.port is not None else self.source_factory
+                        if kind=='financial' and self._financial_limits is not None:
+                            not_before=max(self._financial_limits.not_before(p,scope.demand.account) for p in ('clob','data'))
+                            if self.clock()<not_before:
+                                scope.next_start=max(scope.next_start,not_before);continue
                         if callable(getattr(wait_owner,'not_before',None)):
                             providers={'gamma' if n=='metadata' else 'data' if n=='positions' else 'clob' for n in scope.demand.sources}
                             not_before=max((wait_owner.not_before(p,scope.demand.account) for p in providers),default=0)
                             if self.clock()<not_before:
                                 scope.next_start=max(scope.next_start,not_before);continue
                         scope.completed_sources={}
+                        scope.financial_health_recorded=False
                         self._attempt_sequence+=1;scope.attempt=self._attempt_sequence
                         scope.started=self.clock();scope.deadline=scope.started+(10 if kind=='reward_share' else 5)
                         scope.active=True;scope.actual_end=None;scope.expired=False;scope.cancel_sent=False
@@ -659,7 +668,11 @@ class LPReadRuntime:
                     for name,(port,lane) in self._fixed_ports.items():
                         if name not in self._fixed_closing:
                             self._fixed_closing.add(name);lane.submit(self._close_fixed(name,port))
-                done=self._closed and not self._scopes and len(self._fixed_closed)==len(self._fixed_ports) and self._ws_future is None
+                retired=self._retired_financial
+                if retired is not None and not retired['fault'] and self.clock()>=retired['started']+1:
+                    retired['fault']=self._fault_detail('financial','financial','delayed_read_cleanup')
+                    self._last_pool_rotation=dict(self._last_pool_rotation,close_state='delayed')
+                done=self._closed and not self._scopes and len(self._fixed_closed)==len(self._fixed_ports) and self._ws_future is None and retired is None
                 # A completion/deadline/coverage change wakes the business
                 # owner. Polling the clock alone must not create a 100 Hz loop.
                 notice=tuple((key,s.attempt,s.active,s.fault,s.retiring,s.closed,
@@ -711,6 +724,7 @@ class LPReadRuntime:
         scope.expired=True
         scope.last_sources=None
         if scope.demand.kind=='financial':
+            self._record_account_read(scope,{})
             self._last_financial_timeout=dict(attempt=scope.attempt,
                 observation_id=_location_text(scope.demand.observation_id,96),
                 observation_id_truncated=type(scope.demand.observation_id) is str and len(scope.demand.observation_id)>96,
@@ -794,6 +808,11 @@ class LPReadRuntime:
                         owned=self._fixed_ports.get(fixed)
                         if owned is None:
                             scope.port=self.source_factory(scope.demand)
+                            if fixed=='financial':
+                                if self._financial_limits is None:
+                                    self._financial_limits=getattr(scope.port,'provider_limits',None)
+                                elif hasattr(scope.port,'provider_limits'):
+                                    scope.port.provider_limits=self._financial_limits
                             self._fixed_ports[fixed]=(scope.port,scope.lane)
                         else:scope.port=owned[0]
                         self._fixed_kinds[fixed]=scope.demand.kind
@@ -835,6 +854,7 @@ class LPReadRuntime:
 
     def _ended(self,scope,sources):
         scope.active=False;scope.actual_end=self.clock()
+        self._record_account_read(scope,sources)
         # A book-only completion cannot heal a failed required refresh, an
         # expired attempt, or an incomplete reward catalog using older facts.
         scope.last_sources=None
@@ -855,6 +875,60 @@ class LPReadRuntime:
                     ended_monotonic=scope.actual_end)
         scope.next_start=max(scope.started+({'sell':30,'position':60,'reward_share':30}.get(scope.demand.kind,5)),
             scope.actual_end,*(s.retry_at or 0 for s in sources.values()))
+        if scope.demand.kind=='financial' and not scope.retiring:
+            errors={s.error for s in sources.values() if s.error}
+            self._pool_timeout_streak=(min(3,self._pool_timeout_streak+1)
+                if not scope.expired and errors=={'PoolTimeout'} else 0)
+            if self._pool_timeout_streak==3 and self._retired_financial is None:
+                self._rotate_financial(scope)
+
+    def _record_account_read(self,scope,sources):
+        if scope.demand.kind!='financial' or scope.retiring or scope.financial_health_recorded:return
+        scope.financial_health_recorded=True
+        account=scope.demand.account.casefold()
+        previous=self._engine_account_read
+        if previous['account_id']!=account:
+            previous=dict(account_id=account,last_success_at=None,consecutive_failures=0)
+        now=self.utc_now()
+        stamps=[s.checked_at for s in sources.values()]
+        valid=(not scope.expired and set(sources)==set(_FINANCIAL_SOURCES)
+            and all(s.complete and not s.error for s in sources.values())
+            and all(isinstance(t,datetime) and t.utcoffset() is not None and t<=now for t in stamps))
+        self._engine_account_read=dict(account_id=account,
+            last_success_at=min(stamps).astimezone(UTC).isoformat() if valid else previous['last_success_at'],
+            consecutive_failures=0 if valid else min(999999999,previous['consecutive_failures']+1))
+
+    def _rotate_financial(self,scope):
+        port=scope.port
+        pools=[]
+        try:pools=port.financial_pool_status()
+        except Exception:pass
+        self._financial_generation+=1;self._pool_timeout_streak=0
+        self._last_pool_rotation=dict(generation=self._financial_generation,attempt=scope.attempt,
+            reason='pool_wait_timeout',at=self.utc_now().isoformat(),pools=pools,close_state='pending')
+        import logging
+        logging.getLogger(__name__).warning('prediction_lp_financial_pool_rotation %s',
+            json.dumps(self._last_pool_rotation,sort_keys=True))
+        self._fixed_ports.pop('financial',None)
+        # All scopes sharing this lane must reacquire the new group, including retired scopes.
+        for peer in self._scopes.values():
+            if peer.port is port:peer.port=None
+        retired=dict(port=port,started=self.clock(),fault=None,task=None)
+        self._retired_financial=retired
+        retired['task']=scope.lane.submit(self._close_retired_financial(retired))
+
+    async def _close_retired_financial(self,retired):
+        try:await retired['port'].aclose()
+        except BaseException:
+            with self._lock:
+                retired['fault']=self._fault_detail('financial','financial','port_close_failure')
+                self._last_pool_rotation=dict(self._last_pool_rotation,close_state='failed')
+        else:
+            with self._lock:
+                self._retired_financial=None
+                self._last_pool_rotation=dict(self._last_pool_rotation,close_state='closed')
+        finally:self.wake();self._notify()
+
 
     async def _close_scope(self,scope):
         try:
@@ -944,14 +1018,18 @@ class LPReadRuntime:
             owned=[s for s in self._scopes.values() if s.demand.kind in ('buy','income')]
             ports=[s.port for s in owned if s.port is not None and not s.closed]
             ports.extend(p for key,(p,_) in self._fixed_ports.items() if key not in self._fixed_closed)
+            retired=self._retired_financial
+            if retired is not None:ports.append(retired['port'])
             pools=sum(len(set(port.clients.values())) for port in ports)
             ws_tasks=(self._ws.managed_tasks() if self._ws is not None else 0)+int(self._ws_close is not None and not self._ws_close.done())
             managed=ws_tasks+sum(s.active+sum(not t.done() for t in s.tasks)+(s.closing and not s.closed)
                 for s in self._scopes.values())+len(self._fixed_closing-self._fixed_closed)
-            faults=sum(s.fault for s in self._scopes.values())+len(self._fixed_faults)
-            fixed_faults=bool(self._fixed_faults-{'reward_share'}) or any(s.fault and s.demand.kind not in ('buy','income','reward_share') for s in self._scopes.values())
+            retired_fault=retired['fault'] if retired is not None else None
+            managed+=int(retired is not None and (retired['task'] is None or not retired['task'].done()))
+            faults=sum(s.fault for s in self._scopes.values())+len(self._fixed_faults)+bool(retired_fault)
+            fixed_faults=bool(retired_fault) or bool(self._fixed_faults-{'reward_share'}) or any(s.fault and s.demand.kind not in ('buy','income','reward_share') for s in self._scopes.values())
             # Put blockers first so a full BUY lane cannot hide a fixed fault.
-            details=[self._fixed_fault_details[name] for name in sorted(self._fixed_faults)]
+            details=([retired_fault] if retired_fault else [])+[self._fixed_fault_details[name] for name in sorted(self._fixed_faults)]
             details.extend(s.fault_detail for buy in (False,True) for s in self._scopes.values()
                 if s.fault and (s.demand.kind in ('buy','income'))==buy)
             block_reasons=tuple(reason for reason,active in (
@@ -975,11 +1053,15 @@ class LPReadRuntime:
                 last_financial_cleanup_fault=self._last_financial_cleanup_fault,
                 last_financial_timeout=self._last_financial_timeout,
                 financial_request_cleanup=self._financial_request_cleanup,
+                engine_account_read=self._engine_account_read,
+                financial_pool=dict(generation=self._financial_generation,
+                    consecutive_pool_timeouts=self._pool_timeout_streak,last_rotation=self._last_pool_rotation,
+                    retired_groups=int(retired is not None)),
                 retiring_buy_scopes=sum(s.retiring for s in owned),deferred_count=len(deferred),
                 deferred_order_ids=tuple(d.order_id for d in deferred[:64]),new_buy_allowed=len(owned)<self.buy_cap and not deferred and not fixed_faults,
                 ready_buy_count=sum(s.result is not None or s.fault_pending for s in owned),
                 ready_count=sum(s.result is not None or s.fault_pending for s in self._scopes.values()),
-                pool_count=pools,pool_limit=2*self.buy_cap+6,connection_limit=4*self.buy_cap+10+int(self._ws_future is not None),managed_tasks=managed,
+                pool_count=pools,pool_limit=2*self.buy_cap+6+2*int(retired is not None),connection_limit=4*self.buy_cap+10+3*int(retired is not None)+int(self._ws_future is not None),managed_tasks=managed,
                 scopes=tuple(dict(key=s.demand.key,kind=s.demand.kind,attempt=s.attempt,started=s.started,next_start=s.next_start,
                     active=s.active,retiring=s.retiring,cleanup_fault=s.fault) for s in self._scopes.values())))
 

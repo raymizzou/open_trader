@@ -122,6 +122,7 @@ def test_monitor_orders_and_pools_share_one_snapshot(tmp_path, monkeypatch):
         def observe(seconds,*,full=False,missing=False,targets=None):
             at=origin+timedelta(seconds=seconds);auto=deepcopy(captured)
             member=auto['observed_pools']['current_membership'];member['observed_at']=at.isoformat()
+            auto['diagnostics']['async_reads']['engine_account_read']['last_success_at']=at.isoformat()
             if full:
                 for row in member['orders']:
                     if row['order_id']=='old-F':row['pool']='income'
@@ -150,7 +151,7 @@ def test_monitor_missing_sources_remain_unknown(tmp_path, monkeypatch):
         assert empty['balance']['status'] == 'unknown'
         assert empty['fills']['hour']['count'] is None
         assert empty['cancellations']['hour']['success'] is None
-        assert rig.execution.lp_monitor_summary(now=now+timedelta(seconds=299))['balance']['status'] == 'unknown'
+        assert rig.execution.lp_monitor_summary(now=now+timedelta(seconds=299))['balance']['status'] == 'abnormal'
         assert rig.execution.lp_monitor_summary(now=now+timedelta(seconds=300))['balance']['status'] == 'abnormal'
         rig.execution._store = saved_store
         # Recover from complete current sources. An explicit observed zero is known.
@@ -360,6 +361,7 @@ def test_monitor_pool_runtime_and_candidate_thresholds(tmp_path, monkeypatch):
             at=now+timedelta(seconds=seconds)
             fresh=deepcopy(auto)
             fresh['observed_pools']['current_membership']['observed_at']=at.isoformat()
+            fresh['diagnostics']['async_reads']['engine_account_read']['last_success_at']=at.isoformat()
             value=summarize(fresh,failed,at,monitor)
             assert value['status']==expected
             assert value['candidate_last_success_at']==now.isoformat()
@@ -539,7 +541,9 @@ def test_monitor_explains_read_cleanup_fault_and_recovery():
     assert blocked['pools']['status'] == 'abnormal'
     assert blocked['pools']['reason'] == '读取清理故障，暂停新增 BUY'
     assert blocked['pools']['read_health'] == dict(status='abnormal', reason='读取清理故障，暂停新增 BUY',
-        cleanup_fault_details=dict(total=1, omitted=0, items=[item]), new_buy_block_reasons=['cleanup_fault'])
+        cleanup_fault_details=dict(total=1, omitted=0, items=[item]), new_buy_block_reasons=['cleanup_fault'],
+        engine_account_read=dict(status='unknown',reason='做市引擎账户读取状态未知',last_success_at=None,
+            consecutive_failures=None,age_seconds=None))
     assert blocked['orders'] == healthy['orders'] and blocked['balance'] == healthy['balance']
     retained = deepcopy(blocked)
     runtime['cleanup_faults'] = 0
@@ -549,7 +553,8 @@ def test_monitor_explains_read_cleanup_fault_and_recovery():
     recovered = summary(blocked_auto)
     assert recovered['pools']['status'] == healthy['pools']['status']
     assert recovered['pools']['reason'] == healthy['pools']['reason']
-    assert recovered['pools']['read_health']['status'] == 'normal'
+    assert recovered['pools']['read_health']['status'] == 'unknown'
+    assert recovered['pools']['read_health']['engine_account_read']['last_success_at'] is None
     assert blocked == retained  # no references to subsequently changed input
     assert summary()['pools']['read_health']['status'] == 'unknown'
     good = dict(cleanup_faults=1, new_buy_allowed=False, new_buy_block_reasons=['cleanup_fault'],

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-30 — LP account-read recovery and truthful monitor panels (#498 / #422)
+
+- Bound financial pool waits to three seconds and distinguish `PoolTimeout` from network/round timeouts. After three consecutive affected rounds, log bounded pool occupancy and rotate once; retain provider cooldowns, actual close ownership and financial UNKNOWN gates. A delayed or failed retired group remains visible and bounds further replacements. This mitigates saturation; the historic unreleased-connection cause remains unproven.
+- Show the engine's last complete account read and consecutive failures. More than 60 seconds without success reports the account-read failure. Preserve independently confirmed same-account dashboard balances and timestamps as display facts, with engine capacity still UNKNOWN. Report candidate refresh older than ten minutes before zero candidates; show stuck and unknown cancel totals, and downgrade only older-than-24-hour unknown requests proven absent from complete current same-account orders.
+- Give the read-only summary a 15-second upstream wait. An explicit private `lp_monitor_host` pairs the listener with the selected systemd service release and interpreter; installation remains stopped, later authorized lifecycle actions update both, and process checks reject mismatched identity. The listener receives a clean environment. No deployment, notification activation, trading-rule change or production acceptance is included.
+
 ## 2026-10-29 — Income-gap read-only test synchronization (#482 / PR #500)
 
 - Wait for previously admitted asynchronous reads to finish and publish at the frozen business clock before checking that read-only snapshots cause no new requests or trading changes. Preserve all diagnostic, detached-copy and negative assertions; production behavior is unchanged.

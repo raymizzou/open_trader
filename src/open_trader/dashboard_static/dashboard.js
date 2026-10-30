@@ -4917,17 +4917,21 @@ function lpMonitorCards(summary) {
     } else if (key === "pools") {
       big = `候选 ${text(data.eligible_candidates)}`;
       detail = pairs([["想开",data.desired_running],["实际开",data.effective_running],["致命错误",data.fatal],["候选上次刷新成功",data.candidate_last_success_at]]);
+      const engine = data.read_health?.engine_account_read || {};
+      detail += '<h4>引擎账户读取</h4>' + pairs([["最后成功时间",engine.last_success_at],
+        ["连续失败次数",engine.consecutive_failures],["距上次成功（秒）",engine.age_seconds],["读取说明",engine.reason]]);
       for (const [pool,name] of [["trial","试挂池"],["income","收益池"]]) {
         const row = data.items?.[pool] || {};
         detail += `<h4>${name}</h4>` + pairs([[summary?.orders?.counts_basis === "last_confirmed" ? "最近确认 / 目标" : "当前 / 目标",`${row.count ?? "未知"} / ${row.target ?? "未知"}`],["预算（USD）",row.budget_usd],
           ["已占用（USD）",row.used_usd],["最近补位或换单",row.last_change_at],["时间来源说明",row.last_change_reason]]);
       }
     } else if (key === "balance") {
-      big = `可用 $${text(data.capacity_usd)}`;
-      detail = pairs([["余额（USD）",data.balance_usd],["授权额度（USD）",data.allowance_usd],["还能用来挂单（USD）",data.capacity_usd],
+      big = `已确认余额 $${text(data.balance_usd)}`;
+      detail = pairs([["余额（USD）",data.balance_usd],["授权额度（USD）",data.allowance_usd],["引擎可用资金（USD）",data.capacity_usd],
         ["当前库存成本（USD）",data.inventory_cost_usd],["读取时间",data.checked_at]]);
     } else if (key === "cancellations") {
-      big = `卡单 ${data.hour?.success == null ? "未知" : text(data.stuck?.length)}`;
+      big = `卡单 ${data.hour?.success == null ? "未知" : text(data.stuck?.length)} · 结果未知 ${text(data.unknown_counts?.total)}`;
+      detail += pairs([["结果未知：24 小时内",data.unknown_counts?.recent],["结果未知：更早",data.unknown_counts?.older]]);
       for (const [window,name] of [["hour","最近一小时"],["today","Tokyo 今天"]]) {
         const row = data[window] || {};
         detail += `<h4>${name}</h4>` + pairs([["已确认撤完",row.success],["被拒",row.rejected],["结果未知",row.unknown],["被拦下",row.blocked]]);

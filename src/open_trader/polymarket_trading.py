@@ -2736,7 +2736,8 @@ class PolymarketTradingClient:
                 if demand.kind=='exact' else {'clob':1} if demand.kind=='reward_share' else {'gamma':1,'clob':3})
             clients={service:httpx.AsyncClient(base_url=getattr(environment,service+'_url'),
                 limits=httpx.Limits(max_connections=size,max_keepalive_connections=size),
-                timeout=None,transport=transport,follow_redirects=False) for service,size in sizes.items()}
+                timeout=httpx.Timeout(None,pool=3) if demand.kind=='financial' else None,
+                transport=transport,follow_redirects=False) for service,size in sizes.items()}
             return LPAsyncSourcePort(clients,clock=clock,utc_now=utc_now,provider_limits=limits,
                 auth_resolver=auth,signature_type=signature,spender=environment.standard_exchange)
         factory.not_before=limits.not_before
