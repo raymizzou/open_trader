@@ -8,6 +8,14 @@
 - Show the engine's last complete account read and consecutive failures. More than 60 seconds without success reports the account-read failure. Preserve independently confirmed same-account dashboard balances and timestamps as display facts, with engine capacity still UNKNOWN. Report candidate refresh older than ten minutes before zero candidates; show stuck and unknown cancel totals, and downgrade only older-than-24-hour unknown requests proven absent from complete current same-account orders.
 - Give the read-only summary a 15-second upstream wait. An explicit private `lp_monitor_host` pairs the listener with the selected systemd service release and interpreter; installation remains stopped, later authorized lifecycle actions update both, and process checks reject mismatched identity. The listener receives a clean environment. No deployment, notification activation, trading-rule change or production acceptance is included.
 
+## 2026-10-30 — Paused-route manual-order fixture book (#499)
+
+- Include the existing manual BUY price in the paused HTTP scenario's offline order book. This keeps the read-only route test from triggering unrelated queue-data protection on an inconsistent fixture. Preserve zero POST/CANCEL assertions, normal LP startup and protection, and the earlier SQL test clock repair; production behavior is unchanged.
+
+## 2026-10-30 — SQL protection test clock synchronization (#482 / PR #499)
+
+- Freeze the SQL protection fixture clock after setup reads have published their actual source timestamps. Slow setup can no longer move partial-fill facts behind the accepted account watermark. Preserve all state-responsiveness, current-fact, cancellation identity, no-replay and watchdog assertions; production behavior is unchanged.
+
 ## 2026-10-29 — Income-gap read-only test synchronization (#482 / PR #500)
 
 - Wait for previously admitted asynchronous reads to finish and publish at the frozen business clock before checking that read-only snapshots cause no new requests or trading changes. Preserve all diagnostic, detached-copy and negative assertions; production behavior is unchanged.
@@ -18,6 +26,11 @@
 - Promote only fresh, finite positive measured yields. A mature zero remains a valid measurement and clears the existing 600-second trial timeout, but reports `zero_yield` instead of promoting.
 - Replace only the worst income order when a strictly better trial qualifies. Preserve retained exact orders and amounts; cancel the entrant's old trial order and wait for actual release before buying in the available fixed 50/30/20 slot.
 - Wait 120 process-observed seconds for each exact managed order before counting a D2 sample. New orders start a fresh window; original source timestamps, sample freshness, protection and restart boundaries remain unchanged. No deployment or mode activation is included.
+
+## 2026-10-29 — Normal WS connection Smoke log check (#487)
+
+- Allow empty `exception_class` metadata only on the exact normal LP order-book connected or closed-disconnected record, with the real message marker and an INFO producer prefix or no prefix. Keep all other fields, prefixes and log lines under the existing error checks.
+- Preserve rejection of real exceptions, malformed records and missing runtime evidence. This checker-only repair does not change the recorded Tokyo Smoke failure or establish a new live Smoke result.
 
 ## 2026-10-29 — LP telemetry test log synchronization (#495)
 
