@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-30 — Reward-share isolation fixture clock phases (#491 / PR #493)
+
+- Wait for healthy BUY, financial, exact and SELL reads to finish their current phase before advancing the fixture clock. Preserve the reward-share timeout, cleanup isolation, cadence, all assertions and watchdogs; production behavior is unchanged.
+
 ## 2026-10-30 — Paused-route manual-order fixture book (#499)
 
 - Include the existing manual BUY price in the paused HTTP scenario's offline order book. This keeps the read-only route test from triggering unrelated queue-data protection on an inconsistent fixture. Preserve zero POST/CANCEL assertions, normal LP startup and protection, and the earlier SQL test clock repair; production behavior is unchanged.
@@ -24,6 +28,10 @@
 - Allow empty `exception_class` metadata only on the exact normal LP order-book connected or closed-disconnected record, with the real message marker and an INFO producer prefix or no prefix. Keep all other fields, prefixes and log lines under the existing error checks.
 - Preserve rejection of real exceptions, malformed records and missing runtime evidence. This checker-only repair does not change the recorded Tokyo Smoke failure or establish a new live Smoke result.
 
+## 2026-10-29 — Synchronize pool fixture account clock phases (#491 / PR #493)
+
+- Finish each setup round's account publication and publish its next read ticket before advancing the fixture clock. Preserve the original cancellation, current-account, wake and final-proof assertions and watchdogs; production behavior is unchanged.
+
 ## 2026-10-29 — LP telemetry test log synchronization (#495)
 
 - Wait for each missing-context read's asynchronous log capture before checking diagnostic reasons and public fields. Preserve all existing assertions and production behavior; REST completion does not imply that its queued log has been emitted.
@@ -32,6 +40,21 @@
 
 - Partition actual shadow BUY REST completions without comparison context into nine finite diagnostic causes. Publish counts and fractions of missing reads, and add the chosen cause to the existing safe missing-context log event.
 - Capture unchanged owner/runtime rejection guards with bounded, current-demand provenance. Preserve context admission, all existing counters, UNKNOWN and acceptance gates, source timestamps and off/use behavior. Earlier 8200 live counts cannot be split retroactively; no deployment, mode activation or acceptance claim is included.
+
+## 2026-10-29 — Publish native-cancel fixture JSON atomically (#491 / PR #493)
+
+- Write the independent-cancel shutdown fixture marker to a same-directory temporary file before replacing its final JSON path. Preserve the existing payload, lifecycle assertions, watchdogs and timeouts; readers no longer see a partially written marker. Production behavior is unchanged.
+
+## 2026-10-29 — Seal queued exact reads during pool rotation (#491 / PR #493)
+
+- Bind fixed-lane ownership at admission, including exact reads whose coroutine has not yet bound an HTTP port. Seal queued peers when their generation rotates, and recheck generation before client binding or child-read registration. Keep original timeout mailboxes and complete results unchanged; sealed attempts cannot issue late reads or publish complete facts.
+- Preserve original request/order identities, actual cleanup/close ownership, resource counts, financial UNKNOWN, cooldown and no replay. Add a controlled public-boundary queued-fills regression; no trading or deployment permission changes.
+
+## 2026-10-29 — Recover fixed LP read pools after timeouts (#491)
+
+- Close the whole financial or exact-query HTTP client generation when a five-second attempt still owns unfinished reads. Reuse healthy clients; allow replacement only after original reads and full client closure finish. Keep the old generation in resource counts until its original source/response cleanup ends. Preserve pool sizes, provider Retry-After, original timeout identities, UNKNOWN financial admission and actual shutdown ownership. A failed or stalled client close remains a cleanup fault and cannot create unlimited replacements.
+- Limit repeated cancellation-refusal logs to one per exact order per rolling minute, with cumulative rejected count while its bounded entry is retained. Continue counting every refusal and preserve stale-fact rejection, native cancellation guards and no replay. Logging runs outside the state lock and cannot grant a mutation.
+- Show `账户挂单/余额读取卡住 N 分钟` in monitor orders and pools after an observed financial timeout streak exceeds one minute. Bind the diagnostic to the current account/process/generation, reject missing or stale evidence and clear it only after fresh complete current reads. Unknown counts and balances stay unknown. No merge, deployment or production activation is included.
 
 ## 2026-10-29 — LP shadow evidence ordering and CI fixture phases (#487 / PR #492)
 

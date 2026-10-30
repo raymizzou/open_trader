@@ -117,7 +117,7 @@ def test_financial_cleanup_completion_restores_existing_reader(source):
         assert not boundary.close_exited.is_set()
         boundary.close_release.set()
         assert boundary.close_exited.wait(4)
-        # A fresh complete attempt must emerge from the same owned port/client.
+        # A fresh complete attempt follows actual child exit and old-client closure.
         recovered = collect(runtime, boundary, lambda rows: any(r.complete for r in rows))
         assert len(recovered) == 1 and recovered[0].complete
         fresh = recovered[0]
@@ -125,7 +125,9 @@ def test_financial_cleanup_completion_restores_existing_reader(source):
         assert set(fresh.sources) == set(FINANCIAL)
         assert all(r.complete and not r.error and r.checked_at == clock.utc() for r in fresh.sources.values())
         assert all(fresh.sources[name].source_id != old_ids[name] for name in FINANCIAL)
-        assert len(boundary.ports) == 1 and len(boundary.clients) == 2
+        assert len(boundary.ports) == 2 and len(boundary.clients) == 4
+        assert all(c.is_closed for c in boundary.clients[:2])
+        assert all(not c.is_closed for c in boundary.clients[2:])
         assert len(boundary.requests) == 6 and runtime.drain_results() == ()
         status = runtime.status()
         assert status['cleanup_faults'] == 0 and status['new_buy_allowed']
@@ -279,7 +281,9 @@ def test_scheduled_financial_recovery_restores_current_facts(tmp_path, mode):
         assert runtime.status()['cleanup_faults'] == 0
         assert runtime.status()['financial_cleanup_faults'] == 1
         assert runtime.status()['last_financial_cleanup_fault']['ended_monotonic'] == 67
-        assert len(boundary.clients) == 2 and len(boundary.ports) == 1
+        assert len(boundary.clients) == 4 and len(boundary.ports) == 2
+        assert all(c.is_closed for c in boundary.clients[:2])
+        assert all(not c.is_closed for c in boundary.clients[2:])
         assert all(sum(s == source and stamp == 67 for s, stamp in boundary.requests) == 1 for source in FINANCIAL)
         assert live.rounds.snapshot().active_batch_id is None
         assert trading.cancels == [('A',)]
@@ -344,7 +348,9 @@ def test_financial_recovery_preserves_mailbox_and_provider_cooldown():
         set_time(runtime, boundary, clock, 20)
         boundary.wait(lambda: len(boundary.requests) == 6)
         assert financial_scope(runtime)['attempt'] > old and financial_scope(runtime)['started'] == 20
-        assert len(boundary.clients) == 2 and runtime.drain_results() == ()
+        assert len(boundary.clients) == 4 and len(boundary.ports) == 2 and runtime.drain_results() == ()
+        assert all(c.is_closed for c in boundary.clients[:2])
+        assert all(not c.is_closed for c in boundary.clients[2:])
         assert runtime.close(.02) is False
         assert boundary.close_entered.wait(4) and not boundary.close_exited.is_set()
         assert any(not client.is_closed for client in boundary.clients)

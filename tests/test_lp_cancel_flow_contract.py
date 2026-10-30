@@ -1051,3 +1051,61 @@ def test_native_cancel_registration_cannot_interrupt_protection(tmp_path, monkey
     finally:
         native_gate.set()
         rig.close()
+
+
+def test_stale_protection_cancel_logs_once_per_order_per_minute(tmp_path, monkeypatch, caplog):
+    """Refusal still uses the real current-order gate, without native requests."""
+    import logging
+    from datetime import timedelta
+    rig = CancelRig(tmp_path, monkeypatch)
+    # The synchronous source reader owns retry deadlines as well as the live
+    # owner. Use its public clock seam before introducing the external failure.
+    assert rig.live.reader.close(timeout=4)
+    rig.live.reader = MarketReader(rig.adapter.lp_reader_source_port(), clock=lambda:rig.seconds[0])
+    try:
+        for name in 'AB':
+            rig.market(name)
+            rig.add_order(name, '8', order_id=name)
+        rig.live.run_once()
+        keys = {o.key[3]:o.key for o in rig.live.state.snapshot().active_orders}
+        original_read = rig.sdk.list_open_orders
+        def unavailable(**kwargs):
+            raise OSError('external account read unavailable')
+        rig.sdk.list_open_orders = unavailable
+        rig.live.run_once()
+        assert not rig.live.state.snapshot().observation.orders_complete
+        original = rig.live.diagnostics()['cancel_blocks']['total']
+        origin = rig.date[0]
+        caplog.set_level(logging.INFO, logger='open_trader.polymarket_lp_live_execution')
+        caplog.clear()
+        for stamp in (0, 1, 59.999):
+            rig.seconds[0] = stamp
+            rig.date[0] = origin + timedelta(seconds=stamp)
+            for name in 'AB':
+                with pytest.raises(ValueError, match='independent_cancel_not_current'):
+                    rig.live.cancel_independent(keys[name], reason='read_failure_limit')
+        logs = [r for r in caplog.records if r.msg == 'lp_cancel_blocked']
+        assert len(logs) == 2
+        assert {r.order_key for r in logs} == set(keys.values())
+        assert rig.live.diagnostics()['cancel_blocks']['total'] == original + 6
+        rig.seconds[0] = 60
+        rig.date[0] = origin + timedelta(seconds=60)
+        for name in 'AB':
+            with pytest.raises(ValueError, match='independent_cancel_not_current'):
+                rig.live.cancel_independent(keys[name], reason='read_failure_limit')
+        logs = [r for r in caplog.records if r.msg == 'lp_cancel_blocked']
+        assert len(logs) == 4
+        assert [r.rejected_count for r in logs] == [1, 1, 4, 4]
+        blocks = rig.live.diagnostics()['cancel_blocks']
+        assert blocks['total'] == original + 8
+        assert blocks['by_reason']['independent_cancel_not_current'] >= 8
+        assert rig.sdk.cancels == []
+        assert [r for r in action_rows(rig.store) if r['kind'] == 'CANCEL'] == []
+        # Restored facts use the existing reader; the original account gate has
+        # not been relaxed and the logger never manufactures a request.
+        rig.sdk.list_open_orders = original_read
+        rig.live.run_once()
+        assert rig.live.state.snapshot().observation.orders_complete
+        assert rig.sdk.cancels == []
+    finally:
+        rig.close()

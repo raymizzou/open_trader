@@ -77,6 +77,15 @@ def test_reward_share_runtime_cadence_and_failure_isolation():
             transport=httpx.MockTransport(http))),clock=clock,utc_now=clock.utc)
     runtime=LPReadRuntime(factory,clock=clock,utc_now=clock.utc);runtime.start()
     share=demand('share',kind='reward_share',sources=('reward_share',))
+    def finish_healthy_phase():
+        # A clock jump must not expire unrelated reads still unwinding on the
+        # account loop. Keep the held reward read and its timeout independent.
+        def complete():
+            status=runtime.status()
+            return status['observed_monotonic']==clock() and all(
+                not scope['active'] and scope['next_start']>clock()
+                for scope in status['scopes'] if scope['kind']!='reward_share')
+        boundary.wait(complete)
     try:
         runtime.reconcile((share,demand('duplicate',kind='reward_share',sources=('reward_share',)),
             demand('B'),demand('sell',kind='sell'),demand('O',kind='financial',sources=('balance','open_orders','positions')),
@@ -86,10 +95,12 @@ def test_reward_share_runtime_cadence_and_failure_isolation():
         assert all(r.complete for r in rows if r.demand.order_id in ('B','O','exact','sell'))
         clock.value=5;runtime.wake()
         assert not any(r.demand.kind=='reward_share' for r in runtime.drain_results())
+        finish_healthy_phase()
         clock.value=10;runtime.wake()
         expired=collect(runtime,boundary,lambda rows:any(r.demand.kind=='reward_share' for r in rows))
         row=next(r for r in expired if r.demand.kind=='reward_share')
         assert (row.started,row.deadline,row.reason)==(0,10,'timeout')
+        finish_healthy_phase()
         assert runtime.status()['new_buy_allowed'] is True
         clock.value=11;runtime.wake()
         boundary.wait(lambda:runtime.status()['cleanup_faults']==1)
@@ -99,6 +110,7 @@ def test_reward_share_runtime_cadence_and_failure_isolation():
         clock.value=15;runtime.wake()
         healthy=collect(runtime,boundary,lambda rows:any(r.demand.order_id=='B' and r.started==15 for r in rows))
         assert any(r.demand.order_id=='B' and r.complete for r in healthy)
+        finish_healthy_phase()
         release.set()
         boundary.wait(lambda:not any(s['active'] for s in runtime.status()['scopes'] if s['kind']=='reward_share'))
         clock.value=29.999;runtime.wake()

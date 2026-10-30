@@ -1203,9 +1203,11 @@ def child(runtime_root,port,scenario,config_path,*,control=None):
             def observe_ci_stop(runtime):
                 result=native_ci_begin_stop(runtime)
                 if (events/'ci-cancel-entered').exists() and not (events/'ci-cancel-ended').exists():
-                    (events/'ci-native-stopping.json').write_text(json.dumps(dict(state=runtime.state,
+                    temp=events/'ci-native-stopping.new'
+                    temp.write_text(json.dumps(dict(state=runtime.state,
                         production_owner=runtime.production_owner,store_retained=runtime.store is ci_resources[0][0],
                         lp_retained=runtime.lp is ci_resources[0][1],client_retained=runtime._prediction_trading is adapter)))
+                    temp.replace(events/'ci-native-stopping.json')
                 return result
             patch.setattr(ci_runtime.PredictionRuntime,'begin_stop',observe_ci_stop)
             from open_trader.polymarket_lp_live_execution import LPD2LiveExecution
