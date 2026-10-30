@@ -306,3 +306,48 @@ OQ1 要求同进程 shadow 连续7200秒、观测间隔<=10秒、至少30个不�
 关闭释放相关标记，新上下文不等待旧标记，status 只读数量不推进期限。
 原六变体及新增公开生命周期保护已局部验证，不构成东京实际两小时、正式 CI、独立评审、
 部署或启用证明；这些外部门禁仍未验证/执行，验收权限仍属 Main/Ray。
+
+
+## 固定读取通道超时后整池轮换（2026-10-29，#491）
+
+本修订替代上文 2026-10-23 financial 延迟清理恢复时「复用原客户端与连接池」的规则，
+也适用于共享客户端的 exact order / fills。历史决定与证据保留；独立 source 调用的同池取消清理、
+low、BUY/income、GET 签名范围、池大小及五秒期限不变。
+
+financial 或 exact 期限到达且仍有来源任务未退出时，封存原 attempt 的 incomplete/UNKNOWN，
+取消未完成读取，并关闭该固定通道的整个端口及其所有 HTTP 客户端。健康完整轮次继续复用。
+轮换期间不向旧 generation 接纳新读取；同客户端的在途 exact peer 保留自己的请求/订单身份，
+未完成 peer 封存 pool_rotated，不发布关闭后的迟到事实。已经完成的结果和原 timeout/fault 邮箱不被覆盖。
+
+2026-10-29，PR #493 queued-exact 复核：准入时即记录固定通道的代际所有权，不能等协程开始后
+才由 port 判断归属。整代封存包含已 active 但尚无 port/tasks 的排队 owner；其原起点、期限、
+订单/请求身份保持，发布 incomplete/pool_rotated，不运行该 attempt 的迟到 HTTP 读取。
+协程迟启动时在现有锁下复核该代是否已轮换/关闭或 attempt 已封存，再绑定客户端并登记来源任务。
+全部旧 owner 实际结束且客户端关闭成功后才推进代际；原 timeout 与已完成邮箱不改写，
+失败关闭故障、UNKNOWN、Retry-After、资源上限和 no-replay 不因该补充放宽。
+
+只有全部原始子读取（包括响应关闭）实际退出，且整个端口 aclose 成功结束后，下一次符合条件的
+读取才新建客户端。取消、Future 完成或 HTTPX is_closed 标志本身均不替代这一边界。
+即使客户端 aclose 已完成，只要原 source/response 清理仍实际在途，pool_count 仍计入该旧 generation；
+全部原所有者退出后才释放这部分计数。状态查询只复制实际所有权，不触发网络、换池或权限变更。
+provider/account Retry-After 与起点节奏仍限制下一次读取；无需求或 shutdown 不触发恢复读取。
+客户端关闭的宽限从 aclose 实际开始计时，排在阻塞 I/O loop 后的关闭仍归原来源清理所有权。
+关闭失败或超过现有一秒清理宽限时保留 port_close_failure/cleanup_fault 和实际资源，不无限轮换。
+financial 的延迟来源清理故障仍须全部子读取实际退出才解除；exact 的延迟来源清理故障与关闭故障
+保持既有锁存，不借客户端轮换解除。故障仍在时，下一次读取不具备重试资格。
+
+保护撤单的事实过期拒绝规则不变。同一账户、精确订单的重复拒绝日志，在滚动六十秒内最多一行，
+带保留记录内的累计 rejected_count；全部拒绝仍计入总量、原因计数及最近诊断。
+日志预留与计数在状态锁内完成，实际日志在锁外写出；日志失败不能放行 mutation。
+最多保留 256 个日志身份，不能为新身份驱逐仍处于六十秒窗口的记录；满额时省略该新身份日志，
+诊断仍计数。过期记录可被替换，其累计次数不冒充永久审计；真实 CANCEL 请求审计与 no-replay 不变。
+
+runtime 从当前账户/process/generation 的真实超时事件维护一个有界 streak；使用不可逆身份摘要，
+不发布原账户或 epoch。只有新鲜、完整且身份仍当前的 financial 成功清除 streak；旧结果不能恢复健康。
+只读 status 给出已观察 elapsed_seconds、超时次数及观察时间；live 另按当前 owner 投影期望身份。
+monitor 核对账户摘要、当前 owner、合法时间和至多六十秒的快照年龄，不从历史 last_financial_timeout
+或查询间隔推断故障。真实 elapsed_seconds 超过六十秒时，orders/pools 显示
+「账户挂单/余额读取卡住 N 分钟」，N 为已观察整分钟且至少一。
+完整成功恢复后仍保留历史 timeout 诊断，但不再显示当前读取卡住。
+致命错误、想开而未实际运行及停止状态保留原优先级；挂单数量、余额缺失仍为 UNKNOWN，
+该观察不授予 BUY 或 CANCEL 权限，也不增加通知服务、调度器或生产操作。

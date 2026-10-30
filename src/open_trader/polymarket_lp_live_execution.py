@@ -437,6 +437,7 @@ class LPD2LiveExecution:
         self._rotation_summary = None
         self._rotation_pending = ()
         self._cancel_blocks = freeze(dict(total=0, by_reason={}, recent=()))
+        self._cancel_block_logs = {}
         self._rotation_cancel_backoffs = {}
         self._pool_next = 'trial'
         self._pool_pending = set()
@@ -2019,6 +2020,9 @@ class LPD2LiveExecution:
                     result['async_reads']['failures']=dict(total=len(snapshot.read_failures),
                         recent=[dict(order_id=key[3][:96],consecutive_failures=f.consecutive_failures,reason_codes=f.reason_codes)
                             for key,f in list(snapshot.read_failures.items())[:20]])
+                    from .polymarket_lp_read_runtime import financial_read_identity
+                    result['async_reads']['financial_identity']=financial_read_identity(
+                        self.account_id,self.process_epoch,snapshot.current.cycle_generation)
                     result['async_reads']['persistence_error']=self._read_store_error
                 result['local_outcomes'] = self._diagnostic_outcomes
                 result['cancel_blocks'] = diagnostic_json_copy(self._cancel_blocks)
@@ -2631,10 +2635,13 @@ class LPD2LiveExecution:
                 self._record_cancel_block('rotation_not_current', phase='before_request', order_key=order.key)
                 outcomes.append(RotationOutcome(order.key, 'not_sent', 'rotation_not_current'))
                 continue
+            logs = []
             with self.state._lock:
-                if self._rotation_cancel_backoff(decision, order):
-                    outcomes.append(RotationOutcome(order.key, 'suppressed', 'cancel_backoff'))
-                    continue
+                suppressed = self._rotation_cancel_backoff(decision, order, _log_records=logs)
+            self._emit_cancel_block_logs(logs)
+            if suppressed:
+                outcomes.append(RotationOutcome(order.key, 'suppressed', 'cancel_backoff'))
+                continue
             try:
                 handle = self.cancel_independent(order.key, rotation_origin=(decision, order))
                 outcomes.append(RotationOutcome(order.key, 'pending' if handle else 'not_sent',
@@ -3234,12 +3241,13 @@ class LPD2LiveExecution:
                 last_current_evidence=self._last_current_evidence,
                 last_buy_uncertainty=self._last_buy_uncertainty)
 
-    def _record_cancel_block(self, reason, *, phase, order_key=None, request_id=None, generation=None, **details):
+    def _record_cancel_block(self, reason, *, phase, order_key=None, request_id=None, generation=None, _log_records=None, **details):
         """Bounded observations only; never invent a request for an early refusal."""
         if reason not in _CANCEL_BLOCK_REASONS:
             raise ValueError('cancel_block_reason_invalid')
         valid_key = (isinstance(order_key, tuple) and len(order_key) == 4
             and order_key[0] == self.account_id and all(type(v) is str and v for v in order_key))
+        log_record = None
         with self.state._lock:
             values = self._cancel_blocks
             counts = dict(values['by_reason'])
@@ -3253,9 +3261,45 @@ class LPD2LiveExecution:
                 sample['generation'] = generation
             self._cancel_blocks = freeze(dict(total=values['total']+1, by_reason=counts,
                 recent=(*values['recent'], sample)[-20:]))
-        logger.info('lp_cancel_blocked', extra=dict(process_epoch=self.process_epoch,
-            phase=phase, reason_code=reason, request_id=request_id,
-            order_key=order_key if valid_key else None, generation=generation, **details))
+            rejected_count = None
+            emit = True
+            if valid_key:
+                now = self._clock()
+                entry = self._cancel_block_logs.get(order_key)
+                if entry is None:
+                    if len(self._cancel_block_logs) >= 256:
+                        # Keep all live rolling-minute reservations. Under an
+                        # identity flood omit logs rather than evict a recent
+                        # order and let it print twice. Refusal diagnostics above
+                        # continue to count every refusal, including overflow.
+                        expired = next((key for key,value in self._cancel_block_logs.items()
+                            if now-value['last'] >= 60), None)
+                        if expired is not None:self._cancel_block_logs.pop(expired)
+                    if len(self._cancel_block_logs) < 256:
+                        entry = dict(last=now-60, count=0)
+                        self._cancel_block_logs[order_key] = entry
+                if entry is None:
+                    emit = False
+                else:
+                    entry['count'] += 1
+                    rejected_count = entry['count']
+                    emit = now-entry['last'] >= 60
+                    if emit:entry['last'] = now
+            if emit:
+                log_record = dict(process_epoch=self.process_epoch,
+                    phase=phase, reason_code=reason, request_id=request_id,
+                    order_key=order_key if valid_key else None, generation=generation,
+                    rejected_count=rejected_count, **details)
+        if log_record is not None:
+            if _log_records is not None:_log_records.append(log_record)
+            else:self._emit_cancel_block_logs((log_record,))
+
+    def _emit_cancel_block_logs(self, records):
+        # Callers holding state ownership stage immutable records and flush
+        # after leaving that ownership. Logging cannot change a refusal.
+        for record in records:
+            try:logger.info('lp_cancel_blocked', extra=record)
+            except Exception:pass
 
     def _rotation_cancel_key(self, decision, order):
         return (order.key[0], self.venue, *order.key[1:], decision.cycle_generation, order.terms_version)
@@ -3267,7 +3311,7 @@ class LPD2LiveExecution:
             if value['retry_at'] > now and key[5] == snapshot.current.cycle_generation
             and orders.get((key[0], *key[2:5])) == key[6]}
 
-    def _rotation_cancel_backoff(self, decision, order):
+    def _rotation_cancel_backoff(self, decision, order, *, _log_records=None):
         """Throttle unchanged never-sent targets, with no request or timer replay."""
         self._prune_rotation_cancel_backoffs()
         identity = self._rotation_cancel_key(decision, order)
@@ -3277,7 +3321,7 @@ class LPD2LiveExecution:
                 self._record_cancel_block('cancel_backoff', phase='before_request', order_key=order.key,
                     generation=decision.cycle_generation, original_reason=key[-1],
                     remaining_seconds=max(0., value['retry_at']-self._clock()),
-                    suppressed_count=value['suppressed_count'])
+                    suppressed_count=value['suppressed_count'], _log_records=_log_records)
                 return True
         return False
 
@@ -3295,19 +3339,20 @@ class LPD2LiveExecution:
                 return None
             raise ValueError('mutation_not_admitted')
         transferred = False
+        block_logs = []
         try:
             with self.state._lock:
                 if not isinstance(order_key, tuple) or len(order_key) != 4 or order_key[0] != self.account_id:
-                    self._record_cancel_block('independent_cancel_identity', phase='before_request')
+                    self._record_cancel_block('independent_cancel_identity', phase='before_request', _log_records=block_logs)
                     raise ValueError('independent_cancel_identity')
                 self._native_jobs = {k: h for k, h in self._native_jobs.items() if h._thread.is_alive()}
                 snapshot = self.state.snapshot()
                 if rotation_origin is not None and not self._rotation_current(*rotation_origin):
-                    self._record_cancel_block('rotation_not_current', phase='before_request', order_key=order_key)
+                    self._record_cancel_block('rotation_not_current', phase='before_request', order_key=order_key, _log_records=block_logs)
                     return None
                 if protection_origin is not None and not self._protection_cancel_origin_current(
                         snapshot, protection_key, protection_origin):
-                    self._record_cancel_block('protection_cancel_not_current', phase='before_request', order_key=order_key)
+                    self._record_cancel_block('protection_cancel_not_current', phase='before_request', order_key=order_key, _log_records=block_logs)
                     return None  # the original never-started ticket remains deferred
                 control = self._control_view()
                 observation = snapshot.observation
@@ -3327,20 +3372,20 @@ class LPD2LiveExecution:
                             current_order.order_type.value, _audit_expiration(current_order.expiration.value)) == (reference.price, reference.quantity,
                             reference.order_type, reference.expiration)))
                 if protection_key is not None and not protection:
-                    self._record_cancel_block('protection_cancel_not_current', phase='before_request', order_key=order_key)
+                    self._record_cancel_block('protection_cancel_not_current', phase='before_request', order_key=order_key, _log_records=block_logs)
                     return None
                 if (not (control.effective_running or protection) or control.fatal or observation is None
                         or not observation.orders_complete
                         or observation.cycle_generation != control.cycle_generation
                         or current_order is None):
-                    self._record_cancel_block('independent_cancel_not_current', phase='before_request', order_key=order_key)
+                    self._record_cancel_block('independent_cancel_not_current', phase='before_request', order_key=order_key, _log_records=block_logs)
                     raise ValueError('independent_cancel_not_current')
                 source = observation.order_view.orders_source
                 consumed = (source.source_id, source.checked_at)
                 if self._cancel_sources.get(order_key, ())[:2] == consumed:
                     return None
                 if (rotation_origin is not None and protection_key is None and protection_origin is None
-                        and self._rotation_cancel_backoff(*rotation_origin)):
+                        and self._rotation_cancel_backoff(*rotation_origin, _log_records=block_logs)):
                     return None
                 identity = ActionIdentity(str(uuid4()), self.account_id,
                     CancelTarget(self.venue, order_key[2], order_key[3]))
@@ -3372,8 +3417,10 @@ class LPD2LiveExecution:
                 transferred = True
                 return handle
         finally:
-            if not transferred:
-                lease.release()
+            try:
+                if not transferred:lease.release()
+            finally:
+                self._emit_cancel_block_logs(block_logs)
 
     def _protection_guard(self, snapshot, scope, orders, *, observation=False):
         return ProtectionGuard(scope, snapshot.current.cycle_generation,

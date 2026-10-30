@@ -2,6 +2,8 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from collections.abc import Mapping
+import hashlib
+import math
 from threading import RLock
 from zoneinfo import ZoneInfo
 
@@ -97,6 +99,33 @@ def read_health(auto, now, account_id=None):
         elif engine['status'] == 'attention' and cleanup['status'] == 'normal':
             result.update(status='attention', reason=engine['reason'])
     return result
+
+
+def financial_timeout_reason(auto, account_id, now):
+    """An active runtime event streak, bound by the current live owner.
+
+    Elapsed time is observed by the runtime. Never age a historical snapshot
+    into an outage or infer health from an old timeout record alone.
+    """
+    runtime=mapping(mapping(auto.get('diagnostics')).get('async_reads'))
+    streak=mapping(runtime.get('financial_timeout_streak'))
+    expected=mapping(runtime.get('financial_identity'))
+    identity=streak.get('identity')
+    fingerprint=streak.get('account_fingerprint')
+    observed=moment(streak.get('observed_at'))
+    elapsed=streak.get('elapsed_seconds')
+    count=streak.get('timeouts')
+    member=mapping(mapping(auto.get('observed_pools')).get('current_membership'))
+    if (type(account_id) is not str or not account_id
+            or type(identity) is not str or len(identity)!=64 or any(c not in '0123456789abcdef' for c in identity)
+            or fingerprint!=hashlib.sha256(account_id.casefold().encode()).hexdigest()
+            or identity!=expected.get('identity') or fingerprint!=expected.get('account_fingerprint')
+            or member.get('account_id',account_id)!=account_id
+            or streak.get('state')!='timed_out' or type(count) is not int or count<1
+            or type(elapsed) not in (int,float) or not math.isfinite(elapsed) or elapsed<0
+            or observed is None or not 0<=(now-observed).total_seconds()<=60):return None
+    if elapsed>60:return f'账户挂单/余额读取卡住 {max(1,int(elapsed//60))} 分钟'
+    return None
 
 
 def unknown_summary(now=None):
@@ -238,10 +267,17 @@ class LPMonitorSummary:
             engine = health['engine_account_read']
             if engine['status'] == 'abnormal':
                 result['orders'].update(status='abnormal', reason=engine['reason'])
+            timeout_reason = (financial_timeout_reason(auto, account_id, now)
+                if not auto.get('fatal') and auto.get('desired_running') is True
+                and auto.get('effective_running') is True else None)
+            if timeout_reason:
+                result['orders'].update(status='abnormal',reason=timeout_reason)
             if auto.get('fatal'):
                 pool_state, pool_reason = 'abnormal', '做市出现致命错误'
             elif auto.get('desired_running') is True and auto.get('effective_running') is False:
                 pool_state, pool_reason = 'abnormal', '做市想开但实际没开'
+            elif timeout_reason:
+                pool_state, pool_reason = 'abnormal', timeout_reason
             elif ((known or engine['status'] == 'abnormal') and auto.get('desired_running') is True and auto.get('effective_running') is True
                     and health['status'] == 'abnormal'):
                 pool_state, pool_reason = 'abnormal', health['reason']

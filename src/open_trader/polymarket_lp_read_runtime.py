@@ -1,11 +1,14 @@
 """Owned asynchronous LP reads. Business decisions remain with the live owner."""
 from dataclasses import dataclass, replace
 from collections.abc import Mapping
+from contextlib import nullcontext
 import time
 import asyncio
 import threading
 import json
 import gc
+import hashlib
+import math
 from collections import OrderedDict, deque
 from datetime import UTC, datetime
 from types import MappingProxyType, CoroutineType, GeneratorType, AsyncGeneratorType
@@ -130,6 +133,7 @@ class _Loop:
 class _Scope:
     def __init__(self,demand,lane):
         self.demand,self.lane=demand,lane
+        self.fixed_generation=None
         self.port=None;self.tasks=();self.completed_sources={};self.active=False;self.closing=False;self.closed=False
         self.retiring=False;self.attempt=0;self.next_start=0;self.result=None
         self.started=self.deadline=0;self.actual_end=None;self.expired=False;self.cancel_sent=False;self.fault=False;self.fault_pending=False
@@ -140,6 +144,14 @@ class _Scope:
         self.last_sources=None
         self.delivered_ws=None
 
+def financial_read_identity(account, process_epoch, generation):
+    """Bound observational ownership without exporting account or raw epochs."""
+    if any(type(v) is not str or not v or len(v)>4096 for v in (account,process_epoch,generation)):
+        return None
+    return dict(account_fingerprint=hashlib.sha256(account.casefold().encode()).hexdigest(),
+        identity=hashlib.sha256(json.dumps((account.casefold(),process_epoch,generation)).encode()).hexdigest())
+
+
 class LPReadRuntime:
     def __init__(self, source_factory, *, clock=time.monotonic, utc_now=lambda:datetime.now(UTC), buy_cap=BUY_SCOPE_CAP,
                  cache_entries=REFERENCE_CACHE_ENTRIES, cache_bytes=REFERENCE_CACHE_BYTES, orderbook_url=None):
@@ -147,13 +159,17 @@ class LPReadRuntime:
         self.buy_cap=buy_cap;self.cache_entries=cache_entries;self.cache_bytes=cache_bytes;self._cache=OrderedDict();self._cache_size=0;self._lock=threading.RLock();self._scopes={};self._demands={}
         self._fixed_ports={};self._fixed_closing=set();self._fixed_closed=set();self._fixed_faults=set()
         self._fixed_kinds={};self._fixed_fault_details={}
+        self._fixed_rotating={};self._fixed_close_started={};self._fixed_generations={}
         self._ages={};self._age_sequence=0
         # Runtime-lifetime identity, independent of scope retirement. One
         # scalar avoids retaining an unbounded ledger of departed order keys.
         self._attempt_sequence=0
         self._financial_cleanup_faults=0;self._last_financial_cleanup_fault=None
         self._last_financial_timeout=None
+        self._financial_current=None;self._financial_streak_state='unknown'
+        self._financial_streak_since=None;self._financial_timeouts=0
         self._financial_request_cleanup=None
+        self._financial_retired_cleanup=();self._financial_record_offset=0
         self._financial_generation=0;self._pool_timeout_streak=0
         self._engine_account_read=dict(account_id=None,last_success_at=None,consecutive_failures=0)
         self._last_pool_rotation=None;self._retired_financial=None;self._financial_limits=None
@@ -559,6 +575,12 @@ class LPReadRuntime:
                 if key not in self._ages:
                     self._age_sequence+=1;self._ages[key]=self._age_sequence
             self._ages={k:v for k,v in self._ages.items() if k in incoming or k in self._scopes}
+            identities=[financial_read_identity(d.account,d.process_epoch,d.generation)
+                for d in incoming.values() if d.kind=='financial']
+            current=identities[0] if len(identities)==1 else None
+            if current!=self._financial_current:
+                self._financial_current=current
+                self._financial_streak_state='unknown';self._financial_streak_since=None;self._financial_timeouts=0
             self._demands=incoming
         self.wake()
 
@@ -589,7 +611,7 @@ class LPReadRuntime:
                             observe=getattr(scope.port,'financial_cleanup_records',None)
                             records=observe(scope.attempt) if observe is not None else None
                             if records is not None and records['attempt']==scope.attempt:
-                                self._financial_request_cleanup=records
+                                self._publish_financial_cleanup(records)
                         except Exception:
                             pass
                     if self._closed:
@@ -619,6 +641,7 @@ class LPReadRuntime:
                         scope.closing=True;scope.lane.submit(self._close_scope(scope))
                     if scope.closed and scope.result is None and not scope.fault_pending:
                         self._scopes.pop(key,None)
+                self._maintain_fixed_rotation()
                 for key,demand in sorted(self._demands.items(),key=lambda item:self._ages[item[0]]):
                     if key not in self._scopes:
                         if demand.kind in ('buy','income') and (sum(s.demand.kind in ('buy','income') for s in self._scopes.values())>=self.buy_cap
@@ -630,16 +653,16 @@ class LPReadRuntime:
                         0 if s.demand.kind=='position' else 1,self._ages.get(s.demand.key,0))):
                     updated=self._demands.get(scope.demand.key)
                     if (updated is not None and not scope.active and scope.result is None
-                            and not (_fixed_lane(scope.demand.kind) in ('financial','low') and scope.fault_pending)):
+                            and not (_fixed_lane(scope.demand.kind) in ('financial','exact','low') and scope.fault_pending)):
                         scope.demand=updated
                     if (not scope.retiring and not scope.fault and not scope.active and scope.result is None
-                            and not (_fixed_lane(scope.demand.kind) in ('financial','low') and scope.fault_pending)
+                            and not (_fixed_lane(scope.demand.kind) in ('financial','exact','low') and scope.fault_pending)
                             and self.clock()>=scope.next_start):
                         kind=scope.demand.kind
                         lane=_fixed_lane(kind)
                         if lane is not None:
                             peers=[s for s in self._scopes.values() if _fixed_lane(s.demand.kind)==lane and s is not scope]
-                            if lane in self._fixed_faults or any(s.fault for s in peers):continue
+                            if lane in self._fixed_rotating or lane in self._fixed_faults or any(s.fault for s in peers):continue
                             if lane=='exact':
                                 fills=scope.demand.sources==('fills',)
                                 if any(s.active and (s.demand.sources==('fills',))==fills for s in peers):continue
@@ -654,6 +677,7 @@ class LPReadRuntime:
                             not_before=max((wait_owner.not_before(p,scope.demand.account) for p in providers),default=0)
                             if self.clock()<not_before:
                                 scope.next_start=max(scope.next_start,not_before);continue
+                        scope.fixed_generation=self._fixed_generations.get(lane,0) if lane in ('financial','exact') else None
                         scope.completed_sources={}
                         scope.financial_health_recorded=False
                         self._attempt_sequence+=1;scope.attempt=self._attempt_sequence
@@ -724,6 +748,7 @@ class LPReadRuntime:
         scope.expired=True
         scope.last_sources=None
         if scope.demand.kind=='financial':
+            self._financial_event(scope,success=False)
             self._record_account_read(scope,{})
             self._last_financial_timeout=dict(attempt=scope.attempt,
                 observation_id=_location_text(scope.demand.observation_id,96),
@@ -737,6 +762,87 @@ class LPReadRuntime:
         scope.result=MarketAttempt(scope.demand,scope.attempt,scope.started,scope.deadline,self.clock(),
             freeze_sources({name:scope.completed_sources.get(name,SourceResult('',complete=False,error='timeout')) for name in scope.demand.sources}),
             False,'timeout')
+        lane=_fixed_lane(scope.demand.kind)
+        if lane in ('financial','exact') and any(not task.done() for task in scope.tasks):
+            self._fixed_rotating.setdefault(lane,self.clock())
+
+    def _publish_financial_cleanup(self,records):
+        # Client rotation must not erase the existing bounded request history.
+        # Offset opaque per-port sequences so current and retired records stay
+        # distinct without retaining ports, callbacks, or request objects.
+        def project(row):return dict(row,sequence=row['sequence']+self._financial_record_offset)
+        history=list((*self._financial_retired_cleanup,*(project(r) for r in records['history']))[-32:])
+        snapshot=dict(attempt=records['attempt'],current=[project(r) for r in records['current']],history=history)
+        while history and len(json.dumps(snapshot,allow_nan=False).encode())>FINANCIAL_WAIT_BYTES:history.pop(0)
+        self._financial_request_cleanup=snapshot
+
+    def _financial_event(self,scope,*,success):
+        d=scope.demand
+        if (d.key not in self._demands or self._financial_current is None
+                or financial_read_identity(d.account,d.process_epoch,d.generation)!=self._financial_current):return
+        if success:
+            self._financial_streak_state='healthy';self._financial_streak_since=None;self._financial_timeouts=0
+        else:
+            if self._financial_streak_since is None:self._financial_streak_since=self.clock()
+            self._financial_streak_state='timed_out';self._financial_timeouts+=1
+
+    def _financial_streak_status(self):
+        observed=None
+        try:
+            stamp=self.utc_now()
+            if isinstance(stamp,datetime) and stamp.utcoffset() is not None:observed=stamp.astimezone(UTC).isoformat()
+        except Exception:pass
+        state=self._financial_streak_state if self._financial_current is not None and not self._closed else 'unknown'
+        elapsed=None
+        if state=='timed_out':
+            elapsed=self.clock()-self._financial_streak_since
+            if not math.isfinite(elapsed) or elapsed<0:state='unknown';elapsed=None
+        return dict(self._financial_current or dict(identity=None,account_fingerprint=None),state=state,
+            elapsed_seconds=elapsed,timeouts=self._financial_timeouts if state=='timed_out' else 0,observed_at=observed)
+
+    def _seal_fixed_peer(self,scope):
+        if scope.expired:return  # Preserve the original timeout/mailbox.
+        scope.expired=True;scope.last_sources=None
+        if not scope.retiring:
+            scope.result=MarketAttempt(scope.demand,scope.attempt,scope.started,scope.deadline,self.clock(),
+                freeze_sources({n:scope.completed_sources.get(n,SourceResult('',complete=False,error='pool_rotated'))
+                    for n in scope.demand.sources}),False,'pool_rotated')
+
+    def _maintain_fixed_rotation(self):
+        # A fixed port belongs to the whole lane. Never replace it while a
+        # source owner or its close is still live, including a concurrent fills
+        # reader sharing the exact client's generation.
+        for name,started in tuple(self._fixed_rotating.items()):
+            owned=self._fixed_ports.get(name)
+            if owned is None:continue
+            port,lane=owned
+            generation=self._fixed_generations.get(name,0)
+            peers=[s for s in self._scopes.values() if s.port is port or
+                (s.active and _fixed_lane(s.demand.kind)==name and s.fixed_generation==generation)]
+            for peer in peers:
+                if peer.active and not peer.expired:
+                    self._seal_fixed_peer(peer)
+                    if not peer.cancel_sent:
+                        peer.cancel_sent=True;peer.lane.loop.call_soon_threadsafe(self._cancel_children,peer)
+            if name not in self._fixed_closing:
+                self._fixed_closing.add(name);lane.submit(self._close_fixed(name,port))
+            close_started=self._fixed_close_started.get(name)
+            if name not in self._fixed_closed and close_started is not None and self.clock()>=close_started+1:
+                self._fixed_faults.add(name)
+                self._fixed_fault_details.setdefault(name,self._fault_detail(name,
+                    self._fixed_kinds.get(name),'port_close_failure'))
+            if name in self._fixed_closed and not any(s.active for s in peers) and name not in self._fixed_faults:
+                for peer in peers:
+                    peer.port=None
+                if name=='financial' and self._financial_request_cleanup is not None:
+                    self._financial_retired_cleanup=tuple(self._financial_request_cleanup['history'])
+                    self._financial_record_offset=max((r['sequence'] for r in self._financial_retired_cleanup),
+                        default=self._financial_record_offset)
+                self._fixed_ports.pop(name)
+                self._fixed_generations[name]=generation+1
+                self._fixed_rotating.pop(name)
+                self._fixed_close_started.pop(name,None)
+                self._fixed_closing.discard(name);self._fixed_closed.discard(name)
 
     async def _read_source(self,scope,source,request):
         key=(scope.demand.account,scope.demand.process_epoch,scope.demand.generation,
@@ -801,10 +907,17 @@ class LPReadRuntime:
         from .polymarket_lp_async_source import SourceRequest, OwnedReadTask
         sources={}
         try:
-            if scope.port is None:
-                fixed=_fixed_lane(scope.demand.kind)
-                if fixed is not None:
-                    with self._lock:
+            fixed=_fixed_lane(scope.demand.kind)
+            # Admission already owns a generation, even before this coroutine
+            # runs. Recheck and register its children atomically with rotation.
+            with self._lock if fixed is not None else nullcontext():
+                if fixed in ('financial','exact') and (scope.expired
+                        or scope.fixed_generation!=self._fixed_generations.get(fixed,0)
+                        or fixed in self._fixed_rotating or fixed in self._fixed_closed):
+                    self._seal_fixed_peer(scope)
+                    return
+                if scope.port is None:
+                    if fixed is not None:
                         owned=self._fixed_ports.get(fixed)
                         if owned is None:
                             scope.port=self.source_factory(scope.demand)
@@ -816,13 +929,13 @@ class LPReadRuntime:
                             self._fixed_ports[fixed]=(scope.port,scope.lane)
                         else:scope.port=owned[0]
                         self._fixed_kinds[fixed]=scope.demand.kind
-                else:scope.port=self.source_factory(scope.demand)
-            d=scope.demand
-            scope.tasks=tuple(OwnedReadTask(self._read_source(scope,source,SourceRequest(source,d.account,
-                d.condition_id,d.token_id,d.target_order_id or d.order_id,':'.join(map(str,(*d.key,scope.attempt,source))),
-                diagnostic_attempt=scope.attempt if d.kind=='financial' else 0)))
-                for source in d.sources)
-            if scope.cancel_sent:self._cancel_children(scope)
+                    else:scope.port=self.source_factory(scope.demand)
+                d=scope.demand
+                scope.tasks=tuple(OwnedReadTask(self._read_source(scope,source,SourceRequest(source,d.account,
+                    d.condition_id,d.token_id,d.target_order_id or d.order_id,':'.join(map(str,(*d.key,scope.attempt,source))),
+                    diagnostic_attempt=scope.attempt if d.kind=='financial' else 0)))
+                    for source in d.sources)
+                if scope.cancel_sent:self._cancel_children(scope)
             values=await asyncio.gather(*scope.tasks,return_exceptions=True)
             sources={name:value if isinstance(value,SourceResult) else SourceResult('',complete=False,error='read_failed')
                 for name,value in zip(d.sources,values)}
@@ -854,6 +967,15 @@ class LPReadRuntime:
 
     def _ended(self,scope,sources):
         scope.active=False;scope.actual_end=self.clock()
+        if (scope.demand.kind=='financial' and not scope.retiring and not scope.expired
+                and scope.result is not None and scope.result.complete
+                and all(name in sources for name in _FINANCIAL_SOURCES)):
+            try:
+                current=self.utc_now()
+                if all(isinstance(sources[n].checked_at,datetime) and sources[n].checked_at.utcoffset() is not None
+                        and 0<=(current-sources[n].checked_at).total_seconds()<=60 for n in _FINANCIAL_SOURCES):
+                    self._financial_event(scope,success=True)
+            except Exception:pass
         self._record_account_read(scope,sources)
         # A book-only completion cannot heal a failed required refresh, an
         # expired attempt, or an incomplete reward catalog using older facts.
@@ -942,6 +1064,9 @@ class LPReadRuntime:
         finally:self.wake()
 
     async def _close_fixed(self,name,port):
+        # A queued close on a busy I/O loop is still source-cleanup ownership,
+        # not an aclose timeout. Its grace starts when aclose actually begins.
+        with self._lock:self._fixed_close_started[name]=self.clock()
         try:await port.aclose()
         except BaseException:
             with self._lock:
@@ -1006,18 +1131,23 @@ class LPReadRuntime:
                 elif not (scope.active or scope.retiring or scope.fault or scope.closed):
                     lane=_fixed_lane(scope.demand.kind)
                     peers=[s for s in self._scopes.values() if s is not scope and _fixed_lane(s.demand.kind)==lane]
-                    if lane is not None and (lane in self._fixed_faults or any(s.fault for s in peers)
+                    if lane is not None and (lane in self._fixed_rotating or lane in self._fixed_faults or any(s.fault for s in peers)
                             or any(s.active and (lane!='exact' or (s.demand.sources==('fills',))==
                                 (scope.demand.sources==('fills',))) for s in peers)):
                         continue  # actual peer completion/deadline owns admission
                     dependencies.append(scope.next_start)
+            dependencies.extend(started+1 for name,started in self._fixed_close_started.items()
+                if name in self._fixed_rotating and name not in self._fixed_closed and name not in self._fixed_faults)
             # Newly requested fixed scopes need supervisor admission first.
             if any(key not in self._scopes and d.kind not in ('buy','income') for key,d in self._demands.items()):
                 dependencies.append(now)
             deferred=[d for key,d in self._demands.items() if d.kind in ('buy','income') and key not in self._scopes]
             owned=[s for s in self._scopes.values() if s.demand.kind in ('buy','income')]
             ports=[s.port for s in owned if s.port is not None and not s.closed]
-            ports.extend(p for key,(p,_) in self._fixed_ports.items() if key not in self._fixed_closed)
+            # Client aclose can finish before original response/source unwind.
+            # Count that fixed generation while its actual readers still own it.
+            ports.extend(p for key,(p,_) in self._fixed_ports.items()
+                if key not in self._fixed_closed or any(s.active and s.port is p for s in self._scopes.values()))
             retired=self._retired_financial
             if retired is not None:ports.append(retired['port'])
             pools=sum(len(set(port.clients.values())) for port in ports)
@@ -1052,6 +1182,7 @@ class LPReadRuntime:
                 financial_cleanup_faults=self._financial_cleanup_faults,
                 last_financial_cleanup_fault=self._last_financial_cleanup_fault,
                 last_financial_timeout=self._last_financial_timeout,
+                financial_timeout_streak=self._financial_streak_status(),
                 financial_request_cleanup=self._financial_request_cleanup,
                 engine_account_read=self._engine_account_read,
                 financial_pool=dict(generation=self._financial_generation,
