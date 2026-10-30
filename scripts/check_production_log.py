@@ -9,6 +9,31 @@ import subprocess
 
 
 ERROR_SIGNAL = re.compile(r"traceback|fatal|exception|error", re.IGNORECASE)
+ORDERBOOK_CONNECTION_PREFIX = re.compile(
+    r"(?:"
+    r"(?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?\s+)?"
+    r"INFO\s+open_trader\.polymarket_lp_orderbook\s+"
+    r"|INFO:open_trader\.polymarket_lp_orderbook:"
+    r")?prediction_lp_orderbook_connection\s+"
+)
+
+
+def normal_orderbook_connection(prefix: str, payload: object) -> bool:
+    """Recognize only the producer's normal connection records at INFO."""
+    return (
+        ORDERBOOK_CONNECTION_PREFIX.fullmatch(prefix) is not None
+        and isinstance(payload, dict)
+        and payload.keys() == {"at", "event", "reason", "code", "exception_class"}
+        and isinstance(payload["at"], str)
+        and bool(payload["at"].strip())
+        and (
+            payload["event"] == "connected" and payload["reason"] is None
+            or payload["event"] == "disconnected" and payload["reason"] == "closed"
+        )
+        and payload["code"] is None
+        and (payload["exception_class"] is None or payload["exception_class"] == "")
+    )
 
 
 def unique_object(pairs):
@@ -39,6 +64,9 @@ def check(text: str, require_text: str | None = None) -> str | None:
                 )
             except (ValueError, RecursionError):
                 return "log_record_invalid"
+            if normal_orderbook_connection(line[:start], payload):
+                # Keep the prefix and all other fields subject to the error scan.
+                del payload["exception_class"]
             if (
                 isinstance(payload, dict)
                 and payload.get("level") == "INFO"

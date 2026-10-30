@@ -857,3 +857,27 @@ def test_normal_readiness_requires_actual_managed_prediction_proof(tmp_path, sta
     assert not any(call.startswith('lsof ') and '8769' in call for call in calls)
     assert not any('--restart' in call or '--prepare-target' in call for call in calls)
     assert protected()==before
+
+
+@pytest.mark.parametrize("case", ["normal-null", "normal-empty", "ws-exception", "other-error"])
+def test_smoke_accepts_normal_ws_empty_exception_and_blocks_real_errors(tmp_path, case):
+    rows = [
+        {"at": "2026-10-29T13:44:10+00:00", "event": "connected", "reason": None,
+         "code": None, "exception_class": "" if case == "normal-empty" else None},
+        {"at": "2026-10-29T13:44:11+00:00", "event": "disconnected", "reason": "closed",
+         "code": None, "exception_class": "" if case == "normal-empty" else None},
+    ]
+    if case == "ws-exception": rows[-1]["exception_class"] = "RemoteProtocolError private-payload-sentinel"
+    log_content = "INFO prediction_runtime_state ready\n" + "\n".join(
+        "2026-10-29T13:44:10+0000 INFO open_trader.polymarket_lp_orderbook "
+        "prediction_lp_orderbook_connection " + json.dumps(row) for row in rows
+    ) + "\n"
+    if case == "other-error": log_content = "ERROR private-payload-sentinel\n" + "INFO clean\n" * 201 + log_content
+    result, calls = _run_smoke(tmp_path, services="prediction", log_content=log_content)
+    healthy = case in ("normal-null", "normal-empty")
+    assert (result.returncode == 0) is healthy, result.stdout + result.stderr
+    assert result.stdout.rstrip().endswith("HEALTHY" if healthy else "ROLLBACK")
+    assert any(call.startswith("playwright ") for call in calls) is healthy
+    # The Python browser precheck precedes logs; Playwright is the post-log gate.
+    assert any(call == "python browser" for call in calls)
+    assert "private-payload-sentinel" not in result.stdout + result.stderr

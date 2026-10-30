@@ -11,6 +11,11 @@
 - Replace only the worst income order when a strictly better trial qualifies. Preserve retained exact orders and amounts; cancel the entrant's old trial order and wait for actual release before buying in the available fixed 50/30/20 slot.
 - Wait 120 process-observed seconds for each exact managed order before counting a D2 sample. New orders start a fresh window; original source timestamps, sample freshness, protection and restart boundaries remain unchanged. No deployment or mode activation is included.
 
+## 2026-10-29 — Normal WS connection Smoke log check (#487)
+
+- Allow empty `exception_class` metadata only on the exact normal LP order-book connected or closed-disconnected record, with the real message marker and an INFO producer prefix or no prefix. Keep all other fields, prefixes and log lines under the existing error checks.
+- Preserve rejection of real exceptions, malformed records and missing runtime evidence. This checker-only repair does not change the recorded Tokyo Smoke failure or establish a new live Smoke result.
+
 ## 2026-10-29 — LP telemetry test log synchronization (#495)
 
 - Wait for each missing-context read's asynchronous log capture before checking diagnostic reasons and public fields. Preserve all existing assertions and production behavior; REST completion does not imply that its queued log has been emitted.
