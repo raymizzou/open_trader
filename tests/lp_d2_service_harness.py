@@ -671,7 +671,7 @@ def child(runtime_root,port,scenario,config_path,*,control=None):
             if token_id==NO_TOKEN_ID and scenario=='reader' and threading.current_thread().name=='lp-reader-source':hold('reader')
             book=super().get_order_book(token_id=token_id)
             bids=(OrderBookLevel(price=Decimal('.39'),size=Decimal('1000')),OrderBookLevel(price=Decimal('.38'),size=Decimal('1000')))
-            if 'manual-preserved' in scenario:
+            if 'manual-preserved' in scenario or scenario=='consumer-ci-http-legacy-manual':
                 # A stable manual-order book includes the actual resting price.
                 bids+=(OrderBookLevel(price=Decimal('.36') if token_id==NO_TOKEN_ID else Decimal('.27'),size=Decimal('1000')),)
             return book.model_copy(update={'timestamp':utc_clock(),'bids':bids,'asks':(OrderBookLevel(price=Decimal('.41'),size=Decimal('1000')),)})

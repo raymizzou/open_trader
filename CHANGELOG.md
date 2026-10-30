@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-30 — Paused-route manual-order fixture book (#499)
+
+- Include the existing manual BUY price in the paused HTTP scenario's offline order book. This keeps the read-only route test from triggering unrelated queue-data protection on an inconsistent fixture. Preserve zero POST/CANCEL assertions, normal LP startup and protection, and the earlier SQL test clock repair; production behavior is unchanged.
+
 ## 2026-10-30 — SQL protection test clock synchronization (#482 / PR #499)
 
 - Freeze the SQL protection fixture clock after setup reads have published their actual source timestamps. Slow setup can no longer move partial-fill facts behind the accepted account watermark. Preserve all state-responsiveness, current-fact, cancellation identity, no-replay and watchdog assertions; production behavior is unchanged.
