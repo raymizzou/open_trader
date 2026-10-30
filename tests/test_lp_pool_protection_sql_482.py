@@ -22,6 +22,11 @@ def offline_only(monkeypatch):
 def test_pool_cancel_sql_wait_keeps_state_responsive_and_rechecks_current_facts(tmp_path,monkeypatch,query,trigger,change):
     rig=_timed_rig(tmp_path,monkeypatch)
     from tests.test_lp_observed_pools import _pool_test_clock
+    # Setup reads use wall time. Freeze after their actual publication so a
+    # slow fixture cannot move new account facts behind accepted source times.
+    setup=rig.live.state.snapshot().observation
+    rig.date[0]=max(rig.date[0],*(source.checked_at for source in setup.source_frame.sources.values()
+        if source.checked_at is not None))
     dates=_pool_test_clock(monkeypatch)
     rig.date[0]+=timedelta(seconds=1);rig.now=rig.date[0];dates[0]=rig.date[0]
     entered,release=Event(),Event()
