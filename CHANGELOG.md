@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-30 — Preserve LP financial diagnostics through pool rotation (#498)
+
+- Archive the old client's final staged cleanup records before either financial rotation path detaches it. Preserve bounded, detached history and monotonic request sequences across replacements, without changing read or trading authority. Isolate loopback test pool/read budgets and gate delayed 503 responses so ordinary failures retain their expected classification.
+
 ## 2026-10-30 — LP account-read recovery and truthful monitor panels (#498 / #422)
 
 - Keep main-service stop/restart available when its configured monitor has independently exited, but only after verifying trusted matching units, loaded configuration, PID zero and no monitor listener. Unknown ownership remains fail-closed; start/status/smoke still require both services healthy before reporting success.

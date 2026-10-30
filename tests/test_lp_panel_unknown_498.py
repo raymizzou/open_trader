@@ -31,6 +31,9 @@ class FinancialServer:
         self.closed = threading.Event()
         self.changed = threading.Condition()
         self.mode = 'ok'
+        self.error_gate = None
+        self.error_entered = set()
+        self.error_completed = set()
         owner = self
         class Handler(BaseHTTPRequestHandler):
             protocol_version = 'HTTP/1.1'
@@ -54,17 +57,25 @@ class FinancialServer:
                     dict(balance='100000000', allowances={'spender':'100000000'}),
                     '/data/orders': dict(data=[],next_cursor='LTE=')}
                 body=json.dumps(values[path]).encode()
+                if owner.mode=='error' and owner.error_gate is not None:
+                    with owner.changed:
+                        owner.error_entered.add(path);owner.changed.notify_all()
+                    assert owner.error_gate.wait(4)
                 self.send_response(503 if owner.mode=='error' else 429 if owner.mode=='cooling' else 200)
                 if owner.mode=='cooling':self.send_header('Retry-After','12')
                 self.send_header('Content-Length',str(len(body)));self.end_headers()
                 if owner.mode=='slow':owner.release.wait(4)
                 try:self.wfile.write(body);self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):pass
+                if owner.mode=='error' and owner.error_gate is not None:
+                    with owner.changed:
+                        owner.error_completed.add(path);owner.changed.notify_all()
         self.server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
         self.server.daemon_threads=True
         self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
         self.url=f'http://127.0.0.1:{self.server.server_port}'
     def close(self):
+        if self.error_gate is not None:self.error_gate.set()
         self.release.set();self.server.shutdown();self.server.server_close();self.thread.join(2)
 
 
@@ -86,6 +97,7 @@ class SaturatedFactory:
     def __call__(self,d):
         self.loop=asyncio.get_running_loop()
         port=self.create(d);self.ports.append(port)
+        self.timeouts={client:client.timeout for client in port.clients.values()}
         if len(self.ports)==1:
             ready=asyncio.Event()
             async def occupy():
@@ -101,7 +113,7 @@ class SaturatedFactory:
         return port
     async def saturate_current(self):
         port=self.ports[-1]
-        for client in port.clients.values():client.timeout=httpx.Timeout(None,pool=.04,read=.04)
+        for client in port.clients.values():client.timeout=httpx.Timeout(**(self.timeouts[client].as_dict()|{'pool':.04}))
         for service in ('clob','clob','data'):
             client=port.clients[service]
             self.responses.append(await client.send(client.build_request('GET','/hold'),stream=True))
@@ -109,6 +121,7 @@ class SaturatedFactory:
     async def release_holders(self):
         for response in self.responses:await response.aclose()
         await asyncio.gather(*self.hold_tasks)
+        for client,timeout in self.timeouts.items():client.timeout=timeout
 
 
 def stop(runtime,factory,server):
@@ -197,7 +210,20 @@ def test_three_pool_timeout_rounds_rotate_and_recover(caplog):
             assert {s.error for s in step(t).sources.values()}=={'PoolTimeout'}
             assert runtime.status()['financial_pool']['consecutive_pool_timeouts']==streak
         release();server.mode='error'
-        assert {s.error for s in step(32).sources.values()}=={'ReadResponseError'}
+        server.error_gate=threading.Event();gate_result=[]
+        def delayed_error_response():
+            with server.changed:
+                entered=server.changed.wait_for(lambda:len(server.error_entered)==3,timeout=2)
+            # Response latency, unlike scheduling, deliberately exceeds the old read budget.
+            early=server.error_gate.wait(.08)
+            server.error_gate.set();gate_result.append((entered,early))
+        delayed=threading.Thread(target=delayed_error_response,daemon=True);delayed.start()
+        ordinary=step(32)
+        delayed.join(2)
+        assert not delayed.is_alive() and gate_result==[(True,False)]
+        with server.changed:
+            assert server.changed.wait_for(lambda:len(server.error_completed)==3,timeout=2)
+        assert {s.error for s in ordinary.sources.values()}=={'ReadResponseError'}
         assert runtime.status()['financial_pool']['consecutive_pool_timeouts']==0
         saturate();assert not step(37).complete
         assert runtime.status()['financial_pool']['consecutive_pool_timeouts']==1
@@ -205,10 +231,81 @@ def test_three_pool_timeout_rounds_rotate_and_recover(caplog):
         assert runtime.status()['financial_pool']['consecutive_pool_timeouts']==0
         saturate();assert not step(47).complete
         release();server.mode='slow'
+        for client in factory.ports[-1].clients.values():client.timeout=httpx.Timeout(**(client.timeout.as_dict()|{'read':.04}))
         assert {s.error for s in step(52).sources.values()}=={'ReadTimeout'}
         assert runtime.status()['financial_pool']['consecutive_pool_timeouts']==0
         assert runtime.status()['financial_pool']['generation']==1 and len(factory.ports)==2
     finally:stop(runtime,factory,server)
+
+
+def test_pool_rotation_preserves_financial_cleanup_history():
+    clock=Clock();observer=Boundary(clock);ports=[];failing=True
+    sources=('balance','open_orders','positions')
+    async def http(request):
+        if failing:raise httpx.PoolTimeout('secret-sentinel',request=request)
+        values={'/positions':[], '/balance-allowance':dict(balance='100000000',
+            allowances={'spender':'100000000'}), '/data/orders':dict(data=[],next_cursor='LTE=')}
+        return httpx.Response(200,json=values[request.url.path])
+    create=actual_factory(SimpleNamespace(url='http://127.0.0.1'),clock,httpx.MockTransport(http))
+    def factory(d):
+        port=create(d);ports.append(port);return port
+    factory.not_before=create.not_before
+    runtime=LPReadRuntime(factory,clock=clock,utc_now=clock.utc)
+    def step(attempt):
+        nonlocal failing
+        failing=attempt%4!=0
+        clock.value=(attempt-1)*5;runtime.wake()
+        row,=collect(runtime,observer,bool)
+        assert row.attempt==attempt and row.complete is (not failing)
+        if failing:assert {s.error for s in row.sources.values()}=={'PoolTimeout'}
+        return row
+    def snapshot():
+        return json.loads(json.dumps(runtime.status()['financial_request_cleanup'],default=dict))
+    def assert_history(attempt):
+        observer.wait(lambda:runtime.status()['financial_request_cleanup'] is not None
+            and runtime.status()['financial_request_cleanup']['attempt']==attempt
+            and not runtime.status()['financial_request_cleanup']['current'])
+        value=snapshot();history=value['history'];total=attempt*3
+        assert sorted(r['sequence'] for r in history)==list(range(max(1,total-31),total+1))
+        for row in history:
+            assert row['source'] in sources
+            assert row['outcome']==('complete' if row['attempt']%4==0 else 'failed')
+            assert row['started_monotonic']==row['ended_monotonic']==(row['attempt']-1)*5
+        for number in range(max(1,attempt-9),attempt+1):
+            assert {r['source'] for r in history if r['attempt']==number}==set(sources)
+        assert len(history)<=32 and len(json.dumps(value).encode())<=16*1024
+        assert 'secret-sentinel' not in json.dumps(value)
+        return value
+    runtime.start()
+    try:
+        runtime.reconcile((demand('financial',kind='financial',sources=sources),))
+        for attempt in (1,2,3):step(attempt)
+        assert len(ports)==1 and runtime.status()['financial_pool']['generation']==1
+        staged=ports[0].financial_cleanup_records(3)
+        assert not staged['current'] and sorted(r['sequence'] for r in staged['history'])==list(range(1,10))
+        assert {(r['attempt'],r['source']) for r in staged['history']}=={
+            (number,source) for number in (1,2,3) for source in sources}
+        step(4)
+        first=assert_history(4)
+        assert {r['sequence'] for r in first['history'] if r['attempt']==4}=={10,11,12}
+        detached=runtime.status()['financial_request_cleanup']
+        frozen_copy=snapshot()
+        with pytest.raises(TypeError):detached['history'][0]['sequence']=-1
+        first['history'][0]['sequence']=-1
+        assert snapshot()['history'][0]['sequence']>0
+        # More rollovers exercise the shared archive without double-offset or unbounded history.
+        for attempt in range(5,17):
+            step(attempt)
+            if attempt%4==0:assert_history(attempt)
+        assert json.loads(json.dumps(detached,default=dict))==frozen_copy
+        assert sorted(r['sequence'] for r in detached['history'])==list(range(1,13))
+        assert len(ports)==5 and runtime.status()['financial_pool']['generation']==4
+        observer.wait(lambda:runtime.status()['financial_pool']['retired_groups']==0)
+        assert all(client.is_closed for port in ports[:-1] for client in port.clients.values())
+        assert all(not client.is_closed for client in ports[-1].clients.values())
+    finally:
+        runtime.reconcile(());assert runtime.close(4)
+    assert all(client.is_closed for port in ports for client in port.clients.values())
 
 
 def test_pool_rotation_keeps_unknown_and_blocks_new_buy(tmp_path):

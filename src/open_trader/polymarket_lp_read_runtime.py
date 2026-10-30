@@ -776,6 +776,18 @@ class LPReadRuntime:
         while history and len(json.dumps(snapshot,allow_nan=False).encode())>FINANCIAL_WAIT_BYTES:history.pop(0)
         self._financial_request_cleanup=snapshot
 
+    def _archive_financial_cleanup(self,port,attempt):
+        # Actual exit can precede the supervisor tick that publishes its final records.
+        try:
+            observe=getattr(port,'financial_cleanup_records',None)
+            records=observe(attempt) if observe is not None else None
+            if records is not None and records['attempt']==attempt:self._publish_financial_cleanup(records)
+        except Exception:pass
+        if self._financial_request_cleanup is not None:
+            self._financial_retired_cleanup=tuple(self._financial_request_cleanup['history'])
+            self._financial_record_offset=max((r['sequence'] for r in self._financial_retired_cleanup),
+                default=self._financial_record_offset)
+
     def _financial_event(self,scope,*,success):
         d=scope.demand
         if (d.key not in self._demands or self._financial_current is None
@@ -832,12 +844,9 @@ class LPReadRuntime:
                 self._fixed_fault_details.setdefault(name,self._fault_detail(name,
                     self._fixed_kinds.get(name),'port_close_failure'))
             if name in self._fixed_closed and not any(s.active for s in peers) and name not in self._fixed_faults:
+                if name=='financial':self._archive_financial_cleanup(port,max((s.attempt for s in peers),default=0))
                 for peer in peers:
                     peer.port=None
-                if name=='financial' and self._financial_request_cleanup is not None:
-                    self._financial_retired_cleanup=tuple(self._financial_request_cleanup['history'])
-                    self._financial_record_offset=max((r['sequence'] for r in self._financial_retired_cleanup),
-                        default=self._financial_record_offset)
                 self._fixed_ports.pop(name)
                 self._fixed_generations[name]=generation+1
                 self._fixed_rotating.pop(name)
@@ -1031,6 +1040,7 @@ class LPReadRuntime:
         import logging
         logging.getLogger(__name__).warning('prediction_lp_financial_pool_rotation %s',
             json.dumps(self._last_pool_rotation,sort_keys=True))
+        self._archive_financial_cleanup(port,scope.attempt)
         self._fixed_ports.pop('financial',None)
         # All scopes sharing this lane must reacquire the new group, including retired scopes.
         for peer in self._scopes.values():
