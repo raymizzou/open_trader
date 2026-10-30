@@ -944,7 +944,9 @@ def test_scheduler_waits_for_cleanup_fault_exit_without_busy_loop(tmp_path):
             assert status['financial_cleanup_faults']==1
             assert status['pool_count']>=2 and live.state.snapshot().new_capacity.state=='known'
             assert len([e for e in boundary.events if e[:3]==('entered','O','balance') and e[3]>=start])==2
-            assert len(boundary.clients)==2 and len(boundary.ports)==1
+            assert len(boundary.clients)==4 and len(boundary.ports)==2
+            assert all(c.is_closed for c in boundary.clients[:2])
+            assert all(not c.is_closed for c in boundary.clients[2:])
             assert trading.cancels==[]
             scheduler.start()
             def monitor_waiting():

@@ -577,3 +577,87 @@ def test_monitor_explains_read_cleanup_fault_and_recovery():
     assert summary(foreign)['pools']['status'] == 'unknown'
     failed_candidates = {**dashboard, 'candidate_valid_count': 0}
     assert summary(blocked_auto, failed_candidates)['pools']['reason'] == '有效候选为零'
+
+
+def test_financial_timeout_streak_explains_orders_and_pools_and_resets():
+    from copy import deepcopy
+    import hashlib
+    from open_trader.polymarket_lp_diagnostics import diagnostic_json_copy
+    from open_trader.polymarket_lp_monitor import LPMonitorSummary
+    from open_trader.polymarket_lp_read_runtime import LPReadRuntime
+    from test_lp_timeout_pool_rotation import PoolBoundary, advance
+    from test_lp_async_read_runtime_contract import Clock, collect, demand
+    clock = Clock()
+    boundary = PoolBoundary(clock)
+    runtime = LPReadRuntime(boundary.factory, clock=clock, utc_now=clock.utc)
+    runtime.start()
+    monitor = LPMonitorSummary()
+    request = demand('O', kind='financial', sources=('balance','open_orders','positions'))
+    auto = dict(desired_running=True, effective_running=True, fatal=None,
+        effective_settings=dict(trial_target_buy_count=3, income_target_buy_count=3),
+        observed_pools=dict(current_membership=dict(state='unknown', account_id='account',
+            observed_at=clock.utc().isoformat(), orders=[])))
+    def summarize(a):
+        return monitor.summarize(auto=a, dashboard={}, trades={}, audits=[], account_id='account', now=clock.utc())
+    def captured():
+        a = deepcopy(auto)
+        reads = diagnostic_json_copy(runtime.status())
+        streak = reads['financial_timeout_streak']
+        # The live owner publishes its expected identity independently of the
+        # runtime snapshot. Bind this public status to our current request.
+        reads['financial_identity'] = dict(identity=streak['identity'],
+            account_fingerprint=hashlib.sha256(b'account').hexdigest())
+        a['diagnostics'] = dict(async_reads=reads)
+        return a
+    try:
+        runtime.reconcile((request,))
+        boundary.wait(lambda: bool(boundary.transports.get('financial'))
+            and boundary.transports['financial'][0]['clob'].leased == 2)
+        advance(runtime, boundary, clock, 5)
+        boundary.wait(lambda: all(not s['active'] for s in runtime.status()['scopes'])
+            and all(t.closed.is_set() for t in boundary.transports['financial'][0].values()))
+        old_snapshot = captured()
+        for stamp, minutes in [(65, None), (65.001, 1), (130, 2)]:
+            advance(runtime, boundary, clock, stamp)
+            a = captured()
+            summary = summarize(a)
+            for section in ('orders','pools'):
+                if minutes is None:
+                    assert '账户挂单/余额读取卡住' not in summary[section]['reason']
+                else:
+                    assert summary[section]['status'] == 'abnormal'
+                    assert summary[section]['reason'] == f'账户挂单/余额读取卡住 {minutes} 分钟'
+            assert summary['orders']['counts'] is None
+            assert summary['balance']['balance_usd'] is None
+            assert all(p['count'] is None for p in summary['pools']['items'].values())
+        assert '账户挂单/余额读取卡住' not in summarize(old_snapshot)['orders']['reason']
+        good = captured()
+        for changes, expected in [(dict(fatal={'origin':'startup'}),'致命'),
+                (dict(desired_running=True,effective_running=False),'想开')]:
+            special = summarize({**good, **changes})
+            assert expected in special['pools']['reason']
+            assert '账户挂单/余额读取卡住' not in special['orders']['reason']
+        stopped = summarize({**good, 'desired_running':False, 'effective_running':False})
+        assert all('账户挂单/余额读取卡住' not in stopped[k]['reason'] for k in ('orders','pools'))
+        for patch in (None, {}, {'state':'timed_out','elapsed_seconds':125},
+                {**good['diagnostics']['async_reads']['financial_timeout_streak'], 'identity':'foreign'},
+                {**good['diagnostics']['async_reads']['financial_timeout_streak'], 'account_fingerprint':'foreign'},
+                {**good['diagnostics']['async_reads']['financial_timeout_streak'], 'elapsed_seconds':float('nan')},
+                {**good['diagnostics']['async_reads']['financial_timeout_streak'], 'observed_at':old_snapshot['diagnostics']['async_reads']['financial_timeout_streak']['observed_at']}):
+            invalid = deepcopy(good)
+            invalid['diagnostics']['async_reads']['financial_timeout_streak'] = patch
+            unknown = summarize(invalid)
+            assert all(unknown[k]['status'] == 'unknown' for k in ('orders','pools'))
+            assert unknown['orders']['counts'] is None and unknown['balance']['balance_usd'] is None
+        # A complete current attempt clears the outage even while the historical
+        # last timeout diagnostic remains available. GET itself starts no reads.
+        collect(runtime, boundary, lambda rows: any(r.complete for r in rows))
+        fresh = captured()
+        assert fresh['diagnostics']['async_reads']['last_financial_timeout'] is not None
+        before = list(boundary.events)
+        recovered = summarize(fresh)
+        assert all('账户挂单/余额读取卡住' not in recovered[k]['reason'] for k in ('orders','pools'))
+        assert before == boundary.events
+    finally:
+        runtime.reconcile(())
+        assert runtime.close(4)
