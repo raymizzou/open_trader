@@ -537,10 +537,9 @@ def test_readonly_upstream_wait_covers_slow_summary(monkeypatch):
     finally:release.set();timer.cancel();timer.join(1);server.shutdown();server.server_close();thread.join(2)
 
 
-def test_panel_deployment_uses_service_release_and_lifecycle(tmp_path,monkeypatch):
-    from dataclasses import replace
+def panel_lifecycle_host(tmp_path,monkeypatch):
     from pathlib import Path
-    import os,shlex,subprocess
+    import shlex,subprocess
     from open_trader import prediction_cloud as cloud
     from tests.test_prediction_retirement_lifecycle import cloud_host_fixture
     cfg,host,commands,_=cloud_host_fixture(tmp_path,monkeypatch,'shadow',1)
@@ -548,6 +547,60 @@ def test_panel_deployment_uses_service_release_and_lifecycle(tmp_path,monkeypatc
     data=json.loads(config_path.read_text());data['lp_monitor_host']='100.70.80.90'
     config_path.write_text(json.dumps(data));cfg=cloud.load_config(config_path)
     panel=cloud.UNIT_PATH.with_name('open-trader-lp-monitor.service')
+    monkeypatch.setattr(cloud.os,'geteuid',lambda:0)
+    monkeypatch.setattr(cloud,'OPERATION_LOCK',tmp_path/'operation.lock')
+    record=json.loads(cfg.record.read_text());record['state']='stopped';cfg.record.write_text(json.dumps(record))
+    external=subprocess.run
+    panel_pid=23456
+    panel_active=[False]
+    model=SimpleNamespace(start_panel=True,properties={},listener=None,uid=1001)
+    def fake_os(command,**kwargs):
+        args=list(command)
+        if args[:3]==['systemctl','show',panel.name]:
+            commands.append(args)
+            fields=dict(LoadState='loaded',ActiveState='active' if panel_active[0] else 'inactive',
+                MainPID=str(panel_pid if panel_active[0] else 0),FragmentPath=str(panel),DropInPaths='',
+                NeedDaemonReload='no',User='prediction',Group='prediction',WorkingDirectory=str(cfg.release_root))
+            fields.update(model.properties)
+            return subprocess.CompletedProcess(args,0,'\n'.join(k+'='+v for k,v in fields.items()),'')
+        if args[:2] in (['systemctl','start'],['systemctl','stop']):
+            commands.append(args)
+            assert args[2]==cloud.UNIT
+            host['active']=args[1]=='start';panel_active[0]=host['active'] and model.start_panel
+            return subprocess.CompletedProcess(args,0,'','')
+        if args==['systemctl','daemon-reload'] or args[0]=='systemd-analyze':
+            commands.append(args)
+            if args==['systemctl','daemon-reload']:host['loaded_unit']=cloud.UNIT_PATH.read_text()
+            return subprocess.CompletedProcess(args,0,'','')
+        if args[0]=='ss' and args[-1]=='sport = :8780':
+            commands.append(args)
+            return subprocess.CompletedProcess(args,0,
+                model.listener if model.listener is not None else (
+                f'LISTEN 0 100 100.70.80.90:8780 0.0.0.0:* users:(("python",pid={panel_pid},fd=3))' if panel_active[0] else ''),'')
+        return external(command,**kwargs)
+    monkeypatch.setattr(subprocess,'run',fake_os)
+    native_text,native_bytes,native_resolve=Path.read_text,Path.read_bytes,Path.resolve
+    def text(path,*args,**kwargs):
+        if str(path)=='/proc/meminfo':return 'MemAvailable: 4000000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n'
+        if str(path)==f'/proc/{panel_pid}/status':return f'Uid:\t{model.uid}\t{model.uid}\t{model.uid}\t{model.uid}\nGid:\t1001\t1001\t1001\t1001\n'
+        return native_text(path,*args,**kwargs)
+    def raw(path,*args,**kwargs):
+        if str(path)==f'/proc/{panel_pid}/cmdline':
+            return ('\0'.join(shlex.split(panel.read_text().split('ExecStart=',1)[1].splitlines()[0])[6:])+'\0').encode()
+        if str(path)==f'/proc/{panel_pid}/environ':
+            return f'PATH=/usr/bin:/bin\0PYTHONPATH={cfg.release_root}/src\0PYTHONUNBUFFERED=1\0PYTHONDONTWRITEBYTECODE=1\0'.encode()
+        return native_bytes(path,*args,**kwargs)
+    monkeypatch.setattr(Path,'read_text',text);monkeypatch.setattr(Path,'read_bytes',raw)
+    monkeypatch.setattr(Path,'resolve',lambda path,*a,**kw:cfg.release_root if str(path)==f'/proc/{panel_pid}/cwd' else native_resolve(path,*a,**kw))
+    return SimpleNamespace(cloud=cloud,cfg=cfg,host=host,commands=commands,panel=panel,
+        panel_active=panel_active,model=model)
+
+
+def test_panel_deployment_uses_service_release_and_lifecycle(tmp_path,monkeypatch):
+    from dataclasses import replace
+    fixture=panel_lifecycle_host(tmp_path,monkeypatch)
+    cloud,cfg,host,commands,panel=fixture.cloud,fixture.cfg,fixture.host,fixture.commands,fixture.panel
+    panel_active=fixture.panel_active
     unit=cloud.render_unit(cfg);panel_text=cloud.render_monitor_unit(cfg)
     assert 'Wants=open-trader-lp-monitor.service' in unit
     assert f'PartOf={cloud.UNIT}' in panel_text and f'After={cloud.UNIT}' in panel_text
@@ -560,46 +613,6 @@ def test_panel_deployment_uses_service_release_and_lifecycle(tmp_path,monkeypatc
     for bind in ('0.0.0.0','8.8.8.8','localhost','::'):
         with pytest.raises(ValueError):cloud.operate(replace(cfg,lp_monitor_host=bind),'install')
     assert commands==before
-    monkeypatch.setattr(cloud.os,'geteuid',lambda:0)
-    monkeypatch.setattr(cloud,'OPERATION_LOCK',tmp_path/'operation.lock')
-    record=json.loads(cfg.record.read_text());record['state']='stopped';cfg.record.write_text(json.dumps(record))
-    external=subprocess.run
-    panel_pid=23456
-    panel_active=[False]
-    def fake_os(command,**kwargs):
-        args=list(command)
-        if args[:3]==['systemctl','show',panel.name]:
-            commands.append(args)
-            return subprocess.CompletedProcess(args,0,
-                f'LoadState=loaded\nActiveState={"active" if panel_active[0] else "inactive"}\nMainPID={panel_pid if panel_active[0] else 0}\nFragmentPath={panel}\nDropInPaths=\nNeedDaemonReload=no\nUser=prediction\nGroup=prediction\nWorkingDirectory={cfg.release_root}\n','')
-        if args[:2] in (['systemctl','start'],['systemctl','stop']):
-            commands.append(args)
-            assert args[2]==cloud.UNIT
-            host['active']=args[1]=='start';panel_active[0]=host['active']
-            return subprocess.CompletedProcess(args,0,'','')
-        if args==['systemctl','daemon-reload'] or args[0]=='systemd-analyze':
-            commands.append(args)
-            if args==['systemctl','daemon-reload']:host['loaded_unit']=cloud.UNIT_PATH.read_text()
-            return subprocess.CompletedProcess(args,0,'','')
-        if args[0]=='ss' and args[-1]=='sport = :8780':
-            commands.append(args)
-            return subprocess.CompletedProcess(args,0,
-                f'LISTEN 0 100 100.70.80.90:8780 0.0.0.0:* users:(("python",pid={panel_pid},fd=3))' if panel_active[0] else '','')
-        return external(command,**kwargs)
-    monkeypatch.setattr(subprocess,'run',fake_os)
-    native_text,native_bytes,native_resolve=Path.read_text,Path.read_bytes,Path.resolve
-    def text(path,*args,**kwargs):
-        if str(path)=='/proc/meminfo':return 'MemAvailable: 4000000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n'
-        if str(path)==f'/proc/{panel_pid}/status':return 'Uid:\t1001\t1001\t1001\t1001\nGid:\t1001\t1001\t1001\t1001\n'
-        return native_text(path,*args,**kwargs)
-    def raw(path,*args,**kwargs):
-        if str(path)==f'/proc/{panel_pid}/cmdline':
-            return ('\0'.join(shlex.split(panel.read_text().split('ExecStart=',1)[1].splitlines()[0])[6:])+'\0').encode()
-        if str(path)==f'/proc/{panel_pid}/environ':
-            return f'PATH=/usr/bin:/bin\0PYTHONPATH={cfg.release_root}/src\0PYTHONUNBUFFERED=1\0PYTHONDONTWRITEBYTECODE=1\0'.encode()
-        return native_bytes(path,*args,**kwargs)
-    monkeypatch.setattr(Path,'read_text',text);monkeypatch.setattr(Path,'read_bytes',raw)
-    monkeypatch.setattr(Path,'resolve',lambda path,*a,**kw:cfg.release_root if str(path)==f'/proc/{panel_pid}/cwd' else native_resolve(path,*a,**kw))
     # Wrong source identity must fail before any service mutation or artifact write.
     with pytest.raises(ValueError,match='SHA mismatch'):cloud.operate(replace(cfg,expected_sha='b'*40),'install')
     assert not panel.exists()
@@ -658,3 +671,110 @@ def test_pool_occupancy_uses_actual_routed_transport(routing):
             for response in responses:await response.aclose()
             await port.aclose();server.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('action', ('stop','restart'))
+@pytest.mark.parametrize('companion_state', ('inactive','failed'))
+def test_absent_companion_allows_main_stop_and_restart(tmp_path,monkeypatch,action,companion_state):
+    fixture=panel_lifecycle_host(tmp_path,monkeypatch)
+    cloud,cfg=fixture.cloud,fixture.cfg
+    assert cloud.operate(cfg,'install')['status']=='INSTALLED_STOPPED'
+    assert cloud.operate(cfg,'start')['status']=='RUNNING'
+    cloud.installed_unit(cfg)
+    assert cloud.verified_record(cfg,('ready',))['state']=='ready'
+    assert cloud.live_identity(cfg)['lp_monitor']['pid']>0
+    fixture.panel_active[0]=False
+    fixture.model.properties['ActiveState']=companion_state
+    before=len(fixture.commands)
+    if action=='restart':
+        # Only an actual main start heals the companion's pre-stop state.
+        original=cloud.subprocess.run
+        def external(command,**kwargs):
+            if list(command)==['systemctl','start',cloud.UNIT]:fixture.model.properties.clear()
+            return original(command,**kwargs)
+        monkeypatch.setattr(cloud.subprocess,'run',external)
+    result=cloud.operate(cfg,action)
+    mutations=[c[:2] for c in fixture.commands[before:] if c[:2] in (['systemctl','stop'],['systemctl','start'])]
+    assert mutations==([['systemctl','stop']] if action=='stop' else [['systemctl','stop'],['systemctl','start']])
+    assert result['status']==('STOPPED' if action=='stop' else 'RUNNING')
+    saved=json.loads(cfg.record.read_text())
+    assert saved['state']==('stopped' if action=='stop' else 'ready')
+    if action=='restart':
+        assert fixture.host['active'] and fixture.panel_active[0]
+        assert result['lp_monitor']['pid']>0 and cloud.live_identity(cfg)==saved['ready']
+    else:
+        assert not fixture.host['active'] and not fixture.panel_active[0]
+
+
+@pytest.mark.parametrize('action', ('stop','restart'))
+@pytest.mark.parametrize('evidence', (
+    'missing_artifact','mismatched_artifact','mismatched_record','missing_loaded_identity',
+    'wrong_loaded_user','reload_pending','unowned_dropin','unexplained_listener',
+    'inactive_live_pid','unsupported_state','active_unowned_process','active_unowned_listener','active_valid'))
+def test_main_lifecycle_rejects_unproven_companion_absence(tmp_path,monkeypatch,action,evidence):
+    fixture=panel_lifecycle_host(tmp_path,monkeypatch)
+    cloud,cfg=fixture.cloud,fixture.cfg
+    assert cloud.operate(cfg,'install')['status']=='INSTALLED_STOPPED'
+    assert cloud.operate(cfg,'start')['status']=='RUNNING'
+    fixture.panel_active[0]=False
+    if evidence=='missing_artifact':fixture.panel.unlink()
+    elif evidence=='mismatched_artifact':fixture.panel.write_text(fixture.panel.read_text().replace(str(cfg.release_root),'/wrong-release'))
+    elif evidence=='mismatched_record':
+        saved=json.loads(cfg.record.read_text());saved['monitor_unit_text']='unrecognized-unit'
+        cfg.record.write_text(json.dumps(saved))
+    elif evidence=='missing_loaded_identity':fixture.model.properties['FragmentPath']=''
+    elif evidence=='wrong_loaded_user':fixture.model.properties['User']='unowned'
+    elif evidence=='reload_pending':fixture.model.properties['NeedDaemonReload']='yes'
+    elif evidence=='unowned_dropin':fixture.model.properties['DropInPaths']='/unowned.conf'
+    elif evidence=='unexplained_listener':fixture.model.listener='LISTEN 0 100 100.70.80.90:8780 0.0.0.0:* users:(("other",pid=99999,fd=3))'
+    elif evidence=='inactive_live_pid':fixture.model.properties['MainPID']='23456'
+    elif evidence=='unsupported_state':fixture.model.properties['ActiveState']='activating'
+    elif evidence=='active_unowned_process':
+        fixture.panel_active[0]=True;fixture.model.uid=9999
+    elif evidence=='active_unowned_listener':
+        fixture.panel_active[0]=True
+        fixture.model.listener='LISTEN 0 100 100.70.80.90:8780 0.0.0.0:* users:(("other",pid=99999,fd=3))'
+    elif evidence=='active_valid':fixture.panel_active[0]=True
+    before=len(fixture.commands);saved=cfg.record.read_bytes()
+    if evidence=='active_valid':
+        result=cloud.operate(cfg,action)
+        assert result['status']==('STOPPED' if action=='stop' else 'RUNNING')
+        assert [c[:2] for c in fixture.commands[before:] if c[:2] in (['systemctl','stop'],['systemctl','start'])]==(
+            [['systemctl','stop']] if action=='stop' else [['systemctl','stop'],['systemctl','start']])
+    else:
+        with pytest.raises((OSError,ValueError)):cloud.operate(cfg,action)
+        assert fixture.host['active']
+        assert cfg.record.read_bytes()==saved
+        assert not any(c[:2] in (['systemctl','stop'],['systemctl','start']) for c in fixture.commands[before:])
+
+
+@pytest.mark.parametrize('action', ('start','restart'))
+def test_absent_companion_never_reports_service_ready(tmp_path,monkeypatch,action):
+    fixture=panel_lifecycle_host(tmp_path,monkeypatch)
+    cloud,cfg=fixture.cloud,fixture.cfg
+    assert cloud.operate(cfg,'install')['status']=='INSTALLED_STOPPED'
+    assert cloud.operate(cfg,'start')['status']=='RUNNING'
+    fixture.panel_active[0]=False
+    saved=cfg.record.read_bytes();before=len(fixture.commands)
+    with pytest.raises(ValueError,match='monitor'):cloud.live_identity(cfg)
+    with pytest.raises(ValueError,match='monitor'):cloud.monitor_identity(cfg)
+    for check in ('status','smoke'):
+        with pytest.raises(ValueError,match='monitor'):cloud.operate(cfg,check)
+    assert fixture.host['active'] and cfg.record.read_bytes()==saved
+    assert not any(c[:2] in (['systemctl','stop'],['systemctl','start']) for c in fixture.commands[before:])
+    if action=='start':assert cloud.operate(cfg,'stop')['status']=='STOPPED'
+    fixture.model.start_panel=False
+    clock=Clock()
+    def elapsed(seconds):clock.value+=seconds
+    # Replace only this module's clock binding; the native watchdog keeps real time.
+    monkeypatch.setattr(cloud,'time',SimpleNamespace(monotonic=clock,sleep=elapsed))
+    before=len(fixture.commands)
+    with pytest.raises(ValueError,match='candidate readiness not proven'):cloud.operate(cfg,action)
+    assert fixture.host['active'] and not fixture.panel_active[0]
+    failed=json.loads(cfg.record.read_text())
+    assert failed['state']=='failed' and failed['failure_reason']=='candidate_readiness_not_proven'
+    assert 'ready' not in failed
+    assert [c[:2] for c in fixture.commands[before:] if c[:2] in (['systemctl','stop'],['systemctl','start'])]==(
+        [['systemctl','start']] if action=='start' else [['systemctl','stop'],['systemctl','start']])
+    with pytest.raises(ValueError):cloud.operate(cfg,'status')
+    assert json.loads(cfg.record.read_text())['state']=='failed'

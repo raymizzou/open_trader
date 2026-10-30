@@ -306,14 +306,20 @@ def _installed_monitor(c):
         raise ValueError('monitor does not match selected release/config')
 
 
-def monitor_identity(c):
+def monitor_identity(c, *, allow_absent=False):
     if c.lp_monitor_host is None:return None
     _installed_monitor(c)
     state=_monitor_state();pid=int(state['MainPID'])
-    if (state['ActiveState']!='active' or pid<=0 or state.get('DropInPaths')
+    if (state.get('DropInPaths')
             or state.get('FragmentPath')!=str(UNIT_PATH.with_name(MONITOR_UNIT))
             or state.get('NeedDaemonReload')!='no' or state.get('User')!=c.user
             or state.get('Group')!=c.user or state.get('WorkingDirectory')!=str(c.release_root)):
+        raise ValueError('monitor loaded identity mismatch')
+    # A proven absent display process must not prevent safe main shutdown.
+    if allow_absent and state['ActiveState'] in ('inactive','failed'):
+        _monitor_absent(c)
+        return None
+    if state['ActiveState']!='active' or pid<=0:
         raise ValueError('monitor loaded identity mismatch')
     process=Path('/proc')/str(pid);user=service_user(c)
     if (process/'cwd').resolve()!=c.release_root.resolve():raise ValueError('monitor cwd mismatch')
@@ -444,7 +450,7 @@ def installed_unit(c: CloudConfig, *, contents: bytes | None = None) -> None:
         raise ValueError('unknown unit source or drop-in')
 
 
-def live_identity(c: CloudConfig) -> dict:
+def live_identity(c: CloudConfig, *, allow_absent_monitor=False) -> dict:
     user = service_user(c)
     identity = release_identity(c)
     installed_unit(c)
@@ -507,7 +513,7 @@ def live_identity(c: CloudConfig) -> dict:
     return {'pid': pid, 'git_sha': c.expected_sha, 'candidate_exclusions': effective_exclusions,
             'started_at': health.get('started_at'),
             'systemd_started_at': state.get('ExecMainStartTimestamp'), **isolation,
-            **({'lp_monitor':monitor_identity(c)} if c.lp_monitor_host is not None else {})}
+            **({'lp_monitor':monitor_identity(c,allow_absent=allow_absent_monitor)} if c.lp_monitor_host is not None else {})}
 
 
 def staged_instance_identity(c: CloudConfig) -> dict:
@@ -1220,7 +1226,7 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
                     record(c, 'stopped', operation_fd=lock.fileno())
                 return {'status':'STOPPED', 'git_sha':c.expected_sha}
             verified_record(c, ('ready','maintenance','failed'))
-            live = live_identity(c)
+            live = live_identity(c,allow_absent_monitor=True)
             record(c, 'maintenance', ready=live, operation_fd=lock.fileno())
             run('systemctl', 'stop', UNIT, timeout=100)
             absent(c)
@@ -1242,7 +1248,7 @@ def operate(c: CloudConfig, action: str, *, operation_nonce=None, prepare_for=No
                     require_prepared=operation_nonce is not None,extras=extras)
             if current['MainPID']!='0':
                 verified_record(c,('ready','maintenance','failed'))
-                live=live_identity(c)
+                live=live_identity(c,allow_absent_monitor=True)
                 record(c,'maintenance',ready=live,operation_fd=lock.fileno())
                 if c.mode=='production':_prepared_lp_validation(c,nonce)
                 run('systemctl','stop',UNIT,timeout=100)
