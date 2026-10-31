@@ -9165,12 +9165,13 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
     source_config=polymarket_trading_module.load_trading_config(prediction_config_path)
     source_trading=polymarket_trading_module.PolymarketTradingClient.from_keychain(source_config)
     _ci_start_service_source(runtime,source_trading,history=True)
-    runtime._start_candidate_scan_monitor()
     try:
         assert current.request('/healthz')['runtime_state'] == "RUNNING"
         assert runtime.monitor is not None
         runtime.monitor.stop()
         assert probe.first_catalog_entered.wait(timeout=2)
+        # History preparation establishes its fence before the fixture starts the scan.
+        runtime._start_candidate_scan_monitor()
         assert runtime.lp is not None
         deadline = time.monotonic() + 2
         preparation_snapshot = runtime.lp.candidate_snapshot()

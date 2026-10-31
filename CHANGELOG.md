@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-30 — Candidate refresh fixture preparation ordering (#498)
+
+- Wait for history preparation to enter its catalog call before starting the fixture's candidate scanner. Preserve all refresh, no-trading, UNKNOWN, single-flight and cleanup assertions and timeouts; production behavior is unchanged.
+
 ## 2026-10-30 — Preserve LP financial diagnostics through pool rotation (#498)
 
 - Archive the old client's final staged cleanup records before either financial rotation path detaches it. Preserve bounded, detached history and monotonic request sequences across replacements, without changing read or trading authority. Isolate loopback test pool/read budgets and gate delayed 503 responses so ordinary failures retain their expected classification.
