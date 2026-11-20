@@ -1,23 +1,32 @@
-# Reuse CI before a source release
+# Reuse full-backend CI before an existing-stack source release
 
-The supported forward path is: successful exact-SHA main CI (push or main-only manual) → fresh Host
-Readiness → `scripts/deploy_release.py` → Production Smoke. The wrapper checks
+The supported forward path requires successful exact-SHA full-backend main CI
+(push or main-only manual), followed by fresh Host Readiness,
+`scripts/deploy_release.py` and Production Smoke. The wrapper checks
 CI and source/runtime identity immediately before calling one existing installer.
 Deployment still requires explicit authorization. Neither CI nor this preflight
 grants trading permission.
 
-## What changed
+## Scope and required evidence
 
-Previously `make candidate-acceptance` built another test image, ran the whole
-backend serially, then ran the portable prediction scenarios. CI now owns the
-four-service backend partition and the non-LIVE portable scenarios. Deployment
-reuses their evidence and does not run backend pytest or build a Docker image.
+Current CI runs Trend V3 lint and tests. Its green `required` check alone
+cannot clear existing-stack Deployment Preflight. Use an exact main SHA
+with its own complete and unexpired full-backend evidence. An older SHA
+may be eligible while it remains in main history. Missing or expired
+evidence blocks the selected release.
+
+The [Trend V3 Mini workflow](../../services/trend_v3/AGENTS.md#deployment-on-mini)
+applies only to the isolated Trend V3 service and requires separate deployment
+authorization. Existing-stack deployments use this runbook.
+
+Existing-stack preflight reuses the full-backend partition and portable
+prediction evidence. It does not rerun pytest or build a Docker image.
 `make candidate-acceptance` and `make acceptance` are compatibility aliases for
-`make deployment-preflight`; they no longer mean a separate test stage.
+`make deployment-preflight`.
 
 The backend still excludes `pressure` and `browser`. Gateway, Account and Legacy
 remain serial. Prediction runs on three machines, each with two xdist workers and its explicit shared-port
-and solver-fixture groups. Portable scenarios run serially. CI checks collected
+and solver-fixture groups. Portable scenarios run serially. The verifier checks collected
 executed required plus explicit optional and retired nodeids against the full backend
 collection so new files, nested tests, marker changes and omitted partitions cannot silently reduce coverage. The old single
 cross-service pytest session is not reproduced: arbitrary global test ordering
@@ -51,10 +60,10 @@ partition without overlap; all seven required artifact scopes are checked for
 the exact selected SHA, run and attempt. Required, optional and retired collections must be
 pairwise disjoint and complete. The 273 exact reviewed release-test identities in
 `scripts/ci_optional_tests.json` (`release-advisory-v1`) are classified as `not-executed-advisory`, never
-passed by declaration. Their separate Release advisory workflow runs automatically only on main
-pushes, with a manual entry; its success is not a preflight wait or gate, and
-its genuine failure can be deferred. Optional artifacts cannot substitute for
-trusted required success. The proof's retired collection is explicitly not
+passed by declaration. The separate Release advisory workflow runs by manual
+dispatch only. Preflight does not wait for it, and genuine advisory failures
+can be deferred. Optional artifacts cannot substitute for trusted required
+success. The proof's retired collection is explicitly not
 executed and is never required to be passed. The preflight checks the exact
 manifest and selection digests against the selected checkout. It rejects missing
 LP/pause executions, unknown policies and false full-coverage claims. There is
@@ -68,9 +77,11 @@ artifact `event_name` must match the selected run’s actual event. Manual evide
 is never relabelled as push. Workflow, repository, SHA, current attempt, check
 suite/app, artifact, partition, lock and runtime guards remain required.
 
-If automatic CI is unavailable, a separately authorized operator can run
-`gh workflow run ci.yml --ref main`, then verify the run’s exact main SHA and
-wait for its complete trusted evidence. There is no arbitrary SHA input.
+Main-only dispatch requires separate authorization and uses the current main
+workflow. Dispatch under Trend V3-only CI cannot produce full-backend evidence.
+The workflow accepts no arbitrary SHA input. Obtain approval for any PR that
+restores full-backend checks. Then verify the actual run and its complete
+evidence before selecting a release.
 
 A later main commit does not invalidate a selected release that has its own
 successful main push/manual evidence and remains in main history. PR-head and synthetic

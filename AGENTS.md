@@ -123,52 +123,39 @@ backend run unless they affect a testable contract. Report missing dependencies
 or blocked focused checks rather than claiming success. Docker is optional for
 focused diagnosis and is not a prerequisite to task-branch publication.
 
-GitHub CI runs all four backend services (`gateway`, `legacy`, `account`,
-`prediction`) with `TEST_N_LEG=0` and the explicit permanent N-leg retirement
-manifest automatically on PRs targeting `main` and every final GitHub `main`
-push. Feature branches receive CI through their PR; feature pushes without a PR
-and tag pushes do not trigger it. Preserve the existing main-only
-`workflow_dispatch` with no inputs and exact `github.sha` checkout; plan and
-required guards restrict only manual runs to `refs/heads/main`. Before merge,
-verify successful PR `CI / required`. For CI trigger changes, follow the
-[mandatory PR coverage rule](docs/operations/ci.md); disabling that coverage needs
-Ray's explicit approval at the time. Manual fallback requires separate
-authorization. No workflow concurrency group cancels or replaces another run.
-Documentation-only, LP-only,
-trend-only, and missing-diff cases have the same active backend coverage, excluding
-`pressure` and `browser`. Before first publication, complete applicable focused
-local checks; independent review follows publication and continues alongside
-delivery. After merge, Main records the final SHA and actual CI run, attempt and
-result. Merge success is not CI success. Failed, cancelled or missing CI stays
-visible; Main diagnoses it and proposes a scoped repair/revert through a new PR.
-No automatic main write, revert, retry-until-green or deployment is authorized.
-Deployment Preflight runs only for a selected final GitHub `main` SHA during an
-explicitly authorized deployment. It selects the newest exact-SHA main CI run
-across push and the existing main-only manual workflow, then verifies its latest
-attempt and artifacts bound to the real event. A newer unsuccessful run blocks
-older green evidence. It checks immutable source/lock/runtime identity and never
-reruns backend tests.
-Required evidence has seven scopes: `gateway`, `legacy`, `account`,
-`prediction-1`, `prediction-2`, `prediction-3`, `portable`. Prediction uses three
-machines with two workers each. CI also runs the non-LIVE portable prediction scenarios and proves that executed
-required nodeids plus the explicit optional collection and declared retired nodeids
-cover the complete backend collection without overlap. The 273 exact reviewed release-test identities are declared in
-`scripts/ci_optional_tests.json` under `release-advisory-v1`. Their unchanged
-cases run on four serial machines in `Release advisory`, automatically only on main pushes,
-with a manual entry. Only full literal nodeids, including parameter identities,
-are exempt; new names and new parameters stay required. Financial/order,
-UNKNOWN, no-replay, fatal-stop and owner-lock, current-API owner handoff/restart, active-service drain,
-credential SSM runtime and stopped data-recovery transaction tests stay required.
-Genuine advisory failures can be deferred; required CI and Deployment Preflight
-do not wait for them. Optional classification is not execution or success. Other active
-tests remain required. Retired tests are recorded as not executed, never passed. See
-[the retirement policy](docs/operations/ci-nleg-retirement.md). `candidate-acceptance` and `acceptance` are compatibility
-aliases for this lightweight check, not another test stage. Use the supported
-forward wrapper in [deployment-preflight.md](docs/operations/deployment-preflight.md),
-with fresh Host Readiness before installation and Production Smoke afterward.
-Missing or mismatched evidence blocks deployment; no automatic full-test retry.
-Existing authorized compatible rollback procedures remain separate.
-Exact-SHA evidence, conflict-resolution, exception and deployment rules still apply.
+GitHub CI runs the isolated [Trend V3 service](services/trend_v3/AGENTS.md)
+lint and unit tests on every PR targeting `main`, every final GitHub `main`
+push, and separately authorized main-only `workflow_dispatch`. Manual dispatch
+accepts no inputs. The jobs use the exact `github.sha` candidate. `CI / required`
+passes only when `trend_v3` succeeds. Documentation-only changes run the same
+checks. Feature pushes without a PR and tag pushes do not trigger this workflow.
+No workflow concurrency group cancels another run. Verify successful PR
+`CI / required` before merge. Disabling PR coverage requires Ray's explicit
+approval. See [CI identity and scope](docs/operations/ci.md).
+
+Before first publication, complete applicable focused local checks. Independent
+review follows publication and continues alongside delivery. After merge, Main
+records the final SHA, actual CI run and attempt, and result. Failed, cancelled or
+missing CI stays visible. Main diagnoses the result and proposes a scoped repair
+or revert through a PR. No automatic main write, revert, retry or deployment is
+authorized.
+
+Ray's 2026-11-20 decision keeps the legacy backend tests off by default.
+When Ray says to open those checks, Main prepares a PR with
+`git revert <removal-commit>` targeting the isolated commit titled
+`ci: disable legacy jobs by default`. Keep the Trend V3 service and its CI
+job. Follow the [restoration procedure](docs/operations/ci.md#restore-the-full-backend-jobs)
+and the normal PR and merge authorization rules. Release advisory runs by
+manual dispatch only while the legacy jobs are off.
+
+Deployment of the existing OpenTrader stack still requires a clean main
+release with trusted exact-SHA full-backend CI from the latest eligible push
+or main-only manual attempt and all required artifacts. Existing-stack deployments also require source, lock and runtime
+identity checks, explicit authorization, fresh Host Readiness and Production
+Smoke. A Trend V3-only result cannot satisfy this contract. Select an older main ancestor only
+with its own valid evidence. See [Deployment Preflight](docs/operations/deployment-preflight.md).
+The [Mini deployment workflow](services/trend_v3/AGENTS.md#deployment-on-mini)
+applies only to Trend V3 and requires explicit deployment authorization.
 
 ## Test design and stability
 

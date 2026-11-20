@@ -193,49 +193,43 @@ checks. Missing dependencies or unavailable environments are blockers to report,
 not passing evidence. Keep TDD, relevant stability checks and independent review.
 
 Docker is not a prerequisite to task-branch publication. Optional focused Docker
-diagnosis can use `make test TEST='tests/path.py::test_name'`; local development
-does not require whole-service or full-backend suites. GitHub CI owns required backend coverage and the explicit optional
-classification automatically on PRs targeting `main` and every final GitHub `main` push: `gateway`, `legacy`, `account`, and
-`prediction`, with `TEST_N_LEG=0` and the permanent retirement manifest, excluding
-`pressure` and `browser`. The 273 exact reviewed release-test identities are declared in
-`scripts/ci_optional_tests.json` under `release-advisory-v1`; see
-[Release advisory](ci.md#release-advisory). Their unchanged whole cases run on four serial machines in a separate workflow, automatically
-only on main pushes, with a manual entry. Genuine failures can be deferred;
-required CI and Deployment Preflight do not wait for it. Only the literal reviewed set is exempt from required execution. New names
-and new parameter identities remain required. Financial/order, UNKNOWN, no-replay,
-fatal-stop and owner-lock, current-API handoff/restart, active drain, credential SSM runtime and stopped
-data-recovery transaction tests remain required.
-Documentation-only, LP-only, trend-only and unavailable/empty diff cases all run
-that same coverage. Feature branches receive CI through their PR; feature pushes
-without a PR and tag pushes do not trigger this workflow. Preserve its existing
-main-only `workflow_dispatch` with no inputs and exact `github.sha` checkout;
-plan and required guards restrict only manual runs to main. Verify successful
-PR `CI / required` before merge. For trigger changes, follow the
-[mandatory PR coverage rule](ci.md); disabling coverage needs Ray's explicit
-approval at the time. A manual
-fallback needs separate authorization; dispatch alone is not successful evidence.
-There is no workflow concurrency group, so later pushes or manual dispatches do
-not cancel or replace earlier runs, including pending runs.
-Required artifact scopes are `gateway`, `legacy`, `account`, `prediction-1`,
-`prediction-2`, `prediction-3` and `portable`; see [CI identity and execution](ci.md). CI also runs the non-LIVE portable prediction scenarios. It does not run
-Deployment Preflight, Host Readiness or Production Smoke.
+diagnosis can use `make test TEST='tests/path.py::test_name'`. Trend V3 has
+its own package, lint and unit test commands. See the
+[service instructions](../../services/trend_v3/AGENTS.md).
+
+GitHub CI runs Trend V3 lint and unit tests on PRs targeting `main`, every
+GitHub `main` push and separately authorized main-only manual dispatch with
+no inputs. The exact `github.sha` is checked out and verified. The fixed
+`required` job depends only on a successful `trend_v3` job. Documentation-only
+changes run these checks as well. Feature pushes without a PR and tag pushes
+do not trigger this workflow. No concurrency group cancels earlier runs.
+Verify successful PR `CI / required` before merge. Disabling PR coverage
+requires Ray's explicit approval. See [CI identity and scope](ci.md).
+
+The full-backend jobs are no longer automatic. The Docker runner and collection
+rules below describe retained full-backend evidence and local diagnostics.
+Release advisory runs by manual dispatch only. Existing-stack Deployment
+Preflight still needs all seven full-backend artifact scopes for the selected
+exact main SHA. The successful Trend V3 result only establishes service lint
+and unit tests. No current CI job runs Deployment Preflight, Host Readiness
+or Production Smoke.
 
 ### Existing Docker test mechanics
 
-CI reuses `make test SERVICE=<service>` and the worktree-specific `Dockerfile.dev`
-image. Valid service names are `gateway`, `legacy`, `account`, and `prediction`;
-unscoped `make test` fails before building. Gateway contains `frontend_gateway`
+The retained full-backend runner reuses `make test SERVICE=<service>` and the
+worktree-specific `Dockerfile.dev` image. Valid service names are `gateway`,
+`legacy`, `account`, and `prediction`. Unscoped `make test` fails before building. Gateway contains `frontend_gateway`
 tests; Legacy contains Dashboard and remaining shared backend test files,
 including standalone trend-curve tests. Keep selection prefixes current when
-adding service-specific test families. The retained standalone trend-curve CI
-job is not selected because legacy already includes its tests.
+adding service-specific test families. The former workflow skipped the
+standalone trend-curve job because legacy includes its tests.
 
-Makefile and CI use `TEST_N_LEG=0`: only the 29 reviewed files in
+The Makefile and full-backend runner use `TEST_N_LEG=0`. The 29 reviewed files in
 `scripts/ci_nleg_retired.json` are omitted from execution because N-leg is
-permanently retired. CI separately excludes the 273 exact reviewed release-advisory identities;
-ordinary local direct pytest remains unchanged. The three mixed/shared files
-remain active, as do LP,
-service/runtime and pause guards. Unknown/new files default to active coverage.
+permanently retired. The full-backend runner separately excludes the 273 exact
+reviewed release-advisory identities. Direct local pytest uses its regular
+selection. The three mixed/shared files and the LP, service/runtime and pause
+guards remain active. Unknown/new files default to active coverage.
 The shared validation fixture file stays importable. `TEST_N_LEG=1` and explicit
 `TEST=...` remain manual diagnostic entries; no scheduled full N-leg regression
 is required. Selection never changes production `N_LEG_PAUSED`.
@@ -245,16 +239,18 @@ collection proof and deployment evidence; update its prefixes for new service
 families. Invalid manifests and empty partitions fail before the test build.
 The Makefile's Prediction service default remains six pytest-xdist workers with
 `--dist=loadgroup`, distributing individual tests across workers; solver benchmark
-tests share one worker to reuse their full-handoff fixture cache. CI uses three Prediction machines with two workers each. `TEST_WORKERS=4` can reduce busy-host load and
-`TEST_WORKERS=1` supports serial diagnosis. Non-Prediction services and explicit
-`TEST=...` selections default to serial, and also accept `TEST_WORKERS`.
-Portable scenarios run serially in CI. Known Prediction shared-port and cached
-fixture groups retain their xdist grouping; global cross-service serial ordering
-is not a separate deployment requirement. CI proves complete backend collection equals executed required nodeids plus
-the explicit optional collection and declared retired nodeids, with no gaps or
-overlap. Optional classification means `not-executed-advisory`, never passed;
-it does not retire the test or weaken other active coverage. Each job retains selected
-nodeids, phase durations, outcomes, JUnit and wall time, including failed runs.
+tests share one worker to reuse their full-handoff fixture cache. Full-backend
+CI used three Prediction machines with two workers each. `TEST_WORKERS=4` can
+reduce busy-host load and `TEST_WORKERS=1` supports serial diagnosis.
+Non-Prediction services and explicit `TEST=...` selections default to serial
+and also accept `TEST_WORKERS`.
+The retained runner executes portable scenarios serially. Known Prediction
+shared-port and cached fixture groups retain their xdist grouping. The
+full-backend evidence accounts for the complete collection through executed
+required nodeids, explicitly optional nodeids and retired nodeids, with no
+gaps or overlap. The runner records optional classification as
+`not-executed-advisory`. Each job retains selected nodeids, phase durations,
+outcomes, JUnit and wall time, including failed runs.
 The development image includes Node and `procps`, but excludes npm, Python/JS
 Playwright and Chromium/browser assets. Test containers have no host mounts,
 network, published ports, Docker socket, home directory or credentials.
@@ -347,7 +343,8 @@ forward-deployment wrapper, trust checks, environment limits and rollback path.
 - `make deployment-preflight EXPECTED_SHA=<40hex> PYTHON_BIN=<release-python>`
   checks trusted exact-SHA CI and source/lock/runtime identity. Success exits zero;
   missing or mismatched evidence exits nonzero. It runs no backend pytest or Docker
-  build. CI owns the four backend services and non-LIVE portable scenarios.
+  build. Existing-stack releases need all full-backend CI evidence. This
+  preflight cannot pass with Trend V3-only CI.
 - `make host-readiness` is read-only and must end with `READY` or `BLOCKED`.
   On a fresh host with no Open Trader launchd agent or selected-service
   listener, use `FIRST_DEPLOY=1`. This checks that no managed agent or selected
@@ -447,10 +444,7 @@ only new core tests does not establish this condition. Complete applicable
 focused/security checks and add the dated operator-facing `CHANGELOG.md` entry.
 Documentation-only work uses diff inspection and `git diff --check`, without
 local backend tests. First publication does not require later improvements or
-completed remote CI. Full backend CI supplements focused local checks by finding
-previously unrecognized or omitted impacts, including cross-service and
-environment/concurrency differences; it is not a reason to postpone known
-affected failures or expand local verification to a full backend suite.
+completed remote CI.
 
 Standing user authorization dated 2026-10-09, scoped to `raymizzou/open_trader`
 across machines and checkouts, requires Main to promptly stage/commit only the
@@ -666,8 +660,9 @@ repairs require a new isolated branch and PR with separate merge authorization.
 Independent review, feedback collection and reproducible blocker repair continue
 until completed or durably handed off; merging does not complete them.
 
-Deployment Preflight requires successful trusted main CI for the selected final
-SHA, retained in main history, from push or the existing main-only manual workflow.
+Existing-stack Deployment Preflight requires complete trusted full-backend CI
+for the selected exact SHA in main history. The evidence must come from a main
+push or the main-only manual workflow.
 It selects the newest exact-SHA run across those events and verifies its latest
 attempt and artifacts bound to the real event. A newer unsuccessful run blocks
 older green evidence; manual fallback needs separate authorization.
@@ -691,29 +686,33 @@ and service-manager ownership/state. Stop or restart stale processes only
 within the authorized deployment scope, then verify a fresh PID and
 timestamped logs before claiming that live behavior changed.
 
-Before the first deployment, manually move production once to a clean,
-immutable detached release checkout. `make`, acceptance, readiness, and Smoke
-never perform that migration. After explicit deployment authorization, deploy
+Before the first existing-stack deployment, manually move production once
+to a clean, immutable detached release checkout. `make`, acceptance, readiness,
+and Smoke never perform that migration. After explicit deployment authorization, deploy
 only the exact CI-verified SHA through `scripts/deploy_release.py` and the existing
 release runbook, then run Smoke against that detached checkout. Smoke reads selected-service health,
 process/listener, logs, the selected Prediction N_LEG/LP contract, and browser evidence; it never deploys,
 restarts, rolls back, or submits. `ROLLBACK` is evidence only.
 
-Failed Deployment Preflight or Host `BLOCKED` blocks forward deployment. Missing,
-expired, cancelled or mismatched CI evidence is not a reason to rerun local full
-pytest. Report the missing check and obtain fresh trusted CI evidence through the
-approved process. A real test failure returns through focused diagnosis, approved
+Failed Deployment Preflight or Host `BLOCKED` blocks existing-stack
+deployment. Missing, expired, cancelled or mismatched CI evidence is not
+a reason to rerun local full pytest. Report the missing check and obtain fresh
+trusted CI evidence through the approved process. A real test failure returns through focused diagnosis, approved
 in-scope repair, task-branch/PR update, independent review, CI and separately
 authorized merge.
 Do not weaken tests, invent attestations, provision credentials or expand scope to
 turn an unknown result into success.
 
-Deployment requires exact-SHA preflight success, fresh Host `READY`, and explicit
-user authorization. Production Smoke must report `HEALTHY` for that same SHA.
+Existing-stack deployment requires exact-SHA preflight success, fresh Host
+`READY`, and explicit user authorization. Production Smoke must report
+`HEALTHY` for that same SHA.
 Task-branch push and PR creation/updates have the standing authorization above;
 GitHub merge, release/tag creation and deployment retain separate authorization
 boundaries. Preserve the exact selected SHA, immutable
 root, `code_root`, service owner and rollback evidence throughout the handoff.
+The [Trend V3 Mini deployment workflow](../../services/trend_v3/AGENTS.md#deployment-on-mini)
+requires explicit authorization, installation from the approved main SHA,
+passing service unit tests and a launchd reload.
 Existing authorized rollback uses the recorded compatible release and retained
 environment; it is not blocked by expired forward CI artifacts. Low-level helpers
 retain their rollback semantics and are not a substitute for the supported

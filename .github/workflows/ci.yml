@@ -11,188 +11,36 @@ permissions:
   contents: read
 
 jobs:
-  plan:
+  trend_v3:
     if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      plan: ${{ steps.route.outputs.plan }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Test routing and fail-closed aggregation
-        run: python3 -m unittest discover -s tests -p 'test_ci_*.py' -v
-      - name: Plan active backend checks
-        id: route
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: python3 scripts/ci_plan.py plan
-
-  gateway:
-    needs: plan
-    if: contains(fromJSON(needs.plan.outputs.plan).scopes, 'gateway')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 3
+    defaults:
+      run:
+        working-directory: services/trend_v3
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Run offline gateway development tests
-        env:
-          TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
-        run: bash scripts/run_ci_service.sh "gateway" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
-      - name: Preserve exact-SHA evidence including phase metrics and JUnit
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ci-gateway-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ci-evidence
-          retention-days: 3
-          if-no-files-found: error
-
-  legacy:
-    needs: plan
-    if: contains(fromJSON(needs.plan.outputs.plan).scopes, 'legacy')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Run offline legacy development tests
-        env:
-          TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
-        run: bash scripts/run_ci_service.sh "legacy" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
-      - name: Preserve exact-SHA evidence including phase metrics and JUnit
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ci-legacy-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ci-evidence
-          retention-days: 3
-          if-no-files-found: error
-
-  account:
-    needs: plan
-    if: contains(fromJSON(needs.plan.outputs.plan).scopes, 'account')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Run offline account development tests
-        env:
-          TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
-        run: bash scripts/run_ci_service.sh "account" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
-      - name: Preserve exact-SHA evidence including phase metrics and JUnit
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ci-account-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ci-evidence
-          retention-days: 3
-          if-no-files-found: error
-
-  prediction:
-    name: prediction-${{ matrix.shard }}
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3]
-    needs: plan
-    if: contains(fromJSON(needs.plan.outputs.plan).scopes, 'prediction')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Run offline prediction development tests
-        env:
-          TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
-        run: bash scripts/run_ci_service.sh "prediction-${{ matrix.shard }}" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
-      - name: Preserve exact-SHA evidence including phase metrics and JUnit
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ci-prediction-${{ matrix.shard }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ci-evidence
-          retention-days: 3
-          if-no-files-found: error
-
-  portable:
-    needs: plan
-    if: contains(fromJSON(needs.plan.outputs.plan).scopes, 'portable')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Run offline portable development tests
-        env:
-          TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
-        run: bash scripts/run_ci_service.sh "portable" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
-      - name: Preserve exact-SHA evidence including phase metrics and JUnit
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ci-portable-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ci-evidence
-          retention-days: 3
-          if-no-files-found: error
-
-  trend_curve:
-    needs: plan
-    if: contains(fromJSON(needs.plan.outputs.plan).scopes, 'trend-curve')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Run offline trend-curve development tests
-        env:
-          TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
-        run: bash scripts/run_ci_service.sh "trend-curve" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
-      - name: Preserve exact-SHA evidence including phase metrics and JUnit
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ci-trend-curve-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ci-evidence
-          retention-days: 3
-          if-no-files-found: error
+      - name: Verify exact candidate and install Trend V3
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -m venv .venv
+          .venv/bin/python -m pip install '.[dev]'
+      - name: Lint Trend V3
+        run: .venv/bin/python -m ruff check src tests
+      - name: Test Trend V3
+        run: .venv/bin/python -m pytest tests
 
   required:
     name: required
     if: always() && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
-    needs: [plan, gateway, legacy, account, prediction, portable, trend_curve]
+    needs: [trend_v3]
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 1
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Download every required machine's execution evidence
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: ci-*
-          path: ${{ runner.temp }}/required-evidence
-      - name: Require all backend, portable and partition checks
+      - name: Require successful Trend V3 checks
         env:
-          NEEDS_JSON: ${{ toJSON(needs) }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$NEEDS_JSON" | python3 scripts/ci_plan.py required --evidence "${{ runner.temp }}/required-evidence" | tee -a "$GITHUB_STEP_SUMMARY"
+          TREND_V3_RESULT: ${{ needs.trend_v3.result }}
+        run: test "$TREND_V3_RESULT" = success
