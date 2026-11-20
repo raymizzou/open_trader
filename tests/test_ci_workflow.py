@@ -1,6 +1,7 @@
-"""Static contract tests for CI wiring; runtime verdict tests live in routing tests."""
+"""Workflow wiring and executable Trend V3 verdict checks."""
 from pathlib import Path
 import re
+import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +16,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn('concurrency:', workflow)
         self.assertNotIn('inputs:', workflow)
         guard = "github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'"
-        self.assertIn('  plan:\n    if: ' + guard, workflow)
+        self.assertIn('  trend_v3:\n    if: ' + guard, workflow)
         required = workflow.split('  required:\n', 1)[1]
         self.assertIn('if: always() && (' + guard + ')', required)
         self.assertNotIn('paths:', workflow)
@@ -26,32 +27,40 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn('cancel-in-progress:', workflow)
         for ref in re.findall(r'uses: (\S+)', workflow):
             self.assertRegex(ref, r'^[\w-]+/[\w-]+@[0-9a-f]{40}$')
-        self.assertEqual(workflow.count('persist-credentials: false'), 9)
-        self.assertEqual(workflow.count('ref: ${{ github.sha }}'), 9)
-        self.assertEqual(workflow.count('runs-on: ubuntu-24.04'), 9)
-        self.assertEqual(workflow.count('timeout-minutes:'), 9)
-        self.assertIn('BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}', workflow)
-        self.assertIn('Plan active backend checks', workflow)
+        self.assertEqual(workflow.count('uses: actions/checkout@'), 1)
+        self.assertIn(
+            '        with:\n          ref: ${{ github.sha }}\n          persist-credentials: false',
+            workflow,
+        )
+        self.assertEqual(workflow.count('runs-on: ubuntu-24.04'), 2)
+        self.assertEqual(workflow.count('timeout-minutes:'), 2)
+        self.assertIn('test "$(git rev-parse HEAD)" = "$GITHUB_SHA"', workflow)
 
     def test_fixed_required_check_and_all_service_results(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
-        required = workflow.split('  required:\n', 1)[1]
+        jobs = workflow.split('\njobs:\n', 1)[1]
+        self.assertEqual(re.findall(r'^  (\w+):$', jobs, re.M), ['trend_v3', 'required'])
+        trend, required = jobs.split('  required:\n', 1)
+        self.assertIn('timeout-minutes: 3', trend)
+        self.assertIn('working-directory: services/trend_v3', trend)
+        for command in (
+            "python3 -m venv .venv",
+            ".venv/bin/python -m pip install '.[dev]'",
+            ".venv/bin/python -m ruff check src tests",
+            ".venv/bin/python -m pytest tests",
+        ):
+            self.assertIn(command, trend)
         self.assertIn('name: required', required)
         self.assertIn('if: always()', required)
-        self.assertIn('needs: [plan, gateway, legacy, account, prediction, portable, trend_curve, trend_v3]', required)
+        self.assertIn('needs: [trend_v3]', required)
         self.assertIn('TREND_V3_RESULT: ${{ needs.trend_v3.result }}', required)
-        self.assertIn('run: test "$TREND_V3_RESULT" = success', required)
-        self.assertIn('toJSON(needs)', required)
-        self.assertIn('python3 scripts/ci_plan.py required', required)
         self.assertNotIn('continue-on-error', workflow)
-        self.assertEqual(workflow.count('if-no-files-found: error'), 6)
-        for scope in ['gateway', 'legacy', 'account', 'prediction-${{ matrix.shard }}', 'portable', 'trend-curve']:
-            self.assertIn(f'"{scope}"', workflow)
-        self.assertIn('test_ci_*.py', workflow)
-        self.assertEqual(workflow.count('including phase metrics and JUnit'), 6)
-        self.assertEqual(workflow.count('if: always()'), 7)
-        self.assertIn('ci-portable-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}', workflow)
-        self.assertEqual(workflow.count('retention-days: 3'), 6)
+        (verdict,) = re.findall(r'^        run: (.+)$', required, re.M)
+        for result in ('success', 'failure', 'cancelled', 'skipped', '', 'unknown'):
+            with self.subTest(result=result):
+                env = {'TREND_V3_RESULT': result} if result else {}
+                completed = subprocess.run(['bash', '-e', '-c', verdict], env=env, check=False)
+                self.assertEqual(completed.returncode, 0 if result == 'success' else 1)
 
     def test_runner_uses_existing_offline_make_gate_and_records_evidence(self):
         script = (ROOT / 'scripts/run_ci_service.sh').read_text()

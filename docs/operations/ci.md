@@ -1,67 +1,66 @@
-# Active backend CI and focused local verification
+# Trend V3 CI and focused local verification
 
-`.github/workflows/ci.yml` runs automatically on `pull_request` events targeting
-`main` and pushes to GitHub `main`, including documentation-only changes and
-each final merged-main SHA. Feature branches receive formal CI through their PR;
-feature pushes without a PR and tag pushes do not trigger it. Preserve the existing
-`workflow_dispatch` with no inputs. The plan and required guards restrict only
-manual runs to `refs/heads/main`; PR runs on `refs/pull/N/merge` are admitted.
-All checkouts use the exact `github.sha`. Planning uses
-`github.event.pull_request.base.sha || github.event.before` as `BASE_SHA`.
+`.github/workflows/ci.yml` runs Trend V3 on PRs targeting `main`, on each
+push to GitHub `main` and through the separately authorized main-only
+`workflow_dispatch`. There are no path filters or dispatch inputs. PRs on
+`refs/pull/N/merge` run normally. Feature work receives CI through its PR.
+The workflow has no concurrency group that cancels an earlier run.
 
-Formal CI must cover feature/PR work. Do not change it back to main-push-only
-without Ray's explicit approval at the time of that change. Every PR that changes
-`ci.yml` triggers must explicitly verify that a PR event still runs `required`.
-Every run selects all four existing backend services: `gateway`, `legacy`,
-`account`, and `prediction`, with `TEST_N_LEG=0`. Active backend coverage excludes
-`pressure` and `browser`; it does not include Deployment Preflight, Host Readiness
-or Production Smoke. Non-LIVE portable prediction scenarios run in a separate
-serial job and are required by the aggregate.
-
-The stable aggregate appears as **CI / required** in the UI (workflow `CI`, job
-`required`), but its exact API check-run/context name is **`required`**, emitted
-by **GitHub Actions**, app ID **15368**. Deployment evidence must bind that exact
-name and source, not the display string or an arbitrary same-named status.
-Before merging a PR, verify that its current candidate's **CI / required** succeeds.
-This is premerge evidence; it does not replace final-main CI for deployment.
-No repository settings are changed by this workflow; the
-[dated settings read-back](repository-protection.md) records active PR/tag
-protections and the separately approved removal of the main required-status rule.
+Formal CI must cover PRs. Disabling that coverage requires Ray's explicit
+approval. Verify that changes to workflow triggers still run `required` on a
+PR. Before an authorized merge, verify successful **CI / required** on the
+current PR candidate. The exact check-run name is **`required`**, emitted by
+**GitHub Actions** (app ID **15368**). See the
+[repository settings read-back](repository-protection.md) for the separately
+managed branch and tag protections.
 
 ## Identity and coverage
 
-Jobs check out `github.sha`: the PR's synthetic merge candidate for a PR event,
-or the exact main SHA for a main push or manual run. Record the PR head/base,
-checked-out candidate, final merge SHA, event, Actions run ID, attempt and actual result.
-The final main commit can differ from a PR head or synthetic merge SHA; evidence
-does not transfer between them. PR aggregation accepts only canonical
-`refs/pull/<positive-number>/merge` refs and binds every artifact's event, ref,
-workflow ref, source SHA, run and attempt to that candidate. Deployment validation
-keeps its main-only default and rejects PR evidence, even for the same source SHA.
-After authorized GitHub merge, inspect the
-main-push run for that exact final SHA. Failed, cancelled or missing results
-remain visible; merge success is not CI success.
+`trend_v3` checks out and verifies `github.sha`, the PR's synthetic merge
+candidate or the selected main commit. It runs on `ubuntu-24.04` with a
+three-minute job limit. It installs the independent package and its development
+dependencies in a virtual environment, runs Ruff on source and tests, then
+runs pytest for the service. The checkout action is commit-pinned, the token has
+`contents: read`, and checkout does not persist credentials.
 
-A separately authorized manual run (`gh workflow run ci.yml --ref main`) can
-provide the same evidence for the then-current main SHA when automatic CI is
-unavailable. It accepts no arbitrary SHA input. Verify the resulting run and
-exact SHA; dispatch alone proves nothing. Deployment Preflight selects the
-newest exact-SHA run across push and main-only `workflow_dispatch`, verifies its
-latest attempt and binds artifacts to the real event. A newer failed, cancelled
-or pending run blocks reuse of older green evidence.
+The fixed `required` job depends only on `trend_v3`. It evaluates a failed,
+cancelled, skipped or missing dependency result as failure whenever the gate
+runs. A run cancelled by GitHub also provides no successful evidence. Off-main
+manual dispatch skips both jobs. Main records PR head and base, the checked-out
+candidate, and the actual run and attempt for the final main SHA after merge.
+CI evidence applies only to the candidate that ran.
 
-Main owns focused diagnosis and a scoped repair/revert proposal through PRs.
-There is no automatic main write, revert, retry-until-green or deployment.
-A failed main SHA cannot be deployed and does not change running production.
-Successful trusted exact-SHA main CI (push or the existing main-only manual
-workflow) and complete artifacts are required for separately authorized
-[Deployment Preflight](deployment-preflight.md),
-source/lock/runtime checks, fresh Host Readiness and Production Smoke. An older
-main ancestor can be selected only with its own valid evidence. Deployment does
-not repeat the backend suite.
+## Restore the full-backend jobs
 
-Changed paths and diff availability do not narrow CI. Documentation-only, isolated
-LP, standalone trend-curve, shared, unknown, deleted/renamed, empty-diff and
+Ray's 2026-11-20 decision keeps the legacy backend, portable and partition
+checks off by default. The routing, runner, tests and artifact verifier are
+available for retained full-backend evidence and local diagnostics.
+
+When Ray says to open those checks, locate the isolated removal commit in
+main's history by its exact subject, `ci: disable legacy jobs by default`.
+On a task branch from current `origin/main`, use
+`git revert <removal-commit>` and deliver it through a PR. Keep the Trend V3
+service and its CI job. Review the revert diff and verify that the restored
+required gate includes Trend V3 and the original full-backend evidence
+checks. The restored workflow runs the gateway, legacy, account and
+prediction suites with `TEST_N_LEG=0` and the non-LIVE portable scenarios.
+The PR still requires Ray's explicit merge approval.
+
+## Existing backend evidence
+
+The [existing stack's Deployment Preflight](deployment-preflight.md) still
+requires a successful trusted main push or main-only manual run with all seven
+full-backend artifacts for the selected exact SHA. A Trend V3-only run cannot
+provide that proof. An older main ancestor remains eligible with its own
+unexpired evidence. A newer unsuccessful run for the same SHA blocks reuse
+of an older green run. Dispatch requires separate authorization and runs the
+workflow defined at the selected main ref. The
+[Trend V3 deployment workflow](../../services/trend_v3/AGENTS.md#deployment-on-mini)
+uses the service-specific steps and applies only to Trend V3.
+
+Under the retained full-backend contract, changed paths and diff availability
+do not narrow coverage. Documentation-only, isolated LP, standalone trend-curve,
+shared, unknown, deleted/renamed, empty-diff and
 missing-history changes all select the same four services with `TEST_N_LEG=0`.
 The retained standalone trend-curve job stays skipped because the legacy suite
 already includes its tests. Make and `scripts/ci_evidence.py` share one service selection entry point.
@@ -88,21 +87,22 @@ credential-shaped negative-test parameters do not enter that job output.
 Local CLI tests verify this content contract; they do not reproduce GitHub's
 hosted output scanner. Normal subsequent push evidence verifies hosted transport.
 
-## Execution and verdict
+### Full-backend execution and verdict
 
 Each service reuses `make test SERVICE=...` with `TEST_N_LEG=0` and the locked
 Docker dev image. Non-Prediction services retain Makefile's serial default;
 Prediction runs on three machines, each with two xdist workers. Gateway,
 Legacy, Account and Portable retain one machine each. Prediction parameters
-stay together, including the existing cross-file shared-port group. Advisory
-runs on four machines with one process each; lp410 uses exactly two of them.
+stay together, including the existing cross-file shared-port group. The separately
+dispatched advisory runs on four machines with one process each. The lp410
+cases use exactly two of them.
 Image builds can download locked dependencies; tests use the existing
 network-disabled container, no host mounts, forwarded credentials, Docker socket
 or published ports. There are no real account credentials, trading requests,
 Deployment Preflight, host readiness or production Smoke steps.
 
-The workflow uses standard `ubuntu-24.04` runners, `contents: read`, commit-pinned
-Actions and checkouts without persisted credentials. Each service times out after
+The previous workflow used standard `ubuntu-24.04` runners, `contents: read`,
+commit-pinned Actions and checkouts without persisted credentials. Each service times out after
 60 minutes; planner/aggregate after five. There is no workflow concurrency group:
 a later push or manual dispatch does not cancel or replace an earlier run,
 including a pending run. Cancellation is not success; inspect the selected SHA's
@@ -124,7 +124,7 @@ required check permanently pending.
 installer and manager cases across ten files. The selector pins the sorted
 literal set to SHA-256
 `0343677be27fc53783631374b15fb20de6985d5f821f45aa5efa002918af3e78`.
-Tests and business assertions stay unchanged. Required Prediction CI excludes
+In the retained full-backend contract, required Prediction excludes
 only these canonical identities, before xdist adds execution group names.
 New names and new parameter identities stay required; no file, function prefix
 or wildcard grants an exemption. Financial/order, UNKNOWN, no-replay,
@@ -135,12 +135,10 @@ selection; CI applies its exclusion through the explicit `--ci-required` option.
 
 The independent `.github/workflows/ci-rollback-advisory.yml` keeps its workflow
 path and history. Its visible name is `Release advisory`; its job, runner scope
-and Make target use `release-advisory`. It runs automatically only on pushes to
-`main`, normally after a merge, and provides `workflow_dispatch` for manual use.
-It does not run on PRs, ordinary branch pushes or a schedule. A PR therefore
-has no premerge advisory execution. The exact `github.sha` is checked out and
-the declared cases are partitioned over four machines, each with one serial session, with the same locked,
-offline Docker environment and 60-minute job timeout. Parameter IDs are quoted
+and Make target use `release-advisory`. It runs by separately authorized
+`workflow_dispatch` only. It checks out the exact `github.sha` and partitions
+the declared cases over four machines. Each machine runs one serial session in
+the locked offline Docker environment, with a 60-minute timeout. Parameter IDs are quoted
 as whole command arguments.
 
 The advisory keeps genuine failed, partial, cancelled and timed-out results,
@@ -149,8 +147,7 @@ identity. Evidence uploads use `always()` and the same three-day retention.
 There is no `continue-on-error`, automatic retry, issue creation or notification.
 A failed advisory can be repaired later; the fixed `required` job neither waits
 for it nor consumes its result. Deployment Preflight also does not wait for
-optional success. Other slow tests remain required. No fixed wall-time saving
-is claimed.
+optional success. The other tests remain part of the full-backend contract.
 
 ## Local verification and delivery
 
@@ -189,10 +186,10 @@ Local main only synchronizes the remote. Merge remains separate from release/tag
 creation, Deployment Preflight and deployment; no CI job grants production or
 trading authorization.
 
-## Collection and execution semantics
+## Retained full-backend collection and execution
 
-CI collects the complete backend universe under `not pressure and not browser`.
-It separately collects the required service partitions, the exact optional nodes
+The full-backend runner collects the complete backend universe under
+`not pressure and not browser`. It separately collects the required service partitions, the exact optional nodes
 and the retired files. The three collections must be pairwise disjoint, and
 their union must equal the universe. Missing, extra or duplicate nodeids and collection errors fail the
 proof. Optional declarations carry `not-executed-advisory`; they are classification
@@ -215,7 +212,7 @@ Artifacts bind the source SHA, run ID/attempt, retirement and optional manifests
 image and dependency identities; hashes bind the records. Failure and skip
 records remain visible. Missing records cannot describe a successful job.
 
-The planning job retains stdlib unittest smoke tests. Real pytest collection and
+The previous planning job ran stdlib unittest smoke tests. Real pytest collection and
 metrics fixtures run in the required legacy partition, in the locked dev image.
 The host smoke does not pretend to execute module-level pytest functions.
 

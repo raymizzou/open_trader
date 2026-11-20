@@ -3,7 +3,8 @@
 ## 2026-11-20 — Trend V3 service CI (#507)
 
 - Add the independent Trend V3 package. The opening freshness gate passes only when the class data date matches the expected date supplied by the caller.
-- Add Trend V3 lint and unit tests to the existing PR and main CI, alongside the full-backend jobs.
+- Run Trend V3 lint and unit tests on PRs targeting main, final main pushes and authorized main-only dispatch. The fixed `CI / required` check requires the Trend V3 job to succeed. Remove automatic full-backend jobs and run Release advisory by manual dispatch only.
+- Existing releases still need complete exact-SHA full-backend evidence for Deployment Preflight. Trend V3 uses its own Mini deployment workflow with explicit authorization.
 
 ## 2026-11-20 — Trend discipline v3 for manual execution
 

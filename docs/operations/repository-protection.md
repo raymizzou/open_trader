@@ -79,13 +79,11 @@ under the release process.
 
 ## CI and deployment evidence
 
-[CI](ci.md) now runs all four backend services plus non-LIVE portable scenarios
-automatically on each final main push, including documentation-only and
-unavailable/empty diff cases. Preserve the existing separately authorized
-main-only manual workflow with no inputs, exact-SHA checkout and plan/required
-main-ref guards. There are no feature/PR triggers or cross-SHA concurrency cancellation.
-Old feature branches may still carry their old workflows during migration; do
-not synchronize/push solely to remove those runs, or wait for them.
+[CI](ci.md) runs Trend V3 lint and unit tests on PRs targeting `main`, each
+final main push and separately authorized main-only manual dispatch. All paths
+receive the same coverage. The workflow checks out the exact event SHA and
+does not cancel earlier runs. Its fixed `required` job depends on the
+Trend V3 result.
 
 The aggregate API check-run name remains exactly **`required`**, emitted by
 **GitHub Actions**, app ID **15368**; the UI display `CI / required` is not the API
@@ -94,15 +92,14 @@ is not CI success. Failed, cancelled or missing results stay visible; Main owns
 focused diagnosis and a scoped repair/revert proposal through PRs, without
 automatic main writes, revert, retry-until-green or deployment.
 
-Deployment still needs successful trusted exact-SHA main CI (push or the existing
-main-only manual workflow), selecting the newest run across both events and its
-latest attempt with artifacts bound to the real event. Newer unsuccessful runs
-block older green evidence. Deployment also needs complete
-required artifacts, source/lock/runtime verification, explicit deployment
-authorization, fresh Host Readiness and Production Smoke. A failed main SHA
-cannot be deployed and does not change running production. An older main ancestor
-needs its own valid evidence. Optional rollback advisory remains independent;
-retired classification and all other required tests remain unchanged.
+Existing-stack deployment still needs successful trusted exact-SHA
+full-backend main CI and complete artifacts. The verifier selects the newest
+eligible push or main-only manual run and checks artifacts from its latest
+attempt. Trend V3-only CI cannot substitute for full-backend evidence.
+A selected older main ancestor needs its own valid proof. Existing-stack
+deployment still requires explicit authorization, source, lock and runtime
+verification, fresh Host Readiness and Production Smoke. Release advisory runs
+by manual dispatch and remains independent.
 
 Official references: [available rules and source binding](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
 and [repository rules API](https://docs.github.com/en/rest/repos/rules).

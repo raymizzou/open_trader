@@ -291,6 +291,16 @@ def test_rejects_wrong_run_identity(evidence, field, value):
         preflight.verify_ci(api, SHA, root, NOW)
 
 
+def test_successful_trend_v3_ci_cannot_supply_full_backend_release_evidence(evidence):
+    root, api = evidence
+    required = next(job for job in api.jobs if job['name'] == 'required')
+    api.jobs = [dict(api.jobs[0], name='trend_v3'), required]
+    api.checks = [dict(api.checks[0], name='trend_v3'), api.checks[-1]]
+    api.artifacts = []
+    with pytest.raises(preflight.PreflightError, match='Missing or duplicate CI job: plan'):
+        preflight.verify_ci(api, SHA, root, NOW)
+
+
 def test_latest_failed_run_cannot_reuse_older_green(evidence):
     root, api = evidence
     api.runs.append(dict(api.run, id=23, run_number=5, conclusion='failure'))
