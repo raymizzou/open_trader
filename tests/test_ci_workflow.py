@@ -26,10 +26,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn('cancel-in-progress:', workflow)
         for ref in re.findall(r'uses: (\S+)', workflow):
             self.assertRegex(ref, r'^[\w-]+/[\w-]+@[0-9a-f]{40}$')
-        self.assertEqual(workflow.count('persist-credentials: false'), 8)
-        self.assertEqual(workflow.count('ref: ${{ github.sha }}'), 8)
-        self.assertEqual(workflow.count('runs-on: ubuntu-24.04'), 8)
-        self.assertEqual(workflow.count('timeout-minutes:'), 8)
+        self.assertEqual(workflow.count('persist-credentials: false'), 9)
+        self.assertEqual(workflow.count('ref: ${{ github.sha }}'), 9)
+        self.assertEqual(workflow.count('runs-on: ubuntu-24.04'), 9)
+        self.assertEqual(workflow.count('timeout-minutes:'), 9)
         self.assertIn('BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}', workflow)
         self.assertIn('Plan active backend checks', workflow)
 
@@ -38,7 +38,9 @@ class WorkflowTests(unittest.TestCase):
         required = workflow.split('  required:\n', 1)[1]
         self.assertIn('name: required', required)
         self.assertIn('if: always()', required)
-        self.assertIn('needs: [plan, gateway, legacy, account, prediction, portable, trend_curve]', required)
+        self.assertIn('needs: [plan, gateway, legacy, account, prediction, portable, trend_curve, trend_v3]', required)
+        self.assertIn('TREND_V3_RESULT: ${{ needs.trend_v3.result }}', required)
+        self.assertIn('run: test "$TREND_V3_RESULT" = success', required)
         self.assertIn('toJSON(needs)', required)
         self.assertIn('python3 scripts/ci_plan.py required', required)
         self.assertNotIn('continue-on-error', workflow)

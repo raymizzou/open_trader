@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-20 — Trend V3 service CI (#507)
+
+- Add the independent Trend V3 package. The opening freshness gate passes only when the class data date matches the expected date supplied by the caller.
+- Add Trend V3 lint and unit tests to the existing PR and main CI, alongside the full-backend jobs.
+
 ## 2026-11-20 — Trend discipline v3 for manual execution
 
 - Rewrite `纪律.md` as v3, a manual discipline that follows only Trend Animals signals. Select the top two and bottom two asset classes by strength. Open a 2% probe position on 温转热 or 凉转寒. Add 4% on 热转沸 or 寒转冻, and 4% more on a closing all-time high or low, to a 10% maximum per instrument and 10 instruments. Take one-third profit on 开香槟 or 上天台, and go back to the probe size when the signal moves back one level. Exit fully on a danger or rebound alert, a change of right-side status, or a move to 平. Remove the ATR protection lines, Kelly, industry ranking and the no-leverage rule. Futures are permitted. Documentation only: the automated trend reports (CN v17 / HK v14 / US v14) do not change and are not aligned with v3.

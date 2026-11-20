@@ -247,7 +247,7 @@ class OptionalWorkflowTests:
         check.assertIn('retention-days: 3', text)
         check.assertIn('name: ci-release-advisory-${{ matrix.shard }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}', text)
         required = (ROOT/'.github/workflows/ci.yml').read_text().split('  required:\n',1)[1]
-        check.assertIn('needs: [plan, gateway, legacy, account, prediction, portable, trend_curve]', required)
+        check.assertIn('needs: [plan, gateway, legacy, account, prediction, portable, trend_curve, trend_v3]', required)
         check.assertNotIn('advisory', required)
         for action in re.findall(r'uses: (\S+)', text):
             check.assertRegex(action, r'^[\w-]+/[\w-]+@[0-9a-f]{40}$')
