@@ -29,6 +29,19 @@ python3 -m venv .venv
 .venv/bin/python -m pytest tests
 ```
 
+### Herdr pane cleanup
+
+Main checks task-owned Herdr panes after each worker handoff and when a phase
+ends. Close a worker pane promptly once its assigned work and repairs are
+complete or a named owner has accepted the handoff. Before closing, confirm
+that output and evidence are saved, all commands have finished, and the live
+pane belongs to this task. Verify the closure in Herdr.
+
+Keep workers with active repairs. Keep daily interactive report tabs for Ray's
+follow-up until Ray asks to close them. Leave user panes and panes from other
+tasks alone. Follow the separate repository rules for deleting a worktree or
+branch.
+
 ## PR review and merge
 
 Main's implementation checks are separate from independent PR review. Follow
