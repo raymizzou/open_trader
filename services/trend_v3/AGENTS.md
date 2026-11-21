@@ -6,6 +6,10 @@ The freshness gate compares the class data date with the expected data date
 supplied by the caller. An exact match only passes the freshness condition.
 The caller owns calendar decisions and all other opening conditions.
 
+For a private Trend V3 daily observation report, use the
+[daily report skill](.agents/skills/trend-v3-daily-report/SKILL.md) from the
+repository revision selected for the run.
+
 ## Implementation
 
 For every new assigned Trend V3 task, Main creates a fresh implementation
