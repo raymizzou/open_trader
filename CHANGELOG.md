@@ -2,7 +2,7 @@
 
 ## 2026-11-21 — Trend V3 daily report evidence and ranks (#511)
 
-- Render new-position candidates with dated instrument evidence, directional ranks from comparable favorites, and explicit coverage gaps. Add offline replay and show 「本期不含持仓」 in each holdings and Kelly panel.
+- Show one compact mobile card per selected instrument with its current trend, special signals, global strength, and a short reason. Keep dated evidence, ranks, coverage, and fees in expandable sections. Add offline replay and show 「本期不含持仓」 in each holdings and Kelly panel.
 
 ## 2026-11-21 — Trend V3 scheduled daily report refresh (#507)
 

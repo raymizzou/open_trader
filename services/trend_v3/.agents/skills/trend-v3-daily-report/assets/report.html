@@ -63,26 +63,26 @@
       padding-block-start: .85rem;
     }
     .edition {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: baseline;
-      justify-content: space-between;
-      column-gap: 1.5rem;
-      row-gap: .35rem;
       font-size: .86rem;
       font-weight: 650;
     }
-    .edition time { color: var(--muted); }
     .masthead h1 {
       margin-block: .65rem .35rem;
       font: 750 clamp(2rem, 6vw, 4.75rem)/1.13 var(--serif);
       letter-spacing: .025em;
     }
-    .masthead p {
-      margin-block-end: 1.1rem;
+    .masthead .market-state {
+      margin-block-end: .65rem;
       color: var(--muted);
       font-size: .9rem;
     }
+    .market-evidence {
+      margin-block-end: .55rem;
+      color: var(--muted);
+      font-size: .85rem;
+      overflow-wrap: anywhere;
+    }
+    .market-evidence p { margin-block: .35rem; }
     .contents {
       display: flex;
       flex-wrap: wrap;
@@ -116,52 +116,72 @@
     }
     .classes { display: grid; gap: .55rem; }
     .class-row {
+      min-inline-size: 0;
       background: var(--paper);
       border: 1px solid var(--rule);
       border-radius: .3rem;
     }
-    .class-row summary {
-      display: grid;
-      grid-template-columns: 1.1rem minmax(0, 1fr) max-content max-content;
-      align-items: center;
-      gap: clamp(.45rem, 1.4vw, 1.05rem);
-      min-block-size: 64px;
-      padding: .55rem clamp(.7rem, 2vw, 1rem);
-      border-radius: .25rem;
-      list-style: none;
+    .class-name {
+      padding: .65rem clamp(.75rem, 2.2vw, 1rem) .3rem;
+      color: var(--accent);
+      font-size: clamp(1rem, 2.3vw, 1.16rem);
+      font-weight: 720;
+    }
+    .candidate {
+      padding: .6rem clamp(.75rem, 2.2vw, 1rem) .72rem;
+      overflow-wrap: anywhere;
+    }
+    .candidate + .candidate { border-block-start: 1px solid var(--soft-rule); }
+    .candidate-name { margin: 0; font-size: 1.05rem; }
+    .candidate-metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .25rem .57rem;
+      margin-block: .38rem;
+      font-size: .875rem;
+    }
+    .candidate-metrics > div {
+      display: flex;
+      gap: .28rem;
+      align-items: baseline;
+      min-inline-size: 0;
+      max-inline-size: 100%;
+    }
+    .candidate-metrics > div + div {
+      padding-inline-start: .57rem;
+      border-inline-start: 1px solid var(--rule);
+    }
+    .candidate-metrics dt { flex: none; color: var(--muted); }
+    .candidate-metrics dd { min-inline-size: 0; font-weight: 700; }
+    .candidate-metrics .number { white-space: nowrap; }
+    .candidate-reason { color: var(--muted); font-size: .875rem; }
+    .class-evidence { border-block-start: 1px solid var(--soft-rule); }
+    .market-evidence > summary, .class-evidence > summary, .report-evidence summary {
+      min-block-size: 44px;
+      padding-block: .64rem;
       cursor: pointer;
+      font-weight: 650;
     }
-    .class-row summary::-webkit-details-marker { display: none; }
-    .class-row[open] summary, .class-row summary:hover { background: var(--wash); }
-    .class-row[open] summary { border-end-start-radius: 0; border-end-end-radius: 0; }
-    .chevron {
-      justify-self: center;
-      inline-size: .55rem;
-      block-size: .55rem;
-      margin-inline-end: .23rem;
-      border: solid var(--accent);
-      border-width: 0 2px 2px 0;
-      transform: rotate(-45deg);
+    .class-evidence > summary {
+      padding-inline: clamp(.75rem, 2.2vw, 1rem);
+      color: var(--muted);
+      font-size: .85rem;
     }
-    [open] > summary .chevron {
-      margin-inline-end: 0;
-      margin-block-start: -.23rem;
-      transform: rotate(45deg);
+    .class-evidence > summary:hover, .class-evidence[open] > summary { background: var(--wash); }
+    .class-facts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .3rem 1rem;
+      color: var(--muted);
+      font-size: .85rem;
     }
-    .class-name { font-size: clamp(1.08rem, 2.5vw, 1.28rem); font-weight: 720; }
-    .stat {
-      display: grid;
-      min-inline-size: 2.55rem;
-      gap: .1rem;
-      justify-items: end;
-      line-height: 1.15;
-    }
-    .stat-label { color: var(--muted); font-size: .75rem; }
-    .stat .number { color: var(--accent); font-size: 1.22rem; font-weight: 650; }
-    .ledger { padding: .25rem clamp(.75rem, 2.2vw, 1.15rem) .65rem; }
+    .class-facts .number { color: var(--accent); font-weight: 650; }
+    .ledger { padding: .6rem clamp(.75rem, 2.2vw, 1rem) .75rem; }
+    .ledger > p { margin-block: .45rem; }
     .asset-group { padding-block-start: .55rem; }
     .asset-group + .asset-group { margin-block-start: .45rem; }
-    .asset-group h3 {
+    .asset-group h4 {
+      margin: 0;
       padding-block-end: .26rem;
       border-block-end: 1px solid var(--rule);
       color: var(--muted);
@@ -346,7 +366,6 @@
     @media (min-width: 46rem) {
       .sheet { inline-size: min(calc(100% - 4rem), 70rem); }
       .directions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .edition { flex-direction: row-reverse; }
     }
     @media (min-width: 52rem) {
       .positions {
@@ -400,7 +419,6 @@
       color: var(--muted);
       font-size: .8rem;
     }
-    .report-evidence summary { cursor: pointer; font-weight: 650; }
     .report-evidence p { margin-block-start: .4rem; }
   </style>
 </head>
@@ -408,12 +426,15 @@
   <a class="skip-link" href="#report">跳到报告正文</a>
   <div class="sheet">
     <header class="masthead">
-      <div class="edition">
-        <span>Trend V3 日报</span>
-        <time datetime="{{report-date}}"><!-- slot:edition-date --></time>
-      </div>
+      <div class="edition">Trend V3 日报</div>
       <h1>趋势动物观察报告</h1>
-      <p><!-- slot:summary --></p>
+      <p class="market-state" data-status="short"><!-- slot:market-state --></p>
+      <details class="market-evidence">
+        <summary>市场数据与日期</summary>
+        <p>报告日 <time datetime="{{report-date}}"><!-- slot:edition-date --></time></p>
+        <!-- slot:market-evidence -->
+        <p data-status="full"><!-- slot:market-status-detail --></p>
+      </details>
       <nav class="contents" aria-label="报告目录">
         <a href="#short">做空</a>
         <a href="#long">做多</a>
@@ -473,31 +494,50 @@
       <details>
         <summary>费用与证据</summary>
         <!-- slot:evidence -->
+        <p data-status="full"><!-- slot:footer-status-detail --></p>
       </details>
     </footer>
   </div>
 
   <!-- Reuse these inert patterns when rendering; remove all template elements from the report. -->
   <template id="class-pattern">
-    <details class="class-row">
-      <summary>
-        <span class="chevron" aria-hidden="true"></span>
-        <span class="class-name"><!-- slot:class-name --></span>
-        <span class="stat"><span class="stat-label">组内排名</span><span class="number"><!-- slot:class-rank --></span></span>
-        <span class="stat"><span class="stat-label">强度</span><span class="number"><!-- slot:class-strength --></span></span>
-      </summary>
-      <div class="ledger">
-        <p class="asset-note"><!-- slot:class-coverage --></p>
-        <div class="asset-group">
-          <h3>直接交易标的</h3>
-          <!-- slot:direct-assets -->
+    <div class="class-row">
+      <h3 class="class-name"><!-- slot:class-name --></h3>
+      <!-- slot:candidate-cards -->
+      <details class="class-evidence">
+        <summary>分组与标的证据</summary>
+        <div class="ledger">
+          <p class="class-facts">
+            <span>大类图名次 <b class="number"><!-- slot:class-rank --></b></span>
+            <span>大类强度 <b class="number"><!-- slot:class-strength --></b></span>
+            <span>榜图 <!-- slot:chart-edition --></span>
+          </p>
+          <p class="asset-note"><!-- slot:class-coverage --></p>
+          <!-- slot:selection-evidence -->
+          <div class="asset-group">
+            <h4>直接交易标的</h4>
+            <!-- slot:direct-assets -->
+          </div>
+          <div class="asset-group">
+            <h4>关联标的</h4>
+            <!-- slot:related-assets -->
+          </div>
+          <!-- slot:favorite-evidence -->
         </div>
-        <div class="asset-group">
-          <h3>关联标的</h3>
-          <!-- slot:related-assets -->
-        </div>
-      </div>
-    </details>
+      </details>
+    </div>
+  </template>
+
+  <template id="candidate-pattern">
+    <li class="candidate">
+      <h4 class="candidate-name"><span class="ticker"><!-- slot:ticker --></span> · <!-- slot:asset-name --></h4>
+      <dl class="candidate-metrics">
+        <div><dt>当前趋势</dt><dd><!-- slot:temperature --></dd></div>
+        <div><dt>特殊信号</dt><dd><!-- slot:events --></dd></div>
+        <div><dt>强度</dt><dd class="number"><!-- slot:strength --></dd></div>
+      </dl>
+      <p class="candidate-reason"><!-- slot:reason --></p>
+    </li>
   </template>
 
   <template id="asset-pattern">
@@ -505,6 +545,7 @@
       <span class="asset-name"><span class="ticker"><!-- slot:ticker --></span> <!-- slot:asset-name --></span>
       <span class="asset-status"><!-- slot:asset-status --></span>
       <span class="asset-note"><!-- slot:asset-evidence --></span>
+      <span class="asset-note field-trace"><!-- slot:asset-trace --></span>
     </li>
   </template>
 
