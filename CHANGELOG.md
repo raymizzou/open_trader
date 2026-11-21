@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-21 — Trend V3 scheduled daily report refresh (#507)
+
+- Start one interactive Herdr session at 08:00 Taipei time. Check A-share, Hong Kong and US data in their own trading windows. The same session rechecks pending markets hourly and updates the private daily HTML when verified data changes.
+
 ## 2026-11-21 — Trend V3 daily report skill (#507)
 
 - Add the private daily report workflow and approved offline HTML layout. The report renders the discipline from the selected repository revision, separates direct instruments from related instruments, and reserves the live and Kelly panels. Simulation positions require a verified Trend V3 simulation source.
