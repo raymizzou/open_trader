@@ -2,7 +2,7 @@
 
 ## 2026-11-21 — Trend V3 daily report evidence and ranks (#511)
 
-- Show one compact mobile card per selected instrument with its current trend, special signals, global strength, and a short reason. Keep dated evidence, ranks, coverage, and fees in expandable sections. Add offline replay and show 「本期不含持仓」 in each holdings and Kelly panel.
+- Use the approved mobile reader layout with one card per selected instrument. Limit HTML to the title, selected groups, instrument names, current trends, special signals, global strength, and a short reason. Keep evidence, ranks, coverage, and fees in private records for offline replay.
 
 ## 2026-11-21 — Trend V3 scheduled daily report refresh (#507)
 

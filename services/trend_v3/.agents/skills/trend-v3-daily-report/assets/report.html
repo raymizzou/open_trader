@@ -1,576 +1,86 @@
 <!doctype html>
-<html lang="zh-Hans">
+<html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
-  <title>趋势动物观察报告｜{{report-date}}</title>
+  <title>趋势日报</title>
   <style>
-    :root {
-      color-scheme: light;
-      --ground: #f5f2eb;
-      --paper: #fffcf6;
-      --ink: #242720;
-      --muted: #55594f;
-      --rule: #d4cec1;
-      --soft-rule: #e5dfd3;
-      --short: #8a4036;
-      --short-wash: #f8eee9;
-      --long: #285e4e;
-      --long-wash: #edf3ec;
-      --serif: "Songti SC", "Noto Serif CJK SC", "Noto Serif SC", SimSun, serif;
-      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    }
-
-    *, *::before, *::after { box-sizing: border-box; }
-    html { scroll-padding-block-start: 1rem; }
+    * { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
     body {
       margin: 0;
-      background: var(--ground);
-      color: var(--ink);
-      font: 1rem/1.55 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #fff;
+      color: #182722;
+      font: 17px/1.55 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
     }
-    .sheet {
-      inline-size: min(calc(100% - 2rem), 70rem);
-      margin-inline: auto;
-      padding-block: clamp(1.35rem, 4vw, 3rem) 3rem;
-    }
+    main { max-width: 660px; margin: auto; padding: 24px 20px 40px; }
     h1, h2, h3, p, dl, dd { margin: 0; }
-    a { color: inherit; }
-    a:focus-visible, summary:focus-visible, main:focus-visible {
-      outline: 2px solid var(--ink);
-      outline-offset: 3px;
-    }
-    .number, .ticker {
-      font-family: var(--mono);
-      font-variant-numeric: tabular-nums lining-nums;
-    }
-    .skip-link {
-      position: absolute;
-      inset-block-start: .5rem;
-      inset-inline-start: 1rem;
-      z-index: 1;
-      display: inline-flex;
-      align-items: center;
-      min-block-size: 44px;
-      padding-inline: .75rem;
-      background: var(--paper);
-      transform: translateY(-140%);
-    }
-    .skip-link:focus { transform: none; }
-    .masthead {
-      border-block-start: 4px solid var(--ink);
-      padding-block-start: .85rem;
-    }
-    .edition {
-      font-size: .86rem;
-      font-weight: 650;
-    }
-    .masthead h1 {
-      margin-block: .65rem .35rem;
-      font: 750 clamp(2rem, 6vw, 4.75rem)/1.13 var(--serif);
-      letter-spacing: .025em;
-    }
-    .masthead .market-state {
-      margin-block-end: .65rem;
-      color: var(--muted);
-      font-size: .9rem;
-    }
-    .market-evidence {
-      margin-block-end: .55rem;
-      color: var(--muted);
-      font-size: .85rem;
-      overflow-wrap: anywhere;
-    }
-    .market-evidence p { margin-block: .35rem; }
-    .contents {
-      display: flex;
-      flex-wrap: wrap;
-      column-gap: clamp(.45rem, 2vw, 1.75rem);
-      padding-block: .2rem;
-      border-block: 1px solid var(--rule);
-    }
-    .contents a {
-      display: inline-flex;
-      min-inline-size: 44px;
-      min-block-size: 44px;
-      align-items: center;
-      padding-inline: .4rem;
-      font-size: .875rem;
-      font-weight: 650;
-      text-decoration: none;
-    }
-    .contents a:hover { text-decoration: underline; text-underline-offset: .24em; }
-    main { padding-block-start: 1.55rem; }
-    .directions { display: grid; gap: 1.6rem; }
-    .short { --accent: var(--short); --wash: var(--short-wash); }
-    .long { --accent: var(--long); --wash: var(--long-wash); }
-    .section-title {
-      font: 750 clamp(1.36rem, 3vw, 1.8rem)/1.3 var(--serif);
-      letter-spacing: .035em;
-    }
-    .direction .section-title {
-      padding-block: .65rem .7rem;
-      border-block-start: 2px solid var(--accent);
-      color: var(--accent);
-    }
-    .classes { display: grid; gap: .55rem; }
-    .class-row {
-      min-inline-size: 0;
-      background: var(--paper);
-      border: 1px solid var(--rule);
-      border-radius: .3rem;
-    }
-    .class-name {
-      padding: .65rem clamp(.75rem, 2.2vw, 1rem) .3rem;
-      color: var(--accent);
-      font-size: clamp(1rem, 2.3vw, 1.16rem);
-      font-weight: 720;
-    }
-    .candidate {
-      padding: .6rem clamp(.75rem, 2.2vw, 1rem) .72rem;
-      overflow-wrap: anywhere;
-    }
-    .candidate + .candidate { border-block-start: 1px solid var(--soft-rule); }
-    .candidate-name { margin: 0; font-size: 1.05rem; }
-    .candidate-metrics {
-      display: flex;
-      flex-wrap: wrap;
-      gap: .25rem .57rem;
-      margin-block: .38rem;
-      font-size: .875rem;
-    }
-    .candidate-metrics > div {
-      display: flex;
-      gap: .28rem;
-      align-items: baseline;
-      min-inline-size: 0;
-      max-inline-size: 100%;
-    }
-    .candidate-metrics > div + div {
-      padding-inline-start: .57rem;
-      border-inline-start: 1px solid var(--rule);
-    }
-    .candidate-metrics dt { flex: none; color: var(--muted); }
-    .candidate-metrics dd { min-inline-size: 0; font-weight: 700; }
-    .candidate-metrics .number { white-space: nowrap; }
-    .candidate-reason { color: var(--muted); font-size: .875rem; }
-    .class-evidence { border-block-start: 1px solid var(--soft-rule); }
-    .market-evidence > summary, .class-evidence > summary, .report-evidence summary {
-      min-block-size: 44px;
-      padding-block: .64rem;
-      cursor: pointer;
-      font-weight: 650;
-    }
-    .class-evidence > summary {
-      padding-inline: clamp(.75rem, 2.2vw, 1rem);
-      color: var(--muted);
-      font-size: .85rem;
-    }
-    .class-evidence > summary:hover, .class-evidence[open] > summary { background: var(--wash); }
-    .class-facts {
-      display: flex;
-      flex-wrap: wrap;
-      gap: .3rem 1rem;
-      color: var(--muted);
-      font-size: .85rem;
-    }
-    .class-facts .number { color: var(--accent); font-weight: 650; }
-    .ledger { padding: .6rem clamp(.75rem, 2.2vw, 1rem) .75rem; }
-    .ledger > p { margin-block: .45rem; }
-    .asset-group { padding-block-start: .55rem; }
-    .asset-group + .asset-group { margin-block-start: .45rem; }
-    .asset-group h4 {
-      margin: 0;
-      padding-block-end: .26rem;
-      border-block-end: 1px solid var(--rule);
-      color: var(--muted);
-      font-size: .835rem;
-      font-weight: 700;
-    }
-    .asset-list { margin: 0; padding: 0; list-style: none; }
-    .asset {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) max-content;
-      align-items: start;
-      column-gap: .65rem;
-      row-gap: .13rem;
-      padding-block: .49rem;
-    }
-    .asset + .asset { border-block-start: 1px solid var(--soft-rule); }
-    .asset-name {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: baseline;
-      gap: .04rem .6rem;
-      min-inline-size: 0;
-      font-size: .9rem;
-      overflow-wrap: anywhere;
-    }
-    .ticker { font-weight: 720; }
-    .asset-status {
-      margin-block-start: .05rem;
-      padding: .12rem .4rem;
-      border: 1px solid var(--soft-rule);
-      border-radius: .2rem;
-      color: var(--muted);
-      font-size: .75rem;
-      font-weight: 650;
-      text-align: center;
-    }
-    .asset-status.signal {
-      background: var(--wash);
-      border-color: transparent;
-      color: var(--accent);
-    }
-    .asset-note, .empty-direct {
-      color: var(--muted);
-      font-size: .85rem;
-    }
-    .asset-note { grid-column: 1 / -1; }
-    .empty-direct { padding-block: .5rem; }
-    .record { margin-block-start: clamp(1.6rem, 4vw, 2.3rem); }
-    .record .section-title {
-      padding-block: .65rem;
-      border-block-start: 2px solid var(--ink);
-    }
-    .reserved {
-      min-block-size: 4.5rem;
-      border-block: 1px solid var(--soft-rule);
-      background: var(--paper);
-    }
-    .positions-note {
-      margin-block: 0 .65rem;
-      color: var(--muted);
-      font-size: .86rem;
-    }
-    .positions { border-block: 1px solid var(--rule); background: var(--paper); }
-    .position-head { display: none; }
-    .position {
-      display: grid;
-      gap: .5rem;
-      padding: .7rem .8rem;
-    }
-    .position + .position { border-block-start: 1px solid var(--rule); }
-    .position h3 { font-size: .94rem; }
-    .position h3 .ticker { margin-inline-end: .38em; }
-    .position dl {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(min(100%, 6.75rem), 1fr));
-      gap: .52rem .7rem;
-    }
-    .position dt { color: var(--muted); font-size: .785rem; }
-    .position dd { font-size: .95rem; }
-    .position .direction-label, .pnl { font-weight: 720; }
-    .position .short-label, .pnl.loss { color: var(--short); }
-    .position .long-label, .pnl.gain { color: var(--long); }
-    .kelly-values {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      border-block: 1px solid var(--rule);
-      background: var(--paper);
-    }
-    .kelly-values > div { padding: .65rem .85rem .85rem; }
-    .kelly-values > div + div { border-inline-start: 1px solid var(--rule); }
-    .kelly-values dt { font-weight: 650; font-size: .88rem; }
-    .kelly-values dd { min-block-size: 1.7rem; }
-
-
-    .discipline {
-      margin-block-end: 1.5rem;
-      border: 1px solid var(--rule);
-      border-radius: .3rem;
-      background: var(--paper);
-    }
-    .discipline summary {
+    header { margin-bottom: 26px; }
+    header p { font-size: 14px; color: #55635c; margin-top: 2px; }
+    h1 { font-size: 29px; letter-spacing: -.025em; line-height: 1.3; }
+    h2 {
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 1rem;
-      min-block-size: 56px;
-      padding: .7rem clamp(.75rem, 2.4vw, 1.15rem);
-      border-radius: .25rem;
-      font: 750 clamp(1.15rem, 2.8vw, 1.42rem)/1.35 var(--serif);
-      letter-spacing: .025em;
-      cursor: pointer;
-      list-style: none;
-    }
-    .discipline summary::-webkit-details-marker { display: none; }
-    .discipline summary:hover,
-    .discipline details[open] > summary { background: var(--ground); }
-    .discipline details[open] > summary {
-      border-block-end: 1px solid var(--rule);
-      border-end-start-radius: 0;
-      border-end-end-radius: 0;
-    }
-    .discipline .disclosure-mark {
-      flex: 0 0 .58rem;
-      block-size: .58rem;
-      margin-inline-end: .25rem;
-      border: solid var(--ink);
-      border-width: 0 2px 2px 0;
-      transform: rotate(-45deg);
-    }
-    .discipline details[open] .disclosure-mark {
-      margin-block-start: -.24rem;
-      transform: rotate(45deg);
-    }
-    .discipline .discipline-document {
-      max-inline-size: 54rem;
-      margin-inline: auto;
-      padding: clamp(.75rem, 3vw, 1.5rem);
+      gap: 10px;
+      font-size: 20px;
+      color: var(--accent);
+      line-height: 1.45;
+      margin-bottom: 4px;
       overflow-wrap: anywhere;
     }
-    .discipline .discipline-attribution {
-      margin-block-end: .9rem;
-      color: var(--muted);
-      font-size: .86rem;
+    h2::before {
+      content: "";
+      flex: 0 0 4px;
+      height: 19px;
+      border-radius: 2px;
+      background: var(--accent);
     }
-    .discipline h2 {
-      font: 750 clamp(1.3rem, 3vw, 1.85rem)/1.35 var(--serif);
+    section { margin-top: 26px; }
+    section + section { border-top: 1px solid #aab8b0; padding-top: 19px; margin-top: 6px; }
+    .short { --accent: #89452e; }
+    .long { --accent: #22634d; }
+    article { padding: 15px 0 16px; }
+    article + article { border-top: 1px solid #d8dfda; }
+    h3 { font-size: 19px; line-height: 1.45; overflow-wrap: anywhere; }
+    h3 span { font-weight: 450; }
+    dl {
+      display: grid;
+      grid-template-columns: minmax(48px, .75fr) minmax(110px, 1.75fr) minmax(55px, .8fr);
+      gap: 10px;
+      margin-top: 12px;
     }
-    .discipline h3 {
-      margin-block: 1.65rem .5rem;
-      padding-block-start: .55rem;
-      border-block-start: 1px solid var(--rule);
-      font: 750 clamp(1.1rem, 2.6vw, 1.29rem)/1.4 var(--serif);
-    }
-    .discipline blockquote { margin: 0; }
-    .discipline .discipline-source-text > blockquote {
-      padding: .65rem .8rem;
-      border-inline-start: 2px solid var(--muted);
-      background: var(--ground);
-    }
-    .discipline .discipline-source-text > :is(ol, ul, p, blockquote, table) {
-      margin-block: .6rem .85rem;
-    }
-    .discipline .discipline-source-text > :last-child { margin-block-end: 0; }
-    .discipline blockquote > p + p { margin-block-start: .45rem; }
-    .discipline :is(ol, ul) { padding-inline-start: 1.4rem; }
-    .discipline li + li { margin-block-start: .26rem; }
-    .discipline table {
-      inline-size: 100%;
-      table-layout: fixed;
-      border-collapse: collapse;
-      font-size: .875rem;
-      font-variant-numeric: tabular-nums;
-    }
-    .discipline :is(th, td) {
-      padding: .42rem clamp(.38rem, 1.7vw, .75rem);
-      border-block-end: 1px solid var(--rule);
-      text-align: start;
-      vertical-align: top;
-    }
-    .discipline thead { background: var(--ground); }
-
-    @media (min-width: 46rem) {
-      .sheet { inline-size: min(calc(100% - 4rem), 70rem); }
-      .directions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    }
-    @media (min-width: 52rem) {
-      .positions {
-        --position-columns: minmax(10rem, 1.55fr) repeat(2, minmax(3.4rem, .65fr))
-                            repeat(2, minmax(4.6rem, .85fr)) minmax(6.7rem, 1fr);
-        --position-gap: .85rem;
-      }
-      .position-head, .position {
-        display: grid;
-        grid-template-columns: var(--position-columns);
-        align-items: baseline;
-        gap: var(--position-gap);
-        padding-inline: 1rem;
-      }
-      .position-head {
-        padding-block: .55rem;
-        border-block-end: 1px solid var(--rule);
-        color: var(--muted);
-        font-size: .8rem;
-        font-weight: 650;
-      }
-      .position-head span:nth-child(n + 3), .position dl > div:nth-child(n + 2) {
-        text-align: end;
-      }
-      .position dl {
-        grid-column: 2 / -1;
-        grid-template-columns: repeat(2, minmax(3.4rem, .65fr))
-                               repeat(2, minmax(4.6rem, .85fr)) minmax(6.7rem, 1fr);
-        gap: var(--position-gap);
-      }
-      .position dt {
-        position: absolute;
-        inline-size: 1px;
-        block-size: 1px;
-        overflow: hidden;
-        clip-path: inset(50%);
-        white-space: nowrap;
-      }
-    }
-    .position .position-note {
-      grid-column: 1 / -1;
-      color: var(--muted);
-      font-size: .85rem;
-      overflow-wrap: anywhere;
-    }
-    .position :is(h3, dd), .asset-note, .report-evidence { overflow-wrap: anywhere; }
-    .report-evidence {
-      margin-block-start: 1.6rem;
-      padding-block-start: .65rem;
-      border-block-start: 1px solid var(--rule);
-      color: var(--muted);
-      font-size: .8rem;
-    }
-    .report-evidence p { margin-block-start: .4rem; }
+    dt { font-size: 13px; color: #56645d; margin-bottom: 1px; }
+    dd { font-size: 19px; font-weight: 650; line-height: 1.45; overflow-wrap: anywhere; }
+    .event { color: var(--accent); }
+    .score { font-variant-numeric: tabular-nums; }
+    .score small { font-size: 13px; font-weight: 450; color: #56645d; }
+    .reason { margin-top: 11px; font-size: 16px; line-height: 1.55; color: #35463d; }
   </style>
 </head>
 <body>
-  <a class="skip-link" href="#report">跳到报告正文</a>
-  <div class="sheet">
-    <header class="masthead">
-      <div class="edition">Trend V3 日报</div>
-      <h1>趋势动物观察报告</h1>
-      <p class="market-state" data-status="short"><!-- slot:market-state --></p>
-      <details class="market-evidence">
-        <summary>市场数据与日期</summary>
-        <p>报告日 <time datetime="{{report-date}}"><!-- slot:edition-date --></time></p>
-        <!-- slot:market-evidence -->
-        <p data-status="full"><!-- slot:market-status-detail --></p>
-      </details>
-      <nav class="contents" aria-label="报告目录">
-        <a href="#short">做空</a>
-        <a href="#long">做多</a>
-        <a href="#live">实盘</a>
-        <a href="#simulation">模拟盘</a>
-        <a href="#kelly">凯利胜率</a>
-      </nav>
+  <main>
+    <header>
+      <h1>趋势日报</h1>
+      <!-- slot:synthetic-label -->
     </header>
-
-    <main id="report" tabindex="-1">
-      <section id="discipline" class="discipline" aria-labelledby="discipline-title">
-        <details>
-          <summary id="discipline-title">
-            趋势交易纪律 V3
-            <span class="disclosure-mark" aria-hidden="true"></span>
-          </summary>
-          <div class="discipline-document">
-            <p class="discipline-attribution">引自 <code>纪律.md</code>（提交 <code><!-- slot:revision --></code>）。</p>
-            <blockquote class="discipline-source-text" aria-labelledby="discipline-source-heading">
-              <!-- slot:discipline -->
-            </blockquote>
-          </div>
-        </details>
-      </section>
-
-      <div class="directions">
-        <section id="short" class="direction short" aria-labelledby="short-title">
-          <h2 id="short-title" class="section-title">可做空的大类</h2>
-          <div class="classes"><!-- slot:short-classes --></div>
-        </section>
-        <section id="long" class="direction long" aria-labelledby="long-title">
-          <h2 id="long-title" class="section-title">可做多的大类</h2>
-          <div class="classes"><!-- slot:long-classes --></div>
-        </section>
-      </div>
-
-      <section id="live" class="record" aria-labelledby="live-title">
-        <h2 id="live-title" class="section-title">当前实盘持仓</h2>
-        <div class="reserved"></div>
-      </section>
-
-      <section id="simulation" class="record" aria-labelledby="simulation-title">
-        <h2 id="simulation-title" class="section-title">模拟盘持仓情况</h2>
-        <!-- slot:simulation -->
-      </section>
-
-      <section id="kelly" class="record" aria-labelledby="kelly-title">
-        <h2 id="kelly-title" class="section-title">当前凯利胜率</h2>
-        <dl class="kelly-values">
-          <div><dt>实盘</dt><dd></dd></div>
-          <div><dt>模拟盘</dt><dd></dd></div>
-        </dl>
-      </section>
-    </main>
-
-    <footer class="report-evidence">
-      <details>
-        <summary>费用与证据</summary>
-        <!-- slot:evidence -->
-        <p data-status="full"><!-- slot:footer-status-detail --></p>
-      </details>
-    </footer>
-  </div>
-
-  <!-- Reuse these inert patterns when rendering; remove all template elements from the report. -->
-  <template id="class-pattern">
-    <div class="class-row">
-      <h3 class="class-name"><!-- slot:class-name --></h3>
-      <!-- slot:candidate-cards -->
-      <details class="class-evidence">
-        <summary>分组与标的证据</summary>
-        <div class="ledger">
-          <p class="class-facts">
-            <span>大类图名次 <b class="number"><!-- slot:class-rank --></b></span>
-            <span>大类强度 <b class="number"><!-- slot:class-strength --></b></span>
-            <span>榜图 <!-- slot:chart-edition --></span>
-          </p>
-          <p class="asset-note"><!-- slot:class-coverage --></p>
-          <!-- slot:selection-evidence -->
-          <div class="asset-group">
-            <h4>直接交易标的</h4>
-            <!-- slot:direct-assets -->
-          </div>
-          <div class="asset-group">
-            <h4>关联标的</h4>
-            <!-- slot:related-assets -->
-          </div>
-          <!-- slot:favorite-evidence -->
-        </div>
-      </details>
-    </div>
+    <!-- slot:groups -->
+  </main>
+  <template id="group-pattern">
+    <section class="<!-- slot:direction-class -->">
+      <h2><!-- slot:direction --> · <!-- slot:class-name --></h2>
+      <!-- slot:cards -->
+    </section>
   </template>
-
   <template id="candidate-pattern">
-    <li class="candidate">
-      <h4 class="candidate-name"><span class="ticker"><!-- slot:ticker --></span> · <!-- slot:asset-name --></h4>
-      <dl class="candidate-metrics">
-        <div><dt>当前趋势</dt><dd><!-- slot:temperature --></dd></div>
-        <div><dt>特殊信号</dt><dd><!-- slot:events --></dd></div>
-        <div><dt>强度</dt><dd class="number"><!-- slot:strength --></dd></div>
-      </dl>
-      <p class="candidate-reason"><!-- slot:reason --></p>
-    </li>
-  </template>
-
-  <template id="asset-pattern">
-    <li class="asset">
-      <span class="asset-name"><span class="ticker"><!-- slot:ticker --></span> <!-- slot:asset-name --></span>
-      <span class="asset-status"><!-- slot:asset-status --></span>
-      <span class="asset-note"><!-- slot:asset-evidence --></span>
-      <span class="asset-note field-trace"><!-- slot:asset-trace --></span>
-    </li>
-  </template>
-
-  <!-- For unavailable or verified-empty SIM, emit a status paragraph instead of the grid. -->
-  <template id="positions-pattern">
-    <p class="positions-note"><!-- slot:positions-basis --></p>
-    <div class="positions">
-      <div class="position-head" aria-hidden="true">
-        <span>标的</span><span>方向</span><span>数量</span><span>开仓价</span><span>最新价</span><span>浮动盈亏</span>
-      </div>
-      <!-- slot:position-rows -->
-    </div>
-  </template>
-
-  <template id="position-pattern">
-    <article class="position">
-      <h3><span class="ticker"><!-- slot:ticker --></span> <!-- slot:asset-name --></h3>
+    <article>
+      <h3><!-- slot:ticker --> <span>· <!-- slot:asset-name --></span></h3>
       <dl>
-        <div><dt>方向</dt><dd class="direction-label"><!-- slot:position-direction --></dd></div>
-        <div><dt>数量</dt><dd class="number"><!-- slot:position-quantity --></dd></div>
-        <div><dt>开仓价</dt><dd class="number"><!-- slot:position-entry --></dd></div>
-        <div><dt>最新价</dt><dd class="number"><!-- slot:position-price --></dd></div>
-        <div><dt>浮动盈亏</dt><dd class="number pnl"><!-- slot:position-pnl --></dd></div>
+        <div><dt>当前趋势</dt><dd><!-- slot:temperature --></dd></div>
+        <div><dt>特殊信号</dt><dd class="event"><!-- slot:events --></dd></div>
+        <div><dt>强度</dt><dd class="score"><!-- slot:strength --> <small>/ 100</small></dd></div>
       </dl>
-      <p class="position-note"><!-- slot:position-evidence --></p>
+      <p class="reason"><!-- slot:reason --></p>
     </article>
   </template>
 </body>
