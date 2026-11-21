@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-21 — Trend V3 daily report evidence and ranks (#511)
+
+- Show one compact mobile card per selected instrument with its current trend, special signals, global strength, and a short reason. Keep dated evidence, ranks, coverage, and fees in expandable sections. Add offline replay and show 「本期不含持仓」 in each holdings and Kelly panel.
+
 ## 2026-11-21 — Trend V3 scheduled daily report refresh (#507)
 
 - Start one interactive Herdr session at 08:00 Taipei time. Check A-share, Hong Kong and US data in their own trading windows. The same session rechecks pending markets hourly and updates the private daily HTML when verified data changes.
