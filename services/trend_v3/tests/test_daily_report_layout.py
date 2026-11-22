@@ -546,3 +546,99 @@ def test_rejects_invalid_direction_seats(tmp_path, direction, seats):
     assert result.returncode != 0
     assert "seat" in result.stderr
     assert not output_file.exists()
+
+
+@pytest.mark.parametrize("direction", ["long", "short"])
+def test_direct_watch_entries(tmp_path, direction):
+    # Hand-worked orders: all five qualify, including the equal-strength B/C.
+    codes = (
+        ["B", "C", "E", "A", "D"]
+        if direction == "long"
+        else ["D", "A", "E", "B", "C"]
+    )
+    strengths = {"A": 60, "B": 90, "C": 90, "D": 30, "E": 75}
+    cards = [
+        {
+            "code": code,
+            "name": f"合成标的 {code}",
+            "trend": "热" if direction == "long" else "寒",
+            "signal_events": ["温转热" if direction == "long" else "凉转寒"],
+            "strength": f"{strengths[code]} / 100",
+            "direct_verified": True,
+            "watch_eligible": True,
+        }
+        for code in codes
+    ]
+    html = render(
+        tmp_path,
+        {
+            "date": "2040-02-29",
+            direction: [{"seat": 1, "name": "合成类", "direct": cards}],
+        },
+        f"direct-watch-{direction}",
+    )
+    rendered = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+    assert len(rendered) == 5
+    assert re.findall(r'<h4 class="reader-name">(\w+) <span>', html) == codes
+    for card in rendered:
+        assert '<span class="reader-marker">直属</span>' in card
+        assert '<span class="reader-marker">应建观察仓</span>' in card
+    assert_formal_records(html)
+
+
+def test_direct_watch_markers_require_evidence(tmp_path):
+    assets = [
+        {"code": "OLD", "name": "旧投影", "signal": "温转热"},
+        {
+            "code": "Z", "name": "仅警报",
+            "signal_events": ["反抽警报"], "direct_verified": True,
+        },
+        {
+            "code": "Y", "name": "日期待核",
+            "direct_verified": True, "watch_eligible": False,
+        },
+        {
+            "code": "STR", "name": "文本不是核实值",
+            "direct_verified": "true", "watch_eligible": "true",
+        },
+        {
+            "code": "MISS", "name": "完整无匹配",
+            "lookup": "miss", "direct_verified": True,
+        },
+        {
+            "code": "PENDING", "name": "分页待核",
+            "lookup": "pending", "direct_verified": True,
+        },
+        {
+            "code": "F", "name": "仅缺强度", "trend": "热",
+            "signal_events": ["温转热"], "direct_verified": True,
+            "watch_eligible": True,
+        },
+    ]
+    html = render(
+        tmp_path,
+        {
+            "date": "2040-02-29",
+            "long": [{
+                "seat": 1, "name": "合成类", "direct": assets,
+                "related": [{
+                    "code": "X", "name": "关联 ETF",
+                    "signal_events": ["温转热"], "strength": "99 / 100",
+                }],
+            }],
+        },
+        "evidence-markers",
+    )
+    cards = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+    assert len(cards) == 8
+    assert 'reader-marker' not in cards[0]
+    assert 'reader-marker' not in cards[3]
+    for index in (1, 2, 4, 5):
+        assert '<span class="reader-marker">直属</span>' in cards[index]
+        assert '应建观察仓' not in cards[index]
+    assert 'reader-marker' not in cards[7]
+    assert '<span class="reader-marker">直属</span>' in cards[6]
+    assert '<span class="reader-marker">应建观察仓</span>' in cards[6]
+    assert '<dt>强度</dt><dd>待核</dd>' in cards[6]
+    assert '<dt>当前趋势</dt><dd>查不到</dd>' in cards[4]
+    assert '<dt>当前趋势</dt><dd>待核</dd>' in cards[5]

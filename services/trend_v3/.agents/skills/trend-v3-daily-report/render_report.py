@@ -142,7 +142,17 @@ def render_card(pattern, asset):
         trend = strength = status
         signal = "无"
         reason = display_text(asset.get("reason"), status)
+    # These flags are supplied only after evidence selection. Neither list
+    # placement nor a displayed event establishes membership or eligibility.
+    markers = []
+    if asset.get("direct_verified") is True:
+        markers.append('<span class="reader-marker">直属</span>')
+    if lookup is None and asset.get("watch_eligible") is True:
+        markers.append('<span class="reader-marker">应建观察仓</span>')
     return pattern.substitute(
+        markers='<p class="reader-markers">' + " · ".join(markers) + "</p>"
+        if markers
+        else "",
         code=display_text(asset["code"]),
         name=display_text(asset["name"]),
         trend=trend,
