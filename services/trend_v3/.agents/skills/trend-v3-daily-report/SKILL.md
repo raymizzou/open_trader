@@ -117,7 +117,7 @@ python3 "$skill_dir/render_report.py" "$verified_json" "$new_html"
 `skill_dir` 为核对过版本的技能目录，`verified_json` 为明确选定的 UTF-8 输入路径，`new_html` 为已存在的私有目录下尚未使用的候选文件路径。渲染器只读该输入与同目录下的 `assets/report.html`，生成一份 UTF-8 HTML。它转义所有动态文本，展开并移除模板节点和插槽。已有路径返回非零。需要替换现行日报时，先核对候选，再按下文的锁、归档和原子替换流程处理。
 
 - 根对象必须有 `date`（实际报告日，`YYYY-MM-DD`）。可选 `board_date`（经核实的榜图日，同格式）、`board_version`、`short`、`long`、`short_note`、`long_note`。方向数组缺省为空，方向说明只写白名单允许的具体缺项。
-- 每个大类有整数 `seat`（该方向已核实席位）和 `name`，可选 `code`、`board_strength`、`direct`、`related`、`direct_note`、`related_note`。两个列表缺省为空。两种列表说明用于对应列表为空时。保持筛选后的席位和标的顺序。
+- 每个大类有已核实的方向席位 `seat`（整数 `1` 或 `2`，同一方向内唯一）和 `name`，可选 `code`、`board_strength`、`direct`、`related`、`direct_note`、`related_note`。两个列表缺省为空。两种列表说明用于对应列表为空时。保持筛选后的席位和标的顺序。
 - 列表中的标的有 `code` 和 `name`，可选 `trend`、`signal`、`strength`、`reason` 和 `lookup`。独立有据的指标使用显示文本。不确定的指标可省略，私有缺项标记 `UNKNOWN` 在标的指标中也显示为「待核」。提供 `lookup` 时，渲染器只用查询状态填三个指标，仍可提供经核实的 `reason`。除整数席位和数组外，所有提供的值均为文本。最少输入只有报告日，例如 `{"date":"2040-01-01"}`，仍生成完整页面。
 
 ### 私有证据

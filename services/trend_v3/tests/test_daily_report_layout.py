@@ -8,6 +8,8 @@ import sys
 from html.parser import HTMLParser
 from pathlib import Path
 
+import pytest
+
 SKILL = Path(__file__).resolve().parents[1] / ".agents/skills/trend-v3-daily-report"
 TEMPLATE = SKILL / "assets/report.html"
 RENDERER = SKILL / "render_report.py"
@@ -332,3 +334,38 @@ def test_excludes_example_and_private_data(tmp_path):
     assert duplicate.returncode != 0
     assert output.read_text(encoding="utf-8") == zero
     assert output.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    ("direction", "seats"),
+    [
+        pytest.param("short", [17], id="global-rank-17"),
+        pytest.param("short", [18], id="global-rank-18"),
+        pytest.param("long", [1, 1], id="duplicate-seat"),
+        pytest.param("short", [True], id="non-integer-seat"),
+    ],
+)
+def test_rejects_invalid_direction_seats(tmp_path, direction, seats):
+    other_direction = "long" if direction == "short" else "short"
+    report = {
+        "date": "2040-02-29",
+        direction: [
+            {"name": f"合成分类 {index}", "seat": seat}
+            for index, seat in enumerate(seats)
+        ],
+        other_direction: [{"name": "合成分类", "seat": 1}],
+    }
+    input_file = tmp_path / "invalid-seats.json"
+    output_file = tmp_path / "candidate.html"
+    input_file.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(RENDERER), str(input_file), str(output_file)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert "seat" in result.stderr
+    assert not output_file.exists()

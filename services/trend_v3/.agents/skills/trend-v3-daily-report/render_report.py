@@ -64,10 +64,14 @@ def render_direction(fragments, groups, note):
     if not isinstance(groups, list):
         raise ValueError("Direction rows must be arrays")
     rows = []
+    seen_seats = set()
     for index, group in enumerate(groups):
         seat = group["seat"]
-        if type(seat) is not int or seat < 1:
-            raise ValueError("A direction seat must be a positive integer")
+        if type(seat) is not int or seat not in (1, 2):
+            raise ValueError("A direction seat must be the integer 1 or 2")
+        if seat in seen_seats:
+            raise ValueError(f"Duplicate seat {seat} in one direction")
+        seen_seats.add(seat)
         code = group.get("code")
         rows.append(
             fragments["class_row"].substitute(
