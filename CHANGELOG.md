@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-11-22 — Trend V3 confirmed events and BTC spot strength (#511)
+
+- Show distinct confirmed special events in first-seen order, separated by
+  `，`. Show `无` when there are no confirmed events to display. Lookup
+  status remains visible in the card's trend, strength, and reason.
+- Show BTC spot observation strength from its own `trendStrengthLocalCurr`
+  for the applicable provider data date, including zero. Reuse verified
+  evidence or add the field to the authorized scheduled BTC snapshot.
+  A separate manual lookup requires explicit authorization.
+
 ## 2026-11-22 — Restore the approved V1 Trend V3 reader (#511)
 
 - Render the dated masthead, linked directory, short and long panels, and
