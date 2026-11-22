@@ -11,6 +11,9 @@
 - Apply the same selection rules to scheduled, manual and offline reports.
   Publish discipline v3.2 without changing class seats or account limits.
   Real drilldown acceptance remains subject to matching source evidence.
+- Keep verified direct cards visible with an explicit, public partial-coverage
+  note after them when other members remain unverified. Use the new
+  `direct_partial_note` field; legacy empty-list notes keep their prior behavior.
 
 ## 2026-11-22 — Trend V3 confirmed events and BTC spot strength (#511)
 

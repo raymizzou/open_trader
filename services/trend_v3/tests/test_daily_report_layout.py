@@ -642,3 +642,92 @@ def test_direct_watch_markers_require_evidence(tmp_path):
     assert '<dt>强度</dt><dd>待核</dd>' in cards[6]
     assert '<dt>当前趋势</dt><dd>查不到</dd>' in cards[4]
     assert '<dt>当前趋势</dt><dd>待核</dd>' in cards[5]
+
+
+def test_direct_partial_coverage_with_verified_cards(tmp_path):
+    direct = {
+        "code": "A",
+        "name": "已核实标的",
+        "direct_verified": True,
+        "watch_eligible": True,
+        "trend": "热",
+        "signal_events": ["温转热"],
+    }
+    related = {"code": "X", "name": "关联标的"}
+    public_note = "部分直属成员已核实，后续页 <待核> & 尚未确认。"
+    escaped_note = "部分直属成员已核实，后续页 &lt;待核&gt; &amp; 尚未确认。"
+    group = {
+        "seat": 1,
+        "name": "部分覆盖类",
+        "direct": [direct],
+        "direct_partial_note": public_note,
+        "direct_note": "LEGACY-DIRECT-EMPTY-ONLY",
+        "related": [related],
+        "related_note": "LEGACY-RELATED-EMPTY-ONLY",
+        "coverage_evidence": "PRIVATE-COVERAGE-DETAILS",
+    }
+    html = render(
+        tmp_path,
+        {
+            "date": "2040-02-29",
+            "long": [group, {"seat": 2, "name": "空列表类"}],
+        },
+        "partial-direct",
+    )
+    rows = re.findall(r"<details\b.*?</details>", html, re.S)
+    assert len(rows) == 2
+    direct_body, related_body = rows[0].split("<h3>关联标的</h3>")
+    assert '<h4 class="reader-name">A <span>' in direct_body
+    assert '<span class="reader-marker">直属</span>' in direct_body
+    assert '<span class="reader-marker">应建观察仓</span>' in direct_body
+    note_html = f'<p class="empty-direct">{escaped_note}</p>'
+    assert note_html in direct_body
+    assert direct_body.index("</ul>") < direct_body.index(note_html)
+    assert escaped_note not in related_body
+    assert "LEGACY-" not in html
+    assert "PRIVATE-COVERAGE-DETAILS" not in html
+    assert "<待核>" not in html
+    assert "已核实无合格直属标的" not in rows[0]
+    assert "暂无已确认的直接交易标的。" not in rows[0]
+    assert "暂无已确认的关联标的。" not in rows[0]
+    assert "暂无已确认的直接交易标的。" in rows[1]
+    assert "暂无已确认的关联标的。" in rows[1]
+    assert rows[0].index("部分覆盖类") < rows[0].index("reader-card")
+    assert "空列表类" in rows[1]
+    assert digest(stylesheet(html)) == APPROVED_CSS
+    assert shell_digest(html) == APPROVED_SHELL
+    assert_formal_records(html)
+
+    # Existing empty-only fields do not become new public partial-coverage text.
+    legacy = {
+        key: value for key, value in group.items() if key != "direct_partial_note"
+    }
+    for label, fields in (
+        ("legacy", legacy),
+        ("blank", {**group, "direct_partial_note": ""}),
+    ):
+        unchanged = render(
+            tmp_path, {"date": "2040-02-29", "long": [fields]}, label
+        )
+        assert "LEGACY-" not in unchanged
+        row = re.search(r"<details\b.*?</details>", unchanged, re.S)[0]
+        assert "empty-direct" not in row
+        assert "PRIVATE-COVERAGE-DETAILS" not in unchanged
+        assert unchanged.count('<li class="asset reader-card">') == 2
+
+    empty = render(
+        tmp_path,
+        {
+            "date": "2040-02-29",
+            "long": [{
+                "seat": 1,
+                "name": "已知空列表",
+                "direct_note": "直属范围待核 & 未完成。",
+                "related_note": "关联范围待核。",
+            }],
+        },
+        "empty-custom-notes",
+    )
+    assert "直属范围待核 &amp; 未完成。" in empty
+    assert "关联范围待核。" in empty
+    assert '<li class="asset reader-card">' not in empty
