@@ -2,9 +2,10 @@
 
 ## 2026-11-22 — Restore four sections in the Trend V3 report (#511)
 
-- Show each verified market-board class with its rank, direction, strength,
-  and expandable instrument evidence. Keep selected cards with their class
-  and retain classes without cards.
+- Show verified classes from the market board's top two (long) and bottom two
+  (short) seats, even when they have no eligible cards. Show each class's rank,
+  direction, strength, and expandable instrument evidence. Keep selected
+  cards with their class.
 - Deliver all four sections even when evidence is unavailable or only one
   item changes. Show `未接入` for live positions, simulated positions,
   and Kelly win rate.

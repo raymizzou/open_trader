@@ -22,7 +22,8 @@ The caller owns calendar decisions and all other opening conditions.
   latest applicable evidence and has all four sections. Otherwise render from
   available local evidence within the existing permissions. Always include
   大类及逐类下钻, 当前实盘持仓, 模拟盘持仓情况, and 当前凯利胜率 in that order.
-  Keep each verified market-board class even when it has no selected cards.
+  Keep each verified class from the market board's top two (long) and bottom
+  two (short) seats, even when it has no eligible cards.
   Show its verified board facts and available instrument evidence in the class
   drilldown. State missing evidence in the first section even when there is no
   usable evidence at all. The last three sections each show only `未接入`.
