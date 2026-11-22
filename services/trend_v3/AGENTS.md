@@ -20,9 +20,8 @@ The caller owns calendar decisions and all other opening conditions.
 - When a lookup for a known related trading instrument completes and verifies
   that Trend Animals returned no match, keep the instrument in its group with
   its verified identity and the exact reader-visible text `查不到`. Keep that
-  group visible even if it has no other entries. This display is a narrow
-  exception to the older skill whitelist for instrument cards and groups
-  without cards. `查不到` means the source returned no match for that lookup.
+  group visible even if it has no other entries. `查不到` means the source
+  returned no match for that lookup.
   Treat it as missing source data and draw no conclusions about signals,
   eligibility, or ranking. A failed or unattempted lookup remains unknown.
 - Follow the existing data and fee authorizations. This delivery rule grants

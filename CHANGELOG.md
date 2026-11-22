@@ -6,8 +6,10 @@
   complete current HTML in the existing `trend_v3` iCloud folder, including for
   single-item corrections. Reuse the verified file for read-only requests.
 - Keep identifiable related instruments in their groups with `查不到` when a
-  completed Trend Animals lookup confirms no match. The label records a missing
-  source result and gives no signal, eligibility, or ranking conclusion.
+  completed Trend Animals lookup confirms no match. The report skill and
+  template show the instrument's identity and this label, including in groups
+  with no eligible or observation cards. The label records a missing source
+  result and gives no signal, eligibility, or ranking conclusion.
 
 ## 2026-11-22 — Trend V3 weekend checks and direct observations (#511)
 
