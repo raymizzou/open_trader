@@ -291,6 +291,31 @@ def test_renders_approved_shell_across_dates(tmp_path):
             id="legacy-negated-list",
         ),
         pytest.param(
+            {"signal": "未触发开香槟、上天台"},
+            "无",
+            id="legacy-unpunctuated-negation",
+        ),
+        pytest.param(
+            {"signal": "疑似开香槟，上天台；已确认：反抽警报"},
+            "反抽警报",
+            id="legacy-unpunctuated-tentative",
+        ),
+        pytest.param(
+            {"signal": "温转热、未触发开香槟，上天台；寒转冻、热转沸"},
+            "温转热，寒转冻，热转沸",
+            id="legacy-ambiguous-tail",
+        ),
+        pytest.param(
+            {"signal": "未触发开香槟、上天台（其余待核）"},
+            "无",
+            id="legacy-coverage-inside-negation",
+        ),
+        pytest.param(
+            {"signal": "温转热，未触发开香槟，上天台（其余待核）"},
+            "温转热",
+            id="legacy-coverage-after-negated-group",
+        ),
+        pytest.param(
             {
                 "signal": "已确认：热转沸、沸中创历史新高；"
                 "未触发：开香槟、反抽警报；寒转冻"
