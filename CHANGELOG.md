@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-11-22 — Trend V3 report delivery in every session (#511)
+
+- Use the selected revision's report skill in every session or tab. Link the
+  complete current HTML in the existing `trend_v3` iCloud folder, including for
+  single-item corrections. Reuse the verified file for read-only requests.
+- Keep identifiable related instruments in their groups with `查不到` when a
+  completed Trend Animals lookup confirms no match. The report skill and
+  template show the instrument's identity and this label, including in groups
+  with no eligible or observation cards. The label records a missing source
+  result and gives no signal, eligibility, or ranking conclusion.
+
 ## 2026-11-22 — Trend V3 weekend checks and direct observations (#511)
 
 - Start the report at 08:30 Taipei time every calendar day. If the whole report is ready, generate it once and end automatic checks. Otherwise recheck each hour on the half hour until ready. Verify each market's data dates and publication evidence at those shared checks. Show confirmed special events for selected asset classes that are themselves tradable instruments. These observation cards keep the three-field reader and use verified same-instrument strength when available. New-position selection keeps its existing signal, eligibility, global strength, and seat rules.

@@ -26,6 +26,10 @@ current readiness or health claims. If evidence is unavailable, report UNKNOWN;
 do not run an expensive or external gate solely to fill the gap unless the current
 request requires it.
 
+Every session or tab that delivers a Trend V3 report to Ray, including a
+single-item correction, follows the
+[Trend V3 report delivery rules](services/trend_v3/AGENTS.md#daily-report-delivery).
+
 ## Worktree and approval
 
 Start every implementation or repository-change task from freshly fetched
