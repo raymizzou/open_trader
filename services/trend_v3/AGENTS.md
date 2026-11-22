@@ -14,16 +14,21 @@ The caller owns calendar decisions and all other opening conditions.
   file in the existing `trend_v3` iCloud folder. Link to that file in the
   delivering session. Use that link as the sole delivery, even for a
   single-item correction.
-- For a read-only request, reuse the verified current, complete HTML generated
-  by the skill. For a revision, carry forward all other current sections and
-  entries that remain verified. Apply the correction to the complete report.
-- When a lookup for a known related trading instrument completes and verifies
-  that Trend Animals returned no match, keep the instrument in its group with
-  its verified identity and the exact reader-visible text `查不到`. Keep that
-  group visible even if it has no other entries. `查不到` means the source
-  returned no match for that lookup.
-  Treat it as missing source data and draw no conclusions about signals,
-  eligibility, or ranking. A failed or unattempted lookup remains unknown.
+- Make one scheduled pass per Taipei calendar day at 08:30, or once when
+  started late. Perform the authorized retrieval and instrument checks for
+  that pass, then write the report from available evidence. Never check
+  report-wide data completeness or poll for more data before delivery.
+- For a read-only request, reuse the verified current HTML if it matches the
+  latest applicable evidence. Otherwise render from available local evidence
+  within the existing permissions. For a revision, carry forward all other
+  still-valid entries. If there are no displayable entries, use the
+  title-only template without making a claim about the absence of signals.
+- For a known related trading instrument with verified identity, market,
+  and selected group, show `查不到` when a completed applicable Trend Animals
+  lookup confirms no match. Show `待核` when the lookup failed, was skipped,
+  or remains unresolved. Keep the group visible when it has only lookup
+  status entries. These labels give no signal, eligibility, or ranking
+  conclusion.
 - Follow the existing data and fee authorizations. This delivery rule grants
   no authority for trading, additional fees, or additional data access.
 
