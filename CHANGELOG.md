@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-11-22 — Trend V3 reports from available evidence (#511)
+
+- Run one scheduled pass at 08:30 Taipei time each calendar day, or once when
+  started late. After the authorized data checks, write one current HTML
+  from the available evidence. This ends the previous hourly recheck policy.
+- Use the same evidence rule for reads and revisions, including title-only
+  reports when there are no displayable entries. Show `待核` for an unresolved
+  lookup of an identified related instrument. Reserve `查不到` for a verified
+  result with no match.
+
 ## 2026-11-22 — Trend V3 report delivery in every session (#511)
 
 - Use the selected revision's report skill in every session or tab. Link the
