@@ -229,7 +229,184 @@ def test_renders_approved_shell_across_dates(tmp_path):
     )
     assert re.search(r"<dt>强度</dt><dd>12 / 100</dd>", rows[0])
     assert re.search(r"<dt>强度</dt><dd>同品种 43 / 100</dd>", rows[0])
+    assert re.findall(r'<dd class="reader-event">(.*?)</dd>', rows[0]) == [
+        "凉转寒",
+        "开香槟",
+    ]
+    assert '<dd class="reader-event">无</dd>' in partial
     assert "合成的同向观察。" in rows[0]
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        pytest.param({}, "无", id="absent"),
+        pytest.param({"signal_events": []}, "无", id="empty"),
+        pytest.param({"signal_events": ["寒转凉"]}, "寒转凉", id="one"),
+        pytest.param(
+            {"signal_events": ["温转热", "开香槟", "温转热", "上天台", "反抽警报"]},
+            "温转热，开香槟，上天台，反抽警报",
+            id="first-seen",
+        ),
+        pytest.param(
+            {"signal_events": ["UNKNOWN", "未触发", "未出现温转热", "开香槟", "待核"]},
+            "开香槟",
+            id="partial-confirmation",
+        ),
+        pytest.param(
+            {
+                "signal_events": [
+                    "  热转沸  ",
+                    "寒转冻",
+                    "合成回稳 A&B",
+                    "热转沸",
+                    "合成回稳 A&B ",
+                    " unknown ",
+                    "无事件",
+                    "未确认合成信号",
+                    "可能触发",
+                    "合成信号（其余待核）",
+                    "未触发：开香槟、上天台",
+                ],
+            },
+            "热转沸，寒转冻，合成回稳 A&amp;B",
+            id="additional-verified-names",
+        ),
+        pytest.param(
+            {"signal_events": [], "signal": "开香槟"}, "无", id="withdrawn-legacy"
+        ),
+        pytest.param(
+            {"signal_events": ["无量转强", "无开香槟", "无特殊信号", "未见反抽警报"]},
+            "无量转强",
+            id="structured-negation",
+        ),
+        pytest.param(
+            {"signal": "温转热、未触发反抽警报，开香槟（其余待核）, 温转热"},
+            "温转热",
+            id="legacy-mixed",
+        ),
+        pytest.param(
+            {"signal": "温转热、未触发开香槟，上天台（其余待核）"},
+            "温转热",
+            id="legacy-coverage-after-inline-negation",
+        ),
+        pytest.param(
+            {"signal": "已确认：温转热、上天台（其余待核）,热转沸。寒转冻\n反抽警报"},
+            "温转热，上天台，热转沸，寒转冻，反抽警报",
+            id="legacy-affirmative-coverage",
+        ),
+        pytest.param(
+            {"signal": "未触发：温转热、反抽警报；寒转凉、上天台 (其余待核)"},
+            "寒转凉，上天台",
+            id="legacy-negated-list",
+        ),
+        pytest.param(
+            {"signal": "未触发开香槟、上天台"},
+            "无",
+            id="legacy-unpunctuated-negation",
+        ),
+        pytest.param(
+            {"signal": "疑似开香槟，上天台；已确认：反抽警报"},
+            "反抽警报",
+            id="legacy-unpunctuated-tentative",
+        ),
+        pytest.param(
+            {"signal": "温转热、未触发开香槟，上天台；寒转冻、热转沸"},
+            "温转热，寒转冻，热转沸",
+            id="legacy-ambiguous-tail",
+        ),
+        pytest.param(
+            {"signal": "未触发开香槟、上天台（其余待核）"},
+            "无",
+            id="legacy-coverage-inside-negation",
+        ),
+        pytest.param(
+            {"signal": "温转热，未触发开香槟，上天台（其余待核）"},
+            "温转热",
+            id="legacy-coverage-after-negated-group",
+        ),
+        pytest.param(
+            {
+                "signal": "已确认：热转沸、沸中创历史新高；"
+                "未触发：开香槟、反抽警报；寒转冻"
+            },
+            "热转沸，沸中创历史新高，寒转冻",
+            id="legacy-discipline-names",
+        ),
+        pytest.param(
+            {"signal": "未触发、查不到、UNKNOWN、待核、无信号、普通标签"},
+            "无",
+            id="legacy-no-confirmed-event",
+        ),
+        pytest.param(
+            {"lookup": "miss", "signal": "开香槟", "reason": "完整查询无精确匹配。"},
+            "无",
+            id="lookup-miss",
+        ),
+        pytest.param(
+            {
+                "lookup": "pending",
+                "signal_events": ["上天台"],
+                "reason": "当前查询只收到第一页。",
+            },
+            "无",
+            id="lookup-pending",
+        ),
+    ],
+)
+def test_special_signal_display(tmp_path, fields, expected):
+    asset = {"code": "TEST-A", "name": "合成标的", **fields}
+    html = render(
+        tmp_path,
+        {
+            "date": "2040-02-29",
+            "long": [{"seat": 1, "name": "合成类", "direct": [asset]}],
+        },
+        "special-signal",
+    )
+    assert re.findall(r'<dd class="reader-event">(.*?)</dd>', html) == [expected]
+    if "reason" in fields:
+        assert f'<p class="reader-reason">{fields["reason"]}</p>' in html
+
+
+@pytest.mark.parametrize(
+    ("local_strength", "expected"),
+    [
+        pytest.param(0, "同品种 0 / 100", id="zero"),
+        pytest.param(6.25, "同品种 6.25 / 100", id="number"),
+        pytest.param("6.250", "同品种 6.250 / 100", id="source-precision"),
+        pytest.param(None, "待核", id="missing"),
+    ],
+)
+def test_btc_observation_strength(tmp_path, local_strength, expected):
+    html = render(
+        tmp_path,
+        {
+            "date": "2040-02-29",
+            "long": [
+                {
+                    "seat": 2,
+                    "name": "比特币",
+                    "board_strength": "93",
+                    "direct": [
+                        {
+                            "code": "BTC",
+                            "name": "比特币现货",
+                            "trend": "热",
+                            "signal_events": ["开香槟"],
+                            "local_strength": local_strength,
+                            "strength": "87 / 100",
+                        }
+                    ],
+                }
+            ],
+        },
+        "btc-observation",
+    )
+    assert '<span class="number">02</span>' in html
+    assert '<span class="number">93</span>' in html
+    assert re.findall(r"<dt>强度</dt><dd>(.*?)</dd>", html) == [expected]
+    assert "87 / 100" not in html
 
 
 def test_excludes_example_and_private_data(tmp_path):
@@ -310,7 +487,7 @@ def test_excludes_example_and_private_data(tmp_path):
     cards = re.findall(r'<li class="asset reader-card">.*?</li>', result, re.S)
     assert len(cards) == 5
     metric_values = r"<dd(?: class=\"reader-event\")?>(.*?)</dd>"
-    assert re.findall(metric_values, cards[0]) == ["热", "待核", "待核"]
+    assert re.findall(metric_values, cards[0]) == ["热", "无", "待核"]
     lookups = [
         ("查不到", "已核对合成查询 &amp; 全部结果，无精确匹配。"),
         ("待核", "只收到合成查询第一页，后续页为 &quot;&lt;待核&gt;&quot;。"),
@@ -318,7 +495,7 @@ def test_excludes_example_and_private_data(tmp_path):
         ("待核", "待核"),
     ]
     for card, (status, reason) in zip(cards[1:], lookups, strict=True):
-        assert re.findall(metric_values, card) == [status] * 3
+        assert re.findall(metric_values, card) == [status, "无", status]
         assert f'<p class="reader-reason">{reason}</p>' in card
         assert "不适用" not in card
     assert all("查不到" not in card for card in (cards[2], cards[4]))

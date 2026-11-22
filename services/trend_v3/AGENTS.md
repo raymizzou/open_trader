@@ -24,8 +24,10 @@ The caller owns calendar decisions and all other opening conditions.
   Keep each verified class from the market board's bottom two (short) and top
   two (long) seats. Each class expands to direct and related instrument cards.
   Show the verified direction seat and board strength with the class. Show
-  instrument strength with its card. Keep both direction panels when evidence
-  is missing. The live reserved block and the simulation section each show a
+  instrument strength with its card. For BTC spot observation, use the verified
+  same-asset-category strength for the applicable provider data date. Keep both
+  direction panels when evidence is missing. The live reserved block and the
+  simulation section each show a
   `positions-note` paragraph with `未接入`. The two Kelly values each show
   `未接入`.
   Only individual instrument cards may change visually without Ray's approval.
@@ -35,14 +37,16 @@ The caller owns calendar decisions and all other opening conditions.
   within the existing permissions. Revisions preserve still-valid facts and
   entries and render the full report.
 - For an instrument with verified identity, market, and selected group, show
-  `查不到` in all three lookup-card values when a completed applicable
+  `查不到` in the trend and strength values when a completed applicable
   Trend Animals lookup confirms an exact match is absent from the entire
-  applicable result. Show `待核` in all three when the lookup failed, was
+  applicable result. Show `待核` in those values when the lookup failed, was
   skipped, has incomplete pages, or remains unresolved. The reason may give
   verified, publishable provenance or explain the status. It defaults to the
-  same status label. These labels give no signal, eligibility, or ranking
-  conclusion. On ordinary instrument cards, keep verified values and show
-  `待核` for unavailable values.
+  same status label. Keep verified values on ordinary cards and show `待核`
+  for unavailable trend and strength. The special-signal cell lists distinct
+  confirmed event names joined by `，`. It shows `无` when no confirmed event
+  can be listed, including on lookup-only cards. Keep lookup and coverage
+  evidence for eligibility and ranking in the underlying records.
 - Follow the existing data and fee authorizations. This delivery rule grants
   no authority for trading, additional fees, or additional data access.
 
