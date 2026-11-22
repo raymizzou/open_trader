@@ -18,23 +18,31 @@ The caller owns calendar decisions and all other opening conditions.
   started late. Perform the authorized retrieval and instrument checks for
   that pass, then write the report from available evidence. Never check
   report-wide data completeness or poll for more data before delivery.
-- For a read-only request, reuse the verified current HTML if it matches the
-  latest applicable evidence and has all four sections. Otherwise render from
-  available local evidence within the existing permissions. Always include
-  大类及逐类下钻, 当前实盘持仓, 模拟盘持仓情况, and 当前凯利胜率 in that order.
-  Keep each verified class from the market board's top two (long) and bottom
-  two (short) seats, even when it has no eligible cards.
-  Show its verified board facts and available instrument evidence in the class
-  drilldown. State missing evidence in the first section even when there is no
-  usable evidence at all. The last three sections each show only `未接入`.
-  For a revision, regenerate all four sections and carry forward the other
-  still-valid facts and entries.
-- For a known related trading instrument with verified identity, market,
-  and selected group, show `查不到` when a completed applicable Trend Animals
-  lookup confirms an exact match is absent from the entire applicable result.
-  Show `待核` when the lookup failed, was skipped, has incomplete pages, or
-  remains unresolved. These labels give no signal, eligibility, or ranking
-  conclusion.
+- Use the selected revision's [V1 report renderer](.agents/skills/trend-v3-daily-report/render_report.py)
+  for scheduled, manual, offline, and revision work. The dated masthead links
+  to the short, long, live, simulation, and Kelly sections in that order.
+  Keep each verified class from the market board's bottom two (short) and top
+  two (long) seats. Each class expands to direct and related instrument cards.
+  Show the verified direction seat and board strength with the class. Show
+  instrument strength with its card. Keep both direction panels when evidence
+  is missing. The live reserved block and the simulation section each show a
+  `positions-note` paragraph with `未接入`. The two Kelly values each show
+  `未接入`.
+  Only individual instrument cards may change visually without Ray's approval.
+- For a read-only request, reuse the verified current HTML when it comes from
+  the effective template and renderer and matches the HTML rendered from the
+  latest applicable local evidence. Otherwise render the complete V1 report
+  within the existing permissions. Revisions preserve still-valid facts and
+  entries and render the full report.
+- For an instrument with verified identity, market, and selected group, show
+  `查不到` in all three lookup-card values when a completed applicable
+  Trend Animals lookup confirms an exact match is absent from the entire
+  applicable result. Show `待核` in all three when the lookup failed, was
+  skipped, has incomplete pages, or remains unresolved. The reason may give
+  verified, publishable provenance or explain the status. It defaults to the
+  same status label. These labels give no signal, eligibility, or ranking
+  conclusion. On ordinary instrument cards, keep verified values and show
+  `待核` for unavailable values.
 - Follow the existing data and fee authorizations. This delivery rule grants
   no authority for trading, additional fees, or additional data access.
 

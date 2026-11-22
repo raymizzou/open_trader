@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-22 — Restore the approved V1 Trend V3 reader (#511)
+
+- Render the dated masthead, linked directory, short and long panels, and
+  expandable class rows from one fixed template. Display the direction seat
+  and board strength beside each class and the instrument metrics in its card.
+- Use the same renderer for scheduled reports, manual reports, offline
+  verification, and revisions. Keep the live, simulation, and Kelly sections
+  visible with `未接入`, including on days with no verified board seats.
+
 ## 2026-11-22 — Restore four sections in the Trend V3 report (#511)
 
 - Show verified classes from the market board's top two (long) and bottom two
