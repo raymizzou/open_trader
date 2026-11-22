@@ -6,9 +6,27 @@ The freshness gate compares the class data date with the expected data date
 supplied by the caller. An exact match only passes the freshness condition.
 The caller owns calendar decisions and all other opening conditions.
 
-For a private Trend V3 daily observation report, use the
-[daily report skill](.agents/skills/trend-v3-daily-report/SKILL.md) from the
-repository revision selected for the run.
+## Daily report delivery
+
+- In every session or tab that delivers a Trend V3 report to Ray, use the
+  [daily report skill](.agents/skills/trend-v3-daily-report/SKILL.md) from the
+  selected repository revision. Deliver the entire current report as one HTML
+  file in the existing `trend_v3` iCloud folder. Link to that file in the
+  delivering session. Use that link as the sole delivery, even for a
+  single-item correction.
+- For a read-only request, reuse the verified current, complete HTML generated
+  by the skill. For a revision, carry forward all other current sections and
+  entries that remain verified. Apply the correction to the complete report.
+- When a lookup for a known related trading instrument completes and verifies
+  that Trend Animals returned no match, keep the instrument in its group with
+  its verified identity and the exact reader-visible text `查不到`. Keep that
+  group visible even if it has no other entries. This display is a narrow
+  exception to the older skill whitelist for instrument cards and groups
+  without cards. `查不到` means the source returned no match for that lookup.
+  Treat it as missing source data and draw no conclusions about signals,
+  eligibility, or ranking. A failed or unattempted lookup remains unknown.
+- Follow the existing data and fee authorizations. This delivery rule grants
+  no authority for trading, additional fees, or additional data access.
 
 ## Implementation
 
