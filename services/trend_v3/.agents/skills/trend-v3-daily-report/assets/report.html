@@ -15,7 +15,7 @@
       font: 17px/1.55 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
     }
     main { max-width: 660px; margin: auto; padding: 24px 20px 40px; }
-    h1, h2, h3, p, dl, dd { margin: 0; }
+    h1, h2, h3, h4, p, dl, dd { margin: 0; }
     header { margin-bottom: 26px; }
     header p { font-size: 14px; color: #55635c; margin-top: 2px; }
     h1 { font-size: 29px; letter-spacing: -.025em; line-height: 1.3; }
@@ -36,26 +36,47 @@
       border-radius: 2px;
       background: var(--accent);
     }
-    section { margin-top: 26px; }
-    section + section { border-top: 1px solid #aab8b0; padding-top: 19px; margin-top: 6px; }
+    section { --accent: #22634d; }
+    section + section { border-top: 1px solid #aab8b0; padding-top: 16px; margin-top: 22px; }
+    .group { padding: 14px 0 15px; }
+    .group + .group { border-top: 1px solid #aab8b0; }
     .short { --accent: #89452e; }
     .long { --accent: #22634d; }
-    article { padding: 15px 0 16px; }
-    article + article { border-top: 1px solid #d8dfda; }
-    h3 { font-size: 19px; line-height: 1.45; overflow-wrap: anywhere; }
-    h3 span { font-weight: 450; }
-    dl {
+    h3 { color: var(--accent); font-size: 19px; line-height: 1.45; }
+    h4 { font-size: 17px; line-height: 1.45; }
+    h3, h4, p, dd, li { overflow-wrap: anywhere; }
+    h4 span { font-weight: 450; }
+    .board-facts, .note, .lookup p, .unavailable { color: #55635c; font-size: 15px; }
+    .board-facts { display: flex; flex-wrap: wrap; gap: 2px 14px; margin: 3px 0; }
+    .board-facts strong { color: #182722; font-variant-numeric: tabular-nums; }
+    .candidate { padding: 12px 0; }
+    .candidate + .candidate { border-top: 1px solid #d8dfda; }
+    .lookup { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; padding: 5px 0; }
+    .metrics {
       display: grid;
-      grid-template-columns: minmax(48px, .75fr) minmax(110px, 1.75fr) minmax(55px, .8fr);
+      grid-template-columns: minmax(0, .8fr) minmax(0, 1.65fr) minmax(0, 1fr);
       gap: 10px;
-      margin-top: 12px;
+      margin-top: 10px;
     }
     dt { font-size: 13px; color: #56645d; margin-bottom: 1px; }
     dd { font-size: 19px; font-weight: 650; line-height: 1.45; overflow-wrap: anywhere; }
     .event { color: var(--accent); }
     .score { font-variant-numeric: tabular-nums; }
-    .score small { font-size: 13px; font-weight: 450; color: #56645d; }
+    .score small { font-size: 13px; font-weight: 450; color: #56645d; white-space: nowrap; }
     .reason { margin-top: 11px; font-size: 16px; line-height: 1.55; color: #35463d; }
+    details { margin-top: 8px; border: 1px solid #d8dfda; border-radius: 6px; background: #f7faf8; }
+    summary { min-height: 44px; padding: 10px 12px; color: #35463d; font-weight: 650; cursor: pointer; }
+    summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    details > .note { padding: 0 12px 10px; }
+    .evidence { margin: 0; padding: 0 12px; list-style: none; }
+    .evidence li { padding: 9px 0 11px; border-top: 1px solid #d8dfda; }
+    .evidence h4 { margin-bottom: 2px; }
+    .evidence p { color: #35463d; font-size: 15px; }
+    .evidence dl { display: flex; flex-wrap: wrap; gap: 2px 14px; margin: 3px 0; }
+    .evidence dl div { display: flex; flex-wrap: wrap; gap: 0 5px; }
+    .evidence dd { font-size: 14px; }
+    .evidence dt { color: #55635c; }
+    .unavailable { margin-top: 5px; }
   </style>
 </head>
 <body>
@@ -64,18 +85,46 @@
       <h1>趋势日报</h1>
       <!-- slot:synthetic-label -->
     </header>
-    <!-- slot:groups -->
+    <section aria-labelledby="market-title">
+      <h2 id="market-title">大类及逐类下钻</h2>
+      <!-- slot:board-note -->
+      <!-- slot:groups -->
+    </section>
+    <section aria-labelledby="live-title">
+      <h2 id="live-title">当前实盘持仓</h2>
+      <p class="unavailable">未接入</p>
+    </section>
+    <section aria-labelledby="simulation-title">
+      <h2 id="simulation-title">模拟盘持仓情况</h2>
+      <p class="unavailable">未接入</p>
+    </section>
+    <section aria-labelledby="kelly-title">
+      <h2 id="kelly-title">当前凯利胜率</h2>
+      <p class="unavailable">未接入</p>
+    </section>
   </main>
   <template id="group-pattern">
-    <section class="<!-- slot:direction-class -->">
-      <h2><!-- slot:direction --> · <!-- slot:class-name --></h2>
+    <article class="group <!-- slot:direction-class -->">
+      <h3><!-- slot:direction --> · <!-- slot:class-name --></h3>
+      <p class="board-facts">
+        <span>榜图名次 <strong><!-- slot:rank --></strong></span>
+        <span>大类强度 <strong><!-- slot:board-strength --></strong></span>
+        <span>榜图日期 <strong><!-- slot:board-date --></strong></span>
+        <!-- slot:board-edition -->
+      </p>
       <!-- slot:cards -->
-    </section>
+      <!-- slot:lookup-statuses -->
+      <details>
+        <summary>分组与标的证据</summary>
+        <!-- slot:group-note -->
+        <!-- slot:evidence -->
+      </details>
+    </article>
   </template>
   <template id="candidate-pattern">
-    <article>
-      <h3><!-- slot:ticker --> <span>· <!-- slot:asset-name --></span></h3>
-      <dl>
+    <article class="candidate">
+      <h4><!-- slot:ticker --> <span>· <!-- slot:asset-name --></span></h4>
+      <dl class="metrics">
         <div><dt>当前趋势</dt><dd><!-- slot:temperature --></dd></div>
         <div><dt>特殊信号</dt><dd class="event"><!-- slot:events --></dd></div>
         <div><dt>强度</dt><dd class="score"><!-- slot:strength --><!-- optional:strength-unit --> <small>/ 100</small><!-- /optional:strength-unit --></dd></div>
@@ -84,16 +133,44 @@
     </article>
   </template>
   <template id="lookup-miss-pattern">
-    <article>
-      <h3><!-- slot:ticker --> <span>· <!-- slot:asset-name --></span></h3>
+    <article class="lookup">
+      <h4><!-- slot:ticker --> <span>· <!-- slot:asset-name --></span></h4>
       <p>查不到</p>
     </article>
   </template>
   <template id="lookup-pending-pattern">
-    <article>
-      <h3><!-- slot:ticker --> <span>· <!-- slot:asset-name --></span></h3>
+    <article class="lookup">
+      <h4><!-- slot:ticker --> <span>· <!-- slot:asset-name --></span></h4>
       <p>待核</p>
     </article>
+  </template>
+  <template id="note-pattern">
+    <p class="note"><!-- slot:note --></p>
+  </template>
+  <template id="empty-board-pattern">
+    <p class="note">当前无可核实的榜图席位或标的证据。</p>
+  </template>
+  <template id="edition-pattern">
+    <span>榜图版次 <strong><!-- slot:edition --></strong></span>
+  </template>
+  <template id="evidence-list-pattern">
+    <ul class="evidence" role="list">
+      <!-- slot:rows -->
+    </ul>
+  </template>
+  <template id="evidence-row-pattern">
+    <li>
+      <h4><!-- slot:ticker --> <span>· <!-- slot:asset-name --></span></h4>
+      <dl>
+        <div><dt>市场</dt> <dd><!-- slot:market --></dd></div>
+        <div><dt>数据日</dt> <dd><!-- slot:data-date --></dd></div>
+        <!-- slot:instrument-facts -->
+      </dl>
+      <p><strong><!-- slot:result --></strong> · <!-- slot:reason --></p>
+    </li>
+  </template>
+  <template id="fact-pattern">
+    <div><dt><!-- slot:label --></dt> <dd><!-- slot:value --></dd></div>
   </template>
 </body>
 </html>
