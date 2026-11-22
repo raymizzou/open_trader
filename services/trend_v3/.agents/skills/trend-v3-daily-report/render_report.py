@@ -73,32 +73,18 @@ def asset_metric(value):
     return display_text(None if value == "UNKNOWN" else value, "待核")
 
 
-def legacy_clause_events(clause):
-    clause = LEGACY_POSITIVE_HEADING.sub("", clause)
-    ambiguous = False
-    for group in re.split(r"[，,]", clause):
-        parts = group.split("、")
-        for index, part in enumerate(parts):
-            text = part.strip()
-            name = LEGACY_COVERAGE_SUFFIX.sub("", text)
-            if name not in LEGACY_EVENT_NAMES:
-                # A leading qualifier or a scoped heading can govern the whole list.
-                if index == 0 or re.search(r"[:：(（]", name):
-                    return
-                ambiguous = True
-                continue
-            # After an inline qualifier, only a standalone coverage item is explicit.
-            if not ambiguous or (len(parts) == 1 and name != text):
-                yield name
-
-
 def legacy_event_names(value):
     if value is None:
         return
     if not isinstance(value, str):
         raise ValueError("Legacy signal must be text")
-    for clause in re.split(r"[；;。\n]", value):
-        yield from legacy_clause_events(clause)
+    for clause in re.split(r"[；;。.\r\n]", value):
+        clause = LEGACY_POSITIVE_HEADING.sub("", clause)
+        for part in re.split(r"[、，,]", clause):
+            name = LEGACY_COVERAGE_SUFFIX.sub("", part.strip())
+            if name not in LEGACY_EVENT_NAMES:
+                break
+            yield name
 
 
 def verified_event_names(values):

@@ -282,8 +282,18 @@ def test_renders_approved_shell_across_dates(tmp_path):
         ),
         pytest.param(
             {"signal": "温转热、未触发反抽警报，开香槟（其余待核）, 温转热"},
-            "温转热，开香槟",
+            "温转热",
             id="legacy-mixed",
+        ),
+        pytest.param(
+            {"signal": "温转热、未触发开香槟，上天台（其余待核）"},
+            "温转热",
+            id="legacy-coverage-after-inline-negation",
+        ),
+        pytest.param(
+            {"signal": "已确认：温转热、上天台（其余待核）,热转沸。寒转冻\n反抽警报"},
+            "温转热，上天台，热转沸，寒转冻，反抽警报",
+            id="legacy-affirmative-coverage",
         ),
         pytest.param(
             {"signal": "未触发：温转热、反抽警报；寒转凉、上天台 (其余待核)"},
