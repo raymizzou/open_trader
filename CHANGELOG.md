@@ -2,7 +2,7 @@
 
 ## 2026-11-22 — Trend V3 weekend checks and direct observations (#511)
 
-- Check verified 24/7 markets at 08:00 Taipei time every day, including equity holidays, using each market's own data date and publication rules. Show confirmed special events for selected asset classes that are themselves tradable instruments. These observation cards keep the three-field reader and use verified same-instrument strength when available. New-position selection keeps its existing signal, eligibility, global strength, and seat rules.
+- Start the report at 08:30 Taipei time every calendar day. If the whole report is ready, generate it once and end automatic checks. Otherwise recheck each hour on the half hour until ready. Verify each market's data dates and publication evidence at those shared checks. Show confirmed special events for selected asset classes that are themselves tradable instruments. These observation cards keep the three-field reader and use verified same-instrument strength when available. New-position selection keeps its existing signal, eligibility, global strength, and seat rules.
 - When a scheduled observation needs event evidence, request only the necessary fields within the existing authorization and verified rates. The card reason identifies the event's role in the discipline.
 
 ## 2026-11-21 — Trend V3 daily report evidence and ranks (#511)
