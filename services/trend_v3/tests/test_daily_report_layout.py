@@ -2673,3 +2673,99 @@ def test_report_lists_pending_only_on_affected_cards(tmp_path):
     complete = render(tmp_path, complete_report(), 'local-complete')
     assert '核实时间：2026-11-23T10:12:00+08:00' in complete
     assert '下次核实' not in complete
+
+
+def test_conflicting_or_absent_signal_stays_pending(tmp_path):
+    from copy import deepcopy
+
+    cases = ('mismatch', 'missing', 'empty', 'identity', 'invalid-date',
+             'future-date', 'lookup-conflict', 'duplicate')
+    for case in cases:
+        report = complete_report()
+        asset = report['long'][0]['searchable'][0]
+        proof = report['collection']['evidence'][
+            '/long/0/searchable/0/signal_events']
+        if case in ('mismatch', 'duplicate'):
+            asset['signal_events'] = ['开香槟']
+        elif case == 'missing':
+            del asset['signal_events']
+        elif case == 'identity':
+            proof['identity'] = 'other'
+        elif case in ('invalid-date', 'future-date'):
+            asset['data_date'] = ('bad-date' if case == 'invalid-date'
+                                  else '2026-11-24')
+        elif case == 'lookup-conflict':
+            asset['lookup'] = 'miss'
+        if case == 'duplicate':
+            donor = deepcopy(asset)
+            donor['signal_events'] = []
+            report['long'][0]['related'] = [donor]
+            report['collection']['evidence'][
+                '/long/0/related/0/signal_events'] = deepcopy(proof)
+        original = deepcopy(report)
+        html = render(tmp_path, report, 'signal-' + case)
+        card = reader_cards(html)['BTC']
+        expected = '无' if case == 'empty' else '待查'
+        assert f'<dd class="reader-event">{expected}</dd>' in card, case
+        assert '开香槟' not in card
+        if case != 'empty':
+            assert '应建观察仓' not in card
+            assert '数据收集中' in html and '数据已完备' not in html
+        if case in ('invalid-date', 'future-date'):
+            assert '80 / 100' not in card and '90 / 100' not in card
+        elif case in ('mismatch', 'missing', 'identity', 'duplicate'):
+            assert '80 / 100' in card and '90 / 100' in card
+        assert report == original
+
+
+def test_stale_membership_evidence_shows_group_pending(tmp_path):
+    from copy import deepcopy
+
+    from test_hourly_collection import control
+
+    for case in ('added', 'removed', 'missing-id', 'stale-group', 'unknown-target',
+                 'future-target', 'calendar-conflict', 'matching', 'existing-hint'):
+        report = complete_report()
+        group = report['long'][0]
+        note = ('成员范围待查。' if case == 'existing-hint'
+                else '已核实部分成员，仍保留本类关联说明。')
+        group['coverage_note'] = note
+        if case in ('added', 'existing-hint'):
+            member = deepcopy(group['searchable'][0])
+            member.update(code='NEW', instrument_id='new-member')
+            group['searchable'].append(member)
+        elif case == 'removed':
+            group['searchable'] = []
+        elif case == 'missing-id':
+            group['searchable'][0].pop('instrument_id')
+        elif case == 'stale-group':
+            group['data_date'] = '2026-11-21'
+        elif case == 'unknown-target':
+            report['collection']['targets']['BOARD'] = None
+        elif case == 'future-target':
+            report['collection']['targets']['BOARD'] = '2026-11-24'
+            group['data_date'] = '2026-11-24'
+            report['collection']['evidence']['/long/0/coverage'][
+                'data_date'] = '2026-11-24'
+        elif case == 'calendar-conflict':
+            report['collection']['target_evidence'] = {
+                'BOARD': dict(state='verified', report_date='2026-11-23',
+                              basis_date='2026-11-22', kind='equity',
+                              sessions=['2026-11-20'],
+                              covered_through='2026-11-22', source='fixture-calendar')}
+        original = deepcopy(report)
+        html = render(tmp_path, report, 'members-' + case)
+        row = next(row for row in re.findall(r'<details\b.*?</details>', html, re.S)
+                   if '合成加密' in row)
+        assert note in row
+        if case == 'matching':
+            assert '成员范围待查' not in row
+            assert control().assess(report)['complete']
+        else:
+            assert row.count('成员范围待查') == 1, case
+            assert not control().assess(report)['complete']
+            assert '数据收集中' in html
+        header = html.split('<main')[0]
+        assert all(raw not in header for raw in (
+            '/long/', 'coverage', '成分及查询覆盖', '目标', '实际'))
+        assert report == original

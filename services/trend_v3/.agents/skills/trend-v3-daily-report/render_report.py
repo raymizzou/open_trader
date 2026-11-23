@@ -213,11 +213,12 @@ def coverage_note(fragments, group, direct):
     # The general field is independent of known cards. Preserve the legacy
     # direct-only field's behavior when no general field was supplied.
     note = general if general is not None else legacy if direct else None
+    notes = []
     if note and note.strip():
-        return fragments["empty_note"].substitute(note=display_text(note))
-    if group.get("_coverage_pending"):
-        return fragments["empty_note"].substitute(note="成员范围待查。")
-    return ""
+        notes.append(fragments["empty_note"].substitute(note=display_text(note)))
+    if group.get("_coverage_pending") and "成员范围待查" not in (note or ""):
+        notes.append(fragments["empty_note"].substitute(note="成员范围待查。"))
+    return "\n".join(notes)
 
 
 def render_direction(fragments, groups, note, direction):

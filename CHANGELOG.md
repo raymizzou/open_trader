@@ -15,6 +15,9 @@
   absence while preserving date masking, ranking, identity and no-replay rules.
 - Use the same renderer for initial, revised, manual and offline reports. No
   collection schedule, vendor, account or deployment behavior changes.
+- Keep signal evidence mismatches and missing input fields pending after masking.
+  Compare coverage against the current members, group date and applicable target;
+  retain custom coverage notes alongside a single local pending hint.
 
 ## 2026-11-23 — Trend V3 dual instrument strengths (#526)
 
