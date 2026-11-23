@@ -2068,3 +2068,107 @@ def test_null_strength_preserves_independent_watch_eligibility(tmp_path):
             if 'reader-name">BTC ' in card
         )
         assert "应建观察仓" not in btc, bad
+
+
+@pytest.mark.parametrize(
+    "field", ["strength", "local_strength"], ids=["global", "local"]
+)
+def test_final_strength_conflict_blocks_collection_completion(tmp_path, field):
+    from copy import deepcopy
+
+    from test_hourly_collection import control
+
+    def duplicated(agree):
+        report = complete_report()
+        group = report["long"][0]
+        first = group["searchable"][0]
+        scope = {"data_date": "2026-11-22", "version": "fixture-v1"}
+        first["strength_scope"] = scope
+        alias = deepcopy(first)
+        if not agree:
+            alias[field] = "81" if field == "strength" else "91"
+        alias["strength_evidence"] = {
+            metric: {**scope, "state": "verified"}
+            for metric in ("strength", "local_strength")
+        }
+        group["searchable"].append(alias)
+        group["coverage"]["instrument_ids"].append("btc")
+        collection = report["collection"]
+        collection["evidence"]["/long/0/coverage"]["value"] = deepcopy(
+            group["coverage"]
+        )
+        for metric in ("trend", "signal_events", "strength", "local_strength"):
+            path = "/long/0/searchable/1/" + metric
+            collection["worklist"].append(
+                {
+                    "path": path,
+                    "label": "BTC " + metric,
+                    "market": "CRYPTO",
+                    "target_date": "2026-11-22",
+                }
+            )
+            collection["evidence"][path] = {
+                "state": "verified",
+                **scope,
+                "identity": "btc",
+                "market": "CRYPTO",
+                "instrument_type": "spot",
+                "source": "fixture-duplicate-strength",
+                "value": alias[metric],
+            }
+        return report
+
+    api = control()
+    report = duplicated(False)
+    html = render(tmp_path, report, "final-conflict-" + field)
+    cards = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+    btc = next(card for card in cards if 'reader-name">BTC ' in card)
+    label, other_label, other_value = (
+        ("全局强度", "同品种强度", "90")
+        if field == "strength"
+        else ("同品种强度", "全局强度", "80")
+    )
+    assert f"<dt>{label}</dt><dd>待核</dd>" in btc
+    assert f"<dt>{other_label}</dt><dd>{other_value} / 100</dd>" in btc
+    assert "数据收集中" in html and "数据已完备" not in html
+    assert not api.assess(report)["complete"]
+    state = tmp_path / "control.json"
+    api.initialize(state, report)
+    round_ = api.claim_round(state, report, "2026-11-23T08:30:00+08:00")
+    assert round_["markets"] == ["CRYPTO"]
+    assert "/long/0/searchable/0/" + field in round_["pending_paths"]
+    assert all(path.endswith("/" + field) for path in round_["pending_paths"])
+    local, delivered = tmp_path / "local.html", tmp_path / "delivered.html"
+    local.write_text(html, encoding="utf-8")
+    delivered.write_text(html, encoding="utf-8")
+    with pytest.raises(ValueError, match="incomplete"):
+        api.confirm_publication(state, report, local, delivered)
+    assert api.claim_round(state, report, "2026-11-23T09:30:00+08:00")["markets"] == [
+        "CRYPTO"
+    ]
+
+    agreed = duplicated(True)
+    assert api.assess(agreed)["complete"]
+    final = render(tmp_path, agreed, "agreed-" + field)
+    assert "数据已完备" in final
+    local.write_text(final, encoding="utf-8")
+    delivered.write_text(final, encoding="utf-8")
+    api.confirm_publication(state, agreed, local, delivered)
+    assert api.claim_round(state, agreed, "2026-11-23T10:30:00+08:00") is None
+
+    # A current quote for a different explicit identity remains a separate card,
+    # even with the same visible code and a different value of this metric.
+    separate = duplicated(False)
+    group = separate["long"][0]
+    group["searchable"][1]["instrument_id"] = "other-btc"
+    group["coverage"]["instrument_ids"][1] = "other-btc"
+    collection = separate["collection"]
+    collection["evidence"]["/long/0/coverage"]["value"] = deepcopy(group["coverage"])
+    for metric in ("trend", "signal_events", "strength", "local_strength"):
+        collection["evidence"]["/long/0/searchable/1/" + metric]["identity"] = (
+            "other-btc"
+        )
+    assert api.assess(separate)["complete"]
+    separate_html = render(tmp_path, separate, "separate-" + field)
+    assert "数据已完备" in separate_html
+    assert re.findall(r'<h4 class="reader-name">(\S+)', separate_html).count("BTC") == 2
