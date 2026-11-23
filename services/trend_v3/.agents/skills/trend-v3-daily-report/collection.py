@@ -29,16 +29,149 @@ def valid_date(value):
         return None
 
 
+LOOKUP_LABELS = {"miss": "查不到", "pending": "待核"}
+
+
+def platform_id(asset):
+    value = asset.get("instrument_id")
+    if value is None or value == "":
+        return None
+    if type(value) is int and value >= 0:
+        return str(value)
+    if isinstance(value, str):
+        return value.strip() or None
+    raise ValueError("Instrument ID must be text or a nonnegative integer")
+
+
+def instrument_scope(asset):
+    # Currency is an additional boundary when supplied, never inferred.
+    values = (asset.get("market"), asset.get("instrument_type"))
+    if not all(isinstance(value, str) and value.strip() for value in values):
+        return None
+    currency = asset.get("currency")
+    if currency is not None and not isinstance(currency, str):
+        raise ValueError("Instrument currency must be text")
+    return (*values, currency or None)
+
+
+def instrument_identity(asset, ids_by_code):
+    # A code-only alias can use a single established ID in this exact scope.
+    # Multiple contradictory IDs never make the alias identify either one.
+    scope = instrument_scope(asset)
+    if scope is None:
+        return None
+    identifier = platform_id(asset)
+    code = asset.get("code")
+    if identifier is None and isinstance(code, str) and code.strip():
+        ids = ids_by_code.get((*scope, code), set())
+        if len(ids) == 1:
+            identifier = next(iter(ids))
+        else:
+            return (*scope, "code", code)
+    return (*scope, "instrument_id", identifier) if identifier is not None else None
+
+
+def reconcile_lookup(preferred, aliases):
+    # Winner selection uses the original rows. Only the exact-identity match
+    # fact can aggregate here; quotes require the separate strength-only opt-in.
+    # Events and eligibility never transfer.
+    evidence = [
+        row
+        for row in aliases
+        if row.get("platform_match_verified") is True
+        or row.get("lookup") in LOOKUP_LABELS
+    ]
+    if not evidence:
+        return preferred
+    has_match = any(row.get("platform_match_verified") is True for row in evidence)
+    scopes = set()
+    for row in evidence:
+        scope = row.get("lookup_scope")
+        if scope is not None and (not isinstance(scope, str) or not scope.strip()):
+            raise ValueError("Lookup scope must be nonempty text")
+        scopes.add(scope)
+    conflict = len(scopes) > 1 or (
+        has_match and any(row.get("lookup") == "miss" for row in evidence)
+    )
+    if not has_match and not conflict:
+        return preferred
+    reconciled = dict(preferred)
+    reconciled["platform_match_verified"] = has_match and not conflict
+    if conflict:
+        reconciled["lookup"] = "pending"
+        reconciled["reason"] = "平台匹配证据冲突或适用范围待核。"
+    elif preferred.get("lookup") == "pending":
+        # Removing a pending lookup must not unmask its old quote/event payload
+        # or activate an old watch flag. Identity success proves no market data.
+        for field in (
+            "lookup",
+            "trend",
+            "strength",
+            "local_strength",
+            "signal",
+            "strength_reason",
+            "local_strength_reason",
+        ):
+            reconciled.pop(field, None)
+        reconciled["signal_events"] = []
+        reconciled["watch_eligible"] = False
+        reconciled["reason"] = "平台身份已核实，行情字段待核。"
+    return reconciled
+
+
+def instrument_aliases(group):
+    candidates = []
+    for field in ("direct", "searchable", "related"):
+        assets = group.get(field, [])
+        if not isinstance(assets, list):
+            raise ValueError("Asset lists must be arrays")
+        candidates.extend(assets)
+    ids_by_code = {}
+    for asset in candidates:
+        scope = instrument_scope(asset)
+        identifier = platform_id(asset)
+        code = asset.get("code")
+        if scope is not None and identifier is not None and isinstance(code, str):
+            ids_by_code.setdefault((*scope, code), set()).add(identifier)
+    aliases_by_identity = {}
+    for asset in candidates:
+        identity = instrument_identity(asset, ids_by_code)
+        if identity is not None:
+            aliases_by_identity.setdefault(identity, []).append(asset)
+    return candidates, ids_by_code, aliases_by_identity
+
+
 def evidence_for(evidence, path):
     value = evidence.get(path) if isinstance(evidence, dict) else None
     return value if isinstance(value, dict) else {}
 
 
-def field_proof_matches(asset, field, proof, target):
+def field_evidence_matches(asset, field, proof, target):
     identifier = asset.get("instrument_id")
     known_id = (type(identifier) is int and identifier >= 0) or (
         isinstance(identifier, str) and bool(identifier.strip())
     )
+    return (
+        known_id
+        and bool(target)
+        and all(
+            isinstance(asset.get(key), str) and asset[key].strip()
+            for key in ("market", "instrument_type")
+        )
+        and proof.get("state") == "verified"
+        and valid_date(proof.get("data_date")) == target
+        and proof.get("value") == asset.get(field)
+        and proof.get("identity") == identifier
+        and proof.get("market") == asset.get("market")
+        and proof.get("instrument_type") == asset.get("instrument_type")
+        and all(
+            isinstance(proof.get(key), str) and proof[key].strip()
+            for key in ("source", "version")
+        )
+    )
+
+
+def field_proof_matches(asset, field, proof, target):
     value = asset.get(field)
     valid_value = value is not None
     if field in ("strength", "local_strength"):
@@ -61,25 +194,7 @@ def field_proof_matches(asset, field, proof, target):
             and name.casefold() not in ("unknown", "pending", "待核")
             for name in value
         )
-    return (
-        valid_value
-        and known_id
-        and bool(target)
-        and all(
-            isinstance(asset.get(key), str) and asset[key].strip()
-            for key in ("market", "instrument_type")
-        )
-        and proof.get("state") == "verified"
-        and valid_date(proof.get("data_date")) == target
-        and proof.get("value") == value
-        and proof.get("identity") == identifier
-        and proof.get("market") == asset.get("market")
-        and proof.get("instrument_type") == asset.get("instrument_type")
-        and all(
-            isinstance(proof.get(key), str) and proof[key].strip()
-            for key in ("source", "version")
-        )
-    )
+    return valid_value and field_evidence_matches(asset, field, proof, target)
 
 
 def dated_projection(report):
@@ -150,7 +265,19 @@ def dated_projection(report):
                             field_dates.append(label + "日期 " + (field_day or "待核"))
                         if not field_proof_matches(asset, field, proof, target):
                             supplied = field in asset or bool(proof)
-                            if field in ("trend", "signal_events") or supplied:
+                            missing_strength = (
+                                field in ("strength", "local_strength")
+                                and asset.get(field) is None
+                                and (
+                                    not proof
+                                    or field_evidence_matches(
+                                        asset, field, proof, target
+                                    )
+                                )
+                            )
+                            if field in ("trend", "signal_events") or (
+                                supplied and not missing_strength
+                            ):
                                 fields_current = False
                             if evidence_bearing:
                                 # Filter each source before identity dedup/ranking.
@@ -224,6 +351,28 @@ def confirmation_time(value):
         return value if parsed.utcoffset() is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def pending_lookups(report):
+    """Use the same sanitized sources, identity groups and decision as rendering."""
+    projected, _ = dated_projection(report)
+    result = []
+    for direction in ("short", "long"):
+        for gi, group in enumerate(projected.get(direction, [])):
+            _, ids_by_code, aliases_by_identity = instrument_aliases(group)
+            for section in ("direct", "searchable", "related"):
+                for ai, asset in enumerate(group.get(section, [])):
+                    identity = instrument_identity(asset, ids_by_code)
+                    aliases = aliases_by_identity.get(identity, [asset])
+                    if reconcile_lookup(asset, aliases).get("lookup") == "pending":
+                        result.append(
+                            {
+                                "path": f"/{direction}/{gi}/{section}/{ai}/lookup",
+                                "market": asset.get("market"),
+                                "code": asset["code"],
+                            }
+                        )
+    return result
 
 
 def assess(report):
@@ -320,10 +469,19 @@ def assess(report):
                 or any(not member for member in members)
             ):
                 pending.append(group["name"] + "：成分及查询覆盖待核")
+    lookup_pending = pending_lookups(report)
+    pending.extend(
+        item["code"] + " lookup：平台查询或匹配证据待核。" for item in lookup_pending
+    )
     verified_at = confirmation_time(collection.get("verified_at"))
     if not verified_at:
         pending.append("完备核实时间待核")
-    return {"complete": not pending, "pending": pending, "verified_at": verified_at}
+    return {
+        "complete": not pending,
+        "pending": pending,
+        "verified_at": verified_at,
+        "lookup_pending": lookup_pending,
+    }
 
 
 # Persistent controls deliberately do not send requests, sleep, or hold the shared
@@ -493,8 +651,10 @@ def claim_round(path, report, now):
         assessment = assess(report)
         # Re-assess cheap local facts, but request/recompute only affected items.
         # Release observation alone does not satisfy any instrument obligation.
-        pending_paths = []
-        markets = set()
+        pending_paths = [item["path"] for item in assessment["lookup_pending"]]
+        markets = {
+            item["market"] for item in assessment["lookup_pending"] if item["market"]
+        }
         for fact in required_facts(report):
             path_, label, market, identity, value = fact
             if any(text.startswith(label + "：") for text in assessment["pending"]):
@@ -508,7 +668,7 @@ def claim_round(path, report, now):
             "observed_at": now,
             "next_check": (start + timedelta(hours=slot + 1)).isoformat(),
             "markets": sorted(markets),
-            "pending_paths": pending_paths,
+            "pending_paths": list(dict.fromkeys(pending_paths)),
             "changed": changed,
             "affected_groups": sorted(
                 {

@@ -10,12 +10,20 @@ from html import escape
 from pathlib import Path
 from string import Template
 
-from collection import assess, dated_projection
+from collection import (
+    LOOKUP_LABELS,
+    assess,
+    dated_projection,
+    instrument_aliases,
+    instrument_identity,
+    instrument_scope,
+    platform_id,
+    reconcile_lookup,
+)
 
 TEMPLATE_PATH = Path(__file__).resolve().parent / "assets/report.html"
 FRAGMENT = re.compile(r'\n  <template id="([a-z_]+)">\n(.*?)\n  </template>', re.DOTALL)
 DATE_FORMAT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
-LOOKUP_LABELS = {"miss": "查不到", "pending": "待核"}
 LEGACY_EVENT_NAMES = {
     "温转热",
     "凉转寒",
@@ -211,89 +219,12 @@ def render_assets(fragments, assets, note):
     return fragments["asset_list"].substitute(cards="\n".join(cards))
 
 
-def platform_id(asset):
-    value = asset.get("instrument_id")
-    if value is None or value == "":
-        return None
-    if type(value) is int and value >= 0:
-        return str(value)
-    if isinstance(value, str):
-        return value.strip() or None
-    raise ValueError("Instrument ID must be text or a nonnegative integer")
-
-
-def instrument_scope(asset):
-    # Currency is an additional boundary when supplied, never inferred.
-    values = (asset.get("market"), asset.get("instrument_type"))
-    if not all(isinstance(value, str) and value.strip() for value in values):
-        return None
-    currency = asset.get("currency")
-    if currency is not None and not isinstance(currency, str):
-        raise ValueError("Instrument currency must be text")
-    return (*values, currency or None)
-
-
-def instrument_identity(asset, ids_by_code):
-    # A code-only alias can use a single established ID in this exact scope.
-    # Multiple contradictory IDs never make the alias identify either one.
-    scope = instrument_scope(asset)
-    if scope is None:
-        return None
-    identifier = platform_id(asset)
-    code = asset.get("code")
-    if identifier is None and isinstance(code, str) and code.strip():
-        ids = ids_by_code.get((*scope, code), set())
-        if len(ids) == 1:
-            identifier = next(iter(ids))
-        else:
-            return (*scope, "code", code)
-    return (*scope, "instrument_id", identifier) if identifier is not None else None
-
-
 def global_strength(asset):
     # Local strength never participates in direction ordering.
     if asset.get("lookup") is not None:
         return None
     value, _ = strength_fields(asset)
     return Decimal(value) if value is not None else None
-
-
-def reconcile_lookup(preferred, aliases):
-    # Winner selection uses the original rows. Only the exact-identity match
-    # fact can aggregate here; quotes require the separate strength-only opt-in.
-    # Events and eligibility never transfer.
-    evidence = [row for row in aliases
-                if row.get("platform_match_verified") is True
-                or row.get("lookup") in LOOKUP_LABELS]
-    if not evidence:
-        return preferred
-    has_match = any(row.get("platform_match_verified") is True for row in evidence)
-    scopes = set()
-    for row in evidence:
-        scope = row.get("lookup_scope")
-        if scope is not None and (not isinstance(scope, str) or not scope.strip()):
-            raise ValueError("Lookup scope must be nonempty text")
-        scopes.add(scope)
-    conflict = len(scopes) > 1 or (
-        has_match and any(row.get("lookup") == "miss" for row in evidence)
-    )
-    if not has_match and not conflict:
-        return preferred
-    reconciled = dict(preferred)
-    reconciled["platform_match_verified"] = has_match and not conflict
-    if conflict:
-        reconciled["lookup"] = "pending"
-        reconciled["reason"] = "平台匹配证据冲突或适用范围待核。"
-    elif preferred.get("lookup") == "pending":
-        # Removing a pending lookup must not unmask its old quote/event payload
-        # or activate an old watch flag. Identity success proves no market data.
-        for field in ("lookup", "trend", "strength", "local_strength", "signal",
-                      "strength_reason", "local_strength_reason"):
-            reconciled.pop(field, None)
-        reconciled["signal_events"] = []
-        reconciled["watch_eligible"] = False
-        reconciled["reason"] = "平台身份已核实，行情字段待核。"
-    return reconciled
 
 
 def strength_scope(value):
@@ -367,24 +298,7 @@ def reconcile_strengths(preferred, reconciled, aliases):
 
 
 def instrument_sections(group, direction):
-    candidates = []
-    for field in ("direct", "searchable", "related"):
-        assets = group.get(field, [])
-        if not isinstance(assets, list):
-            raise ValueError("Asset lists must be arrays")
-        candidates.extend(assets)
-    ids_by_code = {}
-    for asset in candidates:
-        scope = instrument_scope(asset)
-        identifier = platform_id(asset)
-        code = asset.get("code")
-        if scope is not None and identifier is not None and isinstance(code, str):
-            ids_by_code.setdefault((*scope, code), set()).add(identifier)
-    aliases_by_identity = {}
-    for asset in candidates:
-        identity = instrument_identity(asset, ids_by_code)
-        if identity is not None:
-            aliases_by_identity.setdefault(identity, []).append(asset)
+    candidates, ids_by_code, aliases_by_identity = instrument_aliases(group)
     sections = [[], [], []]
     seen = set()
     # Resolve strongest verified classification before removing duplicates.

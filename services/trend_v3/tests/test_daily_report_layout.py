@@ -1887,3 +1887,184 @@ def test_explicit_collection_missing_lookup_evidence_stays_pending(tmp_path):
     report.pop("collection")
     html = render(tmp_path, report, "legacy-miss")
     assert "查不到" in html
+
+
+def test_reconciled_lookup_conflict_prevents_completion(tmp_path):
+    from copy import deepcopy
+
+    from test_hourly_collection import control
+
+    def with_alias(kind, foreign=False):
+        report = complete_report()
+        group = report["long"][0]
+        found = group["searchable"][0]
+        found["lookup_scope"] = "2026-11-22/v1"
+        alias = deepcopy(found)
+        if kind == "miss":
+            alias.update(lookup="miss", platform_match_verified=False)
+        if foreign:
+            alias.update(market="US", instrument_type="ETF", data_date="2026-11-20")
+        group["searchable"].append(alias)
+        group["coverage"]["instrument_ids"].append("btc")
+        collection = report["collection"]
+        collection["evidence"]["/long/0/coverage"]["value"] = deepcopy(
+            group["coverage"]
+        )
+        for field in (
+            ("lookup",)
+            if kind == "miss"
+            else ("trend", "strength", "local_strength", "signal_events")
+        ):
+            path = "/long/0/searchable/1/" + field
+            collection["worklist"].append(
+                {
+                    "path": path,
+                    "label": "BTC " + field,
+                    "market": alias["market"],
+                    "target_date": alias["data_date"],
+                }
+            )
+            collection["evidence"][path] = {
+                "state": "verified",
+                "data_date": alias["data_date"],
+                "version": "v1",
+                "identity": "btc",
+                "market": alias["market"],
+                "instrument_type": alias["instrument_type"],
+                "source": "fixture-alias-result",
+                "value": alias[field],
+                **({"full_lookup": True} if field == "lookup" else {}),
+            }
+        return report
+
+    api = control()
+    report = with_alias("miss")
+    html = render(tmp_path, report, "lookup-conflict")
+    assert "数据收集中" in html and "数据已完备" not in html
+    cards = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+    btc = next(card for card in cards if 'reader-name">BTC ' in card)
+    assert "<dt>当前趋势</dt><dd>待核</dd>" in btc
+    assert "查不到" not in btc and "应建观察仓" not in btc
+    assert not api.assess(report)["complete"]
+    state = tmp_path / "control.json"
+    api.initialize(state, report)
+    round_ = api.claim_round(state, report, "2026-11-23T08:30:00+08:00")
+    assert round_["markets"] == ["CRYPTO"]
+    assert "/long/0/searchable/1/lookup" in round_["pending_paths"]
+    local, delivered = tmp_path / "local.html", tmp_path / "delivered.html"
+    local.write_text(html, encoding="utf-8")
+    delivered.write_text(html, encoding="utf-8")
+    with pytest.raises(ValueError, match="incomplete"):
+        api.confirm_publication(state, report, local, delivered)
+    assert api.claim_round(state, report, "2026-11-23T09:30:00+08:00")["markets"] == [
+        "CRYPTO"
+    ]
+
+    # Compatible duplicates and a full miss in another actual market retain
+    # completion. Same code/id alone cannot create a cross-market conflict.
+    for kind, foreign in (("match", False), ("miss", True)):
+        valid = with_alias(kind, foreign)
+        assert api.assess(valid)["complete"]
+        valid_html = render(tmp_path, valid, f"compatible-{kind}-{foreign}")
+        assert "数据已完备" in valid_html
+        assert ("查不到" in valid_html) is foreign
+
+
+def test_null_strength_preserves_independent_watch_eligibility(tmp_path):
+    from copy import deepcopy
+
+    from test_hourly_collection import control
+
+    def missing_report(field, mode, proof_mode):
+        report = complete_report()
+        group = report["long"][0]
+        asset = group["searchable"][0]
+        path = "/long/0/searchable/0/" + field
+        if mode == "null":
+            asset[field] = None
+        else:
+            asset.pop(field)
+        if proof_mode == "null-proof":
+            report["collection"]["evidence"][path]["value"] = None
+        else:
+            report["collection"]["evidence"].pop(path)
+        comparator = {
+            **deepcopy(asset),
+            "code": "CMP",
+            "name": "合成比较",
+            "instrument_id": "cmp",
+            "strength": "50",
+            "local_strength": "30",
+            "watch_eligible": False,
+        }
+        group["searchable"].append(comparator)
+        group["coverage"]["instrument_ids"].append("cmp")
+        report["collection"]["evidence"]["/long/0/coverage"]["value"] = deepcopy(
+            group["coverage"]
+        )
+        for metric in ("trend", "signal_events", "strength", "local_strength"):
+            proof_path = "/long/0/searchable/1/" + metric
+            report["collection"]["worklist"].append(
+                {
+                    "path": proof_path,
+                    "label": "CMP " + metric,
+                    "market": "CRYPTO",
+                    "target_date": "2026-11-22",
+                }
+            )
+            report["collection"]["evidence"][proof_path] = {
+                "state": "verified",
+                "data_date": "2026-11-22",
+                "version": "v1",
+                "identity": "cmp",
+                "market": "CRYPTO",
+                "instrument_type": "spot",
+                "source": "fixture-comparator",
+                "value": comparator[metric],
+            }
+        return report
+
+    api = control()
+    for field, label, other_label, other_value in (
+        ("strength", "全局强度", "同品种强度", "90"),
+        ("local_strength", "同品种强度", "全局强度", "80"),
+    ):
+        for mode in ("null", "absent"):
+            for proof_mode in ("no-proof", "null-proof"):
+                report = missing_report(field, mode, proof_mode)
+                html = render(tmp_path, report, f"missing-{field}-{mode}-{proof_mode}")
+                row = re.search(r"<details\b.*?合成加密.*?</details>", html, re.S)[0]
+                cards = re.findall(r'<li class="asset reader-card">.*?</li>', row, re.S)
+                btc = next(card for card in cards if 'reader-name">BTC ' in card)
+                assert "应建观察仓" in btc, (field, mode, proof_mode)
+                assert f"<dt>{label}</dt><dd>待核</dd>" in btc
+                assert f"<dt>{other_label}</dt><dd>{other_value} / 100</dd>" in btc
+                assert re.findall(r'<h4 class="reader-name">(\S+)', row) == (
+                    ["CMP", "BTC"] if field == "strength" else ["BTC", "CMP"]
+                )
+                assert "数据收集中" in html and not api.assess(report)["complete"]
+    for bad in ("withdrawn", "contradiction", "stale-trend", "future-card", "lookup"):
+        report = missing_report("strength", "null", "no-proof")
+        asset = report["long"][0]["searchable"][0]
+        evidence = report["collection"]["evidence"]
+        if bad in ("withdrawn", "contradiction"):
+            evidence["/long/0/searchable/0/strength"] = {
+                **evidence["/long/0/searchable/0/local_strength"],
+                "state": "withdrawn" if bad == "withdrawn" else "verified",
+                "value": None if bad == "withdrawn" else "99",
+            }
+        elif bad == "stale-trend":
+            evidence["/long/0/searchable/0/trend"]["data_date"] = "2026-11-21"
+        elif bad == "future-card":
+            asset["data_date"] = "2026-11-24"
+        else:
+            asset["lookup"] = "pending"
+        html = render(tmp_path, report, "protected-" + bad)
+        btc = next(
+            card
+            for card in re.findall(
+                r'<li class="asset reader-card">.*?</li>', html, re.S
+            )
+            if 'reader-name">BTC ' in card
+        )
+        assert "应建观察仓" not in btc, bad
