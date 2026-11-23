@@ -19,7 +19,7 @@ The caller owns calendar decisions and all other opening conditions.
   control state to check once per elapsed hourly slot until all frozen target
   evidence is verified and the final HTML is published and read back. Never
   delay the initial report, replay missed slots, or poll from normal read/offline
-  entry points. Show per-item actual dates and collection status in the header.
+  entry points. Show the report date once in the heading and only overall status plus the next check or confirmation time in the header. Keep pending information on its affected class or card.
 - Use the selected revision's [V1 report renderer](.agents/skills/trend-v3-daily-report/render_report.py)
   for scheduled, manual, offline, and revision work. The dated masthead links
   to the short, long, live, simulation, and Kelly sections in that order.
@@ -56,7 +56,13 @@ The caller owns calendar decisions and all other opening conditions.
   simulation section each show a
   `positions-note` paragraph with `未接入`. The two Kelly values each show
   `未接入`.
-  Only individual instrument cards may change visually without Ray's approval.
+  Use whole-card green only when the actual quote day matches the applicable
+  market target validated by original-report-day calendar evidence. Stale,
+  missing, invalid, future or contradictory dates use yellow. Show one actual
+  quote date per card; show the target only for a known stale date. Green is a
+  quote-date conclusion, independent of signals, watch eligibility and report
+  completion. Never infer a target from wall-clock or fetch time. Keep field
+  dates, source paths and collection diagnostics private.
 - For a read-only request, reuse the verified current HTML when it comes from
   the effective template and renderer and matches the HTML rendered from the
   latest applicable local evidence. Otherwise render the complete V1 report
@@ -71,7 +77,8 @@ The caller owns calendar decisions and all other opening conditions.
   same status label. Keep verified values on ordinary cards and show `待核`
   for unavailable trend and strength. The special-signal cell lists distinct
   confirmed event names joined by `，`. It shows `无` when no confirmed event
-  can be listed, including on lookup-only cards. Keep lookup and coverage
+  can be listed and absence is confirmed. Missing or unverified signal evidence
+  displays `待查`. Legacy verified display projections remain readable. Keep lookup and coverage
   evidence for eligibility and ranking in the underlying records.
 - Follow the existing data and fee authorizations. This delivery rule grants
   no authority for trading, additional fees, or additional data access.

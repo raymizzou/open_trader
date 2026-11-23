@@ -132,7 +132,7 @@ def render_card(pattern, asset):
     lookup = asset.get("lookup")
     if lookup is None:
         trend = asset_metric(asset.get("trend"))
-        signal = special_signal(asset)
+        signal = "待查" if asset.get("_signal_pending") else special_signal(asset)
         global_value, local_value = strength_fields(asset)
         strength = f"{global_value} / 100" if global_value is not None else "待核"
         local_strength = f"{local_value} / 100" if local_value is not None else "待核"
@@ -147,7 +147,7 @@ def render_card(pattern, asset):
         status = LOOKUP_LABELS[lookup]
         trend = strength = local_strength = status
         strength_reason = local_strength_reason = ""
-        signal = "无"
+        signal = "待查" if "_signal_pending" in asset else "无"
         reason = display_text(asset.get("reason"), status)
     # These flags are supplied only after evidence selection. Neither list
     # placement nor a displayed event establishes membership or eligibility.
@@ -162,7 +162,9 @@ def render_card(pattern, asset):
         markers='<p class="reader-markers">' + " · ".join(markers) + "</p>"
         if markers
         else "",
-        date_note=display_text(asset.get("_date_note"), "行情日期待核"),
+        freshness=asset.get("_freshness", "waiting"),
+        freshness_label=display_text(asset.get("_freshness_label"), "日期待核"),
+        date_note=display_text(asset.get("_date_note"), "行情截至 待核"),
         code=display_text(asset["code"]),
         name=display_text(asset["name"]),
         trend=trend,
@@ -213,6 +215,8 @@ def coverage_note(fragments, group, direct):
     note = general if general is not None else legacy if direct else None
     if note and note.strip():
         return fragments["empty_note"].substitute(note=display_text(note))
+    if group.get("_coverage_pending"):
+        return fragments["empty_note"].substitute(note="成员范围待查。")
     return ""
 
 
@@ -276,34 +280,20 @@ def render_direction(fragments, groups, note, direction):
 
 def render(report, template):
     assessment = assess(report)
-    report, pending = dated_projection(report)
-    pending = list(dict.fromkeys(assessment["pending"] + pending))
+    report, _ = dated_projection(report)
     day = report_date(report["date"])
-    board_day = report.get("board_date")
-    if board_day:
-        board_note = f"大类强度取自 {report_date(board_day).isoformat()} 官方榜图。"
-    else:
-        board_note = "官方榜图日期待核。"
-    if version := report.get("board_version"):
-        board_note += f"版次 {display_text(version)}。"
-
     fragments = {name: Template(markup) for name, markup in FRAGMENT.findall(template)}
     return Template(FRAGMENT.sub("", template)).substitute(
         collection_status="数据已完备" if assessment["complete"] else "数据收集中",
-        collection_details=display_text(
-            "核实时间：" + assessment["verified_at"]
-            if assessment["complete"] else "；".join(pending)
-        ),
-        next_check=display_text(
-            "已停止（数据已完备）" if assessment["complete"]
-            else report.get("collection", {}).get("next_check"),
-            "待核（普通读取不启动轮询）",
+        collection_time=display_text(
+            "核实时间：" + assessment["verified_at"] if assessment["complete"]
+            else "下次核实：" + str(report.get("collection", {}).get("next_check")
+                                      or "待核（普通读取不启动轮询）")
         ),
         date=day.isoformat(),
         year=day.year,
         month=day.month,
         day=day.day,
-        board_note=board_note,
         short_rows=render_direction(
             fragments, report.get("short", []), report.get("short_note"), "short"
         ),

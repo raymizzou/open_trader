@@ -98,6 +98,8 @@ def reconcile_lookup(preferred, aliases):
     reconciled = dict(preferred)
     reconciled["platform_match_verified"] = has_match and not conflict
     if conflict:
+        if "_signal_pending" in reconciled:
+            reconciled["_signal_pending"] = True
         reconciled["lookup"] = "pending"
         reconciled["reason"] = "平台匹配证据冲突或适用范围待核。"
     elif preferred.get("lookup") == "pending":
@@ -114,6 +116,8 @@ def reconcile_lookup(preferred, aliases):
         ):
             reconciled.pop(field, None)
         reconciled["signal_events"] = []
+        if "_signal_pending" in reconciled:
+            reconciled["_signal_pending"] = True
         reconciled["watch_eligible"] = False
         reconciled["reason"] = "平台身份已核实，行情字段待核。"
     return reconciled
@@ -399,6 +403,21 @@ def dated_projection(report):
             group["_date_note"] = "大类数据日期 " + (
                 valid_date(group.get("data_date")) or "待核"
             )
+            coverage = group.get("coverage", {})
+            coverage_proof = evidence_for(
+                collection.get("evidence", {}), f"/{direction}/{gi}/coverage"
+            )
+            group["_coverage_pending"] = evidence_bearing and not (
+                valid_date(targets.get("BOARD"))
+                and isinstance(coverage, dict) and coverage.get("state") == "complete"
+                and coverage_proof.get("state") == "verified"
+                and coverage_proof.get("value") == coverage
+                and coverage_proof.get("identity") == group.get("name")
+                and valid_date(coverage_proof.get("data_date"))
+                == valid_date(targets.get("BOARD"))
+                and bool(coverage_proof.get("source"))
+                and bool(coverage_proof.get("version"))
+            )
             for section in ("direct", "searchable", "related"):
                 for ai, asset in enumerate(group.get(section, [])):
                     # These annotations are derived anew from this report's proofs.
@@ -422,7 +441,25 @@ def dated_projection(report):
                     except ValueError:
                         target = None
                     card_current = bool(actual and target and actual == target)
-                    asset["_date_note"] = "行情日期 " + (actual or "待核")
+                    # Display freshness is separate from publication/watch eligibility.
+                    display_target = target
+                    try:
+                        validate_targets(report["date"], {
+                            "targets": {market: target},
+                            "target_evidence": collection.get("target_evidence", {}),
+                        }, require_proof=(market,))
+                    except ValueError:
+                        display_target = None
+                    asset["_freshness"] = (
+                        "fresh" if actual and display_target == actual else "waiting"
+                    )
+                    asset["_freshness_label"] = (
+                        "本期最新" if asset["_freshness"] == "fresh"
+                        else f"待更新 · 等 {display_target}"
+                        if actual and display_target and actual < display_target
+                        else "日期待核"
+                    )
+                    asset["_date_note"] = "行情截至 " + (actual or "待核")
                     if evidence_bearing and not card_current:
                         asset["reason"] = "行情日期不适用或待核，不作当期比较。"
                     if not evidence_bearing and (
@@ -446,7 +483,6 @@ def dated_projection(report):
                         ):
                             asset["lookup"] = "pending"
                             asset["reason"] = "完整查询证据或适用范围待核。"
-                    field_dates = []
                     fields_current = True
                     for field, label in (
                         ("trend", "趋势"),
@@ -456,10 +492,6 @@ def dated_projection(report):
                     ):
                         proof = evidence_for(proofs, prefix + "/" + field)
                         field_day = valid_date(proof.get("data_date"))
-                        if proof:
-                            if field_day and target and field_day < target:
-                                field_dates.append("历史数据")
-                            field_dates.append(label + "日期 " + (field_day or "待核"))
                         current_strength_scope = (
                             field in ("strength", "local_strength")
                             and card_current
@@ -526,17 +558,21 @@ def dated_projection(report):
                                 f"{asset['code']} {field}：目标 {target or '待核'}，"
                                 f"实际 {field_day or actual or '待核'}"
                             )
-                    if field_dates:
-                        asset["_date_note"] += "；" + "；".join(field_dates)
+                    if evidence_bearing:
+                        asset["_signal_pending"] = not (
+                            card_current and field_proof_matches(
+                                asset, "signal_events",
+                                evidence_for(proofs, prefix + "/signal_events"), target
+                            )
+                        )
+                    else:
+                        asset.pop("_signal_pending", None)
                     if not fields_current:
                         asset["watch_eligible"] = False
                     if not actual or not target or actual != target:
                         asset["watch_eligible"] = False
-                        asset["_date_note"] += (
-                            "（历史数据）"
-                            if actual and target and actual < target
-                            else "（日期待核）"
-                        )
+                        if actual and target and actual < target:
+                            asset["_date_note"] += "（历史数据）"
                         pending.append(
                             f"{asset['code']}：目标 {target or '待核'}，"
                             f"实际 {actual or '待核'}"
