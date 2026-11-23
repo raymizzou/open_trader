@@ -142,7 +142,17 @@ def render_card(pattern, asset):
         trend = strength = status
         signal = "无"
         reason = display_text(asset.get("reason"), status)
+    # These flags are supplied only after evidence selection. Neither list
+    # placement nor a displayed event establishes membership or eligibility.
+    markers = []
+    if asset.get("direct_verified") is True:
+        markers.append('<span class="reader-marker">直属</span>')
+    if lookup is None and asset.get("watch_eligible") is True:
+        markers.append('<span class="reader-marker">应建观察仓</span>')
     return pattern.substitute(
+        markers='<p class="reader-markers">' + " · ".join(markers) + "</p>"
+        if markers
+        else "",
         code=display_text(asset["code"]),
         name=display_text(asset["name"]),
         trend=trend,
@@ -152,14 +162,24 @@ def render_card(pattern, asset):
     )
 
 
-def render_assets(fragments, assets, note):
+def render_assets(fragments, assets, note, partial_note=None):
     if not isinstance(assets, list):
         raise ValueError("Asset lists must be arrays")
     if not assets:
         return fragments["empty_note"].substitute(note=note)
 
     cards = [render_card(fragments["asset_card"], asset) for asset in assets]
-    return fragments["asset_list"].substitute(cards="\n".join(cards))
+    rendered = fragments["asset_list"].substitute(cards="\n".join(cards))
+    # Empty-only legacy notes remain hidden on populated lists. Only the new
+    # explicit public partial-coverage field opts into a note after the cards.
+    if partial_note is not None:
+        if not isinstance(partial_note, str):
+            raise ValueError("Partial coverage note must be text")
+        if partial_note.strip():
+            rendered += "\n" + fragments["empty_note"].substitute(
+                note=display_text(partial_note)
+            )
+    return rendered
 
 
 def render_direction(fragments, groups, note):
@@ -190,6 +210,7 @@ def render_direction(fragments, groups, note):
                     display_text(
                         group.get("direct_note"), "暂无已确认的直接交易标的。"
                     ),
+                    partial_note=group.get("direct_partial_note"),
                 ),
                 related=render_assets(
                     fragments,

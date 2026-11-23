@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-11-22 — Trend V3 complete direct watch lists (#512)
+
+- List every verified eligible direct instrument in each selected class,
+  including equal-strength instruments. Sort by global strength for the
+  direction, then code; keep eligible instruments with missing strength last.
+- Retain verified membership in each class while removing duplicates within
+  a class. Show explicit `直属` and `应建观察仓` card labels from verified
+  projection fields. Old list placement or event text cannot create labels.
+- Apply the same selection rules to scheduled, manual and offline reports.
+  Publish discipline v3.2 without changing class seats or account limits.
+  Real drilldown acceptance remains subject to matching source evidence.
+- Keep verified direct cards visible with an explicit, public partial-coverage
+  note after them when other members remain unverified. Use the new
+  `direct_partial_note` field; legacy empty-list notes keep their prior behavior.
+
 ## 2026-11-22 — Trend V3 confirmed events and BTC spot strength (#511)
 
 - Show distinct confirmed special events in first-seen order, separated by
