@@ -1213,3 +1213,65 @@ def test_verified_dual_strength_survives_dedup(tmp_path):
                 "ALIEN", "开香槟", "应建观察仓", "data_date", "strength_evidence"))
             assert re.findall(r'<h4 class="reader-name">(\S+)', first) == (
                 ["B", "A"] if global_value == "待核" else ["A", "B"])
+
+
+def test_legacy_peer_text_allows_verified_global_strength(tmp_path):
+    scope = {"data_date": "2040-01-01", "version": "v1"}
+    proof = {**scope, "state": "verified"}
+    withdrawal = {**scope, "state": "withdrawn"}
+    base = {"code": "A", "name": "合成兼容标的", "market": "US",
+            "instrument_type": "ETF", "instrument_id": "id-A"}
+    for case, direct_fields, donor_fields, global_value, local_value in [
+        ("legacy-preferred", {"strength": "同品种 20 / 100"}, {},
+         "80 / 100", "20 / 100"),
+        ("explicit-global-null", {"strength": None, "local_strength": 20}, {},
+         "待核", "20 / 100"),
+        ("explicit-global-invalid", {"strength": "INVALID", "local_strength": 20},
+         {}, "待核", "20 / 100"),
+        ("global-withdrawal", {"strength": "同品种 20 / 100",
+                               "strength_evidence": {"strength": withdrawal}},
+         {}, "待核", "20 / 100"),
+        ("local-null", {"strength": "同品种 20 / 100", "local_strength": None},
+         {}, "80 / 100", "待核"),
+        ("legacy-donor", {}, {"strength": "同品种 20 / 100",
+                              "strength_evidence": {
+                                  "strength": proof, "local_strength": proof}},
+         "80 / 100", "20 / 100"),
+        ("legacy-only-donor", {}, {"strength": "同品种 20 / 100",
+                                   "strength_evidence": {
+                                       "strength": proof, "local_strength": proof}},
+         "待核", "20 / 100"),
+        ("donor-withdrawal", {"strength": "80 / 100", "local_strength": 20},
+         {"strength": "同品种 20 / 100", "strength_evidence": {
+             "strength": withdrawal, "local_strength": proof}},
+         "待核", "20 / 100"),
+        ("unsupported-legacy-donor", {"strength": "80 / 100",
+                                      "local_strength": 20},
+         {"strength": "同品种 90 / 100", "strength_evidence": {"strength": proof}},
+         "80 / 100", "20 / 100"),
+    ]:
+        direct = {**base, "direct_verified": True, "strength_scope": scope,
+                  **direct_fields}
+        global_source = {**base, "platform_match_verified": True,
+                         "strength": "80 / 100", "strength_evidence": {
+                             "strength": proof}}
+        donor = {**base, "platform_match_verified": True, **donor_fields}
+        for reverse in (False, True):
+            aliases = [donor] if case == "legacy-only-donor" else [global_source, donor]
+            html = render(tmp_path, {"date": "2040-01-02", "long": [{
+                "seat": 1, "name": "合成兼容组", "direct": [direct, {
+                    "code": "B", "name": "对照", "direct_verified": True,
+                    "strength": "60 / 100"}],
+                "searchable": aliases[::-1] if reverse else aliases,
+            }]}, f"legacy-proof-{case}-{reverse}")
+            cards = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+            assert len(cards) == 2
+            a = next(card for card in cards if 'reader-name">A ' in card)
+            assert f'<dt>全局强度</dt><dd>{global_value}</dd>' in a, case
+            assert f'<dt>同品种强度</dt><dd>{local_value}</dd>' in a, case
+            assert re.findall(r'<h4 class="reader-name">(\S+)', html) == (
+                ["B", "A"] if global_value == "待核" else ["A", "B"])
+            assert '<dt>当前趋势</dt><dd>待核</dd>' in a
+            assert '<dd class="reader-event">无</dd>' in a
+            assert '应建观察仓' not in a
+            assert '同品种 20 / 100' not in a

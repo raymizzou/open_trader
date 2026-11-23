@@ -129,16 +129,23 @@ def strength_value(value):
     return None
 
 
+def strength_inputs(asset):
+    """Normalize field provenance before deciding presence or invalidation."""
+    fields = {key: asset[key] for key in ("strength", "local_strength")
+              if key in asset}
+    legacy = fields.get("strength")
+    if isinstance(legacy, str) and legacy.startswith("同品种 "):
+        # Peer-only text supplies no global claim, including no withdrawal.
+        # Explicit local null still wins over the legacy local value.
+        fields.pop("strength")
+        fields.setdefault("local_strength", legacy.removeprefix("同品种 "))
+    return fields
+
+
 def strength_fields(asset):
-    global_value = asset.get("strength")
-    local_value = asset.get("local_strength")
-    # Old peer-only display text proves no global value. Explicit local null
-    # is a withdrawal/missing value and must not revive the legacy peer text.
-    if isinstance(global_value, str) and global_value.startswith("同品种 "):
-        if "local_strength" not in asset:
-            local_value = global_value.removeprefix("同品种 ")
-        global_value = None
-    return strength_value(global_value), strength_value(local_value)
+    fields = strength_inputs(asset)
+    return (strength_value(fields.get("strength")),
+            strength_value(fields.get("local_strength")))
 
 
 def strength_note(asset, field, value, label):
@@ -310,6 +317,7 @@ def reconcile_strengths(preferred, reconciled, aliases):
             or reconciled.get("lookup") is not None):
         return reconciled
     result = dict(reconciled)
+    preferred_inputs = strength_inputs(preferred)
     own_evidence = preferred.get("strength_evidence", {})
     if not isinstance(own_evidence, dict):
         own_evidence = {}
@@ -318,7 +326,7 @@ def reconcile_strengths(preferred, reconciled, aliases):
     ):
         values = [current] if current is not None else []
         # Omission can be supplemented. An explicit null/invalid value cannot.
-        invalidated = field in preferred and current is None
+        invalidated = field in preferred_inputs and current is None
         if field in own_evidence:
             proof = own_evidence[field]
             invalidated |= (strength_scope(proof) != scope
@@ -333,10 +341,11 @@ def reconcile_strengths(preferred, reconciled, aliases):
             proof = evidence.get(field) if isinstance(evidence, dict) else None
             if strength_scope(proof) != scope:
                 continue
+            row_inputs = strength_inputs(row)
             if proof.get("state") == "withdrawn":
                 invalidated = True
-            elif proof.get("state") == "verified" and field in row:
-                value = strength_value(row[field])
+            elif proof.get("state") == "verified" and field in row_inputs:
+                value = strength_value(row_inputs[field])
                 if value is None:
                     invalidated = True
                 else:

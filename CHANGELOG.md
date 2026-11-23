@@ -20,6 +20,9 @@
   Never inherit trend, events or watch eligibility. Keep each metric uncertain
   on conflicting, withdrawn or invalidated evidence; preserve the other metric
   and uncontested preferred facts. Legacy inputs remain compatible.
+- Normalize legacy peer-prefixed strength as a local-only field before
+  reconciliation. It neither claims nor withdraws global strength; explicit
+  null, invalid values and field-scoped withdrawals still prevent revival.
 
 ## 2026-11-23 — Trend V3 three instrument sections (#512)
 
