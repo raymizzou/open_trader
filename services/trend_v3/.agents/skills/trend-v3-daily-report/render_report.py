@@ -147,6 +147,8 @@ def render_card(pattern, asset):
     markers = []
     if asset.get("direct_verified") is True:
         markers.append('<span class="reader-marker">直属</span>')
+    if asset.get("platform_match_verified") is True:
+        markers.append('<span class="reader-marker">趋势动物可查</span>')
     if lookup is None and asset.get("watch_eligible") is True:
         markers.append('<span class="reader-marker">应建观察仓</span>')
     return pattern.substitute(
@@ -162,27 +164,119 @@ def render_card(pattern, asset):
     )
 
 
-def render_assets(fragments, assets, note, partial_note=None):
-    if not isinstance(assets, list):
-        raise ValueError("Asset lists must be arrays")
+def render_assets(fragments, assets, note):
     if not assets:
         return fragments["empty_note"].substitute(note=note)
-
     cards = [render_card(fragments["asset_card"], asset) for asset in assets]
-    rendered = fragments["asset_list"].substitute(cards="\n".join(cards))
-    # Empty-only legacy notes remain hidden on populated lists. Only the new
-    # explicit public partial-coverage field opts into a note after the cards.
-    if partial_note is not None:
-        if not isinstance(partial_note, str):
-            raise ValueError("Partial coverage note must be text")
-        if partial_note.strip():
-            rendered += "\n" + fragments["empty_note"].substitute(
-                note=display_text(partial_note)
-            )
-    return rendered
+    return fragments["asset_list"].substitute(cards="\n".join(cards))
 
 
-def render_direction(fragments, groups, note):
+def platform_id(asset):
+    value = asset.get("instrument_id")
+    if value is None or value == "":
+        return None
+    if type(value) is int and value >= 0:
+        return str(value)
+    if isinstance(value, str):
+        return value.strip() or None
+    raise ValueError("Instrument ID must be text or a nonnegative integer")
+
+
+def instrument_scope(asset):
+    # Currency is an additional boundary when supplied, never inferred.
+    values = (asset.get("market"), asset.get("instrument_type"))
+    if not all(isinstance(value, str) and value.strip() for value in values):
+        return None
+    currency = asset.get("currency")
+    if currency is not None and not isinstance(currency, str):
+        raise ValueError("Instrument currency must be text")
+    return (*values, currency or None)
+
+
+def instrument_identity(asset, ids_by_code):
+    # A code-only alias can use a single established ID in this exact scope.
+    # Multiple contradictory IDs never make the alias identify either one.
+    scope = instrument_scope(asset)
+    if scope is None:
+        return None
+    identifier = platform_id(asset)
+    code = asset.get("code")
+    if identifier is None and isinstance(code, str) and code.strip():
+        ids = ids_by_code.get((*scope, code), set())
+        if len(ids) == 1:
+            identifier = next(iter(ids))
+        else:
+            return (*scope, "code", code)
+    return (*scope, "instrument_id", identifier) if identifier is not None else None
+
+
+def global_strength(asset):
+    # BTC peer strength is deliberately excluded from global ordering.
+    if asset.get("lookup") is not None:
+        return None
+    raw = asset.get("strength")
+    if not isinstance(raw, str):
+        return None
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?) / 100", raw)
+    return Decimal(match[1]) if match and Decimal(match[1]) <= 100 else None
+
+
+def instrument_sections(group, direction):
+    candidates = []
+    for field in ("direct", "searchable", "related"):
+        assets = group.get(field, [])
+        if not isinstance(assets, list):
+            raise ValueError("Asset lists must be arrays")
+        candidates.extend(assets)
+    ids_by_code = {}
+    for asset in candidates:
+        scope = instrument_scope(asset)
+        identifier = platform_id(asset)
+        code = asset.get("code")
+        if scope is not None and identifier is not None and isinstance(code, str):
+            ids_by_code.setdefault((*scope, code), set()).add(identifier)
+    sections = [[], [], []]
+    seen = set()
+    # Resolve strongest verified classification before removing duplicates.
+    # Keep the selected row's own facts and eligibility; do not copy flags from
+    # lower-priority aliases or infer membership from list position.
+    for priority in range(3):
+        for asset in candidates:
+            category = (0 if asset.get("direct_verified") is True else
+                        1 if asset.get("platform_match_verified") is True else 2)
+            if category != priority:
+                continue
+            identity = instrument_identity(asset, ids_by_code)
+            if identity is not None:
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            sections[priority].append(asset)
+    def order(asset):
+        strength = global_strength(asset)
+        return (strength is None,
+                -strength if direction == "long" and strength is not None else
+                strength if strength is not None else Decimal(0), asset["code"])
+    for section in sections:
+        section.sort(key=order)
+    return sections
+
+
+def coverage_note(fragments, group, direct):
+    general = group.get("coverage_note")
+    legacy = group.get("direct_partial_note")
+    for note in (general, legacy):
+        if note is not None and not isinstance(note, str):
+            raise ValueError("Coverage note must be text")
+    # The general field is independent of known cards. Preserve the legacy
+    # direct-only field's behavior when no general field was supplied.
+    note = general if general is not None else legacy if direct else None
+    if note and note.strip():
+        return fragments["empty_note"].substitute(note=display_text(note))
+    return ""
+
+
+def render_direction(fragments, groups, note, direction):
     if not isinstance(groups, list):
         raise ValueError("Direction rows must be arrays")
     rows = []
@@ -195,6 +289,7 @@ def render_direction(fragments, groups, note):
             raise ValueError(f"Duplicate seat {seat} in one direction")
         seen_seats.add(seat)
         code = group.get("code")
+        direct, searchable, related = instrument_sections(group, direction)
         rows.append(
             fragments["class_row"].substitute(
                 open_attr=" open" if index == 0 else "",
@@ -205,18 +300,27 @@ def render_direction(fragments, groups, note):
                 seat=f"{seat:02}",
                 board_strength=display_text(group.get("board_strength")),
                 direct=render_assets(
-                    fragments,
-                    group.get("direct", []),
+                    fragments, direct,
                     display_text(
-                        group.get("direct_note"), "暂无已确认的直接交易标的。"
+                        group.get("direct_note") if not group.get("direct") else None,
+                        "暂无已核实的直属成员。",
                     ),
-                    partial_note=group.get("direct_partial_note"),
+                ),
+                searchable=render_assets(
+                    fragments, searchable,
+                    display_text(
+                        group.get("searchable_note"),
+                        "暂无已核实的平台精确匹配标的。",
+                    ),
                 ),
                 related=render_assets(
-                    fragments,
-                    group.get("related", []),
-                    display_text(group.get("related_note"), "暂无已确认的关联标的。"),
+                    fragments, related,
+                    display_text(
+                        group.get("related_note") if not group.get("related") else None,
+                        "暂无其他有据关联的标的。",
+                    ),
                 ),
+                coverage_note=coverage_note(fragments, group, direct),
             )
         )
 
@@ -253,10 +357,10 @@ def render(report, template):
         day=day.day,
         board_note=board_note,
         short_rows=render_direction(
-            fragments, report.get("short", []), report.get("short_note")
+            fragments, report.get("short", []), report.get("short_note"), "short"
         ),
         long_rows=render_direction(
-            fragments, report.get("long", []), report.get("long_note")
+            fragments, report.get("long", []), report.get("long_note"), "long"
         ),
     )
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-11-23 — Trend V3 three instrument sections (#512)
+
+- Show every class with `大类直属`, `趋势动物里面能够查到`, and
+  `相关的标的`, including empty sections. Verified direct membership takes
+  precedence over an exact platform match and other related evidence.
+- Remove identified overlaps within each class, preserving different markets
+  and instrument types. Show verified lookup and membership labels separately
+  from watch eligibility. Sort global strength by direction, with missing values
+  last; keep BTC peer strength separate.
+- Connect ID-less scoped aliases to a uniquely proved platform ID, including
+  integer IDs, while preserving contradictory identities.
+- Show general coverage notes after all three sections even with no direct
+  cards. Keep the legacy direct-only note compatible. Rebuild old projections
+  from valid membership and lookup evidence, without new market queries.
+
 ## 2026-11-22 — Trend V3 complete direct watch lists (#512)
 
 - List every verified eligible direct instrument in each selected class,
