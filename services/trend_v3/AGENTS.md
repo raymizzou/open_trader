@@ -22,7 +22,15 @@ The caller owns calendar decisions and all other opening conditions.
   for scheduled, manual, offline, and revision work. The dated masthead links
   to the short, long, live, simulation, and Kelly sections in that order.
   Keep each verified class from the market board's bottom two (short) and top
-  two (long) seats. Each class expands to direct and related instrument cards.
+  two (long) seats. Each class expands to three labelled blocks, in order: `大类直属`,
+  `趋势动物里面能够查到`, and `相关的标的`, including empty blocks.
+  Verified membership wins over an exact platform match, which wins over
+  other evidence-backed related instruments. Show each instrument once per
+  class, with explicit `直属` / `趋势动物可查` markers where verified.
+  Keep watch eligibility independent. Put general `coverage_note` text after
+  all three blocks even when no direct cards are known; retain the older
+  direct-only partial note for compatible inputs. Never infer membership or an exact match from legacy
+  list placement, class identity, or a missing strength/date.
   Show the verified direction seat and board strength with the class. Show
   instrument strength with its card. For BTC spot observation, use the verified
   same-asset-category strength for the applicable provider data date. Keep both
