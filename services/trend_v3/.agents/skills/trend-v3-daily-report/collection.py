@@ -191,21 +191,27 @@ def strength_scope(value):
     return day, version
 
 
+def strength_candidate_withdrawn(candidate, field, aliases):
+    scope = strength_scope(candidate.get("_strength_field_scopes", {}).get(field))
+    if scope is None:
+        return False
+    return any(
+        platform_id(row) == platform_id(candidate)
+        and instrument_scope(row) == instrument_scope(candidate)
+        and row.get("lookup") is None
+        and strength_scope(row.get("_strength_withdrawals", {}).get(field)) == scope
+        for row in aliases
+    )
+
+
 def reconcile_strengths(preferred, reconciled, aliases):
     """Opt-in, field-only bridge for independently verified split projections."""
     # Explicit, validated current null withdrawals are field-local. They must
     # survive duplicate selection even without the optional split-field opt-in.
     withdrawn = {
         field
-        for field, field_scope in preferred.get("_strength_field_scopes", {}).items()
-        if any(
-            platform_id(row) == platform_id(preferred)
-            and instrument_scope(row) == instrument_scope(preferred)
-            and row.get("lookup") is None
-            and strength_scope(row.get("_strength_withdrawals", {}).get(field))
-            == strength_scope(field_scope)
-            for row in aliases
-        )
+        for field in preferred.get("_strength_field_scopes", {})
+        if strength_candidate_withdrawn(preferred, field, aliases)
     }
     if withdrawn:
         preferred = {**preferred, **{field: None for field in withdrawn}}
@@ -256,7 +262,7 @@ def reconcile_strengths(preferred, reconciled, aliases):
                 invalidated = True
             elif proof.get("state") == "verified" and field in row_inputs:
                 value = strength_value(row_inputs[field])
-                if value is None:
+                if value is None or strength_candidate_withdrawn(row, field, aliases):
                     invalidated = True
                 else:
                     values.append(value)

@@ -2419,3 +2419,155 @@ def test_withdrawn_strength_retains_independent_watch(tmp_path, field):
         )
         assert "应建观察仓" not in invalid_btc
         assert "开香槟" not in invalid_btc
+
+
+@pytest.mark.parametrize(
+    "field", ["strength", "local_strength"], ids=["global", "local"]
+)
+def test_three_source_withdrawal_cannot_revive_omitted_strength(tmp_path, field):
+    from copy import deepcopy
+    from itertools import permutations
+
+    def report_with_sources(order, withdrawal_scope):
+        report = complete_report()
+        group = report["long"][0]
+        preferred = group.pop("searchable")[0]
+        preferred.update(
+            direct_verified=True,
+            signal_events=["开香槟"],
+            strength_scope={"data_date": "2026-11-22", "version": "fixture-v1"},
+        )
+        donor = deepcopy(preferred)
+        donor.update(direct_verified=False, watch_eligible=False)
+        donor[field] = "80" if field == "strength" else "88"
+        donor["strength_evidence"] = {
+            field: {
+                "state": "verified",
+                "data_date": "2026-11-22",
+                "version": "fixture-v1",
+            }
+        }
+        withdrawn = deepcopy(donor)
+        withdrawn[field] = None
+        withdrawn["strength_evidence"] = {}
+        withdrawal_version = (
+            "fixture-v2" if withdrawal_scope == "version" else "fixture-v1"
+        )
+        if withdrawal_scope == "day":
+            withdrawn["data_date"] = "2026-11-21"
+        elif withdrawal_scope == "market":
+            withdrawn["market"] = "CRYPTO-ALT"
+            report["collection"]["targets"]["CRYPTO-ALT"] = "2026-11-22"
+        elif withdrawal_scope == "identity":
+            withdrawn["instrument_id"] = "other-btc"
+        preferred.pop(field)
+        comparator = {
+            **deepcopy(donor),
+            "code": "CMP",
+            "name": "合成比较",
+            "instrument_id": "cmp",
+            "direct_verified": True,
+            "strength": "50",
+            "local_strength": "30",
+            "signal_events": [],
+        }
+        group["direct"] = [preferred, comparator]
+        group["searchable"] = [
+            deepcopy(withdrawn if role == "withdrawn" else donor) for role in order
+        ]
+        group["coverage"]["instrument_ids"] = [
+            asset["instrument_id"]
+            for section in ("direct", "searchable")
+            for asset in group[section]
+        ]
+        collection = report["collection"]
+        collection["worklist"] = [
+            item
+            for item in collection["worklist"]
+            if not item["path"].startswith("/long/0/searchable/")
+        ]
+        collection["evidence"] = {
+            path: proof
+            for path, proof in collection["evidence"].items()
+            if not path.startswith("/long/0/searchable/")
+        }
+        collection["evidence"]["/long/0/coverage"]["value"] = deepcopy(
+            group["coverage"]
+        )
+        for section in ("direct", "searchable"):
+            for i, asset in enumerate(group[section]):
+                role = order[i] if section == "searchable" else "preferred"
+                for metric in ("trend", "signal_events", "strength", "local_strength"):
+                    path = f"/long/0/{section}/{i}/" + metric
+                    collection["worklist"].append(
+                        {
+                            "path": path,
+                            "label": asset["code"] + " " + metric,
+                            "market": asset["market"],
+                            "target_date": collection["targets"][asset["market"]],
+                        }
+                    )
+                    if metric not in asset:
+                        continue  # the preferred row genuinely has no field scope
+                    collection["evidence"][path] = {
+                        "state": "withdrawn"
+                        if role == "withdrawn" and metric == field
+                        else "verified",
+                        "data_date": asset["data_date"],
+                        "version": withdrawal_version
+                        if role == "withdrawn"
+                        else "fixture-v1",
+                        "identity": asset["instrument_id"],
+                        "market": asset["market"],
+                        "instrument_type": "spot",
+                        "source": "fixture-" + role,
+                        "value": asset[metric],
+                    }
+        return report
+
+    examples = [
+        (order, scope)
+        for roles in (("donor", "withdrawn"), ("donor", "withdrawn", "extra-donor"))
+        for order in permutations(roles)
+        for scope in ("same", "version")
+    ]
+    examples += [
+        (("donor", "withdrawn"), scope) for scope in ("day", "market", "identity")
+    ]
+    for index, (order, scope) in enumerate(examples):
+        report = report_with_sources(order, scope)
+        html = render(tmp_path, report, f"three-source-{index}")
+        row = next(
+            row
+            for row in re.findall(r"<details\b.*?</details>", html, re.S)
+            if "合成加密" in row
+        )
+        direct = row.split("<h3>大类直属</h3>")[1].split(
+            "<h3>趋势动物里面能够查到</h3>"
+        )[0]
+        btc = next(
+            card
+            for card in re.findall(
+                r'<li class="asset reader-card">.*?</li>', direct, re.S
+            )
+            if 'reader-name">BTC ' in card
+        )
+        label, other_label, other_value = (
+            ("全局强度", "同品种强度", "90")
+            if field == "strength"
+            else ("同品种强度", "全局强度", "80")
+        )
+        value = (
+            "待核"
+            if scope == "same"
+            else ("80 / 100" if field == "strength" else "88 / 100")
+        )
+        assert f"<dt>{label}</dt><dd>{value}</dd>" in btc, (field, order, scope)
+        assert f"<dt>{other_label}</dt><dd>{other_value} / 100</dd>" in btc
+        assert "应建观察仓" in btc and "开香槟" in btc
+        assert re.findall(r'<h4 class="reader-name">(\S+)', direct) == (
+            ["CMP", "BTC"]
+            if field == "strength" and scope == "same"
+            else ["BTC", "CMP"]
+        )
+        assert "数据收集中" in html
