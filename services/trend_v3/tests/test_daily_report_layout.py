@@ -16,8 +16,8 @@ RENDERER = SKILL / "render_report.py"
 
 # Capture the approved reference independently of the shipping template.
 APPROVED_CSS = "bca3cfea0b8b67e5633eb92ebfe06d1b25f6dc6ea770ec1c100c276cf40060d4"
-APPROVED_SHELL = "6c198190abeee41c63c316cc2b2e69146beadb6411f65df09ba5e119d0184b20"
-APPROVED_CLASS_ROW = "05e08cb66aa0c237fd18f6caa6fc9806b6d832b3f79f5af3664b30a7472be413"
+APPROVED_SHELL = "fbb6a4fc76798eb6776683617fcc062f389ccfa7aec171c9885144ce42bbe957"
+APPROVED_CLASS_ROW = "b215fe8afb44d74c144d7d11fc04a4993b04567c786a98ed622d724ffa4af523"
 FORMAL_RECORDS = {
     "live": (
         '<h2 id="live-title" class="section-title">当前实盘持仓</h2>',
@@ -71,6 +71,12 @@ def shell_digest(html):
     # keep their order, semantic elements, and attributes.
     html = re.sub(r"<(style|template|details)\b.*?</\1>", "", html, flags=re.S)
     html = html.replace("｜界面样稿", "")
+    html = re.sub(r'(<strong>).*?(</strong>)', r"\1\2", html, flags=re.S)
+    html = re.sub(r'(<div class="collection-status"[^>]*>)(.*?)(</div>)',
+                  lambda m: (m[1]
+                             + re.sub(r'(<p>).*?(</p>)', r"\1\2", m[2], flags=re.S)
+                             + m[3]),
+                  html, flags=re.S)
     html = re.sub(r"(<div class=\"edition\">).*?(</div>)", r"\1\2", html, flags=re.S)
     html = re.sub(r"(<h1>.*?</h1>\s*)<p>.*?</p>", r"\1", html, flags=re.S)
     html = re.sub(r"(<div class=\"classes\">).*?(</div>)", r"\1\2", html, flags=re.S)
@@ -97,6 +103,7 @@ def class_row_digest(row):
     row = re.sub(
         r'(<ul class="asset-list" role="list">).*?(</ul>)', r"\1\2", row, flags=re.S
     )
+    row = re.sub(r'(<p class="data-date">).*?(</p>)', r"\1\2", row)
     return digest(json.dumps(Markup(row).events, ensure_ascii=False))
 
 
@@ -112,6 +119,54 @@ def render(tmp_path, report, name):
     )
     assert result.returncode == 0, result.stderr
     return output_file.read_text(encoding="utf-8")
+
+
+
+def render_verified_watch(tmp_path, report, name):
+    # Synthetic membership consumers supply current per-field observations under
+    # the explicit collection contract; missing strengths remain missing.
+    day = {
+        "2040-02-29": "2040-02-28",
+        "2040-01-01": "2039-12-31",
+        "2041-01-02": "2041-01-01",
+    }[report["date"]]
+    collection = {"targets": {}, "evidence": {}}
+    report["collection"] = collection
+    for direction in ("short", "long"):
+        for gi, group in enumerate(report.get(direction, [])):
+            for section in ("direct", "searchable", "related"):
+                for ai, asset in enumerate(group.get(section, [])):
+                    asset.setdefault("instrument_id", "fixture-" + asset["code"])
+                    asset.setdefault("market", "US")
+                    asset.setdefault("instrument_type", "stock")
+                    asset["data_date"] = day
+                    collection["targets"][asset["market"]] = day
+                    if asset.get("watch_eligible") is True:
+                        asset.setdefault("trend", "热")
+                        asset.setdefault("signal_events", [])
+                    fields = (
+                        ("lookup",)
+                        if asset.get("lookup") == "miss"
+                        else ()
+                        if asset.get("lookup")
+                        else ("trend", "signal_events", "strength", "local_strength")
+                    )
+                    for field in fields:
+                        if field not in asset:
+                            continue
+                        path = f"/{direction}/{gi}/{section}/{ai}/{field}"
+                        collection["evidence"][path] = {
+                            "state": "verified",
+                            "data_date": day,
+                            "market": asset["market"],
+                            "instrument_type": asset["instrument_type"],
+                            "source": "fixture-current-observation",
+                            "version": "fixture-v1",
+                            "identity": asset["instrument_id"],
+                            "value": asset[field],
+                            **({"full_lookup": True} if field == "lookup" else {}),
+                        }
+    return render(tmp_path, report, name)
 
 
 def test_renders_approved_shell_across_dates(tmp_path):
@@ -578,7 +633,7 @@ def test_direct_watch_entries(tmp_path, direction):
         }
         for code in codes
     ]
-    html = render(
+    html = render_verified_watch(
         tmp_path,
         {
             "date": "2040-02-29",
@@ -624,7 +679,7 @@ def test_direct_watch_markers_require_evidence(tmp_path):
             "watch_eligible": True,
         },
     ]
-    html = render(
+    html = render_verified_watch(
         tmp_path,
         {
             "date": "2040-02-29",
@@ -677,7 +732,7 @@ def test_direct_partial_coverage_with_verified_cards(tmp_path):
         "related_note": "LEGACY-RELATED-EMPTY-ONLY",
         "coverage_evidence": "PRIVATE-COVERAGE-DETAILS",
     }
-    html = render(
+    html = render_verified_watch(
         tmp_path,
         {
             "date": "2040-02-29",
@@ -717,7 +772,7 @@ def test_direct_partial_coverage_with_verified_cards(tmp_path):
         ("legacy", legacy),
         ("blank", {**group, "direct_partial_note": ""}),
     ):
-        unchanged = render(
+        unchanged = render_verified_watch(
             tmp_path, {"date": "2040-02-29", "long": [fields]}, label
         )
         assert "LEGACY-" not in unchanged
@@ -726,7 +781,7 @@ def test_direct_partial_coverage_with_verified_cards(tmp_path):
         assert "PRIVATE-COVERAGE-DETAILS" not in unchanged
         assert unchanged.count('<li class="asset reader-card">') == 2
 
-    empty = render(
+    empty = render_verified_watch(
         tmp_path,
         {
             "date": "2040-02-29",
@@ -777,7 +832,7 @@ def test_three_instrument_sections(tmp_path):
         ("long", ["B", "G", "F", "C"]),
         ("short", ["F", "B", "G", "C"]),
     ):
-        html = render(tmp_path, {"date": "2040-02-29", direction: [group,
+        html = render_verified_watch(tmp_path, {"date": "2040-02-29", direction: [group,
             {"seat": 2, "name": "跨类归属", "related": [a]}]}, direction)
         rows = re.findall(r"<details\b.*?</details>", html, re.S)
         first, second, third = re.split(
@@ -803,14 +858,14 @@ def test_three_instrument_sections(tmp_path):
         assert codes(rows[1]) == ["A"]  # independent class membership survives
         assert_formal_records(html)
 
-    empty = render(tmp_path, {"date": "2041-01-02", "long": [
+    empty = render_verified_watch(tmp_path, {"date": "2041-01-02", "long": [
         {"seat": 1, "name": "空类"}]}, "three-empty")
     assert re.findall(r"<h3>(.*?)</h3>", empty) == [
         "大类直属", "趋势动物里面能够查到", "相关的标的"]
     empty_row = re.search(r"<details\b.*?</details>", empty, re.S)[0]
     assert empty_row.count('class="empty-direct"') == 3
 
-    legacy = render(tmp_path, {"date": "2041-01-02", "long": [{
+    legacy = render_verified_watch(tmp_path, {"date": "2041-01-02", "long": [{
         "seat": 1, "name": "旧输入", "direct": [
             {"code": "OLD", "name": "未核实直属位置"}],
         "related": [dict(b)], "direct_note": "PRIVATE-OLD-EMPTY-NOTE",
@@ -993,7 +1048,7 @@ def test_negative_lookup_with_changed_scope_is_pending(tmp_path):
         ("changed", "2040-01-01/v2", "待核"),
         ("same", "2040-01-01/v1", "查不到"),
     ):
-        html = render(tmp_path, {"date": "2040-01-01", "long": [{
+        html = render_verified_watch(tmp_path, {"date": "2040-01-01", "long": [{
             "seat": 1, "name": "查询版本核对", "direct": [{
                 **base, "direct_verified": True, "lookup": "miss",
                 "lookup_scope": "2040-01-01/v1", "trend": "MASKED-QUOTE",
@@ -1027,7 +1082,7 @@ def test_negative_lookup_with_changed_scope_is_pending(tmp_path):
                   "watch_eligible": True}
         if quote_scope is not None:
             direct["lookup_scope"] = quote_scope
-        html = render(tmp_path, {"date": "2040-01-01", "long": [{
+        html = render_verified_watch(tmp_path, {"date": "2040-01-01", "long": [{
             "seat": 1, "name": "行情独立", "direct": [direct],
             "related": [{**base, "platform_match_verified": True,
                          "lookup_scope": "2040-01-01/v1"}]}]}, label)
@@ -1275,3 +1330,1244 @@ def test_legacy_peer_text_allows_verified_global_strength(tmp_path):
             assert '<dd class="reader-event">无</dd>' in a
             assert '应建观察仓' not in a
             assert '同品种 20 / 100' not in a
+
+
+def mixed_report():
+    return {
+        "date": "2026-11-23",
+        "board_date": "2026-11-22",
+        "board_version": "2026-11-23/v1",
+        "long": [
+            {
+                "seat": 1,
+                "name": "合成加密",
+                "board_strength": "80",
+                "data_date": "2026-11-22",
+                "searchable": [
+                    {
+                        "code": "BTC",
+                        "name": "合成比特币",
+                        "market": "CRYPTO",
+                        "instrument_type": "spot",
+                        "instrument_id": "btc",
+                        "platform_match_verified": True,
+                        "data_date": "2026-11-21",
+                        "trend": "热",
+                        "strength": "80",
+                        "local_strength": "90",
+                        "signal_events": [],
+                        "watch_eligible": True,
+                    }
+                ],
+            },
+            {
+                "seat": 2,
+                "name": "合成股票",
+                "board_strength": "70",
+                "data_date": "2026-11-22",
+                "searchable": [
+                    {
+                        "code": "ETF",
+                        "name": "合成基金",
+                        "market": "US",
+                        "instrument_type": "ETF",
+                        "instrument_id": "etf",
+                        "platform_match_verified": True,
+                        "data_date": "2026-11-20",
+                        "trend": "热",
+                        "strength": "60",
+                        "local_strength": "50",
+                        "signal_events": [],
+                    }
+                ],
+            },
+        ],
+        "collection": {
+            "targets": {
+                "BOARD": "2026-11-22",
+                "CRYPTO": "2026-11-22",
+                "US": "2026-11-20",
+            },
+            "next_check": "2026-11-23T10:30:00+08:00",
+            "worklist": [],
+            "evidence": {},
+        },
+    }
+
+
+def test_monday_mixed_data_dates_pending(tmp_path):
+    html = render(tmp_path, mixed_report(), "monday")
+    assert "数据收集中" in html and "数据已完备" not in html
+    assert "目标 2026-11-22" in html and "实际 2026-11-21" in html
+    assert "2026-11-23T10:30:00+08:00" in html
+    cards = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+    btc = next(c for c in cards if 'reader-name">BTC ' in c)
+    etf = next(c for c in cards if 'reader-name">ETF ' in c)
+    assert "行情日期 2026-11-21" in btc and "历史数据" in btc
+    assert "行情日期 2026-11-20" in etf
+    assert "应建观察仓" not in btc
+    assert "版次 2026-11-23/v1" in html
+
+
+def test_release_without_matching_instrument_stays_pending(tmp_path):
+    report = mixed_report()
+    asset = report["long"][0]["searchable"][0]
+    asset["data_date"] = "2026-11-22"
+    report["collection"]["releases"] = {"CRYPTO": "2026-11-22"}
+    report["collection"]["evidence"] = {
+        "/long/0/searchable/0/strength": {
+            "state": "verified",
+            "data_date": "2026-11-21",
+            "version": "v1",
+            "source": "fixture-old-response",
+            "value": "80",
+            "identity": "btc",
+        }
+    }
+    html = render(tmp_path, report, "release-only")
+    assert "数据收集中" in html and "数据已完备" not in html
+    assert "全局强度日期 2026-11-21" in html
+    assert "BTC strength：目标 2026-11-22，实际 2026-11-21" in html
+    assert "应建观察仓" not in html
+
+
+    for label, day in (("future-card", "2026-11-24"), ("invalid-card", "bad-date")):
+        invalid = mixed_report()
+        card = invalid["long"][0]["searchable"][0]
+        card.update(data_date=day, trend="INVALID-DATE-QUOTE", strength="88.888",
+                    local_strength="77.777", signal_events=["开香槟"])
+        html = render(tmp_path, invalid, label)
+        btc = next(c for c in re.findall(
+            r'<li class="asset reader-card">.*?</li>', html, re.S)
+                   if 'reader-name">BTC ' in c)
+        assert all(hidden not in btc for hidden in (
+            "INVALID-DATE-QUOTE", "88.888", "77.777", "开香槟", "应建观察仓"))
+
+
+def complete_report():
+    report = mixed_report()
+    report["long"][0]["searchable"][0]["data_date"] = "2026-11-22"
+    report["short"] = [
+        {
+            "seat": 1,
+            "name": "合成弱类甲",
+            "board_strength": "10",
+            "data_date": "2026-11-22",
+        },
+        {
+            "seat": 2,
+            "name": "合成弱类乙",
+            "board_strength": "20",
+            "data_date": "2026-11-22",
+        },
+    ]
+    collection = report["collection"]
+    collection["verified_at"] = "2026-11-23T10:12:00+08:00"
+    facts = [
+        ("/board_date", "榜图", "BOARD", "board", report["board_date"]),
+        ("/board_version", "榜图版次", "BOARD", "board", report["board_version"]),
+    ]
+    for direction in ("short", "long"):
+        for i, group in enumerate(report[direction]):
+            prefix = f"/{direction}/{i}"
+            members = [a["instrument_id"] for a in group.get("searchable", [])]
+            group["coverage"] = {"state": "complete", "instrument_ids": members}
+            for field in ("board_strength", "coverage"):
+                facts.append(
+                    (
+                        prefix + "/" + field,
+                        group["name"] + " " + field,
+                        "BOARD",
+                        group["name"],
+                        group[field],
+                    )
+                )
+            for j, asset in enumerate(group.get("searchable", [])):
+                for field in ("trend", "strength", "local_strength", "signal_events"):
+                    facts.append(
+                        (
+                            prefix + f"/searchable/{j}/" + field,
+                            asset["code"] + " " + field,
+                            asset["market"],
+                            asset["instrument_id"],
+                            asset[field],
+                        )
+                    )
+    for path, label, market, identity, value in facts:
+        day = collection["targets"][market]
+        collection["worklist"].append(
+            {"path": path, "label": label, "market": market, "target_date": day}
+        )
+        collection["evidence"][path] = {
+            "state": "verified",
+            "data_date": day,
+            "version": "fixture-v1",
+            "market": market,
+            "instrument_type": ("spot" if market == "CRYPTO" else "ETF"),
+            "source": "fixture-response-" + path,
+            "identity": identity,
+            "value": value,
+        }
+    return report
+
+
+def test_complete_report_shows_confirmation_time(tmp_path):
+    report = complete_report()
+    html = render(tmp_path, report, "complete")
+    assert "数据已完备" in html and "数据收集中" not in html
+    assert "2026-11-23T10:12:00+08:00" in html
+    assert "行情日期 2026-11-20" in html and "行情日期 2026-11-22" in html
+    assert "应建观察仓" in html
+    # A proof is bound to the field, identity, date and source, independently.
+    path = "/long/0/searchable/0/strength"
+    for label, changes in (
+        ("mixed", {"data_date": "2026-11-21"}),
+        ("identity", {"identity": "other"}),
+        ("value", {"value": "99"}),
+        ("source", {"source": ""}),
+        ("withdrawn", {"state": "withdrawn"}),
+    ):
+        revised = complete_report()
+        revised["collection"]["evidence"][path].update(changes)
+        html = render(tmp_path, revised, label)
+        assert "数据收集中" in html and "数据已完备" not in html
+        assert "应建观察仓" not in html
+
+
+    for label in ("card-date", "foreign-market", "invalid-strength"):
+        revised = complete_report()
+        asset = revised["long"][0]["searchable"][0]
+        if label == "card-date":
+            asset["data_date"] = "2026-11-21"
+        elif label == "foreign-market":
+            revised["collection"]["evidence"][path]["market"] = "OTHER"
+        else:
+            asset["strength"] = "INVALID"
+            revised["collection"]["evidence"][path]["value"] = "INVALID"
+        html = render(tmp_path, revised, label)
+        assert "数据收集中" in html and "数据已完备" not in html
+
+
+    revised = complete_report()
+    asset = revised["long"][0]["searchable"][0]
+    asset.update(lookup="miss", platform_match_verified=False)
+    manifest = revised["collection"]
+    prefix = "/long/0/searchable/0/"
+    manifest["worklist"] = [item for item in manifest["worklist"]
+                            if not item["path"].startswith(prefix)]
+    manifest["worklist"].append({"path": prefix + "lookup", "label": "BTC lookup",
+                                 "market": "CRYPTO", "target_date": "2026-11-22"})
+    manifest["evidence"][prefix + "lookup"] = {
+        "state": "verified", "data_date": "2026-11-22", "version": "fixture-v1",
+        "source": "fixture-full-result", "identity": "btc", "market": "CRYPTO",
+        "instrument_type": "spot", "value": "miss", "full_lookup": True}
+    html = render(tmp_path, revised, "verified-miss")
+    assert "数据已完备" in html and "查不到" in html
+    assert "应建观察仓" not in html
+    manifest["evidence"][prefix + "lookup"]["full_lookup"] = False
+    html = render(tmp_path, revised, "unverified-miss")
+    assert "数据收集中" in html and "数据已完备" not in html
+    assert "查不到" not in html and "待核" in html
+
+
+def test_missing_manifest_cannot_finish(tmp_path):
+    for name, manifest in (
+        ("absent", None),
+        ("empty", {}),
+        ("bare", {"complete": True, "missing": []}),
+    ):
+        report = {"date": "2026-11-23"}
+        if manifest is not None:
+            report["collection"] = manifest
+        html = render(tmp_path, report, name)
+        assert "数据收集中" in html and "数据已完备" not in html
+    for name in ("unresolved-extra", "duplicate", "invalid-target", "missing-item"):
+        report = complete_report()
+        manifest = report["collection"]
+        if name == "unresolved-extra":
+            manifest["worklist"].append(
+                {
+                    "path": "/unknown",
+                    "label": "尚未核完的目录",
+                    "market": "US",
+                    "target_date": "2026-11-20",
+                }
+            )
+        elif name == "duplicate":
+            manifest["worklist"].append(manifest["worklist"][0])
+        elif name == "invalid-target":
+            manifest["worklist"][0]["target_date"] = "unknown"
+        else:
+            manifest["worklist"].pop()
+        html = render(tmp_path, report, name)
+        assert "数据收集中" in html and "数据已完备" not in html, name
+
+
+@pytest.mark.parametrize(
+    "cited_day", ["2026-11-19", "2026-11-24", None],
+    ids=["stale", "future", "missing"],
+)
+def test_stale_cited_board_cannot_complete(tmp_path, cited_day):
+    from test_hourly_collection import control
+
+    report = complete_report()
+    api = control()
+    state = tmp_path / "control.json"
+    api.initialize(state, report)
+    assert api.claim_round(state, report, "2026-11-23T08:30:00+08:00")["slot"] == 0
+    local, delivered = tmp_path / "local.html", tmp_path / "delivered.html"
+    current_html = api.render_html(report)
+    local.write_text(current_html, encoding="utf-8")
+    delivered.write_text(current_html, encoding="utf-8")
+    api.confirm_publication(state, report, local, delivered)
+    assert api.claim_round(state, report, "2026-11-23T10:30:00+08:00") is None
+
+    # The cited board date and its matching value agree with each other, while
+    # evidence metadata still claims the target day. The citation must win.
+    if cited_day is None:
+        report.pop("board_date")
+    else:
+        report["board_date"] = cited_day
+    report["collection"]["evidence"]["/board_date"]["value"] = cited_day
+    html = render(tmp_path, report, "cited-board")
+    assert "数据收集中" in html and "数据已完备" not in html
+    assert f"榜图：目标 2026-11-22，实际 {cited_day or '待核'}" in html
+    assert "大类数据日期 2026-11-22" in html
+    assert "版次 2026-11-23/v1" in html
+    if cited_day:
+        assert f"大类强度取自 {cited_day} 官方榜图。" in html
+    else:
+        assert "官方榜图日期待核。" in html
+
+    round_ = api.claim_round(state, report, "2026-11-23T10:30:00+08:00")
+    assert round_["markets"] == ["BOARD"]
+    assert "/board_date" in round_["pending_paths"]
+    assert round_["changed"] == ["/board_date"]
+    # A later slot cannot replay an already claimed round, nor can publication
+    # acknowledge this incomplete projection even when file bytes match it.
+    assert api.claim_round(state, report, "2026-11-23T10:31:00+08:00") is None
+    local.write_text(html, encoding="utf-8")
+    delivered.write_text(html, encoding="utf-8")
+    with pytest.raises(ValueError, match="incomplete"):
+        api.confirm_publication(state, report, local, delivered)
+
+
+def test_wrong_field_date_cannot_rank_or_publish_current_value(tmp_path):
+    from copy import deepcopy
+
+    base = {
+        "code": "A",
+        "name": "合成甲",
+        "market": "US",
+        "instrument_type": "ETF",
+        "instrument_id": "a",
+        "data_date": "2026-11-20",
+        "platform_match_verified": True,
+        "direct_verified": True,
+        "strength": "99",
+        "local_strength": "77",
+        "trend": "热",
+        "signal_events": ["开香槟"],
+        "watch_eligible": True,
+    }
+    other = {
+        **base,
+        "code": "B",
+        "name": "合成乙",
+        "instrument_id": "b",
+        "strength": "40",
+        "local_strength": "20",
+        "watch_eligible": False,
+    }
+    source = {
+        "date": "2026-11-23",
+        "long": [{"seat": 1, "name": "合成比较", "direct": [base, other]}],
+        "collection": {"targets": {"US": "2026-11-20"}, "evidence": {}},
+    }
+    for i, asset in enumerate((base, other)):
+        for field in ("trend", "signal_events", "strength", "local_strength"):
+            source["collection"]["evidence"][f"/long/0/direct/{i}/{field}"] = {
+                "state": "verified",
+                "data_date": "2026-11-20",
+                "version": "v1",
+                "identity": asset["instrument_id"],
+                "market": "US",
+                "instrument_type": "ETF",
+                "source": "fixture-field-response",
+                "value": asset[field],
+            }
+    path = "/long/0/direct/0/strength"
+    for case in (
+        "future",
+        "bad-date",
+        "old",
+        "identity",
+        "market",
+        "type",
+        "value",
+        "UNKNOWN",
+        "missing-proof",
+        "null-proof",
+        "withdrawn",
+        "split-revival",
+    ):
+        report = deepcopy(source)
+        proof = report["collection"]["evidence"][path]
+        if case in ("future", "bad-date", "old"):
+            proof["data_date"] = {
+                "future": "2026-11-24",
+                "bad-date": "bad",
+                "old": "2026-11-19",
+            }[case]
+        elif case in ("identity", "market", "type", "value"):
+            key = {"type": "instrument_type"}.get(case, case)
+            proof[key] = "OTHER"
+        elif case == "UNKNOWN":
+            proof["state"] = "UNKNOWN"
+        elif case == "null-proof":
+            report["collection"]["evidence"][path] = None
+        elif case == "missing-proof":
+            report["collection"]["evidence"].pop(path)
+        else:
+            proof["state"] = "withdrawn"
+        if case == "split-revival":
+            a = report["long"][0]["direct"][0]
+            a["strength_scope"] = {"data_date": "2026-11-20", "version": "v1"}
+            alias = {
+                **base,
+                "direct_verified": False,
+                "strength": "100",
+                "strength_evidence": {
+                    "strength": {
+                        "data_date": "2026-11-20",
+                        "version": "v1",
+                        "state": "verified",
+                    }
+                },
+            }
+            report["long"][0]["searchable"] = [alias]
+            report["collection"]["evidence"]["/long/0/searchable/0/strength"] = {
+                **source["collection"]["evidence"][path],
+                "value": "100",
+            }
+        html = render(tmp_path, report, "field-" + case)
+        cards = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+        assert re.findall(r'<h4 class="reader-name">(\S+)', html) == ["B", "A"], case
+        a = next(card for card in cards if 'reader-name">A ' in card)
+        assert "<dt>全局强度</dt><dd>待核</dd>" in a, case
+        assert "<dt>同品种强度</dt><dd>77 / 100</dd>" in a, case
+        assert "99 / 100" not in a and "100 / 100" not in a
+        assert "应建观察仓" not in a
+        if case == "old":
+            assert "历史数据" in a and "全局强度日期 2026-11-19" in a
+    for field, hidden in (("trend", "热"), ("signal_events", "开香槟")):
+        report = deepcopy(source)
+        report["collection"]["evidence"]["/long/0/direct/0/" + field]["identity"] = (
+            "other"
+        )
+        html = render(tmp_path, report, "other-field-" + field)
+        a = next(
+            card
+            for card in re.findall(
+                r'<li class="asset reader-card">.*?</li>', html, re.S
+            )
+            if 'reader-name">A ' in card
+        )
+        assert f"<dd>{hidden}</dd>" not in a if field == "trend" else hidden not in a
+        assert "<dt>同品种强度</dt><dd>77 / 100</dd>" in a
+
+    # A missing preferred field can still use an independently verified current
+    # split source. An invalid donor must not revive it or mask a valid peer.
+    for valid in (True, False):
+        report = deepcopy(source)
+        preferred = report["long"][0]["direct"][0]
+        preferred.pop("strength")
+        preferred["strength_scope"] = {"data_date": "2026-11-20", "version": "v1"}
+        report["collection"]["evidence"].pop(path)
+        donor = {
+            **base,
+            "direct_verified": False,
+            "strength": "88",
+            "strength_evidence": {
+                "strength": {
+                    "data_date": "2026-11-20",
+                    "version": "v1",
+                    "state": "verified",
+                }
+            },
+        }
+        report["long"][0]["searchable"] = [donor]
+        report["collection"]["evidence"]["/long/0/searchable/0/strength"] = {
+            **source["collection"]["evidence"][path],
+            "value": "88",
+            "data_date": "2026-11-20" if valid else "2026-11-24",
+        }
+        html = render(tmp_path, report, f"split-{valid}")
+        a = next(
+            card
+            for card in re.findall(
+                r'<li class="asset reader-card">.*?</li>', html, re.S
+            )
+            if 'reader-name">A ' in card
+        )
+        assert "<dt>同品种强度</dt><dd>77 / 100</dd>" in a
+        assert ("<dt>全局强度</dt><dd>88 / 100</dd>" in a) is valid
+        assert re.findall(r'<h4 class="reader-name">(\S+)', html) == (
+            ["A", "B"] if valid else ["B", "A"]
+        )
+
+
+def test_explicit_collection_missing_lookup_evidence_stays_pending(tmp_path):
+    from copy import deepcopy
+
+    asset = {
+        "code": "MISS",
+        "name": "合成查询",
+        "market": "US",
+        "instrument_type": "ETF",
+        "instrument_id": "miss-id",
+        "data_date": "2026-11-20",
+        "lookup": "miss",
+    }
+    source = {
+        "date": "2026-11-23",
+        "long": [{"seat": 1, "name": "合成查询类", "related": [asset]}],
+        "collection": {"targets": {"US": "2026-11-20"}, "evidence": {}},
+    }
+    path = "/long/0/related/0/lookup"
+    proof = {
+        "state": "verified",
+        "data_date": "2026-11-20",
+        "version": "v1",
+        "identity": "miss-id",
+        "market": "US",
+        "instrument_type": "ETF",
+        "source": "fixture-full-catalog",
+        "value": "miss",
+        "full_lookup": True,
+    }
+    for case in (
+        "no-proof",
+        "null-to-null",
+        "no-target",
+        "no-id",
+        "no-market",
+        "no-type",
+        "no-source",
+        "not-full",
+    ):
+        report = deepcopy(source)
+        card = report["long"][0]["related"][0]
+        evidence = deepcopy(proof)
+        if case != "no-proof":
+            report["collection"]["evidence"][path] = evidence
+        if case == "null-to-null":
+            card["instrument_id"] = evidence["identity"] = None
+            report["collection"]["targets"]["US"] = evidence["data_date"] = None
+        elif case == "no-target":
+            report["collection"]["targets"]["US"] = None
+        elif case == "no-id":
+            card["instrument_id"] = None
+        elif case == "no-market":
+            card.pop("market")
+        elif case == "no-type":
+            card.pop("instrument_type")
+        elif case == "no-source":
+            evidence.pop("source")
+        elif case == "not-full":
+            evidence["full_lookup"] = False
+        html = render(tmp_path, report, "lookup-" + case)
+        assert "查不到" not in html and "待核" in html, case
+        assert "数据收集中" in html and "数据已完备" not in html
+    report = deepcopy(source)
+    report["collection"]["evidence"][path] = proof
+    html = render(tmp_path, report, "full-miss")
+    assert "查不到" in html
+    # Explicit old-format compatibility is retained, without inventing proof.
+    report.pop("collection")
+    html = render(tmp_path, report, "legacy-miss")
+    assert "查不到" in html
+
+
+def test_reconciled_lookup_conflict_prevents_completion(tmp_path):
+    from copy import deepcopy
+
+    from test_hourly_collection import control
+
+    def with_alias(kind, foreign=False):
+        report = complete_report()
+        group = report["long"][0]
+        found = group["searchable"][0]
+        found["lookup_scope"] = "2026-11-22/v1"
+        alias = deepcopy(found)
+        if kind == "miss":
+            alias.update(lookup="miss", platform_match_verified=False)
+        if foreign:
+            alias.update(market="US", instrument_type="ETF", data_date="2026-11-20")
+        group["searchable"].append(alias)
+        group["coverage"]["instrument_ids"].append("btc")
+        collection = report["collection"]
+        collection["evidence"]["/long/0/coverage"]["value"] = deepcopy(
+            group["coverage"]
+        )
+        for field in (
+            ("lookup",)
+            if kind == "miss"
+            else ("trend", "strength", "local_strength", "signal_events")
+        ):
+            path = "/long/0/searchable/1/" + field
+            collection["worklist"].append(
+                {
+                    "path": path,
+                    "label": "BTC " + field,
+                    "market": alias["market"],
+                    "target_date": alias["data_date"],
+                }
+            )
+            collection["evidence"][path] = {
+                "state": "verified",
+                "data_date": alias["data_date"],
+                "version": "v1",
+                "identity": "btc",
+                "market": alias["market"],
+                "instrument_type": alias["instrument_type"],
+                "source": "fixture-alias-result",
+                "value": alias[field],
+                **({"full_lookup": True} if field == "lookup" else {}),
+            }
+        return report
+
+    api = control()
+    report = with_alias("miss")
+    html = render(tmp_path, report, "lookup-conflict")
+    assert "数据收集中" in html and "数据已完备" not in html
+    cards = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+    btc = next(card for card in cards if 'reader-name">BTC ' in card)
+    assert "<dt>当前趋势</dt><dd>待核</dd>" in btc
+    assert "查不到" not in btc and "应建观察仓" not in btc
+    assert not api.assess(report)["complete"]
+    state = tmp_path / "control.json"
+    api.initialize(state, report)
+    round_ = api.claim_round(state, report, "2026-11-23T08:30:00+08:00")
+    assert round_["markets"] == ["CRYPTO"]
+    assert "/long/0/searchable/1/lookup" in round_["pending_paths"]
+    local, delivered = tmp_path / "local.html", tmp_path / "delivered.html"
+    local.write_text(html, encoding="utf-8")
+    delivered.write_text(html, encoding="utf-8")
+    with pytest.raises(ValueError, match="incomplete"):
+        api.confirm_publication(state, report, local, delivered)
+    assert api.claim_round(state, report, "2026-11-23T09:30:00+08:00")["markets"] == [
+        "CRYPTO"
+    ]
+
+    # Compatible duplicates and a full miss in another actual market retain
+    # completion. Same code/id alone cannot create a cross-market conflict.
+    for kind, foreign in (("match", False), ("miss", True)):
+        valid = with_alias(kind, foreign)
+        assert api.assess(valid)["complete"]
+        valid_html = render(tmp_path, valid, f"compatible-{kind}-{foreign}")
+        assert "数据已完备" in valid_html
+        assert ("查不到" in valid_html) is foreign
+
+
+def test_null_strength_preserves_independent_watch_eligibility(tmp_path):
+    from copy import deepcopy
+
+    from test_hourly_collection import control
+
+    def missing_report(field, mode, proof_mode):
+        report = complete_report()
+        group = report["long"][0]
+        asset = group["searchable"][0]
+        path = "/long/0/searchable/0/" + field
+        if mode == "null":
+            asset[field] = None
+        else:
+            asset.pop(field)
+        if proof_mode == "null-proof":
+            report["collection"]["evidence"][path]["value"] = None
+        else:
+            report["collection"]["evidence"].pop(path)
+        comparator = {
+            **deepcopy(asset),
+            "code": "CMP",
+            "name": "合成比较",
+            "instrument_id": "cmp",
+            "strength": "50",
+            "local_strength": "30",
+            "watch_eligible": False,
+        }
+        group["searchable"].append(comparator)
+        group["coverage"]["instrument_ids"].append("cmp")
+        report["collection"]["evidence"]["/long/0/coverage"]["value"] = deepcopy(
+            group["coverage"]
+        )
+        for metric in ("trend", "signal_events", "strength", "local_strength"):
+            proof_path = "/long/0/searchable/1/" + metric
+            report["collection"]["worklist"].append(
+                {
+                    "path": proof_path,
+                    "label": "CMP " + metric,
+                    "market": "CRYPTO",
+                    "target_date": "2026-11-22",
+                }
+            )
+            report["collection"]["evidence"][proof_path] = {
+                "state": "verified",
+                "data_date": "2026-11-22",
+                "version": "v1",
+                "identity": "cmp",
+                "market": "CRYPTO",
+                "instrument_type": "spot",
+                "source": "fixture-comparator",
+                "value": comparator[metric],
+            }
+        return report
+
+    api = control()
+    for field, label, other_label, other_value in (
+        ("strength", "全局强度", "同品种强度", "90"),
+        ("local_strength", "同品种强度", "全局强度", "80"),
+    ):
+        for mode in ("null", "absent"):
+            for proof_mode in ("no-proof", "null-proof"):
+                report = missing_report(field, mode, proof_mode)
+                html = render(tmp_path, report, f"missing-{field}-{mode}-{proof_mode}")
+                row = re.search(r"<details\b.*?合成加密.*?</details>", html, re.S)[0]
+                cards = re.findall(r'<li class="asset reader-card">.*?</li>', row, re.S)
+                btc = next(card for card in cards if 'reader-name">BTC ' in card)
+                assert "应建观察仓" in btc, (field, mode, proof_mode)
+                assert f"<dt>{label}</dt><dd>待核</dd>" in btc
+                assert f"<dt>{other_label}</dt><dd>{other_value} / 100</dd>" in btc
+                assert re.findall(r'<h4 class="reader-name">(\S+)', row) == (
+                    ["CMP", "BTC"] if field == "strength" else ["BTC", "CMP"]
+                )
+                assert "数据收集中" in html and not api.assess(report)["complete"]
+    for bad in ("withdrawn", "contradiction", "stale-trend", "future-card", "lookup"):
+        report = missing_report("strength", "null", "no-proof")
+        asset = report["long"][0]["searchable"][0]
+        evidence = report["collection"]["evidence"]
+        if bad in ("withdrawn", "contradiction"):
+            evidence["/long/0/searchable/0/strength"] = {
+                **evidence["/long/0/searchable/0/local_strength"],
+                "state": "withdrawn" if bad == "withdrawn" else "verified",
+                "value": None if bad == "withdrawn" else "99",
+            }
+        elif bad == "stale-trend":
+            evidence["/long/0/searchable/0/trend"]["data_date"] = "2026-11-21"
+        elif bad == "future-card":
+            asset["data_date"] = "2026-11-24"
+        else:
+            asset["lookup"] = "pending"
+        html = render(tmp_path, report, "protected-" + bad)
+        btc = next(
+            card
+            for card in re.findall(
+                r'<li class="asset reader-card">.*?</li>', html, re.S
+            )
+            if 'reader-name">BTC ' in card
+        )
+        if bad == "withdrawn":
+            # hourly-b06: a same-scope null strength withdrawal affects that
+            # metric only; the independently verified watch is retained.
+            assert "应建观察仓" in btc
+        else:
+            assert "应建观察仓" not in btc, bad
+
+
+@pytest.mark.parametrize(
+    "field", ["strength", "local_strength"], ids=["global", "local"]
+)
+def test_final_strength_conflict_blocks_collection_completion(tmp_path, field):
+    from copy import deepcopy
+
+    from test_hourly_collection import control
+
+    def duplicated(agree):
+        report = complete_report()
+        group = report["long"][0]
+        first = group["searchable"][0]
+        scope = {"data_date": "2026-11-22", "version": "fixture-v1"}
+        first["strength_scope"] = scope
+        alias = deepcopy(first)
+        if not agree:
+            alias[field] = "81" if field == "strength" else "91"
+        alias["strength_evidence"] = {
+            metric: {**scope, "state": "verified"}
+            for metric in ("strength", "local_strength")
+        }
+        group["searchable"].append(alias)
+        group["coverage"]["instrument_ids"].append("btc")
+        collection = report["collection"]
+        collection["evidence"]["/long/0/coverage"]["value"] = deepcopy(
+            group["coverage"]
+        )
+        for metric in ("trend", "signal_events", "strength", "local_strength"):
+            path = "/long/0/searchable/1/" + metric
+            collection["worklist"].append(
+                {
+                    "path": path,
+                    "label": "BTC " + metric,
+                    "market": "CRYPTO",
+                    "target_date": "2026-11-22",
+                }
+            )
+            collection["evidence"][path] = {
+                "state": "verified",
+                **scope,
+                "identity": "btc",
+                "market": "CRYPTO",
+                "instrument_type": "spot",
+                "source": "fixture-duplicate-strength",
+                "value": alias[metric],
+            }
+        return report
+
+    api = control()
+    report = duplicated(False)
+    html = render(tmp_path, report, "final-conflict-" + field)
+    cards = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+    btc = next(card for card in cards if 'reader-name">BTC ' in card)
+    label, other_label, other_value = (
+        ("全局强度", "同品种强度", "90")
+        if field == "strength"
+        else ("同品种强度", "全局强度", "80")
+    )
+    assert f"<dt>{label}</dt><dd>待核</dd>" in btc
+    assert f"<dt>{other_label}</dt><dd>{other_value} / 100</dd>" in btc
+    assert "数据收集中" in html and "数据已完备" not in html
+    assert not api.assess(report)["complete"]
+    state = tmp_path / "control.json"
+    api.initialize(state, report)
+    round_ = api.claim_round(state, report, "2026-11-23T08:30:00+08:00")
+    assert round_["markets"] == ["CRYPTO"]
+    assert "/long/0/searchable/0/" + field in round_["pending_paths"]
+    assert all(path.endswith("/" + field) for path in round_["pending_paths"])
+    local, delivered = tmp_path / "local.html", tmp_path / "delivered.html"
+    local.write_text(html, encoding="utf-8")
+    delivered.write_text(html, encoding="utf-8")
+    with pytest.raises(ValueError, match="incomplete"):
+        api.confirm_publication(state, report, local, delivered)
+    assert api.claim_round(state, report, "2026-11-23T09:30:00+08:00")["markets"] == [
+        "CRYPTO"
+    ]
+
+    agreed = duplicated(True)
+    assert api.assess(agreed)["complete"]
+    final = render(tmp_path, agreed, "agreed-" + field)
+    assert "数据已完备" in final
+    local.write_text(final, encoding="utf-8")
+    delivered.write_text(final, encoding="utf-8")
+    api.confirm_publication(state, agreed, local, delivered)
+    assert api.claim_round(state, agreed, "2026-11-23T10:30:00+08:00") is None
+
+    # A current quote for a different explicit identity remains a separate card,
+    # even with the same visible code and a different value of this metric.
+    separate = duplicated(False)
+    group = separate["long"][0]
+    group["searchable"][1]["instrument_id"] = "other-btc"
+    group["coverage"]["instrument_ids"][1] = "other-btc"
+    collection = separate["collection"]
+    collection["evidence"]["/long/0/coverage"]["value"] = deepcopy(group["coverage"])
+    for metric in ("trend", "signal_events", "strength", "local_strength"):
+        collection["evidence"]["/long/0/searchable/1/" + metric]["identity"] = (
+            "other-btc"
+        )
+    assert api.assess(separate)["complete"]
+    separate_html = render(tmp_path, separate, "separate-" + field)
+    assert "数据已完备" in separate_html
+    assert re.findall(r'<h4 class="reader-name">(\S+)', separate_html).count("BTC") == 2
+
+
+@pytest.mark.parametrize(
+    "card_day",
+    [None, "bad-date", "2026-11-21", "2026-11-24"],
+    ids=["unknown", "invalid", "stale", "future"],
+)
+def test_invalid_card_date_cannot_rank_current_fields(tmp_path, card_day):
+    from copy import deepcopy
+
+    from test_hourly_collection import control
+
+    def with_rows(day, duplicate):
+        report = complete_report()
+        group = report["long"][0]
+        asset = group["searchable"][0]
+        asset["signal_events"] = ["开香槟"]
+        report["collection"]["evidence"]["/long/0/searchable/0/signal_events"][
+            "value"
+        ] = ["开香槟"]
+        asset["strength_scope"] = {"data_date": "2026-11-22", "version": "fixture-v1"}
+        comparator = {
+            **deepcopy(asset),
+            "code": "CMP",
+            "name": "合成比较",
+            "instrument_id": "cmp",
+            "strength": "50",
+            "local_strength": "30",
+            "signal_events": [],
+            "watch_eligible": False,
+        }
+        extra = [comparator]
+        if duplicate:
+            donor = deepcopy(asset)
+            donor["strength_evidence"] = {
+                field: {
+                    "state": "verified",
+                    "data_date": "2026-11-22",
+                    "version": "fixture-v1",
+                }
+                for field in ("strength", "local_strength")
+            }
+            extra.append(donor)
+        asset["data_date"] = day
+        for i, row in enumerate(extra, 1):
+            group["searchable"].append(row)
+            group["coverage"]["instrument_ids"].append(row["instrument_id"])
+            for field in ("trend", "signal_events", "strength", "local_strength"):
+                path = f"/long/0/searchable/{i}/" + field
+                report["collection"]["worklist"].append(
+                    {
+                        "path": path,
+                        "label": row["code"] + " " + field,
+                        "market": "CRYPTO",
+                        "target_date": "2026-11-22",
+                    }
+                )
+                report["collection"]["evidence"][path] = {
+                    "state": "verified",
+                    "data_date": "2026-11-22",
+                    "version": "fixture-v1",
+                    "identity": row["instrument_id"],
+                    "market": "CRYPTO",
+                    "instrument_type": "spot",
+                    "source": "fixture-current-card-fields",
+                    "value": row[field],
+                }
+        report["collection"]["evidence"]["/long/0/coverage"]["value"] = deepcopy(
+            group["coverage"]
+        )
+        return report
+
+    api = control()
+    for duplicate in (False, True):
+        report = with_rows(card_day, duplicate)
+        original = deepcopy(report)
+        html = render(tmp_path, report, f"bad-card-{duplicate}")
+        row = next(
+            row
+            for row in re.findall(r"<details\b.*?</details>", html, re.S)
+            if "合成加密" in row
+        )
+        btc = next(
+            card
+            for card in re.findall(r'<li class="asset reader-card">.*?</li>', row, re.S)
+            if 'reader-name">BTC ' in card
+        )
+        assert "<dt>全局强度</dt><dd>待核</dd>" in btc
+        assert "<dt>同品种强度</dt><dd>待核</dd>" in btc
+        assert "<dt>当前趋势</dt><dd>待核</dd>" in btc
+        assert '<dd class="reader-event">无</dd>' in btc
+        assert all(
+            value not in btc
+            for value in ("80 / 100", "90 / 100", "开香槟", "应建观察仓")
+        )
+        assert re.findall(r'<h4 class="reader-name">(\S+)', row) == ["CMP", "BTC"]
+        assert (
+            "行情日期 " + (card_day if card_day and card_day != "bad-date" else "待核")
+            in btc
+        )
+        if card_day == "2026-11-21":
+            assert "历史数据" in btc
+        assert "数据收集中" in html and not api.assess(report)["complete"]
+        assert report == original  # original dates, values and proofs are retained
+        state = tmp_path / f"state-{duplicate}.json"
+        api.initialize(state, report)
+        assert api.claim_round(state, report, "2026-11-23T08:30:00+08:00")[
+            "markets"
+        ] == ["CRYPTO"]
+        local, delivered = tmp_path / "local.html", tmp_path / "delivered.html"
+        local.write_text(html, encoding="utf-8")
+        delivered.write_text(html, encoding="utf-8")
+        with pytest.raises(ValueError, match="incomplete"):
+            api.confirm_publication(state, report, local, delivered)
+    current = with_rows("2026-11-22", True)
+    html = render(tmp_path, current, "current-card")
+    btc = next(
+        card
+        for card in re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+        if 'reader-name">BTC ' in card
+    )
+    assert "80 / 100" in btc and "90 / 100" in btc
+    assert "开香槟" in btc and "应建观察仓" in btc
+    assert api.assess(current)["complete"] and "数据已完备" in html
+
+
+@pytest.mark.parametrize(
+    "field", ["strength", "local_strength"], ids=["global", "local"]
+)
+def test_withdrawn_strength_retains_independent_watch(tmp_path, field):
+    from copy import deepcopy
+
+    from test_hourly_collection import control
+
+    def withdrawn_report(position):
+        report = complete_report()
+        group = report["long"][0]
+        first = group["searchable"][0]
+        first["signal_events"] = ["开香槟"]
+        report["collection"]["evidence"]["/long/0/searchable/0/signal_events"][
+            "value"
+        ] = ["开香槟"]
+        if position != "single":
+            group["searchable"].append(deepcopy(first))
+        index = 1 if position == "alias" else 0
+        group["searchable"][index][field] = None
+        comparator = {
+            **deepcopy(first),
+            "code": "CMP",
+            "name": "合成比较",
+            "instrument_id": "cmp",
+            "strength": "50",
+            "local_strength": "30",
+            "watch_eligible": False,
+            "signal_events": [],
+        }
+        group["searchable"].append(comparator)
+        collection = report["collection"]
+        group["coverage"]["instrument_ids"] = [
+            row["instrument_id"] for row in group["searchable"]
+        ]
+        collection["evidence"]["/long/0/coverage"]["value"] = deepcopy(
+            group["coverage"]
+        )
+        for i, row in enumerate(group["searchable"]):
+            for metric in ("trend", "signal_events", "strength", "local_strength"):
+                path = f"/long/0/searchable/{i}/" + metric
+                if i:
+                    collection["worklist"].append(
+                        {
+                            "path": path,
+                            "label": row["code"] + " " + metric,
+                            "market": "CRYPTO",
+                            "target_date": "2026-11-22",
+                        }
+                    )
+                collection["evidence"][path] = {
+                    "state": "withdrawn"
+                    if i == index and metric == field
+                    else "verified",
+                    "data_date": "2026-11-22",
+                    "version": "fixture-v1",
+                    "identity": row["instrument_id"],
+                    "market": "CRYPTO",
+                    "instrument_type": "spot",
+                    "source": "fixture-field-withdrawal",
+                    "value": row[metric],
+                }
+        return report
+
+    api = control()
+    label, other_label, other_value = (
+        ("全局强度", "同品种强度", "90")
+        if field == "strength"
+        else ("同品种强度", "全局强度", "80")
+    )
+    for position in ("single", "selected", "alias"):
+        report = withdrawn_report(position)
+        html = render(tmp_path, report, "withdrawal-" + position)
+        row = next(
+            row
+            for row in re.findall(r"<details\b.*?</details>", html, re.S)
+            if "合成加密" in row
+        )
+        btc = next(
+            card
+            for card in re.findall(r'<li class="asset reader-card">.*?</li>', row, re.S)
+            if 'reader-name">BTC ' in card
+        )
+        assert "应建观察仓" in btc, (field, position)
+        assert "开香槟" in btc and "<dt>当前趋势</dt><dd>热</dd>" in btc
+        assert f"<dt>{label}</dt><dd>待核</dd>" in btc
+        assert f"<dt>{other_label}</dt><dd>{other_value} / 100</dd>" in btc
+        assert re.findall(r'<h4 class="reader-name">(\S+)', row) == (
+            ["CMP", "BTC"] if field == "strength" else ["BTC", "CMP"]
+        )
+        assert "数据收集中" in html and not api.assess(report)["complete"]
+        state = tmp_path / f"withdrawn-{position}.json"
+        api.initialize(state, report)
+        assert api.claim_round(state, report, "2026-11-23T08:30:00+08:00")[
+            "markets"
+        ] == ["CRYPTO"]
+        local, delivered = tmp_path / "local.html", tmp_path / "delivered.html"
+        local.write_text(html, encoding="utf-8")
+        delivered.write_text(html, encoding="utf-8")
+        with pytest.raises(ValueError, match="incomplete"):
+            api.confirm_publication(state, report, local, delivered)
+
+        invalid_signal = deepcopy(report)
+        invalid_signal["collection"]["evidence"]["/long/0/searchable/0/signal_events"][
+            "state"
+        ] = "UNKNOWN"
+        invalid_html = render(tmp_path, invalid_signal, "invalid-signal-" + position)
+        invalid_btc = next(
+            card
+            for card in re.findall(
+                r'<li class="asset reader-card">.*?</li>', invalid_html, re.S
+            )
+            if 'reader-name">BTC ' in card
+        )
+        assert "应建观察仓" not in invalid_btc
+        assert "开香槟" not in invalid_btc
+
+
+@pytest.mark.parametrize(
+    "field", ["strength", "local_strength"], ids=["global", "local"]
+)
+def test_three_source_withdrawal_cannot_revive_omitted_strength(tmp_path, field):
+    from copy import deepcopy
+    from itertools import permutations
+
+    def report_with_sources(order, withdrawal_scope):
+        report = complete_report()
+        group = report["long"][0]
+        preferred = group.pop("searchable")[0]
+        preferred.update(
+            direct_verified=True,
+            signal_events=["开香槟"],
+            strength_scope={"data_date": "2026-11-22", "version": "fixture-v1"},
+        )
+        donor = deepcopy(preferred)
+        donor.update(direct_verified=False, watch_eligible=False)
+        donor[field] = "80" if field == "strength" else "88"
+        donor["strength_evidence"] = {
+            field: {
+                "state": "verified",
+                "data_date": "2026-11-22",
+                "version": "fixture-v1",
+            }
+        }
+        withdrawn = deepcopy(donor)
+        withdrawn[field] = None
+        withdrawn["strength_evidence"] = {}
+        withdrawal_version = (
+            "fixture-v2" if withdrawal_scope == "version" else "fixture-v1"
+        )
+        if withdrawal_scope == "day":
+            withdrawn["data_date"] = "2026-11-21"
+        elif withdrawal_scope == "market":
+            withdrawn["market"] = "CRYPTO-ALT"
+            report["collection"]["targets"]["CRYPTO-ALT"] = "2026-11-22"
+        elif withdrawal_scope == "identity":
+            withdrawn["instrument_id"] = "other-btc"
+        preferred.pop(field)
+        comparator = {
+            **deepcopy(donor),
+            "code": "CMP",
+            "name": "合成比较",
+            "instrument_id": "cmp",
+            "direct_verified": True,
+            "strength": "50",
+            "local_strength": "30",
+            "signal_events": [],
+        }
+        group["direct"] = [preferred, comparator]
+        group["searchable"] = [
+            deepcopy(withdrawn if role == "withdrawn" else donor) for role in order
+        ]
+        group["coverage"]["instrument_ids"] = [
+            asset["instrument_id"]
+            for section in ("direct", "searchable")
+            for asset in group[section]
+        ]
+        collection = report["collection"]
+        collection["worklist"] = [
+            item
+            for item in collection["worklist"]
+            if not item["path"].startswith("/long/0/searchable/")
+        ]
+        collection["evidence"] = {
+            path: proof
+            for path, proof in collection["evidence"].items()
+            if not path.startswith("/long/0/searchable/")
+        }
+        collection["evidence"]["/long/0/coverage"]["value"] = deepcopy(
+            group["coverage"]
+        )
+        for section in ("direct", "searchable"):
+            for i, asset in enumerate(group[section]):
+                role = order[i] if section == "searchable" else "preferred"
+                for metric in ("trend", "signal_events", "strength", "local_strength"):
+                    path = f"/long/0/{section}/{i}/" + metric
+                    collection["worklist"].append(
+                        {
+                            "path": path,
+                            "label": asset["code"] + " " + metric,
+                            "market": asset["market"],
+                            "target_date": collection["targets"][asset["market"]],
+                        }
+                    )
+                    if metric not in asset:
+                        continue  # the preferred row genuinely has no field scope
+                    collection["evidence"][path] = {
+                        "state": "withdrawn"
+                        if role == "withdrawn" and metric == field
+                        else "verified",
+                        "data_date": asset["data_date"],
+                        "version": withdrawal_version
+                        if role == "withdrawn"
+                        else "fixture-v1",
+                        "identity": asset["instrument_id"],
+                        "market": asset["market"],
+                        "instrument_type": "spot",
+                        "source": "fixture-" + role,
+                        "value": asset[metric],
+                    }
+        return report
+
+    examples = [
+        (order, scope)
+        for roles in (("donor", "withdrawn"), ("donor", "withdrawn", "extra-donor"))
+        for order in permutations(roles)
+        for scope in ("same", "version")
+    ]
+    examples += [
+        (("donor", "withdrawn"), scope) for scope in ("day", "market", "identity")
+    ]
+    for index, (order, scope) in enumerate(examples):
+        report = report_with_sources(order, scope)
+        html = render(tmp_path, report, f"three-source-{index}")
+        row = next(
+            row
+            for row in re.findall(r"<details\b.*?</details>", html, re.S)
+            if "合成加密" in row
+        )
+        direct = row.split("<h3>大类直属</h3>")[1].split(
+            "<h3>趋势动物里面能够查到</h3>"
+        )[0]
+        btc = next(
+            card
+            for card in re.findall(
+                r'<li class="asset reader-card">.*?</li>', direct, re.S
+            )
+            if 'reader-name">BTC ' in card
+        )
+        label, other_label, other_value = (
+            ("全局强度", "同品种强度", "90")
+            if field == "strength"
+            else ("同品种强度", "全局强度", "80")
+        )
+        value = (
+            "待核"
+            if scope == "same"
+            else ("80 / 100" if field == "strength" else "88 / 100")
+        )
+        assert f"<dt>{label}</dt><dd>{value}</dd>" in btc, (field, order, scope)
+        assert f"<dt>{other_label}</dt><dd>{other_value} / 100</dd>" in btc
+        assert "应建观察仓" in btc and "开香槟" in btc
+        assert re.findall(r'<h4 class="reader-name">(\S+)', direct) == (
+            ["CMP", "BTC"]
+            if field == "strength" and scope == "same"
+            else ["BTC", "CMP"]
+        )
+        assert "数据收集中" in html

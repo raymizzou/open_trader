@@ -321,6 +321,7 @@
       </div>
       <h1>趋势动物观察报告</h1>
       <p>${board_note}</p>
+      <div class="collection-status" role="status"><strong>${collection_status}</strong><p>${collection_details}</p><p>下次核实：${next_check}</p></div>
       <nav class="contents" aria-label="报告目录">
         <a href="#short">做空</a>
         <a href="#long">做多</a>
@@ -375,6 +376,7 @@ ${long_rows}
                 <span class="stat"><span class="stat-label">强度</span><span class="number">${board_strength}</span></span>
               </summary>
               <div class="ledger">
+                <p class="data-date">${date_note}</p>
                 <div class="asset-group">
                   <h3>大类直属</h3>
 ${direct}
@@ -402,6 +404,7 @@ ${cards}
   <template id="asset_card">
                     <li class="asset reader-card">
                       <h4 class="reader-name">${code} <span>· ${name}</span></h4>
+                      <p class="data-date">${date_note}</p>
                       ${markers}
                       <dl class="reader-metrics">
                         <div><dt>当前趋势</dt><dd>${trend}</dd></div>
