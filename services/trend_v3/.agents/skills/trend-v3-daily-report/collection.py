@@ -193,6 +193,23 @@ def strength_scope(value):
 
 def reconcile_strengths(preferred, reconciled, aliases):
     """Opt-in, field-only bridge for independently verified split projections."""
+    # Explicit, validated current null withdrawals are field-local. They must
+    # survive duplicate selection even without the optional split-field opt-in.
+    withdrawn = {
+        field
+        for field, field_scope in preferred.get("_strength_field_scopes", {}).items()
+        if any(
+            platform_id(row) == platform_id(preferred)
+            and instrument_scope(row) == instrument_scope(preferred)
+            and row.get("lookup") is None
+            and strength_scope(row.get("_strength_withdrawals", {}).get(field))
+            == strength_scope(field_scope)
+            for row in aliases
+        )
+    }
+    if withdrawn:
+        preferred = {**preferred, **{field: None for field in withdrawn}}
+        reconciled = {**reconciled, **{field: None for field in withdrawn}}
     scope = strength_scope(preferred.get("strength_scope"))
     identifier = platform_id(preferred)
     identity_scope = instrument_scope(preferred)
@@ -314,7 +331,7 @@ def evidence_for(evidence, path):
     return value if isinstance(value, dict) else {}
 
 
-def field_evidence_matches(asset, field, proof, target):
+def field_evidence_matches(asset, field, proof, target, states=("verified",)):
     identifier = asset.get("instrument_id")
     known_id = (type(identifier) is int and identifier >= 0) or (
         isinstance(identifier, str) and bool(identifier.strip())
@@ -326,7 +343,7 @@ def field_evidence_matches(asset, field, proof, target):
             isinstance(asset.get(key), str) and asset[key].strip()
             for key in ("market", "instrument_type")
         )
-        and proof.get("state") == "verified"
+        and proof.get("state") in states
         and valid_date(proof.get("data_date")) == target
         and proof.get("value") == asset.get(field)
         and proof.get("identity") == identifier
@@ -378,6 +395,9 @@ def dated_projection(report):
             )
             for section in ("direct", "searchable", "related"):
                 for ai, asset in enumerate(group.get(section, [])):
+                    # These annotations are derived anew from this report's proofs.
+                    asset.pop("_strength_field_scopes", None)
+                    asset.pop("_strength_withdrawals", None)
                     actual = valid_date(asset.get("data_date"))
                     market = asset.get("market")
                     target = valid_date(targets.get(market))
@@ -395,7 +415,10 @@ def dated_projection(report):
                         )
                     except ValueError:
                         target = None
+                    card_current = bool(actual and target and actual == target)
                     asset["_date_note"] = "行情日期 " + (actual or "待核")
+                    if evidence_bearing and not card_current:
+                        asset["reason"] = "行情日期不适用或待核，不作当期比较。"
                     if not evidence_bearing and (
                         (asset.get("data_date") is not None and not actual)
                         or (actual and target and actual > target)
@@ -431,7 +454,33 @@ def dated_projection(report):
                             if field_day and target and field_day < target:
                                 field_dates.append("历史数据")
                             field_dates.append(label + "日期 " + (field_day or "待核"))
-                        if not field_proof_matches(asset, field, proof, target):
+                        current_strength_scope = (
+                            field in ("strength", "local_strength")
+                            and card_current
+                            and field_evidence_matches(
+                                asset,
+                                field,
+                                proof,
+                                target,
+                                states=("verified", "withdrawn"),
+                            )
+                        )
+                        if evidence_bearing and current_strength_scope:
+                            asset.setdefault("_strength_field_scopes", {})[field] = {
+                                "data_date": proof["data_date"],
+                                "version": proof["version"],
+                            }
+                            if (
+                                proof["state"] == "withdrawn"
+                                and asset.get(field) is None
+                            ):
+                                asset.setdefault("_strength_withdrawals", {})[field] = {
+                                    "data_date": proof["data_date"],
+                                    "version": proof["version"],
+                                }
+                        if (
+                            evidence_bearing and not card_current
+                        ) or not field_proof_matches(asset, field, proof, target):
                             supplied = field in asset or bool(proof)
                             missing_strength = (
                                 field in ("strength", "local_strength")
@@ -439,7 +488,11 @@ def dated_projection(report):
                                 and (
                                     not proof
                                     or field_evidence_matches(
-                                        asset, field, proof, target
+                                        asset,
+                                        field,
+                                        proof,
+                                        target,
+                                        states=("verified", "withdrawn"),
                                     )
                                 )
                             )
@@ -451,7 +504,11 @@ def dated_projection(report):
                                 # Filter each source before identity dedup/ranking.
                                 # Explicit invalid input remains a withdrawal; mere
                                 # omission can still use a verified split-field donor.
-                                if supplied or field == "signal_events":
+                                if (
+                                    supplied
+                                    or field == "signal_events"
+                                    or not card_current
+                                ):
                                     asset[field] = (
                                         [] if field == "signal_events" else None
                                     )
