@@ -10,6 +10,8 @@ from html import escape
 from pathlib import Path
 from string import Template
 
+from collection import assess, dated_projection
+
 TEMPLATE_PATH = Path(__file__).resolve().parent / "assets/report.html"
 FRAGMENT = re.compile(r'\n  <template id="([a-z_]+)">\n(.*?)\n  </template>', re.DOTALL)
 DATE_FORMAT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
@@ -189,6 +191,7 @@ def render_card(pattern, asset):
         markers='<p class="reader-markers">' + " · ".join(markers) + "</p>"
         if markers
         else "",
+        date_note=display_text(asset.get("_date_note"), "行情日期待核"),
         code=display_text(asset["code"]),
         name=display_text(asset["name"]),
         trend=trend,
@@ -446,6 +449,7 @@ def render_direction(fragments, groups, note, direction):
         direct, searchable, related = instrument_sections(group, direction)
         rows.append(
             fragments["class_row"].substitute(
+                date_note=display_text(group.get("_date_note"), "大类数据日期待核"),
                 open_attr=" open" if index == 0 else "",
                 name=display_text(group["name"]),
                 ticker=fragments["ticker"].substitute(code=display_text(code))
@@ -494,6 +498,9 @@ def report_date(value):
 
 
 def render(report, template):
+    assessment = assess(report)
+    report, pending = dated_projection(report)
+    pending = list(dict.fromkeys(assessment["pending"] + pending))
     day = report_date(report["date"])
     board_day = report.get("board_date")
     if board_day:
@@ -505,6 +512,16 @@ def render(report, template):
 
     fragments = {name: Template(markup) for name, markup in FRAGMENT.findall(template)}
     return Template(FRAGMENT.sub("", template)).substitute(
+        collection_status="数据已完备" if assessment["complete"] else "数据收集中",
+        collection_details=display_text(
+            "核实时间：" + assessment["verified_at"]
+            if assessment["complete"] else "；".join(pending)
+        ),
+        next_check=display_text(
+            "已停止（数据已完备）" if assessment["complete"]
+            else report.get("collection", {}).get("next_check"),
+            "待核（普通读取不启动轮询）",
+        ),
         date=day.isoformat(),
         year=day.year,
         month=day.month,

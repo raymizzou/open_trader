@@ -14,10 +14,12 @@ The caller owns calendar decisions and all other opening conditions.
   file in the existing `trend_v3` iCloud folder. Link to that file in the
   delivering session. Use that link as the sole delivery, even for a
   single-item correction.
-- Make one scheduled pass per Taipei calendar day at 08:30, or once when
-  started late. Perform the authorized retrieval and instrument checks for
-  that pass, then write the report from available evidence. Never check
-  report-wide data completeness or poll for more data before delivery.
+- Deliver the first report at Taipei 08:30 from available evidence, including
+  missing data. Scheduled sessions then use the pinned skill collection.py
+  control state to check once per elapsed hourly slot until all frozen target
+  evidence is verified and the final HTML is published and read back. Never
+  delay the initial report, replay missed slots, or poll from normal read/offline
+  entry points. Show per-item actual dates and collection status in the header.
 - Use the selected revision's [V1 report renderer](.agents/skills/trend-v3-daily-report/render_report.py)
   for scheduled, manual, offline, and revision work. The dated masthead links
   to the short, long, live, simulation, and Kelly sections in that order.
