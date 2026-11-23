@@ -4,6 +4,21 @@
 
 # Changelog
 
+## 2026-11-23 — Trend V3 card freshness display (#507)
+
+- Apply the approved whole-card green/yellow reader layout. Green requires a
+  matching quote day and verified applicable market-calendar target; other dates
+  remain yellow. Card color does not establish signals or watch eligibility.
+- Show one report date in the heading, one quote date per card, and a target only
+  for stale quotes. Keep pending information with its class/card and keep raw
+  collection diagnostics private. Distinguish unverified signals from confirmed
+  absence while preserving date masking, ranking, identity and no-replay rules.
+- Use the same renderer for initial, revised, manual and offline reports. No
+  collection schedule, vendor, account or deployment behavior changes.
+- Keep signal evidence mismatches and missing input fields pending after masking.
+  Compare coverage against the current members, group date and applicable target;
+  retain custom coverage notes alongside a single local pending hint.
+
 ## 2026-11-23 — Trend V3 dual instrument strengths (#526)
 
 - Select global and same-asset-category strength for every exactly matched

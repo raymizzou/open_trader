@@ -298,30 +298,45 @@
         white-space: nowrap;
       }
     }
-    /* asset-card-preview */
-    li.asset.reader-card { display: block; padding: 15px 0 16px; min-width: 0; }
-    li.asset.reader-card .reader-name { display: block; margin: 0; color: var(--ink); font-size: 19px; line-height: 1.45; font-weight: 650; overflow-wrap: anywhere; }
-    li.asset.reader-card .reader-name > span { font-weight: 450; }
-    li.asset.reader-card .reader-metrics { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; margin: 10px 0 0; }
-    li.asset.reader-card .reader-metrics dt { margin: 0 0 1px; font-size: 13px; color: var(--muted); }
-    li.asset.reader-card .reader-metrics dd { margin: 0; font-size: 19px; font-weight: 650; line-height: 1.45; overflow-wrap: anywhere; }
-    li.asset.reader-card .reader-event { color: var(--accent); }
-    li.asset.reader-card .reader-reason { margin: 11px 0 0; font-size: 16px; line-height: 1.55; color: var(--ink); overflow-wrap: anywhere; }
-    li.asset.reader-card .reader-metric-note { margin: 3px 0 0; font-size: 13px; line-height: 1.45; color: var(--muted); overflow-wrap: anywhere; }
-    /* /asset-card-preview */
+    /* Approved reader cards: color conveys applicable quote day only. */
+    .masthead h1 time { display:block; font:550 15px/1.5 system-ui,sans-serif; letter-spacing:0; color:#45574d; margin-top:5px; }
+    .collection-status { display:flex; gap:12px; flex-wrap:wrap; align-items:baseline; font-size:13px; color:#526057; margin-bottom:12px; }
+    .collection-status p { margin:0; font-size:13px; }
+    .sheet { max-inline-size:70rem; }
+    li.asset.reader-card { display:block; padding:10px 0 0; min-width:0; }
+    .reader-surface { padding:15px 17px 12px; border:1px solid; border-radius:11px; color:#192e2a; }
+    .reader-surface.fresh { background:#e6f4e8; border-color:#adcab4; }
+    .reader-surface.waiting { background:#fff1c5; border-color:#d5b45e; }
+    .fresh .freshness { color:#21603d; }
+    .waiting .freshness { color:#79520c; }
+    .freshness { font-weight:680; margin-inline-start:8px; }
+    .reader-name { margin:0; font-size:24px; line-height:1.3; font-weight:700; overflow-wrap:anywhere; }
+    .reader-name > span { display:block; font-size:14px; font-weight:550; color:#3e5148; }
+    .data-date { margin:7px 0 11px; font-size:12px; color:#536259; overflow-wrap:anywhere; }
+    .reader-markers { font-size:12px; color:#47584c; overflow-wrap:anywhere; }
+    .reader-metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; margin:10px 0 0; }
+    .reader-metrics dt { font-size:12px; color:#536259; }
+    .reader-metrics dd { margin:1px 0 0; font-size:22px; font-weight:630; line-height:1.42; overflow-wrap:anywhere; }
+    .reader-metrics > div:has(.reader-event) { grid-column:1 / -1; grid-row:2; display:flex; align-items:baseline; flex-wrap:wrap; gap:7px; border-top:1px solid rgba(60,71,49,.19); margin-top:4px; padding-top:8px; }
+    .reader-metrics .reader-event { font-size:14px; font-weight:550; color:#47584c; }
+    .reader-reason { margin:8px 0 0; font-size:13px; color:#47584c; overflow-wrap:anywhere; }
+    .reader-metric-note { margin:3px 0 0; font-size:12px; color:#536259; overflow-wrap:anywhere; }
+    @media(max-width:460px) {
+      .sheet { inline-size:calc(100% - 28px); }
+      .reader-surface { padding:13px 13px 10px; }
+      .ledger { padding-inline:8px; }
+      .reader-metrics dd { font-size:20px; }
+    }
+
   </style>
 </head>
 <body>
   <a class="skip-link" href="#report">跳到报告正文</a>
   <div class="sheet">
     <header class="masthead">
-      <div class="edition">
-        <span>趋势日报</span>
-        <time datetime="${date}"><span class="number">${year}</span> 年 <span class="number">${month}</span> 月 <span class="number">${day}</span> 日</time>
-      </div>
-      <h1>趋势动物观察报告</h1>
-      <p>${board_note}</p>
-      <div class="collection-status" role="status"><strong>${collection_status}</strong><p>${collection_details}</p><p>下次核实：${next_check}</p></div>
+      <div class="edition"><span>Trend V3 · 趋势日报</span></div>
+      <h1>趋势动物观察报告<time datetime="${date}">${year} 年 ${month} 月 ${day} 日</time></h1>
+      <div class="collection-status" role="status"><strong>${collection_status}</strong><p>${collection_time}</p></div>
       <nav class="contents" aria-label="报告目录">
         <a href="#short">做空</a>
         <a href="#long">做多</a>
@@ -403,8 +418,9 @@ ${cards}
   </template>
   <template id="asset_card">
                     <li class="asset reader-card">
+                      <article class="reader-surface ${freshness}">
                       <h4 class="reader-name">${code} <span>· ${name}</span></h4>
-                      <p class="data-date">${date_note}</p>
+                      <p class="data-date">${date_note} <span class="freshness">${freshness_label}</span></p>
                       ${markers}
                       <dl class="reader-metrics">
                         <div><dt>当前趋势</dt><dd>${trend}</dd></div>
@@ -413,6 +429,7 @@ ${cards}
                         <div><dt>同品种强度</dt><dd>${local_strength}</dd>${local_strength_reason}</div>
                       </dl>
                       <p class="reader-reason">${reason}</p>
+                      </article>
                     </li>
   </template>
   <template id="empty_note">

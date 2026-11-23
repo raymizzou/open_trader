@@ -15,8 +15,8 @@ TEMPLATE = SKILL / "assets/report.html"
 RENDERER = SKILL / "render_report.py"
 
 # Capture the approved reference independently of the shipping template.
-APPROVED_CSS = "bca3cfea0b8b67e5633eb92ebfe06d1b25f6dc6ea770ec1c100c276cf40060d4"
-APPROVED_SHELL = "fbb6a4fc76798eb6776683617fcc062f389ccfa7aec171c9885144ce42bbe957"
+APPROVED_CSS = "fbeb823b2adba84a553833218129e5725935a2d91de6c62f291735d4da211f2f"
+APPROVED_SHELL = "6387569e7dff66bef16ce2aed1b459e9f0433a59c0b87c4a3dd3d2bab87081ab"
 APPROVED_CLASS_ROW = "b215fe8afb44d74c144d7d11fc04a4993b04567c786a98ed622d724ffa4af523"
 FORMAL_RECORDS = {
     "live": (
@@ -71,6 +71,7 @@ def shell_digest(html):
     # keep their order, semantic elements, and attributes.
     html = re.sub(r"<(style|template|details)\b.*?</\1>", "", html, flags=re.S)
     html = html.replace("｜界面样稿", "")
+    html = re.sub(r'<time\b.*?</time>', '', html, flags=re.S)
     html = re.sub(r'(<strong>).*?(</strong>)', r"\1\2", html, flags=re.S)
     html = re.sub(r'(<div class="collection-status"[^>]*>)(.*?)(</div>)',
                   lambda m: (m[1]
@@ -174,10 +175,7 @@ def test_renders_approved_shell_across_dates(tmp_path):
     # no executable renderer in that revision.
     template = TEMPLATE.read_text(encoding="utf-8")
     assert digest(stylesheet(template)) == APPROVED_CSS
-    unchanged_css = re.sub(
-        r"/\* asset-card-preview \*/.*?/\* /asset-card-preview \*/", "",
-        stylesheet(template), flags=re.S,
-    )
+    unchanged_css = stylesheet(template).split("/* Approved reader cards:")[0] + "\n  "
     assert digest(unchanged_css) == (
         "ed5b22e5391d937e99574300ff08c2c939f04489540cb2cda1956419add69d52"
     )
@@ -264,14 +262,14 @@ def test_renders_approved_shell_across_dates(tmp_path):
         assert not re.search(r"<template\b|\$\{[a-z_]+}", rendered)
 
     assert '<time datetime="2040-02-29">' in full
-    assert '<span class="number">29</span> 日' in full
-    assert "2040-02-28" in full
+    assert '2040 年 2 月 29 日' in full
+    assert "行情截至 待核" in full
     assert '<time datetime="2041-05-03">' in partial
     assert (
-        '<span class="number">5</span> 月 <span class="number">3</span> 日' in partial
+        '2041 年 5 月 3 日' in partial
     )
     assert "2040-02-29" not in partial
-    assert "官方榜图日期待核" in partial
+    assert "大类数据日期 待核" in partial
     assert "本方向榜图席位待核。" in partial
     assert "第一席待核。" in partial
     assert "直属成分证据待核。" in partial
@@ -539,14 +537,14 @@ def test_excludes_example_and_private_data(tmp_path):
         "private",
     )
     assert not re.search(
-        r"<script\b|<img\b|<article\b|position-head\"|<template\b", result
+        r"<script\b|<img\b|position-head\"|<template\b", result
     )
     assert private not in result
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in result
     assert "甲 &amp; 乙" in result
     assert "&lt;&quot;group&quot;&gt;" in result
     assert "保留 &quot;理由&quot; &amp; 文本。" in result
-    assert "&lt;img src=&quot;https://example.invalid/&quot;&gt;" in result
+    assert "https://example.invalid/" not in result
     assert_formal_records(result)
     cards = re.findall(r'<li class="asset reader-card">.*?</li>', result, re.S)
     assert len(cards) == 5
@@ -777,7 +775,9 @@ def test_direct_partial_coverage_with_verified_cards(tmp_path):
         )
         assert "LEGACY-" not in unchanged
         row = re.search(r"<details\b.*?</details>", unchanged, re.S)[0]
-        assert row.count('class="empty-direct"') == 1  # empty platform block
+        # Empty platform block plus local coverage.
+        assert row.count('class="empty-direct"') == 2
+        assert "成员范围待查。" in row
         assert "PRIVATE-COVERAGE-DETAILS" not in unchanged
         assert unchanged.count('<li class="asset reader-card">') == 2
 
@@ -863,7 +863,8 @@ def test_three_instrument_sections(tmp_path):
     assert re.findall(r"<h3>(.*?)</h3>", empty) == [
         "大类直属", "趋势动物里面能够查到", "相关的标的"]
     empty_row = re.search(r"<details\b.*?</details>", empty, re.S)[0]
-    assert empty_row.count('class="empty-direct"') == 3
+    assert empty_row.count('class="empty-direct"') == 4
+    assert "成员范围待查。" in empty_row
 
     legacy = render_verified_watch(tmp_path, {"date": "2041-01-02", "long": [{
         "seat": 1, "name": "旧输入", "direct": [
@@ -1066,7 +1067,7 @@ def test_negative_lookup_with_changed_scope_is_pending(tmp_path):
         assert f'<dt>当前趋势</dt><dd>{expected}</dd>' in first
         assert f'<dt>全局强度</dt><dd>{expected}</dd>' in first
         assert f'<dt>同品种强度</dt><dd>{expected}</dd>' in first
-        assert '<dd class="reader-event">无</dd>' in first
+        assert '<dd class="reader-event">待查</dd>' in first
         assert '直属</span>' in first and '趋势动物可查</span>' not in row
         assert '应建观察仓' not in row and 'MASKED-QUOTE' not in row
         assert '88 / 100' not in row and 'lookup_scope' not in html
@@ -1398,15 +1399,17 @@ def mixed_report():
 def test_monday_mixed_data_dates_pending(tmp_path):
     html = render(tmp_path, mixed_report(), "monday")
     assert "数据收集中" in html and "数据已完备" not in html
-    assert "目标 2026-11-22" in html and "实际 2026-11-21" in html
+    from test_hourly_collection import control
+    _, pending = control().dated_projection(mixed_report())
+    assert "BTC：目标 2026-11-22，实际 2026-11-21" in pending
     assert "2026-11-23T10:30:00+08:00" in html
     cards = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
     btc = next(c for c in cards if 'reader-name">BTC ' in c)
     etf = next(c for c in cards if 'reader-name">ETF ' in c)
-    assert "行情日期 2026-11-21" in btc and "历史数据" in btc
-    assert "行情日期 2026-11-20" in etf
+    assert "行情截至 2026-11-21" in btc and "历史数据" in btc
+    assert "行情截至 2026-11-20" in etf
     assert "应建观察仓" not in btc
-    assert "版次 2026-11-23/v1" in html
+    assert "2026-11-23/v1" not in html
 
 
 def test_release_without_matching_instrument_stays_pending(tmp_path):
@@ -1426,8 +1429,12 @@ def test_release_without_matching_instrument_stays_pending(tmp_path):
     }
     html = render(tmp_path, report, "release-only")
     assert "数据收集中" in html and "数据已完备" not in html
-    assert "全局强度日期 2026-11-21" in html
-    assert "BTC strength：目标 2026-11-22，实际 2026-11-21" in html
+    from test_hourly_collection import control
+    assert (
+        "BTC strength：目标 2026-11-22，实际 2026-11-21"
+        in control().assess(report)["pending"]
+    )
+    assert "全局强度日期" not in html
     assert "应建观察仓" not in html
 
 
@@ -1516,7 +1523,7 @@ def test_complete_report_shows_confirmation_time(tmp_path):
     html = render(tmp_path, report, "complete")
     assert "数据已完备" in html and "数据收集中" not in html
     assert "2026-11-23T10:12:00+08:00" in html
-    assert "行情日期 2026-11-20" in html and "行情日期 2026-11-22" in html
+    assert "行情截至 2026-11-20" in html and "行情截至 2026-11-22" in html
     assert "应建观察仓" in html
     # A proof is bound to the field, identity, date and source, independently.
     path = "/long/0/searchable/0/strength"
@@ -1631,13 +1638,18 @@ def test_stale_cited_board_cannot_complete(tmp_path, cited_day):
     report["collection"]["evidence"]["/board_date"]["value"] = cited_day
     html = render(tmp_path, report, "cited-board")
     assert "数据收集中" in html and "数据已完备" not in html
-    assert f"榜图：目标 2026-11-22，实际 {cited_day or '待核'}" in html
+    assert (
+        f"榜图：目标 2026-11-22，实际 {cited_day or '待核'}"
+        in api.assess(report)["pending"]
+    )
     assert "大类数据日期 2026-11-22" in html
-    assert "版次 2026-11-23/v1" in html
+    assert "2026-11-23/v1" not in html
     if cited_day:
-        assert f"大类强度取自 {cited_day} 官方榜图。" in html
+        assert report["board_date"] == cited_day
+        assert "官方榜图。" not in html
     else:
-        assert "官方榜图日期待核。" in html
+        assert "board_date" not in report
+        assert "榜图：目标 2026-11-22，实际 待核" in api.assess(report)["pending"]
 
     round_ = api.claim_round(state, report, "2026-11-23T10:30:00+08:00")
     assert round_["markets"] == ["BOARD"]
@@ -1759,7 +1771,12 @@ def test_wrong_field_date_cannot_rank_or_publish_current_value(tmp_path):
         assert "99 / 100" not in a and "100 / 100" not in a
         assert "应建观察仓" not in a
         if case == "old":
-            assert "历史数据" in a and "全局强度日期 2026-11-19" in a
+            from test_hourly_collection import control
+            assert (
+                "A strength：目标 2026-11-20，实际 2026-11-19"
+                in control().assess(report)["pending"]
+            )
+            assert "全局强度日期" not in a
     for field, hidden in (("trend", "热"), ("signal_events", "开香槟")):
         report = deepcopy(source)
         report["collection"]["evidence"]["/long/0/direct/0/" + field]["identity"] = (
@@ -2267,14 +2284,14 @@ def test_invalid_card_date_cannot_rank_current_fields(tmp_path, card_day):
         assert "<dt>全局强度</dt><dd>待核</dd>" in btc
         assert "<dt>同品种强度</dt><dd>待核</dd>" in btc
         assert "<dt>当前趋势</dt><dd>待核</dd>" in btc
-        assert '<dd class="reader-event">无</dd>' in btc
+        assert '<dd class="reader-event">待查</dd>' in btc
         assert all(
             value not in btc
             for value in ("80 / 100", "90 / 100", "开香槟", "应建观察仓")
         )
         assert re.findall(r'<h4 class="reader-name">(\S+)', row) == ["CMP", "BTC"]
         assert (
-            "行情日期 " + (card_day if card_day and card_day != "bad-date" else "待核")
+            "行情截至 " + (card_day if card_day and card_day != "bad-date" else "待核")
             in btc
         )
         if card_day == "2026-11-21":
@@ -2571,3 +2588,184 @@ def test_three_source_withdrawal_cannot_revive_omitted_strength(tmp_path, field)
             else ["BTC", "CMP"]
         )
         assert "数据收集中" in html
+
+
+def freshness_report():
+    """Hypothetical Monday: authenticated fixture facts, never a live report."""
+    report = complete_report()
+    report['collection']['target_evidence'] = {
+        'CRYPTO': dict(state='verified', report_date='2026-11-23',
+                       basis_date='2026-11-22', source='offline-calendar',
+                       kind='continuous'),
+        'US': dict(state='verified', report_date='2026-11-23',
+                   basis_date='2026-11-22', source='offline-calendar', kind='equity',
+                   sessions=['2026-11-20'], covered_through='2026-11-22'),
+    }
+    # The quote is current; the signal has not been checked.
+    del report['collection']['evidence']['/long/0/searchable/0/signal_events']
+    return report
+
+
+def reader_cards(html):
+    return {re.search(r'reader-name">(\S+)', card)[1]: card
+            for card in re.findall(
+                r'<li class="asset reader-card">.*?</li>', html, re.S)}
+
+
+def test_card_freshness_before_and_after_crypto_release(tmp_path):
+    for phase, day, css, label in (
+        ('before', '2026-11-21', 'waiting', '待更新 · 等 2026-11-22'),
+        ('after', '2026-11-22', 'fresh', '本期最新'),
+    ):
+        report = freshness_report()
+        btc = report['long'][0]['searchable'][0]
+        btc['data_date'] = day
+        html = render(tmp_path, report, phase)
+        cards = reader_cards(html)
+        assert f'class="reader-surface {css}"' in cards['BTC']
+        assert label in cards['BTC']
+        assert f'行情截至 {day}' in cards['BTC']
+        assert 'class="reader-surface fresh"' in cards['ETF']
+        assert '行情截至 2026-11-20' in cards['ETF']
+        assert '特殊信号' in cards['BTC'] and '待查' in cards['BTC']
+        assert '数据收集中' in html and '数据已完备' not in html
+        if phase == 'before':
+            assert '80 / 100' not in cards['BTC']
+            assert '应建观察仓' not in cards['BTC']
+
+
+def test_card_with_unknown_or_future_date_is_yellow(tmp_path):
+    for case, day in [('unknown', None), ('invalid', 'bad-date'),
+                      ('future', '2026-11-24'), ('contradictory', '2026-11-22'),
+                      ('no-calendar', '2026-11-22')]:
+        report = freshness_report()
+        asset = report['long'][0]['searchable'][0]
+        asset['data_date'] = day
+        if case == 'contradictory':
+            report['collection']['target_evidence']['CRYPTO']['kind'] = 'equity'
+        if case == 'no-calendar':
+            del report['collection']['target_evidence']['CRYPTO']
+        html = render(tmp_path, report, case)
+        card = reader_cards(html)['BTC']
+        assert 'class="reader-surface waiting"' in card
+        assert '日期待核' in card and '本期最新' not in card
+        assert '待更新 · 等' not in card  # targets appear only for known stale dates
+        if case in ('unknown', 'invalid', 'future', 'contradictory'):
+            assert all(v not in card for v in ('80 / 100', '90 / 100', '应建观察仓'))
+
+
+def test_report_lists_pending_only_on_affected_cards(tmp_path):
+    report = freshness_report()
+    report['long'][0]['coverage_note'] = '成员范围待查'
+    html = render(tmp_path, report, 'local-pending')
+    header = html.split('<main')[0]
+    assert '<h1>趋势动物观察报告<time' in html
+    assert html.count('2026 年 11 月 23 日') == 1
+    assert '下次核实：2026-11-23T10:30:00+08:00' in header
+    assert all(word not in header for word in (
+        'signal_events', '/long/', '缺少', '目标', '榜图日期'))
+    assert '成员范围待查' in html
+    cards = reader_cards(html)
+    assert '<dd class="reader-event">待查</dd>' in cards['BTC']
+    assert '<dd class="reader-event">无</dd>' in cards['ETF']
+    assert cards['BTC'].count('行情截至') == 1
+    assert '全局强度日期' not in html and '特殊信号日期' not in html
+    complete = render(tmp_path, complete_report(), 'local-complete')
+    assert '核实时间：2026-11-23T10:12:00+08:00' in complete
+    assert '下次核实' not in complete
+
+
+def test_conflicting_or_absent_signal_stays_pending(tmp_path):
+    from copy import deepcopy
+
+    cases = ('mismatch', 'missing', 'empty', 'identity', 'invalid-date',
+             'future-date', 'lookup-conflict', 'duplicate')
+    for case in cases:
+        report = complete_report()
+        asset = report['long'][0]['searchable'][0]
+        proof = report['collection']['evidence'][
+            '/long/0/searchable/0/signal_events']
+        if case in ('mismatch', 'duplicate'):
+            asset['signal_events'] = ['开香槟']
+        elif case == 'missing':
+            del asset['signal_events']
+        elif case == 'identity':
+            proof['identity'] = 'other'
+        elif case in ('invalid-date', 'future-date'):
+            asset['data_date'] = ('bad-date' if case == 'invalid-date'
+                                  else '2026-11-24')
+        elif case == 'lookup-conflict':
+            asset['lookup'] = 'miss'
+        if case == 'duplicate':
+            donor = deepcopy(asset)
+            donor['signal_events'] = []
+            report['long'][0]['related'] = [donor]
+            report['collection']['evidence'][
+                '/long/0/related/0/signal_events'] = deepcopy(proof)
+        original = deepcopy(report)
+        html = render(tmp_path, report, 'signal-' + case)
+        card = reader_cards(html)['BTC']
+        expected = '无' if case == 'empty' else '待查'
+        assert f'<dd class="reader-event">{expected}</dd>' in card, case
+        assert '开香槟' not in card
+        if case != 'empty':
+            assert '应建观察仓' not in card
+            assert '数据收集中' in html and '数据已完备' not in html
+        if case in ('invalid-date', 'future-date'):
+            assert '80 / 100' not in card and '90 / 100' not in card
+        elif case in ('mismatch', 'missing', 'identity', 'duplicate'):
+            assert '80 / 100' in card and '90 / 100' in card
+        assert report == original
+
+
+def test_stale_membership_evidence_shows_group_pending(tmp_path):
+    from copy import deepcopy
+
+    from test_hourly_collection import control
+
+    for case in ('added', 'removed', 'missing-id', 'stale-group', 'unknown-target',
+                 'future-target', 'calendar-conflict', 'matching', 'existing-hint'):
+        report = complete_report()
+        group = report['long'][0]
+        note = ('成员范围待查。' if case == 'existing-hint'
+                else '已核实部分成员，仍保留本类关联说明。')
+        group['coverage_note'] = note
+        if case in ('added', 'existing-hint'):
+            member = deepcopy(group['searchable'][0])
+            member.update(code='NEW', instrument_id='new-member')
+            group['searchable'].append(member)
+        elif case == 'removed':
+            group['searchable'] = []
+        elif case == 'missing-id':
+            group['searchable'][0].pop('instrument_id')
+        elif case == 'stale-group':
+            group['data_date'] = '2026-11-21'
+        elif case == 'unknown-target':
+            report['collection']['targets']['BOARD'] = None
+        elif case == 'future-target':
+            report['collection']['targets']['BOARD'] = '2026-11-24'
+            group['data_date'] = '2026-11-24'
+            report['collection']['evidence']['/long/0/coverage'][
+                'data_date'] = '2026-11-24'
+        elif case == 'calendar-conflict':
+            report['collection']['target_evidence'] = {
+                'BOARD': dict(state='verified', report_date='2026-11-23',
+                              basis_date='2026-11-22', kind='equity',
+                              sessions=['2026-11-20'],
+                              covered_through='2026-11-22', source='fixture-calendar')}
+        original = deepcopy(report)
+        html = render(tmp_path, report, 'members-' + case)
+        row = next(row for row in re.findall(r'<details\b.*?</details>', html, re.S)
+                   if '合成加密' in row)
+        assert note in row
+        if case == 'matching':
+            assert '成员范围待查' not in row
+            assert control().assess(report)['complete']
+        else:
+            assert row.count('成员范围待查') == 1, case
+            assert not control().assess(report)['complete']
+            assert '数据收集中' in html
+        header = html.split('<main')[0]
+        assert all(raw not in header for raw in (
+            '/long/', 'coverage', '成分及查询覆盖', '目标', '实际'))
+        assert report == original

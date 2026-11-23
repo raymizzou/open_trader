@@ -98,6 +98,8 @@ def reconcile_lookup(preferred, aliases):
     reconciled = dict(preferred)
     reconciled["platform_match_verified"] = has_match and not conflict
     if conflict:
+        if "_signal_pending" in reconciled:
+            reconciled["_signal_pending"] = True
         reconciled["lookup"] = "pending"
         reconciled["reason"] = "平台匹配证据冲突或适用范围待核。"
     elif preferred.get("lookup") == "pending":
@@ -114,6 +116,8 @@ def reconcile_lookup(preferred, aliases):
         ):
             reconciled.pop(field, None)
         reconciled["signal_events"] = []
+        if "_signal_pending" in reconciled:
+            reconciled["_signal_pending"] = True
         reconciled["watch_eligible"] = False
         reconciled["reason"] = "平台身份已核实，行情字段待核。"
     return reconciled
@@ -388,16 +392,72 @@ def field_proof_matches(asset, field, proof, target):
     return valid_value and field_evidence_matches(asset, field, proof, target)
 
 
+def fact_evidence_matches(value, proof, target, identity, item, market, actual):
+    """Match one frozen obligation to its original value and source evidence."""
+    return bool(
+        target
+        and identity
+        and value is not None
+        and item.get("target_date") == target
+        and item.get("market") == market
+        and proof.get("state") == "verified"
+        and valid_date(proof.get("data_date")) == target
+        and actual == target
+        and proof.get("identity") == identity
+        and proof.get("value") == value
+        and proof.get("source")
+        and proof.get("version")
+    )
+
+
+def coverage_members_match(group):
+    """Coverage describes the exact current list, including every identity."""
+    members = [
+        asset.get("instrument_id")
+        for section in ("direct", "searchable", "related")
+        for asset in group.get(section, [])
+    ]
+    coverage = group.get("coverage") or {}
+    return (
+        coverage.get("state") == "complete"
+        and coverage.get("instrument_ids") == members
+        and all(members)
+    )
+
+
 def dated_projection(report):
     result = deepcopy(report)
     collection = report.get("collection") or {}
     evidence_bearing = "collection" in report
     targets = collection.get("targets", {})
+    obligations = {
+        item.get("path"): item for item in collection.get("worklist", [])
+        if isinstance(item, dict)
+    }
+    board_target = valid_date(targets.get("BOARD"))
+    try:
+        validate_targets(report["date"], {
+            "targets": {"BOARD": board_target},
+            "target_evidence": collection.get("target_evidence", {}),
+        })
+    except ValueError:
+        board_target = None
     pending = []
     for direction in ("short", "long"):
         for gi, group in enumerate(result.get(direction, [])):
             group["_date_note"] = "大类数据日期 " + (
                 valid_date(group.get("data_date")) or "待核"
+            )
+            coverage_path = f"/{direction}/{gi}/coverage"
+            coverage_proof = evidence_for(collection.get("evidence", {}), coverage_path)
+            group["_coverage_pending"] = evidence_bearing and not (
+                coverage_members_match(group)
+                and valid_date(group.get("data_date")) == board_target
+                and fact_evidence_matches(
+                    group.get("coverage"), coverage_proof, board_target,
+                    group.get("name"), obligations.get(coverage_path, {}),
+                    "BOARD", valid_date(coverage_proof.get("data_date")),
+                )
             )
             for section in ("direct", "searchable", "related"):
                 for ai, asset in enumerate(group.get(section, [])):
@@ -422,7 +482,25 @@ def dated_projection(report):
                     except ValueError:
                         target = None
                     card_current = bool(actual and target and actual == target)
-                    asset["_date_note"] = "行情日期 " + (actual or "待核")
+                    # Display freshness is separate from publication/watch eligibility.
+                    display_target = target
+                    try:
+                        validate_targets(report["date"], {
+                            "targets": {market: target},
+                            "target_evidence": collection.get("target_evidence", {}),
+                        }, require_proof=(market,))
+                    except ValueError:
+                        display_target = None
+                    asset["_freshness"] = (
+                        "fresh" if actual and display_target == actual else "waiting"
+                    )
+                    asset["_freshness_label"] = (
+                        "本期最新" if asset["_freshness"] == "fresh"
+                        else f"待更新 · 等 {display_target}"
+                        if actual and display_target and actual < display_target
+                        else "日期待核"
+                    )
+                    asset["_date_note"] = "行情截至 " + (actual or "待核")
                     if evidence_bearing and not card_current:
                         asset["reason"] = "行情日期不适用或待核，不作当期比较。"
                     if not evidence_bearing and (
@@ -446,7 +524,6 @@ def dated_projection(report):
                         ):
                             asset["lookup"] = "pending"
                             asset["reason"] = "完整查询证据或适用范围待核。"
-                    field_dates = []
                     fields_current = True
                     for field, label in (
                         ("trend", "趋势"),
@@ -456,10 +533,15 @@ def dated_projection(report):
                     ):
                         proof = evidence_for(proofs, prefix + "/" + field)
                         field_day = valid_date(proof.get("data_date"))
-                        if proof:
-                            if field_day and target and field_day < target:
-                                field_dates.append("历史数据")
-                            field_dates.append(label + "日期 " + (field_day or "待核"))
+                        field_verified = field in asset and field_proof_matches(
+                            asset, field, proof, target
+                        )
+                        if evidence_bearing and field == "signal_events":
+                            # Retain the original verdict before masking to [].
+                            # A missing/mismatched signal is not verified absence.
+                            asset["_signal_pending"] = not (
+                                card_current and field_verified
+                            )
                         current_strength_scope = (
                             field in ("strength", "local_strength")
                             and card_current
@@ -486,7 +568,7 @@ def dated_projection(report):
                                 }
                         if (
                             evidence_bearing and not card_current
-                        ) or not field_proof_matches(asset, field, proof, target):
+                        ) or not field_verified:
                             supplied = field in asset or bool(proof)
                             missing_strength = (
                                 field in ("strength", "local_strength")
@@ -526,17 +608,14 @@ def dated_projection(report):
                                 f"{asset['code']} {field}：目标 {target or '待核'}，"
                                 f"实际 {field_day or actual or '待核'}"
                             )
-                    if field_dates:
-                        asset["_date_note"] += "；" + "；".join(field_dates)
+                    if not evidence_bearing:
+                        asset.pop("_signal_pending", None)
                     if not fields_current:
                         asset["watch_eligible"] = False
                     if not actual or not target or actual != target:
                         asset["watch_eligible"] = False
-                        asset["_date_note"] += (
-                            "（历史数据）"
-                            if actual and target and actual < target
-                            else "（日期待核）"
-                        )
+                        if actual and target and actual < target:
+                            asset["_date_note"] += "（历史数据）"
                         pending.append(
                             f"{asset['code']}：目标 {target or '待核'}，"
                             f"实际 {actual or '待核'}"
@@ -669,19 +748,8 @@ def assess(report):
         # A proof's metadata cannot replace the actual date cited in the report.
         # Board edition remains independent of the board's data day.
         actual = valid_date(value) if path == "/board_date" else evidence_day
-        if (
-            not target
-            or not identity
-            or value is None
-            or item.get("target_date") != target
-            or item.get("market") != market
-            or proof.get("state") != "verified"
-            or evidence_day != target
-            or actual != target
-            or proof.get("identity") != identity
-            or proof.get("value") != value
-            or not proof.get("source")
-            or not proof.get("version")
+        if not fact_evidence_matches(
+            value, proof, target, identity, item, market, actual
         ):
             pending.append(f"{label}：目标 {target or '待核'}，实际 {actual or '待核'}")
         if len(parts) == 5:
@@ -717,17 +785,7 @@ def assess(report):
         if {g.get("seat") for g in groups} != {1, 2}:
             pending.append(direction + "：榜图席位待核")
         for group in groups:
-            members = [
-                a.get("instrument_id")
-                for section in ("direct", "searchable", "related")
-                for a in group.get(section, [])
-            ]
-            coverage = group.get("coverage") or {}
-            if (
-                coverage.get("state") != "complete"
-                or coverage.get("instrument_ids") != members
-                or any(not member for member in members)
-            ):
+            if not coverage_members_match(group):
                 pending.append(group["name"] + "：成分及查询覆盖待核")
     final_pending = pending_final_fields(report)
     lookup_pending = [item for item in final_pending if item["field"] == "lookup"]
