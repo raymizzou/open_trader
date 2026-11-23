@@ -250,7 +250,8 @@ def global_strength(asset):
 
 def reconcile_lookup(preferred, aliases):
     # Winner selection uses the original rows. Only the exact-identity match
-    # fact can aggregate; losing quotes and eligibility never transfer.
+    # fact can aggregate here; quotes require the separate strength-only opt-in.
+    # Events and eligibility never transfer.
     evidence = [row for row in aliases
                 if row.get("platform_match_verified") is True
                 or row.get("lookup") in LOOKUP_LABELS]
@@ -285,6 +286,74 @@ def reconcile_lookup(preferred, aliases):
     return reconciled
 
 
+def strength_scope(value):
+    if not isinstance(value, dict):
+        return None
+    version = value.get("version")
+    if not isinstance(version, str) or not version.strip():
+        return None
+    try:
+        day = report_date(value.get("data_date"))
+    except (TypeError, ValueError):
+        return None
+    return day, version
+
+
+def reconcile_strengths(preferred, reconciled, aliases):
+    """Opt-in, field-only bridge for independently verified split projections."""
+    scope = strength_scope(preferred.get("strength_scope"))
+    identifier = platform_id(preferred)
+    identity_scope = instrument_scope(preferred)
+    # Identity resolution alone must never revive pending/hidden market data.
+    if (scope is None or identifier is None or identity_scope is None
+            or preferred.get("lookup") is not None
+            or reconciled.get("lookup") is not None):
+        return reconciled
+    result = dict(reconciled)
+    own_evidence = preferred.get("strength_evidence", {})
+    if not isinstance(own_evidence, dict):
+        own_evidence = {}
+    for field, current in zip(
+        ("strength", "local_strength"), strength_fields(preferred), strict=True
+    ):
+        values = [current] if current is not None else []
+        # Omission can be supplemented. An explicit null/invalid value cannot.
+        invalidated = field in preferred and current is None
+        if field in own_evidence:
+            proof = own_evidence[field]
+            invalidated |= (strength_scope(proof) != scope
+                            or proof.get("state") != "verified")
+        for row in aliases:
+            if (row is preferred or row.get("lookup") is not None
+                    or row.get("platform_match_verified") is not True
+                    or platform_id(row) != identifier
+                    or instrument_scope(row) != identity_scope):
+                continue
+            evidence = row.get("strength_evidence", {})
+            proof = evidence.get(field) if isinstance(evidence, dict) else None
+            if strength_scope(proof) != scope:
+                continue
+            if proof.get("state") == "withdrawn":
+                invalidated = True
+            elif proof.get("state") == "verified" and field in row:
+                value = strength_value(row[field])
+                if value is None:
+                    invalidated = True
+                else:
+                    values.append(value)
+        if invalidated or len({Decimal(value) for value in values}) > 1:
+            result[field] = None
+            result[field + "_reason"] = "该强度证据已失效或存在冲突，待核。"
+        elif values:
+            # Equal values are compatible; preserve preferred precision, otherwise
+            # choose the longest source representation independently of row order.
+            result[field] = current or max(
+                values, key=lambda value: (len(value), value)
+            )
+            result.pop(field + "_reason", None)
+    return result
+
+
 def instrument_sections(group, direction):
     candidates = []
     for field in ("direct", "searchable", "related"):
@@ -307,8 +376,8 @@ def instrument_sections(group, direction):
     sections = [[], [], []]
     seen = set()
     # Resolve strongest verified classification before removing duplicates.
-    # Keep the selected row's own facts and eligibility; do not copy flags from
-    # lower-priority aliases or infer membership from list position.
+    # Keep selected-row facts and eligibility. Only explicitly verified strength
+    # fields may cross rows below; never infer membership from list position.
     for priority in range(3):
         for asset in candidates:
             category = (0 if asset.get("direct_verified") is True else
@@ -320,9 +389,9 @@ def instrument_sections(group, direction):
                 if identity in seen:
                     continue
                 seen.add(identity)
-            reconciled = reconcile_lookup(
-                asset, aliases_by_identity.get(identity, [asset])
-            )
+            aliases = aliases_by_identity.get(identity, [asset])
+            reconciled = reconcile_lookup(asset, aliases)
+            reconciled = reconcile_strengths(asset, reconciled, aliases)
             final_category = (
                 0 if reconciled.get("direct_verified") is True else
                 1 if reconciled.get("platform_match_verified") is True else 2

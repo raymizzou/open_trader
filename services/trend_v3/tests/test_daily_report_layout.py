@@ -1133,3 +1133,83 @@ def test_lookup_cannot_expose_dual_strength(tmp_path):
             assert hidden not in row
         assert "直属" in row
         assert ("趋势动物可查" in row) == (case == "resolved-identity")
+
+
+def test_verified_dual_strength_survives_dedup(tmp_path):
+    # Split facts enter the real CLI, not a manually consolidated test card.
+    scope = {"data_date": "2040-01-01", "version": "v1"}
+    proof = {**scope, "state": "verified"}
+    base = {"code": "A", "name": "合成直属", "market": "US",
+            "instrument_type": "ETF", "instrument_id": "id-A"}
+    cases = [
+        ("split", {}, {}, "80 / 100", "20 / 100"),
+        ("no-opt-in", {"strength_scope": None}, {}, "待核", "待核"),
+        ("unverified", {}, {"strength_evidence": {}}, "待核", "待核"),
+        ("no-match-proof", {}, {"platform_match_verified": False}, "待核", "待核"),
+        ("idless-alias", {}, {"instrument_id": None}, "待核", "待核"),
+        ("unresolved-field", {}, {"strength_evidence": {
+            "strength": {**proof, "state": "pending"},
+            "local_strength": proof}}, "待核", "20 / 100"),
+        ("alias-disagreement", {}, {}, "待核", "20 / 100"),
+        ("foreign-market", {}, {"market": "HK"}, "待核", "待核"),
+        ("foreign-id", {}, {"instrument_id": "id-B"}, "待核", "待核"),
+        ("foreign-type", {}, {"instrument_type": "stock"}, "待核", "待核"),
+        ("foreign-date", {}, {"strength_evidence": {
+            "strength": {**proof, "data_date": "2039-12-31"},
+            "local_strength": proof}}, "待核", "20 / 100"),
+        ("foreign-version", {}, {"strength_evidence": {
+            "strength": {**proof, "version": "v2"},
+            "local_strength": proof}}, "待核", "20 / 100"),
+        ("withdrawn", {"strength": None}, {}, "待核", "20 / 100"),
+        ("pending-preferred", {"lookup": "pending"}, {}, "待核", "待核"),
+        ("pending-alias", {}, {"lookup": "pending"}, "待核", "待核"),
+        ("miss", {"lookup": "miss"}, {}, "待核", "待核"),
+        ("conflict", {"strength": "70 / 100"}, {}, "待核", "20 / 100"),
+        ("preferred-kept", {"strength": "70 / 100"},
+         {"strength": None, "strength_evidence": {"local_strength": proof}},
+         "70 / 100", "20 / 100"),
+        ("withdrawal-proof", {"strength": "80 / 100"},
+         {"strength_evidence": {"strength": {**proof, "state": "withdrawn"},
+                                "local_strength": proof}}, "待核", "20 / 100"),
+        ("stale-preferred", {"strength": "80 / 100", "strength_evidence": {
+            "strength": {**proof, "data_date": "2039-12-31"}}},
+         {}, "待核", "20 / 100"),
+    ]
+    for case, preferred_fields, alias_fields, global_value, local_value in cases:
+        direct = {**base, "direct_verified": True, "strength_scope": scope,
+                  **preferred_fields}
+        quote = {**base, "platform_match_verified": True, "strength": "80 / 100",
+                 "local_strength": "20", "strength_evidence": {
+                     "strength": proof, "local_strength": proof},
+                 "trend": "ALIEN-TREND", "signal_events": ["开香槟"],
+                 "watch_eligible": True, "reason": "ALIEN-REASON", **alias_fields}
+        # Reversing duplicate sources must not choose an arbitrary value.
+        aliases = [quote]
+        if case == "split":
+            quote = {**quote, "strength_evidence": {"strength": proof}}
+            aliases = [quote, {**quote, "strength_evidence": {
+                "local_strength": proof}}]
+        if case == "alias-disagreement":
+            aliases = [quote, {**quote, "strength": "81 / 100"}]
+        for reverse in (False, True):
+            html = render(tmp_path, {"date": "2040-01-02", "long": [{
+                "seat": 1, "name": "合成验证组", "direct": [direct, {
+                    "code": "B", "name": "固定对照", "direct_verified": True,
+                    "strength": "60 / 100"}],
+                "searchable": list(reversed(aliases)) if reverse else aliases,
+            }]}, f"dedup-{case}-{reverse}")
+            first = re.split(r"<h3>大类直属</h3>", html)[1].split(
+                "<h3>趋势动物里面能够查到</h3>")[0]
+            cards = re.findall(r'<li class="asset reader-card">.*?</li>', first, re.S)
+            by_code = {re.search(r'<h4 class="reader-name">(\S+)', c)[1]: c
+                       for c in cards}
+            assert len(cards) == 2
+            a = by_code["A"]
+            assert f'<dt>全局强度</dt><dd>{global_value}</dd>' in a, case
+            assert f'<dt>同品种强度</dt><dd>{local_value}</dd>' in a, case
+            assert '<dt>当前趋势</dt><dd>待核</dd>' in a
+            assert '<dd class="reader-event">无</dd>' in a
+            assert all(text not in a for text in (
+                "ALIEN", "开香槟", "应建观察仓", "data_date", "strength_evidence"))
+            assert re.findall(r'<h4 class="reader-name">(\S+)', first) == (
+                ["B", "A"] if global_value == "待核" else ["A", "B"])

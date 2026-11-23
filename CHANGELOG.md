@@ -4,8 +4,10 @@
 
 - Select global and same-asset-category strength for every exactly matched
   instrument, independently of temperature, opening signals, comparison groups
-  or BTC identity. Reuse each applicable cache field separately and merge only
-  authorized missing fields into planned requests; retain fee and no-replay rules.
+  or BTC identity. Reuse each applicable cache field separately, prioritize
+  merging authorized missing fields into planned requests, and retain existing
+  authorized ETF retrieval, fee and no-replay rules. The BTC-specific
+  standalone restriction does not apply to all ETFs.
 - Show both strengths side by side, retaining zero and source precision, with
   separate reasons for missing fields. Accept older projections without moving
   peer strength into the global column. Sort all three blocks only by global
@@ -13,6 +15,11 @@
 - Apply the same rules to scheduled, manual and offline reports. Keep uncertain
   and conflicting lookup cards masked, and clear stale missing-field reasons
   when an identity match is resolved. Offline validation adds no vendor calls.
+- Preserve separately verified strength facts when deduplicating a direct member
+  and quote rows, using an optional per-field identity/date/version contract.
+  Never inherit trend, events or watch eligibility. Keep each metric uncertain
+  on conflicting, withdrawn or invalidated evidence; preserve the other metric
+  and uncontested preferred facts. Legacy inputs remain compatible.
 
 ## 2026-11-23 — Trend V3 three instrument sections (#512)
 

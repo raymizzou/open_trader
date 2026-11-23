@@ -36,7 +36,15 @@ The caller owns calendar decisions and all other opening conditions.
   instrument card, preserving source precision and zero. Select both fields for
   every exact platform match, independently of opening signals or comparison
   groups. Reuse each verified applicable-version cache field separately and merge
-  missing fields only into authorized requests under the shared ledger rules.
+  missing fields into authorized requests under the shared ledger rules. A
+  settled temperature-only ETF response does not cover missing strengths;
+  separately confirmed existing authority may permit their retrieval after
+  ledger checks. Keep the BTC-specific standalone-request restriction scoped.
+  Consolidate independently verified split strength facts before projection, or
+  use the optional per-field evidence contract in the daily report skill. Only
+  matching explicit identities, applicable dates and versions may bridge rows;
+  conflicts and withdrawals mask that metric independently. Never inherit
+  trend, events or eligibility from duplicate quote rows.
   Use only global strength for direction sorting; give each missing field its
   own public reason. Apply this to scheduled, manual and offline entry points.
   Lookup-only cards mask both strengths; invalid dates or identity resolution
