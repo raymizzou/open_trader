@@ -302,11 +302,12 @@
     li.asset.reader-card { display: block; padding: 15px 0 16px; min-width: 0; }
     li.asset.reader-card .reader-name { display: block; margin: 0; color: var(--ink); font-size: 19px; line-height: 1.45; font-weight: 650; overflow-wrap: anywhere; }
     li.asset.reader-card .reader-name > span { font-weight: 450; }
-    li.asset.reader-card .reader-metrics { display: grid; grid-template-columns: minmax(0,.8fr) minmax(0,1.65fr) minmax(0,1fr); gap: 10px; margin: 10px 0 0; }
+    li.asset.reader-card .reader-metrics { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; margin: 10px 0 0; }
     li.asset.reader-card .reader-metrics dt { margin: 0 0 1px; font-size: 13px; color: var(--muted); }
     li.asset.reader-card .reader-metrics dd { margin: 0; font-size: 19px; font-weight: 650; line-height: 1.45; overflow-wrap: anywhere; }
     li.asset.reader-card .reader-event { color: var(--accent); }
     li.asset.reader-card .reader-reason { margin: 11px 0 0; font-size: 16px; line-height: 1.55; color: var(--ink); overflow-wrap: anywhere; }
+    li.asset.reader-card .reader-metric-note { margin: 3px 0 0; font-size: 13px; line-height: 1.45; color: var(--muted); overflow-wrap: anywhere; }
     /* /asset-card-preview */
   </style>
 </head>
@@ -405,7 +406,8 @@ ${cards}
                       <dl class="reader-metrics">
                         <div><dt>当前趋势</dt><dd>${trend}</dd></div>
                         <div><dt>特殊信号</dt><dd class="reader-event">${signal}</dd></div>
-                        <div><dt>强度</dt><dd>${strength}</dd></div>
+                        <div><dt>全局强度</dt><dd>${strength}</dd>${strength_reason}</div>
+                        <div><dt>同品种强度</dt><dd>${local_strength}</dd>${local_strength_reason}</div>
                       </dl>
                       <p class="reader-reason">${reason}</p>
                     </li>

@@ -116,16 +116,43 @@ def special_signal(asset):
     return display_text("，".join(dict.fromkeys(names)), "无")
 
 
-def card_strength(asset):
-    if "local_strength" not in asset:
-        return asset_metric(asset.get("strength"))
-    raw = str(asset["local_strength"])
+def strength_value(value):
+    """Keep source precision while validating the 0–100 comparison scale."""
+    raw = str(value)
+    if raw.endswith(" / 100"):
+        raw = raw[:-6]
     try:
         if STRENGTH_NUMBER.fullmatch(raw) and Decimal(raw) <= 100:
-            return f"同品种 {raw} / 100"
+            return raw
     except InvalidOperation:
         pass
-    return "待核"
+    return None
+
+
+def strength_inputs(asset):
+    """Normalize field provenance before deciding presence or invalidation."""
+    fields = {key: asset[key] for key in ("strength", "local_strength")
+              if key in asset}
+    legacy = fields.get("strength")
+    if isinstance(legacy, str) and legacy.startswith("同品种 "):
+        # Peer-only text supplies no global claim, including no withdrawal.
+        # Explicit local null still wins over the legacy local value.
+        fields.pop("strength")
+        fields.setdefault("local_strength", legacy.removeprefix("同品种 "))
+    return fields
+
+
+def strength_fields(asset):
+    fields = strength_inputs(asset)
+    return (strength_value(fields.get("strength")),
+            strength_value(fields.get("local_strength")))
+
+
+def strength_note(asset, field, value, label):
+    if value is not None:
+        return ""
+    reason = display_text(asset.get(field + "_reason"), label + "字段缺失或无效。")
+    return f'<p class="reader-metric-note">{reason}</p>'
 
 
 def render_card(pattern, asset):
@@ -133,13 +160,20 @@ def render_card(pattern, asset):
     if lookup is None:
         trend = asset_metric(asset.get("trend"))
         signal = special_signal(asset)
-        strength = card_strength(asset)
+        global_value, local_value = strength_fields(asset)
+        strength = f"{global_value} / 100" if global_value is not None else "待核"
+        local_strength = f"{local_value} / 100" if local_value is not None else "待核"
+        strength_reason = strength_note(asset, "strength", global_value, "全局强度")
+        local_strength_reason = strength_note(
+            asset, "local_strength", local_value, "同品种强度"
+        )
         reason = display_text(asset.get("reason"), "品种证据待核。")
     else:
         if not isinstance(lookup, str) or lookup not in LOOKUP_LABELS:
             raise ValueError("Lookup status must be miss or pending")
         status = LOOKUP_LABELS[lookup]
-        trend = strength = status
+        trend = strength = local_strength = status
+        strength_reason = local_strength_reason = ""
         signal = "无"
         reason = display_text(asset.get("reason"), status)
     # These flags are supplied only after evidence selection. Neither list
@@ -160,6 +194,9 @@ def render_card(pattern, asset):
         trend=trend,
         signal=signal,
         strength=strength,
+        local_strength=local_strength,
+        strength_reason=strength_reason,
+        local_strength_reason=local_strength_reason,
         reason=reason,
     )
 
@@ -211,19 +248,17 @@ def instrument_identity(asset, ids_by_code):
 
 
 def global_strength(asset):
-    # BTC peer strength is deliberately excluded from global ordering.
+    # Local strength never participates in direction ordering.
     if asset.get("lookup") is not None:
         return None
-    raw = asset.get("strength")
-    if not isinstance(raw, str):
-        return None
-    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?) / 100", raw)
-    return Decimal(match[1]) if match and Decimal(match[1]) <= 100 else None
+    value, _ = strength_fields(asset)
+    return Decimal(value) if value is not None else None
 
 
 def reconcile_lookup(preferred, aliases):
     # Winner selection uses the original rows. Only the exact-identity match
-    # fact can aggregate; losing quotes and eligibility never transfer.
+    # fact can aggregate here; quotes require the separate strength-only opt-in.
+    # Events and eligibility never transfer.
     evidence = [row for row in aliases
                 if row.get("platform_match_verified") is True
                 or row.get("lookup") in LOOKUP_LABELS]
@@ -249,12 +284,83 @@ def reconcile_lookup(preferred, aliases):
     elif preferred.get("lookup") == "pending":
         # Removing a pending lookup must not unmask its old quote/event payload
         # or activate an old watch flag. Identity success proves no market data.
-        for field in ("lookup", "trend", "strength", "local_strength", "signal"):
+        for field in ("lookup", "trend", "strength", "local_strength", "signal",
+                      "strength_reason", "local_strength_reason"):
             reconciled.pop(field, None)
         reconciled["signal_events"] = []
         reconciled["watch_eligible"] = False
         reconciled["reason"] = "平台身份已核实，行情字段待核。"
     return reconciled
+
+
+def strength_scope(value):
+    if not isinstance(value, dict):
+        return None
+    version = value.get("version")
+    if not isinstance(version, str) or not version.strip():
+        return None
+    try:
+        day = report_date(value.get("data_date"))
+    except (TypeError, ValueError):
+        return None
+    return day, version
+
+
+def reconcile_strengths(preferred, reconciled, aliases):
+    """Opt-in, field-only bridge for independently verified split projections."""
+    scope = strength_scope(preferred.get("strength_scope"))
+    identifier = platform_id(preferred)
+    identity_scope = instrument_scope(preferred)
+    # Identity resolution alone must never revive pending/hidden market data.
+    if (scope is None or identifier is None or identity_scope is None
+            or preferred.get("lookup") is not None
+            or reconciled.get("lookup") is not None):
+        return reconciled
+    result = dict(reconciled)
+    preferred_inputs = strength_inputs(preferred)
+    own_evidence = preferred.get("strength_evidence", {})
+    if not isinstance(own_evidence, dict):
+        own_evidence = {}
+    for field, current in zip(
+        ("strength", "local_strength"), strength_fields(preferred), strict=True
+    ):
+        values = [current] if current is not None else []
+        # Omission can be supplemented. An explicit null/invalid value cannot.
+        invalidated = field in preferred_inputs and current is None
+        if field in own_evidence:
+            proof = own_evidence[field]
+            invalidated |= (strength_scope(proof) != scope
+                            or proof.get("state") != "verified")
+        for row in aliases:
+            if (row is preferred or row.get("lookup") is not None
+                    or row.get("platform_match_verified") is not True
+                    or platform_id(row) != identifier
+                    or instrument_scope(row) != identity_scope):
+                continue
+            evidence = row.get("strength_evidence", {})
+            proof = evidence.get(field) if isinstance(evidence, dict) else None
+            if strength_scope(proof) != scope:
+                continue
+            row_inputs = strength_inputs(row)
+            if proof.get("state") == "withdrawn":
+                invalidated = True
+            elif proof.get("state") == "verified" and field in row_inputs:
+                value = strength_value(row_inputs[field])
+                if value is None:
+                    invalidated = True
+                else:
+                    values.append(value)
+        if invalidated or len({Decimal(value) for value in values}) > 1:
+            result[field] = None
+            result[field + "_reason"] = "该强度证据已失效或存在冲突，待核。"
+        elif values:
+            # Equal values are compatible; preserve preferred precision, otherwise
+            # choose the longest source representation independently of row order.
+            result[field] = current or max(
+                values, key=lambda value: (len(value), value)
+            )
+            result.pop(field + "_reason", None)
+    return result
 
 
 def instrument_sections(group, direction):
@@ -279,8 +385,8 @@ def instrument_sections(group, direction):
     sections = [[], [], []]
     seen = set()
     # Resolve strongest verified classification before removing duplicates.
-    # Keep the selected row's own facts and eligibility; do not copy flags from
-    # lower-priority aliases or infer membership from list position.
+    # Keep selected-row facts and eligibility. Only explicitly verified strength
+    # fields may cross rows below; never infer membership from list position.
     for priority in range(3):
         for asset in candidates:
             category = (0 if asset.get("direct_verified") is True else
@@ -292,9 +398,9 @@ def instrument_sections(group, direction):
                 if identity in seen:
                     continue
                 seen.add(identity)
-            reconciled = reconcile_lookup(
-                asset, aliases_by_identity.get(identity, [asset])
-            )
+            aliases = aliases_by_identity.get(identity, [asset])
+            reconciled = reconcile_lookup(asset, aliases)
+            reconciled = reconcile_strengths(asset, reconciled, aliases)
             final_category = (
                 0 if reconciled.get("direct_verified") is True else
                 1 if reconciled.get("platform_match_verified") is True else 2

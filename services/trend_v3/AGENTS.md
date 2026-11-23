@@ -31,9 +31,25 @@ The caller owns calendar decisions and all other opening conditions.
   all three blocks even when no direct cards are known; retain the older
   direct-only partial note for compatible inputs. Never infer membership or an exact match from legacy
   list placement, class identity, or a missing strength/date.
-  Show the verified direction seat and board strength with the class. Show
-  instrument strength with its card. For BTC spot observation, use the verified
-  same-asset-category strength for the applicable provider data date. Keep both
+  Show the verified direction seat and board strength with the class. Show both
+  global and same-asset-category strengths side by side on every
+  instrument card, preserving source precision and zero. Select both fields for
+  every exact platform match, independently of opening signals or comparison
+  groups. Reuse each verified applicable-version cache field separately and merge
+  missing fields into authorized requests under the shared ledger rules. A
+  settled temperature-only ETF response does not cover missing strengths;
+  separately confirmed existing authority may permit their retrieval after
+  ledger checks. Keep the BTC-specific standalone-request restriction scoped.
+  Consolidate independently verified split strength facts before projection, or
+  use the optional per-field evidence contract in the daily report skill. Only
+  matching explicit identities, applicable dates and versions may bridge rows;
+  conflicts and withdrawals mask that metric independently. Never inherit
+  trend, events or eligibility from duplicate quote rows.
+  Use only global strength for direction sorting; give each missing field its
+  own public reason. Apply this to scheduled, manual and offline entry points.
+  Lookup-only cards mask both strengths; invalid dates or identity resolution
+  must never restore stale quotes, strengths, events or watch eligibility. Keep
+  both
   direction panels when evidence is missing. The live reserved block and the
   simulation section each show a
   `positions-note` paragraph with `未接入`. The two Kelly values each show

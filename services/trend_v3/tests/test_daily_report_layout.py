@@ -15,7 +15,7 @@ TEMPLATE = SKILL / "assets/report.html"
 RENDERER = SKILL / "render_report.py"
 
 # Capture the approved reference independently of the shipping template.
-APPROVED_CSS = "a81b6168b5ec0ca83b50fa74337cbccdff1d9b3343f961b5ccf41de8c30a9695"
+APPROVED_CSS = "bca3cfea0b8b67e5633eb92ebfe06d1b25f6dc6ea770ec1c100c276cf40060d4"
 APPROVED_SHELL = "6c198190abeee41c63c316cc2b2e69146beadb6411f65df09ba5e119d0184b20"
 APPROVED_CLASS_ROW = "05e08cb66aa0c237fd18f6caa6fc9806b6d832b3f79f5af3664b30a7472be413"
 FORMAL_RECORDS = {
@@ -119,6 +119,13 @@ def test_renders_approved_shell_across_dates(tmp_path):
     # no executable renderer in that revision.
     template = TEMPLATE.read_text(encoding="utf-8")
     assert digest(stylesheet(template)) == APPROVED_CSS
+    unchanged_css = re.sub(
+        r"/\* asset-card-preview \*/.*?/\* /asset-card-preview \*/", "",
+        stylesheet(template), flags=re.S,
+    )
+    assert digest(unchanged_css) == (
+        "ed5b22e5391d937e99574300ff08c2c939f04489540cb2cda1956419add69d52"
+    )
     assert shell_digest(template) == APPROVED_SHELL
 
     direct = {
@@ -226,10 +233,11 @@ def test_renders_approved_shell_across_dates(tmp_path):
     assert full.count('<li class="asset reader-card">') == 4
     assert partial.count('<li class="asset reader-card">') == 1
     assert (
-        re.findall(r"<dt>(.*?)</dt>", rows[0]) == ["当前趋势", "特殊信号", "强度"] * 2
+        re.findall(r"<dt>(.*?)</dt>", rows[0])
+        == ["当前趋势", "特殊信号", "全局强度", "同品种强度"] * 2
     )
-    assert re.search(r"<dt>强度</dt><dd>12 / 100</dd>", rows[0])
-    assert re.search(r"<dt>强度</dt><dd>同品种 43 / 100</dd>", rows[0])
+    assert re.search(r"<dt>全局强度</dt><dd>12 / 100</dd>", rows[0])
+    assert re.search(r"<dt>同品种强度</dt><dd>43 / 100</dd>", rows[0])
     assert re.findall(r'<dd class="reader-event">(.*?)</dd>', rows[0]) == [
         "凉转寒",
         "开香槟",
@@ -373,9 +381,9 @@ def test_special_signal_display(tmp_path, fields, expected):
 @pytest.mark.parametrize(
     ("local_strength", "expected"),
     [
-        pytest.param(0, "同品种 0 / 100", id="zero"),
-        pytest.param(6.25, "同品种 6.25 / 100", id="number"),
-        pytest.param("6.250", "同品种 6.250 / 100", id="source-precision"),
+        pytest.param(0, "0 / 100", id="zero"),
+        pytest.param(6.25, "6.25 / 100", id="number"),
+        pytest.param("6.250", "6.250 / 100", id="source-precision"),
         pytest.param(None, "待核", id="missing"),
     ],
 )
@@ -406,8 +414,8 @@ def test_btc_observation_strength(tmp_path, local_strength, expected):
     )
     assert '<span class="number">02</span>' in html
     assert '<span class="number">93</span>' in html
-    assert re.findall(r"<dt>强度</dt><dd>(.*?)</dd>", html) == [expected]
-    assert "87 / 100" not in html
+    assert re.findall(r"<dt>同品种强度</dt><dd>(.*?)</dd>", html) == [expected]
+    assert re.findall(r"<dt>全局强度</dt><dd>(.*?)</dd>", html) == ["87 / 100"]
 
 
 def test_excludes_example_and_private_data(tmp_path):
@@ -488,7 +496,7 @@ def test_excludes_example_and_private_data(tmp_path):
     cards = re.findall(r'<li class="asset reader-card">.*?</li>', result, re.S)
     assert len(cards) == 5
     metric_values = r"<dd(?: class=\"reader-event\")?>(.*?)</dd>"
-    assert re.findall(metric_values, cards[0]) == ["热", "无", "待核"]
+    assert re.findall(metric_values, cards[0]) == ["热", "无", "待核", "待核"]
     lookups = [
         ("查不到", "已核对合成查询 &amp; 全部结果，无精确匹配。"),
         ("待核", "只收到合成查询第一页，后续页为 &quot;&lt;待核&gt;&quot;。"),
@@ -496,7 +504,7 @@ def test_excludes_example_and_private_data(tmp_path):
         ("待核", "待核"),
     ]
     for card, (status, reason) in zip(cards[1:], lookups, strict=True):
-        assert re.findall(metric_values, card) == [status, "无", status]
+        assert re.findall(metric_values, card) == [status, "无", status, status]
         assert f'<p class="reader-reason">{reason}</p>' in card
         assert "不适用" not in card
     assert all("查不到" not in card for card in (cards[2], cards[4]))
@@ -642,7 +650,7 @@ def test_direct_watch_markers_require_evidence(tmp_path):
     assert 'reader-marker' not in cards_by_code["X"]
     assert '<span class="reader-marker">直属</span>' in cards_by_code["F"]
     assert '<span class="reader-marker">应建观察仓</span>' in cards_by_code["F"]
-    assert '<dt>强度</dt><dd>待核</dd>' in cards_by_code["F"]
+    assert '<dt>全局强度</dt><dd>待核</dd>' in cards_by_code["F"]
     assert '<dt>当前趋势</dt><dd>查不到</dd>' in cards_by_code["MISS"]
     assert '<dt>当前趋势</dt><dd>待核</dd>' in cards_by_code["PENDING"]
 
@@ -944,7 +952,8 @@ def test_direct_card_preserves_verified_lookup_fact(tmp_path, case):
     assert '77 / 100' not in first
     assert '<dd class="reader-event">无</dd>' in first
     assert '<dt>当前趋势</dt><dd>待核</dd>' in first
-    assert '<dt>强度</dt><dd>待核</dd>' in first
+    assert '<dt>全局强度</dt><dd>待核</dd>' in first
+    assert '<dt>同品种强度</dt><dd>待核</dd>' in first
     assert 'OLD-PENDING-LOOKUP' not in first
     assert '查不到' not in first  # conflict is uncertain; positive is known found
     assert 'lookup_scope' not in html and '2040-01-01/v1' not in html
@@ -968,7 +977,8 @@ def test_non_direct_lookup_conflict_stays_related(tmp_path):
     assert 'class="asset reader-card"' not in first + second
     assert 'class="asset reader-card"' in third
     assert '<dt>当前趋势</dt><dd>待核</dd>' in third
-    assert '<dt>强度</dt><dd>待核</dd>' in third
+    assert '<dt>全局强度</dt><dd>待核</dd>' in third
+    assert '<dt>同品种强度</dt><dd>待核</dd>' in third
     assert '<dd class="reader-event">无</dd>' in third
     assert '趋势动物可查</span>' not in row and '应建观察仓' not in row
     assert '直属</span>' not in row and 'MASKED-QUOTE' not in row
@@ -999,7 +1009,8 @@ def test_negative_lookup_with_changed_scope_is_pending(tmp_path):
         assert 'class="asset reader-card"' in first
         assert 'class="asset reader-card"' not in second + third
         assert f'<dt>当前趋势</dt><dd>{expected}</dd>' in first
-        assert f'<dt>强度</dt><dd>{expected}</dd>' in first
+        assert f'<dt>全局强度</dt><dd>{expected}</dd>' in first
+        assert f'<dt>同品种强度</dt><dd>{expected}</dd>' in first
         assert '<dd class="reader-event">无</dd>' in first
         assert '直属</span>' in first and '趋势动物可查</span>' not in row
         assert '应建观察仓' not in row and 'MASKED-QUOTE' not in row
@@ -1022,6 +1033,245 @@ def test_negative_lookup_with_changed_scope_is_pending(tmp_path):
                          "lookup_scope": "2040-01-01/v1"}]}]}, label)
         assert html.count('class="asset reader-card"') == 1
         assert '<dt>当前趋势</dt><dd>热</dd>' in html
-        assert '<dt>强度</dt><dd>65 / 100</dd>' in html
+        assert '<dt>全局强度</dt><dd>65 / 100</dd>' in html
         assert '<dd class="reader-event">温转热</dd>' in html
         assert '应建观察仓</span>' in html and '趋势动物可查</span>' in html
+
+
+def test_dual_strength_values(tmp_path):
+    # Literal source values intentionally differ; a peer value cannot fill G.
+    cases = [
+        ({"strength": "20.500 / 100", "local_strength": "90.250"},
+         "20.500 / 100", "90.250 / 100", []),
+        ({"strength": 0, "local_strength": 0}, "0 / 100", "0 / 100", []),
+        ({"strength": "同品种 43.00 / 100"}, "待核", "43.00 / 100",
+         ["全局强度字段缺失或无效。"]),
+        ({"strength": "80 / 100", "local_strength": None,
+          "local_strength_reason": "同品种字段本版未提供。"},
+         "80 / 100", "待核", ["同品种字段本版未提供。"]),
+        ({"local_strength": "10.0", "strength_reason": "全局字段尚未获准补取。"},
+         "待核", "10.0 / 100", ["全局字段尚未获准补取。"]),
+        ({}, "待核", "待核",
+         ["全局强度字段缺失或无效。", "同品种强度字段缺失或无效。"]),
+        ({"strength": "25 / 100"}, "25 / 100", "待核",
+         ["同品种强度字段缺失或无效。"]),
+    ]
+    for index, (fields, global_value, local_value, reasons) in enumerate(cases):
+        html = render(tmp_path, {"date": "2040-01-01", "long": [{
+            "seat": 1, "name": "固定合成类", "searchable": [{
+                "code": "FIXTURE", "name": "固定合成标的",
+                "platform_match_verified": True, **fields,
+            }],
+        }]}, f"dual-values-{index}")
+        assert re.findall(r"<dt>全局强度</dt><dd>(.*?)</dd>", html) == [global_value]
+        assert re.findall(r"<dt>同品种强度</dt><dd>(.*?)</dd>", html) == [local_value]
+        for reason in reasons:
+            assert reason in html
+        assert "同品种 43.00" not in html
+
+
+def test_dual_strength_order(tmp_path):
+    # Hand-worked G order: 0 < 20 = 20 < 80; missing follows every number.
+    for direction, expected in (
+        ("long", ["B", "A", "D", "Z", "C"]),
+        ("short", ["Z", "A", "D", "B", "C"]),
+    ):
+        for swapped in (False, True):
+            groups = []
+            assets = []
+            for section, flags in (
+                ("DIRECT", {"direct_verified": True}),
+                ("MATCH", {"platform_match_verified": True}),
+                ("RELATED", {}),
+            ):
+                for code, g, local in (
+                    ("A", 20, 90), ("B", 80, 10), ("C", None, 100),
+                    ("D", 20, 5), ("Z", 0, 99),
+                ):
+                    assets.append({"code": f"{section}-{code}", "name": "合成",
+                                   "strength": g,
+                                   "local_strength": 100-local if swapped else local,
+                                   **flags})
+            groups.append({"seat": 1, "name": "合成排序类", "related": assets})
+            html = render(tmp_path, {"date": "2040-01-01", direction: groups},
+                          f"order-{direction}-{swapped}")
+            assert re.findall(r'<h4 class="reader-name">(\S+)', html) == [
+                f"{section}-{code}" for section in ("DIRECT", "MATCH", "RELATED")
+                for code in expected
+            ]
+
+
+def test_lookup_cannot_expose_dual_strength(tmp_path):
+    base = {"code": "FIXTURE", "name": "合成身份", "instrument_id": "id-1",
+            "market": "US", "instrument_type": "ETF"}
+    stale = {"trend": "STALE-TREND", "strength": "88.123 / 100",
+             "local_strength": "77.456", "signal_events": ["开香槟"],
+             "watch_eligible": True, "strength_reason": "STALE-G-REASON",
+             "local_strength_reason": "STALE-L-REASON"}
+    for case in ("miss", "pending", "conflict", "version", "resolved-identity"):
+        direct = {**base, **stale, "direct_verified": True,
+                  "lookup": "pending" if case == "resolved-identity" else "miss",
+                  "lookup_scope": "2040-01-01/v1"}
+        aliases = []
+        if case == "pending":
+            direct["lookup"] = "pending"
+        if case in ("conflict", "version", "resolved-identity"):
+            aliases = [{**base, **stale, "platform_match_verified": True,
+                        "lookup_scope": "2040-01-01/v2" if case == "version"
+                        else "2040-01-01/v1"}]
+        html = render(tmp_path, {"date": "2040-01-01", "long": [{
+            "seat": 1, "name": "合成类", "direct": [direct], "searchable": aliases,
+        }]}, f"masked-{case}")
+        cards = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+        assert len(cards) == 1
+        row = cards[0]
+        status = "查不到" if case == "miss" else "待核"
+        assert f"<dt>全局强度</dt><dd>{status}</dd>" in row
+        assert f"<dt>同品种强度</dt><dd>{status}</dd>" in row
+        assert '<dd class="reader-event">无</dd>' in row
+        for hidden in ("STALE", "88.123", "77.456", "开香槟", "应建观察仓"):
+            assert hidden not in row
+        assert "直属" in row
+        assert ("趋势动物可查" in row) == (case == "resolved-identity")
+
+
+def test_verified_dual_strength_survives_dedup(tmp_path):
+    # Split facts enter the real CLI, not a manually consolidated test card.
+    scope = {"data_date": "2040-01-01", "version": "v1"}
+    proof = {**scope, "state": "verified"}
+    base = {"code": "A", "name": "合成直属", "market": "US",
+            "instrument_type": "ETF", "instrument_id": "id-A"}
+    cases = [
+        ("split", {}, {}, "80 / 100", "20 / 100"),
+        ("no-opt-in", {"strength_scope": None}, {}, "待核", "待核"),
+        ("unverified", {}, {"strength_evidence": {}}, "待核", "待核"),
+        ("no-match-proof", {}, {"platform_match_verified": False}, "待核", "待核"),
+        ("idless-alias", {}, {"instrument_id": None}, "待核", "待核"),
+        ("unresolved-field", {}, {"strength_evidence": {
+            "strength": {**proof, "state": "pending"},
+            "local_strength": proof}}, "待核", "20 / 100"),
+        ("alias-disagreement", {}, {}, "待核", "20 / 100"),
+        ("foreign-market", {}, {"market": "HK"}, "待核", "待核"),
+        ("foreign-id", {}, {"instrument_id": "id-B"}, "待核", "待核"),
+        ("foreign-type", {}, {"instrument_type": "stock"}, "待核", "待核"),
+        ("foreign-date", {}, {"strength_evidence": {
+            "strength": {**proof, "data_date": "2039-12-31"},
+            "local_strength": proof}}, "待核", "20 / 100"),
+        ("foreign-version", {}, {"strength_evidence": {
+            "strength": {**proof, "version": "v2"},
+            "local_strength": proof}}, "待核", "20 / 100"),
+        ("withdrawn", {"strength": None}, {}, "待核", "20 / 100"),
+        ("pending-preferred", {"lookup": "pending"}, {}, "待核", "待核"),
+        ("pending-alias", {}, {"lookup": "pending"}, "待核", "待核"),
+        ("miss", {"lookup": "miss"}, {}, "待核", "待核"),
+        ("conflict", {"strength": "70 / 100"}, {}, "待核", "20 / 100"),
+        ("preferred-kept", {"strength": "70 / 100"},
+         {"strength": None, "strength_evidence": {"local_strength": proof}},
+         "70 / 100", "20 / 100"),
+        ("withdrawal-proof", {"strength": "80 / 100"},
+         {"strength_evidence": {"strength": {**proof, "state": "withdrawn"},
+                                "local_strength": proof}}, "待核", "20 / 100"),
+        ("stale-preferred", {"strength": "80 / 100", "strength_evidence": {
+            "strength": {**proof, "data_date": "2039-12-31"}}},
+         {}, "待核", "20 / 100"),
+    ]
+    for case, preferred_fields, alias_fields, global_value, local_value in cases:
+        direct = {**base, "direct_verified": True, "strength_scope": scope,
+                  **preferred_fields}
+        quote = {**base, "platform_match_verified": True, "strength": "80 / 100",
+                 "local_strength": "20", "strength_evidence": {
+                     "strength": proof, "local_strength": proof},
+                 "trend": "ALIEN-TREND", "signal_events": ["开香槟"],
+                 "watch_eligible": True, "reason": "ALIEN-REASON", **alias_fields}
+        # Reversing duplicate sources must not choose an arbitrary value.
+        aliases = [quote]
+        if case == "split":
+            quote = {**quote, "strength_evidence": {"strength": proof}}
+            aliases = [quote, {**quote, "strength_evidence": {
+                "local_strength": proof}}]
+        if case == "alias-disagreement":
+            aliases = [quote, {**quote, "strength": "81 / 100"}]
+        for reverse in (False, True):
+            html = render(tmp_path, {"date": "2040-01-02", "long": [{
+                "seat": 1, "name": "合成验证组", "direct": [direct, {
+                    "code": "B", "name": "固定对照", "direct_verified": True,
+                    "strength": "60 / 100"}],
+                "searchable": list(reversed(aliases)) if reverse else aliases,
+            }]}, f"dedup-{case}-{reverse}")
+            first = re.split(r"<h3>大类直属</h3>", html)[1].split(
+                "<h3>趋势动物里面能够查到</h3>")[0]
+            cards = re.findall(r'<li class="asset reader-card">.*?</li>', first, re.S)
+            by_code = {re.search(r'<h4 class="reader-name">(\S+)', c)[1]: c
+                       for c in cards}
+            assert len(cards) == 2
+            a = by_code["A"]
+            assert f'<dt>全局强度</dt><dd>{global_value}</dd>' in a, case
+            assert f'<dt>同品种强度</dt><dd>{local_value}</dd>' in a, case
+            assert '<dt>当前趋势</dt><dd>待核</dd>' in a
+            assert '<dd class="reader-event">无</dd>' in a
+            assert all(text not in a for text in (
+                "ALIEN", "开香槟", "应建观察仓", "data_date", "strength_evidence"))
+            assert re.findall(r'<h4 class="reader-name">(\S+)', first) == (
+                ["B", "A"] if global_value == "待核" else ["A", "B"])
+
+
+def test_legacy_peer_text_allows_verified_global_strength(tmp_path):
+    scope = {"data_date": "2040-01-01", "version": "v1"}
+    proof = {**scope, "state": "verified"}
+    withdrawal = {**scope, "state": "withdrawn"}
+    base = {"code": "A", "name": "合成兼容标的", "market": "US",
+            "instrument_type": "ETF", "instrument_id": "id-A"}
+    for case, direct_fields, donor_fields, global_value, local_value in [
+        ("legacy-preferred", {"strength": "同品种 20 / 100"}, {},
+         "80 / 100", "20 / 100"),
+        ("explicit-global-null", {"strength": None, "local_strength": 20}, {},
+         "待核", "20 / 100"),
+        ("explicit-global-invalid", {"strength": "INVALID", "local_strength": 20},
+         {}, "待核", "20 / 100"),
+        ("global-withdrawal", {"strength": "同品种 20 / 100",
+                               "strength_evidence": {"strength": withdrawal}},
+         {}, "待核", "20 / 100"),
+        ("local-null", {"strength": "同品种 20 / 100", "local_strength": None},
+         {}, "80 / 100", "待核"),
+        ("legacy-donor", {}, {"strength": "同品种 20 / 100",
+                              "strength_evidence": {
+                                  "strength": proof, "local_strength": proof}},
+         "80 / 100", "20 / 100"),
+        ("legacy-only-donor", {}, {"strength": "同品种 20 / 100",
+                                   "strength_evidence": {
+                                       "strength": proof, "local_strength": proof}},
+         "待核", "20 / 100"),
+        ("donor-withdrawal", {"strength": "80 / 100", "local_strength": 20},
+         {"strength": "同品种 20 / 100", "strength_evidence": {
+             "strength": withdrawal, "local_strength": proof}},
+         "待核", "20 / 100"),
+        ("unsupported-legacy-donor", {"strength": "80 / 100",
+                                      "local_strength": 20},
+         {"strength": "同品种 90 / 100", "strength_evidence": {"strength": proof}},
+         "80 / 100", "20 / 100"),
+    ]:
+        direct = {**base, "direct_verified": True, "strength_scope": scope,
+                  **direct_fields}
+        global_source = {**base, "platform_match_verified": True,
+                         "strength": "80 / 100", "strength_evidence": {
+                             "strength": proof}}
+        donor = {**base, "platform_match_verified": True, **donor_fields}
+        for reverse in (False, True):
+            aliases = [donor] if case == "legacy-only-donor" else [global_source, donor]
+            html = render(tmp_path, {"date": "2040-01-02", "long": [{
+                "seat": 1, "name": "合成兼容组", "direct": [direct, {
+                    "code": "B", "name": "对照", "direct_verified": True,
+                    "strength": "60 / 100"}],
+                "searchable": aliases[::-1] if reverse else aliases,
+            }]}, f"legacy-proof-{case}-{reverse}")
+            cards = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+            assert len(cards) == 2
+            a = next(card for card in cards if 'reader-name">A ' in card)
+            assert f'<dt>全局强度</dt><dd>{global_value}</dd>' in a, case
+            assert f'<dt>同品种强度</dt><dd>{local_value}</dd>' in a, case
+            assert re.findall(r'<h4 class="reader-name">(\S+)', html) == (
+                ["B", "A"] if global_value == "待核" else ["A", "B"])
+            assert '<dt>当前趋势</dt><dd>待核</dd>' in a
+            assert '<dd class="reader-event">无</dd>' in a
+            assert '应建观察仓' not in a
+            assert '同品种 20 / 100' not in a
