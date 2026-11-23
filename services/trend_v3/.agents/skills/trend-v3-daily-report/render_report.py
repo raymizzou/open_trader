@@ -116,16 +116,36 @@ def special_signal(asset):
     return display_text("，".join(dict.fromkeys(names)), "无")
 
 
-def card_strength(asset):
-    if "local_strength" not in asset:
-        return asset_metric(asset.get("strength"))
-    raw = str(asset["local_strength"])
+def strength_value(value):
+    """Keep source precision while validating the 0–100 comparison scale."""
+    raw = str(value)
+    if raw.endswith(" / 100"):
+        raw = raw[:-6]
     try:
         if STRENGTH_NUMBER.fullmatch(raw) and Decimal(raw) <= 100:
-            return f"同品种 {raw} / 100"
+            return raw
     except InvalidOperation:
         pass
-    return "待核"
+    return None
+
+
+def strength_fields(asset):
+    global_value = asset.get("strength")
+    local_value = asset.get("local_strength")
+    # Old peer-only display text proves no global value. Explicit local null
+    # is a withdrawal/missing value and must not revive the legacy peer text.
+    if isinstance(global_value, str) and global_value.startswith("同品种 "):
+        if "local_strength" not in asset:
+            local_value = global_value.removeprefix("同品种 ")
+        global_value = None
+    return strength_value(global_value), strength_value(local_value)
+
+
+def strength_note(asset, field, value, label):
+    if value is not None:
+        return ""
+    reason = display_text(asset.get(field + "_reason"), label + "字段缺失或无效。")
+    return f'<p class="reader-metric-note">{reason}</p>'
 
 
 def render_card(pattern, asset):
@@ -133,13 +153,20 @@ def render_card(pattern, asset):
     if lookup is None:
         trend = asset_metric(asset.get("trend"))
         signal = special_signal(asset)
-        strength = card_strength(asset)
+        global_value, local_value = strength_fields(asset)
+        strength = f"{global_value} / 100" if global_value is not None else "待核"
+        local_strength = f"{local_value} / 100" if local_value is not None else "待核"
+        strength_reason = strength_note(asset, "strength", global_value, "全局强度")
+        local_strength_reason = strength_note(
+            asset, "local_strength", local_value, "同品种强度"
+        )
         reason = display_text(asset.get("reason"), "品种证据待核。")
     else:
         if not isinstance(lookup, str) or lookup not in LOOKUP_LABELS:
             raise ValueError("Lookup status must be miss or pending")
         status = LOOKUP_LABELS[lookup]
-        trend = strength = status
+        trend = strength = local_strength = status
+        strength_reason = local_strength_reason = ""
         signal = "无"
         reason = display_text(asset.get("reason"), status)
     # These flags are supplied only after evidence selection. Neither list
@@ -160,6 +187,9 @@ def render_card(pattern, asset):
         trend=trend,
         signal=signal,
         strength=strength,
+        local_strength=local_strength,
+        strength_reason=strength_reason,
+        local_strength_reason=local_strength_reason,
         reason=reason,
     )
 
@@ -211,14 +241,11 @@ def instrument_identity(asset, ids_by_code):
 
 
 def global_strength(asset):
-    # BTC peer strength is deliberately excluded from global ordering.
+    # Local strength never participates in direction ordering.
     if asset.get("lookup") is not None:
         return None
-    raw = asset.get("strength")
-    if not isinstance(raw, str):
-        return None
-    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?) / 100", raw)
-    return Decimal(match[1]) if match and Decimal(match[1]) <= 100 else None
+    value, _ = strength_fields(asset)
+    return Decimal(value) if value is not None else None
 
 
 def reconcile_lookup(preferred, aliases):
@@ -249,7 +276,8 @@ def reconcile_lookup(preferred, aliases):
     elif preferred.get("lookup") == "pending":
         # Removing a pending lookup must not unmask its old quote/event payload
         # or activate an old watch flag. Identity success proves no market data.
-        for field in ("lookup", "trend", "strength", "local_strength", "signal"):
+        for field in ("lookup", "trend", "strength", "local_strength", "signal",
+                      "strength_reason", "local_strength_reason"):
             reconciled.pop(field, None)
         reconciled["signal_events"] = []
         reconciled["watch_eligible"] = False

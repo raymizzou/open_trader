@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-11-23 — Trend V3 dual instrument strengths (#526)
+
+- Select global and same-asset-category strength for every exactly matched
+  instrument, independently of temperature, opening signals, comparison groups
+  or BTC identity. Reuse each applicable cache field separately and merge only
+  authorized missing fields into planned requests; retain fee and no-replay rules.
+- Show both strengths side by side, retaining zero and source precision, with
+  separate reasons for missing fields. Accept older projections without moving
+  peer strength into the global column. Sort all three blocks only by global
+  strength for each direction, then code, with missing values last.
+- Apply the same rules to scheduled, manual and offline reports. Keep uncertain
+  and conflicting lookup cards masked, and clear stale missing-field reasons
+  when an identity match is resolved. Offline validation adds no vendor calls.
+
 ## 2026-11-23 — Trend V3 three instrument sections (#512)
 
 - Show every class with `大类直属`, `趋势动物里面能够查到`, and
