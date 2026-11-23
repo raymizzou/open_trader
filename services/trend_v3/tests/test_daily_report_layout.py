@@ -1585,3 +1585,52 @@ def test_missing_manifest_cannot_finish(tmp_path):
             manifest["worklist"].pop()
         html = render(tmp_path, report, name)
         assert "数据收集中" in html and "数据已完备" not in html, name
+
+
+@pytest.mark.parametrize(
+    "cited_day", ["2026-11-19", "2026-11-24", None],
+    ids=["stale", "future", "missing"],
+)
+def test_stale_cited_board_cannot_complete(tmp_path, cited_day):
+    from test_hourly_collection import control
+
+    report = complete_report()
+    api = control()
+    state = tmp_path / "control.json"
+    api.initialize(state, report)
+    assert api.claim_round(state, report, "2026-11-23T08:30:00+08:00")["slot"] == 0
+    local, delivered = tmp_path / "local.html", tmp_path / "delivered.html"
+    current_html = api.render_html(report)
+    local.write_text(current_html, encoding="utf-8")
+    delivered.write_text(current_html, encoding="utf-8")
+    api.confirm_publication(state, report, local, delivered)
+    assert api.claim_round(state, report, "2026-11-23T10:30:00+08:00") is None
+
+    # The cited board date and its matching value agree with each other, while
+    # evidence metadata still claims the target day. The citation must win.
+    if cited_day is None:
+        report.pop("board_date")
+    else:
+        report["board_date"] = cited_day
+    report["collection"]["evidence"]["/board_date"]["value"] = cited_day
+    html = render(tmp_path, report, "cited-board")
+    assert "数据收集中" in html and "数据已完备" not in html
+    assert f"榜图：目标 2026-11-22，实际 {cited_day or '待核'}" in html
+    assert "大类数据日期 2026-11-22" in html
+    assert "版次 2026-11-23/v1" in html
+    if cited_day:
+        assert f"大类强度取自 {cited_day} 官方榜图。" in html
+    else:
+        assert "官方榜图日期待核。" in html
+
+    round_ = api.claim_round(state, report, "2026-11-23T10:30:00+08:00")
+    assert round_["markets"] == ["BOARD"]
+    assert "/board_date" in round_["pending_paths"]
+    assert round_["changed"] == ["/board_date"]
+    # A later slot cannot replay an already claimed round, nor can publication
+    # acknowledge this incomplete projection even when file bytes match it.
+    assert api.claim_round(state, report, "2026-11-23T10:31:00+08:00") is None
+    local.write_text(html, encoding="utf-8")
+    delivered.write_text(html, encoding="utf-8")
+    with pytest.raises(ValueError, match="incomplete"):
+        api.confirm_publication(state, report, local, delivered)

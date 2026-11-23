@@ -188,7 +188,10 @@ def assess(report):
         item = obligations.get(path, {})
         proof = evidence.get(path, {})
         target = valid_date(targets.get(market))
-        actual = valid_date(proof.get("data_date"))
+        evidence_day = valid_date(proof.get("data_date"))
+        # A proof's metadata cannot replace the actual date cited in the report.
+        # Board edition remains independent of the board's data day.
+        actual = valid_date(value) if path == "/board_date" else evidence_day
         if (
             not target
             or not identity
@@ -196,6 +199,7 @@ def assess(report):
             or item.get("target_date") != target
             or item.get("market") != market
             or proof.get("state") != "verified"
+            or evidence_day != target
             or actual != target
             or proof.get("identity") != identity
             or proof.get("value") != value
