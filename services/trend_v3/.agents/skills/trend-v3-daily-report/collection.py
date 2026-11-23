@@ -29,9 +29,64 @@ def valid_date(value):
         return None
 
 
+def evidence_for(evidence, path):
+    value = evidence.get(path) if isinstance(evidence, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def field_proof_matches(asset, field, proof, target):
+    identifier = asset.get("instrument_id")
+    known_id = (type(identifier) is int and identifier >= 0) or (
+        isinstance(identifier, str) and bool(identifier.strip())
+    )
+    value = asset.get(field)
+    valid_value = value is not None
+    if field in ("strength", "local_strength"):
+        raw = str(value).removesuffix(" / 100")
+        valid_value = bool(
+            re.fullmatch(r"[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?", raw)
+        )
+        if valid_value:
+            valid_value = Decimal(raw) <= 100
+    elif field == "trend":
+        valid_value = (
+            isinstance(value, str)
+            and bool(value.strip())
+            and value.casefold() not in ("unknown", "pending", "待核")
+        )
+    elif field == "signal_events":
+        valid_value = isinstance(value, list) and all(
+            isinstance(name, str)
+            and bool(name.strip())
+            and name.casefold() not in ("unknown", "pending", "待核")
+            for name in value
+        )
+    return (
+        valid_value
+        and known_id
+        and bool(target)
+        and all(
+            isinstance(asset.get(key), str) and asset[key].strip()
+            for key in ("market", "instrument_type")
+        )
+        and proof.get("state") == "verified"
+        and valid_date(proof.get("data_date")) == target
+        and proof.get("value") == value
+        and proof.get("identity") == identifier
+        and proof.get("market") == asset.get("market")
+        and proof.get("instrument_type") == asset.get("instrument_type")
+        and all(
+            isinstance(proof.get(key), str) and proof[key].strip()
+            for key in ("source", "version")
+        )
+    )
+
+
 def dated_projection(report):
     result = deepcopy(report)
-    targets = report.get("collection", {}).get("targets", {})
+    collection = report.get("collection") or {}
+    evidence_bearing = "collection" in report
+    targets = collection.get("targets", {})
     pending = []
     for direction in ("short", "long"):
         for gi, group in enumerate(result.get(direction, [])):
@@ -41,10 +96,26 @@ def dated_projection(report):
             for section in ("direct", "searchable", "related"):
                 for ai, asset in enumerate(group.get(section, [])):
                     actual = valid_date(asset.get("data_date"))
-                    target = valid_date(targets.get(asset.get("market")))
+                    market = asset.get("market")
+                    target = valid_date(targets.get(market))
+                    try:
+                        validate_targets(
+                            report["date"],
+                            {
+                                "targets": {market: target},
+                                "target_evidence": {
+                                    market: collection["target_evidence"][market]
+                                }
+                                if market in collection.get("target_evidence", {})
+                                else {},
+                            },
+                        )
+                    except ValueError:
+                        target = None
                     asset["_date_note"] = "行情日期 " + (actual or "待核")
-                    if (asset.get("data_date") is not None and not actual) or (
-                        actual and target and actual > target
+                    if not evidence_bearing and (
+                        (asset.get("data_date") is not None and not actual)
+                        or (actual and target and actual > target)
                     ):
                         for field in ("trend", "strength", "local_strength", "signal"):
                             asset[field] = None
@@ -52,21 +123,14 @@ def dated_projection(report):
                         asset["watch_eligible"] = False
                         asset["reason"] = "行情日期无效或晚于目标日，行情待核。"
                     prefix = f"/{direction}/{gi}/{section}/{ai}"
-                    proofs = report.get("collection", {}).get("evidence", {})
-                    lookup_proof = proofs.get(prefix + "/lookup", {})
-                    if asset.get("lookup") == "miss" and lookup_proof:
+                    proofs = collection.get("evidence", {})
+                    lookup_proof = evidence_for(proofs, prefix + "/lookup")
+                    if asset.get("lookup") == "miss" and evidence_bearing:
                         if (
-                            lookup_proof.get("state") != "verified"
+                            not field_proof_matches(
+                                asset, "lookup", lookup_proof, target
+                            )
                             or lookup_proof.get("full_lookup") is not True
-                            or valid_date(lookup_proof.get("data_date")) != target
-                            or lookup_proof.get("identity")
-                            != asset.get("instrument_id")
-                            or lookup_proof.get("market") != asset.get("market")
-                            or lookup_proof.get("instrument_type")
-                            != asset.get("instrument_type")
-                            or lookup_proof.get("value") != "miss"
-                            or not lookup_proof.get("source")
-                            or not lookup_proof.get("version")
                         ):
                             asset["lookup"] = "pending"
                             asset["reason"] = "完整查询证据或适用范围待核。"
@@ -78,28 +142,28 @@ def dated_projection(report):
                         ("local_strength", "同品种强度"),
                         ("signal_events", "特殊信号"),
                     ):
-                        proof = proofs.get(prefix + "/" + field, {})
+                        proof = evidence_for(proofs, prefix + "/" + field)
                         field_day = valid_date(proof.get("data_date"))
                         if proof:
                             if field_day and target and field_day < target:
                                 field_dates.append("历史数据")
                             field_dates.append(label + "日期 " + (field_day or "待核"))
-                        if (
-                            proof.get("state") != "verified"
-                            or not field_day
-                            or field_day != target
-                            or proof.get("value") != asset.get(field)
-                            or not proof.get("source")
-                            or not proof.get("version")
-                            or not asset.get("instrument_id")
-                            or proof.get("identity") != asset.get("instrument_id")
-                            or proof.get("market") != asset.get("market")
-                            or not asset.get("instrument_type")
-                            or proof.get("instrument_type")
-                            != asset.get("instrument_type")
-                        ):
-                            if field in ("trend", "signal_events") or proof:
+                        if not field_proof_matches(asset, field, proof, target):
+                            supplied = field in asset or bool(proof)
+                            if field in ("trend", "signal_events") or supplied:
                                 fields_current = False
+                            if evidence_bearing:
+                                # Filter each source before identity dedup/ranking.
+                                # Explicit invalid input remains a withdrawal; mere
+                                # omission can still use a verified split-field donor.
+                                if supplied or field == "signal_events":
+                                    asset[field] = (
+                                        [] if field == "signal_events" else None
+                                    )
+                                if field in ("strength", "local_strength"):
+                                    split = asset.get("strength_evidence")
+                                    if isinstance(split, dict):
+                                        split.pop(field, None)
                             pending.append(
                                 f"{asset['code']} {field}：目标 {target or '待核'}，"
                                 f"实际 {field_day or actual or '待核'}"
@@ -172,6 +236,10 @@ def assess(report):
         item.get("path"): item for item in worklist if isinstance(item, dict)
     }
     pending = []
+    try:
+        validate_targets(report["date"], collection)
+    except ValueError:
+        pending.append("目标日历证据待核")
     facts = list(required_facts(report))
     paths = [item.get("path") for item in worklist if isinstance(item, dict)]
     if not worklist or len(paths) != len(worklist) or len(set(paths)) != len(paths):
@@ -186,7 +254,7 @@ def assess(report):
         for part in parts[:-1]:
             subject = subject[int(part)] if isinstance(subject, list) else subject[part]
         item = obligations.get(path, {})
-        proof = evidence.get(path, {})
+        proof = evidence_for(evidence, path)
         target = valid_date(targets.get(market))
         evidence_day = valid_date(proof.get("data_date"))
         # A proof's metadata cannot replace the actual date cited in the report.
@@ -209,7 +277,8 @@ def assess(report):
             pending.append(f"{label}：目标 {target or '待核'}，实际 {actual or '待核'}")
         if len(parts) == 5:
             if (
-                not subject.get("instrument_type")
+                not field_proof_matches(subject, parts[-1], proof, target)
+                or not subject.get("instrument_type")
                 or proof.get("market") != market
                 or proof.get("instrument_type") != subject.get("instrument_type")
                 or valid_date(subject.get("data_date")) != target
@@ -306,12 +375,15 @@ def initialize(path, report):
     with state_lock(path):
         if path.exists():
             state = json.loads(path.read_text())
-            check_frozen(state, report)
+            if check_frozen(state, report):
+                save(path, state)
             return state
+        validate_targets(day, report.get("collection", {}))
         state = {
             "date": day,
             "targets": report.get("collection", {}).get("targets", {}),
             "worklist": report.get("collection", {}).get("worklist", []),
+            "target_evidence": report.get("collection", {}).get("target_evidence", {}),
             "last_slot": -1,
             "rounds": [],
             "evidence": {},
@@ -321,12 +393,71 @@ def initialize(path, report):
         return state
 
 
+def validate_targets(day, collection, require_proof=()):
+    """Legacy initial dates remain supported; first resolution needs day-bound proof."""
+    basis = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+    proofs = collection.get("target_evidence", {})
+    for market, target in collection.get("targets", {}).items():
+        if target is None:
+            continue
+        if valid_date(target) != target or target > basis:
+            raise ValueError("Invalid or future target")
+        proof = proofs.get(market)
+        if proof is None and market not in require_proof:
+            continue
+        if (
+            not isinstance(proof, dict)
+            or proof.get("state") != "verified"
+            or proof.get("report_date") != day
+            or proof.get("basis_date") != basis
+            or not isinstance(proof.get("source"), str)
+            or not proof["source"].strip()
+        ):
+            raise ValueError("Verified original-day calendar proof required")
+        sessions = proof.get("sessions", [])
+        if (
+            not isinstance(sessions, list)
+            or any(not valid_date(value) or value > basis for value in sessions)
+            or target_dates(day, {market: proof}).get(market) != target
+        ):
+            raise ValueError("Target does not match original-day calendar proof")
+
+
 def check_frozen(state, report):
-    if (
-        report.get("date") != state["date"]
-        or report.get("collection", {}).get("targets", {}) != state["targets"]
+    if report.get("date") != state["date"]:
+        raise ValueError("Report day is frozen; reconcile original run")
+    collection = report.get("collection", {})
+    incoming = collection.get("targets", {})
+    old = state["targets"]
+    if any(
+        market not in incoming or (target is not None and incoming[market] != target)
+        for market, target in old.items()
     ):
-        raise ValueError("Report day and targets are frozen; reconcile original run")
+        raise ValueError("Established targets are frozen; reconcile original run")
+    resolving = {
+        market
+        for market, target in incoming.items()
+        if target is not None and old.get(market) is None
+    }
+    validate_targets(state["date"], collection, resolving)
+    changed = incoming != old
+    if changed:
+        # Called only under state_lock; the caller must persist before returning,
+        # even when the current hourly slot is not due. No request is authorized.
+        state.update(
+            targets=deepcopy(incoming),
+            worklist=collection.get("worklist", []),
+            projection=report,
+            assessment=assess(report),
+            published=None,
+        )
+        state["pending_target_changes"] = sorted(
+            set(state.get("pending_target_changes", [])) | resolving
+        )
+        state.setdefault("target_evidence", {}).update(
+            {market: collection["target_evidence"][market] for market in resolving}
+        )
+    return changed
 
 
 def claim_round(path, report, now):
@@ -336,12 +467,14 @@ def claim_round(path, report, now):
         raise ValueError("Clock must have a timezone")
     with state_lock(path):
         state = json.loads(path.read_text())
-        check_frozen(state, report)
+        targets_changed = check_frozen(state, report)
         start = datetime.fromisoformat(state["date"] + "T08:30:00").replace(
             tzinfo=TAIPEI
         )
         slot = int((instant - start).total_seconds() // 3600)
         if slot < 0 or slot <= state["last_slot"]:
+            if targets_changed:
+                save(path, state)
             return None
         if state.get("published") == fingerprint(report) and assess(report)["complete"]:
             return None
@@ -351,6 +484,11 @@ def claim_round(path, report, now):
             key
             for key in set(hashes) | set(state["evidence"])
             if hashes.get(key) != state["evidence"].get(key)
+        )
+        target_changes = set(state.get("pending_target_changes", []))
+        changed = sorted(
+            set(changed)
+            | {fact[0] for fact in required_facts(report) if fact[2] in target_changes}
         )
         assessment = assess(report)
         # Re-assess cheap local facts, but request/recompute only affected items.
@@ -388,6 +526,7 @@ def claim_round(path, report, now):
             projection=report,
         )
         state["rounds"].append(result)
+        state["pending_target_changes"] = []
         state["published"] = None
         save(path, state)  # claim before any observation; unknown is never replayed
         return result

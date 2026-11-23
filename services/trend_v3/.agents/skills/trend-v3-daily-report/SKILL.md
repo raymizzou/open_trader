@@ -25,7 +25,7 @@ description: Prepare or retrieve the mobile Trend V3 daily report for Trend Anim
 
 每个日历日（含周末及股市假日）Asia/Taipei 08:30 首版立即交付；晚启动只补当前轮，不补历史轮次。缺项时页头显示「数据收集中」，列具体工作项、目标日、实际日及下一次核实时间。08:30、09:30、10:30 等为锚定时点，跨午夜继续原报告日。全部证据核实并交付当前完整 HTML 后显示「数据已完备」与核实时间，停止监测，保留交互标签。
 
-- 使用同版 `collection.py` 的正式命令，不以文字约定代替执行控制。报告日开始时，按「适用数据日期」将已核实日历保存为 `calendars.json`：连续市场 `kind: continuous`；股市 `kind: equity`、`sessions`（已确认交易日）、`covered_through`（完整日历覆盖末日）；均含 `source`。`targets` 命令按 D−1 计算连续市场，按各市场日历取不晚于 D−1 的最近收盘日；覆盖不足或来源不明返回 null。榜图目标独立核实，版次不等于图面数据日。把结果固定到投影 `collection.targets`，未知不得猜测。
+- 使用同版 `collection.py` 的正式命令，不以文字约定代替执行控制。报告日开始时，按「适用数据日期」将已核实日历保存为 `calendars.json`：连续市场 `kind: continuous`；股市 `kind: equity`、`sessions`（已确认交易日）、`covered_through`（完整日历覆盖末日）；均含 `source`。`targets` 命令按 D−1 计算连续市场，按各市场日历取不晚于 D−1 的最近收盘日；覆盖不足或来源不明返回 null。榜图目标独立核实，版次不等于图面数据日。把结果保存到投影 `collection.targets`，未知为 null，不得猜测；已确认日期冻结。
 - 在 `_evidence/YYYY-MM-DD/` 持日锁运行 `init`，保存本日控制文件。恢复先读此文件及共享账本，复用已核实缓存、响应与原日目标，不滚动到新日。已有旧版报告也须先交付可用首版，再建工作清单；旧报告不能凭缺项列表为空成为完整。
 - 各轮先运行 `claim --now <带时区实际时间>`。返回 null 不取数。持久化成功才处理返回的当前 slot；已过小时不追赶、同 slot 不重发。`markets` 是仍待核实市场集合，每轮至多一次已有授权的 `getUpdateStatus` 覆盖这些适用市场（BOARD 先映射已核实供应商榜图范围，不作为臆造的 API 参数）。集合为空只处理尚未完成的交付。返回 `changed` / `affected_groups` 指明变动字段与相关结论，重核变化及其直接依赖，不为已核实且来源未变的项重复请求。控制文件的本地重算不产生请求。
 - 共享锁→日锁→重读共享账本和本轮状态后才发送获准请求。`claim` 自身不是费用授权或账本锁；“已认领”后的崩溃仍须核对原发送，不能用下一 slot 绕过 UNKNOWN。每次更新观测和响应保存原始私有记录与账本定位。先复用缓存，更新发布时间不证明标的字段已齐。迟到发布仅补原目标日；请求范围、费率、强度/BTC 限制和未知不重放规则不变。
@@ -43,13 +43,15 @@ python /绝对同版路径/collection.py confirm reader-projection.json --state 
 
 ### 完备工作清单与字段证据
 
-`collection` 是私有投影元数据，只公开适用日期、状态、缺项和时间，不公开路径/请求/账本。包含 `targets`、`worklist`、`evidence`、`next_check`、`verified_at`。所有必需项逐项入 `worklist`，每项为 `{path, label, market, target_date}`；path 是当前投影的位置，如 `/long/0/searchable/0/strength`。目标固定后不变。清单不能缺失、重复、少项或留下未决额外项；名单/排序调整后同步迁移 path 和证据，不按旧位置继承。
+初次 `init` 允许未知目标，不因日历缺项延迟首版。后来首次确定 null／新增市场时，在 `collection.target_evidence[市场]` 提供 `{state: "verified", report_date: 原报告日, basis_date: 原报告日D−1, source: 可回溯日历来源, kind: "equity"或"continuous"}`；股市另含 `sessions` 和 `covered_through`。交易日列表不得超出原 D−1；覆盖须到该日，按同一 D−1／最近收盘规则重算后严格等于拟定目标。既有初始非空目标仍兼容，但不能晚于 D−1；显式提供的初始日历证明也须匹配。`init`／`claim`／`confirm` 在 state_lock 下校验并原子保存首次确定及证明，不替换或删除已确认日期。无证明、不适用原报告日或未来目标一律拒绝，保留原控制状态；同 slot 的日历补证可以保存，但不授权重放请求；首次确定目标会把相关缓存字段及分组列为待重核，保留至下一有效 slot，不要求响应字节先发生变化。
+
+`collection` 是私有投影元数据，只公开适用日期、状态、缺项和时间，不公开路径/请求/账本。包含 `targets`、`worklist`、`evidence`、`next_check`、`verified_at`。所有必需项逐项入 `worklist`，每项为 `{path, label, market, target_date}`；path 是当前投影的位置，如 `/long/0/searchable/0/strength`。已确认目标不变；null 或新增市场可在原报告日下首次核实，规则如下。清单不能缺失、重复、少项或留下未决额外项；名单/排序调整后同步迁移 path 和证据，不按旧位置继承。
 
 必需项由程序从实际报告枚举：`/board_date`、`/board_version`，两方向各 1/2 席位的 `board_strength` 和 `coverage`，以及每卡的 `trend`、`strength`、`local_strength`、`signal_events`；查询卡改为其 `lookup`。每类 `coverage` 为 `{state: "complete", instrument_ids: [...]}`，按 direct/searchable/related 原序列出核实名单身份，空名单也须有完整查询证据，不能用无卡片证明完整。尚未完成的目录/候选查询列为额外工作项；查完后更新 coverage 和正式清单，保留原记录历史。
 
-`evidence[path]` 每项含 `{state: "verified", data_date, version, source, identity, value}`（标的字段另含匹配的 `market`、`instrument_type`），来自可回溯且已核实的响应；value 与当前投影字段严格相等，source 不为空，版次/日期适用，身份匹配。榜图 identity 为 `board`；大类用其核实名称；标的用显式 instrument_id，market/type 同时核实。查询 `miss` 还须 `full_lookup: true` 且来源确实覆盖完整适用查询范围；pending/未知、分页不全、仅发布时间都不终结。不得为让校验通过伪填来源或值。`verified_at` 是最后逐项核实完成的带时区时间，不是启动或发布观测时间。
+`evidence[path]` 每项含 `{state: "verified", data_date, version, source, identity, value}`（标的字段另含匹配的 `market`、`instrument_type`），来自可回溯且已核实的响应；value 与当前投影字段严格相等，source 不为空，版次/日期适用，身份匹配。榜图 identity 为 `board`；大类用其核实名称；标的用显式 instrument_id，market/type 同时核实。在含 `collection` 的投影中，查询 `miss` 必须有该 path 的证明、非空有效目标与身份、完整 market/type、匹配日期和值，另须 `full_lookup: true` 且来源确实覆盖完整适用查询范围；无证明、null 对 null 或范围缺失显示「待核」，不显示「查不到」。不含 `collection` 的旧格式仍按已核实显示投影兼容，不能借删除 collection 绕过新证据规则。pending/未知、分页不全、仅发布时间都不终结。不得为让校验通过伪填来源或值。`verified_at` 是最后逐项核实完成的带时区时间，不是启动或发布观测时间。
 
-每类及卡片独立填明确 `data_date`（不得从任意榜图/市场/报告日继承）；不同字段日期在 `evidence` 逐项列出。旧投影缺日期显示「待核」。已有旧日事实可明确显示历史日期，但不得产生当期新仓/观察仓资格；字段需目标日、身份、来源和值全部相符。持仓与 Kelly 的「未接入」不进入清单。该控制器不访问供应商、不购数据、不改外部调度。
+每类及卡片独立填明确 `data_date`（不得从任意榜图/市场/报告日继承）；不同字段日期在 `evidence` 逐项列出。旧投影缺日期显示「待核」。含 collection 的投影在去重和排序前逐字段检查目标日、身份、market/type、来源、版次、状态和值；缺失、UNKNOWN、撤回、错日/错值/错范围字段显示待核，事件不列出，不参与当前排序或资格。已核实历史字段可标历史及其日期，但不作为当前值或当前比较。每个字段独立遮蔽，保留另一项有效强度；重复行与 split-field 不能恢复无效字段。明确省略且无撤回的字段仍可按原 split-field 契约从独立核实的适用来源补齐；旧格式兼容仍保留，不能产生新增取数或费用权。持仓与 Kelly 的「未接入」不进入清单。该控制器不访问供应商、不购数据、不改外部调度。
 
 ### 双强度字段选择（各入口共用）
 

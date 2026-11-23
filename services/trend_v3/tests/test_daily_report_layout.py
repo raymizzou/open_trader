@@ -123,32 +123,48 @@ def render(tmp_path, report, name):
 
 
 def render_verified_watch(tmp_path, report, name):
-    # These specific legacy consumers test membership/eligibility, independently
-    # of completeness. Supply explicit current trend/event provenance; strengths
-    # are still optional for opening and their negative assertions stay intact.
-    report["collection"] = {"targets": {"US": "2040-02-28"}, "evidence": {}}
+    # Synthetic membership consumers supply current per-field observations under
+    # the explicit collection contract; missing strengths remain missing.
+    day = {
+        "2040-02-29": "2040-02-28",
+        "2040-01-01": "2039-12-31",
+        "2041-01-02": "2041-01-01",
+    }[report["date"]]
+    collection = {"targets": {}, "evidence": {}}
+    report["collection"] = collection
     for direction in ("short", "long"):
         for gi, group in enumerate(report.get(direction, [])):
             for section in ("direct", "searchable", "related"):
                 for ai, asset in enumerate(group.get(section, [])):
                     asset.setdefault("instrument_id", "fixture-" + asset["code"])
-                    if asset.get("watch_eligible") is not True:
-                        continue
-                    asset.update(market="US", data_date="2040-02-28")
+                    asset.setdefault("market", "US")
                     asset.setdefault("instrument_type", "stock")
-                    asset.setdefault("instrument_id", "fixture-" + asset["code"])
-                    for field in ("trend", "signal_events"):
-                        asset.setdefault(field, "热" if field == "trend" else [])
+                    asset["data_date"] = day
+                    collection["targets"][asset["market"]] = day
+                    if asset.get("watch_eligible") is True:
+                        asset.setdefault("trend", "热")
+                        asset.setdefault("signal_events", [])
+                    fields = (
+                        ("lookup",)
+                        if asset.get("lookup") == "miss"
+                        else ()
+                        if asset.get("lookup")
+                        else ("trend", "signal_events", "strength", "local_strength")
+                    )
+                    for field in fields:
+                        if field not in asset:
+                            continue
                         path = f"/{direction}/{gi}/{section}/{ai}/{field}"
-                        report["collection"]["evidence"][path] = {
+                        collection["evidence"][path] = {
                             "state": "verified",
-                            "data_date": "2040-02-28",
+                            "data_date": day,
                             "market": asset["market"],
                             "instrument_type": asset["instrument_type"],
                             "source": "fixture-current-observation",
                             "version": "fixture-v1",
                             "identity": asset["instrument_id"],
                             "value": asset[field],
+                            **({"full_lookup": True} if field == "lookup" else {}),
                         }
     return render(tmp_path, report, name)
 
@@ -1634,3 +1650,240 @@ def test_stale_cited_board_cannot_complete(tmp_path, cited_day):
     delivered.write_text(html, encoding="utf-8")
     with pytest.raises(ValueError, match="incomplete"):
         api.confirm_publication(state, report, local, delivered)
+
+
+def test_wrong_field_date_cannot_rank_or_publish_current_value(tmp_path):
+    from copy import deepcopy
+
+    base = {
+        "code": "A",
+        "name": "合成甲",
+        "market": "US",
+        "instrument_type": "ETF",
+        "instrument_id": "a",
+        "data_date": "2026-11-20",
+        "platform_match_verified": True,
+        "direct_verified": True,
+        "strength": "99",
+        "local_strength": "77",
+        "trend": "热",
+        "signal_events": ["开香槟"],
+        "watch_eligible": True,
+    }
+    other = {
+        **base,
+        "code": "B",
+        "name": "合成乙",
+        "instrument_id": "b",
+        "strength": "40",
+        "local_strength": "20",
+        "watch_eligible": False,
+    }
+    source = {
+        "date": "2026-11-23",
+        "long": [{"seat": 1, "name": "合成比较", "direct": [base, other]}],
+        "collection": {"targets": {"US": "2026-11-20"}, "evidence": {}},
+    }
+    for i, asset in enumerate((base, other)):
+        for field in ("trend", "signal_events", "strength", "local_strength"):
+            source["collection"]["evidence"][f"/long/0/direct/{i}/{field}"] = {
+                "state": "verified",
+                "data_date": "2026-11-20",
+                "version": "v1",
+                "identity": asset["instrument_id"],
+                "market": "US",
+                "instrument_type": "ETF",
+                "source": "fixture-field-response",
+                "value": asset[field],
+            }
+    path = "/long/0/direct/0/strength"
+    for case in (
+        "future",
+        "bad-date",
+        "old",
+        "identity",
+        "market",
+        "type",
+        "value",
+        "UNKNOWN",
+        "missing-proof",
+        "null-proof",
+        "withdrawn",
+        "split-revival",
+    ):
+        report = deepcopy(source)
+        proof = report["collection"]["evidence"][path]
+        if case in ("future", "bad-date", "old"):
+            proof["data_date"] = {
+                "future": "2026-11-24",
+                "bad-date": "bad",
+                "old": "2026-11-19",
+            }[case]
+        elif case in ("identity", "market", "type", "value"):
+            key = {"type": "instrument_type"}.get(case, case)
+            proof[key] = "OTHER"
+        elif case == "UNKNOWN":
+            proof["state"] = "UNKNOWN"
+        elif case == "null-proof":
+            report["collection"]["evidence"][path] = None
+        elif case == "missing-proof":
+            report["collection"]["evidence"].pop(path)
+        else:
+            proof["state"] = "withdrawn"
+        if case == "split-revival":
+            a = report["long"][0]["direct"][0]
+            a["strength_scope"] = {"data_date": "2026-11-20", "version": "v1"}
+            alias = {
+                **base,
+                "direct_verified": False,
+                "strength": "100",
+                "strength_evidence": {
+                    "strength": {
+                        "data_date": "2026-11-20",
+                        "version": "v1",
+                        "state": "verified",
+                    }
+                },
+            }
+            report["long"][0]["searchable"] = [alias]
+            report["collection"]["evidence"]["/long/0/searchable/0/strength"] = {
+                **source["collection"]["evidence"][path],
+                "value": "100",
+            }
+        html = render(tmp_path, report, "field-" + case)
+        cards = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+        assert re.findall(r'<h4 class="reader-name">(\S+)', html) == ["B", "A"], case
+        a = next(card for card in cards if 'reader-name">A ' in card)
+        assert "<dt>全局强度</dt><dd>待核</dd>" in a, case
+        assert "<dt>同品种强度</dt><dd>77 / 100</dd>" in a, case
+        assert "99 / 100" not in a and "100 / 100" not in a
+        assert "应建观察仓" not in a
+        if case == "old":
+            assert "历史数据" in a and "全局强度日期 2026-11-19" in a
+    for field, hidden in (("trend", "热"), ("signal_events", "开香槟")):
+        report = deepcopy(source)
+        report["collection"]["evidence"]["/long/0/direct/0/" + field]["identity"] = (
+            "other"
+        )
+        html = render(tmp_path, report, "other-field-" + field)
+        a = next(
+            card
+            for card in re.findall(
+                r'<li class="asset reader-card">.*?</li>', html, re.S
+            )
+            if 'reader-name">A ' in card
+        )
+        assert f"<dd>{hidden}</dd>" not in a if field == "trend" else hidden not in a
+        assert "<dt>同品种强度</dt><dd>77 / 100</dd>" in a
+
+    # A missing preferred field can still use an independently verified current
+    # split source. An invalid donor must not revive it or mask a valid peer.
+    for valid in (True, False):
+        report = deepcopy(source)
+        preferred = report["long"][0]["direct"][0]
+        preferred.pop("strength")
+        preferred["strength_scope"] = {"data_date": "2026-11-20", "version": "v1"}
+        report["collection"]["evidence"].pop(path)
+        donor = {
+            **base,
+            "direct_verified": False,
+            "strength": "88",
+            "strength_evidence": {
+                "strength": {
+                    "data_date": "2026-11-20",
+                    "version": "v1",
+                    "state": "verified",
+                }
+            },
+        }
+        report["long"][0]["searchable"] = [donor]
+        report["collection"]["evidence"]["/long/0/searchable/0/strength"] = {
+            **source["collection"]["evidence"][path],
+            "value": "88",
+            "data_date": "2026-11-20" if valid else "2026-11-24",
+        }
+        html = render(tmp_path, report, f"split-{valid}")
+        a = next(
+            card
+            for card in re.findall(
+                r'<li class="asset reader-card">.*?</li>', html, re.S
+            )
+            if 'reader-name">A ' in card
+        )
+        assert "<dt>同品种强度</dt><dd>77 / 100</dd>" in a
+        assert ("<dt>全局强度</dt><dd>88 / 100</dd>" in a) is valid
+        assert re.findall(r'<h4 class="reader-name">(\S+)', html) == (
+            ["A", "B"] if valid else ["B", "A"]
+        )
+
+
+def test_explicit_collection_missing_lookup_evidence_stays_pending(tmp_path):
+    from copy import deepcopy
+
+    asset = {
+        "code": "MISS",
+        "name": "合成查询",
+        "market": "US",
+        "instrument_type": "ETF",
+        "instrument_id": "miss-id",
+        "data_date": "2026-11-20",
+        "lookup": "miss",
+    }
+    source = {
+        "date": "2026-11-23",
+        "long": [{"seat": 1, "name": "合成查询类", "related": [asset]}],
+        "collection": {"targets": {"US": "2026-11-20"}, "evidence": {}},
+    }
+    path = "/long/0/related/0/lookup"
+    proof = {
+        "state": "verified",
+        "data_date": "2026-11-20",
+        "version": "v1",
+        "identity": "miss-id",
+        "market": "US",
+        "instrument_type": "ETF",
+        "source": "fixture-full-catalog",
+        "value": "miss",
+        "full_lookup": True,
+    }
+    for case in (
+        "no-proof",
+        "null-to-null",
+        "no-target",
+        "no-id",
+        "no-market",
+        "no-type",
+        "no-source",
+        "not-full",
+    ):
+        report = deepcopy(source)
+        card = report["long"][0]["related"][0]
+        evidence = deepcopy(proof)
+        if case != "no-proof":
+            report["collection"]["evidence"][path] = evidence
+        if case == "null-to-null":
+            card["instrument_id"] = evidence["identity"] = None
+            report["collection"]["targets"]["US"] = evidence["data_date"] = None
+        elif case == "no-target":
+            report["collection"]["targets"]["US"] = None
+        elif case == "no-id":
+            card["instrument_id"] = None
+        elif case == "no-market":
+            card.pop("market")
+        elif case == "no-type":
+            card.pop("instrument_type")
+        elif case == "no-source":
+            evidence.pop("source")
+        elif case == "not-full":
+            evidence["full_lookup"] = False
+        html = render(tmp_path, report, "lookup-" + case)
+        assert "查不到" not in html and "待核" in html, case
+        assert "数据收集中" in html and "数据已完备" not in html
+    report = deepcopy(source)
+    report["collection"]["evidence"][path] = proof
+    html = render(tmp_path, report, "full-miss")
+    assert "查不到" in html
+    # Explicit old-format compatibility is retained, without inventing proof.
+    report.pop("collection")
+    html = render(tmp_path, report, "legacy-miss")
+    assert "查不到" in html
