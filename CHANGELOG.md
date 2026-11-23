@@ -14,6 +14,11 @@
 - Show general coverage notes after all three sections even with no direct
   cards. Keep the legacy direct-only note compatible. Rebuild old projections
   from valid membership and lookup evidence, without new market queries.
+- Retain a compatible exact platform-match fact on the single preferred direct
+  card. Treat contradictory match outcomes or evidence scopes as uncertain;
+  resolving a pending identity lookup never unmasks old quotes, events or watch
+  eligibility and never copies market data from a duplicate. Keep uncertain
+  non-direct cards in the related section after reconciliation.
 
 ## 2026-11-22 — Trend V3 complete direct watch lists (#512)
 

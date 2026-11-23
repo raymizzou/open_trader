@@ -221,6 +221,34 @@ def global_strength(asset):
     return Decimal(match[1]) if match and Decimal(match[1]) <= 100 else None
 
 
+def reconcile_lookup(preferred, aliases):
+    # Winner selection uses the original rows. Only the exact-identity match
+    # fact can aggregate; losing quotes and eligibility never transfer.
+    if not any(row.get("platform_match_verified") is True for row in aliases):
+        return preferred
+    scopes = set()
+    for row in aliases:
+        scope = row.get("lookup_scope")
+        if scope is not None and (not isinstance(scope, str) or not scope.strip()):
+            raise ValueError("Lookup scope must be nonempty text")
+        scopes.add(scope)
+    conflict = len(scopes) > 1 or any(row.get("lookup") == "miss" for row in aliases)
+    reconciled = dict(preferred)
+    reconciled["platform_match_verified"] = not conflict
+    if conflict:
+        reconciled["lookup"] = "pending"
+        reconciled["reason"] = "平台匹配证据冲突或适用范围待核。"
+    elif preferred.get("lookup") == "pending":
+        # Removing a pending lookup must not unmask its old quote/event payload
+        # or activate an old watch flag. Identity success proves no market data.
+        for field in ("lookup", "trend", "strength", "local_strength", "signal"):
+            reconciled.pop(field, None)
+        reconciled["signal_events"] = []
+        reconciled["watch_eligible"] = False
+        reconciled["reason"] = "平台身份已核实，行情字段待核。"
+    return reconciled
+
+
 def instrument_sections(group, direction):
     candidates = []
     for field in ("direct", "searchable", "related"):
@@ -235,6 +263,11 @@ def instrument_sections(group, direction):
         code = asset.get("code")
         if scope is not None and identifier is not None and isinstance(code, str):
             ids_by_code.setdefault((*scope, code), set()).add(identifier)
+    aliases_by_identity = {}
+    for asset in candidates:
+        identity = instrument_identity(asset, ids_by_code)
+        if identity is not None:
+            aliases_by_identity.setdefault(identity, []).append(asset)
     sections = [[], [], []]
     seen = set()
     # Resolve strongest verified classification before removing duplicates.
@@ -251,7 +284,14 @@ def instrument_sections(group, direction):
                 if identity in seen:
                     continue
                 seen.add(identity)
-            sections[priority].append(asset)
+            reconciled = reconcile_lookup(
+                asset, aliases_by_identity.get(identity, [asset])
+            )
+            final_category = (
+                0 if reconciled.get("direct_verified") is True else
+                1 if reconciled.get("platform_match_verified") is True else 2
+            )
+            sections[final_category].append(reconciled)
     def order(asset):
         strength = global_strength(asset)
         return (strength is None,

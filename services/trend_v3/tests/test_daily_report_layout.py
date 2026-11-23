@@ -879,3 +879,94 @@ def test_group_coverage_after_three_without_direct(tmp_path):
         assert '<待核>' not in html
         assert "暂无已核实的直属成员。" in row
         assert_formal_records(html)
+
+
+@pytest.mark.parametrize("case", [
+    "matched-alias", "pending-preferred", "pending-and-hit-on-one-row",
+    "miss-versus-hit", "conflicting-flags", "different-date", "different-version",
+    "scope-missing", "different-identity",
+])
+def test_direct_card_preserves_verified_lookup_fact(tmp_path, case):
+    base = {"code": "A", "name": "合成同一标的", "market": "US",
+            "instrument_type": "ETF", "instrument_id": "1",
+            "lookup_scope": "2040-01-01/v1"}
+    direct = {**base, "direct_verified": True}
+    alias = {**base, "platform_match_verified": True,
+             "trend": "LOSING-QUOTE", "strength": "99 / 100",
+             "signal_events": ["开香槟"], "watch_eligible": True}
+    aliases = [alias]
+    if case in ("pending-preferred", "pending-and-hit-on-one-row"):
+        direct.update(lookup="pending", trend="MASKED-QUOTE",
+                      strength="88 / 100", local_strength=77,
+                      signal_events=["反抽警报"], watch_eligible=True,
+                      reason="OLD-PENDING-LOOKUP")
+    if case == "pending-and-hit-on-one-row":
+        direct["platform_match_verified"] = True
+        aliases = []
+    elif case == "miss-versus-hit":
+        direct.update(lookup="miss", trend="MASKED-QUOTE", strength="88 / 100",
+                      signal_events=["反抽警报"], watch_eligible=True)
+    elif case == "conflicting-flags":
+        direct.update(lookup="miss", platform_match_verified=True)
+        aliases = []
+    elif case == "different-date":
+        alias["lookup_scope"] = "2039-12-31/v1"
+    elif case == "different-version":
+        alias["lookup_scope"] = "2040-01-01/v2"
+    elif case == "scope-missing":
+        del alias["lookup_scope"]
+    elif case == "different-identity":
+        alias["instrument_id"] = "2"
+    html = render(tmp_path, {"date": "2040-01-01", "long": [{
+        "seat": 1, "name": "核实归并", "direct": [direct],
+        "searchable": aliases}]}, case)
+    row = re.search(r"<details\b.*?</details>", html, re.S)[0]
+    first, second, third = re.split(
+        r"<h3>(?:大类直属|趋势动物里面能够查到|相关的标的)</h3>", row
+    )[1:]
+    assert first.count('class="asset reader-card"') == 1
+    assert 'class="asset reader-card"' not in third
+    assert 'class="reader-marker">直属</span>' in first
+    compatible = case in ("matched-alias", "pending-preferred",
+                          "pending-and-hit-on-one-row")
+    assert ('class="reader-marker">趋势动物可查</span>' in first) is compatible
+    assert row.count('class="asset reader-card"') == (
+        2 if case == "different-identity" else 1)
+    if case != "different-identity":
+        assert 'class="asset reader-card"' not in second
+    assert '应建观察仓' not in first
+    assert 'LOSING-QUOTE' not in first and 'MASKED-QUOTE' not in first
+    assert '99 / 100' not in first and '88 / 100' not in first
+    assert '77 / 100' not in first
+    assert '<dd class="reader-event">无</dd>' in first
+    assert '<dt>当前趋势</dt><dd>待核</dd>' in first
+    assert '<dt>强度</dt><dd>待核</dd>' in first
+    assert 'OLD-PENDING-LOOKUP' not in first
+    assert '查不到' not in first  # conflict is uncertain; positive is known found
+    assert 'lookup_scope' not in html and '2040-01-01/v1' not in html
+
+
+def test_non_direct_lookup_conflict_stays_related(tmp_path):
+    base = {"code": "Q", "name": "合成关联", "market": "US",
+            "instrument_type": "ETF", "instrument_id": "12",
+            "lookup_scope": "2040-01-01/v1"}
+    html = render(tmp_path, {"date": "2040-01-01", "long": [{
+        "seat": 1, "name": "匹配冲突", "searchable": [{
+            **base, "platform_match_verified": True,
+            "trend": "MASKED-QUOTE", "strength": "99 / 100",
+            "signal_events": ["开香槟"], "watch_eligible": True}],
+        "related": [{**base, "lookup": "miss"}]}]}, "conflict-placement")
+    row = re.search(r"<details\b.*?</details>", html, re.S)[0]
+    first, second, third = re.split(
+        r"<h3>(?:大类直属|趋势动物里面能够查到|相关的标的)</h3>", row
+    )[1:]
+    assert row.count('class="asset reader-card"') == 1
+    assert 'class="asset reader-card"' not in first + second
+    assert 'class="asset reader-card"' in third
+    assert '<dt>当前趋势</dt><dd>待核</dd>' in third
+    assert '<dt>强度</dt><dd>待核</dd>' in third
+    assert '<dd class="reader-event">无</dd>' in third
+    assert '趋势动物可查</span>' not in row and '应建观察仓' not in row
+    assert '直属</span>' not in row and 'MASKED-QUOTE' not in row
+    assert '99 / 100' not in row and '查不到' not in row
+    assert 'lookup_scope' not in html
