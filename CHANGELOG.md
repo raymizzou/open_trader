@@ -19,6 +19,9 @@
   resolving a pending identity lookup never unmasks old quotes, events or watch
   eligibility and never copies market data from a duplicate. Keep uncertain
   non-direct cards in the related section after reconciliation.
+- Reconcile negative lookup scopes even without a positive match: an old-version
+  miss with a different-version pending result stays uncertain. Price/event-only
+  rows do not create identity-query conflicts or hide independent current facts.
 
 ## 2026-11-22 — Trend V3 complete direct watch lists (#512)
 

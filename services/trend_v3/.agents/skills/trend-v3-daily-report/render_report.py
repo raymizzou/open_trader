@@ -224,17 +224,25 @@ def global_strength(asset):
 def reconcile_lookup(preferred, aliases):
     # Winner selection uses the original rows. Only the exact-identity match
     # fact can aggregate; losing quotes and eligibility never transfer.
-    if not any(row.get("platform_match_verified") is True for row in aliases):
+    evidence = [row for row in aliases
+                if row.get("platform_match_verified") is True
+                or row.get("lookup") in LOOKUP_LABELS]
+    if not evidence:
         return preferred
+    has_match = any(row.get("platform_match_verified") is True for row in evidence)
     scopes = set()
-    for row in aliases:
+    for row in evidence:
         scope = row.get("lookup_scope")
         if scope is not None and (not isinstance(scope, str) or not scope.strip()):
             raise ValueError("Lookup scope must be nonempty text")
         scopes.add(scope)
-    conflict = len(scopes) > 1 or any(row.get("lookup") == "miss" for row in aliases)
+    conflict = len(scopes) > 1 or (
+        has_match and any(row.get("lookup") == "miss" for row in evidence)
+    )
+    if not has_match and not conflict:
+        return preferred
     reconciled = dict(preferred)
-    reconciled["platform_match_verified"] = not conflict
+    reconciled["platform_match_verified"] = has_match and not conflict
     if conflict:
         reconciled["lookup"] = "pending"
         reconciled["reason"] = "平台匹配证据冲突或适用范围待核。"

@@ -895,6 +895,10 @@ def test_direct_card_preserves_verified_lookup_fact(tmp_path, case):
              "trend": "LOSING-QUOTE", "strength": "99 / 100",
              "signal_events": ["开香槟"], "watch_eligible": True}
     aliases = [alias]
+    if case in ("different-date", "different-version", "scope-missing"):
+        # Scope conflicts require actual identity-query outcomes on both rows;
+        # ordinary price/event records do not dispute a verified lookup.
+        direct["lookup"] = "pending"
     if case in ("pending-preferred", "pending-and-hit-on-one-row"):
         direct.update(lookup="pending", trend="MASKED-QUOTE",
                       strength="88 / 100", local_strength=77,
@@ -970,3 +974,54 @@ def test_non_direct_lookup_conflict_stays_related(tmp_path):
     assert '直属</span>' not in row and 'MASKED-QUOTE' not in row
     assert '99 / 100' not in row and '查不到' not in row
     assert 'lookup_scope' not in html
+
+
+def test_negative_lookup_with_changed_scope_is_pending(tmp_path):
+    base = {"code": "A", "name": "合成直属", "market": "US",
+            "instrument_type": "ETF", "instrument_id": "1"}
+    for label, alias_scope, expected in (
+        ("changed", "2040-01-01/v2", "待核"),
+        ("same", "2040-01-01/v1", "查不到"),
+    ):
+        html = render(tmp_path, {"date": "2040-01-01", "long": [{
+            "seat": 1, "name": "查询版本核对", "direct": [{
+                **base, "direct_verified": True, "lookup": "miss",
+                "lookup_scope": "2040-01-01/v1", "trend": "MASKED-QUOTE",
+                "strength": "88 / 100", "signal_events": ["开香槟"],
+                "watch_eligible": True}], "related": [{
+                    **base, "lookup": "pending", "lookup_scope": alias_scope,
+                    "platform_match_verified": False}]}]}, label)
+        row = re.search(r"<details\b.*?</details>", html, re.S)[0]
+        first, second, third = re.split(
+            r"<h3>(?:大类直属|趋势动物里面能够查到|相关的标的)</h3>", row
+        )[1:]
+        assert row.count('class="asset reader-card"') == 1
+        assert 'class="asset reader-card"' in first
+        assert 'class="asset reader-card"' not in second + third
+        assert f'<dt>当前趋势</dt><dd>{expected}</dd>' in first
+        assert f'<dt>强度</dt><dd>{expected}</dd>' in first
+        assert '<dd class="reader-event">无</dd>' in first
+        assert '直属</span>' in first and '趋势动物可查</span>' not in row
+        assert '应建观察仓' not in row and 'MASKED-QUOTE' not in row
+        assert '88 / 100' not in row and 'lookup_scope' not in html
+        if label == "changed":
+            assert '查不到' not in first
+
+    # A price/event row is not an identity-query outcome. Its scope does not
+    # dispute a separate verified match or mask the preferred current facts.
+    for label, quote_scope in (("quote-other-scope", "2040-01-01/v2"),
+                               ("quote-no-scope", None)):
+        direct = {**base, "direct_verified": True, "trend": "热",
+                  "strength": "65 / 100", "signal_events": ["温转热"],
+                  "watch_eligible": True}
+        if quote_scope is not None:
+            direct["lookup_scope"] = quote_scope
+        html = render(tmp_path, {"date": "2040-01-01", "long": [{
+            "seat": 1, "name": "行情独立", "direct": [direct],
+            "related": [{**base, "platform_match_verified": True,
+                         "lookup_scope": "2040-01-01/v1"}]}]}, label)
+        assert html.count('class="asset reader-card"') == 1
+        assert '<dt>当前趋势</dt><dd>热</dd>' in html
+        assert '<dt>强度</dt><dd>65 / 100</dd>' in html
+        assert '<dd class="reader-event">温转热</dd>' in html
+        assert '应建观察仓</span>' in html and '趋势动物可查</span>' in html
