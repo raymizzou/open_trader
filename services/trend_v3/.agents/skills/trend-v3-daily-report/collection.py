@@ -93,7 +93,12 @@ def reconcile_lookup(preferred, aliases):
     conflict = len(scopes) > 1 or (
         has_match and any(row.get("lookup") == "miss" for row in evidence)
     )
-    if not has_match and not conflict:
+    same_scope_miss = (
+        preferred.get("lookup") == "pending"
+        and None not in scopes
+        and any(row.get("lookup") == "miss" for row in evidence)
+    )
+    if not has_match and not conflict and not same_scope_miss:
         return preferred
     reconciled = dict(preferred)
     reconciled["platform_match_verified"] = has_match and not conflict
@@ -102,6 +107,11 @@ def reconcile_lookup(preferred, aliases):
             reconciled["_signal_pending"] = True
         reconciled["lookup"] = "pending"
         reconciled["reason"] = "平台匹配证据冲突或适用范围待核。"
+    elif same_scope_miss and not has_match:
+        # A pending query does not invalidate a completed negative in the same
+        # explicit scope. Keep winner identity/classification, never donor facts.
+        reconciled["lookup"] = "miss"
+        reconciled.pop("reason", None)
     elif preferred.get("lookup") == "pending":
         # Removing a pending lookup must not unmask its old quote/event payload
         # or activate an old watch flag. Identity success proves no market data.

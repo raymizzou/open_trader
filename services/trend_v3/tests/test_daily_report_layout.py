@@ -1042,6 +1042,76 @@ def test_non_direct_lookup_conflict_stays_related(tmp_path):
     assert 'lookup_scope' not in html
 
 
+def test_same_scope_negative_lookup_survives_dedup(tmp_path):
+    base = {"code": "MISS", "name": "合成阴性", "market": "US",
+            "instrument_type": "ETF", "instrument_id": "negative-id",
+            "lookup_scope": "2040-01-01/v1"}
+    for placement in ("direct", "related"):
+        for reverse in (False, True):
+            pending = {**base, "lookup": "pending", "trend": "STALE-QUOTE",
+                       "strength": 88, "local_strength": 77,
+                       "signal_events": ["开香槟"], "watch_eligible": True,
+                       "reason": "STALE-PENDING-REASON"}
+            negative = {**base, "lookup": "miss", "reason": "LOSING-REASON"}
+            group = {"seat": 1, "name": "阴性查询"}
+            if placement == "direct":
+                pending["direct_verified"] = True
+                group["direct" if not reverse else "related"] = [pending]
+                group["related" if not reverse else "direct"] = [negative]
+            else:
+                group["related"] = ([negative, pending] if reverse
+                                    else [pending, negative])
+            html = render(tmp_path, {"date": "2040-01-01", "long": [group]},
+                          f"negative-{placement}-{reverse}")
+            row = re.search(r"<details\b.*?</details>", html, re.S)[0]
+            sections = re.split(
+                r"<h3>(?:大类直属|趋势动物里面能够查到|相关的标的)</h3>", row
+            )[1:]
+            assert row.count('class="asset reader-card"') == 1
+            assert 'class="asset reader-card"' in sections[
+                0 if placement == "direct" else 2]
+            for label in ("当前趋势", "全局强度", "同品种强度"):
+                assert f"<dt>{label}</dt><dd>查不到</dd>" in row
+            assert '<dd class="reader-event">无</dd>' in row
+            for hidden in ("STALE-QUOTE", "88 / 100", "77 / 100", "开香槟",
+                           "应建观察仓", "趋势动物可查</span>",
+                           "STALE-PENDING-REASON", "lookup_scope"):
+                assert hidden not in row
+            if placement == "direct" or not reverse:
+                assert "LOSING-REASON" not in row
+
+    # Absent/partial scopes cannot promote another row's negative. An ordinary
+    # quote/watch winner is not a pending query and keeps its independent facts.
+    for case in ("no-scopes", "partial-scope", "quote-winner"):
+        winner = {**base, "direct_verified": True, "lookup": "pending"}
+        negative = {**base, "lookup": "miss"}
+        if case == "no-scopes":
+            winner.pop("lookup_scope")
+            negative.pop("lookup_scope")
+        elif case == "partial-scope":
+            negative.pop("lookup_scope")
+        else:
+            winner.pop("lookup")
+            winner.update(trend="热", strength=65, local_strength=45,
+                          signal_events=["温转热"], watch_eligible=True)
+        html = render_verified_watch(tmp_path, {
+            "date": "2040-01-01", "long": [{
+                "seat": 1, "name": "查询边界", "direct": [winner],
+                "related": [negative]}]}, "negative-" + case)
+        assert html.count('class="asset reader-card"') == 1
+        assert "查不到" not in html
+        if case == "quote-winner":
+            assert '<dt>当前趋势</dt><dd>热</dd>' in html
+            assert '<dt>全局强度</dt><dd>65 / 100</dd>' in html
+            assert '<dt>同品种强度</dt><dd>45 / 100</dd>' in html
+            assert '<dd class="reader-event">温转热</dd>' in html
+            assert '应建观察仓</span>' in html
+        else:
+            for label in ("当前趋势", "全局强度", "同品种强度"):
+                assert f"<dt>{label}</dt><dd>待核</dd>" in html
+            assert '应建观察仓</span>' not in html
+
+
 def test_negative_lookup_with_changed_scope_is_pending(tmp_path):
     base = {"code": "A", "name": "合成直属", "market": "US",
             "instrument_type": "ETF", "instrument_id": "1"}
@@ -1904,6 +1974,81 @@ def test_explicit_collection_missing_lookup_evidence_stays_pending(tmp_path):
     report.pop("collection")
     html = render(tmp_path, report, "legacy-miss")
     assert "查不到" in html
+
+
+def test_same_scope_negative_lookup_requires_applicable_collection_proof(tmp_path):
+    from copy import deepcopy
+
+    from test_hourly_collection import control
+
+    source = complete_report()
+    group = source["long"][0]
+    negative = group["searchable"].pop(0)
+    negative.update(lookup="miss", platform_match_verified=False,
+                    lookup_scope="2026-11-22/v1")
+    group["related"] = [negative]
+    group["direct"] = [{**negative, "lookup": "pending",
+                        "direct_verified": True, "reason": "STALE-PENDING"}]
+    group["coverage"]["instrument_ids"].append("btc")
+    manifest = source["collection"]
+    old_prefix = "/long/0/searchable/0/"
+    manifest["worklist"] = [item for item in manifest["worklist"]
+                            if not item["path"].startswith(old_prefix)]
+    manifest["evidence"] = {path: proof
+                            for path, proof in manifest["evidence"].items()
+                            if not path.startswith(old_prefix)}
+    manifest["evidence"]["/long/0/coverage"]["value"] = deepcopy(group["coverage"])
+    path = "/long/0/related/0/lookup"
+    for section in ("direct", "related"):
+        manifest["worklist"].append({
+            "path": f"/long/0/{section}/0/lookup", "label": "BTC lookup",
+            "market": "CRYPTO", "target_date": "2026-11-22"})
+    manifest["evidence"][path] = {
+        "state": "verified", "data_date": "2026-11-22", "version": "v1",
+        "identity": "btc", "market": "CRYPTO", "instrument_type": "spot",
+        "source": "fixture-full-negative", "value": "miss", "full_lookup": True}
+    api = control()
+    for case in ("valid", "missing", "invalid", "not-full", "wrong-date",
+                 "wrong-identity"):
+        report = deepcopy(source)
+        proofs = report["collection"]["evidence"]
+        if case == "missing":
+            proofs.pop(path)
+        elif case == "invalid":
+            proofs[path] = None
+        elif case == "not-full":
+            proofs[path]["full_lookup"] = False
+        elif case == "wrong-date":
+            proofs[path]["data_date"] = "2026-11-21"
+        elif case == "wrong-identity":
+            proofs[path]["identity"] = "other-id"
+        html = render(tmp_path, report, "dedup-proof-" + case)
+        cards = re.findall(r'<li class="asset reader-card">.*?</li>', html, re.S)
+        btc = next(card for card in cards if 'reader-name">BTC ' in card)
+        expected = "查不到" if case == "valid" else "待核"
+        for label in ("当前趋势", "全局强度", "同品种强度"):
+            assert f"<dt>{label}</dt><dd>{expected}</dd>" in btc
+        assert '<dd class="reader-event">待查</dd>' in btc
+        assert "应建观察仓" not in btc
+        if case == "valid":
+            assert "STALE-PENDING" not in btc
+        # One applicable proof can serve the eligible deduplicated card, but
+        # cannot complete the separate unresolved direct lookup obligation.
+        assert "数据收集中" in html and "数据已完备" not in html
+        assert not api.assess(report)["complete"]
+        if case != "valid":
+            assert "查不到" not in btc
+        else:
+            # With the unresolved alias removed, the full negative is complete.
+            report["long"][0]["direct"] = []
+            report["long"][0]["coverage"]["instrument_ids"].pop()
+            report["collection"]["evidence"]["/long/0/coverage"]["value"] = (
+                deepcopy(report["long"][0]["coverage"]))
+            report["collection"]["worklist"] = [
+                item for item in report["collection"]["worklist"]
+                if item["path"] != "/long/0/direct/0/lookup"]
+            assert api.assess(report)["complete"]
+            assert "数据已完备" in render(tmp_path, report, "full-negative-complete")
 
 
 def test_reconciled_lookup_conflict_prevents_completion(tmp_path):

@@ -4,6 +4,20 @@
 
 # Changelog
 
+## 2026-11-24 — Trend V3 lookup and manual report scope (#528)
+
+- Preserve a completed negative lookup when deduplicating pending query rows
+  with the same verified identity and explicit scope. Keep card placement and
+  mask quotes, both strengths, events and watch markers; retain collection proof
+  and target-date checks before showing absence or completing a report.
+- Use Taipei 08:30 for ordinary manual first reports. Retain confirmed cutoffs
+  for reuse/history, record explicit revision overrides, and keep late evidence
+  bound to frozen targets. Ordinary reads add no market requests.
+- Distinguish official board seats from manual trading-pool continuation and
+  new-position watch candidates from class signal observations. Clarify fixed
+  offline output versus locked local reformatting; root trading rules stay with
+  their existing owner.
+
 ## 2026-11-23 — Trend V3 card freshness display (#507)
 
 - Apply the approved whole-card green/yellow reader layout. Green requires a
