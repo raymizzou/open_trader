@@ -1116,13 +1116,13 @@ def test_negative_lookup_with_changed_scope_is_pending(tmp_path):
     base = {"code": "A", "name": "合成直属", "market": "US",
             "instrument_type": "ETF", "instrument_id": "1"}
     for label, alias_scope, expected in (
-        ("changed", "2040-01-01/v2", "待核"),
-        ("same", "2040-01-01/v1", "查不到"),
+        ("changed", "2039-12-31/fixture-v2", "待核"),
+        ("same", "2039-12-31/fixture-v1", "查不到"),
     ):
         html = render_verified_watch(tmp_path, {"date": "2040-01-01", "long": [{
             "seat": 1, "name": "查询版本核对", "direct": [{
                 **base, "direct_verified": True, "lookup": "miss",
-                "lookup_scope": "2040-01-01/v1", "trend": "MASKED-QUOTE",
+                "lookup_scope": "2039-12-31/fixture-v1", "trend": "MASKED-QUOTE",
                 "strength": "88 / 100", "signal_events": ["开香槟"],
                 "watch_eligible": True}], "related": [{
                     **base, "lookup": "pending", "lookup_scope": alias_scope,
@@ -2051,6 +2051,86 @@ def test_same_scope_negative_lookup_requires_applicable_collection_proof(tmp_pat
             assert "数据已完备" in render(tmp_path, report, "full-negative-complete")
 
 
+@pytest.mark.parametrize("case,scope,proof_scope,version,expected", [
+    ("stale-version", "2026-11-22/v2", None, "v1", "待核"),
+    ("canonical", "2026-11-22/v2", None, "v2", "查不到"),
+    ("explicit-canonical", "2026-11-22/v2", "2026-11-22/v2", "v2", "查不到"),
+    ("explicit-contradiction", "2026-11-22/v2", "2026-11-22/v1", "v2", "待核"),
+    ("receipt-field-contradiction", "2026-11-22/v2", "2026-11-22/v2", "v1", "待核"),
+    ("opaque-bound", "private-cutoff/catalog", "private-cutoff/catalog",
+     "v2", "查不到"),
+    ("opaque-unbound", "private-cutoff/catalog", None, "v2", "待核"),
+    ("opaque-partial", "private-cutoff/catalog", "catalog", "v2", "待核"),
+])
+def test_negative_lookup_proof_must_cover_declared_scope(
+    tmp_path, case, scope, proof_scope, version, expected
+):
+    from copy import deepcopy
+
+    from test_hourly_collection import control
+
+    api = control()
+    for mode in ("pending-first", "negative-first", "single-negative"):
+        report = complete_report()
+        group = report["long"][0]
+        negative = group["searchable"].pop(0)
+        negative.update(lookup="miss", platform_match_verified=False,
+                        lookup_scope=scope, trend="PRIVATE-STALE-QUOTE",
+                        strength=98, local_strength=97,
+                        signal_events=["开香槟"], watch_eligible=True)
+        pending = {**negative, "lookup": "pending", "direct_verified": True}
+        if mode == "single-negative":
+            negative["direct_verified"] = True
+            rows = [negative]
+        else:
+            rows = ([pending, negative] if mode == "pending-first"
+                    else [negative, pending])
+        group["direct"] = rows
+        group["coverage"]["instrument_ids"] = ["btc"] * len(rows)
+        manifest = report["collection"]
+        old = "/long/0/searchable/0/"
+        manifest["worklist"] = [item for item in manifest["worklist"]
+                                if not item["path"].startswith(old)]
+        manifest["evidence"] = {path: proof
+                                for path, proof in manifest["evidence"].items()
+                                if not path.startswith(old)}
+        manifest["evidence"]["/long/0/coverage"]["value"] = deepcopy(group["coverage"])
+        for index, row in enumerate(rows):
+            path = f"/long/0/direct/{index}/lookup"
+            manifest["worklist"].append({
+                "path": path, "label": "BTC lookup", "market": "CRYPTO",
+                "target_date": "2026-11-22"})
+            if row["lookup"] != "miss":
+                continue
+            manifest["evidence"][path] = {
+                "state": "verified", "data_date": "2026-11-22",
+                "identity": "btc", "market": "CRYPTO", "instrument_type": "spot",
+                "source": "PRIVATE-RECEIPT", "version": version,
+                "value": "miss", "full_lookup": True}
+            if proof_scope is not None:
+                manifest["evidence"][path]["lookup_scope"] = proof_scope
+        html = render(tmp_path, report, f"scope-proof-{case}-{mode}")
+        row = next(row for row in re.findall(r"<details\b.*?</details>", html, re.S)
+                   if 'reader-name">BTC ' in row)
+        sections = re.split(
+            r"<h3>(?:大类直属|趋势动物里面能够查到|相关的标的)</h3>", row
+        )[1:]
+        assert row.count('class="asset reader-card"') == 1
+        assert 'class="asset reader-card"' in sections[0]
+        for label in ("当前趋势", "全局强度", "同品种强度"):
+            assert f"<dt>{label}</dt><dd>{expected}</dd>" in row
+        assert '<dd class="reader-event">待查</dd>' in row
+        for hidden in ("PRIVATE-", scope, "lookup_scope", "开香槟",
+                       "98 / 100", "97 / 100", "应建观察仓", "趋势动物可查</span>"):
+            assert hidden not in row
+        complete = mode == "single-negative" and expected == "查不到"
+        assert api.assess(report)["complete"] is complete
+        assert ("数据已完备" in html) is complete
+        assert ("数据收集中" in html) is not complete
+        if expected == "待核":
+            assert "查不到" not in html
+
+
 def test_reconciled_lookup_conflict_prevents_completion(tmp_path):
     from copy import deepcopy
 
@@ -2065,7 +2145,8 @@ def test_reconciled_lookup_conflict_prevents_completion(tmp_path):
         if kind == "miss":
             alias.update(lookup="miss", platform_match_verified=False)
         if foreign:
-            alias.update(market="US", instrument_type="ETF", data_date="2026-11-20")
+            alias.update(market="US", instrument_type="ETF", data_date="2026-11-20",
+                         lookup_scope="2026-11-20/v1")
         group["searchable"].append(alias)
         group["coverage"]["instrument_ids"].append("btc")
         collection = report["collection"]

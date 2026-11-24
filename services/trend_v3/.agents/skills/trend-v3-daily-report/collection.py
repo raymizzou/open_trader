@@ -376,6 +376,25 @@ def field_evidence_matches(asset, field, proof, target, states=("verified",)):
     )
 
 
+def lookup_scope_matches(asset, proof):
+    """Bind a negative receipt independently to the row's declared scope."""
+    scope = asset.get("lookup_scope")
+    if scope is None:
+        # Preserve the scope-less receipt contract, not a partial explicit bind.
+        return "lookup_scope" not in proof
+    if not isinstance(scope, str) or not scope.strip():
+        return False
+    if "lookup_scope" in proof and proof["lookup_scope"] != scope:
+        return False
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}/[^/]+", scope):
+        # Only this complete date/version form has defined component semantics.
+        # Even an equal explicit scope cannot override contradictory fields.
+        return scope == f"{proof.get('data_date')}/{proof.get('version')}"
+    # Opaque cutoffs/catalog IDs cannot be reconstructed from the row or a
+    # version substring; the receipt must independently record the exact scope.
+    return proof.get("lookup_scope") == scope
+
+
 def field_proof_matches(asset, field, proof, target):
     value = asset.get(field)
     valid_value = value is not None
@@ -386,6 +405,8 @@ def field_proof_matches(asset, field, proof, target):
         )
         if valid_value:
             valid_value = Decimal(raw) <= 100
+    elif field == "lookup":
+        valid_value = value == "miss" and lookup_scope_matches(asset, proof)
     elif field == "trend":
         valid_value = (
             isinstance(value, str)

@@ -10,6 +10,10 @@
   with the same verified identity and explicit scope. Keep card placement and
   mask quotes, both strengths, events and watch markers; retain collection proof
   and target-date checks before showing absence or completing a report.
+- Bind scoped negative receipts to their declared lookup scope for both display
+  and completion. A canonical date/version must match the receipt fields;
+  opaque scopes require an independently recorded exact receipt scope.
+  Contradictory, partial or unverifiable receipts stay pending.
 - Use Taipei 08:30 for ordinary manual first reports. Retain confirmed cutoffs
   for reuse/history, record explicit revision overrides, and keep late evidence
   bound to frozen targets. Ordinary reads add no market requests.
