@@ -1248,7 +1248,7 @@ def daily_files(home, data, *, supplemental=None):
     return root, live, upstream
 
 
-def run_daily_plan(home, broker, now, live, monkeypatch):
+def run_daily_plan(home, broker, now, live, monkeypatch, *, command=("plan",)):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     release_dir = home / ".config/trend-animals/skill-releases" / RELEASE
     monkeypatch.setattr(
@@ -1265,7 +1265,152 @@ def run_daily_plan(home, broker, now, live, monkeypatch):
         "FutuPaperBroker",
         lambda config, **options: FutuPaperBroker(config, sdk=broker, **options),
     )
-    return paper_cli.main(["--session", NATIVE_SESSION, "plan"])
+    return paper_cli.main(["--session", NATIVE_SESSION, *command])
+
+
+def test_original_tab_direct_parent_plans_without_process_listing(
+    tmp_path, monkeypatch, capsys
+):
+    data, _ = report("ABC")
+    _, live, _ = daily_files(tmp_path, data)
+    live["foreground"]["pid"] = os.getppid()
+    listings = []
+
+    def deny_listing(*args, **kwargs):
+        listings.append(args)
+        raise PermissionError("process listing denied")
+
+    monkeypatch.setattr(paper_authority.subprocess, "run", deny_listing)
+    opend = PlanningOpenD()
+    assert run_daily_plan(tmp_path, opend, PREOPEN, live, monkeypatch) == 0
+    planned = json.loads(capsys.readouterr().out)
+    (line,) = planned["lines"]
+    assert (line["code"], line["quantity"], line["order_type"]) == (
+        "US.ABC",
+        100,
+        "MARKET",
+    )
+    assert planned["execution"] == "awaiting_scheduled_tab_approval"
+    assert opend.quote_calls and opend.calls
+    assert opend.writes == []
+    assert listings == []
+
+
+@pytest.mark.parametrize("caller", ["unrelated", "missing", "deeper-unavailable"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("plan",),
+        ("approve", "plan-id"),
+        ("submit", "plan-id"),
+        ("status",),
+        ("reconcile", "plan-id"),
+    ],
+)
+def test_original_tab_unavailable_ancestry_rejects_before_broker(
+    tmp_path, monkeypatch, capsys, caller, command
+):
+    data, _ = report("ABC")
+    _, live, _ = daily_files(tmp_path, data)
+    live["foreground"]["pid"] = os.getppid() + 10_000_000
+    if caller == "missing":
+        live["foreground"].pop("pid")
+    elif caller == "deeper-unavailable":
+        monkeypatch.setattr(paper_authority.os, "getpid", lambda: 31_004)
+        monkeypatch.setattr(paper_authority.os, "getppid", lambda: 31_000)
+        live["foreground"]["pid"] = 31_001
+    listings = []
+
+    def deny_listing(*args, **kwargs):
+        listings.append(args)
+        raise PermissionError("process listing denied")
+
+    def no_broker(**kwargs):
+        pytest.fail("broker opened without proven original process ancestry")
+
+    monkeypatch.setattr(paper_authority.subprocess, "run", deny_listing)
+    opend = PlanningOpenD()
+    monkeypatch.setattr(opend, "OpenQuoteContext", no_broker)
+    monkeypatch.setattr(opend, "OpenSecTradeContext", no_broker)
+    with pytest.raises(SystemExit) as stopped:
+        run_daily_plan(tmp_path, opend, PREOPEN, live, monkeypatch, command=command)
+    assert stopped.value.code == 2
+    assert "native scheduled tab or original launch prompt is unverified" in (
+        capsys.readouterr().err
+    )
+    assert bool(listings) == (caller != "missing")
+    assert opend.quote_calls == opend.calls == opend.writes == []
+
+
+@pytest.mark.parametrize("guard", ["session", "launch"])
+def test_original_tab_matching_parent_preserves_session_and_launch_guards(
+    tmp_path, monkeypatch, capsys, guard
+):
+    data, _ = report("ABC")
+    _, live, _ = daily_files(tmp_path, data)
+    live["foreground"]["pid"] = os.getppid()
+    if guard == "session":
+        state = tmp_path / ".config/trend-animals/daily-state"
+        launch = json.loads((state / f"{DAY}.launch.json").read_bytes())
+        launch["session"] = "00000000-0000-0000-0000-000000000002"
+        private_input(state, f"{DAY}.launch.json", launch)
+        reason = "scheduled launch receipt does not match this day and session"
+    else:
+        transcript = tmp_path / f".codex/sessions/rollout-{NATIVE_SESSION}.jsonl"
+        transcript.write_bytes(
+            transcript.read_bytes().replace(NATIVE_LAUNCH.encode(), b"6" * 32)
+        )
+        reason = "native scheduled tab or original launch prompt is unverified"
+
+    def no_listing(*args, **kwargs):
+        pytest.fail("matching kernel parent should not need a process listing")
+
+    def no_broker(**kwargs):
+        pytest.fail("broker opened without matching session and launch")
+
+    monkeypatch.setattr(paper_authority.subprocess, "run", no_listing)
+    opend = PlanningOpenD()
+    monkeypatch.setattr(opend, "OpenQuoteContext", no_broker)
+    monkeypatch.setattr(opend, "OpenSecTradeContext", no_broker)
+    with pytest.raises(SystemExit) as stopped:
+        run_daily_plan(tmp_path, opend, PREOPEN, live, monkeypatch)
+    assert stopped.value.code == 2
+    assert reason in capsys.readouterr().err
+    assert opend.quote_calls == opend.calls == opend.writes == []
+
+
+@pytest.mark.parametrize("related", [True, False])
+def test_original_tab_deeper_ancestry_requires_traversal_proof(
+    tmp_path, monkeypatch, capsys, related
+):
+    data, _ = report("ABC")
+    _, live, _ = daily_files(tmp_path, data)
+    live["foreground"]["pid"] = 31_002 if related else 31_003
+    monkeypatch.setattr(paper_authority.os, "getpid", lambda: 31_004)
+    monkeypatch.setattr(paper_authority.os, "getppid", lambda: 31_000)
+    parents = {31_000: 31_001, 31_001: 31_002, 31_002: 1}
+
+    def list_parent(command, **kwargs):
+        assert command[:4] == ["/bin/ps", "-o", "ppid=", "-p"]
+        return SimpleNamespace(stdout=str(parents[int(command[4])]).encode())
+
+    monkeypatch.setattr(paper_authority.subprocess, "run", list_parent)
+    opend = PlanningOpenD()
+    if related:
+        assert run_daily_plan(tmp_path, opend, PREOPEN, live, monkeypatch) == 0
+        planned = json.loads(capsys.readouterr().out)
+        (line,) = planned["lines"]
+        assert (line["code"], line["quantity"]) == ("US.ABC", 100)
+        assert planned["execution"] == "awaiting_scheduled_tab_approval"
+    else:
+        with pytest.raises(SystemExit) as stopped:
+            run_daily_plan(tmp_path, opend, PREOPEN, live, monkeypatch)
+        assert stopped.value.code == 2
+        assert "native scheduled tab or original launch prompt is unverified" in (
+            capsys.readouterr().err
+        )
+        assert opend.quote_calls == opend.calls == []
+    assert opend.writes == []
 
 
 def update_selection(revision, selection):

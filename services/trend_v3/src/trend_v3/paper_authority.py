@@ -110,19 +110,26 @@ def native_terminal(home, terminal):
 
 
 def is_ancestor(pid):
-    current = os.getpid()
+    if pid == os.getpid():
+        return True
+    # The kernel proves our immediate parent without a process-listing command.
+    current = os.getppid()
     for _ in range(32):
         if current == pid:
             return True
         if current <= 1:
             break
-        result = subprocess.run(
-            ["/bin/ps", "-o", "ppid=", "-p", str(current)],
-            capture_output=True,
-            check=True,
-            timeout=2,
-        )
-        current = int(result.stdout)
+        try:
+            result = subprocess.run(
+                ["/bin/ps", "-o", "ppid=", "-p", str(current)],
+                capture_output=True,
+                check=True,
+                timeout=2,
+            )
+            current = int(result.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            # Missing ancestry proof must reject with the original-origin error.
+            return False
     return False
 
 

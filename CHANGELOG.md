@@ -6,6 +6,10 @@
 
 ## 2026-11-25 — Trend V3 first paper entry (#507)
 
+- Verify a directly invoked paper CLI's original foreground parent with the
+  kernel parent PID, without requiring process listing. Deeper ancestry still
+  needs traversal proof; unavailable proof rejects before broker access. Keep
+  original scheduled-session, launch and transcript checks for every command.
 - Fund automatic and manual crypto first entries from account assets without
   an instrument-count cap. Preserve per-account cash and notional reservations,
   including simultaneous manual items, and all identity and no-replay checks.
