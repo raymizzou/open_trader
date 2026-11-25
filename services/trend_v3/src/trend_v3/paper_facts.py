@@ -171,16 +171,17 @@ def verify_membership(report, asset, group, group_path):
         raise FactsMissing("membership_unverified")
 
 
-def group_coverage_complete(report, group, group_path):
-    if not group_coverage_verified(report, group, group_path):
+def coverage_matches_projection(group):
+    sections = [group.get(name, []) for name in ("direct", "searchable", "related")]
+    if not all(isinstance(assets, list) for assets in sections):
         return False
     members = [
-        identity(asset.get("instrument_id"))
-        for section in ("direct", "searchable", "related")
-        for asset in group.get(section, [])
+        identity(asset.get("instrument_id")) if isinstance(asset, dict) else None
+        for assets in sections
+        for asset in assets
     ]
     covered = [identity(member) for member in group["coverage"]["instrument_ids"]]
-    return all(members) and covered == members
+    return all(members) and len(set(members)) == len(members) and covered == members
 
 
 def session_time(broker, code, quote_market, report_day, data_day, now, *, future=None):
@@ -545,9 +546,12 @@ def produce(report, selection, info, evidence_root, broker, now):
             ):
                 continue
             group_path = f"/{direction}/{number}"
-            if not group.get("direct") and not group_coverage_complete(
-                report, group, group_path
-            ):
+            if group_coverage_verified(report, group, group_path):
+                coverage_gap = not coverage_matches_projection(group)
+            else:
+                # Direct cards already report their unverified membership individually.
+                coverage_gap = not group.get("direct")
+            if coverage_gap:
                 facts["coverage_gaps"].append(group_path)
             for offset, asset in enumerate(group.get("direct", [])):
                 if (

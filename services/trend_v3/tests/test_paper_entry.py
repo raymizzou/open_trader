@@ -1334,6 +1334,82 @@ def test_legacy_evidence_gap_is_visible_without_broker_calls(
     assert opend.quote_calls == opend.calls == opend.writes == []
 
 
+@pytest.mark.parametrize(
+    ("membership", "positive", "execution"),
+    [
+        ("missing", False, "evidence_incomplete"),
+        ("complete", False, "verified_no_candidates"),
+        ("missing", True, "awaiting_scheduled_tab_approval"),
+        ("duplicate", False, "evidence_incomplete"),
+        ("malformed", False, "evidence_incomplete"),
+    ],
+)
+def test_partially_represented_members_keep_empty_plan_unverified(
+    tmp_path, monkeypatch, capsys, membership, positive, execution
+):
+    data, _ = report("ABC", "XYZ")
+    (group,) = data["long"]
+    evidence = data["collection"]["evidence"]
+    if membership != "complete":
+        second = group["direct"].pop()
+        if membership == "duplicate":
+            group["searchable"] = [second, deepcopy(second)]
+            group["coverage"]["instrument_ids"].append("XYZ")
+        if membership == "malformed":
+            group["related"] = [None]
+    if not positive:
+        for index, asset in enumerate(group["direct"]):
+            asset.update(watch_eligible=False, trend="温", signal_events=[])
+            evidence[f"/long/0/direct/{index}/trend"]["value"] = "温"
+            evidence[f"/long/0/direct/{index}/signal_events"]["value"] = []
+    root, live, upstream = daily_files(tmp_path, data)
+    if not positive:
+        revision = root / "reports/_evidence" / DAY / "v02"
+        selection = json.loads((revision / "selection-evidence.json").read_bytes())
+        raw = json.loads(upstream.read_bytes())
+        for row, record in zip(selection["instruments"], raw["data"], strict=True):
+            row.update(
+                current="温",
+                labels="",
+                state="核实后未触发",
+                selected_new_position=False,
+            )
+            record.update(trendTemperatureCurr="温", tickerLabels="")
+        private_input(upstream.parent, upstream.name, raw)
+        digest = sha256(upstream.read_bytes()).hexdigest()
+        for record in selection["field_records"].values():
+            record["sha256"] = digest
+        update_selection(revision, selection)
+
+    opend = PlanningOpenD()
+    if not positive:
+
+        def unexpected_connection(**_):
+            pytest.fail("an empty plan must not connect to OpenD")
+
+        opend.OpenQuoteContext = opend.OpenSecTradeContext = unexpected_connection
+    assert run_daily_plan(tmp_path, opend, PREOPEN, live, monkeypatch) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["execution"] == execution
+    if positive:
+        (line,) = plan["lines"]
+        assert (line["code"], line["quantity"]) == ("US.ABC", 100)
+    else:
+        assert plan["lines"] == []
+        assert "approve_all" not in plan
+        assert opend.quote_calls == opend.calls == []
+        expected_codes = {"ABC", "XYZ"} if membership == "complete" else {"ABC"}
+        assert {
+            entry["code"]
+            for entry in plan["skipped"]
+            if entry["reason"] == "verified_no_signal"
+        } == expected_codes
+    assert sum(
+        entry["reason"] == "coverage_unverified" for entry in plan["skipped"]
+    ) == (0 if membership == "complete" else 1)
+    assert opend.writes == []
+
+
 def pending_daily_evidence(tmp_path):
     data, _ = report("ABC")
     data["collection"]["target_evidence"]["BOARD"] = {
