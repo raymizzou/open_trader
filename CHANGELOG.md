@@ -8,6 +8,13 @@
 
 - 日报优先从小程序页面核对关联榜、温度标签和移出状态。已核实免费的官方查询可直接执行，可能收费的查询须先取得本次批准。
 
+## 2026-11-25 — Clarify iCloud report delivery
+
+- Upload complete Trend V3 daily HTML reports and revisions to the existing
+  `trend_v3` iCloud folder. Keep intermediate artifacts in task storage by
+  default; use iCloud for other deliverables only when requested or already
+  agreed for that task.
+
 ## 2026-11-25 — Trend V3 first paper entry (#507)
 
 - Verify a directly invoked paper CLI's original foreground parent with the

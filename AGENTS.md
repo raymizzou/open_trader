@@ -29,6 +29,10 @@ request requires it.
 Every session or tab that delivers a Trend V3 report to Ray, including a
 single-item correction, follows the
 [Trend V3 report delivery rules](services/trend_v3/AGENTS.md#daily-report-delivery).
+Upload the complete daily HTML report, including each revision, to the existing
+`trend_v3` iCloud folder. Keep intermediate artifacts in task storage by default.
+Use iCloud for other deliverables only when specifically requested or already
+agreed for that task.
 
 ## Worktree and approval
 
