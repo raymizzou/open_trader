@@ -1505,10 +1505,69 @@ def search_plan(payload):
             and m.get("version") == board["version"]
             and observed_by(m.get("observed_at"), cutoff)
         ]
-        membership_scopes = [
-            (m, declared_scopes(m, markets), current_scopes(payload, m, markets))
-            for m in memberships
-        ]
+        # Empty withdrawn containers revoke the retained source/scope, including
+        # its obsolete empty coverage proof; no repeated member rows are needed.
+        revoked_scopes = {}
+        for membership in memberships:
+            if (
+                membership.get("state") != "withdrawn"
+                or membership.get("members") != []
+            ):
+                continue
+            declared = declared_scopes(membership, markets)
+            applicable = current_scopes(
+                payload, {**membership, "state": "verified"}, markets
+            )
+            if not declared:
+                # Unknown scope must not silently preserve this source's facts.
+                # Bound the veto to independently known combinations of this day.
+                applicable = current_scopes(
+                    payload,
+                    {
+                        **{
+                            key: value
+                            for key, value in membership.items()
+                            if key not in ("market", "instrument_type")
+                        },
+                        "state": "verified",
+                        "markets": [
+                            {"market": market, "instrument_type": kind}
+                            for market, kind in markets
+                        ],
+                    },
+                )
+            key = tuple(
+                json.dumps(membership.get(field), sort_keys=True)
+                for field in ("source", "version", "data_date")
+            )
+            revoked_scopes.setdefault(key, set()).update(applicable & markets)
+        membership_scopes = []
+        for membership in memberships:
+            if (
+                membership.get("state") == "withdrawn"
+                and membership.get("members") == []
+            ):
+                continue
+            declared = declared_scopes(membership, markets)
+            current = current_scopes(payload, membership, markets)
+            key = tuple(
+                json.dumps(membership.get(field), sort_keys=True)
+                for field in ("source", "version", "data_date")
+            )
+            revoked = revoked_scopes.get(key, set())
+            if revoked:
+                if declared and declared <= revoked:
+                    continue
+                membership = {
+                    **membership,
+                    "members": [
+                        row
+                        for row in membership.get("members", [])
+                        if market_scope(row) not in revoked
+                    ],
+                }
+                declared, current = declared - revoked, current - revoked
+            membership_scopes.append((membership, declared, current))
         membership_coverage = set()
         for membership, declared, current in membership_scopes:
             if not declared:

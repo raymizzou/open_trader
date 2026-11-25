@@ -575,3 +575,115 @@ def test_withdrawn_duplicate_is_order_independent_and_keeps_other_hits(tmp_path)
     remaining = search(tmp_path, removed)["groups"][0]
     assert remaining["status"] == "已命中"
     assert [h["code"] for h in remaining["hits"]] == ["TWO"]
+
+
+def test_empty_scoped_withdrawal_invalidates_only_matching_membership_source(tmp_path):
+    from test_daily_report_layout import render
+    from test_hourly_collection import add_threshold_hit, control, threshold_report
+
+    report = add_threshold_hit(threshold_report())
+    payload = report["signal_search"]
+    us = dict(market="US", instrument_type="stock")
+    hk = dict(market="HK", instrument_type="stock")
+    active = deepcopy(payload["memberships"][0])
+    active["markets"] = [us]
+    withdrawn = dict(active, state="withdrawn", members=[])
+    observed = []
+    for reverse in [False, True]:
+        disputed = deepcopy(payload)
+        disputed["memberships"] = (
+            [withdrawn, active] if reverse else [active, withdrawn]
+        ) + disputed["memberships"][1:]
+        result = search(tmp_path, disputed)
+        assert result["groups"][0]["hits"] == []
+        assert result["groups"][0]["status"] == "待核"
+        assert (
+            result["groups"][1]["status"] == "无命中"
+        )  # Same source, different class.
+        observed.append(result)
+        projected = deepcopy(report)
+        projected["signal_search"] = disputed
+        assert not control().assess(projected)["complete"]
+        assert "信号榜：" not in render(
+            tmp_path, projected, "empty-withdraw-" + str(reverse)
+        )
+        # A complete independent source can support the hit and finish.
+        corroborated = deepcopy(disputed)
+        corroborated["memberships"].append(
+            dict(deepcopy(active), source="independent-B")
+        )
+        first = search(tmp_path, corroborated)["groups"][0]
+        assert first["status"] == "已命中" and [h["code"] for h in first["hits"]] == [
+            "ONE"
+        ]
+        projected["signal_search"] = corroborated
+        assert control().assess(projected)["complete"]
+        # Partial independent evidence keeps a certain hit without claiming coverage.
+        partial = deepcopy(disputed)
+        other = dict(active["members"][0], instrument_id="p2", code="TWO")
+        partial["memberships"].append(
+            dict(
+                deepcopy(active),
+                source="independent-B",
+                complete=False,
+                members=[other],
+            )
+        )
+        partial["boards"][0]["members"].append(
+            dict(other, labels=["温转热"], removed=False)
+        )
+        first = search(tmp_path, partial)["groups"][0]
+        assert first["status"] == "待核" and [h["code"] for h in first["hits"]] == [
+            "TWO"
+        ]
+        # An old full empty proof is also cancelled; it cannot establish absence.
+        empty = deepcopy(disputed)
+        for member_list in empty["memberships"][:2]:
+            member_list["members"] = []
+        empty["boards"][0]["members"] = []
+        assert search(tmp_path, empty)["groups"][0]["status"] == "待核"
+    assert observed[0] == observed[1]
+    for change in ["source", "day", "edition", "market", "product", "class"]:
+        unrelated = deepcopy(withdrawn)
+        if change == "source":
+            unrelated["source"] = "unrelated-source"
+        elif change == "day":
+            unrelated["data_date"] = "2026-11-23"
+        elif change == "edition":
+            unrelated["version"] = "old"
+        elif change == "market":
+            unrelated["markets"] = [hk]
+        elif change == "product":
+            unrelated["markets"] = [dict(market="US", instrument_type="ETF")]
+        else:
+            unrelated["group"] = "Not selected"
+        intact = deepcopy(payload)
+        intact["memberships"].append(unrelated)
+        assert search(tmp_path, intact)["groups"][0]["status"] == "已命中", change
+    # One source may cover two markets; scope-only withdrawal cancels just US.
+    scoped = deepcopy(payload)
+    scoped["group_markets"][0]["markets"] = [us, hk]
+    member_hk = dict(
+        active["members"][0], instrument_id="hk1", code="00001", market="HK"
+    )
+    combined = dict(
+        deepcopy(active), markets=[us, hk], members=[active["members"][0], member_hk]
+    )
+    scoped["memberships"] = [combined, withdrawn] + scoped["memberships"][1:]
+    signal_hk = dict(
+        deepcopy(scoped["boards"][0]),
+        board_id="warm-hk",
+        title="港股温转热",
+        markets=[hk],
+        members=[dict(member_hk, labels=["温转热"], removed=False)],
+    )
+    scoped["boards"].append(signal_hk)
+    scoped["search_coverage"][0]["boards"].append(
+        dict(board_id="warm-hk", version="2026-11-25", markets=[hk])
+    )
+    first = search(tmp_path, scoped)["groups"][0]
+    assert first["status"] == "待核" and [h["code"] for h in first["hits"]] == ["00001"]
+    # No scope on a multi-market empty withdrawal cannot silently keep that source.
+    scoped["memberships"][1] = {k: v for k, v in withdrawn.items() if k != "markets"}
+    first = search(tmp_path, scoped)["groups"][0]
+    assert first["status"] == "待核" and first["hits"] == []
