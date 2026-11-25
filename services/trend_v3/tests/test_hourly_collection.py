@@ -228,7 +228,7 @@ def threshold_report():
         "selection_mode": "threshold-v1",
         "cutoff": "2026-11-25T08:30:00+08:00",
         "collection": {
-            "targets": {"BOARD": "2026-11-24"},
+            "targets": {"BOARD": "2026-11-24", "US": "2026-11-24"},
             "worklist": [],
             "evidence": {},
             "verified_at": "2026-11-25T08:20:00+08:00",
@@ -400,3 +400,84 @@ def test_threshold_report_checks_expected_groups(tmp_path):
         invalid["collection"]["parent_board"]["groups"][0]["strength"] = 99
         with pytest.raises(ValueError, match="frozen"):
             api.initialize(path, invalid)
+
+
+def add_threshold_hit(report):
+    """One independently hand-defined US-stock hit; all quotes are synthetic."""
+    from copy import deepcopy
+
+    identity = dict(
+        instrument_id="p1", code="ONE", market="US", instrument_type="stock"
+    )
+    group = report["long"][0]
+    group["direct"] = [
+        dict(
+            identity,
+            name="合成一号",
+            data_date="2026-11-24",
+            trend="热",
+            signal_events=["温转热"],
+            strength="90",
+            local_strength="80",
+            direct_verified=True,
+            platform_match_verified=True,
+            watch_eligible=False,
+        )
+    ]
+    group["coverage"]["instrument_ids"] = ["p1"]
+    report["collection"]["targets"]["US"] = "2026-11-24"
+    report["signal_search"]["boards"][0]["members"] = [
+        dict(identity, labels=["温转热"], removed=False)
+    ]
+    report["signal_search"]["memberships"][0]["members"] = [deepcopy(identity)]
+    api = control()
+    for path, label, market, owner, value in api.required_facts(report):
+        manifest = report["collection"]
+        if not any(item["path"] == path for item in manifest["worklist"]):
+            manifest["worklist"].append(
+                dict(path=path, label=label, market=market, target_date="2026-11-24")
+            )
+        manifest["evidence"][path] = dict(
+            state="verified",
+            data_date="2026-11-24",
+            version="2026-11-25",
+            source="synthetic-field",
+            identity=owner,
+            value=value,
+            market=market,
+            instrument_type="stock" if market == "US" else None,
+        )
+    return report
+
+
+def test_signal_coverage_rejects_stale_empty_members_and_divergent_market_targets(
+    tmp_path,
+):
+    from copy import deepcopy
+
+    api = control()
+    data = add_threshold_hit(threshold_report())
+    assert api.assess(data)["complete"]
+    for change in ["empty-members-day", "divergent-target"]:
+        invalid = deepcopy(data)
+        if change == "empty-members-day":
+            assert invalid["signal_search"]["memberships"][1]["members"] == []
+            invalid["signal_search"]["memberships"][1]["data_date"] = "2026-11-20"
+        else:
+            invalid["signal_search"]["targets"] = {"US": "2026-11-20"}
+        assert not api.assess(invalid)["complete"], change
+        state = tmp_path / (change + ".json")
+        api.initialize(state, invalid)
+        assert api.claim_round(state, invalid, "2026-11-25T08:30:00+08:00")["slot"] == 0
+        assert api.claim_round(state, invalid, "2026-11-25T09:30:00+08:00")["slot"] == 1
+        planned = api.report_signal_plan(invalid)
+        assert planned["groups"][0]["hits"][0]["code"] == "ONE"
+    holiday = threshold_report()
+    holiday["collection"]["targets"]["US"] = "2026-11-20"
+    holiday["signal_search"]["targets"] = {"US": "2026-11-20"}
+    for container in [
+        *holiday["signal_search"]["memberships"],
+        *holiday["signal_search"]["boards"],
+    ]:
+        container["data_date"] = "2026-11-20"
+    assert api.assess(holiday)["complete"]

@@ -57,10 +57,10 @@ python /绝对同版路径/collection.py confirm reader-projection.json --state 
 
 `python /同版路径/collection.py search-plan search-input.json` 只读本地 JSON、向 stdout 输出规划和逐类交集，零网络、不轮询、不操作交易。输入字段：
 
-- 可选 `targets: {市场: 适用日}` 由已核实日历独立提供；节假日市场数据日可异于母榜日，成员和归属均按其市场目标核对，缺市场目标沿用输入已确认的母榜适用日，显式 null 保持待核。报告投影的 targets 与此一致。`cutoff` 为带时区截至时间；`board` 为独立完整金融资产母榜，含 `state: verified`、`complete: true`、`source`、`observed_at`、`data_date`、`version`、`groups: [{name, strength}]`。数字可以为零，不能从信号成员生成母榜。
+- 可选 `targets: {市场: 适用日}` 由已核实日历独立提供；节假日市场数据日可异于母榜日，成员和归属均按其市场目标核对，缺市场目标沿用输入已确认的母榜适用日，显式 null 保持待核。正式报告边界始终使用 collection.targets 冻结目标重算搜索；signal_search 显式目标与冻结目标不一致时保留已核实事实并记待核，不终止小时复查。空直属清单容器也必须核对适用数据日，不能靠没有成员跳过日期检查。`cutoff` 为带时区截至时间；`board` 为独立完整金融资产母榜，含 `state: verified`、`complete: true`、`source`、`observed_at`、`data_date`、`version`、`groups: [{name, strength}]`。数字可以为零，不能从信号成员生成母榜。
 - `group_markets` 为独立映射数组：`group`、`state: verified`、`source`、`complete`、`markets: [{market, instrument_type}]`。多对多允许，缺映射保留缺口。
 - `boards` 每张含 `board_id`、`title`、`direction`、`label`、`version`、`data_date`、`observed_at`、`source`、`state`、`complete`、适用 `markets` 和 `members`。成员行显式给出的 `data_date/version/state` 必须与适用范围一致，不得由外层榜覆盖陈旧行；`labels` 必须为完整字符串数组，禁止子串匹配。成员逐行含 `instrument_id`、`code`、`market`、`instrument_type`、`labels`、显式 `removed: false/true`，可选 currency。同身份同类多源合并；其他榜退出状态不取消本榜阳性。
-- `memberships` 含 `group`、独立 `source`、同版同适用日的 `version/data_date/observed_at/state`、`complete` 及独立身份 `members`；不得与信号榜使用同一名单来源。`search_coverage` 按方向记录完整搜索结果，含相同范围元数据和 `boards: [{board_id, version, markets: [{market, instrument_type}]}]`；只有已核实适用组合与该类相交的目录项才安排读取；未知映射只记缺口，不猜市场。缺失、改版、晚于截至时间及分页未完分别保留待核。
+- `memberships` 含 `group`、独立 `source`、同版同适用日的 `version/data_date/observed_at/state`、`complete` 及独立身份 `members`；不得与信号榜使用同一名单来源。`search_coverage` 按方向记录完整搜索结果，含相同范围元数据和 `boards: [{board_id, version, markets: [{market, instrument_type}]}]`；每张目录项分别保留其与该类相交的市场×品种组合；同 ID／版次读回必须覆盖这一张榜承诺的组合，其他榜的覆盖不能代替。只有已核实适用组合与该类相交的目录项才安排读取；未知映射只记缺口，不猜市场。缺失、改版、晚于截至时间及分页未完分别保留待核。
 - 输出 `searches` 为要执行的唯一关键字设计，`boards_to_read` 为尚需读取的唯一榜／版次，`groups` 含 `hits`、`gaps` 和 `status`。`metrics` 是离线设计／留存证据计数；`elapsed_seconds: null` 表示没有现场耗时，不能称实际节省。实际搜索／读取／额外归属查询和耗时由现场执行者另记。
 
 将上述原始输入保存在报告私有 `signal_search`，公共渲染器会重新算交集，只给身份完全匹配且 `direct_verified: true` 的原卡添加来源；不复制行情、事件或观察资格。旧卡的实际日期、市场目标或最终 lookup 调解冲突时不添加当前信号阳性。新增卡仍须正常独立核实、填入原投影与逐字段证明；不能把 planner 输出当作全部字段证明。
@@ -234,6 +234,12 @@ PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli \
 ```
 
 `daily_root` 为包含 `reports/_evidence` 的原日报工作区。草稿有原报告日和带时区的 `cutoff`，同名日期或版本声明须一致。命令写入 `trend-v3-paper-evidence/v1`、报告日、版次、发布提交和投影摘要。按原 HTML 核验步骤继续成稿和逐字节读回，独立核实记录采用实际 `projection_sha256`、`selection_sha256`、`fees_sha256` 和 `report_sha256`。已有核实记录或选股证据时禁止覆写。历史原件仍按原版本读取。
+
+新版展示阈值不改变原模拟候选范围。先用独立完整母榜固定原头尾各两席，再分别组装公开阅读投影与私有模拟证据；第二席只有 79（或空头第二席 21）时，阅读投影省略该类，私有模拟证据仍保留其实际已核实成员。不得从母榜名称／分数生成隐藏候选。
+
+在现有同版 `selection-draft.json` 中保存 `paper_projection`，仍由上述 canonicalizer 写入同一个不可覆写的 `selection-evidence.json`，由现有 selection/projection 哈希、发布提交和报告版本绑定；不创建额外信任文件。`paper_projection` 使用原投影结构：`date`、`board_date`、`board_version`、`cutoff`、`revision`（例如 v02）、原头尾两席 `long/short` 组和 `collection`。collection 的 targets、target_evidence、parent_board 与公开投影完全相同；evidence 用该私有投影自己的组索引保存原组强度、完整直属覆盖、每卡身份、日期、趋势、信号及已有字段证明。私有 group/card 保留原 seat、coverage、direct_verified/platform_match_verified/watch_eligible 等已核实字段，旧原始来源、instruments、field_records/field_sources 均仍保留在相同 selection 中。新增第三席和仅标签行不能加入原模拟范围。
+
+在 prepare-report-evidence 及读回核实前完成两份投影，不在已核实版本上补写隐藏材料。正常 daily producer 只在同版哈希身份、日期、截至时间和母榜匹配时，从私有投影补回公开阅读投影缺少的原席；按新内部位置重定位已有证明后继续原 coverage、身份、严格前后温与原始信号、市场、费用／委托保护。candidates 使用同一私有读取逻辑，公开 HTML 不读取 paper_projection。没有匹配私有证据、原席归属／覆盖或原始字段待核时只记缺口，不推断成员，不为这些缺证行读取券商；已核实其他原席继续独立处理。旧报告及无隐藏原席的输入沿用现有流程。
 
 有模拟候选时，投影须保存原日报日适用的 `collection.targets` 与 `target_evidence`，包含 `BOARD`。在 `collection.evidence` 留存同版榜图日期、版次、席位强度、完整直属覆盖及标的自身信号的核实记录。每条 `instruments` 行保存 `id`、`code`、`market`、`group`、`relationship: "直属"`、`data_day`、`expected_day`、`previous`、`current`、`labels`、`state` 和 `selected_new_position`。已核实候选用 `state: "已触发"` 与 `selected_new_position: true`，已核实无触发用 `state: "核实后未触发"` 与 `false`。`field_refs` 按供应商字段名引用原件，至少覆盖 `trendTemperaturePrev`、`trendTemperatureCurr`、`tickerLabels`。
 

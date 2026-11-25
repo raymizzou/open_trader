@@ -18,6 +18,7 @@ from .paper_evidence import (
     field,
     identity,
     native_signal,
+    paper_report_projection,
     product_for,
     receipt,
     same_raw_identity,
@@ -499,6 +500,7 @@ def produce(report, selection, info, evidence_root, broker, now):
     """Only ask OpenD about assets with report, membership and raw signal evidence."""
     report = deepcopy(report)
     selection = normalize_field_sources(selection, report["date"])
+    report = paper_report_projection(report, selection, info)
     digest = sha256(
         (info["projection_sha256"] + info["selection_sha256"]).encode()
     ).hexdigest()
@@ -506,6 +508,9 @@ def produce(report, selection, info, evidence_root, broker, now):
         "report_version": info["revision"],
         "report_revision": int(info["revision"][1:]),
         "selection": selection,
+        "paper_binding": {
+            key: info.get(key) for key in ("revision", "source", "projection_sha256")
+        },
         "instruments": {},
         "gaps": {},
         "coverage_gaps": [],

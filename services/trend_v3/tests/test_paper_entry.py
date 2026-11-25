@@ -3109,3 +3109,210 @@ def test_report_discovery_does_not_expand_paper_candidates(tmp_path):
             invalid, invalid_facts, now=PREOPEN
         )
         assert rejected["lines"] == [], change
+
+
+def test_original_second_seat_outside_threshold_keeps_its_verified_candidate(
+    tmp_path, monkeypatch, capsys
+):
+    """Run the real immutable-artifact producer and candidate path with fake OpenD."""
+    expected = None
+    for variant in [
+        "legacy",
+        "threshold",
+        "absent",
+        "wrong-day",
+        "wrong-revision",
+        "raw-mismatch",
+        "wrong-parent",
+        "spurious-third",
+    ]:
+        home = tmp_path / variant
+        data, _ = report("ABC")
+        root, live, upstream = daily_files(home, data)
+        directory = root / "reports/_evidence" / DAY / "v02"
+        directory.chmod(0o700)
+        selection = json.loads((directory / "selection-evidence.json").read_bytes())
+        info = json.loads((directory / "report-verification.json").read_bytes())
+        # Literal full original universe: long 85,79 and short 0,21.
+        candidate = deepcopy(data["long"][0])
+        candidate.update(seat=2, board_strength="79")
+        first = dict(
+            name="Top empty",
+            seat=1,
+            board_strength="85",
+            direct=[],
+            coverage={"state": "complete", "instrument_ids": []},
+        )
+        data["long"] = [first, candidate]
+        evidence = data["collection"]["evidence"]
+        originals = deepcopy(evidence)
+        for path in list(evidence):
+            if path.startswith("/long/"):
+                evidence.pop(path)
+        for path, proof in originals.items():
+            if path.startswith("/long/0/"):
+                evidence[path.replace("/long/0/", "/long/1/")] = proof
+        evidence["/long/1/board_strength"]["value"] = "79"
+        for field in ["coverage", "board_strength"]:
+            evidence["/long/0/" + field] = receipt(
+                first["name"], first[field], market="BOARD", kind=None
+            )
+        add_verified_empty_board_seats(data)
+        for i, score in enumerate([0, 21]):
+            data["short"][i]["board_strength"] = str(score)
+            evidence[f"/short/{i}/board_strength"]["value"] = str(score)
+        data["collection"]["target_evidence"]["BOARD"] = dict(
+            state="verified",
+            kind="continuous",
+            report_date=DAY,
+            basis_date=DATA_DAY,
+            source="original-board-calendar",
+        )
+        data["cutoff"] = PREOPEN.isoformat()
+        data["collection"]["parent_board"] = dict(
+            state="verified",
+            complete=True,
+            source="independent-parent",
+            data_date=DATA_DAY,
+            version="v1",
+            row_count=4,
+            observed_at=f"{DAY}T08:00:00+08:00",
+            groups=[
+                dict(name=first["name"], strength=85),
+                dict(name=candidate["name"], strength=79),
+                dict(name=data["short"][1]["name"], strength=21),
+                dict(name=data["short"][0]["name"], strength=0),
+            ],
+        )
+        private = deepcopy(data)
+        private["revision"] = "v02"
+        if variant != "legacy":
+            data["selection_mode"] = "threshold-v1"
+            data["long"] = [first]
+            data["short"] = data["short"][:1]
+            for path in list(evidence):
+                if path.startswith(("/long/1/", "/short/1/")):
+                    evidence.pop(path)
+            assert candidate["name"] not in [g["name"] for g in data["long"]]
+            if variant != "absent":
+                selection["paper_projection"] = private
+        if variant == "wrong-day":
+            selection["paper_projection"]["board_date"] = "2026-11-20"
+        if variant == "wrong-revision":
+            selection["paper_projection"]["revision"] = "v01"
+        if variant == "wrong-parent":
+            selection["paper_projection"]["collection"]["parent_board"]["groups"][0][
+                "strength"
+            ] = 99
+        if variant == "raw-mismatch":
+            raw = json.loads(upstream.read_bytes())
+            raw["data"][0]["tickerSymbol"] = "WRONG"
+            private_input(upstream.parent, upstream.name, raw)
+        if variant == "spurious-third":
+            spurious = deepcopy(candidate)
+            spurious.update(name="Spurious third", seat=3, board_strength="80")
+            spurious["direct"][0].update(instrument_id="EVIL", code="EVIL", name="EVIL")
+            spurious["coverage"]["instrument_ids"] = ["EVIL"]
+            data["long"].append(spurious)
+            for field in ["trend", "signal_events", "strength"]:
+                evidence["/long/1/direct/0/" + field] = receipt(
+                    "EVIL", spurious["direct"][0][field]
+                )
+            selected = dict(
+                selection["instruments"][0],
+                id="EVIL",
+                code="EVIL",
+                group="Spurious third",
+                field_refs=dict.fromkeys(
+                    ["trendTemperaturePrev", "trendTemperatureCurr", "tickerLabels"],
+                    "EVIL",
+                ),
+            )
+            selection["instruments"].append(selected)
+            raw = json.loads(upstream.read_bytes())
+            raw["data"].append(dict(raw["data"][0], tmId="EVIL", tickerSymbol="EVIL"))
+            private_input(upstream.parent, upstream.name, raw)
+            selection["field_records"]["EVIL"] = dict(
+                selection["field_records"]["ABC"],
+                identity=dict(
+                    selection["field_records"]["ABC"]["identity"],
+                    tmId="EVIL",
+                    tickerSymbol="EVIL",
+                ),
+                location="$.data[1]",
+                version="v1",
+            )
+            for record in selection["field_records"].values():
+                record["sha256"] = sha256(upstream.read_bytes()).hexdigest()
+            for field in ["coverage", "board_strength"]:
+                evidence["/long/1/" + field] = receipt(
+                    spurious["name"], spurious[field], market="BOARD", kind=None
+                )
+        if variant != "legacy":
+            from test_daily_report_layout import render
+            html = render(home, data, "threshold-public")
+            assert candidate["name"] not in html
+        selection["cutoff"] = PREOPEN.isoformat()
+        selection["field_records"]["ABC"]["version"] = "v1"
+        # Existing canonical hashes bind the public and private inputs.
+        (directory / "selection-evidence.json").unlink()
+        (directory / "report-verification.json").unlink()
+        private_input(directory, "selection-draft.json", selection)
+        projection = private_input(directory, "reader-projection.json", data)
+        assert (
+            paper_cli.main(
+                ["prepare-report-evidence", str(root), DAY, "v02", "--release", RELEASE]
+            )
+            == 0
+        )
+        hashes = json.loads(capsys.readouterr().out)
+        info.update(
+            hashes, projection_sha256=sha256(projection.read_bytes()).hexdigest()
+        )
+        private_input(directory, "report-verification.json", info)
+        opend = PlanningOpenD()
+        assert run_daily_plan(home, opend, PREOPEN, live, monkeypatch) == 0
+        plan = json.loads(capsys.readouterr().out)
+        if variant in ["legacy", "threshold", "spurious-third"]:
+            actual = [
+                (line["code"], line["direction"], line["quantity"])
+                for line in plan["lines"]
+            ]
+            if expected is None:
+                expected = actual
+                assert expected == [("US.ABC", "long", 100)]
+            assert actual == expected, variant
+            assert opend.quote_calls and opend.writes == []
+            assert all("EVIL" not in str(call) for call in opend.quote_calls)
+            if variant == "threshold":
+                from trend_v3.paper_evidence import candidates
+                from trend_v3.paper_facts import produce
+
+                public, retained, verified = paper_authority.latest_report(
+                    root, DAY, RELEASE
+                )
+                original = deepcopy(public)
+                produced, facts = produce(
+                    public,
+                    retained,
+                    verified,
+                    root / "reports/_evidence",
+                    FutuPaperBroker(paper_settings(), sdk=PlanningOpenD()),
+                    PREOPEN,
+                )
+                assert [row["code"] for row in candidates(public, facts)[0]] == [
+                    "US.ABC"
+                ]
+                assert [row["code"] for row in candidates(produced, facts)[0]] == [
+                    "US.ABC"
+                ]
+                assert public == original and len(public["long"]) == 1
+
+            if variant == "threshold":
+                assert run_daily_plan(home, opend, PREOPEN, live, monkeypatch) == 0
+                assert json.loads(capsys.readouterr().out)["id"] == plan["id"]
+        else:
+            assert plan["lines"] == [] and plan["execution"] == "evidence_incomplete", (
+                variant
+            )
+            assert opend.quote_calls == opend.calls == opend.writes == []

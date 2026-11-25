@@ -258,3 +258,40 @@ def test_incomplete_coverage_keeps_known_hits(tmp_path):
                 membership["source"] = value["boards"][0]["source"]
         group = search(tmp_path, value)["groups"][0]
         assert group["hits"] == [] and group["status"] == "待核", change
+
+
+def test_each_expected_board_covers_its_declared_scope(tmp_path):
+    from test_hourly_collection import add_threshold_hit, control, threshold_report
+
+    payload = fixture()
+    bad = deepcopy(payload["boards"][0])
+    bad.update(
+        board_id="second-us",
+        markets=[dict(market="HK", instrument_type="stock")],
+        members=[],
+    )
+    payload["boards"].append(bad)
+    payload["search_coverage"][0]["boards"].append(
+        dict(
+            board_id="second-us",
+            version="2026-11-25",
+            markets=[dict(market="US", instrument_type="stock")],
+        )
+    )
+    result = search(tmp_path, payload)
+    assert result["groups"][0]["hits"][0]["code"] == "ONE"
+    assert result["groups"][0]["status"] == "待核"
+    assert result["boards_to_read"] == [
+        dict(board_id="second-us", version="2026-11-25")
+    ]
+    report = add_threshold_hit(threshold_report())
+    report["signal_search"]["boards"].append(bad)
+    report["signal_search"]["search_coverage"][0]["boards"].append(
+        payload["search_coverage"][0]["boards"][-1]
+    )
+    assert not control().assess(report)["complete"]
+    # A CN-only catalogue entry remains irrelevant even with a missing readback.
+    report["signal_search"]["search_coverage"][0]["boards"][-1]["markets"] = [
+        dict(market="CN", instrument_type="ETF")
+    ]
+    assert control().assess(report)["complete"]

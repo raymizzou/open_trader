@@ -1296,8 +1296,28 @@ def report_signal_plan(report):
     ):
         return {"groups": [], "pending": True, "pending_scope": True}
     try:
+        payload = deepcopy(payload)
+        divergent = False
+        if "collection" in report:
+            frozen = report["collection"].get("targets", {})
+            declared = payload.get("targets", {})
+            divergent = any(
+                value != frozen.get(market) for market, value in declared.items()
+            )
+            payload["targets"] = {
+                market: frozen.get(market)
+                for mapping in payload.get("group_markets", [])
+                for market in (m.get("market") for m in mapping.get("markets", []))
+            }
         plan = search_plan(payload)
-        plan["pending"] = any(g["gaps"] for g in plan["groups"])
+        if divergent:
+            for group in plan["groups"]:
+                group["gaps"].append("搜索市场目标与报告冻结目标不符")
+                group["status"] = "待核"
+        plan["metrics"]["uncovered_groups"] = sum(
+            bool(g["gaps"]) for g in plan["groups"]
+        )
+        plan["pending"] = divergent or any(g["gaps"] for g in plan["groups"])
         return plan
     except (ValueError, KeyError, TypeError):
         return {"groups": [], "pending": True, "pending_scope": True}
@@ -1446,6 +1466,18 @@ def search_plan(payload):
             and m.get("version") == board["version"]
             and observed_by(m.get("observed_at"), cutoff)
         ]
+        invalid_containers = [
+            m
+            for m in memberships
+            if any(
+                valid_date(m.get("data_date"))
+                != valid_date(member_day(payload, {"market": market}))
+                or valid_date(m.get("data_date")) is None
+                for market, _ in markets
+            )
+        ]
+        if invalid_containers:
+            gaps.append("直属清单容器适用日待核")
         if not memberships or not all(m.get("complete") is True for m in memberships):
             gaps.append("独立直属覆盖待核")
             result["metrics"]["extra_membership_queries"] += 1
@@ -1458,7 +1490,7 @@ def search_plan(payload):
         ]
         if not discovery:
             gaps.append("方向搜索及适用组合覆盖待核")
-        expected_boards = set()
+        expected_boards = {}
         for discovery_row in discovery:
             for entry in discovery_row.get("boards", []):
                 key = entry.get("board_id"), entry.get("version")
@@ -1471,7 +1503,9 @@ def search_plan(payload):
                     continue
                 if {market_scope(m) for m in scopes} & markets:
                     if all(isinstance(k, str) and k.strip() for k in key):
-                        expected_boards.add(key)
+                        expected_boards.setdefault(key, set()).update(
+                            {market_scope(m) for m in scopes} & markets
+                        )
                     else:
                         gaps.append("搜索结果榜身份待核")
         for key, signal in signals.items():
@@ -1568,8 +1602,10 @@ def search_plan(payload):
                 or signal.get("complete") is not True
                 or signal.get("direction") != direction
                 or signal.get("label") != label
+                or not expected_boards[key]
+                <= {market_scope(m) for m in signal.get("markets", [])}
             ):
-                gaps.append("搜索结果中的榜缺失、改版或日期不适用")
+                gaps.append("搜索结果中的榜缺失、改版、日期或适用组合不符")
                 requests.add(key)
         if not markets or not markets <= covered:
             gaps.append("适用市场信号榜覆盖待核")

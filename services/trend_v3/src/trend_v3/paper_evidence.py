@@ -1,6 +1,7 @@
 """Verify paper candidates against the daily report and its private evidence."""
 
 import re
+from copy import deepcopy
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -231,6 +232,80 @@ def board_seat_verified(report, evidence, direction, index):
             day(report["board_date"]),
         )
     )
+
+
+def paper_report_projection(report, selection, binding):
+    """Read original seats from the existing same-revision hashed selection only.
+
+    This projection is private input for the existing producer/candidate pipeline;
+    it never changes the public report or invents members from the parent ranks.
+    """
+    if report.get("selection_mode") != "threshold-v1" or not isinstance(
+        selection, dict
+    ):
+        return report
+    private = selection.get("paper_projection")
+    if not isinstance(private, dict) or not isinstance(binding, dict):
+        return report
+    collection = report.get("collection") or {}
+    retained = private.get("collection") or {}
+    if not isinstance(collection, dict) or not isinstance(retained, dict):
+        return report
+    if (
+        selection.get("schema") != REPORT_SCHEMA
+        or selection.get("report_date") != report.get("date")
+        or selection.get("revision") != binding.get("revision")
+        or private.get("revision") != binding.get("revision")
+        or selection.get("source") != binding.get("source")
+        or not isinstance(binding.get("projection_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", binding["projection_sha256"])
+        or selection.get("projection_sha256") != binding["projection_sha256"]
+        or selection.get("cutoff") != report.get("cutoff")
+        or any(
+            private.get(key) != report.get(key)
+            for key in ("date", "board_date", "board_version", "cutoff")
+        )
+        or any(
+            retained.get(key) != collection.get(key)
+            for key in ("targets", "target_evidence", "parent_board")
+        )
+    ):
+        return report
+    result = deepcopy(report)
+    evidence = result.setdefault("collection", {}).setdefault("evidence", {})
+    proofs = retained.get("evidence", {})
+    if not isinstance(proofs, dict):
+        return report
+    for direction in SIGNALS:
+        groups = result.setdefault(direction, [])
+        hidden = private.get(direction, [])
+        if not isinstance(hidden, list) or not all(isinstance(g, dict) for g in hidden):
+            continue
+        for index, group in enumerate(hidden):
+            seat = group.get("seat")
+            if (
+                any(g.get("seat") == seat for g in groups)
+                or sum(g.get("seat") == seat for g in hidden) != 1
+                or not legacy_parent_seat(report, direction, group)
+            ):
+                continue
+            old_prefix, new_prefix = (
+                f"/{direction}/{index}/",
+                f"/{direction}/{len(groups)}/",
+            )
+            mapped = {
+                new_prefix + path[len(old_prefix) :]: proof
+                for path, proof in proofs.items()
+                if path.startswith(old_prefix)
+            }
+            if any(
+                path in evidence and evidence[path] != proof
+                for path, proof in mapped.items()
+            ):
+                continue
+            groups.append(deepcopy(group))
+            evidence.update(deepcopy(mapped))
+    return result
 
 
 def native_signal(selection, asset, group, when, proof, *, entry=True):
@@ -518,6 +593,9 @@ def read_candidate(
 def candidates(report, facts):
     if reason := facts.get("report_gap"):
         return [], [{"reason": reason}]
+    report = paper_report_projection(
+        report, facts.get("selection"), facts.get("paper_binding")
+    )
     report_day = day(report.get("date"))
     collection = report.get("collection") or {}
     evidence = collection.get("evidence") or {}
