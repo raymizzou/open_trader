@@ -3049,3 +3049,63 @@ def test_mixed_openings_withdraw_all_preserves_past_and_cancels_future(
     assert invoke("status") == 0
     assert json.loads(capsys.readouterr().out) == before
     assert [write["code"] for write in sdk.writes] == ["HK.00005"]
+
+
+def test_report_discovery_does_not_expand_paper_candidates(tmp_path):
+    for name in [
+        "original",
+        "extended",
+        "missing-parent",
+        "parent-mismatch",
+        "identity",
+    ]:
+        (tmp_path / name).mkdir()
+    data, facts = report("ABC")
+    data.update(selection_mode="threshold-v1", cutoff=f"{DAY}T08:30:00+08:00")
+    data["collection"]["parent_board"] = dict(
+        state="verified",
+        complete=True,
+        source="independent-parent",
+        data_date=DATA_DAY,
+        version="v1",
+        observed_at=f"{DAY}T08:00:00+08:00",
+        row_count=5,
+        groups=[
+            dict(name="Verified board group", strength=85),
+            dict(name="Second", strength=83),
+            dict(name="New threshold group", strength=80),
+            dict(name="Weak", strength=20),
+            dict(name="Weakest", strength=0),
+        ],
+    )
+    service = make_service(tmp_path / "original")
+    baseline = service.plan(data, facts, now=PREOPEN)
+    assert [x["code"] for x in baseline["lines"]] == ["US.ABC"]
+    extended = deepcopy(data)
+    extra = deepcopy(extended["long"][0])
+    extra.update(name="New threshold group", seat=3, board_strength=80)
+    extended["long"].append(extra)
+    for field in ["board_strength", "coverage"]:
+        extended["collection"]["evidence"][f"/long/1/{field}"] = receipt(
+            extra["name"], extra[field], market="BOARD", kind=None
+        )
+    signal_only = deepcopy(extended["long"][0]["direct"][0])
+    signal_only.update(
+        code="SIGNAL-ONLY", instrument_id="SIGNAL-ONLY", watch_eligible=False
+    )
+    extended["long"][0]["direct"].append(signal_only)
+    plan = make_service(tmp_path / "extended").plan(extended, facts, now=PREOPEN)
+    assert [x["code"] for x in plan["lines"]] == ["US.ABC"]
+    for change in ["missing-parent", "parent-mismatch", "identity"]:
+        invalid = deepcopy(extended)
+        invalid_facts = deepcopy(facts)
+        if change == "missing-parent":
+            invalid["collection"].pop("parent_board")
+        elif change == "parent-mismatch":
+            invalid["collection"]["parent_board"]["groups"][0]["name"] = "Other"
+        else:
+            invalid_facts["instruments"]["ABC"]["signal"]["identity"] = "Other"
+        rejected = make_service(tmp_path / change).plan(
+            invalid, invalid_facts, now=PREOPEN
+        )
+        assert rejected["lines"] == [], change

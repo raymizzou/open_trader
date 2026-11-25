@@ -167,6 +167,49 @@ def board_verified(report, collection, evidence, report_day):
     )
 
 
+def legacy_parent_seat(report, direction, group):
+    """Discovery may grow; paper eligibility remains the original two extremes."""
+    mode = report.get("selection_mode", "legacy-two-seat")
+    if mode == "legacy-two-seat":
+        return True
+    if mode != "threshold-v1":
+        return False
+    parent = report.get("collection", {}).get("parent_board", {})
+    rows = parent.get("groups", [])
+    observed, cutoff = instant(parent.get("observed_at")), instant(report.get("cutoff"))
+    if (
+        parent.get("state") != "verified"
+        or parent.get("complete") is not True
+        or not text(parent.get("source"))
+        or not rows
+        or parent.get("row_count") != len(rows)
+        or day(parent.get("data_date")) != day(report.get("board_date"))
+        or parent.get("version") != report.get("board_version")
+        or observed is None
+        or cutoff is None
+        or observed > cutoff
+        or len({r.get("name") for r in rows}) != len(rows)
+        or any(
+            not text(r.get("name"))
+            or decimal(r.get("strength")) is None
+            or not 0 <= decimal(r["strength"]) <= 100
+            for r in rows
+        )
+    ):
+        return False
+    ordered = sorted(
+        rows, key=lambda row: decimal(row["strength"]), reverse=direction == "long"
+    )[:2]
+    seat = group.get("seat")
+    return (
+        type(seat) is int
+        and 1 <= seat <= len(ordered)
+        and group.get("name") == ordered[seat - 1]["name"]
+        and decimal(group.get("board_strength"))
+        == decimal(ordered[seat - 1]["strength"])
+    )
+
+
 def board_seat_verified(report, evidence, direction, index):
     groups = report.get(direction, [])
     group = groups[index]
@@ -174,6 +217,7 @@ def board_seat_verified(report, evidence, direction, index):
     return (
         type(seat) is int
         and seat in BOARD_SEATS
+        and legacy_parent_seat(report, direction, group)
         and text(name)
         and sum(other.get("seat") == seat for other in groups) == 1
         and field(

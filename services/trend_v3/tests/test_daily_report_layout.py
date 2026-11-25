@@ -3082,3 +3082,80 @@ def test_simulation_requires_matching_current_report_revision(tmp_path):
     assert_formal_records(
         render(tmp_path, report, "unknown-both", report_revision="UNKNOWN")
     )
+
+
+def test_signal_board_hit_renders_direct_without_watch_upgrade(tmp_path):
+    from test_signal_board_search import fixture
+
+    payload = fixture()
+    payload["board"]["groups"] = [dict(name="弱类", strength=20)]
+    payload["group_markets"][0]["group"] = "弱类"
+    payload["memberships"] = [dict(payload["memberships"][0], group="弱类")]
+    signal = payload["boards"][0]
+    signal.update(
+        board_id="cold-us", title="美股凉转寒", direction="short", label="凉转寒"
+    )
+    signal["members"][0].update(labels=["凉转寒"], name="合成一号")
+    signal["members"].append(
+        dict(
+            signal["members"][0],
+            instrument_id="unknown",
+            code="UNKNOWN-MEMBER",
+            name="无归属",
+        )
+    )
+    data = {
+        "date": "2026-11-25",
+        "board_date": "2026-11-24",
+        "board_version": "2026-11-25",
+        "cutoff": payload["cutoff"],
+        "signal_search": payload,
+        "short": [
+            dict(
+                seat=1,
+                name="弱类",
+                board_strength="20",
+                direct=[
+                    dict(
+                        instrument_id="p1",
+                        code="ONE",
+                        market="US",
+                        instrument_type="stock",
+                        name="合成一号",
+                        data_date="2026-11-24",
+                        trend="冻",
+                        direct_verified=True,
+                        signal_events=["凉转寒"],
+                    )
+                ],
+            )
+        ],
+    }
+    html = render(tmp_path, data, "signal-hit")
+    assert "美股凉转寒 · 凉转寒 · 数据日 2026-11-24" in html
+    assert html.count("合成一号") == 1
+    assert '<span class="reader-marker">直属</span>' in html
+    assert "应建观察仓" not in html and "UNKNOWN-MEMBER" not in html
+    assert "冻" in html
+
+    data["board_version"] = "other-edition"
+    html = render(tmp_path, data, "signal-wrong-edition")
+    assert "信号榜：" not in html
+
+    data["board_version"] = "2026-11-25"
+    from copy import deepcopy
+
+    for change in ["stale-card", "lookup-conflict", "market-target"]:
+        revised = deepcopy(data)
+        asset = revised["short"][0]["direct"][0]
+        if change == "stale-card":
+            asset["data_date"] = "2026-11-20"
+        elif change == "lookup-conflict":
+            asset.update(platform_match_verified=True)
+            revised["short"][0]["searchable"] = [
+                dict(asset, lookup="miss", platform_match_verified=False)
+            ]
+        else:
+            revised["signal_search"]["targets"] = {"US": "2026-11-20"}
+        html = render(tmp_path, revised, "signal-" + change)
+        assert "信号榜：" not in html, change
