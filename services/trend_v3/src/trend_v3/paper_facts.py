@@ -11,6 +11,7 @@ from .paper_authority import private_bytes, strict_json
 from .paper_evidence import (
     REPORT_SCHEMA,
     SIGNALS,
+    board_seat_verified,
     board_verified,
     day,
     decimal,
@@ -532,18 +533,10 @@ def produce(report, selection, info, evidence_root, broker, now):
         facts["report_gap"] = "board_unverified"
         return report, facts
     raw = RawEvidence(evidence_root, selection)
-    if not any(report.get(direction) for direction in SIGNALS):
-        facts["report_gap"] = "coverage_unverified"
     for direction in SIGNALS:
         groups = report.get(direction, [])
         for number, group in enumerate(groups):
-            seat = group.get("seat")
-            if (
-                type(seat) is not int
-                or seat not in (1, 2)
-                or not text(group.get("name"))
-                or sum(other.get("seat") == seat for other in groups) != 1
-            ):
+            if not board_seat_verified(report, evidence, direction, number):
                 continue
             group_path = f"/{direction}/{number}"
             if group_coverage_verified(report, group, group_path):

@@ -1208,6 +1208,27 @@ def update_selection(revision, selection):
     private_input(revision, verification.name, info)
 
 
+def project_verified_no_signal(data):
+    evidence = data["collection"]["evidence"]
+    for index, asset in enumerate(data["long"][0]["direct"]):
+        asset.update(watch_eligible=False, trend="温", signal_events=[])
+        evidence[f"/long/0/direct/{index}/trend"]["value"] = "温"
+        evidence[f"/long/0/direct/{index}/signal_events"]["value"] = []
+
+
+def retain_verified_no_signal(selection, upstream):
+    raw = json.loads(upstream.read_bytes())
+    for row, record in zip(selection["instruments"], raw["data"], strict=True):
+        row.update(
+            current="温", labels="", state="核实后未触发", selected_new_position=False
+        )
+        record.update(trendTemperatureCurr="温", tickerLabels="")
+    private_input(upstream.parent, upstream.name, raw)
+    digest = sha256(upstream.read_bytes()).hexdigest()
+    for record in selection["field_records"].values():
+        record["sha256"] = digest
+
+
 @pytest.mark.parametrize(
     ("dates", "mixed", "valid"),
     [
@@ -1279,6 +1300,7 @@ def test_legacy_evidence_gap_is_visible_without_broker_calls(
     tmp_path, monkeypatch, capsys, gap, reason
 ):
     data, _ = report(*(("ABC",) if gap not in (None, "coverage") else ()))
+    add_verified_empty_board_seats(data)
     if gap == "board":
         data.pop("collection")
     if gap == "coverage":
@@ -1286,11 +1308,7 @@ def test_legacy_evidence_gap_is_visible_without_broker_calls(
     if gap == "eligibility":
         data["long"][0]["direct"][0].pop("watch_eligible")
     if gap == "verified_negative":
-        asset = data["long"][0]["direct"][0]
-        asset.update(watch_eligible=False, trend="温", signal_events=[])
-        evidence = data["collection"]["evidence"]
-        evidence["/long/0/direct/0/trend"]["value"] = "温"
-        evidence["/long/0/direct/0/signal_events"]["value"] = []
+        project_verified_no_signal(data)
     root, live, upstream = daily_files(tmp_path, data)
     revision = root / "reports/_evidence" / DAY / "v02"
     if gap:
@@ -1300,18 +1318,7 @@ def test_legacy_evidence_gap_is_visible_without_broker_calls(
             selection.pop("field_records")
             selection["field_sources"] = {}
         if gap == "verified_negative":
-            selection["instruments"][0].update(
-                current="温",
-                labels="",
-                state="核实后未触发",
-                selected_new_position=False,
-            )
-            raw = json.loads(upstream.read_bytes())
-            raw["data"][0].update(trendTemperatureCurr="温", tickerLabels="")
-            private_input(upstream.parent, upstream.name, raw)
-            selection["field_records"]["ABC"]["sha256"] = sha256(
-                upstream.read_bytes()
-            ).hexdigest()
+            retain_verified_no_signal(selection, upstream)
         update_selection(revision, selection)
 
     opend = PlanningOpenD()
@@ -1349,7 +1356,7 @@ def test_partially_represented_members_keep_empty_plan_unverified(
 ):
     data, _ = report("ABC", "XYZ")
     (group,) = data["long"]
-    evidence = data["collection"]["evidence"]
+    add_verified_empty_board_seats(data)
     if membership != "complete":
         second = group["direct"].pop()
         if membership == "duplicate":
@@ -1358,27 +1365,12 @@ def test_partially_represented_members_keep_empty_plan_unverified(
         if membership == "malformed":
             group["related"] = [None]
     if not positive:
-        for index, asset in enumerate(group["direct"]):
-            asset.update(watch_eligible=False, trend="温", signal_events=[])
-            evidence[f"/long/0/direct/{index}/trend"]["value"] = "温"
-            evidence[f"/long/0/direct/{index}/signal_events"]["value"] = []
+        project_verified_no_signal(data)
     root, live, upstream = daily_files(tmp_path, data)
     if not positive:
         revision = root / "reports/_evidence" / DAY / "v02"
         selection = json.loads((revision / "selection-evidence.json").read_bytes())
-        raw = json.loads(upstream.read_bytes())
-        for row, record in zip(selection["instruments"], raw["data"], strict=True):
-            row.update(
-                current="温",
-                labels="",
-                state="核实后未触发",
-                selected_new_position=False,
-            )
-            record.update(trendTemperatureCurr="温", tickerLabels="")
-        private_input(upstream.parent, upstream.name, raw)
-        digest = sha256(upstream.read_bytes()).hexdigest()
-        for record in selection["field_records"].values():
-            record["sha256"] = digest
+        retain_verified_no_signal(selection, upstream)
         update_selection(revision, selection)
 
     opend = PlanningOpenD()
@@ -1410,8 +1402,100 @@ def test_partially_represented_members_keep_empty_plan_unverified(
     assert opend.writes == []
 
 
+def add_verified_empty_board_seats(data):
+    evidence = data["collection"]["evidence"]
+    for direction in ("long", "short"):
+        groups = data.setdefault(direction, [])
+        for seat in (1, 2):
+            if any(group["seat"] == seat for group in groups):
+                continue
+            group = {
+                "seat": seat,
+                "name": f"{direction} control group {seat}",
+                "board_strength": 80 - seat,
+                "coverage": {"state": "complete", "instrument_ids": []},
+                "direct": [],
+            }
+            index = len(groups)
+            groups.append(group)
+            for name in ("board_strength", "coverage"):
+                evidence[f"/{direction}/{index}/{name}"] = receipt(
+                    group["name"], group[name], market="BOARD", kind=None
+                )
+
+
+@pytest.mark.parametrize(
+    ("gap", "positive", "missing_seats"),
+    [
+        ("side", False, {("short", 1), ("short", 2)}),
+        ("seat", False, {("long", 2)}),
+        ("duplicate", False, {("long", 2)}),
+        ("identity", False, {("long", 2)}),
+        ("withdrawn", False, {("long", 2)}),
+        ("side", True, {("short", 1), ("short", 2)}),
+        (None, False, set()),
+    ],
+)
+def test_missing_required_seat_keeps_empty_plan_unverified(
+    tmp_path, monkeypatch, capsys, gap, positive, missing_seats
+):
+    data, _ = report("ABC")
+    add_verified_empty_board_seats(data)
+    evidence = data["collection"]["evidence"]
+    asset = data["long"][0]["direct"][0]
+    if not positive:
+        project_verified_no_signal(data)
+        asset.pop("strength")
+        evidence.pop("/long/0/direct/0/strength")
+
+    if gap == "side":
+        data.pop("short")
+    elif gap == "seat":
+        data["long"].pop()
+    elif gap == "duplicate":
+        data["long"].append(deepcopy(data["long"][1]))
+        for field in ("board_strength", "coverage"):
+            evidence[f"/long/2/{field}"] = deepcopy(evidence[f"/long/1/{field}"])
+    elif gap == "identity":
+        data["long"][1].pop("name")
+    elif gap == "withdrawn":
+        evidence["/long/1/board_strength"]["state"] = "withdrawn"
+
+    root, live, upstream = daily_files(tmp_path, data)
+    opend = PlanningOpenD()
+    if not positive:
+        revision = root / "reports/_evidence" / DAY / "v02"
+        selection = json.loads((revision / "selection-evidence.json").read_bytes())
+        retain_verified_no_signal(selection, upstream)
+        update_selection(revision, selection)
+
+        def unexpected_connection(**_):
+            pytest.fail("an empty plan must not connect to OpenD")
+
+        opend.OpenQuoteContext = opend.OpenSecTradeContext = unexpected_connection
+    assert run_daily_plan(tmp_path, opend, PREOPEN, live, monkeypatch) == 0
+    plan = json.loads(capsys.readouterr().out)
+    if positive:
+        assert plan["execution"] == "awaiting_scheduled_tab_approval"
+        (line,) = plan["lines"]
+        assert (line["code"], line["quantity"]) == ("US.ABC", 100)
+    else:
+        status = "evidence_incomplete" if missing_seats else "verified_no_candidates"
+        assert plan["execution"] == status
+        assert plan["lines"] == opend.quote_calls == opend.calls == []
+        assert "approve_all" not in plan
+        assert {"code": "ABC", "reason": "verified_no_signal"} in plan["skipped"]
+    assert {
+        (item.get("direction"), item.get("seat"))
+        for item in plan["skipped"]
+        if item["reason"] == "board_seat_unverified"
+    } == missing_seats
+    assert opend.writes == []
+
+
 def pending_daily_evidence(tmp_path):
     data, _ = report("ABC")
+    add_verified_empty_board_seats(data)
     data["collection"]["target_evidence"]["BOARD"] = {
         "state": "verified",
         "kind": "continuous",
@@ -1555,6 +1639,7 @@ def test_daily_cli_plans_from_host_receipt_and_retained_sources(
     tmp_path, monkeypatch, capsys
 ):
     data, _ = report("ABC")
+    add_verified_empty_board_seats(data)
     root, live, upstream = daily_files(tmp_path, data)
     opend = PlanningOpenD()
     assert run_daily_plan(tmp_path, opend, PREOPEN, live, monkeypatch) == 0
@@ -1602,6 +1687,7 @@ def test_daily_cli_hk_calendar_and_round_lot(
 ):
     data, _ = report("00005")
     replace_market(data, "HK", "HKD")
+    add_verified_empty_board_seats(data)
     _, live, _ = daily_files(tmp_path, data)
     opend = PlanningOpenD(market="HK", day_type=day_type, lot=100)
     at = datetime.fromisoformat(f"{DAY}T09:20:00+08:00")
@@ -1702,6 +1788,7 @@ def test_daily_cli_flags_unverified_crypto_route_without_broker_access(
 ):
     data, _ = report("BTC", product="spot")
     replace_market(data, "CRYPTO", "USD")
+    add_verified_empty_board_seats(data)
     _, live, _ = daily_files(tmp_path, data)
     broker = PlanningOpenD()
     assert run_daily_plan(tmp_path, broker, PREOPEN, live, monkeypatch) == 0
@@ -1959,6 +2046,7 @@ def test_daily_cli_native_hk_futures_prices_one_multiplier_per_contract(
 ):
     data, _ = report("HSImain", product="future")
     replace_market(data, "HK", "HKD")
+    add_verified_empty_board_seats(data)
     _, live, _ = daily_files(
         tmp_path,
         data,

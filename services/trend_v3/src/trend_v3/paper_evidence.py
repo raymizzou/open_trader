@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .freshness import is_opening_data_fresh
 
 SIGNALS = {"long": ("温", "热", "温转热"), "short": ("凉", "寒", "凉转寒")}
+BOARD_SEATS = (1, 2)
 TAIPEI = ZoneInfo("Asia/Taipei")
 SOURCE_FIELDS = ("trendTemperaturePrev", "trendTemperatureCurr", "tickerLabels")
 REPORT_SCHEMA = "trend-v3-paper-evidence/v1"
@@ -162,6 +163,28 @@ def board_verified(report, collection, evidence, report_day):
             )
             and evidence[f"/{name}"]["version"] == report["board_version"]
             for name in ("board_date", "board_version")
+        )
+    )
+
+
+def board_seat_verified(report, evidence, direction, index):
+    groups = report.get(direction, [])
+    group = groups[index]
+    seat, name = group.get("seat"), group.get("name")
+    return (
+        type(seat) is int
+        and seat in BOARD_SEATS
+        and text(name)
+        and sum(other.get("seat") == seat for other in groups) == 1
+        and field(
+            evidence,
+            f"/{direction}/{index}",
+            "board_strength",
+            group.get("board_strength"),
+            name,
+            "BOARD",
+            None,
+            day(report["board_date"]),
         )
     )
 
@@ -458,33 +481,17 @@ def candidates(report, facts):
         return [], [{"reason": "board_unverified"}]
     facts = {**facts, "board_version": report["board_version"]}
     rows, skipped = [], []
-    sections = (
-        ("direct",)
-        if "daily_evidence_hash" in facts
-        else ("direct", "searchable", "related")
-    )
+    daily = "daily_evidence_hash" in facts
+    sections = ("direct",) if daily else ("direct", "searchable", "related")
     for direction in SIGNALS:
         groups = report.get(direction, [])
+        verified_seats = set()
         for index, group in enumerate(groups):
-            seat, name = group.get("seat"), group.get("name")
-            if (
-                type(seat) is not int
-                or seat not in (1, 2)
-                or not text(name)
-                or sum(other.get("seat") == seat for other in groups) != 1
-                or not field(
-                    evidence,
-                    f"/{direction}/{index}",
-                    "board_strength",
-                    group.get("board_strength"),
-                    name,
-                    "BOARD",
-                    None,
-                    day(report["board_date"]),
-                )
-            ):
-                skipped.append({"reason": "board_seat_unverified"})
+            if not board_seat_verified(report, evidence, direction, index):
+                if not daily:
+                    skipped.append({"reason": "board_seat_unverified"})
                 continue
+            verified_seats.add(group["seat"])
             if f"/{direction}/{index}" in facts.get("coverage_gaps", ()):
                 skipped.append({"reason": "coverage_unverified"})
             for section in sections:
@@ -503,6 +510,16 @@ def candidates(report, facts):
                         skipped.append({"code": asset.get("code"), "reason": reason})
                     else:
                         rows.append(item)
+        if daily:
+            skipped.extend(
+                {
+                    "reason": "board_seat_unverified",
+                    "direction": direction,
+                    "seat": seat,
+                }
+                for seat in BOARD_SEATS
+                if seat not in verified_seats
+            )
     rows.sort(
         key=lambda row: (
             row["direction"],
