@@ -5,7 +5,7 @@ description: Prepare or retrieve the mobile Trend V3 daily report for Trend Anim
 
 # Trend V3 日报
 
-在当前交互式会话完成私有日报。当前范围包括股票、1 倍 ETF 和期权的新仓观察，以及入选大类本身作为交易品种时的当期特殊信号观察。期货与持仓、凯利数据均后置。实盘、模拟盘和凯利各保留一节，统一显示「未接入」。正式阅读文件先在本地核对，再按「读取、修订与同步」交付。禁止交易、发布、发消息、微信或登录自动化、委派其他 agent，以及改动调度。
+在当前交互式会话完成私有日报。当前范围包括股票、1 倍 ETF 和期权的新仓观察，以及入选大类本身作为交易品种时的当期特殊信号观察。持仓对账与凯利数据后置。模拟盘首开仅由正式定时 tab 交接同版模拟开仓技能，其他日报入口只读。实盘与凯利各保留原占位；没有已核实的模拟状态时保留模拟盘占位。正式阅读文件先在本地核对，再按「读取、修订与同步」交付。禁止本技能直接交易、未经授权发布或发消息、微信或登录自动化、委派其他 agent，以及改动调度。
 
 先辨明入口。指定固定证据离线成稿或复验时，直接走「离线证据入口」。定时会话按「定时会话」运行。普通交互请求按「读取、修订与同步」处理；普通首稿、复用、修订和历史离线的截至基准统一按「适用数据日期」核对。每次日报交付以适用于请求报告日及其截至时间的可用证据成稿，交付一份保留 V1 阅读版式的现行 HTML。定时首版立即用可用证据成稿，不因缺项等待。定时会话在交付后按下文逐小时核实完整性；普通读取和离线成稿不启动轮询。任何查询均受原有授权与费用保护约束。
 
@@ -22,6 +22,8 @@ description: Prepare or retrieve the mobile Trend V3 daily report for Trend Anim
 - 复验未提交候选时，可显式指定同一检出的候选技能、渲染器与模板，并记录基准完整 SHA、四份候选文件摘要、纪律的实际提交及摘要、固定证据版本。候选和证据身份只记在私有验证记录。定时与手工运行仍用前述固定版本规则。
 
 ## 定时会话
+
+启动交接保留原正式交互 tab 和本日会话身份。当正式发布包含纸盘计划入口时，在适用正式报告版本交付读回后，从同一提交调用 [Trend V3 模拟盘首次开仓](../trend-v3-paper-entry/SKILL.md)。盘前计划与结果都留在此 tab。在原 tab 展示可核验的盘前计划，收到明确用户回复后才记录批准，并由该 tab 的受监督命令等待相应市场开盘。收到撤回立即记录。日报版次变更后重新展示计划并取得新回复。该入口只读取原日报和模拟盘执行条件，不增加趋势数据请求、费用、调度或新 tab。未启用、证据不足或错过开盘时在原 tab 标明。历史读取及离线入口继续复用已经核实的同版报告，不启动纸盘入口。
 
 每个日历日（含周末及股市假日）Asia/Taipei 08:30 首版立即交付；晚启动只补当前轮，不补历史轮次。缺项时页头显示「数据收集中」，列具体工作项、目标日、实际日及下一次核实时间。08:30、09:30、10:30 等为锚定时点，跨午夜继续原报告日。全部证据核实并交付当前完整 HTML 后显示「数据已完备」与核实时间，停止监测，保留交互标签。
 
@@ -174,6 +176,7 @@ python3 "$skill_dir/render_report.py" "$verified_json" "$new_html"
 
 `skill_dir` 为核对过版本的技能目录，`verified_json` 为明确选定的 UTF-8 输入路径，`new_html` 为已存在的私有目录下尚未使用的候选文件路径。渲染器只读该输入与同目录下的 `assets/report.html`，生成一份 UTF-8 HTML。它转义所有动态文本，展开并移除模板节点和插槽。已有路径返回非零。需要替换现行日报时，先核对候选，再按下文的锁、归档和原子替换流程处理。
 
+- 可选 `paper_entry` 只接受模拟开仓技能 `status` 输出的已核实脱敏结果。定时、手工、复渲染和离线入口须从所选日报的独立核实记录（`report-verification.json`）取得已核实的版次，并在渲染时用 `--report-revision "$verified_revision"` 传入。若用 `collection.py confirm` 核对本轮正式报告，传入相同参数。缺少已核实版次、版次不符或报告日不符时显示「未接入」。只显示标的、已知处理状态、简短原因和已确认数量。账本、账户身份和订单号保留在私有目录。旧输入照常显示「未接入」。
 - 根对象必须有 `date`（实际报告日，`YYYY-MM-DD`）。可选 `board_date`（经核实的榜图日，同格式）、`board_version`、`short`、`long`、`short_note`、`long_note`。方向数组缺省为空，方向说明只写白名单允许的具体缺项。
 - 每个大类有已核实的方向席位 `seat`（整数 `1` 或 `2`，同一方向内唯一）和 `name`，可选 `code`、`board_strength`、`direct`、`searchable`、`related`、`direct_note`、`searchable_note`、`related_note`、`coverage_note`、`direct_partial_note`。三个输入列表缺省为空，旧 `direct` / `related` 仍可读取，但数组位置不是成员或平台匹配证据。渲染器汇总输入后按显式核实字段执行三块分类、优先级去重和方向排序，不代替业务核验。`direct_note`、`searchable_note`、`related_note` 只在对应输出区块为空时显示；旧 direct/related 空列表说明还要求原输入列表为空，避免重新分组后公开原本隐藏的旧说明；非空时忽略，不能将旧空列表默认语或技术说明自动公开。
 - 新 `coverage_note` 为可公开的整类范围说明文本，始终放在三块之后，与卡片和直属区块是否为空无关。缺省不显示；空文本或纯空白不显示。提供该字段时优先于旧 `direct_partial_note`，两者不重复显示。分页与查询范围写在此处，区块空说明只说明当前没有已核实卡片，不能以空说明推断完整查无成员。当天没有直属但有平台可查卡片的输入，也用此字段保留成员第二页待核等事实。
@@ -194,6 +197,23 @@ python3 "$skill_dir/render_report.py" "$verified_json" "$new_html"
 
 - 用固定版本的 `纪律.md` 做核对，纪律全文、完整榜图和证据原件、收藏建议、方向名次计算、费用、讨论，以及超出展示白名单的字段和技术缺项只留私有证据或必要的会话状态。禁止读取持仓或账户仓位来源，不用持仓做候选筛选，不生成持仓动作或凯利值。
 - 在原有 `_evidence/YYYY-MM-DD/vNN/` 保留脱敏输入及实际来源、版本与摘要、各标的实际日期、身份与敞口、温度与标签、资格、可比组及范围、方向公式及名次、并列、未查询及缺项。私下逐项记录事件、全局强度、同品种强度、大类与自身标的同一关系的来源字段及私有编号，并记录观察与新仓结论及去重取舍。无匹配或未核实的关联品种另记已核实的身份、所属大类、查询范围和版本、完成状态、实际结果出处及缺项，引用原脱敏证据，HTML 只列白名单允许的查询结果与简短理由。引用定位到脱敏本地证据的实际版本与记录，保留完整阴性范围及未知原因。按「标的字段来源」稳定复用编号。记录估算、可核实实扣、差额、缓存、未发和待对账请求及其共享账本引用。缺失与待对账金额记 `UNKNOWN`，不得当作零或实扣。既有授权的只读费用对账仅取必要扣费证据，不读取仓位或留存账户标识。禁止把私有证据、旧稿、账本、说明或伴随文件置入阅读文件或同步目录。
+
+### 正式日报的模拟盘证据交接
+
+在包含模拟盘入口的发布版本中，正式定时成稿器每个新 `vNN` 都在报告日锁内先保存 `reader-projection.json`、`selection-draft.json` 和 `fees.json`。把既有选股生成步骤的输出写到 `selection-draft.json`。随后从同一发布的服务源码执行以下命令，由程序在该版私有目录生成 `selection-evidence.json`。
+
+```sh
+PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli \
+  prepare-report-evidence "$daily_root" "$date" "$revision" --release "$report_sha"
+```
+
+`daily_root` 为包含 `reports/_evidence` 的原日报工作区。草稿有原报告日和带时区的 `cutoff`，同名日期或版本声明须一致。命令写入 `trend-v3-paper-evidence/v1`、报告日、版次、发布提交和投影摘要。按原 HTML 核验步骤继续成稿和逐字节读回，独立核实记录采用实际 `projection_sha256`、`selection_sha256`、`fees_sha256` 和 `report_sha256`。已有核实记录或选股证据时禁止覆写。历史原件仍按原版本读取。
+
+有模拟候选时，投影须保存原日报日适用的 `collection.targets` 与 `target_evidence`，包含 `BOARD`。在 `collection.evidence` 留存同版榜图日期、版次、席位强度、完整直属覆盖及标的自身信号的核实记录。每条 `instruments` 行保存 `id`、`code`、`market`、`group`、`relationship: "直属"`、`data_day`、`expected_day`、`previous`、`current`、`labels`、`state` 和 `selected_new_position`。已核实候选用 `state: "已触发"` 与 `selected_new_position: true`，已核实无触发用 `state: "核实后未触发"` 与 `false`。`field_refs` 按供应商字段名引用原件，至少覆盖 `trendTemperaturePrev`、`trendTemperatureCurr`、`tickerLabels`。
+
+每条 `field_records` 引用保留证据根下的 `source` 路径、`sha256`、JSON `location`、`identity`（`tmId`／`asset`／`tickerSymbol`／`asOfDate`）、`fields` 和适用 `version`。已有 `field_sources` 草稿可提供相同原件的 `path`、`sha256`、`location`、`record` 和 `version`，由程序转换引用。原报告日证据目录是普通相对路径的起点。字段版次须与投影的趋势和事件证明一致。草稿、原始响应和交易证据留在私有目录。
+
+没有可核实的交易事实时保留缺项，日报照常用已核实的展示材料发布。交付读回后，原定时 tab 的盘前入口按实际证据说明 `verified_no_candidates` 或 `evidence_incomplete`，并报告 `skipped` 中的具体原因。榜图、覆盖、适用日期、身份或逐字段证据待核时保留待核结论，缺项不触发行情采购或券商读取。
 
 ### 读取、修订与同步
 

@@ -52,10 +52,11 @@ The caller owns calendar decisions and all other opening conditions.
   Lookup-only cards mask both strengths; invalid dates or identity resolution
   must never restore stale quotes, strengths, events or watch eligibility. Keep
   both
-  direction panels when evidence is missing. The live reserved block and the
-  simulation section each show a
-  `positions-note` paragraph with `未接入`. The two Kelly values each show
-  `未接入`.
+  direction panels when evidence is missing. The live reserved block and both Kelly values retain `未接入`.
+  The simulation section also retains that placeholder for old reports and
+  reports without verified paper-entry status. The official scheduled tab can
+  display the current redacted output of the same-version
+  [paper-entry skill](.agents/skills/trend-v3-paper-entry/SKILL.md).
   Use whole-card green only when the actual quote day matches the applicable
   market target validated by original-report-day calendar evidence. Stale,
   missing, invalid, future or contradictory dates use yellow. Show one actual

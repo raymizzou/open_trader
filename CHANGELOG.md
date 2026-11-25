@@ -4,6 +4,26 @@
 
 # Changelog
 
+## 2026-11-25 — Trend V3 first paper entry (#507)
+
+- Fund automatic and manual crypto first entries from account assets without
+  an instrument-count cap. Preserve per-account cash and notional reservations,
+  including simultaneous manual items, and all identity and no-replay checks.
+- Build the pre-open simulation plan in the original scheduled report tab
+  from the current verified daily report and read-only OpenD evidence.
+- Record explicit pre-open user approval from the original tab and submit
+  approved SIMULATE market entries at their respective opens. Size each entry
+  from its account's native net assets and available funds.
+- Preserve order identity and broker evidence across restarts and report
+  revisions. Retry only the confirmed remainder after a fresh reply. Show
+  redacted status in the daily report.
+- Apply plan withdrawals to unopened items and report which items had already
+  opened. Display paper status only for the independently verified report revision.
+- Existing and historical report inputs retain their original placeholders.
+- The scheduled daily report writes versioned paper-entry evidence before
+  publication. Offline and scheduled planning distinguish a verified empty
+  selection from missing board, membership, date or raw signal evidence.
+
 ## 2026-11-24 — Trend V3 lookup and manual report scope (#528)
 
 - Preserve a completed negative lookup when deduplicating pending query rows
