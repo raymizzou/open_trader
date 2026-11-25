@@ -23,8 +23,10 @@ The caller owns calendar decisions and all other opening conditions.
 - Use the selected revision's [V1 report renderer](.agents/skills/trend-v3-daily-report/render_report.py)
   for scheduled, manual, offline, and revision work. The dated masthead links
   to the short, long, live, simulation, and Kelly sections in that order.
-  Keep each verified class from the market board's bottom two (short) and top
-  two (long) seats. Each class expands to three labelled blocks, in order: `大类直属`,
+  For threshold-v1 reports, keep every verified class with strength ≤20
+  (short) or ≥80 (long), including zero and boundary values, checked against
+  an independently frozen complete financial-assets board. Legacy reports
+  retain their original bottom two and top two seats. Each class expands to three labelled blocks, in order: `大类直属`,
   `趋势动物里面能够查到`, and `相关的标的`, including empty blocks.
   Verified membership wins over an exact platform match, which wins over
   other evidence-backed related instruments. Show each instrument once per
