@@ -295,3 +295,168 @@ def test_each_expected_board_covers_its_declared_scope(tmp_path):
         dict(market="CN", instrument_type="ETF")
     ]
     assert control().assess(report)["complete"]
+
+
+def test_distinct_market_days_merge_scoped_membership_coverage(tmp_path):
+    from test_hourly_collection import control
+
+    payload = fixture()
+    payload["board"]["groups"] = [dict(name="甲", strength=100)]
+    payload["targets"] = {"US": "2026-11-23", "HK": "2026-11-24"}
+    us, hk = (
+        dict(market="US", instrument_type="stock"),
+        dict(market="HK", instrument_type="stock"),
+    )
+    payload["group_markets"] = [dict(payload["group_markets"][0], markets=[us, hk])]
+    payload["boards"][0]["data_date"] = "2026-11-23"
+    hong_kong = deepcopy(payload["boards"][0])
+    hong_kong.update(
+        board_id="warm-hk", title="港股温转热", data_date="2026-11-24", markets=[hk]
+    )
+    hong_kong["members"][0].update(instrument_id="p2", code="00001", market="HK")
+    payload["boards"].append(hong_kong)
+    payload["memberships"] = [
+        dict(payload["memberships"][0], data_date="2026-11-23", markets=[us]),
+        dict(
+            payload["memberships"][0],
+            data_date="2026-11-24",
+            markets=[hk],
+            members=[
+                {
+                    k: hong_kong["members"][0][k]
+                    for k in ["instrument_id", "code", "market", "instrument_type"]
+                }
+            ],
+        ),
+    ]
+    payload["search_coverage"][0]["boards"] = [
+        dict(board_id="warm-us", version="2026-11-25", markets=[us]),
+        dict(board_id="warm-hk", version="2026-11-25", markets=[hk]),
+    ]
+
+    def formal_assess(evidence, name):
+        report = dict(
+            date="2026-11-25",
+            cutoff=payload["cutoff"],
+            board_date="2026-11-24",
+            board_version="2026-11-25",
+            selection_mode="threshold-v1",
+            signal_search=evidence,
+            long=[
+                dict(
+                    name="甲",
+                    seat=1,
+                    board_strength="100",
+                    data_date="2026-11-24",
+                    coverage={"state": "complete", "instrument_ids": ["p1", "p2"]},
+                    direct=[],
+                )
+            ],
+            short=[],
+            collection=dict(
+                targets={"BOARD": "2026-11-24", **payload["targets"]},
+                parent_board=dict(payload["board"], row_count=1),
+                worklist=[],
+                evidence={},
+                verified_at="2026-11-25T08:20:00+08:00",
+            ),
+        )
+        for identity, code, market, day in [
+            ("p1", "ONE", "US", "2026-11-23"),
+            ("p2", "00001", "HK", "2026-11-24"),
+        ]:
+            report["long"][0]["direct"].append(
+                dict(
+                    instrument_id=identity,
+                    code=code,
+                    name=code,
+                    market=market,
+                    instrument_type="stock",
+                    data_date=day,
+                    direct_verified=True,
+                    platform_match_verified=True,
+                    watch_eligible=False,
+                    trend="热",
+                    signal_events=["温转热"],
+                    strength="90",
+                    local_strength="80",
+                )
+            )
+        for path, label, market, owner, value in control().required_facts(report):
+            day = report["collection"]["targets"][market]
+            report["collection"]["worklist"].append(
+                dict(path=path, label=label, market=market, target_date=day)
+            )
+            report["collection"]["evidence"][path] = dict(
+                state="verified",
+                data_date=day,
+                version="2026-11-25",
+                source="synthetic-frozen-fact",
+                identity=owner,
+                value=value,
+                market=market,
+                instrument_type="stock" if market != "BOARD" else None,
+            )
+        path = tmp_path / (name + "-formal.json")
+        path.write_text(json.dumps(report, ensure_ascii=False))
+        result = subprocess.run(
+            [sys.executable, str(SKILL / "collection.py"), "assess", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    result = search(tmp_path, payload)
+    assert result["groups"][0]["status"] == "已命中"
+    assert [
+        (h["code"], h["signal_sources"][0]["data_date"])
+        for h in result["groups"][0]["hits"]
+    ] == [("ONE", "2026-11-23"), ("00001", "2026-11-24")]
+    assert formal_assess(payload, "both-complete")["complete"]
+    for change in [
+        "missing-hk",
+        "wrong-hk-day",
+        "wrong-hk-scope",
+        "wrong-catalog",
+        "contradictory-member",
+        "contradictory-board",
+        "board-overclaim",
+    ]:
+        incomplete = deepcopy(payload)
+        if change == "missing-hk":
+            incomplete["memberships"].pop()
+        elif change == "wrong-hk-day":
+            incomplete["memberships"][1]["data_date"] = "2026-11-23"
+        elif change == "wrong-hk-scope":
+            incomplete["memberships"][1]["markets"] = [us]
+        elif change == "contradictory-member":
+            incomplete["memberships"][1].update(market="US", instrument_type="stock")
+        elif change == "contradictory-board":
+            incomplete["boards"][1].update(market="US", instrument_type="stock")
+        elif change == "wrong-catalog":
+            incomplete["search_coverage"][0]["boards"][0]["markets"] = [us, hk]
+        else:
+            incomplete["boards"][0]["markets"] = [us, hk]
+            incomplete["boards"][0]["members"].append(
+                dict(hong_kong["members"][0], data_date="2026-11-24")
+            )
+            incomplete["boards"].pop()
+            incomplete["search_coverage"][0]["boards"] = [
+                dict(board_id="warm-us", version="2026-11-25", markets=[us, hk])
+            ]
+        result = search(tmp_path, incomplete)["groups"][0]
+        assert result["status"] == "待核", change
+        assert result["hits"][0]["code"] == "ONE", change
+        if change != "wrong-catalog":
+            assert len(result["hits"]) == 1, change
+        assert not formal_assess(incomplete, change)["complete"], change
+    empty = deepcopy(payload)
+    for container in [*empty["memberships"], *empty["boards"]]:
+        container["members"] = []
+    assert search(tmp_path, empty)["groups"][0]["status"] == "无命中"
+    assert formal_assess(empty, "explicit-empty")["complete"]
+    empty["memberships"][0].pop("markets")
+    assert search(tmp_path, empty)["groups"][0]["status"] == "待核"
+    assert not formal_assess(empty, "ambiguous-empty")["complete"]

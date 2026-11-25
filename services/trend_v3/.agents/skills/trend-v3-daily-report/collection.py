@@ -1382,14 +1382,53 @@ def member_current(payload, member, container):
     )
 
 
-def applicable_board(payload, value):
+def declared_scopes(value, fallback=()):
+    """Legacy omission is unambiguous only for one known market/product pair."""
+    if "markets" not in value:
+        scopes = set(fallback) if len(fallback) == 1 else set()
+        if ("market" in value or "instrument_type" in value) and market_scope(
+            value
+        ) not in scopes:
+            return set()
+        return scopes
+    rows = value["markets"]
+    if (
+        not isinstance(rows, list)
+        or not rows
+        or any(
+            not isinstance(row, dict)
+            or row.get("state", "verified") != "verified"
+            or any(
+                not isinstance(row.get(key), str) or not row[key].strip()
+                for key in ("market", "instrument_type")
+            )
+            for row in rows
+        )
+    ):
+        return set()
+    scopes = {market_scope(row) for row in rows}
+    if ("market" in value or "instrument_type" in value) and market_scope(
+        value
+    ) not in scopes:
+        return set()
+    return scopes
+
+
+def current_scopes(payload, value, fallback=()):
+    """One container date proves only the declared combinations with that target."""
     reference = {**payload["board"], "data_date": value.get("data_date")}
-    targets = {
-        valid_date(member_day(payload, market)) for market in value.get("markets", [])
+    if not retained_scope(value, reference, payload["cutoff"]):
+        return set()
+    return {
+        scope
+        for scope in declared_scopes(value, fallback)
+        if valid_date(value.get("data_date"))
+        == valid_date(member_day(payload, {"market": scope[0]}))
     }
-    return valid_date(value.get("data_date")) in targets and retained_scope(
-        value, reference, payload["cutoff"]
-    )
+
+
+def applicable_board(payload, value):
+    return bool(current_scopes(payload, value))
 
 
 def search_plan(payload):
@@ -1466,19 +1505,21 @@ def search_plan(payload):
             and m.get("version") == board["version"]
             and observed_by(m.get("observed_at"), cutoff)
         ]
-        invalid_containers = [
-            m
+        membership_scopes = [
+            (m, declared_scopes(m, markets), current_scopes(payload, m, markets))
             for m in memberships
-            if any(
-                valid_date(m.get("data_date"))
-                != valid_date(member_day(payload, {"market": market}))
-                or valid_date(m.get("data_date")) is None
-                for market, _ in markets
-            )
         ]
-        if invalid_containers:
-            gaps.append("直属清单容器适用日待核")
-        if not memberships or not all(m.get("complete") is True for m in memberships):
+        membership_coverage = set()
+        for membership, declared, current in membership_scopes:
+            if not declared:
+                gaps.append("直属清单覆盖市场和品种待核")
+            if (declared & markets) - current:
+                gaps.append("直属清单容器适用日待核")
+            if membership.get("complete") is True:
+                membership_coverage.update(current & markets)
+            elif declared & markets:
+                gaps.append("独立直属覆盖待核")
+        if not markets <= membership_coverage or not markets:
             gaps.append("独立直属覆盖待核")
             result["metrics"]["extra_membership_queries"] += 1
         discovery = [
@@ -1497,14 +1538,18 @@ def search_plan(payload):
                 observed = signals.get(key)
                 scopes = entry.get("markets")
                 if scopes is None and observed and applicable_board(payload, observed):
-                    scopes = observed.get("markets", [])
-                if not scopes or entry.get("state", "verified") != "verified":
+                    scopes = [
+                        {"market": market, "instrument_type": kind}
+                        for market, kind in declared_scopes(observed)
+                    ]
+                catalogue_scopes = declared_scopes({**entry, "markets": scopes})
+                if not catalogue_scopes or entry.get("state", "verified") != "verified":
                     gaps.append("搜索结果适用组合映射待核")
                     continue
-                if {market_scope(m) for m in scopes} & markets:
+                if catalogue_scopes & markets:
                     if all(isinstance(k, str) and k.strip() for k in key):
                         expected_boards.setdefault(key, set()).update(
-                            {market_scope(m) for m in scopes} & markets
+                            catalogue_scopes & markets
                         )
                     else:
                         gaps.append("搜索结果榜身份待核")
@@ -1516,7 +1561,11 @@ def search_plan(payload):
                 or not applicable_board(payload, signal)
             ):
                 continue
-            scopes = {market_scope(m) for m in signal.get("markets", [])} & markets
+            advertised = declared_scopes(signal) & markets
+            scopes = current_scopes(payload, signal) & markets
+            if advertised - scopes:
+                gaps.append("信号榜部分适用组合日期待核")
+                requests.add(key)
             if not scopes:
                 continue
             read.add(key)
@@ -1528,17 +1577,28 @@ def search_plan(payload):
             else:
                 gaps.append("信号榜未读到组尾")
                 requests.add(key)
-            independent = [m for m in memberships if m["source"] != signal["source"]]
-            if not independent:
-                gaps.append("直属名单缺独立来源")
+            independent = [
+                (m, declared, current)
+                for m, declared, current in membership_scopes
+                if m["source"] != signal["source"] and declared & scopes
+            ]
+            independent_coverage = set()
+            for membership, _, current in independent:
+                if membership.get("complete") is True:
+                    independent_coverage.update(current)
+            if not scopes <= independent_coverage:
+                gaps.append("直属名单缺独立完整适用范围")
             members, bad_members = set(), set()
-            for membership in independent:
+            for membership, declared, current in independent:
                 for member in membership.get("members", []):
                     identity = search_identity(member)
-                    if identity is None or not member_current(
-                        payload, member, membership
+                    if (
+                        identity is None
+                        or market_scope(member) not in declared
+                        or market_scope(member) not in current
+                        or not member_current(payload, member, membership)
                     ):
-                        gaps.append("直属成员身份或适用日待核")
+                        gaps.append("直属成员身份、声明范围或适用日待核")
                         bad_members.add(identity)
                     elif member.get("removed") is not True:
                         members.add(identity)
@@ -1561,6 +1621,7 @@ def search_plan(payload):
                     identity is None
                     or len(signatures) != 1
                     or not member_current(payload, member, signal)
+                    or market_scope(member) not in current_scopes(payload, signal)
                     or type(member.get("removed")) is not bool
                     or not isinstance(member.get("labels"), list)
                     or any(not isinstance(v, str) for v in member["labels"])
@@ -1602,8 +1663,7 @@ def search_plan(payload):
                 or signal.get("complete") is not True
                 or signal.get("direction") != direction
                 or signal.get("label") != label
-                or not expected_boards[key]
-                <= {market_scope(m) for m in signal.get("markets", [])}
+                or not expected_boards[key] <= current_scopes(payload, signal)
             ):
                 gaps.append("搜索结果中的榜缺失、改版、日期或适用组合不符")
                 requests.add(key)
