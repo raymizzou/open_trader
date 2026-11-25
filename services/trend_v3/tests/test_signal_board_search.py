@@ -460,3 +460,118 @@ def test_distinct_market_days_merge_scoped_membership_coverage(tmp_path):
     empty["memberships"][0].pop("markets")
     assert search(tmp_path, empty)["groups"][0]["status"] == "待核"
     assert not formal_assess(empty, "ambiguous-empty")["complete"]
+
+
+def test_withdrawn_duplicate_is_order_independent_and_keeps_other_hits(tmp_path):
+    import re
+
+    from test_daily_report_layout import render
+    from test_hourly_collection import add_threshold_hit, control, threshold_report
+
+    report = add_threshold_hit(threshold_report())
+    first = report["long"][0]
+    good = dict(first["direct"][0], instrument_id="p2", code="TWO", name="Uncontested")
+    first["direct"].append(good)
+    first["coverage"]["instrument_ids"] = ["p1", "p2"]
+    manifest = report["collection"]
+    manifest["evidence"]["/long/0/coverage"]["value"] = deepcopy(first["coverage"])
+    for field in ["trend", "signal_events", "strength", "local_strength"]:
+        path = "/long/0/direct/1/" + field
+        manifest["worklist"].append(
+            dict(path=path, label="TWO " + field, market="US", target_date="2026-11-24")
+        )
+        manifest["evidence"][path] = dict(
+            manifest["evidence"]["/long/0/direct/0/" + field],
+            identity="p2",
+            value=good[field],
+        )
+    payload = report["signal_search"]
+    signal = payload["boards"][0]
+    signal["members"][0]["state"] = "verified"
+    signal["members"].append(dict(signal["members"][0], instrument_id="p2", code="TWO"))
+    member = payload["memberships"][0]
+    member["members"][0]["state"] = "verified"
+    member["members"].append(dict(member["members"][0], instrument_id="p2", code="TWO"))
+    assert control().assess(report)["complete"]
+    for location in ["signal", "membership-row", "membership-container"]:
+        observed = []
+        for reverse in [False, True]:
+            disputed = deepcopy(payload)
+            if location == "signal":
+                rows = disputed["boards"][0]["members"]
+                pair = [deepcopy(rows[0]), dict(rows[0], state="withdrawn")]
+                disputed["boards"][0]["members"] = (pair[::-1] if reverse else pair) + [
+                    rows[1]
+                ]
+            elif location == "membership-row":
+                rows = disputed["memberships"][0]["members"]
+                pair = [deepcopy(rows[0]), dict(rows[0], state="withdrawn")]
+                disputed["memberships"][0]["members"] = (
+                    pair[::-1] if reverse else pair
+                ) + [rows[1]]
+            else:
+                original = disputed["memberships"][0]
+                withdrawn = dict(
+                    original,
+                    state="withdrawn",
+                    members=[deepcopy(original["members"][0])],
+                )
+                disputed["memberships"] = (
+                    [withdrawn, original] if reverse else [original, withdrawn]
+                ) + disputed["memberships"][1:]
+            result = search(tmp_path, disputed)["groups"][0]
+            assert result["status"] == "待核", (location, reverse)
+            assert [h["code"] for h in result["hits"]] == ["TWO"], (location, reverse)
+            observed.append(result)
+            projected = deepcopy(report)
+            projected["signal_search"] = disputed
+            assert not control().assess(projected)["complete"]
+            html = render(tmp_path, projected, location + str(reverse))
+            cards = re.findall(r"<article\b.*?</article>", html, re.S)
+            contested = next(card for card in cards if "合成一号" in card)
+            certain = next(card for card in cards if "Uncontested" in card)
+            assert "信号榜：" not in contested and "信号榜：" in certain
+        assert observed[0] == observed[1], location
+    stable = deepcopy(payload)
+    stable["boards"][0]["members"].insert(
+        1, deepcopy(stable["boards"][0]["members"][0])
+    )
+    stable["boards"][0]["members"][1].pop("state")
+    stable["memberships"][0]["members"].insert(
+        1, deepcopy(stable["memberships"][0]["members"][0])
+    )
+    stable["memberships"][0]["members"][1].pop("state")
+    result = search(tmp_path, stable)["groups"][0]
+    assert result["status"] == "已命中"
+    assert [h["code"] for h in result["hits"]] == ["ONE", "TWO"]
+    # Another board's current positive is independent of this board's withdrawal.
+    separate = deepcopy(payload)
+    separate["boards"][0]["members"].insert(
+        1, dict(separate["boards"][0]["members"][0], state="withdrawn")
+    )
+    other = deepcopy(payload["boards"][0])
+    other.update(board_id="other-warm", title="独立温转热榜")
+    other["members"][0]["removed_from_other_board"] = "冬至榜"
+    separate["boards"].append(other)
+    result = search(tmp_path, separate)["groups"][0]
+    one = next(h for h in result["hits"] if h["code"] == "ONE")
+    assert [s["board_id"] for s in one["signal_sources"]] == ["other-warm"]
+    assert any(h["code"] == "TWO" for h in result["hits"])
+
+    independent = deepcopy(payload)
+    another = dict(
+        deepcopy(independent["memberships"][0]), source="separate-independent-members"
+    )
+    independent["memberships"][0]["members"].insert(
+        1, dict(independent["memberships"][0]["members"][0], state="withdrawn")
+    )
+    independent["memberships"].append(another)
+    certain = search(tmp_path, independent)["groups"][0]
+    assert certain["status"] == "待核"
+    assert [h["code"] for h in certain["hits"]] == ["ONE", "TWO"]
+
+    removed = deepcopy(payload)
+    removed["memberships"][0]["members"][0]["removed"] = True
+    remaining = search(tmp_path, removed)["groups"][0]
+    assert remaining["status"] == "已命中"
+    assert [h["code"] for h in remaining["hits"]] == ["TWO"]

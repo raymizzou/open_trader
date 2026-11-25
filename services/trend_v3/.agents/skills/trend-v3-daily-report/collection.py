@@ -1500,7 +1500,7 @@ def search_plan(payload):
             m
             for m in payload.get("memberships", [])
             if m.get("group") == group["name"]
-            and m.get("state") == "verified"
+            and m.get("state") in ("verified", "withdrawn")
             and m.get("source")
             and m.get("version") == board["version"]
             and observed_by(m.get("observed_at"), cutoff)
@@ -1588,20 +1588,37 @@ def search_plan(payload):
                     independent_coverage.update(current)
             if not scopes <= independent_coverage:
                 gaps.append("直属名单缺独立完整适用范围")
-            members, bad_members = set(), set()
+            member_proofs, invalidated_proofs = set(), set()
             for membership, declared, current in independent:
                 for member in membership.get("members", []):
                     identity = search_identity(member)
+                    # A same-source/day invalidation must not depend on row order,
+                    # or erase a different source's independently current proof.
+                    proof_key = (
+                        json.dumps(membership["source"], sort_keys=True),
+                        identity,
+                        json.dumps(
+                            member.get("data_date", membership.get("data_date"))
+                        ),
+                        json.dumps(member.get("version", membership.get("version"))),
+                    )
                     if (
                         identity is None
+                        or membership.get("state") != "verified"
+                        or type(member.get("removed", False)) is not bool
                         or market_scope(member) not in declared
                         or market_scope(member) not in current
                         or not member_current(payload, member, membership)
                     ):
                         gaps.append("直属成员身份、声明范围或适用日待核")
-                        bad_members.add(identity)
-                    elif member.get("removed") is not True:
-                        members.add(identity)
+                        invalidated_proofs.add(proof_key)
+                    elif member.get("removed") is True:
+                        invalidated_proofs.add(proof_key)
+                    else:
+                        member_proofs.add(proof_key)
+            if member_proofs & invalidated_proofs:
+                gaps.append("直属成员核实与撤回或移出证明冲突待核")
+            members = {proof[1] for proof in member_proofs - invalidated_proofs}
             rows = {}
             for member in signal.get("members", []):
                 identity = search_identity(member)
@@ -1612,6 +1629,7 @@ def search_plan(payload):
                     (
                         json.dumps(m.get("labels"), ensure_ascii=False),
                         json.dumps(m.get("removed")),
+                        json.dumps(m.get("state", "verified")),
                         m.get("data_date", signal["data_date"]),
                         m.get("version", signal["version"]),
                     )
@@ -1630,7 +1648,6 @@ def search_plan(payload):
                     continue
                 if (
                     identity not in members
-                    or identity in bad_members
                     or market_scope(member) not in scopes
                     or member["removed"]
                     or label not in member["labels"]
