@@ -6,7 +6,6 @@ from decimal import Decimal
 
 from .paper_evidence import decimal, instant, text
 
-MAX_INSTRUMENTS = 10
 ENTRY_FRACTION = Decimal("0.02")
 
 
@@ -115,8 +114,6 @@ class Portfolio:
             return 0, "instrument_busy"
         if holdings and previous_fills == 0:
             return 0, "instrument_busy"
-        if not holdings and len(self.footprints) >= MAX_INSTRUMENTS:
-            return 0, "portfolio_slots_full"
         unit, lot = unit_notional(row), row["lot"]
         budget = min(
             self.net[name] * ENTRY_FRACTION - previous_fills * unit,

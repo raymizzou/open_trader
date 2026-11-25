@@ -524,6 +524,56 @@ def footprint(code, value, *, currency="USD", quantity=1):
     }
 
 
+@pytest.mark.parametrize("existing_count", [10, 11])
+@pytest.mark.parametrize("opening_condition", ["funded", "cash", "capacity", "closed"])
+def test_asset_funded_first_entry_above_ten(
+    tmp_path, existing_count, opening_condition
+):
+    service = make_service(tmp_path)
+    broker = service.broker
+    account = broker.accounts["paper-us"]
+    account["positions"] = [
+        footprint(f"POS{i}", 100) for i in range(existing_count - 1)
+    ]
+    account["orders"] = [footprint("PENDING", 100)]
+
+    # Position/order count does not impose a cap when assets fund the entry.
+    plan = prepare(service, "ABC")
+    assert [(line["code"], line["quantity"]) for line in plan["lines"]] == [
+        ("US.ABC", 100)
+    ]
+    assert plan["skipped"] == []
+    assert broker.orders == []
+    assert service.approve(plan["id"], approval(plan), now=PREOPEN)
+
+    if opening_condition == "cash":
+        account["available"] = "19"  # Below one $20 lot at the opening check.
+    elif opening_condition == "capacity":
+        broker.capacity = lambda line: 0
+    elif opening_condition == "closed":
+        broker.open = False
+    (outcome,) = service.submit(plan["id"], now=OPEN)
+    assert outcome["state"] == (
+        "active" if opening_condition == "funded" else "skipped"
+    )
+    if opening_condition == "funded":
+        assert [row[:3] for row in broker.orders] == [("US.ABC", "long", 100)]
+    else:
+        assert outcome["reason"] == {
+            "cash": "account_or_size_unverified",
+            "capacity": "approved_size_unavailable",
+            "closed": "market_not_open",
+        }[opening_condition]
+        assert broker.orders == []
+
+    # Restored funds/market conditions never replay a completed opening decision.
+    account["available"] = "100000"
+    broker.capacity = lambda line: 100000
+    broker.open = True
+    assert service.submit(plan["id"], now=OPEN + timedelta(seconds=1)) == [outcome]
+    assert len(broker.orders) == (1 if opening_condition == "funded" else 0)
+
+
 def test_notional_lot_and_portfolio_limits(tmp_path):
     service = make_service(tmp_path)
     broker = service.broker
@@ -535,13 +585,20 @@ def test_notional_lot_and_portfolio_limits(tmp_path):
     assert [(line["quantity"], line["notional"]) for line in plan["lines"]] == [
         (40, "1200")
     ]
+    broker.accounts["paper-us"]["available"] = "299"
+    assert service.plan(data, facts, now=PREOPEN)["skipped"] == [
+        {"code": "US.ABC", "reason": "account_or_size_unverified"},
+    ]
+    broker.accounts["paper-us"]["available"] = "1250"
 
     account = broker.accounts["paper-us"]
     account["positions"] = [footprint(f"POS{i}", 100) for i in range(9)]
     account["orders"] = [footprint("OPEN", 100)]
-    assert service.plan(data, facts, now=PREOPEN)["skipped"] == [
-        {"code": "US.ABC", "reason": "portfolio_slots_full"},
+    plan = service.plan(data, facts, now=PREOPEN)
+    assert [(line["quantity"], line["notional"]) for line in plan["lines"]] == [
+        (40, "1200"),
     ]
+    assert plan["skipped"] == []
 
     account["positions"] = [footprint("POS", 99500)]
     account["orders"] = []
@@ -570,18 +627,29 @@ def test_notional_lot_and_portfolio_limits(tmp_path):
     del broker.accounts["paper-hk"]
     account["positions"] = [footprint(f"POS{i}", 100) for i in range(9)]
     data, facts = report("ABC", "XYZ")
+    facts["instruments"]["ABC"]["route"]["value"].update(
+        lot=10, reference_price="30"
+    )
     plan = service.plan(data, facts, now=PREOPEN)
-    assert [line["code"] for line in plan["lines"]] == ["US.ABC"]
-    assert plan["skipped"] == [{"code": "US.XYZ", "reason": "portfolio_slots_full"}]
-    assert service.approve(plan["id"], approval(plan), now=PREOPEN)
+    # ABC reserves $1200 of this account's $1250; XYZ gets only $40 (two lots).
+    assert [(line["code"], line["quantity"]) for line in plan["lines"]] == [
+        ("US.ABC", 40),
+        ("US.XYZ", 2),
+    ]
+    assert plan["skipped"] == []
+    assert service.approve(
+        plan["id"], approval(plan, selection=plan["lines"][:1]), now=PREOPEN
+    )
     broker.reply = TimeoutError()
     assert service.submit(plan["id"], now=OPEN)[0]["state"] == "unknown"
     later = OPEN + timedelta(seconds=4)
     facts["report_version"] = "v2"
     facts["sessions"]["US"]["opens_at"] = (OPEN + timedelta(seconds=20)).isoformat()
     plan = service.plan(data, facts, now=later)
-    assert plan["lines"] == []
-    assert plan["skipped"][-1] == {"code": "US.XYZ", "reason": "portfolio_slots_full"}
+    assert [(line["code"], line["quantity"]) for line in plan["lines"]] == [
+        ("US.XYZ", 2),
+    ]
+    assert plan["skipped"] == [{"code": "US.ABC", "reason": "instrument_busy"}]
     assert len(broker.orders) == 1
 
 

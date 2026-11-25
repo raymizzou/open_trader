@@ -6,6 +6,9 @@
 
 ## 2026-11-25 — Trend V3 first paper entry (#507)
 
+- Fund automatic and manual crypto first entries from account assets without
+  an instrument-count cap. Preserve per-account cash and notional reservations,
+  including simultaneous manual items, and all identity and no-replay checks.
 - Build the pre-open simulation plan in the original scheduled report tab
   from the current verified daily report and read-only OpenD evidence.
 - Record explicit pre-open user approval from the original tab and submit
