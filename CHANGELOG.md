@@ -4,6 +4,13 @@
 
 # Changelog
 
+## 2026-11-25 — Clarify iCloud report delivery
+
+- Upload complete Trend V3 daily HTML reports and revisions to the existing
+  `trend_v3` iCloud folder. Keep intermediate artifacts in task storage by
+  default; use iCloud for other deliverables only when requested or already
+  agreed for that task.
+
 ## 2026-11-25 — Trend V3 first paper entry (#507)
 
 - Verify a directly invoked paper CLI's original foreground parent with the
