@@ -1,0 +1,49 @@
+---
+name: trend-v3-paper-entry
+description: Plan first paper entries from the verified Trend V3 daily report, record an explicit approval in its original scheduled tab, and submit approved Futu SIMULATE orders at the corresponding open.
+---
+
+# Trend V3 模拟盘首次开仓
+
+当天正式日报的原定时交互 tab 在日报交付核验后使用此入口。用与日报相同的不可变发布版本和原 Codex 会话 UUID。程序自行读取本机启动回执、原启动消息与 native 终端身份。只在该 tab 回报。手工读取和历史报告不走正式入口。
+
+本期模拟盘以原定时 tab 中实际收到的明确用户回复为授权。会话记录证明回复来自该 tab；本期采用 tab 级信任。交付计划后等用户本人回复。禁止代发授权、用引述代替授权或从其他 tab 接收授权。
+
+## 盘前计划
+
+1. 照日报流程验证当前 HTML 和主机上传回执。程序从原路径读当天最新报告及关联的 reader、selection、费用与报告核实文件，核对日期、版本、发布身份与摘要。给定原会话 UUID 即可，无需创建证据包或填写仓位、价格或订单内容。
+2. 程序核对原榜图、直属资格、适用数据日、逐字段信号和引用原件。没有合格候选时不连接 OpenD。有合格候选时读取交易日、产品、合约、参考价、整手和模拟账户的风险数据。每笔首次开仓按该账户的当前净资产 2% 计算，并受本币可用资金和账户敞口上限约束，向下取整手或整张。组合最多占 10 个标的，包含配置内持仓、挂单及待核委托。各账户的资金及敞口各以本币计，无需跨币种汇率。
+3. 在原 tab 的可见最终回复中用代码块逐字展示 `plan` 输出的 `delivery` 正文，每行完整保留。正文以外说明仅限价、资格待核、已有持仓、活动或状态不明的委托。展示 `确认全部`、`只确认第1项` 或 `确认第1、3项` 等回复示例。程序按所展示的编号绑定当前报告版次和计划。多个计划导致简短回复含糊时暂停执行，请用户在原 tab 指明项目和计划，此时可用 `模拟批准 <计划编号> <项目编号1>,<项目编号2>`。没有可批准项目时直接说明。日报更新后，重新生成和展示新计划，由用户重新审批。
+4. 收到该 tab 的明确盘前回复后运行 `approve`，读回已记录的决定。有已批准项目时，在最早对应开盘前用该 tab 的受监督命令运行 `submit` 并保留其执行句柄。此命令在本地等待各市场开盘，当前对话轮可结束。后续在原 tab 用同一执行句柄读回结果，必要时用 `status`，不启动守护进程或新 tab。用户可用 `withdraw_all` 或 `模拟撤回 <完整计划编号> <项目编号1>,<项目编号2>` 撤回计划项，收到时立即用 `approve` 记录决定。
+5. 每个开盘组核对原报告版次、累计占用、该账户净资产及可用资金、市场状态和券商可下数量。按原批准数量提交模拟市价单，信号沿用原报告。等待器在开盘后 2 秒内须已唤醒；已唤醒的组须在开盘后 30 秒以内发起每笔新报单。资金下降、交易条件未核实、进程迟到或券商读取超时均逐项回报。错过开盘不补发；重跑只读回已有状态。
+
+## 命令
+
+使用同一发布目录的 `services/trend_v3/src` 和已配 Futu SDK 的 Mini Python。在原 tab 按现有工具读回真实 Codex UUID，传给 `--session`。入口根据现在的台北日期定位报告。错误或证据缺口留在原 tab，私有文件、账户和券商订单编号不随结果发送。
+
+```sh
+PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" plan
+PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" approve "$plan"
+PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" submit "$plan"
+PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" status
+PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" reconcile "$plan"
+```
+
+`status` 不读取券商，可写入当天同报告版次的 `paper_entry` 投影。用原日报模板重渲染完整 HTML。历史报告只复用同版脱敏结果。实盘与凯利保留原占位。
+`reconcile` 只读取已保存委托的匹配回执。逐项回报成交、失败、活动、部分成交及待核。确认原委托已拒绝或已撤销且有剩余数量时，将返回的 `retry_reply` 逐字发给用户。仅在交易时段内收到新的同 tab 明确重试回复后，立即运行 `submit "$plan" --retry-item "$item"`。重复命令、活动委托、未知回执和已全成委托均不会补单。美国交易时段跨过台北午夜后，在 `--session` 后加 `--report-date YYYY-MM-DD`，填写原日报日期。
+
+固定历史演练使用相同文件格式。此入口不会访问 OpenD 或启动真实会话。它验证指定报告版次、原始文件和摘要。仿真的账户和实际提交流程通过服务的离线集成测试验证。
+
+```sh
+PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli rehearse "$daily_root" "$date" "$revision" --release "$report_sha"
+```
+
+## 证据与缺项
+
+- 盘前入口使用 `~/.config/trend-animals/daily-state/YYYY-MM-DD.launch.json` 与同日上传回执、Codex 原会话消息、最新日报目录内的原始文件。核对当前 native 前台和进程归属。出错时保留当前证据，待原 tab 或上传回执恢复。计划数据库在原日报工作区内的 `reports/_evidence/.paper-entry/state.sqlite3`。
+- 精确确认标的类型、市场、代码和日期。日历没有交易日则标明休市。保留当前报告的 `field_records` 原始路径、版本、摘要和记录位置。缺少对应原件或证据更正后不发券商读取。路由或份额规格缺失时保持待核；不能从简称、相似代码或截图推断。
+- 普通股的参考价与整手从精确 OpenD 代码取得。ETF 另须有引用原件中的 1 倍证明。期间无法核实的 A 股 ETF 与加密模拟市价线路保持待核。期货需有标的对应的可交易合约映射，再以 OpenD 合约规格核对有效期限、交易时间和乘数。两种互相冲突的时段不择一猜测。
+- OpenD 默认本机回环。已有私有模拟配置时沿用。无既有配置时只发现能唯一确认的活跃 SIMULATE 市场账户。账户识别、风险及委托只允许在明确的模拟路线内，行情和账户清单端点本身没有交易环境参数。重复账号、缺账户和借券能力不足均有独立待核状态。
+
+- 证券使用 OpenD 快照确认正常且未停牌。单市场模拟证券账户若省略资金币种，由已核实的账户市场确定，预算受扣除冻结额的现金与购买力两者限制。A 股接口使用券商的 `CNH` 参数，A 股账本仍按原计划人民币口径列示。账户资金或敞口的币种与该账户已核实本币冲突时，暂停该账户的新单。
+- 已核实的港股恒指期货使用香港日间开盘，按所选交易日上午或下午时段处理。券商展示的每手 50 与合约乘数指向同一个单位换算，计划数量以整数张列出，每张名义金额仅乘一次。其他形态缺少可信时段、到期日、币种或交易单位时继续待核。

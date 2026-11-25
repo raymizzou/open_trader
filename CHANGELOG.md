@@ -4,6 +4,18 @@
 
 # Changelog
 
+## 2026-11-25 — Trend V3 first paper entry (#507)
+
+- Build the pre-open simulation plan in the original scheduled report tab
+  from the current verified daily report and read-only OpenD evidence.
+- Record explicit pre-open user approval from the original tab and submit
+  approved SIMULATE market entries at their respective opens. Size each entry
+  from its account's native net assets and available funds.
+- Preserve order identity and broker evidence across restarts and report
+  revisions. Retry only the confirmed remainder after a fresh reply. Show
+  redacted status in the daily report.
+- Existing and historical report inputs retain their original placeholders.
+
 ## 2026-11-24 — Trend V3 lookup and manual report scope (#528)
 
 - Preserve a completed negative lookup when deduplicating pending query rows

@@ -2995,3 +2995,33 @@ def test_stale_membership_evidence_shows_group_pending(tmp_path):
         assert all(raw not in header for raw in (
             '/long/', 'coverage', '成分及查询覆盖', '目标', '实际'))
         assert report == original
+
+
+def test_verified_paper_status_is_current_and_redacted(tmp_path):
+    report = {
+        "date": "2040-01-01",
+        "paper_entry": {
+            "schema": "trend-v3-paper-entry.v1", "date": "2040-01-01",
+            "report_version": "v02",
+            "results": [
+                {"code": "US.ABC", "state": "active", "filled": 4, "remaining": 6,
+                 "active": True, "account": "private-id",
+                 "order": "private-order"},
+                {"code": "US.DEF", "state": "unknown", "active": None,
+                 "reason": "broker_receipt_unverified"},
+                {"code": "<script>alert(1)</script>", "state": "filled"},
+            ],
+            "skipped": [{"code": "BTCUSD", "reason": "market_order_unsupported"}],
+        },
+    }
+    html = render(tmp_path, report, "paper-current")
+    simulation = html.split('id="simulation"', 1)[1].split("</section>", 1)[0]
+    assert "US.ABC · 已提交 · 已成交 4 · 剩余 6 · 有活动委托" in simulation
+    assert "US.DEF · 回执待核 · 未核实券商回执 · 活动委托待核" in simulation
+    assert "BTCUSD · 已跳过 · 仅限价或市价不可用" in simulation
+    hidden = ("private-id", "private-order", "<script>")
+    assert all(value not in html for value in hidden)
+    assert html.count("未接入") == 3
+
+    report["paper_entry"]["date"] = "2039-12-31"
+    assert_formal_records(render(tmp_path, report, "paper-stale"))
