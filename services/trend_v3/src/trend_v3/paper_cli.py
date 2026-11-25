@@ -24,6 +24,7 @@ from .paper_entry import PaperEntry, encode
 from .paper_evidence import TAIPEI, instant
 from .paper_facts import produce
 from .paper_futu import BrokerUnavailable, FutuPaperBroker
+from .paper_report import prepare_report_evidence
 
 
 def utc_now():
@@ -62,7 +63,7 @@ def public_plan(plan):
         "timezone",
         "session_date",
     )
-    return {
+    result = {
         "id": plan["id"],
         "date": plan["date"],
         "report_version": plan["report_version"],
@@ -70,6 +71,20 @@ def public_plan(plan):
             {field: row[field] for field in public_fields} for row in plan["lines"]
         ],
         "skipped": plan["skipped"],
+    }
+    if not plan["lines"]:
+        reasons = {row["reason"] for row in plan["skipped"]}
+        if reasons <= {"verified_no_signal"}:
+            execution = "verified_no_candidates"
+        elif any(
+            reason.endswith(("_unverified", "_unavailable", "_conflict"))
+            for reason in reasons
+        ):
+            execution = "evidence_incomplete"
+        else:
+            execution = "no_actionable_candidates"
+        return result | {"execution": execution}
+    return result | {
         "execution": "awaiting_scheduled_tab_approval",
         "delivery": delivery_card(plan),
         "approve_all": "确认全部",
@@ -97,8 +112,13 @@ def rehearse(args):
     artifacts = latest_report(
         root, args.date, args.release, frozen_revision=args.revision
     )
-    now = instant(artifacts[2].get("cutoff"))
-    if now is None:
+    _, selection, info = artifacts
+    now = instant(info.get("cutoff", selection.get("cutoff")))
+    if (
+        now is None
+        or now.astimezone(TAIPEI).date().isoformat() != args.date
+        or ("cutoff" in selection and instant(selection["cutoff"]) != now)
+    ):
         raise ValueError("frozen report cutoff is unavailable")
     scope = {"owner": "offline", "id": "offline", "date": args.date, "kind": "offline"}
     with TemporaryDirectory(prefix="paper-rehearsal-") as folder:
@@ -134,6 +154,14 @@ def parse_args(argv=None):
     offline.add_argument("date")
     offline.add_argument("revision")
     offline.add_argument("--release", required=True)
+    prepare = commands.add_parser(
+        "prepare-report-evidence",
+        help="retain selection evidence before report verification",
+    )
+    prepare.add_argument("root", type=Path)
+    prepare.add_argument("date")
+    prepare.add_argument("revision")
+    prepare.add_argument("--release", required=True)
     return parser, parser.parse_args(argv)
 
 
@@ -142,6 +170,12 @@ def main(argv=None):
     try:
         if args.command == "rehearse":
             rehearse(args)
+        elif args.command == "prepare-report-evidence":
+            emit(
+                prepare_report_evidence(
+                    args.root, args.date, args.revision, args.release
+                )
+            )
         else:
             return run_daily(args)
     except (
@@ -177,6 +211,8 @@ PUBLIC_ERRORS = {
     "daily report revision does not match its verification",
     "daily report artifact digest does not match",
     "daily report artifact date does not match",
+    "daily selection evidence already exists",
+    "unsupported daily selection evidence schema",
     "frozen report cutoff is unavailable",
 }
 

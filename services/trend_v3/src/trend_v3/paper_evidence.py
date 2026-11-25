@@ -10,6 +10,7 @@ from .freshness import is_opening_data_fresh
 SIGNALS = {"long": ("温", "热", "温转热"), "short": ("凉", "寒", "凉转寒")}
 TAIPEI = ZoneInfo("Asia/Taipei")
 SOURCE_FIELDS = ("trendTemperaturePrev", "trendTemperatureCurr", "tickerLabels")
+REPORT_SCHEMA = "trend-v3-paper-evidence/v1"
 
 
 def decimal(value):
@@ -159,12 +160,13 @@ def board_verified(report, collection, evidence, report_day):
             field(
                 evidence, "", name, report.get(name), "board", "BOARD", None, expected
             )
+            and evidence[f"/{name}"]["version"] == report["board_version"]
             for name in ("board_date", "board_version")
         )
     )
 
 
-def native_signal(selection, asset, group, when, proof):
+def native_signal(selection, asset, group, when, proof, *, entry=True):
     """Read the existing selection-evidence row and its field references."""
     matching = [
         row
@@ -176,18 +178,24 @@ def native_signal(selection, asset, group, when, proof):
     if len(matching) != 1:
         return None
     (row,) = matching
+    expected_day = when.isoformat()
+    actual_days = row.get("actual_data_days", [row.get("data_day")])
     if (
-        row.get("selected_new_position") is not True
-        or row.get("state") != "已触发"
+        row.get("selected_new_position") is not entry
+        or row.get("state") != ("已触发" if entry else "核实后未触发")
         or row.get("relationship") != "直属"
         or not text(row.get("market"))
-        or day(row.get("data_day")) != when
-        or day(row.get("expected_day")) != when
+        or actual_days != [expected_day]
+        or row.get("data_day", expected_day) != expected_day
+        or row.get("expected_day", row.get("expected_data_day")) != expected_day
+        or row.get("expected_data_day", expected_day) != expected_day
         or not isinstance(proof, dict)
         or not text(proof.get("version"))
     ):
         return None
     refs, records = row.get("field_refs", {}), selection.get("field_records", {})
+    if not isinstance(refs, dict) or not isinstance(records, dict):
+        return None
     expected_identity = {
         "tmId": row["id"],
         "asset": row["market"],
@@ -197,17 +205,26 @@ def native_signal(selection, asset, group, when, proof):
     for field in SOURCE_FIELDS:
         record = records.get(refs.get(field), {})
         if (
-            record.get("identity") != expected_identity
-            or field not in record.get("fields", [])
+            not isinstance(record, dict)
+            or not same_raw_identity(record.get("identity"), expected_identity)
+            or not isinstance(record.get("fields"), list)
+            or field not in record["fields"]
             or not text(record.get("source"))
             or not text(record.get("location"))
-            or not re.fullmatch(r"[0-9a-f]{64}", record.get("sha256") or "")
+            or not text(record.get("sha256"))
+            or not re.fullmatch(r"[0-9a-f]{64}", record["sha256"])
+            or (
+                ("version" in record or selection.get("schema") == REPORT_SCHEMA)
+                and record.get("version") != proof["version"]
+            )
         ):
             return None
     labels = row.get("labels")
     if isinstance(labels, str):
         labels = [
-            label.strip() for label in re.split(r"[,，、\s]+", labels) if label.strip()
+            label.strip()
+            for label in re.split(r"[,，、;；\s]+", labels)
+            if label.strip()
         ]
     return {
         "state": "verified",
@@ -221,9 +238,16 @@ def native_signal(selection, asset, group, when, proof):
             "previous": row.get("previous"),
             "current": row.get("current"),
             "labels": labels,
-            "action": "entry",
+            "action": "entry" if entry else "no_signal",
         },
     }
+
+
+def same_raw_identity(actual, expected):
+    return isinstance(actual, dict) and all(
+        type(actual.get(key)) is type(value) and actual.get(key) == value
+        for key, value in expected.items()
+    )
 
 
 def product_for(kind, market):
@@ -425,6 +449,8 @@ def read_candidate(
 
 
 def candidates(report, facts):
+    if reason := facts.get("report_gap"):
+        return [], [{"reason": reason}]
     report_day = day(report.get("date"))
     collection = report.get("collection") or {}
     evidence = collection.get("evidence") or {}
@@ -432,6 +458,11 @@ def candidates(report, facts):
         return [], [{"reason": "board_unverified"}]
     facts = {**facts, "board_version": report["board_version"]}
     rows, skipped = [], []
+    sections = (
+        ("direct",)
+        if "daily_evidence_hash" in facts
+        else ("direct", "searchable", "related")
+    )
     for direction in SIGNALS:
         groups = report.get(direction, [])
         for index, group in enumerate(groups):
@@ -454,7 +485,9 @@ def candidates(report, facts):
             ):
                 skipped.append({"reason": "board_seat_unverified"})
                 continue
-            for section in ("direct", "searchable", "related"):
+            if f"/{direction}/{index}" in facts.get("coverage_gaps", ()):
+                skipped.append({"reason": "coverage_unverified"})
+            for section in sections:
                 for offset, asset in enumerate(group.get(section, [])):
                     item, reason = read_candidate(
                         asset,

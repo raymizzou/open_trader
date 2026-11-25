@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from .paper_authority import private_bytes, strict_json
 from .paper_evidence import (
+    REPORT_SCHEMA,
     SIGNALS,
     board_verified,
     day,
@@ -18,9 +19,12 @@ from .paper_evidence import (
     native_signal,
     product_for,
     receipt,
+    same_raw_identity,
     target,
+    text,
 )
 from .paper_futu import BrokerUnavailable, integer
+from .paper_report import normalize_field_sources
 
 # Futu reports the session date and day type. Regular exchange hours apply
 # only to those exact day types. Unsupported/multi-session products stay pending.
@@ -47,6 +51,7 @@ SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9.-]{0,30}", re.IGNORECASE | re.ASCII)
 HSI_HOURS = "(09:15-12:00),(13:00-16:30),(17:00-03:00)"
 HSI_MORNING = (time(9, 15), time(12))
 HSI_AFTERNOON = (time(13), time(16, 30))
+TEMPERATURES = ("冻", "寒", "凉", "平", "温", "热", "沸")
 
 
 class FactsMissing(ValueError):
@@ -88,13 +93,15 @@ class RawEvidence:
         if digest != proof.get("sha256"):
             raise FactsMissing("raw_signal_unverified")
         value = location_value(document, proof.get("location"))
-        identity_fields = ("tmId", "asset", "tickerSymbol", "asOfDate")
-        if any(
-            value.get(key) != proof.get("identity", {}).get(key)
-            for key in identity_fields
-        ):
+        if not same_raw_identity(value, proof["identity"]):
             raise FactsMissing("raw_signal_unverified")
         if field not in value:
+            raise FactsMissing("raw_signal_unverified")
+        if "record" in proof and (
+            field not in proof["record"]
+            or type(value[field]) is not type(proof["record"][field])
+            or value[field] != proof["record"][field]
+        ):
             raise FactsMissing("raw_signal_unverified")
         return value[field]
 
@@ -132,37 +139,48 @@ def direct_selection(selection, asset, group):
     raise FactsMissing("membership_unverified")
 
 
-def verify_membership(report, asset, group, group_path):
-    collection = report["collection"]
-    coverage = group.get("coverage") or {}
+def group_coverage_verified(report, group, group_path):
     expected = day(report.get("board_date"))
-    evidence = collection["evidence"]
-    if (
-        coverage.get("state") != "complete"
-        or identity(asset["instrument_id"])
-        not in {identity(member) for member in coverage.get("instrument_ids", [])}
-        or not field(
-            evidence,
-            group_path,
-            "coverage",
-            coverage,
-            group["name"],
-            "BOARD",
-            None,
-            expected,
+    evidence = report["collection"]["evidence"]
+    coverage = group.get("coverage")
+    return (
+        isinstance(coverage, dict)
+        and coverage.get("state") == "complete"
+        and isinstance(coverage.get("instrument_ids"), list)
+        and all(
+            field(
+                evidence,
+                group_path,
+                name,
+                group.get(name),
+                group.get("name"),
+                "BOARD",
+                None,
+                expected,
+            )
+            and evidence[f"{group_path}/{name}"]["version"] == report["board_version"]
+            for name in ("coverage", "board_strength")
         )
-        or not field(
-            evidence,
-            group_path,
-            "board_strength",
-            group.get("board_strength"),
-            group["name"],
-            "BOARD",
-            None,
-            expected,
-        )
-    ):
+    )
+
+
+def verify_membership(report, asset, group, group_path):
+    if not group_coverage_verified(report, group, group_path) or identity(
+        asset["instrument_id"]
+    ) not in {identity(member) for member in group["coverage"]["instrument_ids"]}:
         raise FactsMissing("membership_unverified")
+
+
+def group_coverage_complete(report, group, group_path):
+    if not group_coverage_verified(report, group, group_path):
+        return False
+    members = [
+        identity(asset.get("instrument_id"))
+        for section in ("direct", "searchable", "related")
+        for asset in group.get(section, [])
+    ]
+    covered = [identity(member) for member in group["coverage"]["instrument_ids"]]
+    return all(members) and covered == members
 
 
 def session_time(broker, code, quote_market, report_day, data_day, now, *, future=None):
@@ -478,6 +496,7 @@ def build_route(
 def produce(report, selection, info, evidence_root, broker, now):
     """Only ask OpenD about assets with report, membership and raw signal evidence."""
     report = deepcopy(report)
+    selection = normalize_field_sources(selection, report["date"])
     digest = sha256(
         (info["projection_sha256"] + info["selection_sha256"]).encode()
     ).hexdigest()
@@ -487,14 +506,33 @@ def produce(report, selection, info, evidence_root, broker, now):
         "selection": selection,
         "instruments": {},
         "gaps": {},
+        "coverage_gaps": [],
         "daily_evidence_hash": digest,
     }
     collection = report.get("collection") or {}
     evidence = collection.get("evidence") or {}
     report_day = day(report["date"])
-    if not board_verified(report, collection, evidence, report_day):
+    board = selection.get("board")
+    if (
+        not board_verified(report, collection, evidence, report_day)
+        or (
+            "board" in selection
+            and (
+                not isinstance(board, dict)
+                or board.get("board_date") != report["board_date"]
+                or board.get("edition") != report["board_version"]
+            )
+        )
+        or (
+            selection.get("schema") == REPORT_SCHEMA
+            and target(collection, "BOARD", report_day) != day(report["board_date"])
+        )
+    ):
+        facts["report_gap"] = "board_unverified"
         return report, facts
     raw = RawEvidence(evidence_root, selection)
+    if not any(report.get(direction) for direction in SIGNALS):
+        facts["report_gap"] = "coverage_unverified"
     for direction in SIGNALS:
         groups = report.get(direction, [])
         for number, group in enumerate(groups):
@@ -502,20 +540,31 @@ def produce(report, selection, info, evidence_root, broker, now):
             if (
                 type(seat) is not int
                 or seat not in (1, 2)
+                or not text(group.get("name"))
                 or sum(other.get("seat") == seat for other in groups) != 1
             ):
                 continue
+            group_path = f"/{direction}/{number}"
+            if not group.get("direct") and not group_coverage_complete(
+                report, group, group_path
+            ):
+                facts["coverage_gaps"].append(group_path)
             for offset, asset in enumerate(group.get("direct", [])):
-                if not all(
-                    asset.get(flag) is True
-                    for flag in (
-                        "direct_verified",
-                        "platform_match_verified",
-                        "watch_eligible",
+                if (
+                    not all(
+                        asset.get(flag) is True
+                        for flag in ("direct_verified", "platform_match_verified")
                     )
-                ) or asset.get("lookup"):
+                    or type(asset.get("watch_eligible")) is not bool
+                    or asset.get("lookup")
+                    or not identity(asset.get("instrument_id"))
+                    or not all(
+                        text(asset.get(name))
+                        for name in ("code", "market", "instrument_type")
+                    )
+                ):
                     continue
-                path = f"/{direction}/{number}/direct/{offset}"
+                path = f"{group_path}/direct/{offset}"
                 try:
                     record_facts(
                         report, facts, raw, broker, group, asset, path, direction, now
@@ -543,25 +592,40 @@ def record_facts(report, facts, raw, broker, group, asset, path, direction, now)
     if when is None or day(asset.get("data_date")) != when:
         raise FactsMissing("data_date_unverified")
     owner = identity(asset["instrument_id"])
+    entry = asset["watch_eligible"]
     signal = native_signal(
-        facts["selection"], asset, group, when, evidence.get(path + "/trend")
+        facts["selection"],
+        asset,
+        group,
+        when,
+        evidence.get(path + "/trend"),
+        entry=entry,
     )
+    if not receipt(signal, owner, market, kind, when) or any(
+        not field(evidence, path, name, asset.get(name), owner, market, kind, when)
+        or evidence[path + "/" + name]["version"] != signal["version"]
+        for name in ("trend", "signal_events")
+    ):
+        raise FactsMissing("signal_unverified")
     previous, current, event = SIGNALS[direction]
+    observation = signal["value"]
+    actual = (observation["previous"], observation["current"])
+    labels, events = observation["labels"], asset.get("signal_events")
     if (
-        not receipt(signal, owner, market, kind, when)
-        or signal["value"]["previous"] != previous
-        or signal["value"]["current"] != current
-        or not isinstance(signal["value"]["labels"], list)
-        or event not in signal["value"]["labels"]
-        or event not in asset.get("signal_events", [])
-        or any(
-            not field(evidence, path, name, asset.get(name), owner, market, kind, when)
-            or evidence[path + "/" + name]["version"] != signal["version"]
-            for name in ("trend", "signal_events")
-        )
+        any(value not in TEMPERATURES for value in actual)
+        or asset.get("trend") != actual[1]
+        or not isinstance(labels, list)
+        or not all(text(label) for label in labels)
+        or not isinstance(events, list)
+        or (actual == (previous, current)) != entry
+        or (event in labels) != entry
+        or (event in events) != entry
     ):
         raise FactsMissing("signal_unverified")
     raw.signal(selected)
+    if not entry:
+        facts["gaps"][path] = "verified_no_signal"
+        return
     route, session = build_route(
         broker,
         raw,

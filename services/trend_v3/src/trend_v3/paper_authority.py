@@ -8,7 +8,7 @@ import subprocess
 from hashlib import sha256
 from pathlib import Path
 
-from .paper_evidence import TAIPEI, day, instant
+from .paper_evidence import REPORT_SCHEMA, TAIPEI, day, instant
 
 HEX_SHA = re.compile(r"[0-9a-f]{40}")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -374,6 +374,32 @@ def upload_receipt(home, scope, verification):
         raise ValueError("matching host report upload receipt is unavailable")
 
 
+def check_selection_identity(
+    selection, projection, report_day, revision, release, digest
+):
+    if not isinstance(projection, dict) or not isinstance(selection, dict):
+        raise ValueError("daily report artifact date does not match")
+    dates = [selection[key] for key in ("report_date", "date") if key in selection]
+    if (
+        projection.get("date") != report_day
+        or not dates
+        or any(value != report_day for value in dates)
+    ):
+        raise ValueError("daily report artifact date does not match")
+    canonical = "schema" in selection
+    if canonical and selection["schema"] != REPORT_SCHEMA:
+        raise ValueError("unsupported daily selection evidence schema")
+    if selection.get("projection_sha256", None if canonical else digest) != digest:
+        raise ValueError("daily report artifact digest does not match")
+    source = selection.get("source", {} if canonical else {"commit": release})
+    if (
+        not isinstance(source, dict)
+        or source.get("commit") != release
+        or selection.get("revision", None if canonical else revision) != revision
+    ):
+        raise ValueError("daily report revision does not match its verification")
+
+
 def latest_report(root, report_day, release, *, frozen_revision=None):
     if not day(report_day) or not HEX_SHA.fullmatch(release):
         raise ValueError("invalid daily report date or release")
@@ -430,10 +456,8 @@ def latest_report(root, report_day, release, *, frozen_revision=None):
         checked[field] = raw
     projection = strict_json(checked["projection_sha256"])
     selection = strict_json(checked["selection_sha256"])
-    if (
-        projection.get("date") != report_day
-        or selection.get("report_date") != report_day
-    ):
-        raise ValueError("daily report artifact date does not match")
+    check_selection_identity(
+        selection, projection, report_day, revision, release, info["projection_sha256"]
+    )
     projection.pop("paper_entry", None)
     return projection, selection, info

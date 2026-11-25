@@ -1200,6 +1200,281 @@ def run_daily_plan(home, broker, now, live, monkeypatch):
     return paper_cli.main(["--session", NATIVE_SESSION, "plan"])
 
 
+def update_selection(revision, selection):
+    path = private_input(revision, "selection-evidence.json", selection)
+    verification = revision / "report-verification.json"
+    info = json.loads(verification.read_bytes())
+    info["selection_sha256"] = sha256(path.read_bytes()).hexdigest()
+    private_input(revision, verification.name, info)
+
+
+@pytest.mark.parametrize(
+    ("dates", "mixed", "valid"),
+    [
+        ({"report_date": DAY}, False, True),
+        ({"date": DAY}, True, True),
+        ({"date": DAY, "report_date": DAY}, True, True),
+        ({}, True, False),
+        ({"date": DATA_DAY}, True, False),
+        ({"date": DAY, "report_date": DATA_DAY}, True, False),
+        ({"date": DAY, "report_date": None}, True, False),
+        ({"date": DAY, "source": {"commit": "0" * 40}}, True, False),
+    ],
+)
+def test_frozen_selection_date_variants_preserve_verified_report_identity(
+    tmp_path, capsys, dates, mixed, valid
+):
+    data, _ = report(*(("ABC",) if mixed else ()))
+    if mixed:
+        data.pop("collection")
+    root, _, _ = daily_files(tmp_path, data)
+    revision = root / "reports/_evidence" / DAY / "v02"
+    verification = revision / "report-verification.json"
+    info = json.loads(verification.read_bytes())
+    path = revision / "selection-evidence.json"
+    selection = json.loads(path.read_bytes())
+    selection.pop("report_date")
+    selection.update(dates)
+    selection["projection_sha256"] = info["projection_sha256"]
+    if mixed:
+        selection.pop("field_records")
+        selection["field_sources"] = {}
+        selection["new_positions"] = []
+        selection["cutoff"] = info.pop("cutoff")
+        private_input(revision, verification.name, info)
+    update_selection(revision, selection)
+    paths = [*revision.iterdir(), root / "reports" / f"{DAY}.html"]
+    before = {file: file.read_bytes() for file in paths}
+    args = ["rehearse", str(root), DAY, "v02", "--release", RELEASE]
+    if valid:
+        assert paper_cli.main(args) == 0
+        planned = json.loads(capsys.readouterr().out)
+        assert (planned["date"], planned["report_version"]) == (DAY, "v02")
+        assert planned["lines"] == []
+        assert planned["broker_io"] == planned["order_writes"] == 0
+        with pytest.raises(SystemExit) as stopped:
+            paper_cli.main([*args[:-1], "0" * 40])
+        assert stopped.value.code == 2
+        assert "does not match its verification" in capsys.readouterr().err
+    else:
+        with pytest.raises(SystemExit) as stopped:
+            paper_cli.main(args)
+        assert stopped.value.code == 2
+        assert "does not match" in capsys.readouterr().err
+    assert {file: file.read_bytes() for file in paths} == before
+
+
+@pytest.mark.parametrize(
+    ("gap", "reason"),
+    [
+        (None, None),
+        ("board", "board_unverified"),
+        ("coverage", "coverage_unverified"),
+        ("references", "signal_unverified"),
+        ("eligibility", "eligibility_unverified"),
+        ("verified_negative", "verified_no_signal"),
+    ],
+)
+def test_legacy_evidence_gap_is_visible_without_broker_calls(
+    tmp_path, monkeypatch, capsys, gap, reason
+):
+    data, _ = report(*(("ABC",) if gap not in (None, "coverage") else ()))
+    if gap == "board":
+        data.pop("collection")
+    if gap == "coverage":
+        data["long"][0].pop("coverage")
+    if gap == "eligibility":
+        data["long"][0]["direct"][0].pop("watch_eligible")
+    if gap == "verified_negative":
+        asset = data["long"][0]["direct"][0]
+        asset.update(watch_eligible=False, trend="温", signal_events=[])
+        evidence = data["collection"]["evidence"]
+        evidence["/long/0/direct/0/trend"]["value"] = "温"
+        evidence["/long/0/direct/0/signal_events"]["value"] = []
+    root, live, upstream = daily_files(tmp_path, data)
+    revision = root / "reports/_evidence" / DAY / "v02"
+    if gap:
+        selection = json.loads((revision / "selection-evidence.json").read_bytes())
+        selection["date"] = selection.pop("report_date")
+        if gap == "references":
+            selection.pop("field_records")
+            selection["field_sources"] = {}
+        if gap == "verified_negative":
+            selection["instruments"][0].update(
+                current="温",
+                labels="",
+                state="核实后未触发",
+                selected_new_position=False,
+            )
+            raw = json.loads(upstream.read_bytes())
+            raw["data"][0].update(trendTemperatureCurr="温", tickerLabels="")
+            private_input(upstream.parent, upstream.name, raw)
+            selection["field_records"]["ABC"]["sha256"] = sha256(
+                upstream.read_bytes()
+            ).hexdigest()
+        update_selection(revision, selection)
+
+    opend = PlanningOpenD()
+
+    def unexpected_connection(**_):
+        pytest.fail("inconclusive or empty trend evidence must not open OpenD")
+
+    opend.OpenQuoteContext = opend.OpenSecTradeContext = unexpected_connection
+    assert run_daily_plan(tmp_path, opend, PREOPEN, live, monkeypatch) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["lines"] == []
+    empty = gap in (None, "verified_negative")
+    assert plan["execution"] == (
+        "verified_no_candidates" if empty else "evidence_incomplete"
+    )
+    assert {item["reason"] for item in plan["skipped"]} == (
+        {reason} if reason else set()
+    )
+    assert "approve_all" not in plan
+    assert opend.quote_calls == opend.calls == opend.writes == []
+
+
+def pending_daily_evidence(tmp_path):
+    data, _ = report("ABC")
+    data["collection"]["target_evidence"]["BOARD"] = {
+        "state": "verified",
+        "kind": "continuous",
+        "report_date": DAY,
+        "basis_date": DATA_DAY,
+        "source": "original board receipt",
+    }
+    root, live, upstream = daily_files(tmp_path, data)
+    revision = root / "reports/_evidence" / DAY / "v02"
+    revision.chmod(0o700)
+    verified = revision / "report-verification.json"
+    info = json.loads(verified.read_bytes())
+    verified.unlink()
+    final = revision / "selection-evidence.json"
+    draft = json.loads(final.read_bytes())
+    final.unlink()
+    draft["date"] = draft.pop("report_date")
+    draft["cutoff"] = PREOPEN.isoformat()
+    record = draft.pop("field_records")["ABC"]
+    draft["field_sources"] = {
+        "ABC": {
+            "path": upstream.name,
+            "sha256": record["sha256"],
+            "location": record["location"],
+            "version": "v1",
+            "record": json.loads(upstream.read_bytes())["data"][0],
+        }
+    }
+    private_input(revision, "selection-draft.json", draft)
+    return root, live, upstream, revision, info
+
+
+def test_daily_producer_verified_signal_reaches_preopen_plan(
+    tmp_path, monkeypatch, capsys
+):
+    root, live, upstream, revision, info = pending_daily_evidence(tmp_path)
+    args = ["prepare-report-evidence", str(root), DAY, "v02", "--release", RELEASE]
+    inputs = (
+        upstream,
+        revision / "selection-draft.json",
+        revision / "reader-projection.json",
+        root / "reports" / f"{DAY}.html",
+    )
+    original = {file: file.read_bytes() for file in inputs}
+    assert paper_cli.main(args) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    final = revision / "selection-evidence.json"
+    canonical_bytes = final.read_bytes()
+    canonical = json.loads(canonical_bytes)
+    assert canonical["schema"] == "trend-v3-paper-evidence/v1"
+    assert (canonical["report_date"], canonical["revision"]) == (DAY, "v02")
+    assert canonical["source"]["commit"] == RELEASE
+    assert canonical["projection_sha256"] == info["projection_sha256"]
+    assert receipt["selection_sha256"] == sha256(canonical_bytes).hexdigest()
+    assert final.stat().st_mode & 0o777 == 0o600
+    info["selection_sha256"] = receipt["selection_sha256"]
+    private_input(revision, "report-verification.json", info)
+
+    opend = PlanningOpenD()
+    assert run_daily_plan(tmp_path, opend, PREOPEN, live, monkeypatch) == 0
+    plan = json.loads(capsys.readouterr().out)
+    (line,) = plan["lines"]
+    assert (line["code"], line["quantity"], line["reference_price"]) == (
+        "US.ABC",
+        100,
+        "20",
+    )
+    assert line["direction"] == "long" and line["signal"] == "温转热"
+    assert opend.writes == []
+    with pytest.raises(SystemExit) as stopped:
+        paper_cli.main(args)
+    assert stopped.value.code == 2
+    assert final.read_bytes() == canonical_bytes
+    assert {file: file.read_bytes() for file in inputs} == original
+
+
+@pytest.mark.parametrize(
+    ("conflict", "reason"),
+    [
+        ("digest", "raw_signal_unverified"),
+        ("source", "raw_signal_unverified"),
+        ("identity", "signal_unverified"),
+        ("raw_version", "signal_unverified"),
+        ("raw_value", "raw_signal_unverified"),
+        ("membership_version", "membership_unverified"),
+        ("board_date", "board_unverified"),
+        ("board_target", "board_unverified"),
+        ("instrument_target", "data_date_unverified"),
+    ],
+)
+def test_conflicting_raw_field_or_identity_prevents_opening(
+    tmp_path, monkeypatch, capsys, conflict, reason
+):
+    root, live, _, revision, info = pending_daily_evidence(tmp_path)
+    draft = json.loads((revision / "selection-draft.json").read_bytes())
+    data = json.loads((revision / "reader-projection.json").read_bytes())
+    raw = draft["field_sources"]["ABC"]
+    collection = data["collection"]
+    if conflict == "digest":
+        raw["sha256"] = "1" * 64
+    elif conflict == "source":
+        raw["path"] = "../another-source.json"
+    elif conflict == "identity":
+        raw["record"]["tmId"] = "other"
+    elif conflict == "raw_version":
+        raw["version"] = "other"
+    elif conflict == "raw_value":
+        raw["record"]["trendTemperatureCurr"] = "寒"
+    elif conflict == "membership_version":
+        collection["evidence"]["/long/0/coverage"]["version"] = "other"
+    elif conflict == "board_date":
+        draft["board"] = {"board_date": DAY, "edition": data["board_version"]}
+    elif conflict == "board_target":
+        collection["target_evidence"]["BOARD"]["report_date"] = DATA_DAY
+    else:
+        collection["target_evidence"]["US"]["report_date"] = DATA_DAY
+    projection = private_input(revision, "reader-projection.json", data)
+    private_input(revision, "selection-draft.json", draft)
+
+    assert (
+        paper_cli.main(
+            ["prepare-report-evidence", str(root), DAY, "v02", "--release", RELEASE]
+        )
+        == 0
+    )
+    receipt = json.loads(capsys.readouterr().out)
+    info["projection_sha256"] = sha256(projection.read_bytes()).hexdigest()
+    info["selection_sha256"] = receipt["selection_sha256"]
+    private_input(revision, "report-verification.json", info)
+
+    opend = PlanningOpenD()
+    assert run_daily_plan(tmp_path, opend, PREOPEN, live, monkeypatch) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["lines"] == []
+    assert plan["execution"] == "evidence_incomplete"
+    assert {item["reason"] for item in plan["skipped"]} == {reason}
+    assert opend.quote_calls == opend.calls == opend.writes == []
+
+
 def test_daily_cli_plans_from_host_receipt_and_retained_sources(
     tmp_path, monkeypatch, capsys
 ):
