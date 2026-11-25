@@ -4,6 +4,10 @@
 
 # Changelog
 
+## 2026-11-25 — Trend V3 模拟盘验收诊断 (#507)
+
+- 记录港股独立验收脚本的撤单匹配失败，以及 Mini 定时日报 11/25 v01 与模拟盘证据读取契约的差异。详见[验收诊断](services/trend_v3/docs/2026-11-25-paper-acceptance.md)。
+
 ## 2026-11-24 — Trend V3 lookup and manual report scope (#528)
 
 - Preserve a completed negative lookup when deduplicating pending query rows
