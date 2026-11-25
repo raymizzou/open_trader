@@ -32,6 +32,8 @@ description: Plan first paper entries from the verified Trend V3 daily report in
 
 使用同一发布目录的 `services/trend_v3/src` 和已配 Futu SDK 的 Mini Python。在原 tab 按现有工具读回真实 Codex UUID，传给 `--session`。入口根据现在的台北日期定位报告。错误或证据缺口留在原 tab，私有文件、账户和券商订单编号不随结果发送。
 
+在原 tab 的受监督命令工具中直接运行下列 CLI，不另用 Python `subprocess` 包装器启动它。直接父进程关系由内核核对；更深的祖先进程关系仍须通过进程遍历证明。若遍历不可用或原会话、启动消息不匹配，入口会在读取券商前拒绝；保留错误交由 Main 核查，不更改权限或改到其他 tab 执行。
+
 ```sh
 PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" plan
 PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" approve "$plan"
