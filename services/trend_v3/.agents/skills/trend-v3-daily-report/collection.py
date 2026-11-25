@@ -1044,31 +1044,30 @@ def claim_round(path, report, now):
         return result
 
 
-def render_html(report):
+def render_html(report, *, report_revision=None):
     """Use the official public renderer, including its exact pinned template."""
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         source, output = root / "input.json", root / "report.html"
         source.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
-        subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).with_name("render_report.py")),
-                str(source),
-                str(output),
-            ],
-            check=True,
-            capture_output=True,
-        )
+        command = [
+            sys.executable,
+            str(Path(__file__).with_name("render_report.py")),
+            str(source),
+            str(output),
+        ]
+        if report_revision is not None:
+            command += ["--report-revision", report_revision]
+        subprocess.run(command, check=True, capture_output=True)
         return output.read_text(encoding="utf-8")
 
 
-def confirm_publication(path, report, local, delivered):
+def confirm_publication(path, report, local, delivered, *, report_revision=None):
     """Stop only after current complete HTML is published and read back exactly."""
     path = Path(path)
     if not assess(report)["complete"]:
         raise ValueError("Report evidence is incomplete")
-    expected = render_html(report).encode("utf-8")
+    expected = render_html(report, report_revision=report_revision).encode("utf-8")
     if Path(local).read_bytes() != expected or Path(delivered).read_bytes() != expected:
         raise ValueError("Current HTML publication readback mismatch")
     with state_lock(path):
@@ -1127,6 +1126,7 @@ def main():
     )
     parser.add_argument("--local", type=Path)
     parser.add_argument("--delivered", type=Path)
+    parser.add_argument("--report-revision", help="Independently verified report revision")
     args = parser.parse_args()
     try:
         report = json.loads(args.input.read_text(encoding="utf-8"))
@@ -1146,7 +1146,10 @@ def main():
             else:
                 if args.local is None or args.delivered is None:
                     raise ValueError("--local and --delivered are required")
-                confirm_publication(args.state, report, args.local, args.delivered)
+                confirm_publication(
+                    args.state, report, args.local, args.delivered,
+                    report_revision=args.report_revision,
+                )
                 value = {"publication_verified": True}
         print(json.dumps(value, ensure_ascii=False))
     except (

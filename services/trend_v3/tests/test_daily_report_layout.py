@@ -108,12 +108,15 @@ def class_row_digest(row):
     return digest(json.dumps(Markup(row).events, ensure_ascii=False))
 
 
-def render(tmp_path, report, name):
+def render(tmp_path, report, name, *, report_revision=None):
     input_file = tmp_path / f"{name}.json"
     output_file = tmp_path / f"{name}.html"
     input_file.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    command = [sys.executable, str(RENDERER), str(input_file), str(output_file)]
+    if report_revision is not None:
+        command += ["--report-revision", report_revision]
     result = subprocess.run(
-        [sys.executable, str(RENDERER), str(input_file), str(output_file)],
+        command,
         capture_output=True,
         text=True,
         timeout=10,
@@ -3014,7 +3017,7 @@ def test_verified_paper_status_is_current_and_redacted(tmp_path):
             "skipped": [{"code": "BTCUSD", "reason": "market_order_unsupported"}],
         },
     }
-    html = render(tmp_path, report, "paper-current")
+    html = render(tmp_path, report, "paper-current", report_revision="v02")
     simulation = html.split('id="simulation"', 1)[1].split("</section>", 1)[0]
     assert "US.ABC · 已提交 · 已成交 4 · 剩余 6 · 有活动委托" in simulation
     assert "US.DEF · 回执待核 · 未核实券商回执 · 活动委托待核" in simulation
@@ -3024,4 +3027,58 @@ def test_verified_paper_status_is_current_and_redacted(tmp_path):
     assert html.count("未接入") == 3
 
     report["paper_entry"]["date"] = "2039-12-31"
-    assert_formal_records(render(tmp_path, report, "paper-stale"))
+    assert_formal_records(
+        render(tmp_path, report, "paper-stale", report_revision="v02")
+    )
+
+
+def test_simulation_requires_matching_current_report_revision(tmp_path):
+    from test_hourly_collection import control
+
+    report = complete_report()
+    report["paper_entry"] = {
+        "schema": "trend-v3-paper-entry.v1",
+        "date": report["date"],
+        "report_version": "v01",
+        "results": [
+            {"code": "US.ABC", "state": "pending", "order": "private-order"},
+        ],
+        "skipped": [],
+    }
+    for name, revision in (
+        ("missing", None), ("mismatched", "v02"), ("unknown", "UNKNOWN"),
+    ):
+        html = render(tmp_path, report, name, report_revision=revision)
+        assert_formal_records(html)
+        assert "US.ABC" not in html
+
+    report["paper_entry"]["report_version"] = "v02"
+    html = render(tmp_path, report, "matching", report_revision="v02")
+    simulation = html.split('id="simulation"', 1)[1].split("</section>", 1)[0]
+    assert "US.ABC · 待执行" in simulation
+    assert "未接入" not in simulation
+    assert "private-order" not in html
+    assert control().render_html(report, report_revision="v02") == html
+    state = tmp_path / "state.json"
+    control().initialize(state, report)
+    delivered = tmp_path / "delivered.html"
+    delivered.write_text(html, encoding="utf-8")
+    confirm = [
+        sys.executable, str(SKILL / "collection.py"), "confirm",
+        str(tmp_path / "matching.json"), "--state", str(state),
+        "--local", str(tmp_path / "matching.html"), "--delivered", str(delivered),
+    ]
+    mismatch = subprocess.run(confirm, capture_output=True, text=True, timeout=10)
+    assert mismatch.returncode == 2
+    assert "publication readback mismatch" in mismatch.stderr
+    verified = subprocess.run(
+        confirm + ["--report-revision", "v02"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout) == {"publication_verified": True}
+
+    report["paper_entry"]["report_version"] = "UNKNOWN"
+    assert_formal_records(
+        render(tmp_path, report, "unknown-both", report_revision="UNKNOWN")
+    )

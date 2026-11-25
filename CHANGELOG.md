@@ -14,6 +14,8 @@
 - Preserve order identity and broker evidence across restarts and report
   revisions. Retry only the confirmed remainder after a fresh reply. Show
   redacted status in the daily report.
+- Apply plan withdrawals to unopened items and report which items had already
+  opened. Display paper status only for the independently verified report revision.
 - Existing and historical report inputs retain their original placeholders.
 
 ## 2026-11-24 — Trend V3 lookup and manual report scope (#528)

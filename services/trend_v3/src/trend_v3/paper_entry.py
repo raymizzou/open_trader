@@ -213,55 +213,98 @@ class PaperEntry:
             return self.current(store, plan_id)
 
     def approve(self, plan_id, reply, *, now):
+        result = self.record_reply(plan_id, reply, now=now)
+        return bool(result and result["recorded"])
+
+    def record_reply(self, plan_id, reply, *, now):
         if (
             not isinstance(reply, dict)
             or self.verify_reply is None
             or not self.verify_reply(reply)
         ):
-            return False
+            return None
         with transaction(self.database) as store:
             plan, created = self.current(store, plan_id)
             if plan is None or not self.valid_reply(reply, plan, created, now):
-                return False
+                return None
+            if self.check_plan is not None and not self.check_plan(plan):
+                return None
             items = {line["item"]: line for line in plan["lines"]}
-            if reply["decision"] == "retry":
-                return self.approve_retry(store, plan, items, reply, now)
+            decision = reply["decision"]
+            selected = [item["item"] for item in reply["items"]]
+            result = {"decision": decision, "items": selected, "recorded": True}
+            if decision == "retry":
+                return (
+                    result
+                    if self.approve_retry(store, plan, items, reply, now)
+                    else None
+                )
             if not reply["items"] or any(
                 not self.valid_selection(
                     selected,
                     items.get(selected.get("item")),
-                    instant(reply["at"]),
                 )
                 for selected in reply["items"]
             ):
-                return False
-            if len({selected["item"] for selected in reply["items"]}) != len(
-                reply["items"]
-            ):
-                return False
+                return None
+            if len(set(selected)) != len(selected):
+                return None
+            at = instant(reply["at"])
+            opened = [
+                item for item in selected if at >= instant(items[item]["opens_at"])
+            ]
+            if decision == "approve" and opened:
+                return None
+            if decision == "deny":
+                settled = {
+                    row["item"]
+                    for row in store.execute(
+                        "SELECT item FROM attempts WHERE plan = ? "
+                        "AND reason IS NOT 'awaiting_broker_receipt' "
+                        "UNION SELECT item FROM decisions WHERE plan = ?",
+                        (plan_id, plan_id),
+                    )
+                }
+                opened = [
+                    item for item in selected if item in opened or item in settled
+                ]
+                selected = [item for item in selected if item not in opened]
+                result.update(items=selected, ignored_opened_items=opened)
+                if not selected:
+                    return result | {"recorded": False, "reason": "no_unopened_items"}
+            at = at.astimezone(UTC).isoformat()
+            newer = {
+                row["item"]
+                for row in store.execute(
+                    "SELECT item FROM approvals WHERE plan = ? AND "
+                    "(at > ? OR (at = ? AND ? = 'approve'))",
+                    (plan_id, at, at, decision),
+                )
+            }
+            selected = [item for item in selected if item not in newer]
+            if not selected:
+                return None
             inserted = store.execute(
                 "INSERT OR IGNORE INTO replies VALUES (?, ?, ?)",
                 (reply["event_id"], plan_id, encode(reply)),
             )
             if not inserted.rowcount:
-                return False
+                return None
             store.executemany(
                 """INSERT INTO approvals VALUES (?, ?, ?, ?)
                    ON CONFLICT(plan, item) DO UPDATE SET
-                   quantity=excluded.quantity, at=excluded.at
-                   WHERE excluded.at > approvals.at OR
-                   (excluded.at = approvals.at AND excluded.quantity = 0)""",
+                   quantity=excluded.quantity, at=excluded.at""",
                 (
                     (
                         plan_id,
-                        selected["item"],
-                        selected["quantity"] if reply["decision"] == "approve" else 0,
-                        instant(reply["at"]).astimezone(UTC).isoformat(),
+                        item,
+                        items[item]["quantity"] if decision == "approve" else 0,
+                        at,
                     )
-                    for selected in reply["items"]
+                    for item in selected
                 ),
             )
-            return True
+            return result | {"items": selected}
 
     def valid_reply(self, reply, plan, created, now):
         at = instant(reply.get("at"))
@@ -287,13 +330,12 @@ class PaperEntry:
         )
 
     @staticmethod
-    def valid_selection(selected, line, now):
+    def valid_selection(selected, line):
         return (
             line is not None
             and type(selected.get("quantity")) is int
             and selected["quantity"] == line["quantity"]
             and selected.get("open") == line["opens_at"]
-            and now < instant(line["opens_at"])
         )
 
     def approve_retry(self, store, plan, items, reply, now):

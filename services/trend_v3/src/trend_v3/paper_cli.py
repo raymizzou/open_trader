@@ -224,7 +224,7 @@ def run_daily(args):
     def record_reply(service, plan, reply):
         nonlocal authorized
         authorized = reply
-        return service.approve(plan["id"], reply, now=utc_now())
+        return service.record_reply(plan["id"], reply, now=utc_now())
 
     try:
         service = PaperEntry(
@@ -284,15 +284,20 @@ def run_action(args, service, plan, replies, record):
         records = replies()
         latest = records[-1] if records else None
         if args.command == "approve":
-            accepted = bool(latest and latest["decision"] != "retry" and record(latest))
-            result = {"plan": plan["id"], "recorded": accepted}
-            if accepted:
-                result["decision"] = latest["decision"]
-                result["items"] = [item["item"] for item in latest["items"]]
-            else:
-                result["reason"] = "approval_clarification_required"
-            emit(result)
-            return 0 if accepted else 2
+            decision = (
+                record(latest) if latest and latest["decision"] != "retry" else None
+            )
+            if decision is not None:
+                emit({"plan": plan["id"], **decision})
+                return 0
+            emit(
+                {
+                    "plan": plan["id"],
+                    "recorded": False,
+                    "reason": "approval_clarification_required",
+                }
+            )
+            return 2
         if (
             not latest
             or latest["decision"] != "retry"
@@ -330,7 +335,9 @@ def wait_for_open(service, plan, replies, record):
         try:
             for reply in replies():
                 if reply and reply["decision"] == "deny":
-                    record(reply)
+                    decision = record(reply)
+                    if decision is not None and decision["recorded"]:
+                        emit({"plan": plan_id, **decision})
         except (OSError, ValueError):
             emit(
                 public_results(

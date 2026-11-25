@@ -330,10 +330,13 @@ def render_direction(fragments, groups, note, direction):
     return "\n".join(rows)
 
 
-def render_simulation(paper, report_day):
+def render_simulation(paper, report_day, report_revision):
     if (
-        not isinstance(paper, dict) or paper.get("schema") != "trend-v3-paper-entry.v1"
+        not isinstance(report_revision, str)
+        or not re.fullmatch(r"v[0-9]{2,}", report_revision)
+        or not isinstance(paper, dict) or paper.get("schema") != "trend-v3-paper-entry.v1"
         or paper.get("date") != report_day.isoformat()
+        or paper.get("report_version") != report_revision
         or not isinstance(paper.get("results"), list)
         or not isinstance(paper.get("skipped"), list)
     ):
@@ -374,13 +377,15 @@ def render_simulation(paper, report_day):
     return section
 
 
-def render(report, template):
+def render(report, template, *, report_revision=None):
     assessment = assess(report)
     paper = report.get("paper_entry")
     report, _ = dated_projection(report)
     day = report_date(report["date"])
     template = template.replace(
-        PAPER_PLACEHOLDER + "<!-- paper-entry -->", render_simulation(paper, day), 1,
+        PAPER_PLACEHOLDER + "<!-- paper-entry -->",
+        render_simulation(paper, day, report_revision),
+        1,
     )
     fragments = {name: Template(markup) for name, markup in FRAGMENT.findall(template)}
     return Template(FRAGMENT.sub("", template)).substitute(
@@ -409,10 +414,14 @@ def main():
     parser.add_argument(
         "output", type=Path, help="New HTML path in an existing directory"
     )
+    parser.add_argument("--report-revision", help="Independently verified report revision")
     args = parser.parse_args()
     try:
         report = json.loads(args.input.read_text(encoding="utf-8"), parse_float=Decimal)
-        html = render(report, TEMPLATE_PATH.read_text(encoding="utf-8"))
+        html = render(
+            report, TEMPLATE_PATH.read_text(encoding="utf-8"),
+            report_revision=args.report_revision,
+        )
         fd = os.open(args.output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as output:
             output.write(html)

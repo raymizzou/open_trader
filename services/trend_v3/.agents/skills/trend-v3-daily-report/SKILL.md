@@ -176,7 +176,7 @@ python3 "$skill_dir/render_report.py" "$verified_json" "$new_html"
 
 `skill_dir` 为核对过版本的技能目录，`verified_json` 为明确选定的 UTF-8 输入路径，`new_html` 为已存在的私有目录下尚未使用的候选文件路径。渲染器只读该输入与同目录下的 `assets/report.html`，生成一份 UTF-8 HTML。它转义所有动态文本，展开并移除模板节点和插槽。已有路径返回非零。需要替换现行日报时，先核对候选，再按下文的锁、归档和原子替换流程处理。
 
-- 可选 `paper_entry` 只接受模拟开仓技能 `status` 输出的当日报日和当前报告版次的已核实脱敏结果。只显示标的、已知处理状态、简短原因和已确认数量。账本、账户身份和订单号保留在私有目录。旧输入照常显示「未接入」。
+- 可选 `paper_entry` 只接受模拟开仓技能 `status` 输出的已核实脱敏结果。定时、手工、复渲染和离线入口须从所选日报的独立核实记录（`report-verification.json`）取得已核实的版次，并在渲染时用 `--report-revision "$verified_revision"` 传入。若用 `collection.py confirm` 核对本轮正式报告，传入相同参数。缺少已核实版次、版次不符或报告日不符时显示「未接入」。只显示标的、已知处理状态、简短原因和已确认数量。账本、账户身份和订单号保留在私有目录。旧输入照常显示「未接入」。
 - 根对象必须有 `date`（实际报告日，`YYYY-MM-DD`）。可选 `board_date`（经核实的榜图日，同格式）、`board_version`、`short`、`long`、`short_note`、`long_note`。方向数组缺省为空，方向说明只写白名单允许的具体缺项。
 - 每个大类有已核实的方向席位 `seat`（整数 `1` 或 `2`，同一方向内唯一）和 `name`，可选 `code`、`board_strength`、`direct`、`searchable`、`related`、`direct_note`、`searchable_note`、`related_note`、`coverage_note`、`direct_partial_note`。三个输入列表缺省为空，旧 `direct` / `related` 仍可读取，但数组位置不是成员或平台匹配证据。渲染器汇总输入后按显式核实字段执行三块分类、优先级去重和方向排序，不代替业务核验。`direct_note`、`searchable_note`、`related_note` 只在对应输出区块为空时显示；旧 direct/related 空列表说明还要求原输入列表为空，避免重新分组后公开原本隐藏的旧说明；非空时忽略，不能将旧空列表默认语或技术说明自动公开。
 - 新 `coverage_note` 为可公开的整类范围说明文本，始终放在三块之后，与卡片和直属区块是否为空无关。缺省不显示；空文本或纯空白不显示。提供该字段时优先于旧 `direct_partial_note`，两者不重复显示。分页与查询范围写在此处，区块空说明只说明当前没有已核实卡片，不能以空说明推断完整查无成员。当天没有直属但有平台可查卡片的输入，也用此字段保留成员第二页待核等事实。

@@ -2297,3 +2297,103 @@ def test_daily_cli_accepts_unambiguous_numbered_chinese_approval(
         row.startswith(f"第{index}项 | {plan['lines'][index - 1]['item']} | ")
         for index, row in enumerate(plan["delivery"].splitlines()[1:], 1)
     )
+
+
+@pytest.mark.parametrize("process_withdrawal", ["interactive", "waiter"])
+def test_mixed_openings_withdraw_all_preserves_past_and_cancels_future(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    process_withdrawal,
+):
+    data, _ = two_market_inputs()
+    _, live, _ = daily_files(tmp_path, data)
+
+    class TwoMarketOpenD(PlanningOpenD):
+        def get_acc_list(self):
+            return 0, [
+                {
+                    "acc_id": account,
+                    "trd_env": "SIMULATE",
+                    "acc_status": "ACTIVE",
+                    "trdmarket_auth": [market],
+                    "sim_acc_type": "STOCK",
+                    "acc_type": "CASH",
+                }
+                for market, account in (("US", 42), ("HK", 43))
+            ]
+
+        def query(self, kind, params, rows):
+            assert params["trd_env"] == "SIMULATE"
+            assert params["acc_id"] in {42, 43}
+            self.calls.append((kind, params))
+            return 0, rows
+
+        def accinfo_query(self, **params):
+            return self.query(
+                "funds",
+                params,
+                [
+                    {
+                        "currency": "USD" if params["acc_id"] == 42 else "HKD",
+                        "total_assets": 100000,
+                        "available_funds": 100000,
+                    }
+                ],
+            )
+
+    sdk = TwoMarketOpenD()
+    hk_open = datetime.fromisoformat(f"{DAY}T09:30:00+08:00")
+    clock, invoke = tab_cli(
+        tmp_path, monkeypatch, sdk, live, start=hk_open - timedelta(minutes=1)
+    )
+    plan = json.loads(capsys.readouterr().out)
+    plan_id = plan["id"]
+    items = {line["code"]: line["item"] for line in plan["lines"]}
+    assert set(items) == {"HK.00005", "US.ABC"}
+    clock.at += timedelta(seconds=1)
+    show_plan(tmp_path, plan, clock.at)
+    clock.at += timedelta(seconds=1)
+    tab_record(tmp_path, "user", "确认全部", clock.at)
+    assert invoke("approve", plan_id) == 0
+    capsys.readouterr()
+    withdrawn = False
+
+    def wait(seconds):
+        nonlocal withdrawn
+        clock.at += timedelta(seconds=seconds)
+        if not withdrawn and hk_open < clock.at < OPEN:
+            withdrawn = True
+            assert [write["code"] for write in sdk.writes] == ["HK.00005"]
+            tab_record(tmp_path, "user", "确认全部", clock.at)
+            assert invoke("approve", plan_id) == 2
+            clock.at += timedelta(seconds=1)
+            tab_record(tmp_path, "user", plan["withdraw_all"], clock.at)
+            if process_withdrawal == "interactive":
+                assert invoke("approve", plan_id) == 0
+
+    monkeypatch.setattr(paper_cli, "sleep_open", wait)
+    assert invoke("submit", plan_id) == 0
+    messages = [json.loads(row) for row in capsys.readouterr().out.splitlines()]
+    (decision,) = (row for row in messages if row.get("decision") == "deny")
+    assert decision["recorded"] is True
+    assert decision["items"] == [items["US.ABC"]]
+    assert decision["ignored_opened_items"] == [items["HK.00005"]]
+    assert [write["code"] for write in sdk.writes] == ["HK.00005"]
+    assert {row["code"]: row["state"] for row in messages[-1]["status"]["results"]} == {
+        "HK.00005": "active",
+        "US.ABC": "denied",
+    }
+
+    before = messages[-1]["status"]
+    clock.at += timedelta(seconds=1)
+    tab_record(tmp_path, "user", plan["withdraw_all"], clock.at)
+    assert invoke("approve", plan_id) == 0
+    no_op = json.loads(capsys.readouterr().out)
+    assert no_op["recorded"] is False
+    assert no_op["decision"] == "deny"
+    assert no_op["reason"] == "no_unopened_items"
+    assert set(no_op["ignored_opened_items"]) == set(items.values())
+    assert invoke("status") == 0
+    assert json.loads(capsys.readouterr().out) == before
+    assert [write["code"] for write in sdk.writes] == ["HK.00005"]
