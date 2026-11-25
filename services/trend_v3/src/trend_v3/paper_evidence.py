@@ -8,10 +8,22 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .freshness import is_opening_data_fresh
 
 SIGNALS = {"long": ("温", "热", "温转热"), "short": ("凉", "寒", "凉转寒")}
+
 BOARD_SEATS = (1, 2)
 TAIPEI = ZoneInfo("Asia/Taipei")
 SOURCE_FIELDS = ("trendTemperaturePrev", "trendTemperatureCurr", "tickerLabels")
 REPORT_SCHEMA = "trend-v3-paper-evidence/v1"
+
+
+def observation_signal(direction, previous, current, labels):
+    """Match a first observation signal; labels must describe this observation."""
+    before, after, event = SIGNALS[direction]
+    return (
+        previous == before
+        and current in ((after, "冻") if direction == "short" else (after,))
+        and isinstance(labels, list)
+        and event in labels
+    )
 
 
 def decimal(value):
@@ -337,17 +349,17 @@ def read_candidate(
     )
     if not receipt(signal, owner, market, kind, expected):
         return None, "signal_unverified"
-    previous, current, event = SIGNALS[direction]
+    event = SIGNALS[direction][2]
     observation = signal["value"]
     events = asset.get("signal_events")
     if (
         not isinstance(observation, dict)
         or observation.get("action") != "entry"
-        or observation.get("previous") != previous
-        or observation.get("current") != current
-        or not isinstance(observation.get("labels"), list)
-        or event not in observation["labels"]
-        or asset.get("trend") != current
+        or not observation_signal(
+            direction, observation.get("previous"), observation.get("current"),
+            observation.get("labels"),
+        )
+        or asset.get("trend") != observation.get("current")
         or not isinstance(events, list)
         or event not in events
         or not all(
