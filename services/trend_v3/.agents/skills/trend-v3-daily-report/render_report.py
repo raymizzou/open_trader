@@ -1,7 +1,6 @@
 """Render the V1 reader from a verified, display-only JSON projection."""
 
 import argparse
-import json
 import os
 import re
 from decimal import Decimal, InvalidOperation
@@ -13,6 +12,7 @@ from collection import (
     LOOKUP_LABELS,
     assess,
     dated_projection,
+    load_report,
     reconciled_instruments,
     report_date,
     strength_fields,
@@ -236,6 +236,38 @@ def coverage_note(fragments, group, direct):
     return "\n".join(notes)
 
 
+def _verify_recorded_cards(markup, group, chosen):
+    """Check rendered event cells against each exact reconciled instrument."""
+    cards = re.findall(r'<li class="asset reader-card">.*?</li>', markup, re.S)
+    for section in ("direct", "searchable", "related"):
+        for original in group.get(section, []):
+            names = original.get("_recorded_own_events", [])
+            if not names:
+                continue
+
+            def identity(asset):
+                return tuple(
+                    asset.get(k)
+                    for k in ("instrument_id", "market", "instrument_type", "currency")
+                )
+
+            indices = [
+                i
+                for i, asset in enumerate(chosen)
+                if identity(asset) == identity(original)
+            ]
+            if len(indices) != 1 or len(cards) != len(chosen):
+                raise ValueError("own-event discrepancy: rendered identity")
+            cell = re.search(
+                r'<dd class="reader-event">(.*?)</dd>', cards[indices[0]], re.S
+            )
+            tokens = cell[1].split("，") if cell else []
+            if any(display_text(name) not in tokens for name in names):
+                raise ValueError(
+                    "own-event discrepancy: rendered special signal " + original["code"]
+                )
+
+
 def render_direction(fragments, groups, note, direction, *, threshold=False):
     if not isinstance(groups, list):
         raise ValueError("Direction rows must be arrays")
@@ -284,6 +316,8 @@ def render_direction(fragments, groups, note, direction, *, threshold=False):
                 coverage_note=coverage_note(fragments, group, direct),
             )
         )
+
+        _verify_recorded_cards(rows[-1], group, direct + searchable + related)
 
     if note or not rows:
         rows.append(
@@ -350,7 +384,7 @@ def main():
     )
     args = parser.parse_args()
     try:
-        report = json.loads(args.input.read_text(encoding="utf-8"), parse_float=Decimal)
+        report = load_report(args.input, parse_float=Decimal)
         html = render(
             report, TEMPLATE_PATH.read_text(encoding="utf-8"),
             report_revision=args.report_revision,

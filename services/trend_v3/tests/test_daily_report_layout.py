@@ -3258,3 +3258,174 @@ def test_daily_reader_displays_reconciled_orders(tmp_path):
     assert "US.DENY · 已跳过 · 开盘前未收到确认" in section
     assert section.count("申请数量 100") == 4
     assert len(service.broker.orders) == 3
+
+
+def test_verified_own_event_without_previous(tmp_path):
+    """Normal CLI consumes hashed own events without inferring prior temperature."""
+    from copy import deepcopy
+
+    base = freshness_report()
+    asset = base["long"][0]["searchable"][0]
+    asset.update(data_date="2026-11-22", signal_events=[], watch_eligible=False)
+    base["board_version"] = "2026-11-23"
+    prefix = "/long/0/searchable/0/"
+    source = "_evidence/2026-11-23/v01/visual-observations.json#stock_details[0]"
+    base["collection"]["evidence"][prefix + "trend"].update(
+        source=source, version="2026-11-23"
+    )
+    for case in (
+        "current",
+        "identity",
+        "market",
+        "day",
+        "version",
+        "product",
+        "digest",
+        "board-only",
+        "unrelated-proof",
+        "conflict",
+        "escape",
+    ):
+        root = tmp_path / case / "v01"
+        root.mkdir(parents=True)
+        report = deepcopy(base)
+        own = dict(
+            identity="btc",
+            code="BTC",
+            name="合成比特币",
+            market="CRYPTO",
+            instrument_type="spot",
+            data_date="2026-11-22",
+            temperature="热",
+            previous_temperature=None,
+            labels=["温转热", "市值龙头"],
+        )
+        if case in ("identity", "market"):
+            own[case] = "other"
+        if case == "day":
+            own["data_date"] = "2026-11-20"
+        if case == "product":
+            own["instrument_type"] = "other"
+        if case == "board-only":
+            own["labels"] = ["市值龙头"]
+        raw = json.dumps(dict(stock_details=[own]), ensure_ascii=False)
+        (root / "visual-observations.json").write_text(raw)
+        draft = dict(
+            date=base["date"],
+            board=dict(version="2026-11-23"),
+            sources=dict(visual=source.split("#")[0]),
+            source_sha256=dict(visual=hashlib.sha256(raw.encode()).hexdigest()),
+            field_records=dict(
+                R1=dict(source=source, version="2026-11-23", record=own)
+            ),
+            instruments=[
+                dict(
+                    id="btc",
+                    code="BTC",
+                    market="CRYPTO",
+                    instrument_type="spot",
+                    data_date="2026-11-22",
+                    field_refs=dict(labels="R1"),
+                )
+            ],
+        )
+        if case == "digest":
+            draft["source_sha256"]["visual"] = "0" * 64
+        if case == "version":
+            draft["field_records"]["R1"]["version"] = "old"
+        if case == "escape":
+            draft["sources"]["visual"] = "../../visual-observations.json"
+        if case == "unrelated-proof":
+            report["collection"]["evidence"][prefix + "signal_events"] = dict(
+                report["collection"]["evidence"][prefix + "trend"],
+                identity="other",
+                value=[],
+            )
+        if case == "conflict":
+            report["collection"]["evidence"][prefix + "signal_events"] = dict(
+                report["collection"]["evidence"][prefix + "trend"], value=[]
+            )
+        (root / "selection-draft.json").write_text(json.dumps(draft))
+        (root / "reader-projection.json").write_text(json.dumps(report))
+        run = subprocess.run(
+            [
+                sys.executable,
+                str(RENDERER),
+                str(root / "reader-projection.json"),
+                str(root / "out.html"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if case in ("conflict", "escape", "digest"):
+            assert run.returncode == 2 and "own-event" in run.stderr
+            continue
+        assert run.returncode == 0, run.stderr
+        card = reader_cards((root / "out.html").read_text())["BTC"]
+        expected = "温转热" if case in ("current", "unrelated-proof") else "待查"
+        assert f'<dd class="reader-event">{expected}</dd>' in card
+        assert "应建观察仓" not in card
+
+        if case == "current":
+            assessed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SKILL / "collection.py"),
+                    "assess",
+                    str(root / "reader-projection.json"),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert assessed.returncode == 0, assessed.stderr
+            pending = json.loads(assessed.stdout)["pending"]
+            assert not any("BTC" in p and "特殊信号" in p for p in pending)
+
+            import shutil
+
+            revision = root.parent / "v02"
+            revision.mkdir()
+            for original in root.glob("*.json"):
+                shutil.copyfile(original, revision / original.name)
+            replay = subprocess.run(
+                [
+                    sys.executable,
+                    str(RENDERER),
+                    str(revision / "reader-projection.json"),
+                    str(revision / "compat.html"),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert replay.returncode == 0, replay.stderr
+            assert (
+                '<dd class="reader-event">温转热</dd>'
+                in reader_cards((revision / "compat.html").read_text())["BTC"]
+            )
+
+            namesake_report = deepcopy(report)
+            namesake = dict(
+                asset, instrument_id="namesake", market="US", data_date="2026-11-20"
+            )
+            namesake_report["long"][0]["related"] = [namesake]
+            (root / "reader-projection.json").write_text(json.dumps(namesake_report))
+            scoped = subprocess.run(
+                [
+                    sys.executable,
+                    str(RENDERER),
+                    str(root / "reader-projection.json"),
+                    str(root / "namesake.html"),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert scoped.returncode == 0, scoped.stderr
+            cells = re.findall(
+                r'<dd class="reader-event">(.*?)</dd>',
+                (root / "namesake.html").read_text(),
+            )
+            assert "温转热" in cells and "待查" in cells
