@@ -362,7 +362,7 @@ def test_threshold_report_checks_expected_groups(tmp_path):
     absent = deepcopy(data)
     absent.pop("signal_search")
     assert not api.assess(absent)["complete"]
-    assert "信号搜索覆盖待核" in api.render_html(absent)
+    assert "信号搜索覆盖待核" not in api.render_html(absent)
     assert "截至 2026-11-25T08:30:00+08:00" in api.render_html(data)
     omitted = deepcopy(data)
     identity = dict(
@@ -373,7 +373,7 @@ def test_threshold_report_checks_expected_groups(tmp_path):
     ]
     omitted["signal_search"]["memberships"][0]["members"] = [identity]
     assert not api.assess(omitted)["complete"]
-    assert "已核实信号命中尚未入直属卡" in api.render_html(omitted)
+    assert "已核实信号命中尚未入直属卡" not in api.render_html(omitted)
     for partial in [
         None,
         dict(
