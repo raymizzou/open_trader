@@ -594,10 +594,57 @@ recorded. Preserve all workers' saved work and commits. Retain Main's delivery
 ownership until the stopping condition above. A worker ending does not mean the
 PR is complete.
 
-Ending a session is separate from deleting a worktree or branch. Deletion still
-requires GitHub merge, user confirmation and a clean worktree under
-[AGENTS.md](../../AGENTS.md#delivery-boundaries); never delete dirty work. These
-rules do not authorize closing existing sessions as part of documentation work.
+Ending a session is separate from deleting a worktree or branch. Follow
+[post-closure local cleanup](#post-closure-local-cleanup) only for its narrow
+issue-closure case; otherwise deletion still requires GitHub merge, user
+confirmation and a clean worktree under [AGENTS.md](../../AGENTS.md#delivery-boundaries).
+Never delete dirty work. These rules do not authorize closing existing sessions
+as part of documentation work.
+
+### Post-closure local cleanup
+
+After the owning host has read back the GitHub issue as **CLOSED** and the
+acceptance record shows every criterion complete or has Ray's explicit recorded
+acceptance, its Main must process each registered local path. The existing
+task-state record must show either final merge evidence or an explicit
+abandonment disposition and name the current owner. Issue closure alone is not
+enough. If a Bot closes the issue after Main exits, the owning host resumes on
+its next authorized pickup; the prior exit never authorizes unattended cleanup.
+
+This standing confirmation applies only to this post-closure case; other cleanup
+retains the prior GitHub-merge, user-confirmation and clean-worktree rule. Use
+only exact paths registered in the existing task state. Before deleting evidence,
+verify its durable references and the permanent acceptance/required record are
+readable from outside the candidate path. Keep the compact per-path disposition
+(`freed` with eligibility/reason, or `retained` with why) in the existing
+task-state record outside the candidate. Main may not grant a deviation: any
+deviation requires Ray's recorded explicit acceptance. Do not create nested or
+duplicate shared records.
+
+An eligible path is either:
+
+- A clean, unused, non-shared, unambiguous disposable Git worktree with no
+  dirty/untracked files, no protected or uniquely needed ignored files, and no unique
+  unmerged/unpublished work. Inspect ignored files separately; clean Git status
+  alone does not establish safety. Remove it only with `git worktree remove <registered-path>`;
+  never force removal or delete a branch/ref.
+- An exact, task-owned evidence file or temporary output (including CI downloads
+  or builds outside the worktree) that is not in use or shared, not protected or
+  the sole required copy (including sole acceptance evidence), and not still
+  needed for rollback/deployment. Remove only the independently eligible exact
+  path with a non-force operation.
+
+If a candidate parent contains shared, protected, unique, or ignored files, do
+not remove that parent; clean only independently eligible exact children. Retain
+any uncertain, dirty/untracked, unique-unmerged/unpublished, sole-evidence, or
+rollback/deployment-needed path. Do not run a blanket retroactive sweep,
+mass-delete, scheduler, service/runtime/production change, or GitHub mutation.
+
+Cleanup is replay-safe: a recorded `freed` path that is absent is a no-op, and a
+recorded `retained` path is not retried by replay. An absent path without a
+recorded `freed` disposition, or any interrupted/partial/mismatched attempt, is
+`retained` as unknown/incomplete with its owner and evidence preserved for the
+next authorized pickup. Never infer success from absence or retry destructively.
 
 ### Handoff and evidence record
 

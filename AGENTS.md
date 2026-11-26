@@ -303,8 +303,14 @@ workflow) evidence on the selected final GitHub `main` SHA.
 A failed main SHA cannot be deployed and does not change running production.
 An older main ancestor needs its own valid evidence when selected for deployment.
 
-Screenshots are optional unless requested. Clean up only after GitHub merge,
-user confirmation, and a clean worktree; never delete a dirty worktree.
+Screenshots are optional unless requested. After the owning host reads the
+GitHub issue as CLOSED and acceptance is complete or has Ray's explicit recorded
+acceptance, its Main must process the registered paths under the
+[post-closure local cleanup policy](docs/operations/agent-verification.md#post-closure-local-cleanup),
+freeing eligible worktrees or task-owned evidence/temporary outputs and recording
+retained items. This standing confirmation is limited to that case; all other
+cleanup still requires GitHub merge, user confirmation, and a clean worktree.
+Never delete dirty work.
 Ending a worker session is separate from deleting its worktree or branch. End
 development workers only with saved work, completed assigned review/repair work
 or an accepted handoff, and a recorded owner for remaining responsibilities;
