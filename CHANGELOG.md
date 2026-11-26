@@ -4,6 +4,12 @@
 
 # Changelog
 
+## 2026-11-27 — 模拟盘成交归集到私有 Kelly 台账 (#548)
+
+- 从正式模拟开仓库只读核对原批准、委托及冻结日报归因。已受理、实际成交与费用确认分别统计。
+- 核对私有券商凭据后归集成交。重复导入按券商成交标识去重；持仓归零且费用齐全时计入收益样本。异币费用须附可核对的实际兑换凭据。
+- 私有页面按冻结母榜列出全部大类，包含零样本行。正式台账入口拒绝使用合成演示数据库。
+
 ## 2026-11-27 — Trend V3 report and mock file placement
 
 - Deliver each official Trend V3 report, revision, or correction as one
