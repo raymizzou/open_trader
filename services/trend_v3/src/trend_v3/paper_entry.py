@@ -106,6 +106,7 @@ class PaperEntry:
                 "INSERT OR REPLACE INTO current_plan VALUES (?, ?)",
                 (plan["date"], plan["id"]),
             )
+        self.freeze_positions(now)
         return plan
 
     @staticmethod
@@ -575,32 +576,51 @@ class PaperEntry:
             )
             return self.attempt_outcome(store, line, self.attempt(store, line))
 
-    def reconcile(self, plan_id, *, now):
+    def reconcile(self, plan_id, *, now, pending_only=False):
+        # Receipt I/O must never hold the SQLite placement lock. Keep a snapshot
+        # and discard a late response if another observer/retry changed it.
         with transaction(self.database) as store:
             plan, _ = self.stored_plan(store, plan_id)
             if plan is None:
                 return []
-            results = []
+            pending = []
             for line in plan["lines"]:
                 attempt = self.attempt(store, line)
                 if attempt is None or attempt["plan"] != plan_id:
                     continue
-                if attempt["state"] != "skipped":
-                    self.reconcile_attempt(store, line, attempt, now)
-                    attempt = self.attempt(store, line)
-                results.append(self.attempt_outcome(store, line, attempt))
-            return results
+                if attempt["state"] == "skipped" or (
+                    pending_only
+                    and (
+                        attempt["state"] not in {"active", "unknown"}
+                        or now >= instant(line["closes_at"])
+                    )
+                ):
+                    continue
+                pending.append((line, dict(attempt)))
+        for line, snapshot in pending:
+            observed = self.clock() if self.clock else now
+            if pending_only and observed >= instant(line["closes_at"]):
+                continue
+            try:
+                response = self.broker.find_order(
+                    line, snapshot["token"], snapshot["order_id"], snapshot["quantity"]
+                )
+            except Exception:
+                continue
+            with transaction(self.database) as store:
+                current = self.attempt(store, line)
+                if current is not None and dict(current) == snapshot:
+                    self.reconcile_attempt(store, line, current, now, response)
+        self.freeze_positions(self.clock() if self.clock else now)
+        with transaction(self.database) as store:
+            return [
+                self.attempt_outcome(store, line, attempt)
+                for line in plan["lines"]
+                if (attempt := self.attempt(store, line)) is not None
+                and attempt["plan"] == plan_id
+            ]
 
-    def reconcile_attempt(self, store, line, attempt, now):
-        try:
-            response = self.broker.find_order(
-                line,
-                attempt["token"],
-                attempt["order_id"],
-                attempt["quantity"],
-            )
-        except Exception:
-            return
+    def reconcile_attempt(self, store, line, attempt, now, response):
         state, order_id, filled, reason = self.broker_result(
             response, attempt["quantity"]
         )
@@ -710,6 +730,8 @@ class PaperEntry:
         return {
             "item": line["item"],
             "code": line["code"],
+            "direction": line["direction"],
+            "quantity": line["quantity"],
             "state": state,
             "filled": filled,
             "remaining": line["quantity"] - filled if filled is not None else None,
@@ -727,6 +749,17 @@ class PaperEntry:
             or 0
         )
 
+    def has_approval(self, plan_id):
+        with transaction(self.database) as store:
+            plan, _ = self.current(store, plan_id)
+            return (
+                plan is not None
+                and store.execute(
+                    "SELECT 1 FROM approvals WHERE plan=? AND quantity>0", (plan_id,)
+                ).fetchone()
+                is not None
+            )
+
     def openings(self, plan_id):
         with transaction(self.database) as store:
             plan, _ = self.current(store, plan_id)
@@ -740,39 +773,370 @@ class PaperEntry:
             plan = self.latest_plan(store)
             if plan is None:
                 return None
-            results = {}
+            results = []
+            pending_codes = set()
             for line in plan["lines"]:
                 attempt = self.attempt(store, line)
-                if attempt:
-                    result = self.attempt_outcome(store, line, attempt)
-                else:
-                    result = self.decision(store, plan["id"], line)
-                    if result is None:
-                        result = self.unsubmitted_status(store, plan["id"], line, now)
-                results[line["code"]] = result
+                if attempt is not None:
+                    continue
+                result = self.decision(store, plan["id"], line)
+                if result is None:
+                    result = self.unsubmitted_status(store, plan["id"], line, now)
+                approval = store.execute(
+                    "SELECT quantity FROM approvals WHERE plan=? AND item=?",
+                    (plan["id"], line["item"]),
+                ).fetchone()
+                result["approved"] = approval["quantity"] if approval else None
+                results.append(self.public_outcome(result))
+                pending_codes.add(line["code"])
             history = store.execute(
                 """SELECT attempts.*, plans.body FROM attempts
                    JOIN plans ON plans.id = attempts.plan
-                   WHERE plans.report_day = ? ORDER BY attempts.number""",
+                   WHERE plans.report_day = ? ORDER BY plans.created, attempts.rowid""",
                 (self.session["date"],),
             )
-            for attempt in history:
+            for ordinal, attempt in enumerate(history, 1):
                 old_plan = json.loads(attempt["body"])
                 line = next(
                     line
                     for line in old_plan["lines"]
                     if line["item"] == attempt["item"]
                 )
-                results[line["code"]] = self.attempt_outcome(store, line, attempt)
+                # Each row is one actual order, not cumulative fills collapsed by code.
+                result = self.outcome(
+                    line, attempt["state"], attempt["filled"], attempt["reason"]
+                )
+                result["quantity"] = attempt["quantity"]
+                result["approved"] = attempt["quantity"]
+                if attempt["filled"] is not None:
+                    result["remaining"] = attempt["quantity"] - attempt["filled"]
+                results.append(
+                    self.public_outcome(result)
+                    | {
+                        "record": ordinal,
+                        "report_version": old_plan["report_version"],
+                        "session_date": line["session_date"],
+                    }
+                )
+                pending_codes.add(line["code"])
             return {
                 "schema": "trend-v3-paper-entry.v1",
                 "date": plan["date"],
                 "report_version": plan["report_version"],
-                "results": [self.public_outcome(result) for result in results.values()],
+                "holdings": self.holdings_projection(store, plan, now),
+                "results": results,
                 "skipped": [
-                    item for item in plan["skipped"] if item.get("code") not in results
+                    item
+                    for item in plan["skipped"]
+                    if item.get("code") not in pending_codes
                 ],
             }
+
+    def freeze_positions(self, now):
+        """Freeze attributed net positions from existing simulation account reads."""
+        if not hasattr(self.broker, "snapshot"):
+            return
+        with transaction(self.database) as store:
+            history = list(
+                store.execute(
+                    "SELECT attempts.*, plans.body FROM attempts "
+                    "JOIN plans ON plans.id=attempts.plan"
+                )
+            )
+            previous = {
+                row["identity"]: json.loads(row["body"])
+                for row in store.execute("SELECT * FROM positions")
+            }
+        groups = {}
+        scopes = {}
+        for attempt in history:
+            plan = json.loads(attempt["body"])
+            scopes.update(plan.get("account_scope") or {})
+            line = next(row for row in plan["lines"] if row["item"] == attempt["item"])
+            if not attempt["filled"]:
+                continue
+            key = fingerprint(
+                [
+                    line["account_identity"],
+                    line["code"],
+                    line["market"],
+                    line["product"],
+                    line["currency"],
+                    line["multiplier"],
+                ]
+            )
+            group = groups.setdefault(key, {"line": line, "attempts": []})
+            group["attempts"].append(dict(attempt) | {"direction": line["direction"]})
+        if not groups:
+            return
+        try:
+            if hasattr(self.broker, "restore_scope"):
+                self.broker.restore_scope(scopes)
+            accounts = self.broker.snapshot()
+        except (OSError, RuntimeError, ValueError):
+            # A lost account read cannot prove flat or restore old valuations.
+            with transaction(self.database) as store:
+                for key, old in previous.items():
+                    if old.get("source") == "manual":
+                        continue
+                    old["unrealized_pnl"] = None
+                    if old.get("quantity") == "0":
+                        old["quantity"] = None
+                    old["as_of"] = now.isoformat()
+                    store.execute(
+                        "INSERT OR REPLACE INTO position_history VALUES (?, ?, ?)",
+                        (key, old["as_of"], encode(old)),
+                    )
+                    store.execute(
+                        "UPDATE positions SET body=? WHERE identity=?",
+                        (encode(old), key),
+                    )
+            return
+        updates = {}
+        for key, group in groups.items():
+            line, attempts = group["line"], group["attempts"]
+            old = previous.get(key, {})
+            flat = old.get("flat_attempts", {})
+            quantity, cost, known_cost = 0, decimal(0), True
+            signed_quantity, directions = 0, set()
+            for attempt in attempts:
+                amount = max(0, attempt["filled"] - flat.get(attempt["token"], 0))
+                quantity += amount
+                if amount:
+                    direction = -1 if attempt["direction"] == "short" else 1
+                    signed_quantity += amount * direction
+                    directions.add(direction)
+                notional = decimal(attempt["filled_notional"])
+                if amount:
+                    if notional is None or flat.get(attempt["token"], 0):
+                        known_cost = False
+                    else:
+                        cost += notional
+            expected = decimal(signed_quantity) if len(directions) <= 1 else None
+            account = accounts.get(line["account"], {})
+            positions = account.get("positions")
+            valid = (
+                account.get("environment") == "SIMULATE"
+                and account.get("identity") == line["account_identity"]
+                and account.get("currency") == line["currency"]
+                and line["market"] in account.get("markets", [])
+                and line["product"] in account.get("products", [])
+                and isinstance(positions, list)
+            )
+            matches = (
+                [p for p in positions if p.get("code") == line["code"]] if valid else []
+            )
+            actual = (
+                decimal(matches[0].get("quantity"))
+                if len(matches) == 1
+                else decimal(0)
+                if valid and not matches
+                else None
+            )
+            position = matches[0] if len(matches) == 1 else {}
+            if position and position.get("currency") != line["currency"]:
+                actual = None
+            body = {
+                "code": line["code"],
+                "market": line["market"],
+                "product": line["product"],
+                "currency": line["currency"],
+                "quantity": None,
+                "average_entry": None,
+                "unrealized_pnl": None,
+                "flat_attempts": flat,
+                "as_of": now.isoformat(),
+            }
+            if actual == 0:
+                body["quantity"] = "0"
+                body["flat_attempts"] = {a["token"]: a["filled"] for a in attempts}
+            elif actual is not None and actual == expected:
+                body["quantity"] = str(actual)
+                multiplier = decimal(line["multiplier"])
+                average = (
+                    cost / quantity / multiplier if known_cost and quantity else None
+                )
+                body["average_entry"] = str(average) if average is not None else None
+                pnl = (
+                    decimal(position.get("unrealized_pnl"))
+                    if average is not None
+                    and decimal(position.get("average_entry")) == average
+                    else None
+                )
+                broker_average = decimal(position.get("average_entry"))
+                if (
+                    average is not None
+                    and broker_average is not None
+                    and broker_average != average
+                ):
+                    # Equal net quantity alone cannot attribute an account position
+                    # whose verified cost contradicts the V3 fill ledger.
+                    body.update(quantity=None, average_entry=None, unrealized_pnl=None)
+                    updates[key] = body
+                    continue
+                mark = decimal(position.get("mark"))
+                if (
+                    pnl is None
+                    and mark is not None
+                    and mark > 0
+                    and average is not None
+                ):
+                    pnl = (mark - average) * actual * multiplier
+                body["unrealized_pnl"] = str(pnl) if pnl is not None else None
+            elif actual is None and old:
+                body.update(
+                    quantity=old.get("quantity")
+                    if old.get("quantity") != "0"
+                    else None,
+                    average_entry=old.get("average_entry"),
+                )
+            updates[key] = body
+        with transaction(self.database) as store:
+            for key, body in updates.items():
+                current = store.execute(
+                    "SELECT body FROM positions WHERE identity=?", (key,)
+                ).fetchone()
+                if current and instant(json.loads(current["body"])["as_of"]) > now:
+                    continue
+                store.execute(
+                    "INSERT OR REPLACE INTO positions VALUES (?, ?)",
+                    (key, encode(body)),
+                )
+                store.execute(
+                    "INSERT OR REPLACE INTO position_history VALUES (?, ?, ?)",
+                    (key, body["as_of"], encode(body)),
+                )
+
+    def record_manual_holdings(self, snapshot, reply, *, now):
+        """Only the original tab's explicit structured user report is authority."""
+        from .paper_public import PAPER_CODE
+
+        if self.verify_reply is None or not self.verify_reply(reply):
+            return False
+        if (
+            snapshot.get("schema") != "trend-v3-manual-holdings.v1"
+            or snapshot.get("strategy") != "trend-v3"
+            or snapshot.get("environment") != "SIMULATE"
+            or snapshot.get("date") != self.session["date"]
+            or not text(snapshot.get("account"))
+            or not isinstance(snapshot.get("positions"), list)
+        ):
+            return False
+        reported_at = instant(reply.get("timestamp")) or now
+        if reported_at > now:
+            return False
+        prepared = []
+        for row in snapshot["positions"]:
+            qty, average = (
+                decimal(row.get("quantity")),
+                decimal(row.get("average_entry")),
+            )
+            if (
+                row.get("market") != "CRYPTO"
+                or row.get("product") != "crypto"
+                or not isinstance(row.get("code"), str)
+                or not PAPER_CODE.fullmatch(row["code"])
+                or row.get("currency") not in {"USD", "HKD", "CNY"}
+                or qty is None
+                or qty < 0
+                or average is not None
+                and average < 0
+            ):
+                return False
+            pnl = decimal(row.get("unrealized_pnl"))
+            if (row.get("average_entry") is not None and average is None) or (
+                row.get("unrealized_pnl") is not None and pnl is None
+            ):
+                return False
+            row = row | {
+                "quantity": str(qty),
+                "average_entry": str(average) if average is not None else None,
+                "unrealized_pnl": str(pnl) if pnl is not None else None,
+            }
+            key = fingerprint(
+                ["manual", snapshot["account"], row["code"], row["currency"]]
+            )
+            prepared.append(
+                (
+                    key,
+                    {
+                        field: row.get(field)
+                        for field in (
+                            "code",
+                            "market",
+                            "product",
+                            "currency",
+                            "quantity",
+                            "average_entry",
+                            "unrealized_pnl",
+                        )
+                    }
+                    | {
+                        "source": "manual",
+                        "source_session": self.session["id"],
+                        "source_event": fingerprint(reply),
+                        "as_of": reported_at.isoformat(),
+                    },
+                )
+            )
+        if len({key for key, body in prepared}) != len(prepared):
+            return False
+        with transaction(self.database) as store:
+            plan = self.latest_plan(store)
+            if plan is None or snapshot.get("report_version") != plan["report_version"]:
+                return False
+            for key, body in prepared:
+                current = store.execute(
+                    "SELECT body FROM positions WHERE identity=?", (key,)
+                ).fetchone()
+                if (
+                    current
+                    and instant(json.loads(current["body"])["as_of"]) > reported_at
+                ):
+                    return False
+            for key, body in prepared:
+                store.execute(
+                    "INSERT OR REPLACE INTO positions VALUES (?, ?)",
+                    (key, encode(body)),
+                )
+                store.execute(
+                    "INSERT OR REPLACE INTO position_history VALUES (?, ?, ?)",
+                    (key, body["as_of"], encode(body)),
+                )
+        return True
+
+    def holdings_projection(self, store, plan, now):
+        fields = (
+            "code",
+            "market",
+            "product",
+            "currency",
+            "quantity",
+            "average_entry",
+            "unrealized_pnl",
+        )
+        latest = {}
+        for row in store.execute("SELECT * FROM position_history"):
+            body = json.loads(row["body"])
+            at = instant(body["as_of"])
+            if at <= now and (
+                row["identity"] not in latest
+                or at >= instant(latest[row["identity"]]["as_of"])
+            ):
+                latest[row["identity"]] = body
+        values = list(latest.values())
+        return {
+            "schema": "trend-v3-paper-holdings.v1",
+            "date": plan["date"],
+            "report_version": plan["report_version"],
+            "verified_flat": bool(values)
+            and all(row.get("quantity") == "0" for row in values),
+            "positions": [
+                {field: row.get(field) for field in fields}
+                for row in values
+                if row.get("quantity") != "0"
+            ],
+        }
 
     def unsubmitted_status(self, store, plan_id, line, now):
         approved = store.execute(
@@ -790,4 +1154,8 @@ class PaperEntry:
     @staticmethod
     def public_outcome(result):
         fields = ("code", "state", "filled", "remaining", "active", "reason")
-        return {field: result[field] for field in fields}
+        return {field: result[field] for field in fields} | {
+            field: result[field]
+            for field in ("direction", "quantity", "approved")
+            if field in result
+        }

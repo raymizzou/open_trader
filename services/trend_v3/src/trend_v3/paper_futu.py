@@ -96,6 +96,25 @@ class FutuPaperBroker:
         self.contexts = {}
         self.quote = None
 
+    def receipt_reader(self):
+        """Use separate SDK contexts and expose no placement interface."""
+        from copy import deepcopy
+
+        broker = FutuPaperBroker(
+            {**self.address, "accounts": deepcopy(self.settings)},
+            sdk=self.sdk,
+            clock=self.clock,
+        )
+
+        class Reader:
+            environment = SIMULATE
+            snapshot = broker.snapshot
+            restore_scope = broker.restore_scope
+            find_order = broker.find_order
+            close = broker.close
+
+        return Reader()
+
     def open_sdk(self):
         if self.sdk is None:
             try:
@@ -408,6 +427,11 @@ class FutuPaperBroker:
             "code": row.get("code"),
             "currency": cls.exposure_currency(row, account),
             "quantity": amount,
+            "mark": row.get("nominal_price"),
+            "average_entry": row.get("cost_price")
+            if row.get("cost_price_valid") is True
+            else None,
+            "unrealized_pnl": row.get("unrealized_pl"),
             "notional": abs(notional) if notional is not None else None,
         }
 

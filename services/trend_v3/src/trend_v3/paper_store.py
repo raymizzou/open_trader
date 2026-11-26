@@ -6,6 +6,10 @@ import stat
 from contextlib import contextmanager
 
 SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS position_history (identity TEXT, as_of TEXT,
+        body TEXT NOT NULL, PRIMARY KEY(identity, as_of))""",
+    """CREATE TABLE IF NOT EXISTS positions (identity TEXT PRIMARY KEY,
+        body TEXT NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS plans (
         id TEXT PRIMARY KEY, report_day TEXT NOT NULL, body TEXT NOT NULL,
         created TEXT NOT NULL

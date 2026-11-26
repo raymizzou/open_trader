@@ -1,0 +1,65 @@
+{
+  "date": "2040-01-01",
+  "collection": {
+    "next_check": "演示数据，仅用于离线版式核对；不连接账户或下单"
+  },
+  "paper_entry": {
+    "schema": "trend-v3-paper-entry.v1",
+    "date": "2040-01-01",
+    "report_version": "v02",
+    "results": [],
+    "skipped": [],
+    "holdings": {
+      "schema": "trend-v3-paper-holdings.v1",
+      "date": "2040-01-01",
+      "report_version": "v02",
+      "positions": [
+        {
+          "code": "BTC",
+          "market": "CRYPTO",
+          "product": "crypto",
+          "currency": "USD",
+          "quantity": "0.025",
+          "average_entry": "64000",
+          "unrealized_pnl": "80"
+        },
+        {
+          "code": "US.AAPL",
+          "market": "US",
+          "product": "stock",
+          "currency": "USD",
+          "quantity": "100",
+          "average_entry": "180",
+          "unrealized_pnl": "250"
+        },
+        {
+          "code": "US.MSFT",
+          "market": "US",
+          "product": "stock",
+          "currency": "USD",
+          "quantity": "20",
+          "average_entry": "420",
+          "unrealized_pnl": "-36"
+        },
+        {
+          "code": "HK.00700",
+          "market": "HK",
+          "product": "stock",
+          "currency": "HKD",
+          "quantity": "100",
+          "average_entry": "400",
+          "unrealized_pnl": "350"
+        },
+        {
+          "code": "SH.600519",
+          "market": "CN",
+          "product": "stock",
+          "currency": "CNY",
+          "quantity": "100",
+          "average_entry": "1480",
+          "unrealized_pnl": "-620"
+        }
+      ]
+    }
+  }
+}

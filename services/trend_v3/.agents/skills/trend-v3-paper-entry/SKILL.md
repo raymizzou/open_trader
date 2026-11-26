@@ -18,7 +18,7 @@ description: Plan first paper entries from the verified Trend V3 daily report in
 1. 照日报流程验证当前 HTML 和主机上传回执。程序从原路径读当天最新报告及关联的 reader、selection、费用与报告核实文件，核对日期、版本、发布身份与摘要。给定原会话 UUID 即可，无需创建证据包或填写仓位、价格或订单内容。
 2. 程序核对原榜图、直属资格、适用数据日、逐字段信号和引用原件。没有合格候选时不连接 OpenD。`verified_no_candidates` 表示已核实范围内无候选，`evidence_incomplete` 表示证据待核，`no_actionable_candidates` 表示本次无可操作项目；按 `skipped` 说明具体原因。只有 `lines` 有内容时才展示批准命令。有合格候选时读取交易日、产品、合约、参考价、整手和模拟账户的风险数据。每笔首次开仓按该账户的当前净资产 2% 计算，并受本币可用资金和账户敞口上限约束，向下取整手或整张。不设标的数量上限，不按名额或隐含计数限制首次开仓。持仓、挂单及待核委托仍用于同标的去重和风险核对；待执行项目按账户预留现金及名义敞口，同一账户的多个项目不能重复使用同一笔资金。各账户的资金及敞口各以本币计，无需跨币种汇率。
 3. 在原 tab 的可见最终回复中用代码块逐字展示 `plan` 输出的 `delivery` 正文，每行完整保留。正文以外说明仅限价、资格待核、已有持仓、活动或状态不明的委托。展示 `确认全部`、`只确认第1项` 或 `确认第1、3项` 等回复示例。程序按所展示的编号绑定当前报告版次和计划。多个计划导致简短回复含糊时暂停执行，请用户在原 tab 指明项目和计划，此时可用 `模拟批准 <计划编号> <项目编号1>,<项目编号2>`。没有可批准项目时直接说明。日报更新后，重新生成和展示新计划，由用户重新审批。
-4. 收到该 tab 的明确盘前回复后运行 `approve`，读回已记录的决定。有已批准项目时，在最早对应开盘前用该 tab 的受监督命令运行 `submit` 并保留其执行句柄。此命令在本地等待各市场开盘，当前对话轮可结束。后续在原 tab 用同一执行句柄读回结果，必要时用 `status`，不启动守护进程或新 tab。用户可用 `withdraw_all` 或 `模拟撤回 <完整计划编号> <项目编号1>,<项目编号2>` 撤回计划项，收到时立即用 `approve` 记录决定。`items` 列出已撤回项目，`ignored_opened_items` 列出已开盘而未受影响的项目。全部已开盘时明确回报无变更。
+4. 收到该 tab 的明确盘前回复后用该 tab 的受监督命令运行 `cycle "$plan"` 并保留其执行句柄。程序从原会话读取并记录精确回复；无有效回复时停止，绝不代为批准。已有批准仅恢复原计划，错过的开盘组不补发。此命令在本地等待各市场开盘，当前对话轮可结束。后续在原 tab 用同一执行句柄读回结果，必要时用 `status`，不启动守护进程或新 tab。用户可用 `withdraw_all` 或 `模拟撤回 <完整计划编号> <项目编号1>,<项目编号2>` 撤回计划项，收到时立即用 `approve` 记录决定。`items` 列出已撤回项目，`ignored_opened_items` 列出已开盘而未受影响的项目。全部已开盘时明确回报无变更。
 5. 每个开盘组核对原报告版次、累计占用、该账户净资产及可用资金、市场状态和券商可下数量。按原批准数量提交模拟市价单，信号沿用原报告。等待器在开盘后 2 秒内须已唤醒；已唤醒的组须在开盘后 30 秒以内发起每笔新报单。资金下降、交易条件未核实、进程迟到或券商读取超时均逐项回报。错过开盘不补发；重跑只读回已有状态。
 
 ## 加密模拟盘手工开仓
@@ -39,12 +39,15 @@ description: Plan first paper entries from the verified Trend V3 daily report in
 ```sh
 PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" plan
 PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" approve "$plan"
-PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" submit "$plan"
+PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" cycle "$plan"
 PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" status
 PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" reconcile "$plan"
 ```
 
-`status` 不读取券商。可把结构化输出作为临时展示投影的 `paper_entry`，从原日报核实记录单独取版次，用 `--report-revision "$verified_revision"` 重渲染整份阅读 HTML。保留该版已核实的本地原 HTML、投影及交付回执。仅更新展示状态不产生新报告版次或改变原摘要。历史报告只复用同版脱敏结果。实盘与凯利保留原占位。
+`plan`、批准、执行与对账后自动刷新同一完整日报 HTML 的模拟盘部分。`cycle` 在每组开盘后读匹配回执并刷新，之后每 30 秒只对账已有委托，直至没有活动或待核委托或原交易时段结束；绝不因刷新重试。内部结果继续保留方向、申请/批准数量、实成、剩余、部分成交及原委托身份，供审批和核查；正常阅读件按 holdings.md 的四列真实持仓契约展示，不输出这些委托字段。
+
+`status` 和 `rehearse` 保持只读，不刷新、不启动等待器或券商读取。原报告、投影、selection、费用及 verification 原件保持不可变，原 HTML 保存在同版 `reader-original.html`；`paper-display.json` 单独记录来源摘要和展示摘要。正式主机同步器由同一不可变发布的 `host/` 候选更新后，从原证据及私有状态重新计算展示，沿用原共享身份、文件保护与上传读回，不信任展示文件自称的摘要。`host/prepare.py` 只准备安装候选，校验发布目录名、Git HEAD 和干净状态；安装、更改主机 pin/SOP、重新加载服务仍需单独批准。部署前同步器和启动器必须同 pin；旧 SOP pin 不匹配时启动器拒绝。没有有效原交付回执不得执行。普通刷新不读取券商、重新计划或生成授权。
+
 `reconcile` 只读取已保存委托的匹配回执。逐项回报成交、失败、活动、部分成交及待核。确认原委托已拒绝或已撤销且有剩余数量时，将返回的 `retry_reply` 逐字发给用户。仅在交易时段内收到新的同 tab 明确重试回复后，立即运行 `submit "$plan" --retry-item "$item"`。重复命令、活动委托、未知回执和已全成委托均不会补单。美国交易时段跨过台北午夜后，在 `--session` 后加 `--report-date YYYY-MM-DD`，填写原日报日期。
 
 固定历史演练验证指定报告版次、原始发布提交、同日日期及原件摘要，兼容已核实旧版的选择日期和逐字段引用。此入口不会访问 OpenD 或启动真实会话。仿真的账户和实际提交流程通过服务的离线集成测试验证。
@@ -62,3 +65,7 @@ PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli rehearse "$d
 
 - 证券使用 OpenD 快照确认正常且未停牌。单市场模拟证券账户若省略资金币种，由已核实的账户市场确定，预算受扣除冻结额的现金与购买力两者限制。A 股接口使用券商的 `CNH` 参数，A 股账本仍按原计划人民币口径列示。账户资金或敞口的币种与该账户已核实本币冲突时，暂停该账户的新单。
 - 已核实的港股恒指期货使用香港日间开盘，按所选交易日上午或下午时段处理。券商展示的每手 50 与合约乘数指向同一个单位换算，计划数量以整数张列出，每张名义金额仅乘一次。其他形态缺少可信时段、到期日、币种或交易单位时继续待核。
+
+### 在仓头寸展示
+
+正常日报模拟盘使用版本化持仓对象，按市场分区，每表仅「标的、持仓数量、开仓均价、持仓盈亏」四列；不展示委托串、申请/批准数量、跳过原因或汇总栏。只显示已归属 V3 的实际在仓头寸，跨日持续跟踪，实证归零才移除。未知估值显示 —，不填假零。手工加密只接受原 tab 明确回报，渲染与 status 保持只读。字段、权重/估值保护、手工来源及完整离线演示见 [holdings.md](holdings.md)。
