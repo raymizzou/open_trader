@@ -311,10 +311,13 @@ freeing eligible worktrees or task-owned evidence/temporary outputs and recordin
 retained items. This standing confirmation is limited to that case; all other
 cleanup still requires GitHub merge, user confirmation, and a clean worktree.
 Never delete dirty work.
-Ending a worker session is separate from deleting its worktree or branch. End
-development workers only with saved work, completed assigned review/repair work
-or an accepted handoff, and a recorded owner for remaining responsibilities;
-see [worker lifecycle](docs/operations/agent-verification.md#worker-lifecycle).
+At handoff acceptance, the owning Main must immediately close eligible task-owned
+worker/reviewer panes and verify both session exit and pane absence. Save work,
+settle commands and complete assigned/exclusive duties or transfer them to a
+named accepting owner first. Record closure or a concrete retention reason and
+next review time/event; preserve worktrees, branches and recoverable session
+evidence. Reconcile own children with durable handoffs on existing checks and
+before idle; see [worker lifecycle](docs/operations/agent-verification.md#worker-lifecycle).
 
 ## Agent skills
 

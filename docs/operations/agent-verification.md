@@ -586,13 +586,35 @@ evidence. Existing deployment and cleanup rules remain unchanged.
 
 ### Worker lifecycle
 
-Assess each development worker's assigned review/repair work and remaining duties.
-End only a worker whose work is saved and committed or durably handed off, whose
-assigned review/repair work and exclusive fixes, CI problems, conflicts and
-monitoring are complete or accepted by a named new owner, and whose handoff is
-recorded. Preserve all workers' saved work and commits. Retain Main's delivery
-ownership until the stopping condition above. A worker ending does not mean the
-PR is complete.
+At handoff acceptance, the owning Main must immediately close each eligible
+task-owned worker/reviewer pane. Eligibility requires saved work (committed or
+durably handed off), settled commands, a recorded accepted handoff, and all
+assigned/exclusive duties complete or explicitly accepted by a named new owner.
+This includes fixes, CI problems, conflicts and monitoring. Verify current task,
+session, terminal and app pane ownership before acting; a DONE/idle badge alone
+does not establish eligibility. Keep active or foreign sessions/panes untouched;
+unverified ownership or command state prevents closure.
+
+Use the installed surface's supported operations for the exact eligible child.
+Fresh terminal and app readback must prove both that the session ended and that
+the pane is absent. Session exit alone is insufficient when its pane remains;
+close that verified task-owned pane and read back again. Record task/batch and
+session/terminal/pane IDs, time, acceptance and ownership evidence, closure result
+and readback references in the existing task state. If closure is blocked or
+readback is unavailable, record the blocker or UNKNOWN and next owner/action;
+do not claim closure.
+
+For any retained child, record its concrete unfinished duty or retention reason,
+owner and next review time/event. Hypothetical future repairs are not a retention
+reason. On existing ten-minute checks and before Main goes idle, reconcile own
+children with their durable handoffs, including handoffs whose notification
+failed, and apply the same acceptance and closure checks. Do not add a timer,
+sweep other tasks or close a child merely because a handoff says DONE.
+
+Preserve saved work, commits and recoverable session evidence. Retain Main's
+delivery, external dots/Opus review and repair ownership until the stopping
+condition above; closing a child does not complete the PR or authorize a local
+reviewer. This rule applies to reviewers only when separately authorized.
 
 Ending a session is separate from deleting a worktree or branch. Follow
 [post-closure local cleanup](#post-closure-local-cleanup) only for its narrow
