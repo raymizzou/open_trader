@@ -1,4 +1,4 @@
-"""Private SQLite ledger for confirmed, synthetic Kelly round evidence."""
+"""Private SQLite ledger for confirmed Kelly round evidence."""
 
 from __future__ import annotations
 
@@ -243,7 +243,7 @@ def _check_private_file(path: Path) -> None:
 
 
 class KellyLedger:
-    """Record verified synthetic fills in a caller-selected local database.
+    """Record verified fills in a caller-selected local database.
 
     Amounts are stored as exact decimal text. SQL consumers can cast values
     for presentation or parse them with Decimal for exact arithmetic.
@@ -344,6 +344,11 @@ class KellyLedger:
         Replaying the same event within the same identity returns its original
         round ID even after that round has closed.
         """
+        with self._write() as db:
+            return self._save_fill(db, identity, fill)
+
+    @staticmethod
+    def _save_fill(db: sqlite3.Connection, identity: RoundIdentity, fill: Fill) -> str:
         quantity, notional = _amount(fill.quantity), _amount(fill.notional)
         if fill.side not in {"buy", "sell"} or quantity <= 0 or notional <= 0:
             raise ValueError(
@@ -358,52 +363,51 @@ class KellyLedger:
             None,
             fill.receipt_ref,
         )
-        with self._write() as db:
-            replay = event.replay_round(db)
-            if replay is not None:
-                round_row = db.execute(
-                    "SELECT * FROM rounds WHERE round_id = ?",
-                    (replay,),
-                ).fetchone()
-                _require_identity(round_row, identity)
-                return replay
-
-            latest = db.execute(
-                """
-                SELECT * FROM rounds
-                WHERE account_key = ? AND environment = ? AND instrument_key = ?
-                ORDER BY opened_at DESC, rowid DESC LIMIT 1
-                """,
-                (identity.account_key, identity.environment, identity.instrument_key),
+        replay = event.replay_round(db)
+        if replay is not None:
+            round_row = db.execute(
+                "SELECT * FROM rounds WHERE round_id = ?",
+                (replay,),
             ).fetchone()
-            if latest is None or latest["closed_at"] is not None:
-                if latest is not None and event.occurred_at < latest["closed_at"]:
-                    raise ValueError("fill precedes the previous close")
-                if fill.side != identity.entry_side:
-                    raise ValueError("first fill must enter the position")
-                round_id = str(uuid4())
-                db.execute(
-                    f"""
-                    INSERT INTO rounds (round_id, {_IDENTITY_COLUMNS}, opened_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (round_id, *astuple(identity), event.occurred_at),
-                )
-            else:
-                _require_identity(latest, identity)
-                round_id = latest["round_id"]
-                (last_fill_at,) = db.execute(
-                    """
-                    SELECT MAX(occurred_at) FROM trade_events
-                    WHERE round_id = ? AND event_type IN ('buy', 'sell')
-                    """,
-                    (round_id,),
-                ).fetchone()
-                if event.occurred_at < last_fill_at:
-                    raise ValueError("fill precedes the last recorded fill")
+            _require_identity(round_row, identity)
+            return replay
 
-            event.insert(db, round_id)
-            _refresh_round(db, round_id, identity.entry_side)
+        latest = db.execute(
+            """
+            SELECT * FROM rounds
+            WHERE account_key = ? AND environment = ? AND instrument_key = ?
+            ORDER BY opened_at DESC, rowid DESC LIMIT 1
+            """,
+            (identity.account_key, identity.environment, identity.instrument_key),
+        ).fetchone()
+        if latest is None or latest["closed_at"] is not None:
+            if latest is not None and event.occurred_at < latest["closed_at"]:
+                raise ValueError("fill precedes the previous close")
+            if fill.side != identity.entry_side:
+                raise ValueError("first fill must enter the position")
+            round_id = str(uuid4())
+            db.execute(
+                f"""
+                INSERT INTO rounds (round_id, {_IDENTITY_COLUMNS}, opened_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (round_id, *astuple(identity), event.occurred_at),
+            )
+        else:
+            _require_identity(latest, identity)
+            round_id = latest["round_id"]
+            (last_fill_at,) = db.execute(
+                """
+                SELECT MAX(occurred_at) FROM trade_events
+                WHERE round_id = ? AND event_type IN ('buy', 'sell')
+                """,
+                (round_id,),
+            ).fetchone()
+            if event.occurred_at < last_fill_at:
+                raise ValueError("fill precedes the last recorded fill")
+
+        event.insert(db, round_id)
+        _refresh_round(db, round_id, identity.entry_side)
         return round_id
 
     def record_adjustment(
@@ -453,23 +457,27 @@ class KellyLedger:
 
     def _record_cash_event(self, round_id: str, event: _Event) -> None:
         with self._write() as db:
-            replay = event.replay_round(db)
-            if replay is not None:
-                if replay != round_id:
-                    raise ValueError("event key conflict")
-                return
-            round_row = db.execute(
-                "SELECT opened_at, closed_at, direction FROM rounds WHERE round_id = ?",
-                (round_id,),
-            ).fetchone()
-            if round_row is None:
-                raise ValueError("cash event requires a known round")
-            if event.occurred_at < round_row["opened_at"]:
-                raise ValueError("cash event precedes the opening fill")
-            if event.event_type == "settle":
-                closed_at = round_row["closed_at"]
-                if closed_at is None or event.occurred_at < closed_at:
-                    raise ValueError("settlement requires a closed round")
-            event.insert(db, round_id)
-            entry_side = "buy" if round_row["direction"] == "long" else "sell"
-            _refresh_round(db, round_id, entry_side)
+            self._save_cash_event(db, round_id, event)
+
+    @staticmethod
+    def _save_cash_event(db: sqlite3.Connection, round_id: str, event: _Event) -> None:
+        replay = event.replay_round(db)
+        if replay is not None:
+            if replay != round_id:
+                raise ValueError("event key conflict")
+            return
+        round_row = db.execute(
+            "SELECT opened_at, closed_at, direction FROM rounds WHERE round_id = ?",
+            (round_id,),
+        ).fetchone()
+        if round_row is None:
+            raise ValueError("cash event requires a known round")
+        if event.occurred_at < round_row["opened_at"]:
+            raise ValueError("cash event precedes the opening fill")
+        if event.event_type == "settle":
+            closed_at = round_row["closed_at"]
+            if closed_at is None or event.occurred_at < closed_at:
+                raise ValueError("settlement requires a closed round")
+        event.insert(db, round_id)
+        entry_side = "buy" if round_row["direction"] == "long" else "sell"
+        _refresh_round(db, round_id, entry_side)
