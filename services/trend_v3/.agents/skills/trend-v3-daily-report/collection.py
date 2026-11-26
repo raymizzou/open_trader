@@ -651,6 +651,66 @@ def dated_projection(report):
                             f"{asset['code']}：目标 {target or '待核'}，"
                             f"实际 {actual or '待核'}"
                         )
+    # Annotate only the final identity/date/lookup-safe direct projection.
+    planned = report_signal_plan(report) if "signal_search" in report else None
+    for direction in ("long", "short"):
+        for group in result.get(direction, []):
+            matches = [
+                g
+                for g in (planned or {}).get("groups", [])
+                if g["name"] == group.get("name") and g["direction"] == direction
+            ]
+            hits = [h for g in matches for h in g["hits"]]
+            group.pop("_signal_coverage_pending", None)
+            group.pop("_missing_signal_hits", None)
+            if report.get("selection_mode") == "threshold-v1":
+                group["_signal_coverage_pending"] = (
+                    not planned
+                    or planned.get("pending_scope", False)
+                    or not matches
+                    or any(g["gaps"] for g in matches)
+                )
+                cutoff = report.get("cutoff")
+                group["_date_note"] += "；截至 " + (
+                    cutoff if observed_by(cutoff, cutoff) else "待核"
+                )
+            for section in ("direct", "searchable", "related"):
+                for asset in group.get(section, []):
+                    asset.pop("signal_sources", None)
+            final_direct = reconciled_instruments(group)[0]
+            safe = {search_identity(a) for a in final_direct if not a.get("lookup")}
+            present = {
+                search_identity(a)
+                for a in final_direct
+                if a.get("direct_verified") is True
+            }
+            group["_missing_signal_hits"] = any(
+                search_identity(h) not in present for h in hits
+            )
+            for section in ("direct", "searchable", "related"):
+                for asset in group.get(section, []):
+                    identity = search_identity(asset)
+                    if asset.get("direct_verified") is not True or identity not in safe:
+                        continue
+                    expected = collection.get("targets", {}).get(asset.get("market"))
+                    if (
+                        expected is None
+                        and not evidence_bearing
+                        and "signal_search" in report
+                    ):
+                        expected = member_day(report["signal_search"], asset)
+                    for hit in hits:
+                        if (
+                            identity == search_identity(hit)
+                            and valid_date(asset.get("data_date"))
+                            == valid_date(expected)
+                            and valid_date(expected) is not None
+                            and all(
+                                source["data_date"] == expected
+                                for source in hit["signal_sources"]
+                            )
+                        ):
+                            asset["signal_sources"] = hit["signal_sources"]
     return result, pending
 
 
@@ -745,6 +805,49 @@ def pending_final_fields(report):
     return result
 
 
+def threshold_groups(report):
+    """Expected classes derive from a separately retained complete parent board."""
+    parent = report.get("collection", {}).get("parent_board") or {}
+    groups = parent.get("groups", [])
+    if (
+        not isinstance(groups, list)
+        or not groups
+        or parent.get("row_count") != len(groups)
+        or parent.get("complete") is not True
+        or not retained_scope(
+            parent,
+            {
+                "data_date": report.get("board_date"),
+                "version": report.get("board_version"),
+            },
+            report.get("cutoff"),
+        )
+        or len({g.get("name") for g in groups}) != len(groups)
+        or any(
+            not g.get("name") or strength_value(g.get("strength")) is None
+            for g in groups
+        )
+    ):
+        raise ValueError("Independent complete parent board pending")
+    result = {}
+    for direction in ("long", "short"):
+        ordered = sorted(
+            groups,
+            key=lambda g: Decimal(strength_value(g["strength"])),
+            reverse=direction == "long",
+        )
+        result[direction] = [
+            g
+            for g in ordered
+            if (
+                Decimal(strength_value(g["strength"])) >= 80
+                if direction == "long"
+                else Decimal(strength_value(g["strength"])) <= 20
+            )
+        ]
+    return result
+
+
 def assess(report):
     """Evidence must bind every obligation to its frozen target and actual value."""
     collection = report.get("collection") or {}
@@ -811,13 +914,42 @@ def assess(report):
             or subject.get("platform_match_verified") is True
         ):
             pending.append(label + "：完整查询范围待核")
+    mode = report.get("selection_mode", "legacy-two-seat")
+    expected = None
+    if mode == "threshold-v1":
+        try:
+            expected = threshold_groups(report)
+        except (ValueError, TypeError, KeyError):
+            pending.append("完整独立母榜待核")
+    elif mode != "legacy-two-seat":
+        pending.append("报告选择版本待核")
     for direction in ("short", "long"):
         groups = report.get(direction, [])
-        if {g.get("seat") for g in groups} != {1, 2}:
+        if mode == "threshold-v1":
+            actual = [
+                (g.get("name"), strength_value(g.get("board_strength")), g.get("seat"))
+                for g in groups
+            ]
+            required = [
+                (g["name"], strength_value(g["strength"]), i + 1)
+                for i, g in enumerate((expected or {}).get(direction, []))
+            ]
+            if expected is None or actual != required:
+                pending.append(direction + "：独立母榜预期大类待核")
+        elif {g.get("seat") for g in groups} != {1, 2} or len(groups) != 2:
             pending.append(direction + "：榜图席位待核")
         for group in groups:
             if not coverage_members_match(group):
                 pending.append(group["name"] + "：成分及查询覆盖待核")
+    if report.get("selection_mode") == "threshold-v1" and "signal_search" not in report:
+        pending.append("信号搜索覆盖待核")
+    if "signal_search" in report and report_signal_plan(report)["pending"]:
+        pending.append("信号搜索或独立归属覆盖待核")
+    projected, _ = dated_projection(report)
+    for direction in ("long", "short"):
+        for group in projected.get(direction, []):
+            if group.get("_missing_signal_hits"):
+                pending.append(group["name"] + "：已核实信号命中尚未入直属卡")
     final_pending = pending_final_fields(report)
     lookup_pending = [item for item in final_pending if item["field"] == "lookup"]
     pending.extend(
@@ -891,6 +1023,9 @@ def initialize(path, report):
         validate_targets(day, report.get("collection", {}))
         state = {
             "date": day,
+            "selection_mode": report.get("selection_mode", "legacy-two-seat"),
+            "parent_board": deepcopy(report.get("collection", {}).get("parent_board")),
+            "cutoff": report.get("cutoff"),
             "targets": report.get("collection", {}).get("targets", {}),
             "worklist": report.get("collection", {}).get("worklist", []),
             "target_evidence": report.get("collection", {}).get("target_evidence", {}),
@@ -933,10 +1068,41 @@ def validate_targets(day, collection, require_proof=()):
             raise ValueError("Target does not match original-day calendar proof")
 
 
+def check_parent_resolution(state, report):
+    old = state.get("parent_board")
+    new = report.get("collection", {}).get("parent_board")
+    if old == new:
+        return False
+    if old and old.get("complete") is True and old.get("state") == "verified":
+        raise ValueError("Independent parent board is frozen")
+    if old:
+        if not new or any(
+            old.get(k) is not None and old.get(k) != new.get(k)
+            for k in ("source", "data_date", "version", "row_count", "observed_at")
+        ):
+            raise ValueError("Established parent facts are frozen")
+        incoming = {g.get("name"): g for g in new.get("groups", [])}
+        if any(g != incoming.get(g.get("name")) for g in old.get("groups", [])):
+            raise ValueError("Established parent rows are frozen")
+    if new and new.get("complete") is True:
+        try:
+            threshold_groups(report)
+        except (ValueError, TypeError, KeyError) as error:
+            raise ValueError(
+                "Verified cutoff-eligible parent required; old facts frozen"
+            ) from error
+    return True
+
+
 def check_frozen(state, report):
     if report.get("date") != state["date"]:
         raise ValueError("Report day is frozen; reconcile original run")
     collection = report.get("collection", {})
+    if state.get("selection_mode", "legacy-two-seat") != report.get(
+        "selection_mode", "legacy-two-seat"
+    ) or state.get("cutoff") != report.get("cutoff"):
+        raise ValueError("Selection and independent parent board are frozen")
+    parent_changed = check_parent_resolution(state, report)
     incoming = collection.get("targets", {})
     old = state["targets"]
     if any(
@@ -950,19 +1116,22 @@ def check_frozen(state, report):
         if target is not None and old.get(market) is None
     }
     validate_targets(state["date"], collection, resolving)
-    changed = incoming != old
+    changed = incoming != old or parent_changed
     if changed:
         # Called only under state_lock; the caller must persist before returning,
         # even when the current hourly slot is not due. No request is authorized.
         state.update(
             targets=deepcopy(incoming),
+            parent_board=deepcopy(collection.get("parent_board")),
             worklist=collection.get("worklist", []),
             projection=report,
             assessment=assess(report),
             published=None,
         )
         state["pending_target_changes"] = sorted(
-            set(state.get("pending_target_changes", [])) | resolving
+            set(state.get("pending_target_changes", []))
+            | resolving
+            | ({"BOARD"} if parent_changed else set())
         )
         state.setdefault("target_evidence", {}).update(
             {market: collection["target_evidence"][market] for market in resolving}
@@ -1112,10 +1281,497 @@ def target_dates(report_day, calendars):
     return result
 
 
+def report_signal_plan(report):
+    payload = report.get("signal_search", {})
+    parent = payload.get("board", {})
+    if (
+        parent.get("data_date") != report.get("board_date")
+        or parent.get("version") != report.get("board_version")
+        or payload.get("cutoff") != report.get("cutoff")
+        or (
+            report.get("selection_mode") == "threshold-v1"
+            and parent.get("groups")
+            != (report.get("collection", {}).get("parent_board") or {}).get("groups")
+        )
+    ):
+        return {"groups": [], "pending": True, "pending_scope": True}
+    try:
+        payload = deepcopy(payload)
+        divergent = False
+        if "collection" in report:
+            frozen = report["collection"].get("targets", {})
+            declared = payload.get("targets", {})
+            divergent = any(
+                value != frozen.get(market) for market, value in declared.items()
+            )
+            payload["targets"] = {
+                market: frozen.get(market)
+                for mapping in payload.get("group_markets", [])
+                for market in (m.get("market") for m in mapping.get("markets", []))
+            }
+        plan = search_plan(payload)
+        if divergent:
+            for group in plan["groups"]:
+                group["gaps"].append("搜索市场目标与报告冻结目标不符")
+                group["status"] = "待核"
+        plan["metrics"]["uncovered_groups"] = sum(
+            bool(g["gaps"]) for g in plan["groups"]
+        )
+        plan["pending"] = divergent or any(g["gaps"] for g in plan["groups"])
+        return plan
+    except (ValueError, KeyError, TypeError):
+        return {"groups": [], "pending": True, "pending_scope": True}
+
+
+def observed_by(value, cutoff):
+    try:
+        actual, limit = datetime.fromisoformat(value), datetime.fromisoformat(cutoff)
+        return (
+            actual.tzinfo is not None and limit.tzinfo is not None and actual <= limit
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def retained_scope(value, board, cutoff):
+    return (
+        value.get("state") == "verified"
+        and isinstance(value.get("source"), str)
+        and bool(value["source"].strip())
+        and valid_date(value.get("data_date")) is not None
+        and valid_date(value.get("data_date")) == valid_date(board.get("data_date"))
+        and value.get("version") == board.get("version")
+        and observed_by(value.get("observed_at"), cutoff)
+    )
+
+
+def search_identity(member):
+    try:
+        pid = platform_id(member)
+        scope = instrument_scope(member)
+    except ValueError:
+        return None
+    asset_code = member.get("code")
+    if (
+        pid is None
+        or scope is None
+        or not isinstance(asset_code, str)
+        or not asset_code.strip()
+    ):
+        return None
+    return (pid, asset_code, *scope)
+
+
+def market_scope(value):
+    return value.get("market"), value.get("instrument_type")
+
+
+def member_day(payload, member):
+    return payload.get("targets", {}).get(
+        member.get("market"), payload["board"]["data_date"]
+    )
+
+
+def member_current(payload, member, container):
+    expected = valid_date(member_day(payload, member))
+    return (
+        expected is not None
+        and member.get("state", "verified") == "verified"
+        and valid_date(member.get("data_date", container.get("data_date"))) == expected
+        and member.get("version", container.get("version")) == container.get("version")
+    )
+
+
+def declared_scopes(value, fallback=()):
+    """Legacy omission is unambiguous only for one known market/product pair."""
+    if "markets" not in value:
+        scopes = set(fallback) if len(fallback) == 1 else set()
+        if ("market" in value or "instrument_type" in value) and market_scope(
+            value
+        ) not in scopes:
+            return set()
+        return scopes
+    rows = value["markets"]
+    if (
+        not isinstance(rows, list)
+        or not rows
+        or any(
+            not isinstance(row, dict)
+            or row.get("state", "verified") != "verified"
+            or any(
+                not isinstance(row.get(key), str) or not row[key].strip()
+                for key in ("market", "instrument_type")
+            )
+            for row in rows
+        )
+    ):
+        return set()
+    scopes = {market_scope(row) for row in rows}
+    if ("market" in value or "instrument_type" in value) and market_scope(
+        value
+    ) not in scopes:
+        return set()
+    return scopes
+
+
+def current_scopes(payload, value, fallback=()):
+    """One container date proves only the declared combinations with that target."""
+    reference = {**payload["board"], "data_date": value.get("data_date")}
+    if not retained_scope(value, reference, payload["cutoff"]):
+        return set()
+    return {
+        scope
+        for scope in declared_scopes(value, fallback)
+        if valid_date(value.get("data_date"))
+        == valid_date(member_day(payload, {"market": scope[0]}))
+    }
+
+
+def applicable_board(payload, value):
+    return bool(current_scopes(payload, value))
+
+
+def search_plan(payload):
+    """Reconcile independent retained membership and signal facts; never fetch."""
+    board, cutoff = payload["board"], payload["cutoff"]
+    if (
+        not valid_date(board.get("data_date"))
+        or not board.get("version")
+        or not retained_scope(board, board, cutoff)
+        or board.get("complete") is not True
+        or any(
+            not g.get("name") or strength_value(g.get("strength")) is None
+            for g in board.get("groups", [])
+        )
+        or len({g["name"] for g in board.get("groups", [])})
+        != len(board.get("groups", []))
+    ):
+        raise ValueError("Complete applicable independent parent board required")
+    result = {
+        "searches": [],
+        "boards_to_read": [],
+        "groups": [],
+        "metrics": {
+            "basis": "offline_design_and_retained_snapshots",
+            "unique_boards_read": 0,
+            "keyword_searches": 0,
+            "extra_membership_queries": 0,
+            "verified_hits": 0,
+            "uncovered_groups": 0,
+            "elapsed_seconds": None,
+        },
+    }
+    signals, read, requests = {}, set(), set()
+    for signal in payload.get("boards", []):
+        key = signal.get("board_id"), signal.get("version")
+        if not all(isinstance(k, str) and k.strip() for k in key):
+            continue
+        if key in signals and signals[key] != signal:
+            signals[key] = None
+        elif key not in signals:
+            signals[key] = signal
+    for group in board["groups"]:
+        strength = Decimal(strength_value(group["strength"]))
+        if strength >= 80:
+            direction, label = "long", "温转热"
+        elif strength <= 20:
+            direction, label = "short", "凉转寒"
+        else:
+            continue
+        if label not in result["searches"]:
+            result["searches"].append(label)
+        gaps, hits, covered = [], {}, set()
+        mappings = [
+            m
+            for m in payload.get("group_markets", [])
+            if m.get("group") == group["name"]
+            and m.get("state") == "verified"
+            and m.get("source")
+        ]
+        markets = {
+            market_scope(m)
+            for mapping in mappings
+            for m in mapping.get("markets", [])
+            if all(market_scope(m))
+        }
+        if not mappings or not all(m.get("complete") is True for m in mappings):
+            gaps.append("适用市场和品种映射待核")
+        memberships = [
+            m
+            for m in payload.get("memberships", [])
+            if m.get("group") == group["name"]
+            and m.get("state") in ("verified", "withdrawn")
+            and m.get("source")
+            and m.get("version") == board["version"]
+            and observed_by(m.get("observed_at"), cutoff)
+        ]
+        # Empty withdrawn containers revoke the retained source/scope, including
+        # its obsolete empty coverage proof; no repeated member rows are needed.
+        revoked_scopes = {}
+        for membership in memberships:
+            if (
+                membership.get("state") != "withdrawn"
+                or membership.get("members") != []
+            ):
+                continue
+            declared = declared_scopes(membership, markets)
+            applicable = current_scopes(
+                payload, {**membership, "state": "verified"}, markets
+            )
+            if not declared:
+                # Unknown scope must not silently preserve this source's facts.
+                # Bound the veto to independently known combinations of this day.
+                applicable = current_scopes(
+                    payload,
+                    {
+                        **{
+                            key: value
+                            for key, value in membership.items()
+                            if key not in ("market", "instrument_type")
+                        },
+                        "state": "verified",
+                        "markets": [
+                            {"market": market, "instrument_type": kind}
+                            for market, kind in markets
+                        ],
+                    },
+                )
+            key = tuple(
+                json.dumps(membership.get(field), sort_keys=True)
+                for field in ("source", "version", "data_date")
+            )
+            revoked_scopes.setdefault(key, set()).update(applicable & markets)
+        membership_scopes = []
+        for membership in memberships:
+            if (
+                membership.get("state") == "withdrawn"
+                and membership.get("members") == []
+            ):
+                continue
+            declared = declared_scopes(membership, markets)
+            current = current_scopes(payload, membership, markets)
+            key = tuple(
+                json.dumps(membership.get(field), sort_keys=True)
+                for field in ("source", "version", "data_date")
+            )
+            revoked = revoked_scopes.get(key, set())
+            if revoked:
+                if declared and declared <= revoked:
+                    continue
+                membership = {
+                    **membership,
+                    "members": [
+                        row
+                        for row in membership.get("members", [])
+                        if market_scope(row) not in revoked
+                    ],
+                }
+                declared, current = declared - revoked, current - revoked
+            membership_scopes.append((membership, declared, current))
+        membership_coverage = set()
+        for membership, declared, current in membership_scopes:
+            if not declared:
+                gaps.append("直属清单覆盖市场和品种待核")
+            if (declared & markets) - current:
+                gaps.append("直属清单容器适用日待核")
+            if membership.get("complete") is True:
+                membership_coverage.update(current & markets)
+            elif declared & markets:
+                gaps.append("独立直属覆盖待核")
+        if not markets <= membership_coverage or not markets:
+            gaps.append("独立直属覆盖待核")
+            result["metrics"]["extra_membership_queries"] += 1
+        discovery = [
+            m
+            for m in payload.get("search_coverage", [])
+            if m.get("direction") == direction
+            and retained_scope(m, board, cutoff)
+            and m.get("complete") is True
+        ]
+        if not discovery:
+            gaps.append("方向搜索及适用组合覆盖待核")
+        expected_boards = {}
+        for discovery_row in discovery:
+            for entry in discovery_row.get("boards", []):
+                key = entry.get("board_id"), entry.get("version")
+                observed = signals.get(key)
+                scopes = entry.get("markets")
+                if scopes is None and observed and applicable_board(payload, observed):
+                    scopes = [
+                        {"market": market, "instrument_type": kind}
+                        for market, kind in declared_scopes(observed)
+                    ]
+                catalogue_scopes = declared_scopes({**entry, "markets": scopes})
+                if not catalogue_scopes or entry.get("state", "verified") != "verified":
+                    gaps.append("搜索结果适用组合映射待核")
+                    continue
+                if catalogue_scopes & markets:
+                    if all(isinstance(k, str) and k.strip() for k in key):
+                        expected_boards.setdefault(key, set()).update(
+                            catalogue_scopes & markets
+                        )
+                    else:
+                        gaps.append("搜索结果榜身份待核")
+        for key, signal in signals.items():
+            if (
+                not signal
+                or signal.get("direction") != direction
+                or signal.get("label") != label
+                or not applicable_board(payload, signal)
+            ):
+                continue
+            advertised = declared_scopes(signal) & markets
+            scopes = current_scopes(payload, signal) & markets
+            if advertised - scopes:
+                gaps.append("信号榜部分适用组合日期待核")
+                requests.add(key)
+            if not scopes:
+                continue
+            read.add(key)
+            if not isinstance(signal.get("title"), str) or not signal["title"].strip():
+                gaps.append("信号榜标题待核")
+                continue
+            if signal.get("complete") is True:
+                covered.update(scopes)
+            else:
+                gaps.append("信号榜未读到组尾")
+                requests.add(key)
+            independent = [
+                (m, declared, current)
+                for m, declared, current in membership_scopes
+                if m["source"] != signal["source"] and declared & scopes
+            ]
+            independent_coverage = set()
+            for membership, _, current in independent:
+                if membership.get("complete") is True:
+                    independent_coverage.update(current)
+            if not scopes <= independent_coverage:
+                gaps.append("直属名单缺独立完整适用范围")
+            member_proofs, invalidated_proofs = set(), set()
+            for membership, declared, current in independent:
+                for member in membership.get("members", []):
+                    identity = search_identity(member)
+                    # A same-source/day invalidation must not depend on row order,
+                    # or erase a different source's independently current proof.
+                    proof_key = (
+                        json.dumps(membership["source"], sort_keys=True),
+                        identity,
+                        json.dumps(
+                            member.get("data_date", membership.get("data_date"))
+                        ),
+                        json.dumps(member.get("version", membership.get("version"))),
+                    )
+                    if (
+                        identity is None
+                        or membership.get("state") != "verified"
+                        or type(member.get("removed", False)) is not bool
+                        or market_scope(member) not in declared
+                        or market_scope(member) not in current
+                        or not member_current(payload, member, membership)
+                    ):
+                        gaps.append("直属成员身份、声明范围或适用日待核")
+                        invalidated_proofs.add(proof_key)
+                    elif member.get("removed") is True:
+                        invalidated_proofs.add(proof_key)
+                    else:
+                        member_proofs.add(proof_key)
+            if member_proofs & invalidated_proofs:
+                gaps.append("直属成员核实与撤回或移出证明冲突待核")
+            members = {proof[1] for proof in member_proofs - invalidated_proofs}
+            rows = {}
+            for member in signal.get("members", []):
+                identity = search_identity(member)
+                rows.setdefault(identity, []).append(member)
+            for identity, copies in rows.items():
+                member = copies[0]
+                signatures = {
+                    (
+                        json.dumps(m.get("labels"), ensure_ascii=False),
+                        json.dumps(m.get("removed")),
+                        json.dumps(m.get("state", "verified")),
+                        m.get("data_date", signal["data_date"]),
+                        m.get("version", signal["version"]),
+                    )
+                    for m in copies
+                }
+                if (
+                    identity is None
+                    or len(signatures) != 1
+                    or not member_current(payload, member, signal)
+                    or market_scope(member) not in current_scopes(payload, signal)
+                    or type(member.get("removed")) is not bool
+                    or not isinstance(member.get("labels"), list)
+                    or any(not isinstance(v, str) for v in member["labels"])
+                ):
+                    gaps.append("信号成员身份、日期、标签或退出状态待核")
+                    continue
+                if (
+                    identity not in members
+                    or market_scope(member) not in scopes
+                    or member["removed"]
+                    or label not in member["labels"]
+                ):
+                    continue
+                hit = hits.setdefault(
+                    identity,
+                    {
+                        k: member[k]
+                        for k in (
+                            "instrument_id",
+                            "code",
+                            "market",
+                            "instrument_type",
+                            "currency",
+                        )
+                        if k in member
+                    },
+                )
+                source = {
+                    k: signal[k] for k in ("board_id", "title", "label", "version")
+                }
+                source["data_date"] = member.get("data_date", signal["data_date"])
+                hit.setdefault("signal_sources", []).append(source)
+        for key in expected_boards:
+            signal = signals.get(key)
+            if (
+                not signal
+                or not applicable_board(payload, signal)
+                or signal.get("complete") is not True
+                or signal.get("direction") != direction
+                or signal.get("label") != label
+                or not expected_boards[key] <= current_scopes(payload, signal)
+            ):
+                gaps.append("搜索结果中的榜缺失、改版、日期或适用组合不符")
+                requests.add(key)
+        if not markets or not markets <= covered:
+            gaps.append("适用市场信号榜覆盖待核")
+        result["groups"].append(
+            {
+                "name": group["name"],
+                "direction": direction,
+                "hits": list(hits.values()),
+                "gaps": sorted(set(gaps)),
+                "status": "待核" if gaps else "已命中" if hits else "无命中",
+            }
+        )
+    result["boards_to_read"] = [
+        {"board_id": key[0], "version": key[1]} for key in sorted(requests)
+    ]
+    result["metrics"].update(
+        unique_boards_read=len(read),
+        keyword_searches=len(result["searches"]),
+        boards_scheduled=len(requests),
+        verified_hits=sum(len(g["hits"]) for g in result["groups"]),
+        uncovered_groups=sum(bool(g["gaps"]) for g in result["groups"]),
+    )
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "action", choices=("targets", "init", "claim", "assess", "confirm")
+        "action",
+        choices=("targets", "init", "claim", "assess", "confirm", "search-plan"),
     )
     parser.add_argument(
         "input", type=Path, help="Verified projection, or calendar JSON for targets"
@@ -1126,11 +1782,15 @@ def main():
     )
     parser.add_argument("--local", type=Path)
     parser.add_argument("--delivered", type=Path)
-    parser.add_argument("--report-revision", help="Independently verified report revision")
+    parser.add_argument(
+        "--report-revision", help="Independently verified report revision"
+    )
     args = parser.parse_args()
     try:
         report = json.loads(args.input.read_text(encoding="utf-8"))
-        if args.action == "targets":
+        if args.action == "search-plan":
+            value = search_plan(report)
+        elif args.action == "targets":
             value = target_dates(report["date"], report["calendars"])
         elif args.action == "assess":
             value = assess(report)

@@ -200,6 +200,14 @@ def render_card(pattern, asset):
         strength_reason = local_strength_reason = ""
         signal = "待查" if "_signal_pending" in asset else "无"
         reason = display_text(asset.get("reason"), status)
+    for source in asset.get("signal_sources", []):
+        reason += (
+            " 信号榜："
+            + " · ".join(display_text(source[key]) for key in ("title", "label"))
+            + " · 数据日 "
+            + display_text(source["data_date"])
+            + "。"
+        )
     # These flags are supplied only after evidence selection. Neither list
     # placement nor a displayed event establishes membership or eligibility.
     markers = []
@@ -269,18 +277,24 @@ def coverage_note(fragments, group, direct):
         notes.append(fragments["empty_note"].substitute(note=display_text(note)))
     if group.get("_coverage_pending") and "成员范围待查" not in (note or ""):
         notes.append(fragments["empty_note"].substitute(note="成员范围待查。"))
+    if group.get("_signal_coverage_pending"):
+        notes.append(fragments["empty_note"].substitute(note="信号搜索覆盖待核。"))
+    if group.get("_missing_signal_hits"):
+        notes.append(
+            fragments["empty_note"].substitute(note="已核实信号命中尚未入直属卡。")
+        )
     return "\n".join(notes)
 
 
-def render_direction(fragments, groups, note, direction):
+def render_direction(fragments, groups, note, direction, *, threshold=False):
     if not isinstance(groups, list):
         raise ValueError("Direction rows must be arrays")
     rows = []
     seen_seats = set()
     for index, group in enumerate(groups):
         seat = group["seat"]
-        if type(seat) is not int or seat not in (1, 2):
-            raise ValueError("A direction seat must be the integer 1 or 2")
+        if type(seat) is not int or (seat < 1 if threshold else seat not in (1, 2)):
+            raise ValueError("Invalid direction seat for this report version")
         if seat in seen_seats:
             raise ValueError(f"Duplicate seat {seat} in one direction")
         seen_seats.add(seat)
@@ -334,7 +348,8 @@ def render_simulation(paper, report_day, report_revision):
     if (
         not isinstance(report_revision, str)
         or not re.fullmatch(r"v[0-9]{2,}", report_revision)
-        or not isinstance(paper, dict) or paper.get("schema") != "trend-v3-paper-entry.v1"
+        or not isinstance(paper, dict)
+        or paper.get("schema") != "trend-v3-paper-entry.v1"
         or paper.get("date") != report_day.isoformat()
         or paper.get("report_version") != report_revision
         or not isinstance(paper.get("results"), list)
@@ -349,8 +364,14 @@ def render_simulation(paper, report_day, report_revision):
         if not isinstance(code, str) or not PAPER_CODE.fullmatch(code):
             continue
         state_code, reason_code = record.get("state"), record.get("reason")
-        state = PAPER_STATES.get(state_code, "已跳过") if isinstance(state_code, str) else "已跳过"
-        reason = PAPER_REASONS.get(reason_code) if isinstance(reason_code, str) else None
+        state = (
+            PAPER_STATES.get(state_code, "已跳过")
+            if isinstance(state_code, str)
+            else "已跳过"
+        )
+        reason = (
+            PAPER_REASONS.get(reason_code) if isinstance(reason_code, str) else None
+        )
         if not reason and state == "已跳过":
             reason = "开仓条件待核或不符"
         parts = [escape(code), state]
@@ -391,19 +412,31 @@ def render(report, template, *, report_revision=None):
     return Template(FRAGMENT.sub("", template)).substitute(
         collection_status="数据已完备" if assessment["complete"] else "数据收集中",
         collection_time=display_text(
-            "核实时间：" + assessment["verified_at"] if assessment["complete"]
-            else "下次核实：" + str(report.get("collection", {}).get("next_check")
-                                      or "待核（普通读取不启动轮询）")
+            "核实时间：" + assessment["verified_at"]
+            if assessment["complete"]
+            else "下次核实："
+            + str(
+                report.get("collection", {}).get("next_check")
+                or "待核（普通读取不启动轮询）"
+            )
         ),
         date=day.isoformat(),
         year=day.year,
         month=day.month,
         day=day.day,
         short_rows=render_direction(
-            fragments, report.get("short", []), report.get("short_note"), "short"
+            fragments,
+            report.get("short", []),
+            report.get("short_note"),
+            "short",
+            threshold=report.get("selection_mode") == "threshold-v1",
         ),
         long_rows=render_direction(
-            fragments, report.get("long", []), report.get("long_note"), "long"
+            fragments,
+            report.get("long", []),
+            report.get("long_note"),
+            "long",
+            threshold=report.get("selection_mode") == "threshold-v1",
         ),
     )
 
@@ -414,7 +447,9 @@ def main():
     parser.add_argument(
         "output", type=Path, help="New HTML path in an existing directory"
     )
-    parser.add_argument("--report-revision", help="Independently verified report revision")
+    parser.add_argument(
+        "--report-revision", help="Independently verified report revision"
+    )
     args = parser.parse_args()
     try:
         report = json.loads(args.input.read_text(encoding="utf-8"), parse_float=Decimal)
