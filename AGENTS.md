@@ -29,10 +29,14 @@ request requires it.
 Every session or tab that delivers a Trend V3 report to Ray, including a
 single-item correction, follows the
 [Trend V3 report delivery rules](services/trend_v3/AGENTS.md#daily-report-delivery).
-Upload the complete daily HTML report, including each revision, to the existing
-`trend_v3` iCloud folder. Keep intermediate artifacts in task storage by default.
-Use iCloud for other deliverables only when specifically requested or already
-agreed for that task.
+Only official daily reports, including officially delivered corrections and
+revisions, go in the existing `trend_v3` iCloud Drive folder. Deliver each
+official report, revision, or correction as one complete daily HTML file and
+link to the actual file in that folder in the delivering session. Development
+mock files and files prepared for Ray's acceptance, including full HTML copies
+and previews, go in the `trend_v3_mock` iCloud Drive folder. Link to the actual
+file in the correct folder. Keep internal evidence, raw ledgers, and
+credentials private.
 
 When a new task tab is needed, open it in the workspace where the task
 originated. Reserve the Herdr `trend_v3` workspace for formal Trend V3 daily

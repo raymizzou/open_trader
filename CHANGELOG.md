@@ -4,6 +4,14 @@
 
 # Changelog
 
+## 2026-11-27 — Trend V3 report and mock file placement
+
+- Deliver each official Trend V3 report, revision, or correction as one
+  complete daily HTML file in the `trend_v3` iCloud Drive folder and link to the
+  actual file. Put development mock files and Ray-acceptance files, including
+  full HTML copies and previews, in the `trend_v3_mock` iCloud Drive folder.
+  Keep internal evidence, raw ledgers, and credentials private.
+
 ## 2026-11-26 — Trend V3 task-tab workspace routing
 
 - Open new task tabs in the originating workspace. Reserve the Herdr `trend_v3`
