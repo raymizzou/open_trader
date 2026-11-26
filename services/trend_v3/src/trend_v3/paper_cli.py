@@ -8,15 +8,18 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Thread
 from time import sleep as sleep_open
 
 from .paper_authority import (
     delivery_card,
     latest_report,
+    message_text,
     read_json,
     release_pin,
     require_private_dir,
     scheduled_scope,
+    session_records,
     transcript_replies,
     upload_receipt,
 )
@@ -24,7 +27,7 @@ from .paper_entry import PaperEntry, encode
 from .paper_evidence import TAIPEI, instant
 from .paper_facts import produce
 from .paper_futu import BrokerUnavailable, FutuPaperBroker
-from .paper_report import prepare_report_evidence
+from .paper_report import prepare_report_evidence, refresh_report
 
 
 def utc_now():
@@ -135,11 +138,19 @@ def parse_args(argv=None):
     commands.add_parser(
         "plan", help="plan from the scheduled tab's latest daily report"
     )
+    manual = commands.add_parser(
+        "manual-holdings", help="record the original user crypto position snapshot"
+    )
+    manual.add_argument("snapshot", type=Path)
     commands.add_parser("status", help="produce the current redacted report supplement")
     approve = commands.add_parser(
         "approve", help="record an explicit reply from the original scheduled tab"
     )
     approve.add_argument("plan")
+    cycle = commands.add_parser(
+        "cycle", help="record the original reply and run approved openings"
+    )
+    cycle.add_argument("plan")
     submit = commands.add_parser(
         "submit", help="wait and submit approved market entries"
     )
@@ -223,7 +234,7 @@ def run_daily(args):
     now = utc_now()
     today = now.astimezone(TAIPEI).date()
     allowed = {today.isoformat()}
-    if args.command in {"reconcile", "status"} or (
+    if args.command in {"reconcile", "status", "cycle"} or (
         args.command == "submit" and args.retry_item
     ):
         allowed.add((today - timedelta(days=1)).isoformat())
@@ -235,7 +246,7 @@ def run_daily(args):
 
     def check_plan(plan):
         try:
-            info = latest_report(root, report_day, pin)[2]
+            info = latest_report(root, report_day, pin, source_only=True)[2]
             upload_receipt(home, scope, info)
             digest = sha256(
                 (info["projection_sha256"] + info["selection_sha256"]).encode()
@@ -252,8 +263,57 @@ def run_daily(args):
         artifacts = latest_report(root, report_day, pin)
         upload_receipt(home, scope, artifacts[2])
     state = root / "reports/_evidence/.paper-entry"
+    if args.command == "status":
+        database = state / "state.sqlite3"
+        result = (
+            PaperEntry(database, OfflineBroker(), scope).status(now=now)
+            if database.exists()
+            else None
+        )
+        emit(result)
+        return 0
     state.mkdir(mode=0o700, exist_ok=True)
     require_private_dir(state)
+    if args.command == "manual-holdings":
+        snapshot = read_json(args.snapshot)
+        info = latest_report(root, report_day, pin, source_only=True)[2]
+        upload_receipt(home, scope, info)
+        if snapshot.get("report_version") != info["revision"]:
+            emit({"recorded": False})
+            return 2
+        proof = None
+        for record in session_records(home, scope["id"], root):
+            at = instant(record.get("timestamp"))
+            payload = record.get("payload", {})
+            text = message_text(payload, "user")
+            meta = payload.get("internal_chat_message_metadata_passthrough")
+            if meta and (
+                not isinstance(meta, dict)
+                or meta.get("content_item_kinds") != ["user.text"]
+                or meta.get("content_item_metadata")
+                != [{"provenance": {"type": "user"}}]
+            ):
+                continue
+            if (
+                record.get("type") == "response_item"
+                and at is not None
+                and at <= now
+                and at.astimezone(TAIPEI).date().isoformat() == report_day
+                and text == "模拟持仓 " + encode(snapshot)
+                and payload.get("recipient") in (None, "all")
+            ):
+                proof = record
+        service = PaperEntry(
+            state / "state.sqlite3",
+            OfflineBroker(),
+            scope,
+            verify_reply=lambda reply: proof is not None and reply is proof,
+        )
+        recorded = service.record_manual_holdings(snapshot, proof, now=now)
+        if recorded:
+            refresh_report(root, report_day, pin, now)
+        emit({"recorded": recorded})
+        return 0 if recorded else 2
     broker = FutuPaperBroker(settings(home), clock=utc_now)
     authorized = None
 
@@ -272,11 +332,10 @@ def run_daily(args):
             check_plan=check_plan,
         )
         if args.command == "plan":
-            emit(
-                plan_report(
-                    service, artifacts, root / "reports/_evidence", now, clock=utc_now
-                )
+            plan = plan_report(
+                service, artifacts, root / "reports/_evidence", now, clock=utc_now
             )
+            emit(plan)
         elif args.command == "status":
             emit(service.status(now=now))
         elif args.command == "reconcile":
@@ -293,9 +352,19 @@ def run_daily(args):
             def record(reply):
                 return record_reply(service, plan, reply)
 
-            return run_action(args, service, plan, replies, record)
+            return run_action(
+                args,
+                service,
+                plan,
+                replies,
+                record,
+                refresh=lambda: refresh_report(root, report_day, pin, utc_now()),
+            )
     finally:
-        broker.close()
+        try:
+            refresh_report(root, report_day, pin, utc_now())
+        finally:
+            broker.close()
     return 0
 
 
@@ -315,16 +384,23 @@ def public_results(plan_id, outcomes):
     return {"plan": plan_id, "results": results}
 
 
-def run_action(args, service, plan, replies, record):
-    if args.command == "approve" or args.retry_item:
+def run_action(args, service, plan, replies, record, refresh=lambda: None):
+    if args.command in {"approve", "cycle"} or args.retry_item:
         records = replies()
         latest = records[-1] if records else None
-        if args.command == "approve":
+        if args.command in {"approve", "cycle"}:
             decision = (
                 record(latest) if latest and latest["decision"] != "retry" else None
             )
             if decision is not None:
                 emit({"plan": plan["id"], **decision})
+                if args.command == "cycle":
+                    wait_for_open(service, plan, replies, record, refresh)
+                    follow_receipts(service, plan, refresh)
+                return 0
+            if args.command == "cycle" and service.has_approval(plan["id"]):
+                wait_for_open(service, plan, replies, record, refresh)
+                follow_receipts(service, plan, refresh)
                 return 0
             emit(
                 {
@@ -354,19 +430,54 @@ def run_action(args, service, plan, replies, record):
             )
         )
         return 0
-    wait_for_open(service, plan, replies, record)
+    wait_for_open(service, plan, replies, record, refresh)
     return 0
 
 
-def wait_for_open(service, plan, replies, record):
+class ReceiptObserver:
+    """One read-only I/O round in flight; never join it on an opening deadline."""
+
+    def __init__(self, service, plan, refresh):
+        self.service, self.plan, self.refresh = service, plan, refresh
+        self.thread = None
+
+    def poll(self):
+        if self.thread is not None and self.thread.is_alive():
+            return
+        if not hasattr(self.service.broker, "receipt_reader"):
+            return
+        # Snapshot the reader configuration on the placement thread. SDK contexts
+        # themselves belong only to the observer and are closed by that observer.
+        reader = self.service.broker.receipt_reader()
+        observer = PaperEntry(
+            self.service.database, reader, self.service.session, clock=utc_now
+        )
+
+        def observe():
+            try:
+                observer.reconcile(self.plan["id"], now=utc_now(), pending_only=True)
+                self.refresh()
+            except (OSError, ValueError, sqlite3.Error):
+                pass
+            finally:
+                reader.close()
+
+        self.thread = Thread(target=observe, daemon=True)
+        self.thread.start()
+
+
+def wait_for_open(service, plan, replies, record, refresh=lambda: None):
     plan_id = plan["id"]
     started = utc_now()
-    for opening in service.openings(plan_id):
+    observer = ReceiptObserver(service, plan, refresh)
+    openings = service.openings(plan_id)
+    for opening in openings:
         if opening <= started:
             continue
         while (observed := utc_now()) < opening:
             if not service.openings(plan_id):
                 break
+            observer.poll()
             sleep_open(min(30, (opening - observed).total_seconds()))
         try:
             for reply in replies():
@@ -393,7 +504,29 @@ def wait_for_open(service, plan, replies, record):
                 plan_id, service.submit(plan_id, now=observed, opening=opening)
             )
         )
+        if opening != openings[-1]:
+            observer.poll()
+        else:
+            service.reconcile(plan_id, now=utc_now(), pending_only=True)
+        refresh()
     emit({"plan": plan_id, "status": service.status(now=utc_now())})
+
+
+def follow_receipts(service, plan, refresh):
+    """A supervised command follows existing orders only, never resubmits them."""
+    closes = max((instant(line["closes_at"]) for line in plan["lines"]), default=None)
+    while True:
+        now = utc_now()
+        outcomes = service.reconcile(plan["id"], now=now, pending_only=True)
+        refresh()
+        emit(public_results(plan["id"], outcomes))
+        if (
+            not closes
+            or now >= closes
+            or not any(row["state"] in {"active", "unknown"} for row in outcomes)
+        ):
+            return
+        sleep_open(min(30, (closes - now).total_seconds()))
 
 
 if __name__ == "__main__":
