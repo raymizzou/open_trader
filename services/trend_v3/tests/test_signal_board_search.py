@@ -530,7 +530,23 @@ def test_withdrawn_duplicate_is_order_independent_and_keeps_other_hits(tmp_path)
             cards = re.findall(r"<article\b.*?</article>", html, re.S)
             contested = next(card for card in cards if "合成一号" in card)
             certain = next(card for card in cards if "Uncontested" in card)
-            assert "信号榜：" not in contested and "信号榜：" in certain
+            # Provenance stays in structured search evidence, never public copy.
+            for card in (contested, certain):
+                assert "信号榜：" not in card
+                assert "美股温转热" not in card
+                assert 'class="reader-reason"' not in card
+            hit = result["hits"][0]
+            assert (hit["instrument_id"], hit["market"], hit["instrument_type"]) == (
+                "p2", "US", "stock"
+            )
+            assert hit["signal_sources"] == [{
+                "board_id": "warm-us",
+                "title": "美股温转热",
+                "label": "温转热",
+                "version": "2026-11-25",
+                "data_date": "2026-11-24",
+            }]
+            assert all(h["instrument_id"] != "p1" for h in result["hits"])
         assert observed[0] == observed[1], location
     stable = deepcopy(payload)
     stable["boards"][0]["members"].insert(

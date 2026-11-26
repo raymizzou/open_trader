@@ -31,9 +31,10 @@ The caller owns calendar decisions and all other opening conditions.
   Verified membership wins over an exact platform match, which wins over
   other evidence-backed related instruments. Show each instrument once per
   class, with explicit `直属` / `趋势动物可查` markers where verified.
-  Keep watch eligibility independent. Put general `coverage_note` text after
-  all three blocks even when no direct cards are known; retain the older
-  direct-only partial note for compatible inputs. Never infer membership or an exact match from legacy
+  Keep watch eligibility independent. Keep coverage, section notes and card
+  rationale private; retain only the existing fixed empty statuses in the reader.
+  New visible wording or labels require Ray's explicit approval of wording and
+  placement. Never infer membership or an exact match from legacy
   list placement, class identity, or a missing strength/date.
   Show the verified direction seat and board strength with the class. Show both
   global and same-asset-category strengths side by side on every
@@ -49,8 +50,8 @@ The caller owns calendar decisions and all other opening conditions.
   matching explicit identities, applicable dates and versions may bridge rows;
   conflicts and withdrawals mask that metric independently. Never inherit
   trend, events or eligibility from duplicate quote rows.
-  Use only global strength for direction sorting; give each missing field its
-  own public reason. Apply this to scheduled, manual and offline entry points.
+  Use only global strength for direction sorting. Show `待核` for each missing
+  field and keep its reason private. Apply this to scheduled, manual and offline entry points.
   Lookup-only cards mask both strengths; invalid dates or identity resolution
   must never restore stale quotes, strengths, events or watch eligibility. Keep
   both
@@ -75,9 +76,9 @@ The caller owns calendar decisions and all other opening conditions.
   `查不到` in the trend and strength values when a completed applicable
   Trend Animals lookup confirms an exact match is absent from the entire
   applicable result. Show `待核` in those values when the lookup failed, was
-  skipped, has incomplete pages, or remains unresolved. The reason may give
-  verified, publishable provenance or explain the status. It defaults to the
-  same status label. Keep verified values on ordinary cards and show `待核`
+  skipped, has incomplete pages, or remains unresolved. Reasons and provenance
+  remain private; no narrative is appended. Keep verified values on ordinary
+  cards and show `待核`
   for unavailable trend and strength. The special-signal cell lists distinct
   confirmed event names joined by `，`. It shows `无` when no confirmed event
   can be listed and absence is confirmed. Missing or unverified signal evidence

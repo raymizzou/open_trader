@@ -273,9 +273,9 @@ def test_renders_approved_shell_across_dates(tmp_path):
     )
     assert "2040-02-29" not in partial
     assert "大类数据日期 待核" in partial
-    assert "本方向榜图席位待核。" in partial
-    assert "第一席待核。" in partial
-    assert "直属成分证据待核。" in partial
+    assert "本方向榜图席位待核。" not in partial
+    assert "第一席待核。" not in partial
+    assert "直属成分证据待核。" not in partial
 
     rows = re.findall(r"<details\b.*?</details>", full, re.S)
     assert len(rows) == 3
@@ -299,7 +299,7 @@ def test_renders_approved_shell_across_dates(tmp_path):
         "开香槟",
     ]
     assert '<dd class="reader-event">无</dd>' in partial
-    assert "合成的同向观察。" in rows[0]
+    assert "合成的同向观察。" not in rows[0]
 
 
 @pytest.mark.parametrize(
@@ -431,7 +431,7 @@ def test_special_signal_display(tmp_path, fields, expected):
     )
     assert re.findall(r'<dd class="reader-event">(.*?)</dd>', html) == [expected]
     if "reason" in fields:
-        assert f'<p class="reader-reason">{fields["reason"]}</p>' in html
+        assert fields["reason"] not in html
 
 
 @pytest.mark.parametrize(
@@ -546,7 +546,7 @@ def test_excludes_example_and_private_data(tmp_path):
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in result
     assert "甲 &amp; 乙" in result
     assert "&lt;&quot;group&quot;&gt;" in result
-    assert "保留 &quot;理由&quot; &amp; 文本。" in result
+    assert "保留 &quot;理由&quot; &amp; 文本。" not in result
     assert "https://example.invalid/" not in result
     assert_formal_records(result)
     cards = re.findall(r'<li class="asset reader-card">.*?</li>', result, re.S)
@@ -561,7 +561,7 @@ def test_excludes_example_and_private_data(tmp_path):
     ]
     for card, (status, reason) in zip(cards[1:], lookups, strict=True):
         assert re.findall(metric_values, card) == [status, "无", status, status]
-        assert f'<p class="reader-reason">{reason}</p>' in card
+        assert 'class="reader-reason"' not in card
         assert "不适用" not in card
     assert all("查不到" not in card for card in (cards[2], cards[4]))
 
@@ -748,8 +748,7 @@ def test_direct_partial_coverage_with_verified_cards(tmp_path):
     assert '<span class="reader-marker">直属</span>' in direct_body
     assert '<span class="reader-marker">应建观察仓</span>' in direct_body
     note_html = f'<p class="empty-direct">{escaped_note}</p>'
-    assert note_html in related_body
-    assert related_body.index("</ul>") < related_body.index(note_html)
+    assert note_html not in related_body
     assert escaped_note not in direct_body
     assert "LEGACY-" not in html
     assert "PRIVATE-COVERAGE-DETAILS" not in html
@@ -778,9 +777,9 @@ def test_direct_partial_coverage_with_verified_cards(tmp_path):
         )
         assert "LEGACY-" not in unchanged
         row = re.search(r"<details\b.*?</details>", unchanged, re.S)[0]
-        # Empty platform block plus local coverage.
-        assert row.count('class="empty-direct"') == 2
-        assert "成员范围待查。" in row
+        # Only the fixed empty platform block remains.
+        assert row.count('class="empty-direct"') == 1
+        assert "成员范围待查。" not in row
         assert "PRIVATE-COVERAGE-DETAILS" not in unchanged
         assert unchanged.count('<li class="asset reader-card">') == 2
 
@@ -797,8 +796,8 @@ def test_direct_partial_coverage_with_verified_cards(tmp_path):
         },
         "empty-custom-notes",
     )
-    assert "直属范围待核 &amp; 未完成。" in empty
-    assert "关联范围待核。" in empty
+    assert "直属范围待核 &amp; 未完成。" not in empty
+    assert "关联范围待核。" not in empty
     assert '<li class="asset reader-card">' not in empty
 
 
@@ -856,8 +855,7 @@ def test_three_instrument_sections(tmp_path):
         assert "查不到" in third and "待核" in third
         assert "PRIVATE-IDENTITY" not in html
         assert '"market"' not in html and 'instrument_type' not in html
-        assert "范围 &lt;待核&gt; &amp; 未完成。" in third
-        assert third.rindex("</ul>") < third.index("范围 &lt;待核&gt;")
+        assert "范围 &lt;待核&gt; &amp; 未完成。" not in third
         assert codes(rows[1]) == ["A"]  # independent class membership survives
         assert_formal_records(html)
 
@@ -866,8 +864,8 @@ def test_three_instrument_sections(tmp_path):
     assert re.findall(r"<h3>(.*?)</h3>", empty) == [
         "大类直属", "趋势动物里面能够查到", "相关的标的"]
     empty_row = re.search(r"<details\b.*?</details>", empty, re.S)[0]
-    assert empty_row.count('class="empty-direct"') == 4
-    assert "成员范围待查。" in empty_row
+    assert empty_row.count('class="empty-direct"') == 3
+    assert "成员范围待查。" not in empty_row
 
     legacy = render_verified_watch(tmp_path, {"date": "2041-01-02", "long": [{
         "seat": 1, "name": "旧输入", "direct": [
@@ -938,10 +936,7 @@ def test_group_coverage_after_three_without_direct(tmp_path):
         row = re.search(r"<details\b.*?</details>", html, re.S)[0]
         assert re.findall(r"<h3>(.*?)</h3>", row) == [
             "大类直属", "趋势动物里面能够查到", "相关的标的"]
-        assert row.count(escaped) == 1
-        assert row.rindex('class="asset-group"') < row.index(escaped)
-        if cards:
-            assert row.index('</ul>') < row.index(escaped)
+        assert escaped not in row
         assert 'LEGACY-NOTE' not in row and 'PRIVATE-COVERAGE' not in html
         assert '<待核>' not in html
         assert "暂无已核实的直属成员。" in row
@@ -1195,7 +1190,7 @@ def test_dual_strength_values(tmp_path):
         assert re.findall(r"<dt>全局强度</dt><dd>(.*?)</dd>", html) == [global_value]
         assert re.findall(r"<dt>同品种强度</dt><dd>(.*?)</dd>", html) == [local_value]
         for reason in reasons:
-            assert reason in html
+            assert reason not in html
         assert "同品种 43.00" not in html
 
 
@@ -2893,7 +2888,7 @@ def test_report_lists_pending_only_on_affected_cards(tmp_path):
     assert '下次核实：2026-11-23T10:30:00+08:00' in header
     assert all(word not in header for word in (
         'signal_events', '/long/', '缺少', '目标', '榜图日期'))
-    assert '成员范围待查' in html
+    assert '成员范围待查' not in html
     cards = reader_cards(html)
     assert '<dd class="reader-event">待查</dd>' in cards['BTC']
     assert '<dd class="reader-event">无</dd>' in cards['ETF']
@@ -2986,12 +2981,12 @@ def test_stale_membership_evidence_shows_group_pending(tmp_path):
         html = render(tmp_path, report, 'members-' + case)
         row = next(row for row in re.findall(r'<details\b.*?</details>', html, re.S)
                    if '合成加密' in row)
-        assert note in row
+        assert note not in row
         if case == 'matching':
             assert '成员范围待查' not in row
             assert control().assess(report)['complete']
         else:
-            assert row.count('成员范围待查') == 1, case
+            assert '成员范围待查' not in row, case
             assert not control().assess(report)['complete']
             assert '数据收集中' in html
         header = html.split('<main')[0]
@@ -3132,7 +3127,7 @@ def test_signal_board_hit_renders_direct_without_watch_upgrade(tmp_path):
         ],
     }
     html = render(tmp_path, data, "signal-hit")
-    assert "美股凉转寒 · 凉转寒 · 数据日 2026-11-24" in html
+    assert "美股凉转寒 · 凉转寒 · 数据日 2026-11-24" not in html
     assert html.count("合成一号") == 1
     assert '<span class="reader-marker">直属</span>' in html
     assert "应建观察仓" not in html and "UNKNOWN-MEMBER" not in html
@@ -3480,3 +3475,64 @@ def test_pinned_paper_renderer_ignores_environment_shadow(tmp_path):
     assert "US.ABC · 部分成交 · 已成交 7 · 剩余 93" in html
     assert "做多 · 申请数量 100" in html
     assert simulation_section(paper, "2040-01-01", "v02") in html
+
+
+def test_reader_omits_unapproved_narratives(tmp_path):
+    # Input prose must have no publication slot, including formerly fixed notes.
+    canaries = [f'UNAPPROVED-{i}' for i in range(12)]
+    group = dict(seat=1, name='合成甲类', board_strength='3',
+                 coverage_note=canaries[0], direct_partial_note=canaries[1],
+                 direct_note=canaries[2], searchable_note=canaries[3],
+                 related_note=canaries[4], direct=[dict(
+                     code='TEST-A', name='合成甲', direct_verified=True,
+                     trend='寒', signal='凉转寒', strength='12',
+                     reason=canaries[5], local_strength_reason=canaries[6],
+                     signal_sources=[dict(title=canaries[7], label=canaries[8],
+                                          data_date='2040-02-28')])])
+    html = render(tmp_path, dict(date='2040-02-29', short=[group],
+                                short_note=canaries[9], long_note=canaries[10]),
+                  'no-prose')
+    for text in canaries + ['成员范围待查', '信号搜索覆盖待核',
+                            '字段缺失或无效', '品种证据待核']:
+        assert text not in html
+    assert '<dd>寒</dd>' in html
+    assert '<dd class="reader-event">凉转寒</dd>' in html
+    assert '<dd>12 / 100</dd>' in html
+    assert '<dd>待核</dd>' in html
+    assert 'reader-marker">直属</span>' in html
+    assert_formal_records(html)
+
+
+def test_reader_approved_expanded_class_and_card(tmp_path):
+    # v1 reader contract: changing these words/slots requires Ray's explicit
+    # approval of the actual wording and placement, independent of input keys.
+    html = render(tmp_path, dict(date='2040-02-29', short=[dict(
+        seat=1, name='合成甲类', board_strength='3', direct=[dict(
+            code='TEST-A', name='合成甲', direct_verified=True,
+            platform_match_verified=True, trend='寒', signal='凉转寒',
+            strength='12', local_strength='0')])]), 'approved-slots')
+    region = re.search(r'<details class="class-row".*?</details>', html, re.S)[0]
+    expected = '''<details class="class-row" open><summary>
+    <span class="chevron" aria-hidden="true"></span>
+    <span class="class-name">合成甲类</span>
+    <span class="stat"><span class="stat-label">组内排名</span>
+    <span class="number">01</span></span>
+    <span class="stat"><span class="stat-label">强度</span>
+    <span class="number">3</span></span>
+    </summary><div class="ledger"><p class="data-date">大类数据日期 待核</p>
+    <div class="asset-group"><h3>大类直属</h3><ul class="asset-list" role="list">
+    <li class="asset reader-card"><article class="reader-surface waiting">
+    <h4 class="reader-name">TEST-A <span>· 合成甲</span></h4>
+    <p class="data-date">行情截至 待核 <span class="freshness">日期待核</span></p>
+    <p class="reader-markers"><span class="reader-marker">直属</span> ·
+    <span class="reader-marker">趋势动物可查</span></p>
+    <dl class="reader-metrics"><div><dt>当前趋势</dt><dd>寒</dd></div>
+    <div><dt>特殊信号</dt><dd class="reader-event">凉转寒</dd></div>
+    <div><dt>全局强度</dt><dd>12 / 100</dd></div>
+    <div><dt>同品种强度</dt><dd>0 / 100</dd></div></dl></article></li></ul></div>
+    <div class="asset-group"><h3>趋势动物里面能够查到</h3>
+    <p class="empty-direct">暂无已核实的平台精确匹配标的。</p></div>
+    <div class="asset-group"><h3>相关的标的</h3>
+    <p class="empty-direct">暂无其他有据关联的标的。</p></div>
+    </div></details>'''
+    assert Markup(region).events == Markup(expected).events
