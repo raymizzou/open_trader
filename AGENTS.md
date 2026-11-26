@@ -34,6 +34,13 @@ Upload the complete daily HTML report, including each revision, to the existing
 Use iCloud for other deliverables only when specifically requested or already
 agreed for that task.
 
+When a new task tab is needed, open it in the workspace where the task
+originated. Reserve the Herdr `trend_v3` workspace for formal Trend V3 daily
+reports, including scheduled runs and explicitly requested formal reruns. Keep
+Trend V3 development, ticket or PR work, mock or preview generation, and
+acceptance in the originating workspace. Workspace routing is separate from
+private task files and the existing iCloud report path.
+
 ## Worktree and approval
 
 Start every implementation or repository-change task from freshly fetched

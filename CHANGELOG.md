@@ -4,6 +4,15 @@
 
 # Changelog
 
+## 2026-11-26 — Trend V3 task-tab workspace routing
+
+- Open new task tabs in the originating workspace. Reserve the Herdr `trend_v3`
+  workspace for formal Trend V3 daily reports, including scheduled runs and
+  explicitly requested formal reruns. Keep development, ticket or PR work,
+  mock or preview generation, and acceptance in the originating workspace.
+  Workspace routing is separate from private task files and the existing iCloud
+  report path.
+
 ## 2026-11-26 — Trend V3 阅读文字边界 (#507)
 
 - 移除阅读区域的自由覆盖说明、卡片理由、信号来源附注及强度长解释输出槽；保留原有数据、状态、标签与版式。新增合成展开大类和卡片的文字／DOM 契约，新增可见文字及位置须先经 Ray 明确批准。
