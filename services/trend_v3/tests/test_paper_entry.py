@@ -1145,7 +1145,9 @@ def daily_files(home, data, *, supplemental=None):
         record["sha256"] = raw_hash
     html = root / "reports" / f"{DAY}.html"
     html.write_text(
-        "<html><title>Fixed current daily fixture</title></html>", encoding="utf-8"
+        '<html><title>Fixed current daily fixture</title>'
+        '<section id="simulation"><h2>模拟盘持仓情况</h2>'
+        '<p>未接入</p></section></html>', encoding="utf-8"
     )
     html.chmod(0o600)
     verification = {
@@ -1782,7 +1784,11 @@ def test_daily_producer_verified_signal_reaches_preopen_plan(
         paper_cli.main(args)
     assert stopped.value.code == 2
     assert final.read_bytes() == canonical_bytes
-    assert {file: file.read_bytes() for file in inputs} == original
+    reader = root / "reports" / f"{DAY}.html"
+    assert {file: file.read_bytes() for file in inputs if file != reader} == {
+        file: raw for file, raw in original.items() if file != reader
+    }
+    assert (revision / "reader-original.html").read_bytes() == original[reader]
 
 
 @pytest.mark.parametrize(
@@ -2484,7 +2490,9 @@ def tab_cli(home, monkeypatch, sdk, live, *, start=PREOPEN):
     clock = SimpleNamespace(at=start)
 
     def invoke(*args):
-        return paper_cli.main(["--session", NATIVE_SESSION, *args])
+        return paper_cli.main(
+            ["--session", NATIVE_SESSION, "--report-date", DAY, *args]
+        )
 
     def wait(seconds):
         clock.at += timedelta(seconds=seconds)
@@ -3382,3 +3390,227 @@ def test_short_cooling_observation_signal(
         assert plan["execution"] == "evidence_incomplete"
         assert opend.quote_calls == opend.calls == []
     assert opend.writes == []
+
+
+def test_daily_cycle_submits_verified_entry_once(tmp_path, monkeypatch, capsys):
+    data, _ = report("ABC", "XYZ")
+    _, live, _ = daily_files(tmp_path, data)
+    sdk = PlanningOpenD()
+    clock, invoke = tab_cli(tmp_path, monkeypatch, sdk, live)
+    plan = json.loads(capsys.readouterr().out)
+    show_plan(tmp_path, plan, clock.at + timedelta(seconds=1))
+    clock.at += timedelta(seconds=2)
+    assert invoke("cycle", plan["id"]) == 2
+    assert sdk.writes == []
+    tab_record(tmp_path, "user", "只确认第1项", clock.at)
+    assert invoke("cycle", plan["id"]) == 0
+    assert [(r["code"], r["qty"], r["trd_env"]) for r in sdk.writes] == [
+        ("US.ABC", 100, "SIMULATE")
+    ]
+    assert clock.at >= OPEN
+    assert invoke("cycle", plan["id"]) == 0
+    assert len(sdk.writes) == 1
+
+
+def daily_reader(home, data):
+    import subprocess
+    import sys
+
+    root, live, upstream = daily_files(home, data)
+    skill = Path(__file__).resolve().parents[1] / ".agents/skills/trend-v3-daily-report"
+    reader = root / "reports" / f"{DAY}.html"
+    display = deepcopy(data)
+    for group in display.get("long", []) + display.get("short", []):
+        group["board_strength"] = str(group["board_strength"])
+    source = private_input(root, "display-fixture.json", display)
+    subprocess.run(
+        [
+            sys.executable,
+            str(skill / "render_report.py"),
+            str(source),
+            str(root / "rendered.html"),
+            "--report-revision",
+            "v02",
+        ],
+        check=True,
+    )
+    reader.write_bytes((root / "rendered.html").read_bytes())
+    verification = root / "reports/_evidence" / DAY / "v02/report-verification.json"
+    info = json.loads(verification.read_bytes())
+    info["report_sha256"] = sha256(reader.read_bytes()).hexdigest()
+    private_input(verification.parent, verification.name, info)
+    upload = home / f".config/trend-animals/daily-state/{DAY}.upload.json"
+    private_input(
+        upload.parent,
+        upload.name,
+        json.loads(upload.read_bytes()) | {"sha256": info["report_sha256"]},
+    )
+    return root, live, upstream
+
+
+def test_daily_cycle_reports_evidence_gap_without_broker(tmp_path, monkeypatch, capsys):
+    data, _ = report("ABC")
+    data["collection"]["evidence"].pop("/board_date")
+    data["collection"]["evidence"].pop("/board_version")
+    root, live, _ = daily_reader(tmp_path, data)
+    sdk = PlanningOpenD()
+    assert run_daily_plan(tmp_path, sdk, PREOPEN, live, monkeypatch) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["execution"] == "evidence_incomplete"
+    assert plan["lines"] == []
+    assert sdk.calls == sdk.quote_calls == sdk.writes == []
+    html = (root / "reports" / f"{DAY}.html").read_text()
+    assert "榜单日期或版本证据待核" in html
+    assert "已核实无开仓信号" not in html
+
+
+def test_published_order_refresh_preserves_report_binding(
+    tmp_path, monkeypatch, capsys
+):
+    data, _ = report("ABC")
+    root, live, _ = daily_reader(tmp_path, data)
+    evidence = root / "reports/_evidence" / DAY / "v02"
+    originals = {
+        name: (evidence / name).read_bytes()
+        for name in (
+            "reader-projection.json",
+            "selection-evidence.json",
+            "fees.json",
+            "report-verification.json",
+        )
+    }
+    reader = root / "reports" / f"{DAY}.html"
+    source_bytes = reader.read_bytes()
+    sdk = PlanningOpenD()
+    clock, invoke = tab_cli(tmp_path, monkeypatch, sdk, live)
+    plan = json.loads(capsys.readouterr().out)
+    clock.at += timedelta(seconds=1)
+    show_plan(tmp_path, plan, clock.at)
+    clock.at += timedelta(seconds=1)
+    tab_record(tmp_path, "user", "确认全部", clock.at)
+    assert invoke("cycle", plan["id"]) == 0
+    # Exercise the actual trusted-host verifier, with only external share helpers faked.
+    import importlib.util
+    import sys
+    import types
+
+    from trend_v3.paper_report import pending_until
+
+    host = Path(__file__).resolve().parents[1] / "host"
+    monkeypatch.syspath_prepend(str(host))
+    monkeypatch.setitem(
+        sys.modules,
+        "daily_release",
+        types.SimpleNamespace(
+            PIN=RELEASE, SERVICE_ROOT=host.parent, SPACE_ID="sp00000000"
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "daily_support",
+        types.SimpleNamespace(
+            retry_sync=None, sync_allowed=None, SyncDenied=ValueError
+        ),
+    )
+    for name in ("daily_sync", "daily_paper"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    spec = importlib.util.spec_from_file_location("daily_sync", host / "daily_sync.py")
+    sync = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sync)
+    import daily_paper
+
+    assert daily_paper.continuing(root, DAY, OPEN + timedelta(hours=3)) is True
+    assert pending_until(root, DAY, RELEASE) == OPEN.replace(hour=16, minute=0)
+    write = sdk.writes[0]
+    sdk.history = [
+        {**write, "order_id": "paper-a", "order_status": "FILLED_ALL", "dealt_qty": 100}
+    ]
+    clock.at = OPEN + timedelta(seconds=10)
+    assert invoke("reconcile", plan["id"]) == 0
+    html = reader.read_text()
+    assert "US.ABC · 全部成交 · 已成交 100 · 剩余 0" in html
+    assert "paper-a" not in html and "TV3" not in html
+    assert {name: (evidence / name).read_bytes() for name in originals} == originals
+    assert (evidence / "reader-original.html").read_bytes() == source_bytes
+    manifest = json.loads((evidence / "paper-display.json").read_bytes())
+    assert manifest["source_sha256"] == sha256(source_bytes).hexdigest()
+    assert manifest["display_sha256"] == sha256(reader.read_bytes()).hexdigest()
+    assert manifest["source"] == {"commit": RELEASE}
+    assert paper_authority.latest_report(root, DAY, RELEASE)[2]["revision"] == "v02"
+    assert invoke("cycle", plan["id"]) == 0
+    assert len(sdk.writes) == 1
+    observed = {p: p.read_bytes() for p in evidence.iterdir() if p.is_file()}
+    reader_before, broker_before = reader.read_bytes(), list(sdk.calls)
+    assert invoke("status") == 0
+    assert reader.read_bytes() == reader_before
+    assert sdk.calls == broker_before
+    assert {p: p.read_bytes() for p in observed} == observed
+    assert daily_paper.continuing(root, DAY, OPEN + timedelta(hours=3)) is False
+    # Previous-day sync stops once the saved order is terminal.
+    assert sync.verified_report(root, DAY, "v02") == (
+        reader,
+        sha256(reader_before).hexdigest(),
+    )
+    destination = tmp_path / "fake-cloud"
+    destination.mkdir()
+    copied = destination / reader.name
+    copied.write_bytes(source_bytes)
+    copy = sync.VerifiedCopy(
+        reader,
+        copied,
+        lambda: sync.verified_report(root, DAY, "v02")[1]
+        == sha256(reader_before).hexdigest(),
+        lambda path: path.read_bytes() == reader_before,
+        sha256(reader_before).hexdigest(),
+        {sha256(source_bytes).hexdigest()},
+    )
+    assert copy.copy_verified() == sha256(reader_before).hexdigest()
+    assert copy.upload(sha256(reader_before).hexdigest())
+    copied.write_bytes(b"foreign destination")
+    with pytest.raises(ValueError):
+        copy.copy_verified()
+    broker_before = list(sdk.calls)
+    assert (
+        paper_cli.main(["rehearse", str(root), DAY, "v02", "--release", RELEASE]) == 0
+    )
+    assert sdk.calls == broker_before
+    assert reader.read_bytes() == reader_before
+    # A tampered display cannot become authority through its own claimed hash.
+    reader.write_text(html.replace("已成交 100", "已成交 999"))
+    with pytest.raises(ValueError):
+        paper_authority.latest_report(root, DAY, RELEASE)
+    forged = json.loads((evidence / "paper-display.json").read_bytes())
+    forged["display_sha256"] = sha256(reader.read_bytes()).hexdigest()
+    private_input(evidence, "paper-display.json", forged)
+    with pytest.raises(ValueError):
+        sync.verified_report(root, DAY, "v02")
+
+    # Prepare candidates against a fake immutable release; Git is the external
+    # authority boundary, never a caller-supplied source.commit field.
+    spec = importlib.util.spec_from_file_location("host_prepare", host / "prepare.py")
+    preparation = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(preparation)
+    release = tmp_path / ".config/trend-animals/skill-releases" / RELEASE
+    source = release / "services/trend_v3/host"
+    source.mkdir(parents=True)
+    for name in preparation.SOURCES:
+        (source / name).write_bytes((host / name).read_bytes())
+    launcher = tmp_path / ".config/trend-animals/run-daily.py"
+    launcher.write_text('SPACE_ID = "sp00000000"\n')
+    identity = {"head": RELEASE, "dirty": ""}
+
+    def git_identity(command, **kwargs):
+        assert command[:3] == ["git", "-C", str(release)]
+        return (
+            identity["head"] + "\n" if command[3] == "rev-parse" else identity["dirty"]
+        )
+
+    monkeypatch.setattr(preparation.subprocess, "check_output", git_identity)
+    output = tmp_path / "host-candidates"
+    assert preparation.prepare(release, output) == RELEASE
+    generated = (output / "daily_release.py").read_text()
+    assert RELEASE in generated and str(release / "services/trend_v3") in generated
+    identity["head"] = "0" * 40
+    with pytest.raises(ValueError):
+        preparation.prepare(release, tmp_path / "wrong-head")
+    assert not (tmp_path / "wrong-head").exists()

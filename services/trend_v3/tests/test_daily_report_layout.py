@@ -3019,7 +3019,7 @@ def test_verified_paper_status_is_current_and_redacted(tmp_path):
     }
     html = render(tmp_path, report, "paper-current", report_revision="v02")
     simulation = html.split('id="simulation"', 1)[1].split("</section>", 1)[0]
-    assert "US.ABC · 已提交 · 已成交 4 · 剩余 6 · 有活动委托" in simulation
+    assert "US.ABC · 部分成交 · 已成交 4 · 剩余 6 · 有活动委托" in simulation
     assert "US.DEF · 回执待核 · 未核实券商回执 · 活动委托待核" in simulation
     assert "BTCUSD · 已跳过 · 仅限价或市价不可用" in simulation
     hidden = ("private-id", "private-order", "<script>")
@@ -3159,3 +3159,102 @@ def test_signal_board_hit_renders_direct_without_watch_upgrade(tmp_path):
             revised["signal_search"]["targets"] = {"US": "2026-11-20"}
         html = render(tmp_path, revised, "signal-" + change)
         assert "信号榜：" not in html, change
+
+
+def test_daily_reader_displays_reconciled_orders(tmp_path):
+    from datetime import timedelta
+
+    from test_paper_entry import (
+        OPEN,
+        PREOPEN,
+        approval,
+        make_service,
+        prepare,
+        retry_reply,
+    )
+
+    service = make_service(tmp_path)
+    plan = prepare(service, "ABC")
+    service.approve(plan["id"], approval(plan), now=PREOPEN)
+    service.broker.reply = {
+        "state": "cancelled",
+        "id": "private-original",
+        "filled": 40,
+    }
+    service.submit(plan["id"], now=OPEN)
+    service.broker.reconciled = service.broker.reply
+    (terminal,) = service.reconcile(plan["id"], now=OPEN + timedelta(seconds=1))
+    at = OPEN + timedelta(seconds=2)
+    assert service.approve(plan["id"], retry_reply(plan, terminal, at, 60), now=at)
+    service.broker.reply = TimeoutError()
+    service.submit(plan["id"], now=at, retry=True)
+    paper = service.status(now=at)
+    assert len(paper["results"]) == 2
+    html = render(
+        tmp_path,
+        {"date": plan["date"], "paper_entry": paper},
+        "reconciled-orders",
+        report_revision="v1",
+    )
+    # Actual report revisions are vNN; retain the service fixture's test-only v1
+    # identity while giving the renderer a valid current revision.
+    paper["report_version"] = "v02"
+    for result in paper["results"]:
+        result["report_version"] = "v02"
+    html = render(
+        tmp_path,
+        {"date": plan["date"], "paper_entry": paper},
+        "reconciled-orders-current",
+        report_revision="v02",
+    )
+    section = html.split('id="simulation"', 1)[1].split("</section>", 1)[0]
+    assert section.count("US.ABC") == 2
+    assert "剩余撤销 · 已成交 40 · 剩余 60" in section
+    unknown = next(
+        row for row in re.findall(r"<li>.*?</li>", section) if "回执待核" in row
+    )
+    assert "已成交 0" not in unknown
+    assert "记录 1" in section and "记录 2" in section
+    assert section.count("做多") == 2
+    assert "申请数量 100" in section and "申请数量 60" in section
+    assert "private-original" not in html and "TV3" not in html
+
+    extra = tmp_path / "more-orders"
+    extra.mkdir()
+    service = make_service(extra)
+    plan = prepare(service, "LIVE", "PART", "DONE", "DENY")
+    selected = [line for line in plan["lines"] if line["code"] != "US.DENY"]
+    assert service.approve(plan["id"], approval(plan, selection=selected), now=PREOPEN)
+    pending = service.status(now=PREOPEN)
+    assert [row["approved"] for row in pending["results"]] == [100, 100, 100, None]
+    for code, state, filled in (
+        ("US.LIVE", "active", 0),
+        ("US.PART", "active", 7),
+        ("US.DONE", "filled", 100),
+    ):
+        service.broker.reply = {
+            "state": state,
+            "id": "private-" + code,
+            "filled": filled,
+        }
+        service.submit(
+            plan["id"],
+            now=OPEN,
+            item=next(line["item"] for line in plan["lines"] if line["code"] == code),
+        )
+    service.submit(plan["id"], now=OPEN)
+    paper = service.status(now=OPEN)
+    paper["report_version"] = "v02"
+    html = render(
+        tmp_path,
+        {"date": plan["date"], "paper_entry": paper},
+        "subset-and-partial",
+        report_revision="v02",
+    )
+    section = html.split('id="simulation"', 1)[1].split("</section>", 1)[0]
+    assert "US.LIVE · 已提交 · 已成交 0 · 剩余 100" in section
+    assert "US.PART · 部分成交 · 已成交 7 · 剩余 93 · 有活动委托" in section
+    assert "US.DONE · 全部成交 · 已成交 100 · 剩余 0" in section
+    assert "US.DENY · 已跳过 · 开盘前未收到确认" in section
+    assert section.count("申请数量 100") == 4
+    assert len(service.broker.orders) == 3

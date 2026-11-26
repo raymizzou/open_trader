@@ -710,6 +710,8 @@ class PaperEntry:
         return {
             "item": line["item"],
             "code": line["code"],
+            "direction": line["direction"],
+            "quantity": line["quantity"],
             "state": state,
             "filled": filled,
             "remaining": line["quantity"] - filled if filled is not None else None,
@@ -727,6 +729,17 @@ class PaperEntry:
             or 0
         )
 
+    def has_approval(self, plan_id):
+        with transaction(self.database) as store:
+            plan, _ = self.current(store, plan_id)
+            return (
+                plan is not None
+                and store.execute(
+                    "SELECT 1 FROM approvals WHERE plan=? AND quantity>0", (plan_id,)
+                ).fetchone()
+                is not None
+            )
+
     def openings(self, plan_id):
         with transaction(self.database) as store:
             plan, _ = self.current(store, plan_id)
@@ -740,37 +753,61 @@ class PaperEntry:
             plan = self.latest_plan(store)
             if plan is None:
                 return None
-            results = {}
+            results = []
+            pending_codes = set()
             for line in plan["lines"]:
                 attempt = self.attempt(store, line)
-                if attempt:
-                    result = self.attempt_outcome(store, line, attempt)
-                else:
-                    result = self.decision(store, plan["id"], line)
-                    if result is None:
-                        result = self.unsubmitted_status(store, plan["id"], line, now)
-                results[line["code"]] = result
+                if attempt is not None:
+                    continue
+                result = self.decision(store, plan["id"], line)
+                if result is None:
+                    result = self.unsubmitted_status(store, plan["id"], line, now)
+                approval = store.execute(
+                    "SELECT quantity FROM approvals WHERE plan=? AND item=?",
+                    (plan["id"], line["item"]),
+                ).fetchone()
+                result["approved"] = approval["quantity"] if approval else None
+                results.append(self.public_outcome(result))
+                pending_codes.add(line["code"])
             history = store.execute(
                 """SELECT attempts.*, plans.body FROM attempts
                    JOIN plans ON plans.id = attempts.plan
-                   WHERE plans.report_day = ? ORDER BY attempts.number""",
+                   WHERE plans.report_day = ? ORDER BY plans.created, attempts.rowid""",
                 (self.session["date"],),
             )
-            for attempt in history:
+            for ordinal, attempt in enumerate(history, 1):
                 old_plan = json.loads(attempt["body"])
                 line = next(
                     line
                     for line in old_plan["lines"]
                     if line["item"] == attempt["item"]
                 )
-                results[line["code"]] = self.attempt_outcome(store, line, attempt)
+                # Each row is one actual order, not cumulative fills collapsed by code.
+                result = self.outcome(
+                    line, attempt["state"], attempt["filled"], attempt["reason"]
+                )
+                result["quantity"] = attempt["quantity"]
+                result["approved"] = attempt["quantity"]
+                if attempt["filled"] is not None:
+                    result["remaining"] = attempt["quantity"] - attempt["filled"]
+                results.append(
+                    self.public_outcome(result)
+                    | {
+                        "record": ordinal,
+                        "report_version": old_plan["report_version"],
+                        "session_date": line["session_date"],
+                    }
+                )
+                pending_codes.add(line["code"])
             return {
                 "schema": "trend-v3-paper-entry.v1",
                 "date": plan["date"],
                 "report_version": plan["report_version"],
-                "results": [self.public_outcome(result) for result in results.values()],
+                "results": results,
                 "skipped": [
-                    item for item in plan["skipped"] if item.get("code") not in results
+                    item
+                    for item in plan["skipped"]
+                    if item.get("code") not in pending_codes
                 ],
             }
 
@@ -790,4 +827,8 @@ class PaperEntry:
     @staticmethod
     def public_outcome(result):
         fields = ("code", "state", "filled", "remaining", "active", "reason")
-        return {field: result[field] for field in fields}
+        return {field: result[field] for field in fields} | {
+            field: result[field]
+            for field in ("direction", "quantity", "approved")
+            if field in result
+        }

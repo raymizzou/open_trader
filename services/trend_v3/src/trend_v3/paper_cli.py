@@ -24,7 +24,7 @@ from .paper_entry import PaperEntry, encode
 from .paper_evidence import TAIPEI, instant
 from .paper_facts import produce
 from .paper_futu import BrokerUnavailable, FutuPaperBroker
-from .paper_report import prepare_report_evidence
+from .paper_report import prepare_report_evidence, refresh_report
 
 
 def utc_now():
@@ -140,6 +140,10 @@ def parse_args(argv=None):
         "approve", help="record an explicit reply from the original scheduled tab"
     )
     approve.add_argument("plan")
+    cycle = commands.add_parser(
+        "cycle", help="record the original reply and run approved openings"
+    )
+    cycle.add_argument("plan")
     submit = commands.add_parser(
         "submit", help="wait and submit approved market entries"
     )
@@ -223,7 +227,7 @@ def run_daily(args):
     now = utc_now()
     today = now.astimezone(TAIPEI).date()
     allowed = {today.isoformat()}
-    if args.command in {"reconcile", "status"} or (
+    if args.command in {"reconcile", "status", "cycle"} or (
         args.command == "submit" and args.retry_item
     ):
         allowed.add((today - timedelta(days=1)).isoformat())
@@ -235,7 +239,7 @@ def run_daily(args):
 
     def check_plan(plan):
         try:
-            info = latest_report(root, report_day, pin)[2]
+            info = latest_report(root, report_day, pin, source_only=True)[2]
             upload_receipt(home, scope, info)
             digest = sha256(
                 (info["projection_sha256"] + info["selection_sha256"]).encode()
@@ -252,6 +256,15 @@ def run_daily(args):
         artifacts = latest_report(root, report_day, pin)
         upload_receipt(home, scope, artifacts[2])
     state = root / "reports/_evidence/.paper-entry"
+    if args.command == "status":
+        database = state / "state.sqlite3"
+        result = (
+            PaperEntry(database, OfflineBroker(), scope).status(now=now)
+            if database.exists()
+            else None
+        )
+        emit(result)
+        return 0
     state.mkdir(mode=0o700, exist_ok=True)
     require_private_dir(state)
     broker = FutuPaperBroker(settings(home), clock=utc_now)
@@ -272,11 +285,10 @@ def run_daily(args):
             check_plan=check_plan,
         )
         if args.command == "plan":
-            emit(
-                plan_report(
-                    service, artifacts, root / "reports/_evidence", now, clock=utc_now
-                )
+            plan = plan_report(
+                service, artifacts, root / "reports/_evidence", now, clock=utc_now
             )
+            emit(plan)
         elif args.command == "status":
             emit(service.status(now=now))
         elif args.command == "reconcile":
@@ -293,9 +305,19 @@ def run_daily(args):
             def record(reply):
                 return record_reply(service, plan, reply)
 
-            return run_action(args, service, plan, replies, record)
+            return run_action(
+                args,
+                service,
+                plan,
+                replies,
+                record,
+                refresh=lambda: refresh_report(root, report_day, pin, utc_now()),
+            )
     finally:
-        broker.close()
+        try:
+            refresh_report(root, report_day, pin, utc_now())
+        finally:
+            broker.close()
     return 0
 
 
@@ -315,16 +337,23 @@ def public_results(plan_id, outcomes):
     return {"plan": plan_id, "results": results}
 
 
-def run_action(args, service, plan, replies, record):
-    if args.command == "approve" or args.retry_item:
+def run_action(args, service, plan, replies, record, refresh=lambda: None):
+    if args.command in {"approve", "cycle"} or args.retry_item:
         records = replies()
         latest = records[-1] if records else None
-        if args.command == "approve":
+        if args.command in {"approve", "cycle"}:
             decision = (
                 record(latest) if latest and latest["decision"] != "retry" else None
             )
             if decision is not None:
                 emit({"plan": plan["id"], **decision})
+                if args.command == "cycle":
+                    wait_for_open(service, plan, replies, record, refresh)
+                    follow_receipts(service, plan, refresh)
+                return 0
+            if args.command == "cycle" and service.has_approval(plan["id"]):
+                wait_for_open(service, plan, replies, record, refresh)
+                follow_receipts(service, plan, refresh)
                 return 0
             emit(
                 {
@@ -354,11 +383,11 @@ def run_action(args, service, plan, replies, record):
             )
         )
         return 0
-    wait_for_open(service, plan, replies, record)
+    wait_for_open(service, plan, replies, record, refresh)
     return 0
 
 
-def wait_for_open(service, plan, replies, record):
+def wait_for_open(service, plan, replies, record, refresh=lambda: None):
     plan_id = plan["id"]
     started = utc_now()
     for opening in service.openings(plan_id):
@@ -393,7 +422,26 @@ def wait_for_open(service, plan, replies, record):
                 plan_id, service.submit(plan_id, now=observed, opening=opening)
             )
         )
+        service.reconcile(plan_id, now=utc_now())
+        refresh()
     emit({"plan": plan_id, "status": service.status(now=utc_now())})
+
+
+def follow_receipts(service, plan, refresh):
+    """A supervised command follows existing orders only, never resubmits them."""
+    closes = max((instant(line["closes_at"]) for line in plan["lines"]), default=None)
+    while True:
+        now = utc_now()
+        outcomes = service.reconcile(plan["id"], now=now)
+        refresh()
+        emit(public_results(plan["id"], outcomes))
+        if (
+            not closes
+            or now >= closes
+            or not any(row["state"] in {"active", "unknown"} for row in outcomes)
+        ):
+            return
+        sleep_open(min(30, (closes - now).total_seconds()))
 
 
 if __name__ == "__main__":

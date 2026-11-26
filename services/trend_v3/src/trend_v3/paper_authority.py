@@ -375,7 +375,8 @@ def upload_receipt(home, scope, verification):
         upload.get("day") != scope["date"]
         or upload.get("launch") != scope["launch"]
         or upload.get("revision") != verification["revision"]
-        or upload.get("sha256") != verification["report_sha256"]
+        or upload.get("source_sha256", upload.get("sha256"))
+        != verification["report_sha256"]
         or upload.get("uploaded") is not True
     ):
         raise ValueError("matching host report upload receipt is unavailable")
@@ -407,7 +408,9 @@ def check_selection_identity(
         raise ValueError("daily report revision does not match its verification")
 
 
-def latest_report(root, report_day, release, *, frozen_revision=None):
+def latest_report(
+    root, report_day, release, *, frozen_revision=None, source_only=False
+):
     if not day(report_day) or not HEX_SHA.fullmatch(release):
         raise ValueError("invalid daily report date or release")
     index = root / "reports/_evidence" / report_day
@@ -446,11 +449,22 @@ def latest_report(root, report_day, release, *, frozen_revision=None):
         sha256(current).hexdigest() != info.get("report_sha256")
         and frozen_revision is not None
     ):
-        archived = evidence / "history" / reader.name
-        if archived.exists():
-            current = private_bytes(archived)
-    if sha256(current).hexdigest() != info.get("report_sha256"):
-        raise ValueError("daily report artifact digest does not match")
+        for archived in (
+            evidence / "history" / reader.name,
+            evidence / "reader-original.html",
+        ):
+            if archived.exists():
+                candidate = private_bytes(archived)
+                if sha256(candidate).hexdigest() == info.get("report_sha256"):
+                    current = candidate
+                    break
+    display = sha256(current).hexdigest() != info.get("report_sha256")
+    if display:
+        original = evidence / "reader-original.html"
+        if not original.exists() or sha256(
+            private_bytes(original)
+        ).hexdigest() != info.get("report_sha256"):
+            raise ValueError("daily report artifact digest does not match")
     checked = {}
     for field, path in (
         ("projection_sha256", evidence / "reader-projection.json"),
@@ -466,5 +480,10 @@ def latest_report(root, report_day, release, *, frozen_revision=None):
     check_selection_identity(
         selection, projection, report_day, revision, release, info["projection_sha256"]
     )
+    if display and not source_only:
+        from .paper_report import verified_display
+
+        if current != verified_display(root, info):
+            raise ValueError("daily report artifact digest does not match")
     projection.pop("paper_entry", None)
     return projection, selection, info
