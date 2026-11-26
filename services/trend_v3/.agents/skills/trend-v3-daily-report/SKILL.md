@@ -206,6 +206,20 @@ python /绝对同版路径/collection.py confirm reader-projection.json --state 
 python3 "$skill_dir/render_report.py" "$verified_json" "$new_html"
 ```
 
+普通逐日生成、评估及确认使用本版 `reader-projection.json` 路径。程序自动读取
+同目录的 `selection-draft.json` 与 `visual-observations.json`；无需额外开关。
+草稿的 `sources.visual` 必须为 `_evidence/<报告日>/<版次>/visual-observations.json`，
+`source_sha256.visual` 须匹配原文件。修订可沿用同报告日的旧版来源标识和原摘要；
+只读取当前目录的固定文件，不将来源标识当任意文件路径打开。`field_refs.labels` 指向 `field_records` 中
+精确的 `stock_details[i]` 原记录；以投影已有的同身份、市场、品种、版次和适用
+日期的温度证明交叉核实。只提取逐只已核实的事件名称，不把「市值龙头」等
+普通标签、榜名、温度或观察资格转为事件，也不推定前温或交易许可。
+独立已核实自身事件即使缺少前温仍显示；缺项保留待查，冲突报明确错误。
+渲染后程序核对实际特殊信号单元格，阳性不能静默丢失。历史或独立投影仍兼容；
+从普通逐日目录复制输入作离线核对时应保留以上同版兄弟文件，不能只复制投影。
+现有封存版不覆写，修订须新建目录，保留来源编号与摘要。
+
+
 `skill_dir` 为核对过版本的技能目录，`verified_json` 为明确选定的 UTF-8 输入路径，`new_html` 为已存在的私有目录下尚未使用的候选文件路径。渲染器只读该输入与同目录下的 `assets/report.html`，生成一份 UTF-8 HTML。它转义所有动态文本，展开并移除模板节点和插槽。已有路径返回非零。需要替换现行日报时，先核对候选，再按下文的锁、归档和原子替换流程处理。
 
 - 可选 `paper_entry` 只接受模拟开仓技能 `status` 输出的已核实脱敏结果。定时、手工、复渲染和离线入口须从所选日报的独立核实记录（`report-verification.json`）取得已核实的版次，并在渲染时用 `--report-revision "$verified_revision"` 传入。若用 `collection.py confirm` 核对本轮正式报告，传入相同参数。缺少已核实版次、版次不符或报告日不符时显示「未接入」。只显示标的、已知处理状态、简短原因和已确认数量。账本、账户身份和订单号保留在私有目录。旧输入照常显示「未接入」。

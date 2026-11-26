@@ -17,6 +17,153 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 
+def load_report(path, *, parse_float=float):
+    """Reconcile owned recorded events from fixed revision siblings, offline only.
+
+    Standalone/historical projections remain valid inputs. Source strings are
+    identifiers, never filesystem paths to open.
+    """
+    path = Path(path)
+    report = json.loads(path.read_text(encoding="utf-8"), parse_float=parse_float)
+    for direction in ("long", "short"):
+        for group in report.get(direction, []):
+            for section in ("direct", "searchable", "related"):
+                for asset in group.get(section, []):
+                    asset.pop("_recorded_own_events", None)
+                    asset.pop("_recorded_own_labels", None)
+    draft_path = path.with_name("selection-draft.json")
+    visual_path = path.with_name("visual-observations.json")
+    if (
+        path.name != "reader-projection.json"
+        or not draft_path.exists()
+        or not visual_path.exists()
+    ):
+        return report
+    if any(
+        p.resolve().parent != path.resolve().parent for p in (draft_path, visual_path)
+    ):
+        raise ValueError("own-event source escapes revision directory")
+    draft = json.loads(draft_path.read_text(encoding="utf-8"))
+    visual_bytes = visual_path.read_bytes()
+    visual = json.loads(visual_bytes)
+    if not visual.get("stock_details") or not draft.get("field_records"):
+        return report
+    expected_source = draft.get("sources", {}).get("visual")
+    pattern = (
+        rf"_evidence/{re.escape(report['date'])}/v[0-9]+/visual-observations\.json"
+    )
+    if not isinstance(expected_source, str) or not re.fullmatch(
+        pattern, expected_source
+    ):
+        raise ValueError(
+            "own-event source is not the standard revision-relative source"
+        )
+    if (
+        draft.get("source_sha256", {}).get("visual")
+        != hashlib.sha256(visual_bytes).hexdigest()
+    ):
+        raise ValueError("own-event source digest mismatch")
+    if draft.get("date") != report["date"] or draft.get("board", {}).get(
+        "version"
+    ) != report.get("board_version"):
+        return report
+    records = {
+        expected_source + f"#stock_details[{i}]": row
+        for i, row in enumerate(visual.get("stock_details", []))
+    }
+    evidence = report.get("collection", {}).get("evidence", {})
+    for direction in ("short", "long"):
+        for gi, group in enumerate(report.get(direction, [])):
+            for section in ("direct", "searchable", "related"):
+                for ai, asset in enumerate(group.get(section, [])):
+                    prefix = f"/{direction}/{gi}/{section}/{ai}/"
+                    target = valid_date(
+                        report.get("collection", {})
+                        .get("targets", {})
+                        .get(asset.get("market"))
+                    )
+                    trend_proof = evidence.get(prefix + "trend", {})
+                    for item in draft.get("instruments", []):
+                        ref = item.get("field_refs", {}).get("labels")
+                        owned = draft.get("field_records", {}).get(ref, {})
+                        record = records.get(owned.get("source"))
+                        if (
+                            not record
+                            or owned.get("record") != record
+                            or record.get("state", "verified") != "verified"
+                            or record.get("verified") is False
+                        ):
+                            continue
+                        if not (
+                            item.get("id")
+                            == asset.get("instrument_id")
+                            == record.get("identity")
+                            and item.get("code")
+                            == asset.get("code")
+                            == record.get("code")
+                            and item.get("market")
+                            == asset.get("market")
+                            == record.get("market")
+                            and item.get("instrument_type")
+                            == asset.get("instrument_type")
+                            == record.get("instrument_type")
+                            and item.get("data_date")
+                            == asset.get("data_date")
+                            == record.get("data_date")
+                            == target
+                            and target
+                            and owned.get("version") == report.get("board_version")
+                            and field_proof_matches(asset, "trend", trend_proof, target)
+                            and trend_proof.get("source") == owned.get("source")
+                            and trend_proof.get("version") == owned.get("version")
+                            and record.get("temperature") == asset.get("trend")
+                        ):
+                            continue
+                        # Validate names with the same public event vocabulary. Generic
+                        # labels, board titles and temperature alone prove no event.
+                        from render_report import (
+                            LEGACY_EVENT_NAMES,
+                            verified_event_names,
+                        )
+
+                        names = list(
+                            dict.fromkeys(
+                                n
+                                for n in verified_event_names(record.get("labels", []))
+                                if n in LEGACY_EVENT_NAMES
+                            )
+                        )
+                        if not names:
+                            continue
+                        existing = evidence.get(prefix + "signal_events", {})
+                        receipt_bound = field_evidence_matches(
+                            dict(asset, signal_events=existing.get("value")),
+                            "signal_events",
+                            existing,
+                            target,
+                            ("verified", "withdrawn"),
+                        )
+                        if (
+                            receipt_bound
+                            and existing.get("version") == owned.get("version")
+                            and (
+                                existing.get("state") == "withdrawn"
+                                or existing.get("value") != names
+                            )
+                        ):
+                            raise ValueError(
+                                "own-event discrepancy: conflicting signal receipt "
+                                + prefix
+                            )
+                        asset["_recorded_own_events"] = names
+                        asset["_recorded_own_labels"] = record["labels"]
+                        asset["signal_events"] = names
+                        evidence[prefix + "signal_events"] = dict(
+                            trend_proof, value=names
+                        )
+    return report
+
+
 def valid_date(value):
     try:
         return (
@@ -1787,7 +1934,7 @@ def main():
     )
     args = parser.parse_args()
     try:
-        report = json.loads(args.input.read_text(encoding="utf-8"))
+        report = load_report(args.input)
         if args.action == "search-plan":
             value = search_plan(report)
         elif args.action == "targets":
