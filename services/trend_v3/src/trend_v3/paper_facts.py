@@ -18,6 +18,7 @@ from .paper_evidence import (
     field,
     identity,
     native_signal,
+    observation_signal,
     paper_report_projection,
     product_for,
     receipt,
@@ -609,7 +610,7 @@ def record_facts(report, facts, raw, broker, group, asset, path, direction, now)
         for name in ("trend", "signal_events")
     ):
         raise FactsMissing("signal_unverified")
-    previous, current, event = SIGNALS[direction]
+    event = SIGNALS[direction][2]
     observation = signal["value"]
     actual = (observation["previous"], observation["current"])
     labels, events = observation["labels"], asset.get("signal_events")
@@ -619,7 +620,8 @@ def record_facts(report, facts, raw, broker, group, asset, path, direction, now)
         or not isinstance(labels, list)
         or not all(text(label) for label in labels)
         or not isinstance(events, list)
-        or (actual == (previous, current)) != entry
+        # Check the transition independently so missing labels cannot certify no-entry.
+        or observation_signal(direction, *actual, [event]) != entry
         or (event in labels) != entry
         or (event in events) != entry
     ):

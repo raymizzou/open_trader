@@ -26,6 +26,10 @@
 - 视觉／日报技能采用方向搜索与交集路径。现场新榜验证、安装、排程、上线和交易行为不在本次变更内。
 
 
+## 2026-11-25 — Short first observation signal
+
+- Accept a short first observation from 凉 to 寒 or 冻 with the contemporaneous 凉转寒 label. Keep the initial 2% size and all evidence, membership, account and simulated borrow checks. Reader grouping remains a private daily-workflow projection.
+
 ## 2026-11-25 — Trend V3 视觉取证
 
 - 日报优先从小程序页面核对关联榜、温度标签和移出状态。已核实免费的官方查询可直接执行，可能收费的查询须先取得本次批准。

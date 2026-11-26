@@ -3316,3 +3316,69 @@ def test_original_second_seat_outside_threshold_keeps_its_verified_candidate(
                 variant
             )
             assert opend.quote_calls == opend.calls == opend.writes == []
+
+
+@pytest.mark.parametrize(
+    ("previous", "current", "labels", "stale", "allowed"),
+    [("凉", "冻", ["凉转寒"], False, True),
+     ("凉", "寒", ["凉转寒"], False, True),
+     ("凉", "冻", [], False, False),
+     ("凉", "冻", ["寒转冻"], False, False),
+     ("寒", "冻", ["凉转寒"], False, False),
+     ("凉", "冻", ["凉转寒"], True, False)],
+)
+def test_short_cooling_observation_signal(
+    tmp_path, monkeypatch, capsys, previous, current, labels, stale, allowed
+):
+    root, live, upstream, revision, info = pending_daily_evidence(tmp_path)
+    draft = json.loads((revision / "selection-draft.json").read_bytes())
+    data = json.loads((revision / "reader-projection.json").read_bytes())
+    data["long"], data["short"] = data["short"], data["long"]
+    data["collection"]["evidence"] = {
+        key.replace("/long/", "/swap/").replace("/short/", "/long/")
+        .replace("/swap/", "/short/"): value
+        for key, value in data["collection"]["evidence"].items()
+    }
+    evidence = data["collection"]["evidence"]
+    asset = data["short"][0]["direct"][0]
+    asset.update(trend=current, signal_events=labels)
+    for name in ("trend", "signal_events"):
+        evidence["/short/0/direct/0/" + name]["value"] = asset[name]
+    row = draft["instruments"][0]
+    row.update(direction="short", previous=previous, current=current, labels=labels)
+    raw = draft["field_sources"]["ABC"]
+    record = raw["record"]
+    record.update(trendTemperaturePrev=previous, trendTemperatureCurr=current,
+                  tickerLabels=labels)
+    if stale:
+        row["data_day"] = record["asOfDate"] = "2026-11-20"
+    upstream.write_text(json.dumps({"data": [record]}))
+    raw["sha256"] = sha256(upstream.read_bytes()).hexdigest()
+    projection = private_input(revision, "reader-projection.json", data)
+    private_input(revision, "selection-draft.json", draft)
+    assert paper_cli.main(["prepare-report-evidence", str(root), DAY, "v02",
+                           "--release", RELEASE]) == 0
+    result = json.loads(capsys.readouterr().out)
+    info.update(projection_sha256=sha256(projection.read_bytes()).hexdigest(),
+                selection_sha256=result["selection_sha256"])
+    private_input(revision, "report-verification.json", info)
+
+    class ShortOpenD(PlanningOpenD):
+        def get_market_snapshot(self, **params):
+            status, rows = super().get_market_snapshot(**params)
+            rows[0].update(enable_short_sell=True, short_available_volume=1000)
+            return status, rows
+
+    opend = ShortOpenD()
+    assert run_daily_plan(tmp_path, opend, PREOPEN, live, monkeypatch) == 0
+    plan = json.loads(capsys.readouterr().out)
+    if allowed:
+        (line,) = plan["lines"]
+        assert (line["direction"], line["signal"], line["quantity"]) == (
+            "short", "凉转寒", 100)
+        assert line["reference_price"] == "20"  # 100000 * 2% / 20
+    else:
+        assert plan["lines"] == []
+        assert plan["execution"] == "evidence_incomplete"
+        assert opend.quote_calls == opend.calls == []
+    assert opend.writes == []
