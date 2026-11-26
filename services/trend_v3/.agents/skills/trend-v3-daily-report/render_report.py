@@ -172,13 +172,6 @@ def special_signal(asset):
     return display_text("，".join(dict.fromkeys(names)), "无")
 
 
-def strength_note(asset, field, value, label):
-    if value is not None:
-        return ""
-    reason = display_text(asset.get(field + "_reason"), label + "字段缺失或无效。")
-    return f'<p class="reader-metric-note">{reason}</p>'
-
-
 def render_card(pattern, asset):
     lookup = asset.get("lookup")
     if lookup is None:
@@ -187,27 +180,12 @@ def render_card(pattern, asset):
         global_value, local_value = strength_fields(asset)
         strength = f"{global_value} / 100" if global_value is not None else "待核"
         local_strength = f"{local_value} / 100" if local_value is not None else "待核"
-        strength_reason = strength_note(asset, "strength", global_value, "全局强度")
-        local_strength_reason = strength_note(
-            asset, "local_strength", local_value, "同品种强度"
-        )
-        reason = display_text(asset.get("reason"), "品种证据待核。")
     else:
         if not isinstance(lookup, str) or lookup not in LOOKUP_LABELS:
             raise ValueError("Lookup status must be miss or pending")
         status = LOOKUP_LABELS[lookup]
         trend = strength = local_strength = status
-        strength_reason = local_strength_reason = ""
         signal = "待查" if "_signal_pending" in asset else "无"
-        reason = display_text(asset.get("reason"), status)
-    for source in asset.get("signal_sources", []):
-        reason += (
-            " 信号榜："
-            + " · ".join(display_text(source[key]) for key in ("title", "label"))
-            + " · 数据日 "
-            + display_text(source["data_date"])
-            + "。"
-        )
     # These flags are supplied only after evidence selection. Neither list
     # placement nor a displayed event establishes membership or eligibility.
     markers = []
@@ -230,9 +208,6 @@ def render_card(pattern, asset):
         signal=signal,
         strength=strength,
         local_strength=local_strength,
-        strength_reason=strength_reason,
-        local_strength_reason=local_strength_reason,
-        reason=reason,
     )
 
 
@@ -261,29 +236,6 @@ def instrument_sections(group, direction):
     for section in sections:
         section.sort(key=order)
     return sections
-
-
-def coverage_note(fragments, group, direct):
-    general = group.get("coverage_note")
-    legacy = group.get("direct_partial_note")
-    for note in (general, legacy):
-        if note is not None and not isinstance(note, str):
-            raise ValueError("Coverage note must be text")
-    # The general field is independent of known cards. Preserve the legacy
-    # direct-only field's behavior when no general field was supplied.
-    note = general if general is not None else legacy if direct else None
-    notes = []
-    if note and note.strip():
-        notes.append(fragments["empty_note"].substitute(note=display_text(note)))
-    if group.get("_coverage_pending") and "成员范围待查" not in (note or ""):
-        notes.append(fragments["empty_note"].substitute(note="成员范围待查。"))
-    if group.get("_signal_coverage_pending"):
-        notes.append(fragments["empty_note"].substitute(note="信号搜索覆盖待核。"))
-    if group.get("_missing_signal_hits"):
-        notes.append(
-            fragments["empty_note"].substitute(note="已核实信号命中尚未入直属卡。")
-        )
-    return "\n".join(notes)
 
 
 def _verify_recorded_cards(markup, group, chosen):
@@ -318,7 +270,7 @@ def _verify_recorded_cards(markup, group, chosen):
                 )
 
 
-def render_direction(fragments, groups, note, direction, *, threshold=False):
+def render_direction(fragments, groups, direction, *, threshold=False):
     if not isinstance(groups, list):
         raise ValueError("Direction rows must be arrays")
     rows = []
@@ -342,37 +294,20 @@ def render_direction(fragments, groups, note, direction, *, threshold=False):
                 else "",
                 seat=f"{seat:02}",
                 board_strength=display_text(group.get("board_strength")),
-                direct=render_assets(
-                    fragments, direct,
-                    display_text(
-                        group.get("direct_note") if not group.get("direct") else None,
-                        "暂无已核实的直属成员。",
-                    ),
-                ),
+                direct=render_assets(fragments, direct, "暂无已核实的直属成员。"),
                 searchable=render_assets(
-                    fragments, searchable,
-                    display_text(
-                        group.get("searchable_note"),
-                        "暂无已核实的平台精确匹配标的。",
-                    ),
+                    fragments, searchable, "暂无已核实的平台精确匹配标的。"
                 ),
-                related=render_assets(
-                    fragments, related,
-                    display_text(
-                        group.get("related_note") if not group.get("related") else None,
-                        "暂无其他有据关联的标的。",
-                    ),
-                ),
-                coverage_note=coverage_note(fragments, group, direct),
+                related=render_assets(fragments, related, "暂无其他有据关联的标的。"),
             )
         )
 
         _verify_recorded_cards(rows[-1], group, direct + searchable + related)
 
-    if note or not rows:
+    if not rows:
         rows.append(
             fragments["empty_note"].substitute(
-                note=display_text(note, "暂无已核实的大类席位。")
+                note="暂无已核实的大类席位。"
             )
         )
     return "\n".join(rows)
@@ -461,14 +396,12 @@ def render(report, template, *, report_revision=None):
         short_rows=render_direction(
             fragments,
             report.get("short", []),
-            report.get("short_note"),
             "short",
             threshold=report.get("selection_mode") == "threshold-v1",
         ),
         long_rows=render_direction(
             fragments,
             report.get("long", []),
-            report.get("long_note"),
             "long",
             threshold=report.get("selection_mode") == "threshold-v1",
         ),
