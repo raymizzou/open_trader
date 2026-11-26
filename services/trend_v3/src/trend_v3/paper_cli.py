@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Thread
 from time import sleep as sleep_open
 
 from .paper_authority import (
@@ -387,15 +388,50 @@ def run_action(args, service, plan, replies, record, refresh=lambda: None):
     return 0
 
 
+class ReceiptObserver:
+    """One read-only I/O round in flight; never join it on an opening deadline."""
+
+    def __init__(self, service, plan, refresh):
+        self.service, self.plan, self.refresh = service, plan, refresh
+        self.thread = None
+
+    def poll(self):
+        if self.thread is not None and self.thread.is_alive():
+            return
+        if not hasattr(self.service.broker, "receipt_reader"):
+            return
+        # Snapshot the reader configuration on the placement thread. SDK contexts
+        # themselves belong only to the observer and are closed by that observer.
+        reader = self.service.broker.receipt_reader()
+        observer = PaperEntry(
+            self.service.database, reader, self.service.session, clock=utc_now
+        )
+
+        def observe():
+            try:
+                observer.reconcile(self.plan["id"], now=utc_now(), pending_only=True)
+                self.refresh()
+            except (OSError, ValueError, sqlite3.Error):
+                pass
+            finally:
+                reader.close()
+
+        self.thread = Thread(target=observe, daemon=True)
+        self.thread.start()
+
+
 def wait_for_open(service, plan, replies, record, refresh=lambda: None):
     plan_id = plan["id"]
     started = utc_now()
-    for opening in service.openings(plan_id):
+    observer = ReceiptObserver(service, plan, refresh)
+    openings = service.openings(plan_id)
+    for opening in openings:
         if opening <= started:
             continue
         while (observed := utc_now()) < opening:
             if not service.openings(plan_id):
                 break
+            observer.poll()
             sleep_open(min(30, (opening - observed).total_seconds()))
         try:
             for reply in replies():
@@ -422,7 +458,10 @@ def wait_for_open(service, plan, replies, record, refresh=lambda: None):
                 plan_id, service.submit(plan_id, now=observed, opening=opening)
             )
         )
-        service.reconcile(plan_id, now=utc_now())
+        if opening != openings[-1]:
+            observer.poll()
+        else:
+            service.reconcile(plan_id, now=utc_now(), pending_only=True)
         refresh()
     emit({"plan": plan_id, "status": service.status(now=utc_now())})
 
@@ -432,7 +471,7 @@ def follow_receipts(service, plan, refresh):
     closes = max((instant(line["closes_at"]) for line in plan["lines"]), default=None)
     while True:
         now = utc_now()
-        outcomes = service.reconcile(plan["id"], now=now)
+        outcomes = service.reconcile(plan["id"], now=now, pending_only=True)
         refresh()
         emit(public_results(plan["id"], outcomes))
         if (

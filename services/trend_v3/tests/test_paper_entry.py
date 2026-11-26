@@ -3614,3 +3614,112 @@ def test_published_order_refresh_preserves_report_binding(
     with pytest.raises(ValueError):
         preparation.prepare(release, tmp_path / "wrong-head")
     assert not (tmp_path / "wrong-head").exists()
+
+
+@pytest.mark.parametrize("slow_reader", [False, True])
+def test_daily_cycle_updates_first_market_before_next_open(
+    tmp_path, monkeypatch, slow_reader
+):
+    from time import sleep
+
+    from trend_v3.paper_report import display_bytes
+
+    hk_open = datetime.fromisoformat(f"{DAY}T09:30:00+08:00")
+    clock = SimpleNamespace(at=hk_open - timedelta(minutes=1))
+    started, release, completed, closed = Event(), Event(), Event(), Event()
+    reads = []
+    placements = []
+    service = make_service(tmp_path)
+    broker = service.broker
+    broker.accounts["paper-hk"] = deepcopy(broker.accounts["paper-us"])
+    broker.accounts["paper-hk"].update(
+        currency="HKD",
+        identity="fixture-hk-account",
+        markets=["HK"],
+        net_value="500000",
+    )
+
+    class Reader:
+        environment = "SIMULATE"
+
+        def find_order(self, line, token, order_id, quantity):
+            reads.append((line["code"], clock.at))
+            if line["code"] == "HK.00005":
+                if slow_reader and len(reads) > 1:
+                    started.set()
+                    assert release.wait(5), "independent observer watchdog expired"
+                filled = quantity if clock.at >= hk_open + timedelta(minutes=1) else 7
+                completed.set()
+                return {
+                    "state": "filled" if filled == quantity else "active",
+                    "id": order_id,
+                    "filled": filled,
+                }
+            return {"state": "filled", "id": order_id, "filled": quantity}
+
+        def close(self):
+            closed.set()
+
+    class PlacementBroker(Broker):
+        def receipt_reader(self):
+            return Reader()
+
+        def place_market(self, line, quantity, token, *, deadline=None):
+            placements.append((line["code"], clock.at))
+            return {"state": "active", "id": line["code"], "filled": 0}
+
+    placement = PlacementBroker()
+    placement.accounts = broker.accounts
+    service.broker = placement
+    data, facts = two_market_inputs()
+    facts["report_version"] = "v02"
+    plan = service.plan(data, facts, now=clock.at)
+    assert len(plan["lines"]) == 2
+    assert service.approve(
+        plan["id"],
+        approval(plan, at=clock.at, delivered_at=clock.at.isoformat()),
+        now=clock.at,
+    )
+    reader = tmp_path / "reader.html"
+    original = b'<section id="simulation"><h2>Paper</h2><p>Pending</p></section>'
+    snapshots = []
+
+    def refresh():
+        html = display_bytes(original, service.status(now=clock.at), DAY, "v02")
+        reader.write_bytes(html)
+        snapshots.append((clock.at, html))
+
+    def wait(seconds):
+        clock.at += timedelta(seconds=seconds)
+        # Give the independent I/O observer CPU without advancing business time.
+        sleep(0.001)
+        if (
+            slow_reader
+            and clock.at > hk_open + timedelta(minutes=2)
+            and clock.at < OPEN
+        ):
+            assert started.wait(1)
+        if clock.at == OPEN:
+            if not slow_reader:
+                assert any(
+                    at < OPEN
+                    and b"US.ABC" in html
+                    and "HK.00005 · 全部成交".encode() in html
+                    for at, html in snapshots
+                )
+            else:
+                assert started.is_set() and not release.is_set()
+
+    monkeypatch.setattr(paper_cli, "utc_now", lambda: clock.at)
+    monkeypatch.setattr(paper_cli, "sleep_open", wait)
+    try:
+        paper_cli.wait_for_open(service, plan, lambda: [], lambda reply: None, refresh)
+        assert placements == [("HK.00005", hk_open), ("US.ABC", OPEN)]
+        assert len(reads) > 1
+        if not slow_reader:
+            assert any("HK.00005 · 部分成交".encode() in html for _, html in snapshots)
+    finally:
+        closed.clear()
+        release.set()
+        if slow_reader and started.is_set():
+            assert closed.wait(5), "observer did not finish after release"

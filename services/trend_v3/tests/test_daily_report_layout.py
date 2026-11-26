@@ -3429,3 +3429,54 @@ def test_verified_own_event_without_previous(tmp_path):
                 (root / "namesake.html").read_text(),
             )
             assert "温转热" in cells and "待查" in cells
+
+
+def test_pinned_paper_renderer_ignores_environment_shadow(tmp_path):
+    import os
+
+    from trend_v3.paper_report import simulation_section
+
+    shadow = tmp_path / "shadow"
+    shadow.mkdir()
+    (shadow / "paper_public.py").write_text('raise RuntimeError("foreign renderer")')
+    package = shadow / "trend_v3"
+    package.mkdir()
+    (package / "__init__.py").write_text('raise RuntimeError("foreign package")')
+    paper = {
+        "schema": "trend-v3-paper-entry.v1",
+        "date": "2040-01-01",
+        "report_version": "v02",
+        "results": [
+            {
+                "code": "US.ABC",
+                "state": "active",
+                "filled": 7,
+                "remaining": 93,
+                "quantity": 100,
+                "direction": "long",
+                "active": True,
+            }
+        ],
+        "skipped": [],
+    }
+    source, output = tmp_path / "report.json", tmp_path / "reader.html"
+    source.write_text(json.dumps({"date": "2040-01-01", "paper_entry": paper}))
+    run = subprocess.run(
+        [
+            sys.executable,
+            str(RENDERER),
+            str(source),
+            str(output),
+            "--report-revision",
+            "v02",
+        ],
+        cwd=shadow,
+        env=os.environ | {"PYTHONPATH": str(shadow)},
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 0, run.stderr
+    html = output.read_text()
+    assert "US.ABC · 部分成交 · 已成交 7 · 剩余 93" in html
+    assert "做多 · 申请数量 100" in html
+    assert simulation_section(paper, "2040-01-01", "v02") in html

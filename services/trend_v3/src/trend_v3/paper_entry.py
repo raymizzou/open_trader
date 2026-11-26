@@ -575,32 +575,50 @@ class PaperEntry:
             )
             return self.attempt_outcome(store, line, self.attempt(store, line))
 
-    def reconcile(self, plan_id, *, now):
+    def reconcile(self, plan_id, *, now, pending_only=False):
+        # Receipt I/O must never hold the SQLite placement lock. Keep a snapshot
+        # and discard a late response if another observer/retry changed it.
         with transaction(self.database) as store:
             plan, _ = self.stored_plan(store, plan_id)
             if plan is None:
                 return []
-            results = []
+            pending = []
             for line in plan["lines"]:
                 attempt = self.attempt(store, line)
                 if attempt is None or attempt["plan"] != plan_id:
                     continue
-                if attempt["state"] != "skipped":
-                    self.reconcile_attempt(store, line, attempt, now)
-                    attempt = self.attempt(store, line)
-                results.append(self.attempt_outcome(store, line, attempt))
-            return results
+                if attempt["state"] == "skipped" or (
+                    pending_only
+                    and (
+                        attempt["state"] not in {"active", "unknown"}
+                        or now >= instant(line["closes_at"])
+                    )
+                ):
+                    continue
+                pending.append((line, dict(attempt)))
+        for line, snapshot in pending:
+            observed = self.clock() if self.clock else now
+            if pending_only and observed >= instant(line["closes_at"]):
+                continue
+            try:
+                response = self.broker.find_order(
+                    line, snapshot["token"], snapshot["order_id"], snapshot["quantity"]
+                )
+            except Exception:
+                continue
+            with transaction(self.database) as store:
+                current = self.attempt(store, line)
+                if current is not None and dict(current) == snapshot:
+                    self.reconcile_attempt(store, line, current, now, response)
+        with transaction(self.database) as store:
+            return [
+                self.attempt_outcome(store, line, attempt)
+                for line in plan["lines"]
+                if (attempt := self.attempt(store, line)) is not None
+                and attempt["plan"] == plan_id
+            ]
 
-    def reconcile_attempt(self, store, line, attempt, now):
-        try:
-            response = self.broker.find_order(
-                line,
-                attempt["token"],
-                attempt["order_id"],
-                attempt["quantity"],
-            )
-        except Exception:
-            return
+    def reconcile_attempt(self, store, line, attempt, now, response):
         state, order_id, filled, reason = self.broker_result(
             response, attempt["quantity"]
         )

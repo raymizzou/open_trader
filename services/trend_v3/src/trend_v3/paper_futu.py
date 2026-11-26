@@ -96,6 +96,23 @@ class FutuPaperBroker:
         self.contexts = {}
         self.quote = None
 
+    def receipt_reader(self):
+        """Use separate SDK contexts and expose no placement interface."""
+        from copy import deepcopy
+
+        broker = FutuPaperBroker(
+            {**self.address, "accounts": deepcopy(self.settings)},
+            sdk=self.sdk,
+            clock=self.clock,
+        )
+
+        class Reader:
+            environment = SIMULATE
+            find_order = broker.find_order
+            close = broker.close
+
+        return Reader()
+
     def open_sdk(self):
         if self.sdk is None:
             try:

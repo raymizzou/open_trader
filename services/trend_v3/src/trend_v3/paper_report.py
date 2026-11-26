@@ -107,17 +107,11 @@ def prepare_report_evidence(root, report_day, revision, release):
 
 def simulation_section(paper, report_day, revision):
     """Use the exact same allowlist as the scheduled reader."""
-    import importlib.util
     from datetime import date
 
-    path = (
-        Path(__file__).resolve().parents[2]
-        / ".agents/skills/trend-v3-daily-report/paper_public.py"
-    )
-    spec = importlib.util.spec_from_file_location("trend_paper_public", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.render_simulation(paper, date.fromisoformat(report_day), revision)
+    from .paper_public import render_simulation
+
+    return render_simulation(paper, date.fromisoformat(report_day), revision)
 
 
 def atomic_private(path, raw):
