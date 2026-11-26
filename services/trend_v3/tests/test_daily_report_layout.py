@@ -3175,53 +3175,56 @@ def test_daily_reader_displays_reconciled_orders(tmp_path):
         "state": "cancelled",
         "id": "private-original",
         "filled": 40,
+        "filled_notional": "400",
     }
     service.submit(plan["id"], now=OPEN)
+    service.broker.accounts["paper-us"]["positions"] = [
+        {
+            "code": "US.ABC",
+            "currency": "USD",
+            "quantity": "40",
+            "notional": "480",
+            "mark": "12",
+        }
+    ]
     service.broker.reconciled = service.broker.reply
     (terminal,) = service.reconcile(plan["id"], now=OPEN + timedelta(seconds=1))
     at = OPEN + timedelta(seconds=2)
     assert service.approve(plan["id"], retry_reply(plan, terminal, at, 60), now=at)
     service.broker.reply = TimeoutError()
     service.submit(plan["id"], now=at, retry=True)
+    service.broker.reconciled = None
+    service.reconcile(plan["id"], now=at)
     paper = service.status(now=at)
     assert len(paper["results"]) == 2
+    assert paper["results"][0]["filled"] == 40
+    assert paper["results"][1]["filled"] is None
+    paper["report_version"] = paper["holdings"]["report_version"] = "v02"
     html = render(
         tmp_path,
         {"date": plan["date"], "paper_entry": paper},
-        "reconciled-orders",
-        report_revision="v1",
-    )
-    # Actual report revisions are vNN; retain the service fixture's test-only v1
-    # identity while giving the renderer a valid current revision.
-    paper["report_version"] = "v02"
-    for result in paper["results"]:
-        result["report_version"] = "v02"
-    html = render(
-        tmp_path,
-        {"date": plan["date"], "paper_entry": paper},
-        "reconciled-orders-current",
+        "holdings-current",
         report_revision="v02",
     )
-    section = html.split('id="simulation"', 1)[1].split("</section>", 1)[0]
-    assert section.count("US.ABC") == 2
-    assert "剩余撤销 · 已成交 40 · 剩余 60" in section
-    unknown = next(
-        row for row in re.findall(r"<li>.*?</li>", section) if "回执待核" in row
+    section = html.split('id="simulation"', 1)[1].split('<section id="kelly"', 1)[0]
+    assert section.count("<td>ABC</td>") == 1
+    assert "40 股" in section and "US$10.00" in section and "+US$80.00" in section
+    assert all(
+        text not in section
+        for text in ("申请数量", "记录 1", "private-original", "TV3")
     )
-    assert "已成交 0" not in unknown
-    assert "记录 1" in section and "记录 2" in section
-    assert section.count("做多") == 2
-    assert "申请数量 100" in section and "申请数量 60" in section
-    assert "private-original" not in html and "TV3" not in html
-
     extra = tmp_path / "more-orders"
     extra.mkdir()
     service = make_service(extra)
     plan = prepare(service, "LIVE", "PART", "DONE", "DENY")
     selected = [line for line in plan["lines"] if line["code"] != "US.DENY"]
     assert service.approve(plan["id"], approval(plan, selection=selected), now=PREOPEN)
-    pending = service.status(now=PREOPEN)
-    assert [row["approved"] for row in pending["results"]] == [100, 100, 100, None]
+    assert [row["approved"] for row in service.status(now=PREOPEN)["results"]] == [
+        100,
+        100,
+        100,
+        None,
+    ]
     for code, state, filled in (
         ("US.LIVE", "active", 0),
         ("US.PART", "active", 7),
@@ -3238,20 +3241,34 @@ def test_daily_reader_displays_reconciled_orders(tmp_path):
             item=next(line["item"] for line in plan["lines"] if line["code"] == code),
         )
     service.submit(plan["id"], now=OPEN)
+    service.broker.accounts["paper-us"]["positions"] = [
+        {
+            "code": code,
+            "currency": "USD",
+            "quantity": qty,
+            "notional": str(int(qty) * 20),
+        }
+        for code, qty in (("US.PART", "7"), ("US.DONE", "100"))
+    ]
+    service.reconcile(plan["id"], now=OPEN)
     paper = service.status(now=OPEN)
-    paper["report_version"] = "v02"
+    states = {row["code"]: row for row in paper["results"]}
+    assert states["US.PART"]["filled"] == 7 and states["US.PART"]["active"] is True
+    assert states["US.DONE"]["filled"] == 100 and states["US.DONE"]["active"] is False
+    assert states["US.DENY"]["reason"] == "not_approved"
+    paper["report_version"] = paper["holdings"]["report_version"] = "v02"
     html = render(
         tmp_path,
         {"date": plan["date"], "paper_entry": paper},
-        "subset-and-partial",
+        "subset-holdings",
         report_revision="v02",
     )
-    section = html.split('id="simulation"', 1)[1].split("</section>", 1)[0]
-    assert "US.LIVE · 已提交 · 已成交 0 · 剩余 100" in section
-    assert "US.PART · 部分成交 · 已成交 7 · 剩余 93 · 有活动委托" in section
-    assert "US.DONE · 全部成交 · 已成交 100 · 剩余 0" in section
-    assert "US.DENY · 已跳过 · 开盘前未收到确认" in section
-    assert section.count("申请数量 100") == 4
+    assert (
+        "7 股" in html
+        and "100 股" in html
+        and "<td>LIVE</td>" not in html
+        and "<td>DENY</td>" not in html
+    )
     assert len(service.broker.orders) == 3
 
 
@@ -3536,3 +3553,53 @@ def test_reader_approved_expanded_class_and_card(tmp_path):
     <p class="empty-direct">暂无其他有据关联的标的。</p></div>
     </div></details>'''
     assert Markup(region).events == Markup(expected).events
+
+
+def test_holdings_group_by_market_show_only_four_columns(tmp_path):
+    paper = {
+        "schema": "trend-v3-paper-entry.v1",
+        "date": "2040-01-01",
+        "report_version": "v02",
+        "results": [],
+        "skipped": [],
+        "holdings": {
+            "schema": "trend-v3-paper-holdings.v1",
+            "date": "2040-01-01",
+            "report_version": "v02",
+            "positions": [
+                {
+                    "code": code,
+                    "market": market,
+                    "product": product,
+                    "currency": currency,
+                    "quantity": quantity,
+                    "average_entry": price,
+                    "unrealized_pnl": pnl,
+                }
+                for code, market, product, currency, quantity, price, pnl in (
+                    ("BTC", "CRYPTO", "crypto", "USD", "0.025", "64000", "80"),
+                    ("US.AAPL", "US", "stock", "USD", "100", "180", "250"),
+                    ("HK.00700", "HK", "stock", "HKD", "-100", "400", "-350"),
+                    ("SH.600519", "CN", "stock", "CNY", "100", "1480", "0"),
+                    ("HK.HSI", "HK", "future", "HKD", "1", None, None),
+                )
+            ],
+        },
+    }
+    html = render(
+        tmp_path,
+        {"date": "2040-01-01", "paper_entry": paper},
+        "holdings",
+        report_revision="v02",
+    )
+    section = html.split('id="simulation"', 1)[1].split('<section id="kelly"', 1)[0]
+    for name in ("加密货币", "美股", "港股", "A股", "香港期货"):
+        assert name in section
+    assert (
+        re.findall(r"<th\b[^>]*>(.*?)</th>", section)
+        == ["标的", "持仓数量", "开仓均价", "持仓盈亏"] * 5
+    )
+    assert "0.025 BTC" in section and "−100 股" in section and "1 张" in section
+    assert "+US$80.00" in section and "−HK$350.00" in section and "¥0.00" in section
+    assert "—" in section and "申请数量" not in section and "记录 1" not in section
+    assert "#simulation .holdings" in html

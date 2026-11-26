@@ -14,10 +14,12 @@ from time import sleep as sleep_open
 from .paper_authority import (
     delivery_card,
     latest_report,
+    message_text,
     read_json,
     release_pin,
     require_private_dir,
     scheduled_scope,
+    session_records,
     transcript_replies,
     upload_receipt,
 )
@@ -136,6 +138,10 @@ def parse_args(argv=None):
     commands.add_parser(
         "plan", help="plan from the scheduled tab's latest daily report"
     )
+    manual = commands.add_parser(
+        "manual-holdings", help="record the original user crypto position snapshot"
+    )
+    manual.add_argument("snapshot", type=Path)
     commands.add_parser("status", help="produce the current redacted report supplement")
     approve = commands.add_parser(
         "approve", help="record an explicit reply from the original scheduled tab"
@@ -268,6 +274,46 @@ def run_daily(args):
         return 0
     state.mkdir(mode=0o700, exist_ok=True)
     require_private_dir(state)
+    if args.command == "manual-holdings":
+        snapshot = read_json(args.snapshot)
+        info = latest_report(root, report_day, pin, source_only=True)[2]
+        upload_receipt(home, scope, info)
+        if snapshot.get("report_version") != info["revision"]:
+            emit({"recorded": False})
+            return 2
+        proof = None
+        for record in session_records(home, scope["id"], root):
+            at = instant(record.get("timestamp"))
+            payload = record.get("payload", {})
+            text = message_text(payload, "user")
+            meta = payload.get("internal_chat_message_metadata_passthrough")
+            if meta and (
+                not isinstance(meta, dict)
+                or meta.get("content_item_kinds") != ["user.text"]
+                or meta.get("content_item_metadata")
+                != [{"provenance": {"type": "user"}}]
+            ):
+                continue
+            if (
+                record.get("type") == "response_item"
+                and at is not None
+                and at <= now
+                and at.astimezone(TAIPEI).date().isoformat() == report_day
+                and text == "模拟持仓 " + encode(snapshot)
+                and payload.get("recipient") in (None, "all")
+            ):
+                proof = record
+        service = PaperEntry(
+            state / "state.sqlite3",
+            OfflineBroker(),
+            scope,
+            verify_reply=lambda reply: proof is not None and reply is proof,
+        )
+        recorded = service.record_manual_holdings(snapshot, proof, now=now)
+        if recorded:
+            refresh_report(root, report_day, pin, now)
+        emit({"recorded": recorded})
+        return 0 if recorded else 2
     broker = FutuPaperBroker(settings(home), clock=utc_now)
     authorized = None
 

@@ -860,6 +860,7 @@ class OpenD:
         self.calls = []
         self.writes = []
         self.history = []
+        self.positions = []
         self.environment = "SIMULATE"
         self.status = "ACTIVE"
         self.markets = ["US"]
@@ -903,7 +904,7 @@ class OpenD:
         )
 
     def position_list_query(self, **params):
-        return self.query("positions", params, [])
+        return self.query("positions", params, self.positions)
 
     def order_list_query(self, **params):
         return self.query("orders", params, [])
@@ -3460,7 +3461,8 @@ def test_daily_cycle_reports_evidence_gap_without_broker(tmp_path, monkeypatch, 
     assert plan["lines"] == []
     assert sdk.calls == sdk.quote_calls == sdk.writes == []
     html = (root / "reports" / f"{DAY}.html").read_text()
-    assert "榜单日期或版本证据待核" in html
+    assert "持仓证据待核" in html
+    assert any(row["reason"] == "board_unverified" for row in plan["skipped"])
     assert "已核实无开仓信号" not in html
 
 
@@ -3523,12 +3525,31 @@ def test_published_order_refresh_preserves_report_binding(
     assert pending_until(root, DAY, RELEASE) == OPEN.replace(hour=16, minute=0)
     write = sdk.writes[0]
     sdk.history = [
-        {**write, "order_id": "paper-a", "order_status": "FILLED_ALL", "dealt_qty": 100}
+        {
+            **write,
+            "order_id": "paper-a",
+            "order_status": "FILLED_ALL",
+            "dealt_qty": 100,
+            "dealt_avg_price": "20",
+        }
+    ]
+    sdk.positions = [
+        {
+            "acc_id": 42,
+            "code": "US.ABC",
+            "currency": "USD",
+            "qty": 100,
+            "market_val": "2100",
+            "nominal_price": "21",
+            "cost_price": "20",
+            "cost_price_valid": True,
+        }
     ]
     clock.at = OPEN + timedelta(seconds=10)
     assert invoke("reconcile", plan["id"]) == 0
     html = reader.read_text()
-    assert "US.ABC · 全部成交 · 已成交 100 · 剩余 0" in html
+    assert "<td>ABC</td><td>100 股</td>" in html
+    assert "+US$100.00" in html
     assert "paper-a" not in html and "TV3" not in html
     assert {name: (evidence / name).read_bytes() for name in originals} == originals
     assert (evidence / "reader-original.html").read_bytes() == source_bytes
@@ -3576,7 +3597,7 @@ def test_published_order_refresh_preserves_report_binding(
     assert sdk.calls == broker_before
     assert reader.read_bytes() == reader_before
     # A tampered display cannot become authority through its own claimed hash.
-    reader.write_text(html.replace("已成交 100", "已成交 999"))
+    reader.write_text(html.replace("100 股", "999 股"))
     with pytest.raises(ValueError):
         paper_authority.latest_report(root, DAY, RELEASE)
     forged = json.loads((evidence / "paper-display.json").read_bytes())
@@ -3649,13 +3670,26 @@ def test_daily_cycle_updates_first_market_before_next_open(
                     started.set()
                     assert release.wait(5), "independent observer watchdog expired"
                 filled = quantity if clock.at >= hk_open + timedelta(minutes=1) else 7
+                placement.accounts["paper-hk"]["positions"] = [
+                    {
+                        "code": line["code"],
+                        "currency": "HKD",
+                        "quantity": str(filled),
+                        "notional": str(filled * 25),
+                        "mark": "25",
+                    }
+                ]
                 completed.set()
                 return {
                     "state": "filled" if filled == quantity else "active",
                     "id": order_id,
                     "filled": filled,
+                    "filled_notional": str(filled * 25),
                 }
             return {"state": "filled", "id": order_id, "filled": quantity}
+
+        def snapshot(self):
+            return deepcopy(placement.accounts)
 
         def close(self):
             closed.set()
@@ -3703,8 +3737,8 @@ def test_daily_cycle_updates_first_market_before_next_open(
             if not slow_reader:
                 assert any(
                     at < OPEN
-                    and b"US.ABC" in html
-                    and "HK.00005 · 全部成交".encode() in html
+                    and "400 股".encode() in html
+                    and "<td>00005</td>".encode() in html
                     for at, html in snapshots
                 )
             else:
@@ -3717,9 +3751,264 @@ def test_daily_cycle_updates_first_market_before_next_open(
         assert placements == [("HK.00005", hk_open), ("US.ABC", OPEN)]
         assert len(reads) > 1
         if not slow_reader:
-            assert any("HK.00005 · 部分成交".encode() in html for _, html in snapshots)
+            assert any("7 股".encode() in html for _, html in snapshots)
     finally:
         closed.clear()
         release.set()
         if slow_reader and started.is_set():
             assert closed.wait(5), "observer did not finish after release"
+
+
+def test_attributed_position_uses_filled_quantity_and_weighted_entry(tmp_path):
+    service = make_service(tmp_path)
+    plan = prepare(service, "ABC")
+    assert service.approve(plan["id"], approval(plan), now=PREOPEN)
+    service.broker.reply = {
+        "state": "cancelled",
+        "id": "first",
+        "filled": 40,
+        "filled_notional": "400",
+    }
+    service.submit(plan["id"], now=OPEN)
+    service.broker.accounts["paper-us"]["positions"] = [
+        {
+            "code": "US.ABC",
+            "currency": "USD",
+            "quantity": "40",
+            "mark": "12",
+            "notional": "480",
+        }
+    ]
+    service.broker.reconciled = service.broker.reply
+    (terminal,) = service.reconcile(plan["id"], now=OPEN + timedelta(seconds=1))
+    at = OPEN + timedelta(seconds=2)
+    assert service.approve(plan["id"], retry_reply(plan, terminal, at, 60), now=at)
+    service.broker.reply = {
+        "state": "filled",
+        "id": "second",
+        "filled": 60,
+        "filled_notional": "720",
+    }
+    assert service.submit(plan["id"], now=at, retry=True)[0]["state"] == "filled"
+    service.broker.accounts["paper-us"]["positions"][0]["quantity"] = "100"
+    service.broker.reconciled = service.broker.reply
+    service.reconcile(plan["id"], now=at)
+    positions = service.status(now=at)["holdings"]["positions"]
+    assert len(positions) == 1
+    assert (
+        positions[0]["quantity"],
+        positions[0]["average_entry"],
+        positions[0]["unrealized_pnl"],
+    ) == ("100", "11.2", "80.0")
+    service.reconcile(plan["id"], now=at)
+    assert service.status(now=at)["holdings"]["positions"] == positions
+
+
+def test_open_positions_survive_report_revision_and_clear_on_verified_flat(tmp_path):
+    service = make_service(tmp_path)
+    plan = prepare(service, "ABC")
+    service.approve(plan["id"], approval(plan), now=PREOPEN)
+    service.broker.reply = {
+        "state": "filled",
+        "id": "first",
+        "filled": 100,
+        "filled_notional": "2000",
+    }
+    service.submit(plan["id"], now=OPEN)
+    service.broker.accounts["paper-us"]["positions"] = [
+        {"code": "US.ABC", "currency": "USD", "quantity": "100", "notional": "2000"}
+    ]
+    service.broker.reconciled = service.broker.reply
+    service.reconcile(plan["id"], now=OPEN)
+    tomorrow = service.session | {"date": "2026-11-25", "id": "next-day"}
+    other = paper_entry.PaperEntry(service.database, service.broker, tomorrow)
+    data, facts = report()
+    data["date"] = "2026-11-25"
+    # Empty frozen new-day evidence does not invent a new entry.
+    at = PREOPEN + timedelta(days=1)
+    next_plan = other.plan(data, facts | {"report_version": "v03"}, now=at)
+    assert other.status(now=at)["holdings"]["positions"][0]["quantity"] == "100"
+    service.broker.accounts["paper-us"]["positions"] = None
+    other.reconcile(next_plan["id"], now=at)
+    assert other.status(now=at)["holdings"]["positions"][0]["quantity"] == "100"
+    service.broker.accounts["paper-us"]["positions"] = []
+    other.reconcile(next_plan["id"], now=at)
+    assert other.status(now=at)["holdings"]["positions"] == []
+    assert service.status(now=OPEN)["holdings"]["positions"][0]["quantity"] == "100"
+    service.broker.accounts["paper-us"]["positions"] = None
+    other.reconcile(next_plan["id"], now=at)
+    assert other.status(now=at)["holdings"]["verified_flat"] is False
+    # An unrelated later account position cannot resurrect the old V3 fill.
+    service.broker.accounts["paper-us"]["positions"] = [
+        {"code": "US.ABC", "currency": "USD", "quantity": "100", "notional": "2000"}
+    ]
+    other.reconcile(next_plan["id"], now=at)
+    assert all(
+        p["quantity"] is None for p in other.status(now=at)["holdings"]["positions"]
+    )
+
+
+def test_unknown_or_mixed_account_valuation_is_not_attributed(tmp_path):
+    service = make_service(tmp_path)
+    plan = prepare(service, "ABC")
+    service.approve(plan["id"], approval(plan), now=PREOPEN)
+    service.broker.reply = {
+        "state": "filled",
+        "id": "own",
+        "filled": 100,
+        "filled_notional": "2000",
+    }
+    service.submit(plan["id"], now=OPEN)
+    position = {
+        "code": "US.ABC",
+        "currency": "USD",
+        "quantity": "100",
+        "notional": "2000",
+        "unrealized_pnl": "999",
+        "average_entry": "10",
+        "mark": "12",
+    }
+    service.broker.accounts["paper-us"]["positions"] = [position]
+    service.broker.reconciled = service.broker.reply
+    service.reconcile(plan["id"], now=OPEN)
+    row = service.status(now=OPEN)["holdings"]["positions"][0]
+    assert row["unrealized_pnl"] is None
+    position.update(average_entry="20", unrealized_pnl="0", mark="20")
+    service.reconcile(plan["id"], now=OPEN)
+    assert service.status(now=OPEN)["holdings"]["positions"][0]["unrealized_pnl"] == "0"
+    position["quantity"] = "200"
+    service.reconcile(plan["id"], now=OPEN)
+    assert (
+        service.status(now=OPEN)["holdings"]["positions"][0]["unrealized_pnl"] is None
+    )
+    # Entirely synthetic account/position values. The broker's pl_val fallback
+    # is not a verified loss when its exact PnL and mark are unavailable.
+    raw = {
+        "acc_id": 123,
+        "code": "US.ABC",
+        "currency": "USD",
+        "qty": 100,
+        "cost_price": "20",
+        "cost_price_valid": True,
+        "nominal_price": "0",
+        "market_val": "0",
+        "unrealized_pl": "N/A",
+        "pl_val_valid": True,
+        "pl_val": "-2000",
+    }
+    account = {
+        "id": 123,
+        "category": "securities",
+        "currency": "USD",
+        "trade_market": "US",
+    }
+    service.broker.accounts["paper-us"]["positions"] = [
+        FutuPaperBroker.position(raw, account)
+    ]
+    service.reconcile(plan["id"], now=OPEN)
+    assert (
+        service.status(now=OPEN)["holdings"]["positions"][0]["unrealized_pnl"] is None
+    )
+    from trend_v3.paper_report import simulation_section
+    paper = service.status(now=OPEN)
+    paper["report_version"] = paper["holdings"]["report_version"] = "v02"
+    html = simulation_section(paper, DAY, "v02")
+    assert '<td class="">—</td>' in html
+    assert "−US$2,000.00" not in html
+    raw["unrealized_pl"] = "-12.50"
+    service.broker.accounts["paper-us"]["positions"] = [
+        FutuPaperBroker.position(raw, account)
+    ]
+    service.reconcile(plan["id"], now=OPEN)
+    assert (
+        service.status(now=OPEN)["holdings"]["positions"][0]["unrealized_pnl"]
+        == "-12.50"
+    )
+    raw["unrealized_pl"] = "0"
+    service.broker.accounts["paper-us"]["positions"] = [
+        FutuPaperBroker.position(raw, account)
+    ]
+    service.reconcile(plan["id"], now=OPEN)
+    assert service.status(now=OPEN)["holdings"]["positions"][0]["unrealized_pnl"] == "0"
+    raw.update(unrealized_pl="N/A", nominal_price="21", market_val="2100")
+    service.broker.accounts["paper-us"]["positions"] = [
+        FutuPaperBroker.position(raw, account)
+    ]
+    service.reconcile(plan["id"], now=OPEN)
+    assert (
+        service.status(now=OPEN)["holdings"]["positions"][0]["unrealized_pnl"] == "100"
+    )
+    manual = {
+        "schema": "trend-v3-manual-holdings.v1",
+        "strategy": "trend-v3",
+        "environment": "SIMULATE",
+        "date": DAY,
+        "report_version": "v1",
+        "account": "manual-crypto",
+        "positions": [
+            {
+                "code": "BTC",
+                "market": "CRYPTO",
+                "product": "crypto",
+                "currency": "USD",
+                "quantity": "0.025",
+                "average_entry": "64000",
+                "unrealized_pnl": None,
+            }
+        ],
+    }
+    assert not service.record_manual_holdings(manual, {}, now=OPEN)
+    assert service.record_manual_holdings(
+        manual, {"proof": "synthetic-test-authority"}, now=OPEN
+    )
+    assert any(
+        p["quantity"] == "0.025" and p["unrealized_pnl"] is None
+        for p in service.status(now=OPEN)["holdings"]["positions"]
+    )
+
+
+def test_manual_holdings_requires_matching_original_user_snapshot(
+    tmp_path, monkeypatch, capsys
+):
+    data, _ = report()
+    root, live, _ = daily_reader(tmp_path, data)
+    sdk = PlanningOpenD()
+    clock, invoke = tab_cli(tmp_path, monkeypatch, sdk, live)
+    capsys.readouterr()
+    snapshot = {
+        "schema": "trend-v3-manual-holdings.v1",
+        "strategy": "trend-v3",
+        "environment": "SIMULATE",
+        "date": DAY,
+        "report_version": "v02",
+        "account": "manual-crypto",
+        "positions": [
+            {
+                "code": "BTC",
+                "market": "CRYPTO",
+                "product": "crypto",
+                "currency": "USD",
+                "quantity": "0.025",
+                "average_entry": "64000",
+                "unrealized_pnl": None,
+            }
+        ],
+    }
+    path = private_input(root, "manual.json", snapshot)
+    assert invoke("manual-holdings", str(path)) == 2
+    clock.at += timedelta(seconds=1)
+    tab_record(tmp_path, "user", "模拟持仓 " + paper_entry.encode(snapshot), clock.at)
+    assert invoke("manual-holdings", str(path)) == 0
+    html = (root / "reports" / f"{DAY}.html").read_text()
+    assert "0.025 BTC" in html and "US$64,000.00" in html
+    assert sdk.calls == sdk.quote_calls == sdk.writes == []
+    snapshot["positions"][0]["quantity"] = "0"
+    clock.at += timedelta(seconds=1)
+    tab_record(tmp_path, "user", "模拟持仓 " + paper_entry.encode(snapshot), clock.at)
+    private_input(root, "manual.json", snapshot)
+    assert invoke("manual-holdings", str(path)) == 0
+    snapshot["positions"][0]["quantity"] = "0.025"
+    private_input(root, "manual.json", snapshot)
+    assert invoke("manual-holdings", str(path)) == 2
+    assert "0.025 BTC" not in (root / "reports" / f"{DAY}.html").read_text()
+    assert sdk.calls == sdk.quote_calls == sdk.writes == []

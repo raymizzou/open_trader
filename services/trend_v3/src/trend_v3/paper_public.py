@@ -77,6 +77,8 @@ def render_simulation(paper, report_day, report_revision):
         or not isinstance(paper.get("skipped"), list)
     ):
         return PAPER_PLACEHOLDER
+    if "holdings" in paper:
+        return render_holdings(paper["holdings"], report_day, report_revision)
     rows = []
     for record in paper["results"] + paper["skipped"]:
         if not isinstance(record, dict):
@@ -154,3 +156,202 @@ def render_simulation(paper, report_day, report_revision):
     if rows:
         return section + '\n        <ul role="list">' + "".join(rows) + "</ul>"
     return section
+
+
+HOLDINGS_STYLE = """<style>
+#simulation .holdings{overflow:hidden;
+border:1px solid #dcded4;
+border-radius:9px;
+margin:14px 0;
+background:#fffefa}
+#simulation .holdings h3{margin:0;
+padding:7px 16px;
+background:#ebeee5;
+color:#354433;
+font-size:17px}
+#simulation .holdings table{width:100%;
+border-collapse:collapse;
+table-layout:fixed}
+#simulation .holdings th,
+#simulation .holdings td{text-align:right;
+padding:6px 12px;
+font-variant-numeric:tabular-nums;
+white-space:nowrap}
+#simulation .holdings th{font-size:13px;
+color:#565e54;
+font-weight:500;
+border-bottom:1px solid #e7e8df}
+#simulation .holdings td{font-size:16px}
+#simulation .holdings tbody tr+tr{border-top:1px solid #eeeee7}
+#simulation .holdings th:first-child,
+#simulation .holdings td:first-child{text-align:left;
+white-space:normal;
+overflow-wrap:anywhere}
+#simulation .holdings .profit{color:#a54030}
+#simulation .holdings .loss{color:#25694e}
+@media(max-width:550px){#simulation .holdings th,
+#simulation .holdings td{padding:7px 4px;
+font-size:clamp(10px,3vw,14px)}
+#simulation .holdings th:first-child{width:17%}
+#simulation .holdings th:nth-child(2){width:23%}
+#simulation .holdings th:nth-child(3){width:32%}
+#simulation .holdings th:last-child{width:28%}}
+</style>"""
+
+
+def holding_number(value):
+    from decimal import Decimal, InvalidOperation
+
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        result = Decimal(str(value))
+        return result if result.is_finite() and abs(result) < Decimal("1e18") else None
+    except InvalidOperation:
+        return None
+
+
+def render_holdings(holdings, report_day, revision):
+    if (
+        not isinstance(holdings, dict)
+        or holdings.get("schema") != "trend-v3-paper-holdings.v1"
+        or holdings.get("date") != report_day.isoformat()
+        or holdings.get("report_version") != revision
+        or not isinstance(holdings.get("positions"), list)
+    ):
+        return '<p class="positions-note">持仓证据待核</p>'
+    names = {
+        "CRYPTO": "加密货币",
+        "US": "美股",
+        "HK": "港股",
+        "CN": "A股",
+        "JP": "日股",
+        "SG": "新加坡股票",
+        "AU": "澳股",
+        "CA": "加拿大股票",
+        "MY": "马股",
+    }
+    money = {
+        "USD": "US$",
+        "HKD": "HK$",
+        "CNY": "¥",
+        "JPY": "¥",
+        "SGD": "S$",
+        "AUD": "A$",
+        "CAD": "C$",
+        "MYR": "RM",
+    }
+    groups = {}
+    for row in holdings["positions"]:
+        if not isinstance(row, dict):
+            continue
+        code, market, product = row.get("code"), row.get("market"), row.get("product")
+        if (
+            not isinstance(code, str)
+            or not PAPER_CODE.fullmatch(code)
+            or market not in names
+        ):
+            continue
+        if (
+            product not in {"stock", "etf", "future", "crypto"}
+            or row.get("currency") not in money
+        ):
+            continue
+        qty = holding_number(row.get("quantity"))
+        if qty == 0:
+            continue
+        average, pnl = (
+            holding_number(row.get("average_entry")),
+            holding_number(row.get("unrealized_pnl")),
+        )
+        prefix = money[row["currency"]]
+        unit = (
+            code.split(".")[-1]
+            if product == "crypto"
+            else "张"
+            if product == "future"
+            else "股"
+        )
+        quantity = (
+            "—"
+            if qty is None
+            else format(qty, "f").rstrip("0").rstrip(".")
+            if qty % 1
+            else str(int(qty))
+        )
+        quantity = quantity.replace("-", "−") + (" " + unit if qty is not None else "")
+        price = "—" if average is None or average < 0 else prefix + f"{average:,.2f}"
+        profit = (
+            "—"
+            if pnl is None
+            else ("+" if pnl > 0 else "−" if pnl < 0 else "")
+            + prefix
+            + f"{abs(pnl):,.2f}"
+        )
+        tone = (
+            "profit"
+            if pnl is not None and pnl > 0
+            else "loss"
+            if pnl is not None and pnl < 0
+            else ""
+        )
+        label = names[market]
+        if product == "future":
+            label = {"HK": "香港期货", "US": "美国期货", "JP": "日本期货"}.get(
+                market, label + "期货"
+            )
+        groups.setdefault(label, []).append(
+            "<tr><td>"
+            + escape(code.split(".", 1)[-1])
+            + "</td><td>"
+            + escape(quantity)
+            + "</td><td>"
+            + escape(price)
+            + '</td><td class="'
+            + tone
+            + '">'
+            + escape(profit)
+            + "</td></tr>"
+        )
+    sections = []
+    order = [
+        "加密货币",
+        "美股",
+        "港股",
+        "A股",
+        "日股",
+        "新加坡股票",
+        "澳股",
+        "加拿大股票",
+        "马股",
+        "美国期货",
+        "香港期货",
+        "日本期货",
+    ]
+    for label in sorted(
+        groups, key=lambda name: order.index(name) if name in order else len(order)
+    ):
+        rows = groups[label]
+        sections.append(
+            '<div class="holdings"><h3>'
+            + label
+            + "</h3><table><thead><tr>"
+            + "".join(
+                '<th scope="col">' + title + "</th>"
+                for title in ("标的", "持仓数量", "开仓均价", "持仓盈亏")
+            )
+            + "</tr></thead><tbody>"
+            + "".join(rows)
+            + "</tbody></table></div>"
+        )
+    return (
+        HOLDINGS_STYLE + "".join(sections)
+        if sections
+        else '<p class="positions-note">'
+        + (
+            "已核实的 V3 头寸已归零；其他市场待核"
+            if holdings.get("verified_flat") is True
+            else "持仓证据待核"
+        )
+        + "</p>"
+    )

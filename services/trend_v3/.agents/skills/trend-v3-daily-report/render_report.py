@@ -272,7 +272,7 @@ def render(report, template, *, report_revision=None):
     day = report_date(report["date"])
     template = template.replace(
         PAPER_PLACEHOLDER + "<!-- paper-entry -->",
-        render_simulation(paper, day, report_revision),
+        render_simulation(paper, day, report_revision).replace("$", "$$"),
         1,
     )
     fragments = {name: Template(markup) for name, markup in FRAGMENT.findall(template)}
