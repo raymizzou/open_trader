@@ -1156,6 +1156,277 @@ def state_lock(path):
         yield
 
 
+def board_text(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def board_rows(values):
+    rows = {}
+    if isinstance(values, list):
+        for row in values:
+            if (
+                isinstance(row, dict)
+                and board_text(row.get("name"))
+                and valid_date(row.get("row_date"))
+                and strength_value(row.get("strength")) is not None
+            ):
+                rows.setdefault(row["name"].strip(), {
+                    key: row[key] for key in ("name", "strength", "row_date")
+                })
+    return rows
+
+
+def board_gap_key(row):
+    if (
+        isinstance(row, dict)
+        and board_text(row.get("name"))
+        and valid_date(row.get("row_date"))
+        and row.get("field") == "strength"
+    ):
+        return row["name"].strip(), row["row_date"]
+    return None
+
+
+def board_api_evidence(proof, observed, version, cutoff):
+    fallback, calls = proof.get("fallback"), proof.get("board_api_calls")
+    if (
+        type(calls) is int and calls > 0
+        and isinstance(fallback, dict)
+        and fallback.get("state") == "verified"
+        and fallback.get("group") == "金融资产"
+        and board_text(version) and fallback.get("version") == version
+        and board_text(fallback.get("source"))
+        and board_text(fallback.get("authorization"))
+        and observed_by(observed, fallback.get("observed_at"))
+        and (cutoff is None or observed_by(fallback.get("observed_at"), cutoff))
+    ):
+        return fallback
+    return {}
+
+
+def board_fallback(fallback, gaps, rows, row_dates):
+    if not fallback or not isinstance(gaps, list):
+        return {}
+    recorded = {board_gap_key(gap) for gap in gaps} - {None}
+    values = fallback.get("rows")
+    accepted = board_rows(values)
+    if not accepted or len(accepted) != len(values):
+        return {}
+    for row in values:
+        name = row["name"].strip()
+        if (
+            board_gap_key(row) not in recorded
+            or name in rows
+            or row_dates.get(name) not in (None, row["row_date"])
+        ):
+            return {}
+    return accepted
+
+
+def unavailable_board(proof, observed, reason, cutoff):
+    result = {"status": "unavailable", "visual_status": "unavailable", "reason": reason}
+    version = proof.get("board_version")
+    fallback = board_api_evidence(proof, observed, version, cutoff)
+    values = fallback.get("rows")
+    rows = board_rows(values)
+    count = fallback.get("row_count")
+    if (
+        not proof.get("rows")
+        and fallback.get("complete") is True
+        and board_text(fallback.get("tail_evidence"))
+        and type(count) is int and count > 0
+        and count == len(rows) == len(values)
+    ):
+        result.update(
+            status="complete",
+            method="api",
+            visual_status="unavailable",
+            visual_rows=[],
+            rows=list(rows.values()),
+            group=fallback["group"],
+            observed_at=fallback["observed_at"],
+            board_version=version,
+            board_api_calls=proof["board_api_calls"],
+        )
+    return result
+
+
+def fresh_board(proof, day, launch, launched_at, cutoff):
+    if (
+        proof.get("mode") != "fresh"
+        or proof.get("report_date") != day
+        or proof.get("launch") != launch
+    ):
+        return {"status": "workflow_failed", "reason": "proof_identity_mismatch"}
+    observed_at = confirmation_time(proof.get("observed_at"))
+    if not observed_by(launched_at, observed_at) or (
+        cutoff is not None and not observed_by(observed_at, cutoff)
+    ):
+        return {"status": "workflow_failed", "reason": "observation_outside_launch"}
+    if proof.get("attempted") is not True:
+        restriction = proof.get("restriction")
+        if (
+            proof.get("attempted") is False
+            and isinstance(restriction, dict)
+            and restriction.get("applies_to") == "scheduled_daily_financial_board"
+            and all(board_text(restriction.get(key)) for key in ("source", "evidence"))
+        ):
+            return unavailable_board(
+                proof, observed_at, "applicable_restriction", cutoff,
+            )
+        return {"status": "workflow_failed", "reason": "visual_attempt_required"}
+
+    version = proof.get("board_version", proof.get("page_timestamp"))
+    count, calls = proof.get("header_count"), proof.get("board_api_calls")
+    if type(calls) is not int or calls < 0:
+        return {"status": "workflow_failed", "reason": "invalid_api_call_count"}
+    scope = (
+        proof.get("app") == "趋势动物Pro"
+        and proof.get("page") == "大类资产"
+        and proof.get("group") == "金融资产"
+        and board_text(proof.get("page_evidence", proof.get("head_evidence")))
+        and board_text(proof.get("page_timestamp"))
+        and board_text(version)
+    )
+    if not scope:
+        if (
+            board_text(proof.get("blocking_step"))
+            and proof.get("coverage") != "complete"
+        ):
+            return unavailable_board(proof, observed_at, "visual_blocked", cutoff)
+        return {"status": "workflow_failed", "reason": "visual_page_unverified"}
+
+    values = proof.get("rows")
+    values = values if isinstance(values, list) else []
+    rows = board_rows(values)
+    row_dates = {
+        row["name"].strip(): valid_date(row.get("row_date"))
+        for row in values
+        if isinstance(row, dict) and board_text(row.get("name"))
+    }
+    closed_scope = (
+        type(count) is int
+        and count > 0
+        and len(row_dates) == len(values)
+        and proof.get("tail_seen") is True
+        and board_text(proof.get("tail_evidence"))
+    )
+    visual_complete = closed_scope and count == len(rows) == len(values)
+    fallback = {}
+    if not visual_complete:
+        evidence = board_api_evidence(proof, observed_at, version, cutoff)
+        fallback = board_fallback(evidence, proof.get("gaps"), rows, row_dates)
+    combined = rows | fallback
+    complete = (
+        visual_complete and calls == 0
+    ) or (
+        bool(fallback) and closed_scope and count == len(combined)
+        and row_dates.keys() <= combined.keys()
+    )
+    result = {
+        "status": "complete" if complete else "partial",
+        "method": "visual_api" if fallback else "visual",
+        "visual_status": "complete" if visual_complete else "partial",
+        "visual_rows": list(rows.values()),
+        "rows": list(combined.values()),
+        "group": proof["group"],
+        "page_timestamp": proof["page_timestamp"],
+        "observed_at": observed_at,
+        "board_version": version,
+        "board_api_calls": calls,
+    }
+    if visual_complete and calls != 0:
+        result.update(
+            status="workflow_failed", reason="invalid_complete_visual_call_count",
+        )
+    elif not complete and proof.get("coverage") == "complete":
+        result.update(status="workflow_failed", reason="unsupported_complete_claim")
+    elif not complete:
+        result["reason"] = "visual_coverage_incomplete"
+    return result
+
+
+def read_board_result(path, day, launch, launched_at, cutoff):
+    if path is None:
+        return {"status": "workflow_failed", "reason": "missing_acquisition_proof"}
+    try:
+        raw = path.read_bytes()
+        proof = json.loads(raw)
+    except FileNotFoundError:
+        return {"status": "workflow_failed", "reason": "missing_acquisition_proof"}
+    except (OSError, ValueError):
+        return {"status": "workflow_failed", "reason": "invalid_acquisition_proof"}
+    if not isinstance(proof, dict):
+        return {"status": "workflow_failed", "reason": "invalid_acquisition_proof"}
+    result = fresh_board(proof, day, launch, launched_at, cutoff)
+    result["proof_sha256"] = hashlib.sha256(raw).hexdigest()
+    return result
+
+
+def closeout(args):
+    launched_at = confirmation_time(args.launched_at)
+    if (
+        not valid_date(args.day)
+        or not re.fullmatch(r"[a-f0-9]{32}", args.launch or "")
+        or not launched_at
+        or datetime.fromisoformat(launched_at).astimezone(TAIPEI).date().isoformat()
+        < args.day
+        or args.state is None
+    ):
+        raise ValueError(
+            "closeout requires report day, launch ID/time and completion path"
+        )
+    context = json.loads(args.input.read_bytes())
+    mode = context.get("mode")
+    if mode == "offline":
+        return {"collection": "not_applicable"}
+    if mode == "fresh":
+        acquisition = read_board_result(
+            args.proof, args.day, args.launch, launched_at, context.get("completed_at"),
+        )
+        status = acquisition["status"]
+    elif (
+        mode == "verified_reuse"
+        and re.fullmatch(r"[a-f0-9]{64}", args.reuse_sha256 or "")
+        and context.get("reused_sha256") == args.reuse_sha256
+        and re.fullmatch(r"v[0-9]{2,}", args.reuse_revision or "")
+        and context.get("revision") == args.reuse_revision
+    ):
+        status = "complete"
+        acquisition = {"status": "not_applicable", "method": "verified_reuse"}
+    else:
+        status = "workflow_failed"
+        reason = "reuse_identity_mismatch" if mode == "verified_reuse" else (
+            "invalid_closeout_mode"
+        )
+        acquisition = {"status": status, "reason": reason}
+
+    receipt = {
+        key: context[key]
+        for key in (
+            "session", "revision", "sha256", "recheck", "pending", "sync",
+            "next_check_execution", "turn", "last_user_at", "completed_at",
+        )
+        if key in context
+    }
+    receipt.update(
+        launch=args.launch,
+        report_date=args.day,
+        collection=status,
+        acquisition=acquisition,
+    )
+    with state_lock(args.state):
+        if args.state.exists() and json.loads(
+            args.state.read_bytes()
+        ).get("launch") != args.launch:
+            raise ValueError("completion belongs to another launch")
+        save(args.state, receipt)
+    result = {"collection": receipt["collection"]}
+    if "reason" in acquisition:
+        result["reason"] = acquisition["reason"]
+    return result
+
+
 def initialize(path, report):
     path = Path(path)
     day = valid_date(report.get("date"))
@@ -1918,7 +2189,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "action",
-        choices=("targets", "init", "claim", "assess", "confirm", "search-plan"),
+        choices=(
+            "targets", "init", "claim", "assess", "confirm", "search-plan", "closeout",
+        ),
     )
     parser.add_argument(
         "input", type=Path, help="Verified projection, or calendar JSON for targets"
@@ -1932,8 +2205,20 @@ def main():
     parser.add_argument(
         "--report-revision", help="Independently verified report revision"
     )
+    parser.add_argument("--day", help="Closeout report day")
+    parser.add_argument("--launch", help="Closeout launch identity")
+    parser.add_argument("--launched-at", help="Start of the bound scheduled launch")
+    parser.add_argument("--proof", type=Path, help="Private board acquisition record")
+    parser.add_argument("--reuse-sha256", help="Pre-launch verified-reuse digest")
+    parser.add_argument("--reuse-revision", help="Pre-launch verified-reuse revision")
     args = parser.parse_args()
     try:
+        if args.action == "closeout":
+            value = closeout(args)
+            print(json.dumps(value, ensure_ascii=False))
+            if value["collection"] == "workflow_failed":
+                raise SystemExit(1)
+            return
         report = load_report(args.input)
         if args.action == "search-plan":
             value = search_plan(report)

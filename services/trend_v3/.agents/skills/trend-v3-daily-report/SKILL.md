@@ -39,6 +39,19 @@ description: Prepare or retrieve the mobile Trend V3 daily report for Trend Anim
 
 ## 定时会话
 
+### 母榜采集回执
+
+按正式启动消息调用同版 `collection.py closeout`。新取数在当日私有目录保留 `board-acquisition.json`：
+
+- 记录 `mode: "fresh"`、`report_date`、`launch`、实际 `attempted`、带时区的 `observed_at` 及母榜数据 API 实际调用数 `board_api_calls`。观测须属于本次启动。读到母榜时另存 `app: "趋势动物Pro"`、`page: "大类资产"`、`group: "金融资产"`、组首现场证据引用 `head_evidence`、原样 `page_timestamp`、`header_count`、`tail_seen`、`tail_evidence`、`coverage` 及 `rows: [{name, strength, row_date}]`。保留原样精度、零值和每行实际数据日。无独立 `board_version` 时用页面所示更新时间识别本次读屏版次，无需虚填母榜统一数据日。
+- 阻断写具体 `blocking_step`。明确适用于本次定时操作的限制须在 `restriction` 记录 `applies_to: "scheduled_daily_financial_board"` 及实际 `source`、`evidence`。历史批次暂停本身不能作为本次限制依据。
+- 补缺前留存 `gaps: [{name, row_date, field: "strength"}]`。获准后取得的官方响应写入 `fallback`，记录 `state: "verified"`、实际原响应 `source` 与既有授权依据 `authorization`、同金融资产组 `group`、同版 `version`、响应的带时区 `observed_at` 及 `rows: [{name, row_date, field: "strength", strength}]`。每个字段须绑定原先记录的缺项，不覆盖已核实视觉值。价目和更新状态不能用作补缺响应。仅在标题计数、组尾及逐行证据一致时确认完整母榜。视觉读全时母榜数据 API 调用为零。
+- 若实际阻断或适用限制导致整个母榜无法读屏，有独立适用版本、原授权和完整官方响应时可按供应商母榜确认数据覆盖。留存独立核实的 `board_version`，并在 `fallback` 另记录 `complete: true`、官方行数 `row_count`、读到末页的 `tail_evidence` 和全部逐行分数及实际数据日。视觉结论仍为未取得。账号警告不扩大原 API 权限。
+
+单独准备私有 `closeout-context.json`，按启动消息填模式和已核实的会话、文件、复查及上传信息。同版已核实的复用报告匹配启动器事先核实的原摘要和版次时，用 `mode: "verified_reuse"`。原稿摘要记为 `reused_sha256`，与当前展示文件摘要分开保存。复用不读取新取数证据。离线演练不写正式回执。收尾命令原子写 `daily-completion.json`，会话不可直接覆盖 `collection`。返回 `workflow_failed` 或报错时在本 tab 向 Ray 说明实际原因；部分或未取得按实际覆盖报告。按时交付可用 HTML。采集结果独立于 HTML、同步和模拟盘结果，不能推断交易机会，也不触发再取数。后续状态变化可用同一采集证据刷新回执。
+
+### 原 tab 与报告交付
+
 宿主启动器须沿用本次明确选定的 Codex profile 启动定时 tab，并核对实际生效的 Codex 调用参数与所选 profile 一致；仅有启动器配置或 tab 创建成功不足以证明生效。不把某台主机的个人权限模式硬编码为通用默认。参数不符时报告启动层问题，按已有授权处理，不自行改权限或调度；即使参数一致，仍须独立完成上述 Computer Use 应用访问与页面读回核实。
 
 启动交接保留原正式交互 tab 和本日会话身份。当正式发布包含纸盘计划入口时，在适用正式报告版本交付读回后，从同一提交调用 [Trend V3 模拟盘首次开仓](../trend-v3-paper-entry/SKILL.md)。盘前计划与结果都留在此 tab。在原 tab 展示可核验的盘前计划，收到明确用户回复后才记录批准，并由该 tab 的受监督命令等待相应市场开盘。收到撤回立即记录。日报版次变更后重新展示计划并取得新回复。该入口只读取原日报和模拟盘执行条件，不增加趋势数据请求、费用、调度或新 tab。未启用、证据不足或错过开盘时在原 tab 标明。历史读取及离线入口继续复用已经核实的同版报告，不启动纸盘入口。

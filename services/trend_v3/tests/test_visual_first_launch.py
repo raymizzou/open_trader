@@ -2,6 +2,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,16 @@ SPACE = "sp00000000"
 def launch_prompt(tmp_path, monkeypatch):
     service = Path(__file__).resolve().parents[1]
     host = service / "host"
+    verified_source = None
+
+    def latest_report(root, day, release, *, source_only):
+        assert source_only and release == PIN and day == DAY
+        if verified_source is None:
+            raise ValueError("unverified report")
+        return {}, {}, {
+            "report_sha256": sha256(verified_source).hexdigest(), "revision": "v05",
+        }
+
     # Stand in for trusted-host configuration, lifecycle and cloud access.
     monkeypatch.setitem(
         sys.modules,
@@ -34,6 +45,11 @@ def launch_prompt(tmp_path, monkeypatch):
         sys.modules,
         "daily_support",
         SimpleNamespace(sync_allowed=lambda *_: False),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "daily_paper",
+        SimpleNamespace(latest_report=latest_report),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -84,7 +100,13 @@ def launch_prompt(tmp_path, monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", herdr)
 
-    def launch(*, smoke):
+    def launch(*, smoke, existing_report=None, verified_original=None):
+        nonlocal verified_source
+        verified_source = verified_original
+        if existing_report is not None:
+            path = root / "reports" / f"{DAY}.html"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(existing_report)
         result = launcher.run(tmp_path, DAY, "daily-fixture", smoke)
         assert result.startswith("tab created;")
         [argv] = launch_argv
@@ -112,6 +134,11 @@ def test_scheduled_prompt_requires_visual_board_before_api(launch_prompt):
     assert "preserve the verified visual rows" in prompt
     assert "only unreadable or missing board fields" in prompt
     assert "zero board-data API calls" in prompt
+    assert "collection.py closeout" in prompt
+    assert "board-acquisition.json" in prompt and "daily-completion.json" in prompt
+    assert "collection=complete" not in prompt
+    assert "workflow_failed" in prompt
+    assert "--reuse-sha256" not in prompt
 
 
 def test_smoke_prompt_preserves_offline_mode(launch_prompt):
@@ -123,3 +150,21 @@ def test_smoke_prompt_preserves_offline_mode(launch_prompt):
     assert "Use no remote resources" in prompt
     assert "WeChat" not in prompt
     assert "大类资产 → 金融资产" not in prompt
+    assert "collection.py closeout" not in prompt
+
+
+@pytest.mark.parametrize("verified_report", (True, False))
+def test_scheduled_verified_reuse_is_bound_to_prelaunch_report(
+    launch_prompt, verified_report,
+):
+    original = b"existing private HTML"
+    display = b"current HTML with separately verified paper overlay"
+    prompt = launch_prompt(
+        smoke=False, existing_report=display,
+        verified_original=original if verified_report else None,
+    )
+
+    proof = f"--reuse-sha256 {sha256(original).hexdigest()} --reuse-revision v05"
+    assert (proof in prompt) == verified_report
+    assert sha256(display).hexdigest() not in prompt
+    assert "verified_reuse" in prompt
