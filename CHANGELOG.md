@@ -18,6 +18,15 @@
   full HTML copies and previews, in the `trend_v3_mock` iCloud Drive folder.
   Keep internal evidence, raw ledgers, and credentials private.
 
+## 2026-11-27 — Trend V3 Skill delivery provenance
+
+- Use the applicable Skill's clean normal entry for every Ray-visible output,
+  including previews, reruns and corrections; the explicitly labeled Mock UI is
+  the sole bypass. For fixes, run the version containing the fix and state the
+  exact run version plus active-or-pending scheduled-release status in the
+  delivery chat or handoff, while keeping private evidence and report content
+  separate.
+
 ## 2026-11-26 — Trend V3 task-tab workspace routing
 
 - Open new task tabs in the originating workspace. Reserve the Herdr `trend_v3`
