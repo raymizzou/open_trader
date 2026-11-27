@@ -3255,7 +3255,8 @@ def test_daily_reader_displays_reconciled_orders(tmp_path):
     states = {row["code"]: row for row in paper["results"]}
     assert states["US.PART"]["filled"] == 7 and states["US.PART"]["active"] is True
     assert states["US.DONE"]["filled"] == 100 and states["US.DONE"]["active"] is False
-    assert states["US.DENY"]["reason"] == "not_approved"
+    assert states["US.DENY"]["state"] == "pending"
+    assert states["US.DENY"]["reason"] == "awaiting_late_confirmation"
     paper["report_version"] = paper["holdings"]["report_version"] = "v02"
     html = render(
         tmp_path,

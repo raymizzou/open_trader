@@ -777,6 +777,11 @@ def routed_candidate(
         "timezone": session["timezone"],
         "session_date": session["session_date"],
         "strength": strength,
+        **(
+            {"contract_owner": route["contract_owner"]}
+            if product == "future" and text(route.get("contract_owner"))
+            else {}
+        ),
     }, None
 
 

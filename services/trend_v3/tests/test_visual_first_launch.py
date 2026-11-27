@@ -139,6 +139,10 @@ def test_scheduled_prompt_requires_visual_board_before_api(launch_prompt):
     assert "collection=complete" not in prompt
     assert "workflow_failed" in prompt
     assert "--reuse-sha256" not in prompt
+    assert f"paper_cli --report-date {DAY} cycle PLAN" in prompt
+    assert "Preopen approvals wait for their opening" in prompt
+    assert "Fresh approvals after opening may submit" in prompt
+    assert "never authorizes automatic catch-up" in prompt
 
 
 def test_smoke_prompt_preserves_offline_mode(launch_prompt):

@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from textwrap import indent
 from threading import Event
 from types import SimpleNamespace
 
@@ -187,7 +188,9 @@ class Broker:
         self.calls.append("market_open")
         return self.open
 
-    def place_market(self, line, quantity, token, *, deadline=None):
+    def place_market(self, line, quantity, token, *, deadline=None, on_submit=None):
+        if on_submit is not None:
+            on_submit()
         self.orders.append((line["code"], line["direction"], quantity, token))
         if isinstance(self.reply, Exception):
             raise self.reply
@@ -322,9 +325,12 @@ def test_late_plan_or_approval_does_not_submit(tmp_path):
     data, facts = report("ABC")
     at = OPEN + timedelta(minutes=1)
     late = service.plan(data, facts, now=at)
-    assert late["lines"] == []
-    assert late["skipped"] == [{"code": "US.ABC", "reason": "missed_open"}]
-    assert service.broker.calls == []
+    assert [(row["code"], row["quantity"]) for row in late["lines"]] == [
+        ("US.ABC", 100)
+    ]
+    assert late["skipped"] == []
+    assert service.submit(late["id"], now=at)[0]["reason"] == "missed_open"
+    assert service.broker.orders == []
 
     other_path = tmp_path / "other"
     other_path.mkdir()
@@ -465,7 +471,9 @@ def test_repeat_and_unknown_do_not_resubmit(tmp_path):
     entered, release, retry_entered = Event(), Event(), Event()
 
     class InterruptedBroker(Broker):
-        def place_market(self, line, quantity, token, *, deadline=None):
+        def place_market(self, line, quantity, token, *, deadline=None, on_submit=None):
+            if on_submit is not None:
+                on_submit()
             self.orders.append((line["code"], line["direction"], quantity, token))
             entered.set()
             if not release.wait(timeout=5):
@@ -1040,6 +1048,7 @@ class PlanningOpenD(OpenD):
         self.basic_suspension = False
         self.snapshot_suspension = False
         self.security_status = "NORMAL"
+        self.snapshot_time = f"{DATA_DAY} 16:00:00"
 
     def request_trading_days(self, **params):
         self.quote_calls.append(("calendar", params))
@@ -1063,7 +1072,7 @@ class PlanningOpenD(OpenD):
         return 0, [
             {
                 "code": params["code_list"][0],
-                "update_time": f"{DATA_DAY} 16:00:00",
+                "update_time": self.snapshot_time,
                 "last_price": "20",
                 "lot_size": self.lot + self.snapshot_offset,
                 "suspension": self.snapshot_suspension,
@@ -2508,6 +2517,262 @@ def show_plan(home, plan, when):
     tab_record(home, "assistant", plan["delivery"], when, phase="final_answer")
 
 
+@pytest.mark.parametrize(
+    ("display", "reply", "authorized"),
+    [
+        ("{card}", "同意", True),
+        ("```\n{card}\n```", "同意", True),
+        ("```text\n{card}\n```", "同意", True),
+        ("```plaintext\n{card}\n```", "同意", True),
+        (" \n  ~~~~ txt \t\n{card}\n ~~~~~\t\n ", "同意", True),
+        ("  ```text\n{two_spaces}\n  ```", "同意", True),
+        ("{four_spaces}", "同意", True),
+        ("```text/plain\n{card}\n```", "同意", True),
+        ('```text title="计划"\n{card}\n```', "同意", True),
+        ("  ~~~\tplain note=`两地`\r\n{crlf_indent}\r\n ~~~~", "同意", True),
+        ("```text\r\n{crlf}\r\n```", "同意", True),
+        ("```text\r{cr}\r```", "同意", True),
+        ("   ~~~ text\n{mixed_indent}\n ~~~", "确认第1项", True),
+        ("\n{tabs}\n\t", "同意", True),
+        ("````text\n{card}\n```", "同意", False),
+        ("```text\n{card}\n~~~", "同意", False),
+        ("```text\n{card}", "同意", True),
+        ("```text\n{card}\n```\n\n```\n别的话题\n```", "同意", False),
+        ("```text\n{changed_card}\n```", "同意", False),
+        ('```text title="`计划`"\n{card}\n```', "同意", False),
+        ('~~~text title="计划"\n{card}', "同意", True),
+        ("  ~~~text\r\n{crlf_indent}\r\n", "同意", True),
+        ("```text\n{truncated_card}", "同意", False),
+        ("```text\n{card}\n", "同意", True),
+        ("```text\n{card}\n\n", "同意", False),
+        ("```text\n{card}\n```text", "同意", False),
+        ("```text\n{card}\n换个字号？", "同意", False),
+        ("```text\n{card}\n```\n换个字号？\n```", "同意", False),
+        ("```text\n{changed_card}", "模拟批准 {plan_id} {item}", False),
+        ('```text title="计划"\n{card}\n```\n换个字号？', "同意", False),
+        ('```text title="计划"\n{changed_card}\n```', "同意", False),
+        ('```text title="同意"\n{card}\n```', "查看状态", False),
+        (" ```text\n{two_spaces}\n ```", "同意", False),
+        ("<pre>\n{card}\n</pre>", "同意", False),
+        ("{four_spaces}\n\n    另一个代码块", "同意", False),
+        ("```plaintext\n{card}\n```", "> 同意", False),
+    ],
+)
+def test_unambiguous_single_card_fence_preserves_same_day_agreement(
+    tmp_path, monkeypatch, capsys, display, reply, authorized
+):
+    data, _ = report("ABC")
+    _, live, _ = daily_files(tmp_path, data)
+    sdk = PlanningOpenD()
+    clock, invoke = tab_cli(tmp_path, monkeypatch, sdk, live)
+    plan = json.loads(capsys.readouterr().out)
+    card = plan["delivery"]
+    tab_record(
+        tmp_path,
+        "assistant",
+        display.format(
+            card=card,
+            changed_card=card.replace("数量 100", "数量 101"),
+            truncated_card=card[:-8],
+            two_spaces=indent(card, "  "),
+            four_spaces=indent(card, "    "),
+            mixed_indent="\n".join(
+                prefix + line
+                for prefix, line in zip(
+                    ("", " ", "  "), card.split("\n"), strict=True
+                )
+            ),
+            tabs=indent(card, "\t"),
+            crlf=card.replace("\n", "\r\n"),
+            crlf_indent=indent(card, "  ").replace("\n", "\r\n"),
+            cr=card.replace("\n", "\r"),
+        ),
+        PREOPEN + timedelta(seconds=1),
+        phase="final_answer",
+    )
+    if authorized:
+        clock.at = PREOPEN + timedelta(seconds=2)
+        sdk.lot = 7
+        assert invoke("plan") == 0
+        assert json.loads(capsys.readouterr().out) == plan
+        sdk.lot = 1
+    clock.at = OPEN + timedelta(minutes=30)
+    sdk.snapshot_time = f"{DAY} 09:59:00"
+    tab_record(
+        tmp_path,
+        "user",
+        reply.format(plan_id=plan["id"], item=plan["lines"][0]["item"]),
+        clock.at,
+    )
+    assert invoke("approve", plan["id"]) == (0 if authorized else 2)
+    expected = [("US.ABC", 100)] if authorized else []
+    assert [(row["code"], row["qty"]) for row in sdk.writes] == expected
+    assert invoke("submit", plan["id"]) == 0
+    assert [(row["code"], row["qty"]) for row in sdk.writes] == expected
+
+
+@pytest.mark.parametrize("context_change", ["assistant", "user", "same-message"])
+def test_bare_agreement_requires_immediately_unambiguous_order_context(
+    tmp_path, monkeypatch, capsys, context_change
+):
+    data, _ = report("ABC")
+    _, live, _ = daily_files(tmp_path, data)
+    sdk = PlanningOpenD()
+    clock, invoke = tab_cli(tmp_path, monkeypatch, sdk, live)
+    plan = json.loads(capsys.readouterr().out)
+    prompt = "要把这份日报的文字调大一点吗？"
+    if context_change == "same-message":
+        tab_record(
+            tmp_path,
+            "assistant",
+            plan["delivery"] + "\n" + prompt,
+            PREOPEN + timedelta(seconds=1),
+            phase="final_answer",
+        )
+    else:
+        show_plan(tmp_path, plan, PREOPEN + timedelta(seconds=1))
+    clock.at = OPEN + timedelta(minutes=30)
+    sdk.snapshot_time = f"{DAY} 09:59:00"
+    if context_change != "same-message":
+        tab_record(
+            tmp_path, context_change, prompt, clock.at - timedelta(seconds=2),
+            phase="final_answer" if context_change == "assistant" else None,
+        )
+    tab_record(tmp_path, "user", "同意", clock.at)
+    assert (invoke("approve", plan["id"]), len(sdk.writes)) == (2, 0)
+    ambiguous = json.loads(capsys.readouterr().out)
+    assert ambiguous["reason"] == "approval_clarification_required"
+
+    clock.at += timedelta(seconds=1)
+    tab_record(tmp_path, "user", "确认第1项", clock.at)
+    assert (invoke("approve", plan["id"]), len(sdk.writes)) == (0, 1)
+    (order,) = sdk.writes
+    assert (order["code"], order["qty"]) == ("US.ABC", 100)
+
+
+def test_original_plan_accepts_first_reply_after_open(tmp_path, monkeypatch, capsys):
+    data, _ = report("ABC", "XYZ")
+    _, live, _ = daily_files(tmp_path, data)
+    sdk = PlanningOpenD()
+    morning = datetime.fromisoformat(f"{DAY}T08:30:00+08:00")
+    clock, invoke = tab_cli(tmp_path, monkeypatch, sdk, live, start=morning)
+    original = json.loads(capsys.readouterr().out)
+    show_plan(tmp_path, original, morning + timedelta(seconds=1))
+    clock.at += timedelta(seconds=2)
+    sdk.lot = 7
+    assert invoke("plan") == 0
+    assert json.loads(capsys.readouterr().out)["lines"] == original["lines"]
+    sdk.lot = 1
+    confirmed_at = OPEN + timedelta(minutes=30)
+    clock.at = confirmed_at
+
+    assert invoke("plan") == 0
+    resumed = json.loads(capsys.readouterr().out)
+    assert resumed["id"] == original["id"]
+    assert resumed["lines"] == original["lines"]
+    assert resumed["delivery"] == original["delivery"]
+    assert invoke("status") == 0
+    before = json.loads(capsys.readouterr().out)
+    assert [(row["code"], row["state"]) for row in before["results"]] == [
+        ("US.ABC", "pending"),
+        ("US.XYZ", "pending"),
+    ]
+    assert sdk.writes == []
+
+    placed_at = []
+    place = sdk.place_order
+
+    def place_order(**params):
+        placed_at.append(clock.at)
+        result, rows = place(**params)
+        if params["code"] == "US.XYZ":
+            rows[0]["order_id"] = "fixture-second-order"
+        return result, rows
+
+    monkeypatch.setattr(sdk, "place_order", place_order)
+    sdk.snapshot_time = f"{DAY} 09:59:00"
+    tab_record(tmp_path, "user", "只确认第1项", confirmed_at)
+    assert invoke("cycle", original["id"]) == 0
+    assert placed_at == [confirmed_at]
+    assert [(row["code"], row["qty"]) for row in sdk.writes] == [("US.ABC", 100)]
+    assert invoke("status") == 0
+    after = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert (
+        next(row for row in after["results"] if row["code"] == "US.XYZ")["state"]
+        == "pending"
+    )
+
+    clock.at = datetime.fromisoformat(f"{DAY}T16:01:00-05:00")
+    sdk.snapshot_time = f"{DAY} 16:00:00"
+    monkeypatch.setattr(
+        sdk,
+        "get_market_state",
+        lambda *, code_list: (
+            0, [{"code": code_list[0], "market_state": "AFTER_HOURS_BEGIN"}]
+        ),
+    )
+    tab_record(tmp_path, "user", "只确认第2项", clock.at)
+    assert invoke("approve", original["id"]) == 0
+    assert placed_at == [confirmed_at, clock.at]
+    assert [(row["code"], row["qty"]) for row in sdk.writes] == [
+        ("US.ABC", 100), ("US.XYZ", 100)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("broker_status", "expected"), [("SUBMITTED", "active"), ("FAILED", "rejected")]
+)
+def test_same_day_postclose_confirmation_submits_once_and_reads_broker_outcome(
+    tmp_path, monkeypatch, capsys, broker_status, expected
+):
+    data, _ = report("ABC")
+    _, live, _ = daily_files(tmp_path, data)
+
+    class AfterClose(PlanningOpenD):
+        def get_market_state(self, *, code_list):
+            return 0, [{"code": code_list[0], "market_state": "AFTER_HOURS_BEGIN"}]
+
+        def place_order(self, **params):
+            assert clock.at == confirmed_at
+            result, rows = super().place_order(**params)
+            rows[0]["order_status"] = broker_status
+            return result, rows
+
+    sdk = AfterClose()
+    clock, invoke = tab_cli(tmp_path, monkeypatch, sdk, live)
+    plan = json.loads(capsys.readouterr().out)
+    show_plan(tmp_path, plan, PREOPEN + timedelta(seconds=1))
+
+    confirmed_at = datetime.fromisoformat(f"{DAY}T16:01:00-05:00")
+    clock.at = confirmed_at
+    sdk.snapshot_time = f"{DAY} 16:00:00"
+    tab_record(tmp_path, "user", "同意", confirmed_at)
+    assert invoke("cycle", plan["id"]) == 0
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    dispatched = output[1]["results"][0]
+    assert (dispatched["state"], dispatched["filled"], dispatched["remaining"]) == (
+        expected,
+        0,
+        100,
+    )
+    assert len(sdk.writes) == 1
+    (order,) = sdk.writes
+    assert (order["code"], order["qty"], order["session"], order["time_in_force"]) == (
+        "US.ABC",
+        100,
+        "RTH",
+        "DAY",
+    )
+    assert order["fill_outside_rth"] is False
+    assert invoke("cycle", plan["id"]) in {0, 2}
+    assert invoke("status") == 0
+    status = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert [(row["state"], row["filled"]) for row in status["results"]] == [
+        (expected, 0)
+    ]
+    assert len(sdk.writes) == 1
+
+
 def test_daily_tab_approval_places_selected_market_order_at_open(
     tmp_path, monkeypatch, capsys
 ):
@@ -2544,7 +2809,7 @@ def test_daily_tab_approval_places_selected_market_order_at_open(
         "wrong-tab",
         "no-message",
         "early",
-        "late",
+        "stale-after-open",
         "unrelated",
         "quoted",
         "tool-recipient",
@@ -2574,9 +2839,10 @@ def test_daily_tab_approval_excludes_other_or_stale_replies(
             invoke("approve", plan["id"])
         assert sdk.writes == []
         return
-    if case == "late":
+    if case == "stale-after-open":
         clock.at = OPEN + timedelta(seconds=1)
         tab_record(tmp_path, "user", approve, clock.at)
+        clock.at += timedelta(hours=1)
     elif case == "unrelated":
         tab_record(tmp_path, "user", "看一下计划", clock.at)
     elif case == "quoted":
@@ -2734,6 +3000,242 @@ def two_market_inputs(*extra):
     return data, facts
 
 
+@pytest.mark.parametrize("independent_command", [False, True])
+def test_mixed_markets_late_subset_waits_for_remaining_open(
+    tmp_path, monkeypatch, capsys, independent_command
+):
+    data, _ = two_market_inputs("XYZ")
+    _, live, _ = daily_files(tmp_path, data)
+    placements = []
+
+    class TwoMarketOpenD(PlanningOpenD):
+        def get_acc_list(self):
+            return 0, [
+                {
+                    "acc_id": account,
+                    "trd_env": "SIMULATE",
+                    "acc_status": "ACTIVE",
+                    "trdmarket_auth": [market],
+                    "sim_acc_type": "STOCK",
+                    "acc_type": "CASH",
+                }
+                for market, account in (("US", 42), ("HK", 43))
+            ]
+
+        def query(self, kind, params, rows):
+            assert params["trd_env"] == "SIMULATE"
+            assert params["acc_id"] in {42, 43}
+            self.calls.append((kind, params))
+            return 0, rows
+
+        def accinfo_query(self, **params):
+            return self.query(
+                "funds",
+                params,
+                [
+                    {
+                        "currency": "USD" if params["acc_id"] == 42 else "HKD",
+                        "total_assets": 100000,
+                        "available_funds": 100000,
+                    }
+                ],
+            )
+
+        def place_order(self, **params):
+            placements.append((params["code"], params["qty"], clock.at))
+            return super().place_order(**params)
+
+    sdk = TwoMarketOpenD()
+    hk_open = datetime.fromisoformat(f"{DAY}T09:30:00+08:00")
+    clock, invoke = tab_cli(
+        tmp_path, monkeypatch, sdk, live, start=hk_open - timedelta(minutes=1)
+    )
+    plan = json.loads(capsys.readouterr().out)
+    items = {line["code"]: line for line in plan["lines"]}
+    assert set(items) == {"HK.00005", "US.ABC", "US.XYZ"}
+    show_plan(tmp_path, plan, clock.at + timedelta(seconds=1))
+    clock.at = hk_open
+    reply_at = hk_open + timedelta(seconds=30)
+    already_replied = False
+
+    def wait(seconds):
+        nonlocal already_replied
+        clock.at += timedelta(seconds=seconds)
+        if not already_replied and clock.at >= reply_at:
+            already_replied = True
+            sdk.snapshot_time = f"{DAY} 09:30:00"
+            selected = ",".join(items[code]["item"] for code in ("HK.00005", "US.ABC"))
+            tab_record(tmp_path, "user", f"模拟批准 {plan['id']} {selected}", clock.at)
+            if independent_command:
+                assert invoke("approve", plan["id"]) == 0
+        elif already_replied and clock.at < OPEN - timedelta(minutes=1):
+            assert [(code, qty) for code, qty, _ in placements] == [
+                ("HK.00005", items["HK.00005"]["quantity"])
+            ]
+            clock.at = OPEN - timedelta(minutes=1)
+
+    monkeypatch.setattr(paper_cli, "sleep_open", wait)
+    assert invoke("submit", plan["id"]) == 0
+    assert [(code, qty) for code, qty, _ in placements] == [
+        (code, items[code]["quantity"]) for code in ("HK.00005", "US.ABC")
+    ]
+    assert reply_at <= placements[0][2] < reply_at + timedelta(seconds=30)
+    assert placements[1][2] == OPEN
+    assert invoke("status") == 0
+    status = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert (
+        next(row for row in status["results"] if row["code"] == "US.XYZ")["state"]
+        == "pending"
+    )
+
+
+@pytest.mark.parametrize("indented_history", [False, True])
+def test_unconfirmed_late_items_survive_restart_without_replay(
+    tmp_path, monkeypatch, capsys, indented_history
+):
+    data, _ = report("ABC", "XYZ", "QRS")
+    _, live, _ = daily_files(tmp_path, data)
+    sdk = PlanningOpenD()
+    clock, invoke = tab_cli(tmp_path, monkeypatch, sdk, live)
+    plan = json.loads(capsys.readouterr().out)
+    plan_id = plan["id"]
+    first, second, third = plan["lines"]
+    legacy_card = plan["delivery"].rsplit("\n", 1)[0]
+    if indented_history:
+        legacy_card = indent(legacy_card, "    ")
+    tab_record(
+        tmp_path,
+        "assistant",
+        legacy_card,
+        PREOPEN + timedelta(seconds=1),
+        phase="final_answer",
+    )
+    clock.at = PREOPEN + timedelta(seconds=2)
+    tab_record(tmp_path, "user", "只确认第1项", clock.at)
+    assert invoke("approve", plan_id) == 0
+
+    clock.at = OPEN + timedelta(minutes=30)
+    assert invoke("submit", plan_id) == 0
+    tab_record(tmp_path, "user", "只确认第2项", clock.at)
+    assert invoke("approve", plan_id) == 2
+    assert sdk.writes == []
+    clock.at += timedelta(seconds=1)
+    show_plan(tmp_path, plan, clock.at)
+    clock.at += timedelta(seconds=1)
+    tab_record(tmp_path, "user", "只确认第2项", clock.at)
+    clock.at += timedelta(hours=2)
+    assert invoke("submit", plan_id) == 0
+    assert sdk.writes == []
+    assert invoke("status") == 0
+    status = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert {row["state"] for row in status["results"]} == {"pending"}
+
+    tab_record(tmp_path, "user", f"模拟撤回 {plan_id} {first['item']}", clock.at)
+    assert invoke("approve", plan_id) == 0
+    assert json.loads(capsys.readouterr().out)["recorded"] is True
+    clock.at += timedelta(seconds=1)
+    sdk.snapshot_time = f"{DAY} 11:59:00"
+    tab_record(tmp_path, "user", "确认第1、2项", clock.at)
+    assert invoke("approve", plan_id) == 0
+    assert [(row["code"], row["qty"]) for row in sdk.writes] == [
+        (second["code"], second["quantity"])
+    ]
+    assert invoke("submit", plan_id) == 0
+
+    clock.at = datetime.fromisoformat(f"{DAY}T00:01:00-05:00") + timedelta(days=1)
+    tab_record(tmp_path, "user", "只确认第3项", clock.at)
+    assert invoke("cycle", plan_id) in {0, 2}
+    assert len(sdk.writes) == 1
+    assert invoke("status") == 0
+    status = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert {row["code"]: row["state"] for row in status["results"]} == {
+        first["code"]: "denied",
+        second["code"]: "active",
+        third["code"]: "skipped",
+    }
+
+
+@pytest.mark.parametrize(
+    ("condition", "expected"),
+    [
+        ("funds", "approved_size_exceeds_available_funds"),
+        ("price", "approved_size_exceeds_entry_budget"),
+        ("halted", "market_halted"),
+        ("external", "instrument_busy"),
+        ("timeout", "broker_timeout"),
+    ],
+)
+def test_late_confirmation_rechecks_account_and_unknown_orders(
+    tmp_path, monkeypatch, capsys, condition, expected
+):
+    data, _ = report("ABC")
+    _, live, _ = daily_files(tmp_path, data)
+
+    class CurrentAccount(PlanningOpenD):
+        changed = False
+
+        def accinfo_query(self, **params):
+            result, rows = super().accinfo_query(**params)
+            if self.changed and condition == "funds":
+                rows[0]["available_funds"] = "1000"
+            return result, rows
+
+        def get_market_snapshot(self, **params):
+            result, rows = super().get_market_snapshot(**params)
+            if self.changed and condition == "price":
+                rows[0]["last_price"] = "25"
+            return result, rows
+
+        def order_list_query(self, **params):
+            if self.changed and condition == "external":
+                return self.query(
+                    "orders",
+                    params,
+                    [
+                        {
+                            "code": "US.ABC",
+                            "currency": "USD",
+                            "qty": 5,
+                            "dealt_qty": 0,
+                            "price": 20,
+                            "order_id": "isolated-external-order",
+                            "order_status": "UNRECOGNIZED",
+                        }
+                    ],
+                )
+            return super().order_list_query(**params)
+
+        def place_order(self, **params):
+            result = super().place_order(**params)
+            if condition == "timeout":
+                raise TimeoutError
+            return result
+
+    sdk = CurrentAccount()
+    clock, invoke = tab_cli(tmp_path, monkeypatch, sdk, live)
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["lines"][0]["quantity"] == 100
+    show_plan(tmp_path, plan, PREOPEN + timedelta(seconds=1))
+    clock.at = OPEN + timedelta(minutes=30)
+    sdk.changed = True
+    sdk.snapshot_time = f"{DAY} 09:59:00"
+    sdk.snapshot_suspension = condition == "halted"
+    tab_record(tmp_path, "user", "同意", clock.at)
+    assert invoke("approve", plan["id"]) == 0
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    (outcome,) = output[-1]["results"]
+    assert outcome["reason"] == expected
+    assert outcome["quantity"] == 100
+    assert outcome["state"] == ("unknown" if condition == "timeout" else "skipped")
+    assert len(sdk.writes) == (1 if condition == "timeout" else 0)
+    if condition == "timeout":
+        clock.at += timedelta(seconds=1)
+        tab_record(tmp_path, "user", "同意", clock.at)
+        assert invoke("approve", plan["id"]) == 2
+        assert invoke("submit", plan["id"]) == 0
+        assert len(sdk.writes) == 1
+
+
 def test_native_account_budget_without_portfolio_fx(tmp_path):
     service = make_service(tmp_path)
     data, facts = two_market_inputs()
@@ -2799,6 +3301,7 @@ def test_scheduled_cli_executes_multi_item_groups_without_catchup(
 
     class LatentOpenD(PlanningOpenD):
         controlled = None
+        inject_latency = True
         sends = []
 
         def get_acc_list(self):
@@ -2818,7 +3321,7 @@ def test_scheduled_cli_executes_multi_item_groups_without_catchup(
             assert params["trd_env"] == "SIMULATE"
             assert params["acc_id"] in {42, 43}
             self.calls.append((kind, params))
-            if self.controlled is not None:
+            if self.controlled is not None and self.inject_latency:
                 latency = {"funds": 3, "capacity": capacity_latency, "write": 1}.get(
                     kind, 0
                 )
@@ -2911,6 +3414,21 @@ def test_scheduled_cli_executes_multi_item_groups_without_catchup(
     sent = len(sdk.writes)
     assert invoke("submit", plan["id"]) == 0
     assert len(sdk.writes) == sent
+    if miss_us_wake or capacity_latency == 10:
+        missed = "US.ABC" if miss_us_wake else "US.QRS"
+        (selected,) = [line for line in plan["lines"] if line["code"] == missed]
+        sdk.inject_latency = False
+        sdk.snapshot_time = f"{DAY} 09:30:00"
+        clock.at = OPEN + timedelta(minutes=1)
+        tab_record(
+            tmp_path, "user", f"模拟批准 {plan['id']} {selected['item']}", clock.at
+        )
+        assert invoke("approve", plan["id"]) == 0
+        assert len(sdk.writes) == sent + 1
+        assert (sdk.writes[-1]["code"], sdk.writes[-1]["qty"]) == (
+            missed,
+            selected["quantity"],
+        )
 
 
 @pytest.mark.parametrize(
@@ -2923,6 +3441,7 @@ def test_scheduled_cli_executes_multi_item_groups_without_catchup(
         ("确认第1、1项", False, []),
         ("我看到有人说确认全部", False, []),
         ("确认全部", True, []),
+        ("确认全部", "indented", []),
     ],
 )
 def test_daily_cli_accepts_unambiguous_numbered_chinese_approval(
@@ -2941,6 +3460,8 @@ def test_daily_cli_accepts_unambiguous_numbered_chinese_approval(
     clock.at += timedelta(seconds=1)
     if competing_plan:
         other = plan["delivery"].replace(plan["id"], "a" * 64)
+        if competing_plan == "indented":
+            other = indent(other, "    ")
         tab_record(tmp_path, "assistant", other, clock.at, phase="final_answer")
         clock.at += timedelta(seconds=1)
     show_plan(tmp_path, plan, clock.at)
@@ -2956,8 +3477,9 @@ def test_daily_cli_accepts_unambiguous_numbered_chinese_approval(
     ]
     assert all(
         row.startswith(f"第{index}项 | {plan['lines'][index - 1]['item']} | ")
-        for index, row in enumerate(plan["delivery"].splitlines()[1:], 1)
+        for index, row in enumerate(plan["delivery"].splitlines()[1:-1], 1)
     )
+    assert len(plan["delivery"].splitlines()[1:-1]) == len(plan["lines"])
 
 
 @pytest.mark.parametrize("process_withdrawal", ["interactive", "waiter"])
@@ -3027,7 +3549,12 @@ def test_mixed_openings_withdraw_all_preserves_past_and_cancels_future(
             withdrawn = True
             assert [write["code"] for write in sdk.writes] == ["HK.00005"]
             tab_record(tmp_path, "user", "确认全部", clock.at)
-            assert invoke("approve", plan_id) == 2
+            assert invoke("approve", plan_id) == 0
+            confirmation = [
+                json.loads(row) for row in capsys.readouterr().out.splitlines()
+            ][-1]
+            assert confirmation["items"] == [items["US.ABC"]]
+            assert [write["code"] for write in sdk.writes] == ["HK.00005"]
             clock.at += timedelta(seconds=1)
             tab_record(tmp_path, "user", plan["withdraw_all"], clock.at)
             if process_withdrawal == "interactive":
@@ -3053,7 +3580,7 @@ def test_mixed_openings_withdraw_all_preserves_past_and_cancels_future(
     no_op = json.loads(capsys.readouterr().out)
     assert no_op["recorded"] is False
     assert no_op["decision"] == "deny"
-    assert no_op["reason"] == "no_unopened_items"
+    assert no_op["reason"] == "no_withdrawable_items"
     assert set(no_op["ignored_opened_items"]) == set(items.values())
     assert invoke("status") == 0
     assert json.loads(capsys.readouterr().out) == before
@@ -3647,7 +4174,8 @@ def test_daily_cycle_updates_first_market_before_next_open(
 
     hk_open = datetime.fromisoformat(f"{DAY}T09:30:00+08:00")
     clock = SimpleNamespace(at=hk_open - timedelta(minutes=1))
-    started, release, completed, closed = Event(), Event(), Event(), Event()
+    started, release, closed = Event(), Event(), Event()
+    partial_visible, full_visible = Event(), Event()
     reads = []
     placements = []
     service = make_service(tmp_path)
@@ -3662,11 +4190,13 @@ def test_daily_cycle_updates_first_market_before_next_open(
 
     class Reader:
         environment = "SIMULATE"
+        blocked = False
 
         def find_order(self, line, token, order_id, quantity):
             reads.append((line["code"], clock.at))
             if line["code"] == "HK.00005":
                 if slow_reader and len(reads) > 1:
+                    self.blocked = True
                     started.set()
                     assert release.wait(5), "independent observer watchdog expired"
                 filled = quantity if clock.at >= hk_open + timedelta(minutes=1) else 7
@@ -3679,7 +4209,6 @@ def test_daily_cycle_updates_first_market_before_next_open(
                         "mark": "25",
                     }
                 ]
-                completed.set()
                 return {
                     "state": "filled" if filled == quantity else "active",
                     "id": order_id,
@@ -3692,13 +4221,16 @@ def test_daily_cycle_updates_first_market_before_next_open(
             return deepcopy(placement.accounts)
 
         def close(self):
-            closed.set()
+            if self.blocked:
+                closed.set()
 
     class PlacementBroker(Broker):
         def receipt_reader(self):
             return Reader()
 
-        def place_market(self, line, quantity, token, *, deadline=None):
+        def place_market(self, line, quantity, token, *, deadline=None, on_submit=None):
+            if on_submit is not None:
+                on_submit()
             placements.append((line["code"], clock.at))
             return {"state": "active", "id": line["code"], "filled": 0}
 
@@ -3722,17 +4254,22 @@ def test_daily_cycle_updates_first_market_before_next_open(
         html = display_bytes(original, service.status(now=clock.at), DAY, "v02")
         reader.write_bytes(html)
         snapshots.append((clock.at, html))
+        if b"<td>00005</td>" in html:
+            if "7 股".encode() in html:
+                partial_visible.set()
+            if "400 股".encode() in html:
+                full_visible.set()
 
     def wait(seconds):
         clock.at += timedelta(seconds=seconds)
         # Give the independent I/O observer CPU without advancing business time.
         sleep(0.001)
-        if (
-            slow_reader
-            and clock.at > hk_open + timedelta(minutes=2)
-            and clock.at < OPEN
-        ):
-            assert started.wait(1)
+        if hk_open < clock.at < hk_open + timedelta(minutes=1):
+            assert partial_visible.wait(1)
+        if hk_open + timedelta(minutes=2) < clock.at < OPEN - timedelta(seconds=30):
+            milestone = started if slow_reader else full_visible
+            assert milestone.wait(1)
+            clock.at = OPEN - timedelta(seconds=30)
         if clock.at == OPEN:
             if not slow_reader:
                 assert any(
@@ -3753,7 +4290,6 @@ def test_daily_cycle_updates_first_market_before_next_open(
         if not slow_reader:
             assert any("7 股".encode() in html for _, html in snapshots)
     finally:
-        closed.clear()
         release.set()
         if slow_reader and started.is_set():
             assert closed.wait(5), "observer did not finish after release"
@@ -4353,6 +4889,20 @@ def test_daily_bridge_cycle_replays_partial_fills_as_verified_holdings(
     replay = json.loads(capsys.readouterr().out)
     assert replay["lines"] == [] and replay["order_writes"] == replay["broker_io"] == 0
     assert replay["skipped"] == [{"code": "600001.SH", "reason": "missed_open"}]
+
+    first_late = tmp_path / "scheduled-after-open"
+    _, late_owner, late_at, _, _ = frozen_bridge(
+        first_late,
+        [("600001.SH", "CN", "qualified")],
+        late=True,
+    )
+    cn_sdk = BridgeOpenD()
+    assert run_daily_plan(first_late, cn_sdk, late_at, late_owner, monkeypatch) == 0
+    late_plan = json.loads(capsys.readouterr().out)
+    assert [(row["code"], row["quantity"]) for row in late_plan["lines"]] == [
+        ("SH.600001", 100)
+    ]
+    assert cn_sdk.writes == []
 
     root, live, now, _, _ = frozen_bridge(
         tmp_path / "scheduled",

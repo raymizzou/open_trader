@@ -9,7 +9,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from .paper_authority import latest_report, strict_json
-from .paper_entry import PaperEntry, fingerprint
+from .paper_entry import PaperEntry, fingerprint, late_deadline, late_trade_date
 from .paper_evidence import (
     board_seat_verified,
     board_verified,
@@ -28,11 +28,16 @@ from .paper_store import SCHEMA
 _CURRENT_SCHEMA = frozenset(
     " ".join(statement.replace(" IF NOT EXISTS", "").split()) for statement in SCHEMA
 )
+_HOLDINGS_SCHEMA = frozenset(
+    statement
+    for statement in _CURRENT_SCHEMA
+    if statement.split()[2] != "attempt_dispatches"
+)
 # The execution store before feab08de. Holdings added these tables without
 # migrating any of the original execution tables.
 _LEGACY_SCHEMA = frozenset(
     statement
-    for statement in _CURRENT_SCHEMA
+    for statement in _HOLDINGS_SCHEMA
     if statement.split()[2]
     in {
         "plans",
@@ -102,6 +107,7 @@ class ExecutionSnapshot:
     retries: dict
     replies: list
     orders: dict
+    dispatches: dict
 
 
 def execution_snapshot(path: Path, report: FrozenReport):
@@ -120,7 +126,7 @@ def execution_snapshot(path: Path, report: FrozenReport):
             " ".join(row[0].split())
             for row in db.execute("SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL")
         }
-        if schemas not in (_CURRENT_SCHEMA, _LEGACY_SCHEMA):
+        if schemas not in (_CURRENT_SCHEMA, _HOLDINGS_SCHEMA, _LEGACY_SCHEMA):
             raise ValueError("expected the canonical paper execution schema")
         plans = {}
         for row in db.execute(
@@ -174,7 +180,17 @@ def execution_snapshot(path: Path, report: FrozenReport):
             for row in db.execute("SELECT * FROM replies")
             if row["plan"] in plans
         ]
-    return ExecutionSnapshot(plans, attempts, approvals, retries, replies, orders)
+        dispatches = (
+            {
+                row["token"]: dict(row)
+                for row in db.execute("SELECT * FROM attempt_dispatches")
+            }
+            if schemas == _CURRENT_SCHEMA
+            else {}
+        )
+    return ExecutionSnapshot(
+        plans, attempts, approvals, retries, replies, orders, dispatches
+    )
 
 
 def opening_group(report, line):
@@ -266,8 +282,23 @@ def authorized_attempt(token, snapshot):
         raise ValueError("official attempt is unverified or declined")
     opens, closes = instant(line["opens_at"]), instant(line["closes_at"])
     approval = snapshot.approvals[(plan["id"], line["item"])]
+    dispatch = snapshot.dispatches.get(token)
+    late = number == 1 and dispatch is not None and dispatch["mode"] == "late"
     if number == 1:
         proof, lower, upper = approval, instant(plan["created"]), opens
+        earliest = opens
+        if late:
+            at, sent = instant(proof["at"]), instant(dispatch["submitted_at"])
+            if not (
+                at is not None
+                and sent is not None
+                and late_trade_date(line, at)
+                and at <= sent < late_deadline(line, at)
+            ):
+                raise ValueError("late submission time is unverified")
+            lower, upper, earliest = opens, late_deadline(line, at), sent
+        elif dispatch is not None and dispatch["mode"] != "opening":
+            raise ValueError("opening dispatch mode is unverified")
     else:
         (previous,) = [
             row
@@ -278,11 +309,14 @@ def authorized_attempt(token, snapshot):
             and row["item"] == attempt["item"]
         ]
         proof, lower, upper = snapshot.retries[previous["token"]], opens, closes
+        earliest = instant(proof["at"])
         if (
             previous["state"] not in {"cancelled", "rejected"}
             or not previous["reconciled"]
             or instant(previous["reconciled"]) >= instant(proof["at"])
             or previous["quantity"] - previous["filled"] != proof["quantity"]
+            or dispatch is not None
+            and dispatch["mode"] != "retry"
         ):
             raise ValueError("retry proof does not match the earlier attempt")
     decision = "approve" if number == 1 else "retry"
@@ -301,9 +335,11 @@ def authorized_attempt(token, snapshot):
             and reply.get("source") == "user_reply"
             and text(reply.get("author"))
             and reply.get("decision") == decision
+            and (not late or reply.get("late_timing_disclosed") is True)
             and instant(reply.get("at")) == at
             and instant(plan["created"]) <= instant(reply.get("delivered_at")) <= at
             and (number == 1 or event_id == proof["event_id"])
+            and (dispatch is None or event_id == dispatch["event_id"])
             and any(
                 selected.get("item") == line["item"]
                 and selected.get("quantity") == proof["quantity"]
@@ -327,7 +363,7 @@ def authorized_attempt(token, snapshot):
         )
     ):
         raise ValueError("official account is unverified")
-    return attempt, line, scope, opens if number == 1 else at
+    return attempt, line, scope, earliest
 
 
 def report_catalog(report):

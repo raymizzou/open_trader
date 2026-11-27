@@ -21,8 +21,10 @@ The source receipt remains bound to the immutable report; a display receipt also
 records `source_sha256`. A forged display hash alone cannot authorize a copy.
 
 The scheduled original tab plans after the initial trusted report upload. It
-shows the exact card and runs `paper_cli cycle PLAN` only after an explicit reply.
-That supervised handle waits for each opening and follows existing receipts.
+shows the exact card and runs `paper_cli --report-date DATE cycle PLAN` after
+an explicit reply. DATE stays tied to the original report across Taipei
+midnight. The handle waits for preopen approvals, checks fresh same-market-day
+approvals after opening, and follows existing receipts.
 Refresh and host sync do not plan, approve, connect to a broker or submit orders.
 After Taipei midnight, the existing per-report companion can continue within its
 bounded 24-hour lifetime while saved orders are outstanding before their original
