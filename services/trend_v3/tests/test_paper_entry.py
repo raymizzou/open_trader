@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from textwrap import indent
 from threading import Event
 from types import SimpleNamespace
 
@@ -2524,11 +2525,20 @@ def show_plan(home, plan, when):
         ("```text\n{card}\n```", "同意", True),
         ("```plaintext\n{card}\n```", "同意", True),
         (" \n  ~~~~ txt \t\n{card}\n ~~~~~\t\n ", "同意", True),
+        ("  ```text\n{two_spaces}\n  ```", "同意", True),
+        ("{four_spaces}", "同意", True),
+        ("```text/plain\n{card}\n```", "同意", True),
+        ("```text\r\n{crlf}\r\n```", "同意", True),
+        ("   ~~~ text\n{mixed_indent}\n ~~~", "确认第1项", True),
+        ("\n{tabs}\n\t", "同意", True),
         ("````text\n{card}\n```", "同意", False),
         ("```text\n{card}\n~~~", "同意", False),
         ("```text\n{card}", "同意", False),
         ("```text\n{card}\n```\n\n```\n别的话题\n```", "同意", False),
         ("```text\n{changed_card}\n```", "同意", False),
+        (" ```text\n{two_spaces}\n ```", "同意", False),
+        ("<pre>\n{card}\n</pre>", "同意", False),
+        ("{four_spaces}\n\n    另一个代码块", "同意", False),
         ("```plaintext\n{card}\n```", "> 同意", False),
     ],
 )
@@ -2544,10 +2554,29 @@ def test_unambiguous_single_card_fence_preserves_same_day_agreement(
     tab_record(
         tmp_path,
         "assistant",
-        display.format(card=card, changed_card=card.replace("数量 100", "数量 101")),
+        display.format(
+            card=card,
+            changed_card=card.replace("数量 100", "数量 101"),
+            two_spaces=indent(card, "  "),
+            four_spaces=indent(card, "    "),
+            mixed_indent="\n".join(
+                prefix + line
+                for prefix, line in zip(
+                    ("", " ", "  "), card.split("\n"), strict=True
+                )
+            ),
+            tabs=indent(card, "\t"),
+            crlf=card.replace("\n", "\r\n"),
+        ),
         PREOPEN + timedelta(seconds=1),
         phase="final_answer",
     )
+    if authorized:
+        clock.at = PREOPEN + timedelta(seconds=2)
+        sdk.lot = 7
+        assert invoke("plan") == 0
+        assert json.loads(capsys.readouterr().out) == plan
+        sdk.lot = 1
     clock.at = OPEN + timedelta(minutes=30)
     sdk.snapshot_time = f"{DAY} 09:59:00"
     tab_record(tmp_path, "user", reply, clock.at)
@@ -3036,8 +3065,9 @@ def test_mixed_markets_late_subset_waits_for_remaining_open(
     )
 
 
+@pytest.mark.parametrize("indented_history", [False, True])
 def test_unconfirmed_late_items_survive_restart_without_replay(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, indented_history
 ):
     data, _ = report("ABC", "XYZ", "QRS")
     _, live, _ = daily_files(tmp_path, data)
@@ -3047,6 +3077,8 @@ def test_unconfirmed_late_items_survive_restart_without_replay(
     plan_id = plan["id"]
     first, second, third = plan["lines"]
     legacy_card = plan["delivery"].rsplit("\n", 1)[0]
+    if indented_history:
+        legacy_card = indent(legacy_card, "    ")
     tab_record(
         tmp_path,
         "assistant",
@@ -3385,6 +3417,7 @@ def test_scheduled_cli_executes_multi_item_groups_without_catchup(
         ("确认第1、1项", False, []),
         ("我看到有人说确认全部", False, []),
         ("确认全部", True, []),
+        ("确认全部", "indented", []),
     ],
 )
 def test_daily_cli_accepts_unambiguous_numbered_chinese_approval(
@@ -3403,6 +3436,8 @@ def test_daily_cli_accepts_unambiguous_numbered_chinese_approval(
     clock.at += timedelta(seconds=1)
     if competing_plan:
         other = plan["delivery"].replace(plan["id"], "a" * 64)
+        if competing_plan == "indented":
+            other = indent(other, "    ")
         tab_record(tmp_path, "assistant", other, clock.at, phase="final_answer")
         clock.at += timedelta(seconds=1)
     show_plan(tmp_path, plan, clock.at)

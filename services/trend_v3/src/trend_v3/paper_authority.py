@@ -20,8 +20,12 @@ HEX_SHA = re.compile(r"[0-9a-f]{40}")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
 SESSION_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 REVISION = re.compile(r"v[0-9]{2,}")
-PLAN_HEADER = re.compile(r"^模拟开仓计划 ([0-9a-f]{64}) · 日报 (v[0-9]{2,})$", re.M)
+PLAN_HEADER = re.compile(
+    r"^[ \t]*模拟开仓计划 ([0-9a-f]{64}) · 日报 (v[0-9]{2,})\r?$", re.M
+)
 NUMBERED_APPROVAL = re.compile(r"只?确认第([1-9][0-9]{0,2}(?:、[1-9][0-9]{0,2})*)项")
+CODE_FENCE = re.compile(r"( {0,3})(`{3,}|~{3,})(.*)")
+FENCE_INFO = re.compile(r"[A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)?")
 
 
 def strict_json(value):
@@ -211,35 +215,76 @@ def message_text(item, role):
     return content if isinstance(content, str) else None
 
 
+def remove_code_indent(line, columns):
+    """Remove up to the structural indent, retaining unconsumed tab columns."""
+    width = offset = 0
+    while width < columns and offset < len(line):
+        char = line[offset]
+        if char == " ":
+            width += 1
+        elif char == "\t":
+            width += 4 - width % 4
+        else:
+            break
+        offset += 1
+    return width >= columns, " " * max(0, width - columns) + line[offset:]
+
+
+def standalone_delivery_body(assistant):
+    """Read either an unwrapped message or one literal Markdown code block."""
+    lines = assistant.replace("\r\n", "\n").split("\n")
+    start, end = 0, len(lines)
+    while start < end and not lines[start].strip(" \t"):
+        start += 1
+    while start < end and not lines[end - 1].strip(" \t"):
+        end -= 1
+    lines = lines[start:end]
+    if not lines:
+        return None
+    opening = CODE_FENCE.fullmatch(lines[0])
+    if opening is not None:
+        indent, fence, raw_info = opening.groups()
+        info = raw_info.strip(" \t")
+        closing = CODE_FENCE.fullmatch(lines[-1])
+        if (
+            len(lines) < 2
+            or (info and not FENCE_INFO.fullmatch(info))
+            or closing is None
+            or not closing[2].startswith(fence)
+            or closing[3].strip(" \t")
+        ):
+            return None
+        return "\n".join(
+            remove_code_indent(line, len(indent))[1] for line in lines[1:-1]
+        )
+
+    if remove_code_indent(lines[0], 4)[0]:
+        body = []
+        for line in lines:
+            indented, content = remove_code_indent(line, 4)
+            if not indented and line.strip(" \t"):
+                return None
+            body.append(content)
+        return "\n".join(body)
+    return "\n".join(lines)
+
+
 def visible_delivery(item, card, historical_card):
     if item.get("phase") != "final_answer":
-        return None, None
+        return None, None, False
     assistant = message_text(item, "assistant")
     if assistant:
+        literal = standalone_delivery_body(assistant)
+        if literal in (card, historical_card):
+            return assistant, literal == card, True
+        # Preserve an exact line-delimited delivery with surrounding context
+        # for named replies. Bare agreement requires the standalone body.
         message = f"\n{assistant}\n"
         if f"\n{card}\n" in message:
-            return assistant, True
+            return assistant, True, False
         if f"\n{historical_card}\n" in message:
-            return assistant, False
-    return assistant, None
-
-
-def standalone_delivery(assistant, card):
-    if assistant.strip() == card:
-        return True
-    before, exact_card, after = assistant.partition(card)
-    if not exact_card:
-        return False
-    opening = re.fullmatch(
-        r"(?:[ \t]*\n)* {0,3}(`{3,}|~{3,})(?:[ \t]*[A-Za-z0-9_.+-]+)?[ \t]*\n",
-        before,
-    )
-    closing = re.fullmatch(r"\n {0,3}(`{3,}|~{3,})[ \t]*(?:\n[ \t]*)*", after)
-    return (
-        opening is not None
-        and closing is not None
-        and closing[1].startswith(opening[1])
-    )
+            return assistant, False, False
+    return assistant, None, False
 
 
 def plan_was_delivered(home, root, scope, plan, created, now):
@@ -248,7 +293,7 @@ def plan_was_delivered(home, root, scope, plan, created, now):
     for record in session_records(home, scope["id"], root):
         at = instant(record.get("timestamp"))
         if record.get("type") == "response_item" and at and created <= at <= now:
-            _, timing = visible_delivery(
+            _, timing, _ = visible_delivery(
                 record.get("payload", {}), card, historical_card
             )
             if timing is not None:
@@ -339,13 +384,15 @@ def transcript_replies(home, root, scope, plan, created, now):
             continue
         item = record.get("payload", {})
         if visible_message(item, "assistant"):
-            assistant, timing = visible_delivery(item, card, historical_card)
+            assistant, timing, standalone = visible_delivery(
+                item, card, historical_card
+            )
             bare_offer = False
             if assistant:
                 displayed.update(PLAN_HEADER.findall(assistant))
                 if created <= at and timing is not None:
                     delivered, late_timing_disclosed = at, timing
-                    bare_offer = timing and standalone_delivery(assistant, card)
+                    bare_offer = timing and standalone
             continue
         if not delivered or at <= delivered or not visible_message(item, "user"):
             continue
