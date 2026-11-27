@@ -2516,6 +2516,48 @@ def show_plan(home, plan, when):
     tab_record(home, "assistant", plan["delivery"], when, phase="final_answer")
 
 
+@pytest.mark.parametrize(
+    ("display", "reply", "authorized"),
+    [
+        ("{card}", "同意", True),
+        ("```\n{card}\n```", "同意", True),
+        ("```text\n{card}\n```", "同意", True),
+        ("```plaintext\n{card}\n```", "同意", True),
+        (" \n  ~~~~ txt \t\n{card}\n ~~~~~\t\n ", "同意", True),
+        ("````text\n{card}\n```", "同意", False),
+        ("```text\n{card}\n~~~", "同意", False),
+        ("```text\n{card}", "同意", False),
+        ("```text\n{card}\n```\n\n```\n别的话题\n```", "同意", False),
+        ("```text\n{changed_card}\n```", "同意", False),
+        ("```plaintext\n{card}\n```", "> 同意", False),
+    ],
+)
+def test_unambiguous_single_card_fence_preserves_same_day_agreement(
+    tmp_path, monkeypatch, capsys, display, reply, authorized
+):
+    data, _ = report("ABC")
+    _, live, _ = daily_files(tmp_path, data)
+    sdk = PlanningOpenD()
+    clock, invoke = tab_cli(tmp_path, monkeypatch, sdk, live)
+    plan = json.loads(capsys.readouterr().out)
+    card = plan["delivery"]
+    tab_record(
+        tmp_path,
+        "assistant",
+        display.format(card=card, changed_card=card.replace("数量 100", "数量 101")),
+        PREOPEN + timedelta(seconds=1),
+        phase="final_answer",
+    )
+    clock.at = OPEN + timedelta(minutes=30)
+    sdk.snapshot_time = f"{DAY} 09:59:00"
+    tab_record(tmp_path, "user", reply, clock.at)
+    assert invoke("approve", plan["id"]) == (0 if authorized else 2)
+    expected = [("US.ABC", 100)] if authorized else []
+    assert [(row["code"], row["qty"]) for row in sdk.writes] == expected
+    assert invoke("submit", plan["id"]) == 0
+    assert [(row["code"], row["qty"]) for row in sdk.writes] == expected
+
+
 @pytest.mark.parametrize("context_change", ["assistant", "user", "same-message"])
 def test_bare_agreement_requires_immediately_unambiguous_order_context(
     tmp_path, monkeypatch, capsys, context_change

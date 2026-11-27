@@ -224,6 +224,24 @@ def visible_delivery(item, card, historical_card):
     return assistant, None
 
 
+def standalone_delivery(assistant, card):
+    if assistant.strip() == card:
+        return True
+    before, exact_card, after = assistant.partition(card)
+    if not exact_card:
+        return False
+    opening = re.fullmatch(
+        r"(?:[ \t]*\n)* {0,3}(`{3,}|~{3,})(?:[ \t]*[A-Za-z0-9_.+-]+)?[ \t]*\n",
+        before,
+    )
+    closing = re.fullmatch(r"\n {0,3}(`{3,}|~{3,})[ \t]*(?:\n[ \t]*)*", after)
+    return (
+        opening is not None
+        and closing is not None
+        and closing[1].startswith(opening[1])
+    )
+
+
 def plan_was_delivered(home, root, scope, plan, created, now):
     card = delivery_card(plan)
     historical_card = delivery_card(plan, historical=True)
@@ -307,7 +325,6 @@ def transcript_replies(home, root, scope, plan, created, now):
     """Read only visible deliveries and actual user messages from this session."""
     card = delivery_card(plan)
     historical_card = delivery_card(plan, historical=True)
-    standalone_cards = {card, f"```\n{card}\n```", f"```text\n{card}\n```"}
     identity = (plan["id"], plan["report_version"])
     displayed = set()
     delivered = None
@@ -328,7 +345,7 @@ def transcript_replies(home, root, scope, plan, created, now):
                 displayed.update(PLAN_HEADER.findall(assistant))
                 if created <= at and timing is not None:
                     delivered, late_timing_disclosed = at, timing
-                    bare_offer = timing and assistant.strip() in standalone_cards
+                    bare_offer = timing and standalone_delivery(assistant, card)
             continue
         if not delivered or at <= delivered or not visible_message(item, "user"):
             continue
