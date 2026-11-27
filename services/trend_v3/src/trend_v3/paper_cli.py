@@ -25,7 +25,7 @@ from .paper_authority import (
 )
 from .paper_entry import PaperEntry, encode
 from .paper_evidence import TAIPEI, instant
-from .paper_facts import produce
+from .paper_facts import produce, retained_bridge
 from .paper_futu import BrokerUnavailable, FutuPaperBroker
 from .paper_report import prepare_report_evidence, refresh_report
 
@@ -73,8 +73,30 @@ def public_plan(plan):
         "lines": [
             {field: row[field] for field in public_fields} for row in plan["lines"]
         ],
-        "skipped": plan["skipped"],
+        "skipped": [
+            {
+                field: row[field]
+                for field in ("code", "reason", "direction", "seat")
+                if field in row
+            }
+            for row in plan["skipped"]
+        ],
     }
+    if "manual" in plan:
+        result["manual"] = [
+            {
+                k: row[k]
+                for k in (
+                    "task_id",
+                    "code",
+                    "direction",
+                    "currency",
+                    "state",
+                    "missing",
+                )
+            }
+            for row in plan["manual"]
+        ]
     if not plan["lines"]:
         reasons = {row["reason"] for row in plan["skipped"]}
         if reasons <= {"verified_no_signal"}:
@@ -225,6 +247,7 @@ PUBLIC_ERRORS = {
     "daily selection evidence already exists",
     "unsupported daily selection evidence schema",
     "frozen report cutoff is unavailable",
+    "daily observation evidence unverified",
 }
 
 
@@ -246,8 +269,11 @@ def run_daily(args):
 
     def check_plan(plan):
         try:
-            info = latest_report(root, report_day, pin, source_only=True)[2]
+            report, selection, info = latest_report(
+                root, report_day, pin, source_only=True
+            )
             upload_receipt(home, scope, info)
+            retained_bridge(report, selection, info, root / "reports/_evidence")
             digest = sha256(
                 (info["projection_sha256"] + info["selection_sha256"]).encode()
             )
@@ -316,6 +342,7 @@ def run_daily(args):
         return 0 if recorded else 2
     broker = FutuPaperBroker(settings(home), clock=utc_now)
     authorized = None
+    refresh_needed = args.command != "plan"
 
     def record_reply(service, plan, reply):
         nonlocal authorized
@@ -335,6 +362,7 @@ def run_daily(args):
             plan = plan_report(
                 service, artifacts, root / "reports/_evidence", now, clock=utc_now
             )
+            refresh_needed = True
             emit(plan)
         elif args.command == "status":
             emit(service.status(now=now))
@@ -362,7 +390,8 @@ def run_daily(args):
             )
     finally:
         try:
-            refresh_report(root, report_day, pin, utc_now())
+            if refresh_needed:
+                refresh_report(root, report_day, pin, utc_now())
         finally:
             broker.close()
     return 0

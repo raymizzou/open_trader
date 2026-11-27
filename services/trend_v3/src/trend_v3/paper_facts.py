@@ -9,14 +9,19 @@ from zoneinfo import ZoneInfo
 
 from .paper_authority import private_bytes, strict_json
 from .paper_evidence import (
+    BRIDGE_MARKETS,
     REPORT_SCHEMA,
     SIGNALS,
+    TAIPEI,
+    a_share_symbol,
     board_seat_verified,
     board_verified,
+    bridge_observations,
     day,
     decimal,
     field,
     identity,
+    instant,
     native_signal,
     observation_signal,
     paper_report_projection,
@@ -239,7 +244,17 @@ def exact_row(rows, code, reason):
 
 
 def quotes(
-    broker, code, quote_market, product, direction, when, zone, now, *, future=None
+    broker,
+    code,
+    quote_market,
+    product,
+    direction,
+    when,
+    zone,
+    now,
+    *,
+    future=None,
+    bridge=False,
 ):
     kind = {"stock": "STOCK", "etf": "ETF", "future": "FUTURE"}[product]
     basic = exact_row(
@@ -252,6 +267,8 @@ def quotes(
         code,
         "product_unverified",
     )
+    if bridge and basic.get("suspension") is True:
+        raise FactsMissing("market_halted")
     if (
         basic.get("stock_type") != kind
         or (basic.get("suspension") is not False and basic.get("suspension") != "N/A")
@@ -264,6 +281,8 @@ def quotes(
         code,
         "reference_price_unverified",
     )
+    if bridge and snapshot.get("suspension") is True:
+        raise FactsMissing("market_halted")
     if (
         snapshot.get("suspension") is not False
         or snapshot.get("sec_status") != "NORMAL"
@@ -415,7 +434,17 @@ def actual_future(broker, raw, selected, asset, report_day):
 
 
 def build_route(
-    broker, raw, selected, asset, product, direction, report_day, when, now
+    broker,
+    raw,
+    selected,
+    asset,
+    product,
+    direction,
+    report_day,
+    when,
+    now,
+    *,
+    bridge=False,
 ):
     market = asset["market"]
     symbol = asset["code"]
@@ -429,12 +458,16 @@ def build_route(
         future = actual_future(broker, raw, selected, asset, report_day)
         extra = future["route"]
     quote_market = market
-    if market == "CN":
+    if market == "CN" or (bridge and market in {"SH", "SZ"}):
         if direction == "short":
             raise FactsMissing("short_route_unsupported")
         if product == "etf":
             raise FactsMissing("a_share_etf_route_unverified")
-        if re.fullmatch(r"6[0-9]{5}", symbol):
+        if bridge:
+            quote_market, symbol = a_share_symbol(market, symbol, explicit=True)
+            if quote_market is None:
+                raise FactsMissing("route_unverified")
+        elif re.fullmatch(r"6[0-9]{5}", symbol):
             quote_market = "SH"
         elif re.fullmatch(r"[03][0-9]{5}", symbol):
             quote_market = "SZ"
@@ -451,6 +484,11 @@ def build_route(
     if future is None and quote_market not in EQUITIES:
         raise FactsMissing("opening_unverified")
     code = future["code"] if future else f"{quote_market}.{symbol}"
+    if bridge and future is None:
+        timezone, _, usual_open, _, _ = EQUITIES[quote_market]
+        # Supported whole and half sessions share their opening time.
+        if now >= datetime.combine(report_day, usual_open, ZoneInfo(timezone)):
+            raise FactsMissing("missed_open")
     session, currency = session_time(
         broker,
         code,
@@ -472,6 +510,7 @@ def build_route(
         zone,
         now,
         future=future,
+        bridge=bridge,
     )
     if expiry == report_day and market == "HK":
         close = datetime.fromisoformat(session["closes_at"])
@@ -501,7 +540,6 @@ def produce(report, selection, info, evidence_root, broker, now):
     """Only ask OpenD about assets with report, membership and raw signal evidence."""
     report = deepcopy(report)
     selection = normalize_field_sources(selection, report["date"])
-    report = paper_report_projection(report, selection, info)
     digest = sha256(
         (info["projection_sha256"] + info["selection_sha256"]).encode()
     ).hexdigest()
@@ -517,6 +555,19 @@ def produce(report, selection, info, evidence_root, broker, now):
         "coverage_gaps": [],
         "daily_evidence_hash": digest,
     }
+    observations = retained_bridge(report, selection, info, evidence_root)
+    if observations is not None:
+        if now < instant(info["cutoff"]):
+            raise ValueError("daily observation evidence unverified")
+        facts["daily_bridge_routes"] = preflight_observations(
+            observations, report, selection, evidence_root, broker, now
+        )
+        if all(row["state"] == "rejected" for row in observations):
+            facts["daily_bridge_coverage_gap"] = bridge_coverage_gap(
+                report, observations
+            )
+        return report, facts
+    report = paper_report_projection(report, selection, info)
     collection = report.get("collection") or {}
     evidence = collection.get("evidence") or {}
     report_day = day(report["date"])
@@ -579,6 +630,363 @@ def produce(report, selection, info, evidence_root, broker, now):
                 except BrokerUnavailable:
                     facts["gaps"][path] = "paper_market_facts_unavailable"
     return report, facts
+
+
+def bridge_coverage_gap(report, observations):
+    """Prove the discovery scope only when reporting an absence of candidates."""
+    collection = report.get("collection") or {}
+    parent = collection.get("parent_board") or {}
+    rows = parent.get("groups")
+    report_day = day(report.get("date"))
+    observed, cutoff = instant(parent.get("observed_at")), instant(report.get("cutoff"))
+    edition = report.get("board_version")
+    if (
+        parent.get("state") != "verified"
+        or parent.get("complete") is not True
+        or not text(parent.get("source"))
+        or not text(edition)
+        or parent.get("version") != edition
+        or observed is None
+        or cutoff is None
+        or observed > cutoff
+        or observed.astimezone(TAIPEI).date() != report_day
+        or not isinstance(rows, list)
+        or not rows
+        or type(parent.get("row_count")) is not int
+        or parent["row_count"] != len(rows)
+    ):
+        return "daily_board_coverage_unverified"
+    if report.get("selection_mode") != "threshold-v1":
+        return "daily_class_coverage_unverified"
+
+    expected_classes = {"short": {}, "long": {}}
+    common_day = target(collection, "BOARD", report_day)
+    if common_day != day(parent.get("data_date")) or common_day != day(
+        report.get("board_date")
+    ):
+        common_day = None
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            return "daily_board_coverage_unverified"
+        name, score = row.get("name"), decimal(row.get("strength"))
+        if not text(name) or name in seen or score is None or not 0 <= score <= 100:
+            return "daily_board_coverage_unverified"
+        seen.add(name)
+        market = row.get("market")
+        expected_day = (
+            target(collection, market, report_day) if text(market) else common_day
+        )
+        actual_day = day(row.get("row_date", parent.get("data_date")))
+        if expected_day is None or actual_day != expected_day:
+            return "daily_target_coverage_unverified"
+        if score >= 80:
+            expected_classes["long"][name] = (score, actual_day)
+        elif score <= 20:
+            expected_classes["short"][name] = (score, actual_day)
+
+    evidence = collection.get("evidence") or {}
+    for direction, expected in expected_classes.items():
+        groups = report.get(direction, [])
+        actual = {
+            group.get("name"): decimal(group.get("board_strength")) for group in groups
+        }
+        if len(actual) != len(groups) or actual != {
+            name: value[0] for name, value in expected.items()
+        }:
+            return "daily_class_coverage_unverified"
+        for index, group in enumerate(groups):
+            name = group["name"]
+            _, when = expected[name]
+            coverage = group.get("coverage")
+            path = f"/{direction}/{index}/coverage"
+            if (
+                not isinstance(coverage, dict)
+                or coverage.get("state") != "complete"
+                or not isinstance(coverage.get("instrument_ids"), list)
+                or not coverage_matches_projection(group)
+                or not field(
+                    evidence,
+                    f"/{direction}/{index}",
+                    "coverage",
+                    coverage,
+                    name,
+                    "BOARD",
+                    None,
+                    when,
+                )
+                or evidence[path]["version"] != edition
+            ):
+                return "daily_member_coverage_unverified"
+            markets = set(collection.get("targets", {})) - {"BOARD"}
+            members = [
+                asset
+                for section in ("direct", "searchable", "related")
+                for asset in group.get(section, [])
+            ]
+            for asset in members:
+                market = asset.get("market")
+                if not text(market) or day(asset.get("data_date")) != target(
+                    collection, market, report_day
+                ):
+                    return "daily_target_coverage_unverified"
+                markets.add(market)
+            if any(
+                target(collection, market, report_day) is None for market in markets
+            ):
+                return "daily_target_coverage_unverified"
+    if any(
+        day(row.get("target_day")) is None
+        or day(row.get("actual_day")) != day(row["target_day"])
+        for row in observations
+    ):
+        return "daily_target_coverage_unverified"
+    return None
+
+
+def retained_bridge(report, selection, info, root):
+    """Recheck the raw sources before using the frozen decision."""
+    try:
+        rows = bridge_observations(report, selection, info)
+        if rows is None:
+            return None
+        checked = {}
+        originals, documents = {}, {}
+        for row in rows:
+            row_sources = {}
+            for source in row["sources"]:
+                path = Path(source["path"])
+                if (
+                    path.is_absolute()
+                    or ".." in path.parts
+                    or len(path.parts) < 3
+                    or path.parts[0] != report["date"]
+                    or path.parts[1] not in {info["revision"], "frames"}
+                ):
+                    raise ValueError("invalid observation source path")
+                if path not in checked:
+                    original = private_bytes(root / path)
+                    checked[path] = sha256(original).hexdigest()
+                    originals[path] = original
+                if checked[path] != source["sha256"]:
+                    raise ValueError("observation source digest mismatch")
+                row_sources[path] = source
+            if row["state"] == "qualified":
+                for field in ("current", "labels"):
+                    read_observation_source(
+                        row, field, row_sources, originals, documents, info
+                    )
+                if "previous" in row["facts"]:
+                    read_observation_source(
+                        row, "previous", row_sources, originals, documents, info
+                    )
+        return rows
+    except (AttributeError, IndexError, KeyError, OSError, TypeError, ValueError):
+        raise ValueError("daily observation evidence unverified") from None
+
+
+def read_observation_source(row, field, row_sources, originals, documents, info=None):
+    proof = row["facts"][field]
+    source, locator = proof["source"].split("#", 1)
+    path = Path(source)
+    if path not in row_sources:
+        raise ValueError("own observation source is unavailable")
+    if (
+        "locations" in row_sources[path]
+        and locator not in row_sources[path]["locations"]
+    ):
+        raise ValueError("own observation location is unavailable")
+    location, _, native_field = locator.partition("#")
+    if not location.startswith("$"):
+        location = "$." + location
+    if path.parts[1] == "frames":
+        raise ValueError("a frame cannot supply a structured field directly")
+    if path not in documents:
+        documents[path] = strict_json(originals[path])
+    record = location_value(documents[path], location)
+    subject = record.get("tmId", record.get("identity", record.get("instrument_id")))
+    market = record.get("asset", record.get("market"))
+    code = record.get("tickerSymbol", record.get("code"))
+    quote_day = record.get("asOfDate", record.get("data_date"))
+    if (
+        identity(subject) != identity(row["identity"])
+        or BRIDGE_MARKETS.get(market, market)
+        != BRIDGE_MARKETS.get(row["market"], row["market"])
+        or code != row["code"]
+        or quote_day != row["target_day"]
+        or record.get("state", "verified") != "verified"
+        or record.get("verified") is False
+    ):
+        raise ValueError("own observation identity is unverified")
+    if location.startswith("$.certified_intersections["):
+        observed = instant(record.get("observed_at"))
+        if (
+            path.name != "signal-evidence-index.json"
+            or observed is None
+            or info is None
+            or observed > instant(info["cutoff"])
+            or record.get("removed") is True
+        ):
+            raise ValueError("the visual intersection is outside the report scope")
+        for kind in (
+            "detail_source",
+            "class_page_source",
+            "signal_row_source",
+            "exact_search_source",
+        ):
+            frame = Path(record[kind].split("#", 1)[0])
+            if (
+                frame.parts[:1] != ("frames",)
+                or Path(row["report_date"]) / frame not in row_sources
+            ):
+                raise ValueError("the visual intersection frame is unavailable")
+    fields = {
+        "previous": ("trendTemperaturePrev", "previous"),
+        "current": ("trendTemperatureCurr", "temperature", "current"),
+        "labels": ("tickerLabels", "labels"),
+        "etfLeverage": ("etfLeverage", "leverage"),
+        "brokerContract": ("brokerContract",),
+    }[field]
+    if native_field and native_field not in fields:
+        raise ValueError("own observation field is unverified")
+    reported = [
+        record[key]
+        for key in fields
+        if key in record and (not native_field or key == native_field)
+    ]
+    if field == "labels":
+        reported = [
+            [label for label in re.split(r"[,，;；、\s]+", value) if label]
+            if isinstance(value, str)
+            else value
+            for value in reported
+        ]
+    if not reported or any(
+        type(value) is not type(proof["value"]) or value != proof["value"]
+        for value in reported
+    ):
+        raise ValueError("own observation field is unverified")
+    return proof["value"]
+
+
+class ObservationRouteFacts:
+    """Execution specifications retained alongside the observation."""
+
+    def __init__(self, root, row):
+        self.root = root
+        self.row = row
+
+    def read(self, _selected, field):
+        if field not in self.row["facts"]:
+            raise FactsMissing(
+                "etf_exposure_unverified"
+                if field == "etfLeverage"
+                else "future_contract_unverified"
+            )
+        proof = self.row["facts"][field]
+        path = Path(proof["source"].split("#", 1)[0])
+        sources = {Path(source["path"]): source for source in self.row["sources"]}
+        if path not in sources:
+            raise FactsMissing("route_source_unverified")
+        original = private_bytes(self.root / path)
+        if sha256(original).hexdigest() != sources[path]["sha256"]:
+            raise FactsMissing("route_source_unverified")
+        return read_observation_source(self.row, field, sources, {path: original}, {})
+
+
+def preflight_observations(rows, report, selection, root, broker, now):
+    result = {}
+    stock_routes = {}
+    report_day = day(report["date"])
+    for row in rows:
+        path = row["projection_path"]
+        result[path] = item = {"observation": row}
+        if row["state"] != "qualified":
+            item["reason"] = {
+                "unknown": "observation_unverified",
+                "conflict": "observation_conflict",
+                "withdrawn": "observation_withdrawn",
+                "rejected": "verified_no_signal",
+            }[row["state"]]
+            continue
+        market = BRIDGE_MARKETS.get(row["market"], row["market"])
+        kind = row["instrument_type"]
+        asset = {
+            "instrument_id": row["identity"],
+            "code": row["code"],
+            "market": market,
+            "instrument_type": kind,
+            "currency": row["currency"],
+        }
+        when = day(row["target_day"])
+        item["asset"] = asset
+        product = product_for(kind, market)
+        if product == "crypto":
+            item["reason"] = manual_crypto(item, asset, row)
+            continue
+        route_key = (
+            market,
+            row["identity"],
+            row["code"],
+            row["direction"],
+            row["currency"],
+            row["target_day"],
+            kind,
+        )
+        if product == "stock" and route_key in stock_routes:
+            item.update(stock_routes[route_key], observation=row)
+            continue
+        try:
+            route, session = build_route(
+                broker,
+                ObservationRouteFacts(root, row),
+                {},
+                asset,
+                product,
+                row["direction"],
+                report_day,
+                when,
+                now,
+                bridge=True,
+            )
+        except FactsMissing as error:
+            item["reason"] = str(error)
+        except (OSError, KeyError, IndexError, ValueError, TypeError):
+            item["reason"] = "raw_or_route_evidence_unavailable"
+        except BrokerUnavailable:
+            item["reason"] = "paper_market_facts_unavailable"
+        else:
+            asset["currency"] = route["currency"]
+            item["route"] = proof(
+                asset,
+                when,
+                row.get("version") or selection["revision"],
+                route,
+                "OpenD route, product, quote, lot and simulation account readback",
+            )
+            item["session"] = session
+        if product == "stock":
+            stock_routes[route_key] = item
+    return result
+
+
+def manual_crypto(item, asset, row):
+    currency, code = asset["currency"], asset["code"]
+    if (
+        asset["market"] != "CRYPTO"
+        or row["direction"] != "long"
+        or not text(currency)
+        or not re.fullmatch(r"[A-Z0-9]{1,20}[-/]" + re.escape(currency), code)
+    ):
+        return "crypto_route_unverified"
+    item["manual"] = {
+        "code": code,
+        "direction": "long",
+        "currency": currency,
+        "state": "pending_verification",
+        "missing": ["funds", "exposure", "limit_price", "quantity_precision"],
+    }
+    return "manual_crypto_preflight_required"
 
 
 def record_facts(report, facts, raw, broker, group, asset, path, direction, now):

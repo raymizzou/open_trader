@@ -8,7 +8,14 @@ import subprocess
 from hashlib import sha256
 from pathlib import Path
 
-from .paper_evidence import REPORT_SCHEMA, TAIPEI, day, instant
+from .paper_evidence import (
+    BRIDGE_REPORT_SCHEMA,
+    REPORT_SCHEMA,
+    TAIPEI,
+    bridge_observations,
+    day,
+    instant,
+)
 
 HEX_SHA = re.compile(r"[0-9a-f]{40}")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -395,7 +402,7 @@ def check_selection_identity(
     ):
         raise ValueError("daily report artifact date does not match")
     canonical = "schema" in selection
-    if canonical and selection["schema"] != REPORT_SCHEMA:
+    if canonical and selection["schema"] not in (REPORT_SCHEMA, BRIDGE_REPORT_SCHEMA):
         raise ValueError("unsupported daily selection evidence schema")
     if selection.get("projection_sha256", None if canonical else digest) != digest:
         raise ValueError("daily report artifact digest does not match")
@@ -409,8 +416,15 @@ def check_selection_identity(
 
 
 def latest_report(
-    root, report_day, release, *, frozen_revision=None, source_only=False
+    root,
+    report_day,
+    release,
+    *,
+    frozen_revision=None,
+    source_only=False,
+    expected_reader=None,
 ):
+    """Verify the exact current bytes when a caller has already captured them."""
     if not day(report_day) or not HEX_SHA.fullmatch(release):
         raise ValueError("invalid daily report date or release")
     index = root / "reports/_evidence" / report_day
@@ -445,9 +459,12 @@ def latest_report(
         raise ValueError("daily report revision does not match its verification")
     reader = root / "reports" / f"{report_day}.html"
     current = private_bytes(reader) if reader.exists() else b""
+    if expected_reader is not None and current != expected_reader:
+        raise ValueError("daily report artifact digest does not match")
     if (
         sha256(current).hexdigest() != info.get("report_sha256")
         and frozen_revision is not None
+        and expected_reader is None
     ):
         for archived in (
             evidence / "history" / reader.name,
@@ -480,6 +497,8 @@ def latest_report(
     check_selection_identity(
         selection, projection, report_day, revision, release, info["projection_sha256"]
     )
+    if not source_only:
+        bridge_observations(projection, selection, info)
     if display and not source_only:
         from .paper_report import verified_display
 

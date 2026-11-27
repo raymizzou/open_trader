@@ -15,7 +15,7 @@ from .paper_authority import (
     strict_json,
 )
 from .paper_entry import encode
-from .paper_evidence import REPORT_SCHEMA, TAIPEI, day, instant
+from .paper_evidence import BRIDGE_REPORT_SCHEMA, REPORT_SCHEMA, TAIPEI, day, instant
 
 
 def normalize_field_sources(selection, report_day):
@@ -60,7 +60,14 @@ def normalize_field_sources(selection, report_day):
     } | {"field_records": records}
 
 
-def prepare_report_evidence(root, report_day, revision, release):
+def prepare_report_evidence(
+    root,
+    report_day,
+    revision,
+    release,
+    *,
+    observation_builder=None,
+):
     """Write a private canonical selection for an unpublished report revision."""
     if (
         not day(report_day)
@@ -75,10 +82,11 @@ def prepare_report_evidence(root, report_day, revision, release):
         raise ValueError("daily selection evidence already exists")
     projection = private_bytes(directory / "reader-projection.json")
     digest = sha256(projection).hexdigest()
+    report = strict_json(projection)
     draft = read_json(directory / "selection-draft.json")
-    check_selection_identity(
-        draft, strict_json(projection), report_day, revision, release, digest
-    )
+    check_selection_identity(draft, report, report_day, revision, release, digest)
+    if "daily_bridge" in draft or draft.get("schema") == BRIDGE_REPORT_SCHEMA:
+        raise ValueError("an observation handoff must be built from the report sources")
     cutoff = instant(draft.get("cutoff"))
     if cutoff is None or cutoff.astimezone(TAIPEI).date().isoformat() != report_day:
         raise ValueError("frozen report cutoff is unavailable")
@@ -93,6 +101,12 @@ def prepare_report_evidence(root, report_day, revision, release):
     )
     selection.setdefault("field_records", {})
     selection.setdefault("instruments", [])
+    if observation_builder is not None:
+        from .paper_facts import retained_bridge
+
+        selection["schema"] = BRIDGE_REPORT_SCHEMA
+        selection["daily_bridge"] = observation_builder(directory, report, selection)
+        retained_bridge(report, selection, selection, directory.parents[1])
     payload = encode(selection).encode()
     with NamedTemporaryFile(dir=directory, prefix=".selection-") as temporary:
         temporary.write(payload)
