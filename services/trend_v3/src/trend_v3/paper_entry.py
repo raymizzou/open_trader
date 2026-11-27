@@ -5,7 +5,7 @@ import json
 from datetime import UTC, timedelta
 from pathlib import Path
 
-from .paper_evidence import TAIPEI, candidates, decimal, instant, text
+from .paper_evidence import TAIPEI, candidate_gap, candidates, decimal, instant, text
 from .paper_futu import MissedOpening
 from .paper_risk import (
     Portfolio,
@@ -64,7 +64,7 @@ class PaperEntry:
             raise ValueError("report date must match the current scheduled report")
         for row in rows:
             if now >= instant(row["opens_at"]):
-                skipped.append({"code": row["code"], "reason": "missed_open"})
+                skipped.append(candidate_gap(row, "missed_open"))
         rows = [row for row in rows if now < instant(row["opens_at"])]
         with transaction(self.database) as store:
             previous = self.latest_plan(store)
@@ -90,6 +90,8 @@ class PaperEntry:
                 "session": self.session["id"],
                 "account_scope": getattr(self.broker, "account_scope", dict)(),
             }
+            if "daily_bridge_routes" in facts:
+                content["manual"] = self.manual_candidates(facts["daily_bridge_routes"])
             content_hash = fingerprint(content)
             if previous and previous["content_hash"] == content_hash:
                 return previous
@@ -108,6 +110,36 @@ class PaperEntry:
             )
         self.freeze_positions(now)
         return plan
+
+    def manual_candidates(self, preflight):
+        candidates = {}
+        for path, entry in preflight.items():
+            if "manual" not in entry:
+                continue
+            row, asset = entry["manual"], entry["asset"]
+            pair = row["code"].replace("/", "-")
+            task = {
+                **row,
+                "code": pair,
+                "instrument_id": asset["instrument_id"],
+                "observation_paths": [path],
+            }
+            if pair not in candidates:
+                candidates[pair] = task
+            elif candidates[pair]["instrument_id"] == task["instrument_id"]:
+                candidates[pair]["observation_paths"].append(path)
+            else:
+                candidates[pair]["state"] = "identity_conflict"
+        return [
+            row
+            | {
+                "task_id": fingerprint(
+                    [self.session["date"], self.session["owner"], pair]
+                )[:24]
+            }
+            for pair, row in sorted(candidates.items())
+            if row["state"] != "identity_conflict"
+        ]
 
     @staticmethod
     def check_revision(previous, revision, report_hash):
@@ -138,7 +170,7 @@ class PaperEntry:
         try:
             portfolio = self.portfolio(store, now)
         except PortfolioUnknown as error:
-            skipped.extend({"code": row["code"], "reason": str(error)} for row in rows)
+            skipped.extend(candidate_gap(row, str(error)) for row in rows)
             return []
 
         lines = []
@@ -162,7 +194,7 @@ class PaperEntry:
                 else:
                     quantity = min(quantity, capacity // row["lot"] * row["lot"])
             if not quantity:
-                skipped.append({"code": row["code"], "reason": reason})
+                skipped.append(candidate_gap(row, reason))
                 continue
             lines.append(
                 {

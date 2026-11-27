@@ -14,6 +14,158 @@ BOARD_SEATS = (1, 2)
 TAIPEI = ZoneInfo("Asia/Taipei")
 SOURCE_FIELDS = ("trendTemperaturePrev", "trendTemperatureCurr", "tickerLabels")
 REPORT_SCHEMA = "trend-v3-paper-evidence/v1"
+BRIDGE_REPORT_SCHEMA = "trend-v3-paper-evidence/v2"
+BRIDGE_SCHEMA = "trend-v3-daily-observations/v1"
+BRIDGE_SCOPE = ("report_date", "revision", "cutoff", "source", "projection_sha256")
+BRIDGE_SECTIONS = {
+    "direct": "大类直属",
+    "searchable": "趋势动物里面能够查到",
+    "related": "相关的标的",
+}
+BRIDGE_MARKETS = {
+    "美股": "US",
+    "美国股票": "US",
+    "美国ETF": "US",
+    "美国股指期货": "US",
+    "美国期货": "US",
+    "美国商品期货": "US",
+    "港股": "HK",
+    "香港股票": "HK",
+    "香港ETF": "HK",
+    "香港股指期货": "HK",
+    "香港期货": "HK",
+    "A股": "CN",
+    "中国A股": "CN",
+    "A股股票": "CN",
+    "A股ETF": "CN",
+    "ETF基金": "CN",
+    "中国ETF": "CN",
+    "加密币": "CRYPTO",
+    "加密现货": "CRYPTO",
+    "加密货币": "CRYPTO",
+    "CC": "CRYPTO",
+}
+
+
+def bridge_projection(report):
+    for direction in SIGNALS:
+        for index, group in enumerate(report.get(direction, [])):
+            for section, label in BRIDGE_SECTIONS.items():
+                for offset, asset in enumerate(group.get(section, [])):
+                    yield (
+                        f"/{direction}/{index}/{section}/{offset}",
+                        direction,
+                        group,
+                        label,
+                        asset,
+                    )
+
+
+def bridge_observations(report, selection, info):
+    """Return the complete frozen inventory, or None for historical reports."""
+    if (
+        selection.get("schema") != BRIDGE_REPORT_SCHEMA
+        and "daily_bridge" not in selection
+    ):
+        return None
+    payload = selection.get("daily_bridge")
+    cutoff = instant(info.get("cutoff"))
+    if (
+        selection.get("schema") != BRIDGE_REPORT_SCHEMA
+        or not isinstance(payload, dict)
+        or payload.get("schema") != BRIDGE_SCHEMA
+        or cutoff is None
+        or cutoff.astimezone(TAIPEI).date() != day(report.get("date"))
+        or instant(report.get("cutoff")) != cutoff
+        or any(
+            payload.get(key) != info.get(key) or payload.get(key) != selection.get(key)
+            for key in BRIDGE_SCOPE
+        )
+        or not re.fullmatch(r"[0-9a-f]{64}", payload.get("private_version") or "")
+        or not isinstance(payload.get("observations"), list)
+    ):
+        raise ValueError("daily observation evidence unverified")
+
+    projected = {item[0]: item[1:] for item in bridge_projection(report)}
+    for row in payload["observations"]:
+        path = row.get("projection_path")
+        if path not in projected:
+            raise ValueError("daily observation evidence unverified")
+        direction, group, section, asset = projected.pop(path)
+        state = row.get("state")
+        if (
+            (row.get("direction"), row.get("group"), row.get("section"))
+            != (direction, group.get("name"), section)
+            or row.get("code") != asset.get("code")
+            or row.get("name") != asset.get("name")
+            or state
+            not in {"qualified", "unknown", "rejected", "conflict", "withdrawn"}
+            or row.get("report_action")
+            != ("first_observation" if state == "qualified" else "none")
+            or (row.get("removed") is True and state == "qualified")
+            or not isinstance(row.get("sources"), list)
+        ):
+            raise ValueError("daily observation evidence unverified")
+        if state != "qualified":
+            continue
+        market, kind = row.get("market"), row.get("instrument_type")
+        owner = identity(row.get("identity"))
+        date = day(row.get("target_day"))
+        latest_allowed = cutoff.astimezone(TAIPEI).date() - timedelta(days=1)
+        collection = report.get("collection") or {}
+        market_day = collection.get("targets", {}).get(asset.get("market"))
+        expected = target(collection, asset.get("market"), day(report["date"]))
+        before, after, event = SIGNALS[direction]
+        own_facts = row["facts"]
+        previous = own_facts.get("previous", {}).get("value")
+        current = own_facts.get("current", {}).get("value")
+        labels = own_facts.get("labels", {}).get("value")
+        if (
+            not owner
+            or owner != identity(asset.get("instrument_id"))
+            or not text(market)
+            or not text(kind)
+            or not text(row.get("code"))
+            or BRIDGE_MARKETS.get(market, market)
+            != BRIDGE_MARKETS.get(asset.get("market"), asset.get("market"))
+            or not text(asset.get("instrument_type"))
+            or product_for(kind, market)
+            != product_for(asset["instrument_type"], market)
+            or row.get("currency") != asset.get("currency")
+            or date is None
+            or date > latest_allowed
+            or (market_day is not None and day(market_day) != date)
+            or (expected is not None and date != expected)
+            or day(row.get("actual_day")) != date
+            or (asset.get("data_date") is not None and day(asset["data_date"]) != date)
+            or asset.get("lookup") in {"pending", "miss"}
+            or current not in ((after, "冻") if direction == "short" else (after,))
+            or (previous != before and not (previous is None and direction == "long"))
+            or not isinstance(labels, list)
+            or event not in labels
+            or not row["sources"]
+        ):
+            raise ValueError("daily observation evidence unverified")
+    if projected:
+        raise ValueError("daily observation evidence unverified")
+    return payload["observations"]
+
+
+def a_share_symbol(market, raw_code, *, explicit=False):
+    """Accept an exchange suffix only when it agrees with the security code."""
+    match = re.fullmatch(r"([0-9]{6})(?:\.(SH|SZ))?", raw_code)
+    if not match:
+        return None, None
+    symbol, suffix = match.groups()
+    exchange = "SH" if symbol.startswith("6") else "SZ" if symbol[0] in "03" else None
+    if (
+        exchange is None
+        or suffix not in (None, exchange)
+        or market not in ("CN", exchange)
+        or (explicit and market == "CN" and suffix is None)
+    ):
+        return None, None
+    return exchange, symbol
 
 
 def observation_signal(direction, previous, current, labels):
@@ -439,7 +591,6 @@ def read_candidate(
 
     board_day = day(collection["targets"]["BOARD"])
     supplement = facts.get("instruments", {}).get(owner, {})
-    product = product_for(kind, market)
     member = supplement.get("membership")
     if not receipt(member, owner, market, kind, board_day):
         return None, "membership_unverified"
@@ -489,6 +640,40 @@ def read_candidate(
     ):
         return None, "signal_unverified"
 
+    strength = decimal(asset.get("strength"))
+    if not field(
+        evidence,
+        prefix,
+        "strength",
+        asset.get("strength"),
+        owner,
+        market,
+        kind,
+        expected,
+    ):
+        strength = None
+    return routed_candidate(
+        asset, direction, report_day, expected, supplement, facts, strength=strength
+    )
+
+
+def routed_candidate(
+    asset,
+    direction,
+    report_day,
+    expected,
+    supplement,
+    facts,
+    *,
+    strength=None,
+    bridge=False,
+):
+    market, kind, raw_code = (
+        asset[name] for name in ("market", "instrument_type", "code")
+    )
+    owner = identity(asset["instrument_id"])
+    product = product_for(kind, market)
+    event = SIGNALS[direction][2]
     route = supplement.get("route")
     if not receipt(route, owner, market, kind, expected) or not isinstance(
         route["value"], dict
@@ -503,9 +688,14 @@ def read_candidate(
     )
     lot, code, currency = route.get("lot"), route.get("code"), route.get("currency")
     prefix_code = "CC" if market == "CRYPTO" else market
-    if market == "CN":
-        prefix_code = route.get("quote_market")
-        if prefix_code not in {"SH", "SZ"}:
+    if market in {"CN", "SH", "SZ"} and (bridge or market == "CN"):
+        if bridge:
+            prefix_code, raw_code = a_share_symbol(market, raw_code, explicit=True)
+            if raw_code is None:
+                return None, "route_unverified"
+        else:
+            prefix_code = route.get("quote_market")
+        if prefix_code not in {"SH", "SZ"} or route.get("quote_market") != prefix_code:
             return None, "route_unverified"
     if (
         route.get("environment") != "SIMULATE"
@@ -567,18 +757,6 @@ def read_candidate(
     session = opening(sessions, market, report_day, expected)
     if session is None:
         return None, "opening_unverified"
-    strength = decimal(asset.get("strength"))
-    if not field(
-        evidence,
-        prefix,
-        "strength",
-        asset.get("strength"),
-        owner,
-        market,
-        kind,
-        expected,
-    ):
-        strength = None
     return {
         "code": code,
         "instrument_id": owner,
@@ -602,9 +780,67 @@ def read_candidate(
     }, None
 
 
+def bridge_candidates(report, facts):
+    rows, skipped, conflicts = {}, [], set()
+    for path, preflight in facts["daily_bridge_routes"].items():
+        observation = preflight["observation"]
+        gap = {
+            "code": observation["code"],
+            "market": observation["market"],
+            "observation_paths": [path],
+            "observation_state": observation["state"],
+            "observation_missing": observation["missing_fields"],
+        }
+        if reason := preflight.get("reason"):
+            skipped.append(gap | {"reason": reason})
+            continue
+        asset = preflight["asset"]
+        item, reason = routed_candidate(
+            asset,
+            observation["direction"],
+            day(report["date"]),
+            day(observation["target_day"]),
+            preflight,
+            facts,
+            bridge=True,
+        )
+        if reason:
+            skipped.append(gap | {"reason": reason})
+        else:
+            item.pop("strength")
+            market = "CN" if item["market"] in {"SH", "SZ"} else item["market"]
+            key = (market, item["product"], item["economic_instrument"])
+            if key not in rows:
+                rows[key] = item, [path]
+            else:
+                prior, paths = rows[key]
+                paths.append(path)
+                if item != prior:
+                    conflicts.add(key)
+    for key in sorted(conflicts):
+        item, paths = rows[key]
+        skipped.append(
+            candidate_gap(item | {"observation_paths": paths}, "identity_conflict")
+        )
+    return [
+        item | {"observation_paths": sorted(paths)}
+        for key, (item, paths) in sorted(rows.items())
+        if key not in conflicts
+    ], skipped
+
+
+def candidate_gap(row, reason):
+    info = {"code": row["code"], "reason": reason}
+    if "observation_paths" in row:
+        info.update(market=row["market"], observation_paths=row["observation_paths"])
+    return info
+
+
 def candidates(report, facts):
     if reason := facts.get("report_gap"):
         return [], [{"reason": reason}]
+    if "daily_bridge_routes" in facts:
+        return bridge_candidates(report, facts)
     report = paper_report_projection(
         report, facts.get("selection"), facts.get("paper_binding")
     )

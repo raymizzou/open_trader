@@ -4012,3 +4012,471 @@ def test_manual_holdings_requires_matching_original_user_snapshot(
     assert invoke("manual-holdings", str(path)) == 2
     assert "0.025 BTC" not in (root / "reports" / f"{DAY}.html").read_text()
     assert sdk.calls == sdk.quote_calls == sdk.writes == []
+
+
+BRIDGE_SCHEMA = "trend-v3-daily-observations/v1"
+BRIDGE_SELECTION = "trend-v3-paper-evidence/v2"
+PRIVATE_RELEASE = "a" * 64
+
+
+def frozen_bridge(home, specifications, *, late=False):
+    """Retain synthetic report artifacts at the ordinary CLI's real file seam."""
+    codes = [item[0] for item in specifications]
+    data, _ = report(*codes)
+    root, live, upstream = daily_files(home, data)
+    today = root / "reports/_evidence" / DAY
+    revision = today / "v02"
+    current = PREOPEN if late else datetime.fromisoformat(f"{DAY}T09:20:00+08:00")
+    selection = json.loads((revision / "selection-evidence.json").read_bytes())
+    verification = json.loads((revision / "report-verification.json").read_bytes())
+    group = data["long"][0]
+    group.update(seat=4, board_strength=87, coverage={"state": "pending"})
+    data.update(
+        board_date=None, cutoff=current.isoformat(), selection_mode="threshold-v1"
+    )
+    data["collection"]["targets"]["BOARD"] = None
+    case_records = []
+    for offset, (code, market, state) in enumerate(specifications):
+        currency, kind = {
+            "CN": ("CNY", "stock"),
+            "US": ("USD", "stock"),
+            "CRYPTO": ("USD", "crypto"),
+        }[market]
+        asset = group["direct"][offset]
+        asset.update(
+            code=code,
+            market=market,
+            currency=currency,
+            instrument_type=kind,
+            watch_eligible=False,
+            instrument_id=f"exact-{market}-{code}",
+        )
+        data["collection"]["targets"][market] = DATA_DAY
+        data["collection"]["target_evidence"][market] = deepcopy(
+            data["collection"]["target_evidence"]["US"]
+        )
+        selected = selection["instruments"][offset]
+        selected.update(previous=None, selected_new_position=False)
+        case_records.append(
+            {
+                "tmId": asset["instrument_id"],
+                "tickerSymbol": code,
+                "asset": market,
+                "asOfDate": DATA_DAY,
+                "trendTemperatureCurr": "热",
+                "tickerLabels": ["温转热"] if state == "qualified" else [],
+            }
+        )
+    digest = sha256(
+        private_input(revision, "reader-projection.json", data).read_bytes()
+    ).hexdigest()
+    native = private_input(
+        revision, "bridge-fixture-native.json", {"data": case_records}
+    )
+    native_hash = sha256(native.read_bytes()).hexdigest()
+    cutoff = current.isoformat()
+    binding = dict(
+        report_date=DAY,
+        revision="v02",
+        cutoff=cutoff,
+        source={"commit": RELEASE},
+        projection_sha256=digest,
+        private_version=PRIVATE_RELEASE,
+    )
+    observations = []
+    for offset, ((code, market, state), asset) in enumerate(
+        zip(
+            specifications,
+            group["direct"],
+            strict=True,
+        )
+    ):
+        native_location = f"{DAY}/v02/{native.name}#$.data[{offset}]"
+        observations.append(
+            {
+                "projection_path": f"/long/0/direct/{offset}",
+                "identity": asset["instrument_id"],
+                "code": code,
+                "name": asset["name"],
+                "market": market,
+                "instrument_type": asset["instrument_type"],
+                "currency": asset["currency"],
+                "direction": "long",
+                "group": group["name"],
+                "section": "大类直属",
+                "target_day": DATA_DAY,
+                "actual_day": DATA_DAY,
+                "state": state,
+                "removed": state == "withdrawn",
+                "report_action": "first_observation"
+                if state == "qualified"
+                else "none",
+                "missing_fields": [] if state == "qualified" else ["labels"],
+                "facts": {
+                    "current": {
+                        "value": "热",
+                        "source": f"{native_location}#trendTemperatureCurr",
+                    },
+                    "labels": {
+                        "value": case_records[offset]["tickerLabels"],
+                        "source": f"{native_location}#tickerLabels",
+                    },
+                },
+                "sources": [
+                    {
+                        "path": f"{DAY}/v02/{native.name}",
+                        "sha256": native_hash,
+                    }
+                ],
+            }
+        )
+    selection.update(
+        {key: value for key, value in binding.items() if key != "private_version"}
+    )
+    selection.update(
+        schema=BRIDGE_SELECTION,
+        field_records={},
+        daily_bridge={"schema": BRIDGE_SCHEMA, **binding, "observations": observations},
+    )
+    verification.update(cutoff=cutoff, projection_sha256=digest)
+    private_input(revision, "report-verification.json", verification)
+    update_selection(revision, selection)
+    return root, live, current, revision, selection
+
+
+class BridgeOpenD(PlanningOpenD):
+    def __init__(self, *, halted=None):
+        super().__init__(market="CN", lot=100)
+        self.denomination = "CNY"
+        self.halted = halted
+
+    def get_stock_basicinfo(self, **params):
+        status, rows = super().get_stock_basicinfo(**params)
+        if rows[0]["code"] == self.halted:
+            rows[0]["suspension"] = True
+        return status, rows
+
+
+BRIDGE_CN_CODES = (
+    "600001.SH",
+    "600002.SH",
+    "600003.SH",
+    "600004.SH",
+    "000001.SZ",
+    "000002.SZ",
+    "300001.SZ",
+)
+
+
+def cn_bridge(home):
+    return frozen_bridge(
+        home,
+        [(code, "CN", "qualified") for code in BRIDGE_CN_CODES]
+        + [("600005.SH", "CN", "unknown")],
+    )
+
+
+def test_daily_bridge_preflights_seven_qualified_items_outside_legacy_seats(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _, live, now, _, _ = cn_bridge(tmp_path)
+    sdk = BridgeOpenD()
+    assert run_daily_plan(tmp_path, sdk, now, live, monkeypatch) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["execution"] == "awaiting_scheduled_tab_approval"
+    assert {r["code"]: r["quantity"] for r in plan["lines"]} == {
+        "SH.600001": 100,
+        "SH.600002": 100,
+        "SH.600003": 100,
+        "SH.600004": 100,
+        "SZ.000001": 100,
+        "SZ.000002": 100,
+        "SZ.300001": 100,
+    }
+    assert "600005" not in plan["delivery"]
+    assert all("600005" not in str(item) for item in sdk.quote_calls)
+    assert sdk.writes == []
+
+
+def test_daily_bridge_halted_item_does_not_block_other_six(
+    tmp_path, monkeypatch, capsys
+):
+    _, live, now, _, _ = cn_bridge(tmp_path)
+    sdk = BridgeOpenD(halted="SH.600003")
+    assert run_daily_plan(tmp_path, sdk, now, live, monkeypatch) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert {row["code"] for row in plan["lines"]} == {
+        "SH.600001",
+        "SH.600002",
+        "SH.600004",
+        "SZ.000001",
+        "SZ.000002",
+        "SZ.300001",
+    }
+    assert {"code": "600003.SH", "reason": "market_halted"} in plan["skipped"]
+    assert sdk.writes == []
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["missing", "rev", "date", "cutoff", "identity", "event", "source", "bytes"],
+)
+def test_daily_bridge_rejects_mixed_revision_cutoff_and_identity(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    damage,
+):
+    root, live, now, revision, selection = cn_bridge(tmp_path)
+    sdk = BridgeOpenD()
+    assert run_daily_plan(tmp_path, sdk, now, live, monkeypatch) == 0
+    assert len(json.loads(capsys.readouterr().out)["lines"]) == 7
+    state = root / "reports/_evidence/.paper-entry/state.sqlite3"
+    original_state = state.read_bytes()
+    payload = selection["daily_bridge"]
+    row = payload["observations"][0]
+    sdk.calls.clear()
+    sdk.quote_calls.clear()
+    if damage == "missing":
+        selection.pop("daily_bridge")
+    elif damage == "rev":
+        payload["revision"] = "v01"
+    elif damage == "date":
+        payload["report_date"] = DATA_DAY
+    elif damage == "cutoff":
+        payload["cutoff"] = (now - timedelta(minutes=1)).isoformat()
+    elif damage == "identity":
+        row["identity"] = "different-instrument"
+    elif damage == "event":
+        row["facts"]["labels"]["value"] = []
+    elif damage == "source":
+        private_input(revision, "bridge-fixture-native.json", {"data": []})
+    elif damage == "bytes":
+        private_input(
+            revision, "selection-evidence.json", selection | {"daily_bridge": {}}
+        )
+    if damage != "bytes":
+        update_selection(revision, selection)
+    with pytest.raises(SystemExit, match="2"):
+        run_daily_plan(tmp_path, sdk, now, live, monkeypatch)
+    assert capsys.readouterr().err in {
+        "Paper planning stopped: daily observation evidence unverified.\n",
+        "Paper planning stopped: daily report artifact digest does not match.\n",
+    }
+    assert state.read_bytes() == original_state
+    assert sdk.quote_calls == sdk.calls == sdk.writes == []
+
+
+def test_daily_bridge_links_verified_item_once_and_keeps_gaps(
+    tmp_path, monkeypatch, capsys
+):
+    root, live, now, revision, selection = frozen_bridge(
+        tmp_path,
+        [
+            ("600001.SH", "CN", "qualified"),
+            ("600001.SH", "CN", "qualified"),
+            ("600002.SH", "CN", "unknown"),
+            ("600003.SZ", "CN", "qualified"),
+            ("600001.SH", "US", "qualified"),
+            ("600004.SH", "CN", "withdrawn"),
+        ],
+    )
+    projection_path = revision / "reader-projection.json"
+    data = json.loads(projection_path.read_bytes())
+    first = data["long"][0]
+    second = deepcopy(first) | {"name": "Separate qualifying group", "seat": 5}
+    second["direct"] = [first["direct"].pop(1)]
+    data["long"].append(second)
+    digest = sha256(
+        private_input(revision, projection_path.name, data).read_bytes()
+    ).hexdigest()
+    selection["projection_sha256"] = digest
+    selection["daily_bridge"]["projection_sha256"] = digest
+    for index, row in enumerate(selection["daily_bridge"]["observations"]):
+        if index == 1:
+            row.update(group=second["name"], projection_path="/long/1/direct/0")
+        elif index > 1:
+            row["projection_path"] = f"/long/0/direct/{index - 1}"
+    verification = json.loads((revision / "report-verification.json").read_bytes())
+    private_input(
+        revision,
+        "report-verification.json",
+        verification | {"projection_sha256": digest},
+    )
+    update_selection(revision, selection)
+    sdk = BridgeOpenD()
+    assert run_daily_plan(tmp_path, sdk, now, live, monkeypatch) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert [(r["code"], r["quantity"]) for r in plan["lines"]] == [("SH.600001", 100)]
+    assert {
+        ("600002.SH", "observation_unverified"),
+        ("600003.SZ", "route_unverified"),
+        ("600001.SH", "simulate_account_unavailable"),
+        ("600004.SH", "observation_withdrawn"),
+    } <= {(row["code"], row["reason"]) for row in plan["skipped"]}
+    scope = {
+        "id": NATIVE_SESSION,
+        "owner": "official-tab",
+        "date": DAY,
+        "kind": "scheduled",
+    }
+    service = paper_entry.PaperEntry(
+        root / "reports/_evidence/.paper-entry/state.sqlite3",
+        Broker(),
+        scope,
+    )
+    stored, _ = service.current_plan(plan["id"])
+    assert stored["lines"][0]["observation_paths"] == [
+        "/long/0/direct/0",
+        "/long/1/direct/0",
+    ]
+    assert sdk.writes == []
+
+
+def test_daily_bridge_cycle_replays_partial_fills_as_verified_holdings(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    historical = tmp_path / "previous-isolated-run"
+    old_root, _, _, _, _ = frozen_bridge(
+        historical,
+        [("600001.SH", "CN", "qualified")],
+        late=True,
+    )
+    assert (
+        paper_cli.main(["rehearse", str(old_root), DAY, "v02", "--release", RELEASE])
+        == 0
+    )
+    replay = json.loads(capsys.readouterr().out)
+    assert replay["lines"] == [] and replay["order_writes"] == replay["broker_io"] == 0
+    assert replay["skipped"] == [{"code": "600001.SH", "reason": "missed_open"}]
+
+    root, live, now, _, _ = frozen_bridge(
+        tmp_path / "scheduled",
+        [("ABC", "US", "qualified"), ("XYZ", "US", "qualified")],
+        late=True,
+    )
+    home = tmp_path / "scheduled"
+    sdk = PlanningOpenD()
+    clock, invoke = tab_cli(home, monkeypatch, sdk, live, start=now)
+    plan = json.loads(capsys.readouterr().out)
+    assert [(r["code"], r["quantity"]) for r in plan["lines"]] == [
+        ("US.ABC", 100),
+        ("US.XYZ", 100),
+    ]
+    reader = root / "reports" / f"{DAY}.html"
+
+    def positions():
+        capsys.readouterr()
+        assert invoke("status") == 0
+        return json.loads(capsys.readouterr().out)["holdings"]["positions"]
+
+    show_plan(home, plan, clock.at + timedelta(seconds=1))
+    clock.at += timedelta(seconds=2)
+    assert invoke("cycle", plan["id"]) == 2
+    tab_record(home, "user", "只确认第1项", clock.at, recipient="other-tab")
+    assert invoke("cycle", plan["id"]) == 2
+    assert sdk.writes == []
+    clock.at += timedelta(seconds=1)
+    tab_record(home, "user", "只确认第1项", clock.at)
+    assert invoke("approve", plan["id"]) == 0
+    assert positions() == []
+    assert invoke("cycle", plan["id"]) == 0
+    (order,) = sdk.writes
+    assert (order["code"], order["qty"], order["trd_env"]) == (
+        "US.ABC",
+        100,
+        "SIMULATE",
+    )
+    assert positions() == []
+    assert "ABC</td>" not in reader.read_text()
+
+    def report_fill(quantity, state):
+        sdk.history = [
+            {
+                **order,
+                "order_id": "paper-a",
+                "order_status": state,
+                "dealt_qty": quantity,
+                "dealt_avg_price": "20",
+            }
+        ]
+        sdk.positions = [
+            {
+                "acc_id": 42,
+                "code": "US.ABC",
+                "currency": "USD",
+                "qty": quantity,
+                "market_val": str(quantity * 21),
+                "nominal_price": "21",
+                "cost_price": "20",
+                "cost_price_valid": True,
+            }
+        ]
+        clock.at += timedelta(seconds=1)
+        assert invoke("reconcile", plan["id"]) == 0
+        assert [p["quantity"] for p in positions()] == [str(quantity)]
+        assert f"<td>ABC</td><td>{quantity} 股</td>" in reader.read_text()
+
+    report_fill(40, "FILLED_PART")
+    report_fill(40, "FILLED_PART")
+    report_fill(100, "FILLED_ALL")
+    assert invoke("cycle", plan["id"]) == 0
+    assert len(sdk.writes) == 1
+    sdk.positions = []
+    assert invoke("reconcile", plan["id"]) == 0
+    assert positions() == []
+
+
+def test_daily_bridge_keeps_manual_crypto_outside_approval_items(
+    tmp_path, monkeypatch, capsys
+):
+    root, live, now, _, _ = frozen_bridge(
+        tmp_path,
+        [
+            ("ABC", "US", "qualified"),
+            ("BTC-USD", "CRYPTO", "qualified"),
+            ("ETH-USD", "CRYPTO", "unknown"),
+        ],
+        late=True,
+    )
+    sdk = PlanningOpenD()
+    clock, invoke = tab_cli(tmp_path, monkeypatch, sdk, live, start=now)
+    plan = json.loads(capsys.readouterr().out)
+    assert [row["code"] for row in plan["lines"]] == ["US.ABC"]
+    assert "BTC" not in plan["delivery"] and "ETH" not in plan["delivery"]
+    (manual,) = plan["manual"]
+    assert (
+        manual["code"],
+        manual["direction"],
+        manual["currency"],
+        manual["state"],
+    ) == (
+        "BTC-USD",
+        "long",
+        "USD",
+        "pending_verification",
+    )
+    assert set(manual["missing"]) == {
+        "funds",
+        "exposure",
+        "limit_price",
+        "quantity_precision",
+    }
+    assert "quantity" not in manual and "item" not in manual
+    assert all("BTC" not in str(params) for _, params in sdk.quote_calls)
+
+    show_plan(tmp_path, plan, clock.at + timedelta(seconds=1))
+    clock.at += timedelta(seconds=2)
+    tab_record(tmp_path, "user", "完成了", clock.at)
+    assert invoke("cycle", plan["id"]) == 2
+    assert sdk.writes == []
+    capsys.readouterr()
+    assert invoke("plan") == 0
+    assert json.loads(capsys.readouterr().out) == plan
+    assert invoke("status") == 0
+    assert json.loads(capsys.readouterr().out)["holdings"]["positions"] == []
+    assert "BTC" not in (root / "reports" / f"{DAY}.html").read_text()

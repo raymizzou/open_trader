@@ -8,7 +8,14 @@ import subprocess
 from hashlib import sha256
 from pathlib import Path
 
-from .paper_evidence import REPORT_SCHEMA, TAIPEI, day, instant
+from .paper_evidence import (
+    BRIDGE_REPORT_SCHEMA,
+    REPORT_SCHEMA,
+    TAIPEI,
+    bridge_observations,
+    day,
+    instant,
+)
 
 HEX_SHA = re.compile(r"[0-9a-f]{40}")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -395,7 +402,7 @@ def check_selection_identity(
     ):
         raise ValueError("daily report artifact date does not match")
     canonical = "schema" in selection
-    if canonical and selection["schema"] != REPORT_SCHEMA:
+    if canonical and selection["schema"] not in (REPORT_SCHEMA, BRIDGE_REPORT_SCHEMA):
         raise ValueError("unsupported daily selection evidence schema")
     if selection.get("projection_sha256", None if canonical else digest) != digest:
         raise ValueError("daily report artifact digest does not match")
@@ -480,6 +487,8 @@ def latest_report(
     check_selection_identity(
         selection, projection, report_day, revision, release, info["projection_sha256"]
     )
+    if not source_only:
+        bridge_observations(projection, selection, info)
     if display and not source_only:
         from .paper_report import verified_display
 
