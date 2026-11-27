@@ -23,6 +23,24 @@ description: Prepare or retrieve the mobile Trend V3 daily report for Trend Anim
 
 只给交集中的原已核实直属卡补信号榜名、标签和数据日；原有其他直属卡继续按自身证据展示。搜索命中不证明归属，标签不证明严格转换或交易资格，模拟盘选中更须保留原始证据。结果复用现有方向面板、三块结构与模板，不截短入选大类、不另加导航或 section。信号字段和双强度逐项核实，缺项按既有规则遮蔽。11/25 20:00 的节气榜观察不回填早报，也不能证明新方向榜成员；新增榜和直达路径未现场核实时明确待核。
 
+### 成分页强度与分组阅读交接
+
+定时或手工需要新增数据时，同一个日报会话在候选和信号发现期间执行同版视觉技能的「当前大类成分页强度」。读一行就保留其正式证据、页内分数和全页顺序。原行资料进入本版私有 `reader-projection.json` 的 `signal_search.component_pages`；该数组只提供排序取证，现有 `memberships`、信号榜及选股链路继续使用各自的原证据。
+
+- 每份成分页取证记录含预期 `group`、本次母榜 `version`、实际带时区的 `observed_at`、组首证据 `source`、`state: "verified"`，以及 `component_page: {kind: "class_components", group, direction, report_date, version, column}`。内层记录的是实见页的所属大类、日报方向 `long`／`short`、本报告日、该成分页自己的版次和实际强度列名。
+- `members` 中同一行保留 `code`、`instrument_id`、`market`、`instrument_type`、适用的 `data_date`、`state`、显式 `removed`、`class_page_strength`、`class_page_position`、`class_page_version` 和 `class_page_source`（实际行画面引用）。身份含币种且可核实的，和对应卡使用同一币种。强度原样写为 0 到 100 的数值或保留显示精度的数值文本；位置按全页次序从 1 起。私有引用指向该日证据根内可定位的现场记录。缺值只保留实际证据，既不补造原值也不借用别榜。
+
+完成本版投影后，在正常成稿内执行同版命令。输出只留本版私有目录，有缺项也照常执行。
+
+```sh
+python3 "$skill_dir/collection.py" component-observations "$verified_json" \
+  --state "$revision_evidence/component-observations.json"
+```
+
+程序逐条对照本报告日、截至时间、方向、大类、卡片身份及适用市场日，产生 `private-visual-observations/v1`，相同行重叠去重、冲突或无证明不输出已核实值。记录的 `source` 是标的行现场引用，`class_page_source` 是所核对页首引用。母榜、事件和开仓资格继续由原流程核对。
+
+已经配置分组阅读时，在原报告通过既有认证后直接调用所选已核实配置的阅读辅助程序，沿用授权和既有参数，并附 `--visual "$revision_evidence/component-observations.json"`。保留已有其他适用的私有证据参数。该辅助程序继续用原规则按已核实成分页分数排序，多头从高到低、空头从低到高，同分按已核实源页位置。缺证继续按该阅读层现有待核规则处理。不要重建排序器、改动投影原字段或手工修补生成物。无配置时沿用普通日报。离线、纯复用和无需新增数据的修订不打开现场、不创建新采集证明，只读所选版本已保存的适用证据。
+
 符合当前入口和取数条件的官方查询，已核实整笔免费时可直接执行，按字段计费且本次全免也可直接执行。费率或字段不明可通过已知免费价目核价，母榜补缺须先满足上述视觉条件。任何可能收费或费用不明的调用（含榜图和成分），先在日报 tab 说明目标、字段、次数、估价及用途，等 Ray 对这次查询明确批准。尚未批准仍交付可用内容；排程、以往付费同意和缓存命中预估不构成本次授权。明确纯视觉及离线入口继续使用其限定来源。此规则覆盖本技能中对“已授权采集／费用”的旧默认解释。
 
 ## 开始与费用控制

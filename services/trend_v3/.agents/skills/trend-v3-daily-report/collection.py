@@ -1784,6 +1784,118 @@ def market_scope(value):
     return value.get("market"), value.get("instrument_type")
 
 
+def component_observations(report):
+    """Carry observed component scores into the private reader's existing input."""
+    day = valid_date(report.get("date"))
+    edition = report.get("board_version")
+    if not day:
+        raise ValueError("Component observations require a report day")
+    targets = report.get("collection", {}).get("targets", {})
+    current = {
+        (group["name"], direction, search_identity(card), card["data_date"])
+        for direction in ("long", "short")
+        for group in report.get(direction, [])
+        for section in ("direct", "searchable", "related")
+        for card in group.get(section, [])
+        if card.get("lookup") not in ("pending", "miss")
+        and valid_date(card.get("data_date"))
+        and card["data_date"] == targets.get(card.get("market"))
+    }
+    records, versions, positions = {}, {}, {}
+    conflicts, withdrawals = set(), set()
+    captures = report.get("signal_search", {}).get("component_pages", [])
+    for capture in captures:
+        page = capture.get("component_page", {})
+        if (
+            not isinstance(page, dict)
+            or page.get("kind") != "class_components"
+            or page.get("group") != capture.get("group")
+            or not board_text(page.get("group"))
+            or page.get("direction") not in ("long", "short")
+            or page.get("report_date") != day
+            or page.get("column") not in (
+                "强度", "页面内排名", "强度 / 页面内排名",
+            )
+            or not board_text(page.get("version"))
+            or capture.get("state") not in ("verified", "withdrawn")
+            or not board_text(edition)
+            or capture.get("version") != edition
+            or not board_text(capture.get("source"))
+            or not observed_by(capture.get("observed_at"), report.get("cutoff"))
+        ):
+            continue
+        group, direction, version = page["group"], page["direction"], page["version"]
+        page_key = group, direction
+        members = capture.get("members", [])
+        if capture["state"] == "withdrawn" and members == []:
+            withdrawals.add((*page_key, version, capture["source"]))
+            continue
+        versions.setdefault(page_key, set()).add(version)
+        for member in members:
+            identity = search_identity(member)
+            data_date = valid_date(member.get("data_date"))
+            if (
+                identity is None
+                or (group, direction, identity, data_date) not in current
+                or member.get("class_page_version") != version
+            ):
+                continue
+            pid, code, market, instrument_type, _ = identity
+            key = group, direction, pid, code, market, instrument_type, data_date
+            if (
+                capture["state"] == "withdrawn"
+                or member.get("state") == "withdrawn"
+                or member.get("removed") is True
+            ):
+                conflicts.add(key)
+                continue
+            score = member.get("class_page_strength")
+            digits = strength_value(score)
+            position = member.get("class_page_position")
+            source = member.get("class_page_source")
+            if (
+                member.get("state") != "verified"
+                or member.get("removed") is not False
+                or not board_text(source)
+                or digits is None
+                or type(position) is not int
+                or position < 1
+            ):
+                continue
+            position_key = (*page_key, version, position)
+            previous_key = positions.setdefault(position_key, key)
+            if previous_key != key:
+                conflicts.update((previous_key, key))
+            previous = records.get(key)
+            if previous:
+                if (
+                    Decimal(strength_value(previous["class_page_strength"]))
+                    != Decimal(digits)
+                    or previous["class_page_position"] != position
+                ):
+                    conflicts.add(key)
+                continue
+            records[key] = {
+                "group": group, "code": code, "identity": pid,
+                "market": market, "instrument_type": instrument_type,
+                "direction": direction, "report_date": day,
+                "data_date": data_date, "state": "verified",
+                "class_page_strength": digits if isinstance(score, str) else score,
+                "class_page_position": position,
+                "class_page_version": version,
+                "source": source,
+                "class_page_source": capture["source"],
+            }
+    verified = [
+        row for key, row in records.items()
+        if key not in conflicts
+        and len(versions[key[:2]]) == 1
+        and (*key[:2], row["class_page_version"], row["class_page_source"])
+        not in withdrawals
+    ]
+    return {"schema": "private-visual-observations/v1", "records": verified}
+
+
 def member_day(payload, member):
     return payload.get("targets", {}).get(
         member.get("market"), payload["board"]["data_date"]
@@ -2191,6 +2303,7 @@ def main():
         "action",
         choices=(
             "targets", "init", "claim", "assess", "confirm", "search-plan", "closeout",
+            "component-observations",
         ),
     )
     parser.add_argument(
@@ -2213,6 +2326,13 @@ def main():
     parser.add_argument("--reuse-revision", help="Pre-launch verified-reuse revision")
     args = parser.parse_args()
     try:
+        if args.action == "component-observations":
+            if args.state is None or args.state.resolve() == args.input.resolve():
+                raise ValueError("Component observations require a private output path")
+            projection = json.loads(args.input.read_bytes())
+            with state_lock(args.state):
+                save(args.state, component_observations(projection))
+            return
         if args.action == "closeout":
             value = closeout(args)
             print(json.dumps(value, ensure_ascii=False))
