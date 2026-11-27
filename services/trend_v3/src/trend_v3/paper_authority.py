@@ -25,7 +25,6 @@ PLAN_HEADER = re.compile(
 )
 NUMBERED_APPROVAL = re.compile(r"只?确认第([1-9][0-9]{0,2}(?:、[1-9][0-9]{0,2})*)项")
 CODE_FENCE = re.compile(r"( {0,3})(`{3,}|~{3,})(.*)")
-FENCE_INFO = re.compile(r"[A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)?")
 
 
 def strict_json(value):
@@ -232,7 +231,7 @@ def remove_code_indent(line, columns):
 
 def standalone_delivery_body(assistant):
     """Read either an unwrapped message or one literal Markdown code block."""
-    lines = assistant.replace("\r\n", "\n").split("\n")
+    lines = assistant.split("\n")
     start, end = 0, len(lines)
     while start < end and not lines[start].strip(" \t"):
         start += 1
@@ -244,11 +243,12 @@ def standalone_delivery_body(assistant):
     opening = CODE_FENCE.fullmatch(lines[0])
     if opening is not None:
         indent, fence, raw_info = opening.groups()
-        info = raw_info.strip(" \t")
         closing = CODE_FENCE.fullmatch(lines[-1])
+        # Backtick fences forbid backticks in their info string. The info
+        # otherwise has no role in matching the literal card.
         if (
             len(lines) < 2
-            or (info and not FENCE_INFO.fullmatch(info))
+            or (fence[0] == "`" and "`" in raw_info)
             or closing is None
             or not closing[2].startswith(fence)
             or closing[3].strip(" \t")
@@ -274,6 +274,7 @@ def visible_delivery(item, card, historical_card):
         return None, None, False
     assistant = message_text(item, "assistant")
     if assistant:
+        assistant = assistant.replace("\r\n", "\n").replace("\r", "\n")
         literal = standalone_delivery_body(assistant)
         if literal in (card, historical_card):
             return assistant, literal == card, True
