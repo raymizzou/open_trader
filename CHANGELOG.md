@@ -10,6 +10,23 @@
 - 核对私有券商凭据后归集成交。重复导入按券商成交标识去重；持仓归零且费用齐全时计入收益样本。异币费用须附可核对的实际兑换凭据。
 - 私有页面按冻结母榜列出全部大类，包含零样本行。正式台账入口拒绝使用合成演示数据库。
 
+## 2026-11-27 — Trend V3 report and mock file placement
+
+- Deliver each official Trend V3 report, revision, or correction as one
+  complete daily HTML file in the `trend_v3` iCloud Drive folder and link to the
+  actual file. Put development mock files and Ray-acceptance files, including
+  full HTML copies and previews, in the `trend_v3_mock` iCloud Drive folder.
+  Keep internal evidence, raw ledgers, and credentials private.
+
+## 2026-11-26 — Trend V3 task-tab workspace routing
+
+- Open new task tabs in the originating workspace. Reserve the Herdr `trend_v3`
+  workspace for formal Trend V3 daily reports, including scheduled runs and
+  explicitly requested formal reruns. Keep development, ticket or PR work,
+  mock or preview generation, and acceptance in the originating workspace.
+  Workspace routing is separate from private task files and the existing iCloud
+  report path.
+
 ## 2026-11-26 — Trend V3 Kelly 私有演示台账 (#546)
 
 - 新增独立 SQLite 演示台账。以合成成交归集开仓、加仓、部分退出、平仓与费用，区分待确认成本和已知零收益。重复初始化保留已记录的事件。演示数据按模拟／实盘标签、报告版本与来源大类隔离。

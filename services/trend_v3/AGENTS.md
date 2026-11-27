@@ -10,9 +10,15 @@ The caller owns calendar decisions and all other opening conditions.
 
 - In every session or tab that delivers a Trend V3 report to Ray, use the
   [daily report skill](.agents/skills/trend-v3-daily-report/SKILL.md) from the
-  selected repository revision. Deliver the entire current report as one HTML
-  file in the existing `trend_v3` iCloud folder. Link to that file in the
-  delivering session. Use that link as the sole delivery, even for a
+  selected repository revision. Only official daily reports, including
+  officially delivered corrections and revisions, go in the existing
+  `trend_v3` iCloud Drive folder. Deliver each official report, revision, or
+  correction as one complete daily HTML file and link to the actual file in
+  that folder in the delivering session. Development mock files and files
+  prepared for Ray's acceptance, including full HTML copies and previews, go
+  in the `trend_v3_mock` iCloud Drive folder. Link to the actual file in the
+  correct folder. Keep internal evidence, raw ledgers, and credentials private.
+  Use the official report link as the sole report delivery, even for a
   single-item correction.
 - Deliver the first report at Taipei 08:30 from available evidence, including
   missing data. Scheduled sessions then use the pinned skill collection.py
