@@ -38,6 +38,19 @@ and previews, go in the `trend_v3_mock` iCloud Drive folder. Link to the actual
 file in the correct folder. Keep internal evidence, raw ledgers, and
 credentials private.
 
+All data, HTML, previews, acceptance artifacts, reruns, corrections, revisions,
+and other output shown or delivered to Ray must come from the applicable
+Skill's normal end-to-end entry point. When reporting a fix, run the Skill
+version that contains that fix. The explicitly identified Mock UI is the only
+permitted Skill bypass. For a repair, use that normal entry on a clean run;
+helpers invoked by the Skill's normal flow are allowed, but manually patched
+data or HTML and out-of-band scripts or renderers are not substitutes.
+If the Skill has not incorporated and verified a fix, report that status instead
+of handing off a manually corrected final or acceptance artifact. State the
+exact Skill version actually run and whether the scheduled release is active or
+a pending switch in the delivery chat or handoff Ray sees, while retaining the
+private evidence; do not add this metadata as extra report content.
+
 When a new task tab is needed, open it in the workspace where the task
 originated. Reserve the Herdr `trend_v3` workspace for formal Trend V3 daily
 reports, including scheduled runs and explicitly requested formal reruns. Keep

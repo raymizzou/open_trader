@@ -20,6 +20,19 @@ The caller owns calendar decisions and all other opening conditions.
   correct folder. Keep internal evidence, raw ledgers, and credentials private.
   Use the official report link as the sole report delivery, even for a
   single-item correction.
+- Produce every Trend V3 output shown or delivered to Ray, including previews,
+  acceptance reruns, corrections, revisions and final reports, through the
+  applicable Skill's normal end-to-end entry point. When reporting a fix, run
+  the Skill version that contains that fix. The explicitly identified Mock UI is
+  the only permitted Skill bypass and remains mock output, not evidence of the
+  official path. For a repair, run that entry on a clean run. Helpers called by
+  the Skill's normal flow are allowed; manually patched data or HTML and
+  out-of-band scripts or renderers are not substitutes.
+  If the exercised Skill does not include and verify the fix, report its status
+  and do not hand off a manually corrected final or acceptance artifact. State
+  the exact Skill version actually run and whether the scheduled release is
+  active or a pending switch in the delivery chat or handoff Ray sees, while
+  retaining private evidence; do not put this metadata in the report content.
 - Deliver the first report at Taipei 08:30 from available evidence, including
   missing data. Scheduled sessions then use the pinned skill collection.py
   control state to check once per elapsed hourly slot until all frozen target
