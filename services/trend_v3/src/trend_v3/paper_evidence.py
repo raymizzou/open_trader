@@ -840,7 +840,10 @@ def candidates(report, facts):
     if reason := facts.get("report_gap"):
         return [], [{"reason": reason}]
     if "daily_bridge_routes" in facts:
-        return bridge_candidates(report, facts)
+        rows, skipped = bridge_candidates(report, facts)
+        if reason := facts.get("daily_bridge_coverage_gap"):
+            skipped.append({"reason": reason})
+        return rows, skipped
     report = paper_report_projection(
         report, facts.get("selection"), facts.get("paper_binding")
     )

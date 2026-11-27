@@ -416,8 +416,15 @@ def check_selection_identity(
 
 
 def latest_report(
-    root, report_day, release, *, frozen_revision=None, source_only=False
+    root,
+    report_day,
+    release,
+    *,
+    frozen_revision=None,
+    source_only=False,
+    expected_reader=None,
 ):
+    """Verify the exact current bytes when a caller has already captured them."""
     if not day(report_day) or not HEX_SHA.fullmatch(release):
         raise ValueError("invalid daily report date or release")
     index = root / "reports/_evidence" / report_day
@@ -452,9 +459,12 @@ def latest_report(
         raise ValueError("daily report revision does not match its verification")
     reader = root / "reports" / f"{report_day}.html"
     current = private_bytes(reader) if reader.exists() else b""
+    if expected_reader is not None and current != expected_reader:
+        raise ValueError("daily report artifact digest does not match")
     if (
         sha256(current).hexdigest() != info.get("report_sha256")
         and frozen_revision is not None
+        and expected_reader is None
     ):
         for archived in (
             evidence / "history" / reader.name,

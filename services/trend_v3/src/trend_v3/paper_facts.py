@@ -12,6 +12,7 @@ from .paper_evidence import (
     BRIDGE_MARKETS,
     REPORT_SCHEMA,
     SIGNALS,
+    TAIPEI,
     a_share_symbol,
     board_seat_verified,
     board_verified,
@@ -561,6 +562,10 @@ def produce(report, selection, info, evidence_root, broker, now):
         facts["daily_bridge_routes"] = preflight_observations(
             observations, report, selection, evidence_root, broker, now
         )
+        if all(row["state"] == "rejected" for row in observations):
+            facts["daily_bridge_coverage_gap"] = bridge_coverage_gap(
+                report, observations
+            )
         return report, facts
     report = paper_report_projection(report, selection, info)
     collection = report.get("collection") or {}
@@ -625,6 +630,118 @@ def produce(report, selection, info, evidence_root, broker, now):
                 except BrokerUnavailable:
                     facts["gaps"][path] = "paper_market_facts_unavailable"
     return report, facts
+
+
+def bridge_coverage_gap(report, observations):
+    """Prove the discovery scope only when reporting an absence of candidates."""
+    collection = report.get("collection") or {}
+    parent = collection.get("parent_board") or {}
+    rows = parent.get("groups")
+    report_day = day(report.get("date"))
+    observed, cutoff = instant(parent.get("observed_at")), instant(report.get("cutoff"))
+    edition = report.get("board_version")
+    if (
+        parent.get("state") != "verified"
+        or parent.get("complete") is not True
+        or not text(parent.get("source"))
+        or not text(edition)
+        or parent.get("version") != edition
+        or observed is None
+        or cutoff is None
+        or observed > cutoff
+        or observed.astimezone(TAIPEI).date() != report_day
+        or not isinstance(rows, list)
+        or not rows
+        or type(parent.get("row_count")) is not int
+        or parent["row_count"] != len(rows)
+    ):
+        return "daily_board_coverage_unverified"
+    if report.get("selection_mode") != "threshold-v1":
+        return "daily_class_coverage_unverified"
+
+    expected_classes = {"short": {}, "long": {}}
+    common_day = target(collection, "BOARD", report_day)
+    if common_day != day(parent.get("data_date")) or common_day != day(
+        report.get("board_date")
+    ):
+        common_day = None
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            return "daily_board_coverage_unverified"
+        name, score = row.get("name"), decimal(row.get("strength"))
+        if not text(name) or name in seen or score is None or not 0 <= score <= 100:
+            return "daily_board_coverage_unverified"
+        seen.add(name)
+        market = row.get("market")
+        expected_day = (
+            target(collection, market, report_day) if text(market) else common_day
+        )
+        actual_day = day(row.get("row_date", parent.get("data_date")))
+        if expected_day is None or actual_day != expected_day:
+            return "daily_target_coverage_unverified"
+        if score >= 80:
+            expected_classes["long"][name] = (score, actual_day)
+        elif score <= 20:
+            expected_classes["short"][name] = (score, actual_day)
+
+    evidence = collection.get("evidence") or {}
+    for direction, expected in expected_classes.items():
+        groups = report.get(direction, [])
+        actual = {
+            group.get("name"): decimal(group.get("board_strength")) for group in groups
+        }
+        if len(actual) != len(groups) or actual != {
+            name: value[0] for name, value in expected.items()
+        }:
+            return "daily_class_coverage_unverified"
+        for index, group in enumerate(groups):
+            name = group["name"]
+            _, when = expected[name]
+            coverage = group.get("coverage")
+            path = f"/{direction}/{index}/coverage"
+            if (
+                not isinstance(coverage, dict)
+                or coverage.get("state") != "complete"
+                or not isinstance(coverage.get("instrument_ids"), list)
+                or not coverage_matches_projection(group)
+                or not field(
+                    evidence,
+                    f"/{direction}/{index}",
+                    "coverage",
+                    coverage,
+                    name,
+                    "BOARD",
+                    None,
+                    when,
+                )
+                or evidence[path]["version"] != edition
+            ):
+                return "daily_member_coverage_unverified"
+            markets = set(collection.get("targets", {})) - {"BOARD"}
+            members = [
+                asset
+                for section in ("direct", "searchable", "related")
+                for asset in group.get(section, [])
+            ]
+            for asset in members:
+                market = asset.get("market")
+                if not text(market) or day(asset.get("data_date")) != target(
+                    collection, market, report_day
+                ):
+                    return "daily_target_coverage_unverified"
+                markets.add(market)
+            if any(
+                target(collection, market, report_day) is None for market in markets
+            ):
+                return "daily_target_coverage_unverified"
+    if any(
+        day(row.get("target_day")) is None
+        or day(row.get("actual_day")) != day(row["target_day"])
+        for row in observations
+    ):
+        return "daily_target_coverage_unverified"
+    return None
 
 
 def retained_bridge(report, selection, info, root):

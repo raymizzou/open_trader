@@ -4480,3 +4480,136 @@ def test_daily_bridge_keeps_manual_crypto_outside_approval_items(
     assert invoke("status") == 0
     assert json.loads(capsys.readouterr().out)["holdings"]["positions"] == []
     assert "BTC" not in (root / "reports" / f"{DAY}.html").read_text()
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("pending-board", "daily_board_coverage_unverified"),
+        ("missing-class", "daily_class_coverage_unverified"),
+        ("pending-members", "daily_member_coverage_unverified"),
+        ("pending-target", "daily_target_coverage_unverified"),
+        ("verified-empty", None),
+        ("verified-empty-group", None),
+        ("mixed-applicable-board-days", None),
+        ("qualified-with-unrelated-pending", None),
+    ],
+)
+def test_daily_bridge_incomplete_empty_report_is_not_verified_no_candidates(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    case,
+    reason,
+):
+    positive = case == "qualified-with-unrelated-pending"
+    if positive:
+        _, live, now, revision, selection = cn_bridge(tmp_path)
+    else:
+        _, live, now, revision, selection = frozen_bridge(tmp_path, ())
+    projection = json.loads((revision / "reader-projection.json").read_bytes())
+    collection = projection["collection"]
+    group = projection["long"][0]
+    group_name = group["name"]
+    other = {"name": "Other direction coverage pending", "seat": 1, "direct": []}
+    group_required = case in {
+        "missing-class",
+        "pending-members",
+        "pending-target",
+        "verified-empty-group",
+    }
+    board_rows = [
+        {
+            "name": group_name,
+            "strength": 87 if group_required else 50,
+            "row_date": DATA_DAY,
+        },
+    ]
+    collection["parent_board"] = {
+        "state": "pending"
+        if case in {"pending-board", "qualified-with-unrelated-pending"}
+        else "verified",
+        "complete": case not in {"pending-board", "qualified-with-unrelated-pending"},
+        "source": "independent retained board",
+        "version": projection["board_version"],
+        "observed_at": (now - timedelta(minutes=5)).isoformat(),
+        "row_count": len(board_rows),
+        "groups": board_rows,
+    }
+    if case == "pending-board":
+        collection["parent_board"].update(row_count=0, groups=[])
+    if positive:
+        projection["short"] = [other]
+    elif case in {"pending-members", "pending-target", "verified-empty-group"}:
+        if case != "pending-members":
+            group["coverage"] = {"state": "complete", "instrument_ids": []}
+            collection["evidence"]["/long/0/coverage"] = receipt(
+                group_name,
+                group["coverage"],
+                market="BOARD",
+                kind=None,
+            )
+    else:
+        projection["long"] = []
+
+    if case == "mixed-applicable-board-days":
+        earlier = (
+            (datetime.fromisoformat(DATA_DAY) - timedelta(days=3)).date().isoformat()
+        )
+        board_rows[0]["market"] = "US"
+        board_rows.append(
+            {
+                "name": "Other market",
+                "strength": 51,
+                "row_date": earlier,
+                "market": "HK",
+            }
+        )
+        collection["parent_board"]["row_count"] = 2
+        collection["targets"]["HK"] = earlier
+        collection["target_evidence"]["HK"] = deepcopy(
+            collection["target_evidence"]["US"]
+        ) | {"sessions": [earlier]}
+    elif case not in {"pending-board", "qualified-with-unrelated-pending"}:
+        projection["board_date"] = DATA_DAY
+        collection["targets"]["BOARD"] = DATA_DAY
+        collection["target_evidence"]["BOARD"] = {
+            "state": "verified",
+            "kind": "continuous",
+            "report_date": DAY,
+            "basis_date": DATA_DAY,
+            "source": "frozen board calendar",
+        }
+        collection["parent_board"]["data_date"] = DATA_DAY
+    if case == "pending-target":
+        collection["targets"]["US"] = None
+
+    projection_path = private_input(revision, "reader-projection.json", projection)
+    digest = sha256(projection_path.read_bytes()).hexdigest()
+    selection["projection_sha256"] = digest
+    selection["daily_bridge"]["projection_sha256"] = digest
+    info = json.loads((revision / "report-verification.json").read_bytes())
+    private_input(
+        revision,
+        "report-verification.json",
+        info | {"projection_sha256": digest},
+    )
+    update_selection(revision, selection)
+
+    sdk = BridgeOpenD()
+    assert run_daily_plan(tmp_path, sdk, now, live, monkeypatch) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert sdk.writes == []
+    if positive:
+        assert len(plan["lines"]) == 7
+        assert plan["execution"] == "awaiting_scheduled_tab_approval"
+    else:
+        assert plan["lines"] == []
+        assert "delivery" not in plan and "approve_all" not in plan
+        assert sdk.quote_calls == sdk.calls == []
+        if reason:
+            assert plan["execution"] == "evidence_incomplete"
+            assert {"reason": reason} in plan["skipped"]
+        else:
+            assert plan["execution"] == "verified_no_candidates"
+            assert plan["skipped"] == []
