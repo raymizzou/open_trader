@@ -11,18 +11,21 @@ from pathlib import Path
 from .paper_evidence import (
     BRIDGE_REPORT_SCHEMA,
     REPORT_SCHEMA,
-    TAIPEI,
     bridge_observations,
     day,
     instant,
 )
+from .paper_public import reason_label
 
 HEX_SHA = re.compile(r"[0-9a-f]{40}")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
 SESSION_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 REVISION = re.compile(r"v[0-9]{2,}")
-PLAN_HEADER = re.compile(r"^模拟开仓计划 ([0-9a-f]{64}) · 日报 (v[0-9]{2,})$", re.M)
+PLAN_HEADER = re.compile(
+    r"^[ \t]*模拟开仓计划 ([0-9a-f]{64}) · 日报 (v[0-9]{2,})\r?$", re.M
+)
 NUMBERED_APPROVAL = re.compile(r"只?确认第([1-9][0-9]{0,2}(?:、[1-9][0-9]{0,2})*)项")
+CODE_FENCE = re.compile(r"( {0,3})(`{3,}|~{3,})(.*)")
 
 
 def strict_json(value):
@@ -171,26 +174,97 @@ def original_prompt(home, session, root, launch, report_day):
     return False
 
 
-def delivery_card(plan):
+def observation_reason(plan, row):
+    reason = row["reason"]
+    # Previously displayed cards must reproduce the text bound to their replies.
+    if plan.get("display_reason_version") != 1:
+        return reason
+    if row.get("state") == "manual":
+        return "、".join(
+            reason_label(code) or "手工条件待核" for code in reason.split("、")
+        )
+    return reason_label(reason) or "开仓条件待核或不符"
+
+
+def delivery_card(plan, *, historical=False, include_observations=False):
     rows = [f"模拟开仓计划 {plan['id']} · 日报 {plan['report_version']}"]
+    context = plan.get("report_context") if include_observations else None
+    if context:
+        rows.append(
+            f"trend_v3 / trend507-{plan['date']} | "
+            f"来源 {context['release']} | 截至 {context['cutoff']}"
+        )
+    approvals = {}
     for number, line in enumerate(plan["lines"], 1):
         direction = "做多" if line["direction"] == "long" else "开空"
-        rows.append(
+        approvals[line["item"]] = (
             f"第{number}项 | {line['item']} | {line['code']} | "
             f"{line['signal']} {direction} | "
             f"数量 {line['quantity']} | 参考价 {line['reference_price']} | "
             f"估算 {line['notional']} {line['currency']} | "
             f"市价 {line['opens_at']} {line['timezone']}"
         )
+    if include_observations:
+        for row in plan.get("observations", ()):
+            if row.get("item") in approvals:
+                rows.append(approvals.pop(row["item"]))
+            elif row["state"] != "awaiting_approval":
+                subject = " ".join(row.get("code", "日报证据").split())
+                state = "加密手工" if row["state"] == "manual" else "暂不可确认"
+                detail = f"{subject} | {state} | {observation_reason(plan, row)}"
+                if missing := row.get("missing_fields"):
+                    if plan.get("display_reason_version") == 1:
+                        labels = (
+                            reason_label(field) or "其他证据" for field in missing
+                        )
+                    else:
+                        labels = (" ".join(field.split()) for field in missing)
+                    detail += " | 缺项 " + "、".join(labels)
+                rows.append(detail)
+    rows.extend(approvals.values())
+    if not historical and plan["lines"]:
+        if context:
+            rows.append("回复「确认全部」「只确认第1项」或「确认第1、3项」。")
+            if len(plan["lines"]) == 1:
+                rows.append("若紧接此卡且期间没有其他对话，也可回复「同意」。")
+        rows.append(
+            "开盘前确认，等开盘提交。开盘后在同一市场交易日内确认，通过即时复核后提交。"
+            "收盘后提交可能挂单或被拒。"
+        )
     return "\n".join(rows)
 
 
+def plan_display(plan):
+    if plan["lines"] or "observations" in plan:
+        return delivery_card(plan, include_observations=True)
+    header = f"模拟开仓状态 {plan['id']} · 日报 {plan['report_version']}"
+    reasons = [observation_reason(plan, row) for row in plan["skipped"]]
+    return "\n".join([header, *reasons])
+
+
+def handoff_identity(report_day, launch, verification):
+    binding = {
+        "day": report_day, "launch": launch, "revision": verification["revision"],
+        "release": verification["source"]["commit"],
+        "source_sha256": verification["report_sha256"],
+        "projection_sha256": verification["projection_sha256"],
+        "selection_sha256": verification["selection_sha256"],
+    }
+    return binding | {
+        "token": sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest(),
+    }
+
+
+def visible_message(item, role):
+    return (
+        item.get("type") == "message"
+        and item.get("role") == role
+        and item.get("recipient") in (None, "all")
+    )
+
+
 def message_text(item, role):
-    if (
-        item.get("type") != "message"
-        or item.get("role") != role
-        or item.get("recipient") not in (None, "all")
-    ):
+    if not visible_message(item, role):
         return None
     parts = item.get("content")
     if not isinstance(parts, list) or len(parts) != 1:
@@ -203,8 +277,118 @@ def message_text(item, role):
     return content if isinstance(content, str) else None
 
 
-def concise_approval(content, plan):
-    if content == "确认全部":
+def remove_code_indent(line, columns):
+    """Remove up to the structural indent, retaining unconsumed tab columns."""
+    width = offset = 0
+    while width < columns and offset < len(line):
+        char = line[offset]
+        if char == " ":
+            width += 1
+        elif char == "\t":
+            width += 4 - width % 4
+        else:
+            break
+        offset += 1
+    return width >= columns, " " * max(0, width - columns) + line[offset:]
+
+
+def standalone_delivery_body(assistant):
+    """Read either an unwrapped message or one literal Markdown code block."""
+    lines = assistant.removesuffix("\n").split("\n")
+    start, end = 0, len(lines)
+    while start < end and not lines[start].strip(" \t"):
+        start += 1
+    while start < end and not lines[end - 1].strip(" \t"):
+        end -= 1
+    if start == end:
+        return None
+    opening = CODE_FENCE.fullmatch(lines[start])
+    if opening is not None:
+        indent, fence, raw_info = opening.groups()
+        # Backtick fences forbid backticks in their info string. The info
+        # otherwise has no role in matching the literal card.
+        if fence[0] == "`" and "`" in raw_info:
+            return None
+        # A fenced block ends at its first valid close or the end of the
+        # message. With no close, even trailing blank content is literal.
+        body_end = len(lines)
+        for index in range(start + 1, end):
+            closing = CODE_FENCE.fullmatch(lines[index])
+            if closing and closing[2].startswith(fence) and not closing[3].strip(" \t"):
+                if index != end - 1:
+                    return None
+                body_end = index
+                break
+        return "\n".join(
+            remove_code_indent(line, len(indent))[1]
+            for line in lines[start + 1 : body_end]
+        )
+
+    lines = lines[start:end]
+    if remove_code_indent(lines[0], 4)[0]:
+        body = []
+        for line in lines:
+            indented, content = remove_code_indent(line, 4)
+            if not indented and line.strip(" \t"):
+                return None
+            body.append(content)
+        return "\n".join(body)
+    return "\n".join(lines)
+
+
+def visible_delivery(item, card, historical_card, display):
+    if item.get("phase") != "final_answer":
+        return None, None, False
+    assistant = message_text(item, "assistant")
+    if assistant:
+        assistant = assistant.replace("\r\n", "\n").replace("\r", "\n")
+        literal = standalone_delivery_body(assistant)
+        if literal in (card, display, historical_card):
+            return assistant, literal in (card, display), True
+        # Preserve an exact line-delimited delivery with surrounding context
+        # for named replies. Bare agreement requires the standalone body.
+        message = f"\n{assistant}\n"
+        if f"\n{card}\n" in message or f"\n{display}\n" in message:
+            return assistant, True, False
+        if f"\n{historical_card}\n" in message:
+            return assistant, False, False
+    return assistant, None, False
+
+
+def plan_was_delivered(home, root, scope, plan, created, now):
+    card = delivery_card(plan)
+    historical_card = delivery_card(plan, historical=True)
+    display = plan_display(plan)
+    for record in session_records(home, scope["id"], root):
+        at = instant(record.get("timestamp"))
+        if record.get("type") == "response_item" and at and created <= at <= now:
+            _, timing, _ = visible_delivery(
+                record.get("payload", {}), card, historical_card, display
+            )
+            if timing is not None:
+                return True
+    return False
+
+
+def plan_displayed_at(home, root, session, plan, created, now):
+    expected = plan_display(plan)
+    for record in session_records(home, session, root):
+        at = instant(record.get("timestamp"))
+        item = record.get("payload", {})
+        if (
+            record.get("type") == "response_item" and at and created <= at <= now
+            and item.get("phase") == "final_answer"
+        ):
+            message = message_text(item, "assistant")
+            if message and standalone_delivery_body(message) == expected:
+                return at
+    return None
+
+
+def concise_approval(content, plan, *, bare_offer):
+    if content == "确认全部" or (
+        content == "同意" and bare_offer and len(plan["lines"]) == 1
+    ):
         return f"模拟批准 {plan['id']} 全部"
     matched = NUMBERED_APPROVAL.fullmatch(content)
     if not matched:
@@ -269,9 +453,13 @@ def reply_from_text(content, plan, scope, event_id, delivered, at):
 def transcript_replies(home, root, scope, plan, created, now):
     """Read only visible deliveries and actual user messages from this session."""
     card = delivery_card(plan)
+    historical_card = delivery_card(plan, historical=True)
+    display = plan_display(plan)
     identity = (plan["id"], plan["report_version"])
     displayed = set()
     delivered = None
+    late_timing_disclosed = False
+    bare_offer = False
     replies = []
     for record in session_records(home, scope["id"], root):
         if record.get("type") != "response_item":
@@ -280,19 +468,33 @@ def transcript_replies(home, root, scope, plan, created, now):
         if not at or at > now:
             continue
         item = record.get("payload", {})
-        visible = item.get("phase") == "final_answer" and item.get("recipient") in (
-            None,
-            "all",
-        )
-        assistant = message_text(item, "assistant") if visible else None
-        if assistant:
-            if at.astimezone(TAIPEI).date().isoformat() == plan["date"]:
-                displayed.update(PLAN_HEADER.findall(assistant))
-            if created <= at and f"\n{card}\n" in f"\n{assistant}\n":
-                delivered = at
+        if visible_message(item, "assistant"):
+            assistant, timing, standalone = visible_delivery(
+                item, card, historical_card, display
+            )
+            bare_offer = False
+            if assistant:
+                for identity_seen in PLAN_HEADER.findall(assistant):
+                    if (
+                        at < created and "report_context" in plan
+                        and int(identity_seen[1][1:]) < int(plan["report_version"][1:])
+                    ):
+                        continue
+                    displayed.add(identity_seen)
+                if created <= at and timing is not None:
+                    delivered, late_timing_disclosed = at, timing
+                    bare_offer = timing and standalone
+            continue
+        if not delivered or at <= delivered or not visible_message(item, "user"):
             continue
         content = message_text(item, "user")
-        if not delivered or at <= delivered or not content:
+        if content and content.startswith(
+            ("# AGENTS.md instructions", "<environment_context>")
+        ):
+            continue
+        offered = bare_offer
+        bare_offer = False
+        if not content:
             continue
         meta = item.get("internal_chat_message_metadata_passthrough") or {}
         if meta and (
@@ -301,26 +503,22 @@ def transcript_replies(home, root, scope, plan, created, now):
             or meta.get("content_item_metadata") != [{"provenance": {"type": "user"}}]
         ):
             continue
-        if content.startswith(("# AGENTS.md instructions", "<environment_context>")):
-            continue
         # Native rollout messages can omit the optional message ID. The exact
         # recorded session, timestamp and text still identify a reply durably.
         event_id = sha256(
             json.dumps([scope["id"], item.get("id"), at.isoformat(), content]).encode()
         ).hexdigest()
         content = content.strip()
-        if (
-            displayed == {identity}
-            and at.astimezone(TAIPEI).date().isoformat() == plan["date"]
-        ):
-            content = concise_approval(content, plan)
-        replies.append(reply_from_text(content, plan, scope, event_id, delivered, at))
+        if displayed == {identity}:
+            content = concise_approval(content, plan, bare_offer=offered)
+        reply = reply_from_text(content, plan, scope, event_id, delivered, at)
+        if reply is not None and late_timing_disclosed:
+            reply["late_timing_disclosed"] = True
+        replies.append(reply)
     return replies
 
 
-def scheduled_scope(home, root, report_day, session):
-    if not SESSION_ID.fullmatch(session or ""):
-        raise ValueError("original scheduled Codex session is unavailable")
+def scheduled_launch(home, root, report_day):
     stored = home / ".config/trend-animals/daily-state"
     launch = read_json(stored / f"{report_day}.launch.json")
     id_ = launch.get("launch") or ""
@@ -330,7 +528,6 @@ def scheduled_scope(home, root, report_day, session):
         or launch.get("name") != f"trend507-{report_day}"
         or launch.get("home") != str(home)
         or launch.get("root") != str(root)
-        or launch.get("session") not in (None, session)
         or not re.fullmatch(r"[0-9a-f]{32}", id_)
         or not re.fullmatch(r"t[0-9a-z]+", terminal)
         or type(launch.get("created_ms")) is not int
@@ -340,21 +537,37 @@ def scheduled_scope(home, root, report_day, session):
         or not launch.get("space")
     ):
         raise ValueError("scheduled launch receipt does not match this day and session")
-    info = native_terminal(home, terminal)
+    return launch
+
+
+def native_tab_matches(info, launch):
     labels, foreground = info.get("labels") or {}, info.get("foreground") or {}
+    return (
+        info.get("state") == "live"
+        and info.get("created_ms") == launch["created_ms"]
+        and info.get("cwd") == launch["root"]
+        and info.get("argv") == launch["argv"]
+        and labels.get("herdr.tab") == launch["tab"]
+        and labels.get("herdr.space") == launch["space"]
+        and (info.get("status") or {}).get("app") == "codex"
+        and foreground.get("name") == "codex"
+        and foreground.get("cwd") == launch["root"]
+        and type(foreground.get("pid")) is int
+        and foreground["pid"] > 0
+    )
+
+
+def scheduled_scope(home, root, report_day, session):
+    if not SESSION_ID.fullmatch(session or ""):
+        raise ValueError("original scheduled Codex session is unavailable")
+    launch = scheduled_launch(home, root, report_day)
+    if launch.get("session") not in (None, session):
+        raise ValueError("scheduled launch receipt does not match this day and session")
+    info = native_terminal(home, launch["terminal"])
     if (
-        info.get("state") != "live"
-        or info.get("created_ms") != launch["created_ms"]
-        or info.get("cwd") != str(root)
-        or info.get("argv") != launch["argv"]
-        or labels.get("herdr.tab") != launch["tab"]
-        or labels.get("herdr.space") != launch["space"]
-        or (info.get("status") or {}).get("app") != "codex"
-        or foreground.get("name") != "codex"
-        or foreground.get("cwd") != str(root)
-        or type(foreground.get("pid")) is not int
-        or not is_ancestor(foreground["pid"])
-        or not original_prompt(home, session, root, id_, report_day)
+        not native_tab_matches(info, launch)
+        or not is_ancestor(info["foreground"]["pid"])
+        or not original_prompt(home, session, root, launch["launch"], report_day)
     ):
         raise ValueError("native scheduled tab or original launch prompt is unverified")
     return {
@@ -362,7 +575,7 @@ def scheduled_scope(home, root, report_day, session):
         "id": session,
         "date": report_day,
         "kind": "scheduled",
-        "launch": id_,
+        "launch": launch["launch"],
         "author": "scheduled_tab_user",
     }
 
@@ -387,6 +600,7 @@ def upload_receipt(home, scope, verification):
         or upload.get("uploaded") is not True
     ):
         raise ValueError("matching host report upload receipt is unavailable")
+    return upload
 
 
 def check_selection_identity(

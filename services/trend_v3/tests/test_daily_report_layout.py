@@ -3009,7 +3009,15 @@ def test_verified_paper_status_is_current_and_redacted(tmp_path):
                  "reason": "broker_receipt_unverified"},
                 {"code": "<script>alert(1)</script>", "state": "filled"},
             ],
-            "skipped": [{"code": "BTCUSD", "reason": "market_order_unsupported"}],
+            "skipped": [
+                {"code": "BTCUSD", "reason": "market_order_unsupported"},
+                {"code": "600001.SH", "reason": "instrument_position"},
+                {"code": "600002.SH", "reason": "instrument_working_order"},
+                {
+                    "code": "600003.SH",
+                    "reason": "instrument_order_reconciliation_pending",
+                },
+            ],
         },
     }
     html = render(tmp_path, report, "paper-current", report_revision="v02")
@@ -3017,6 +3025,9 @@ def test_verified_paper_status_is_current_and_redacted(tmp_path):
     assert "US.ABC · 部分成交 · 已成交 4 · 剩余 6 · 有活动委托" in simulation
     assert "US.DEF · 回执待核 · 未核实券商回执 · 活动委托待核" in simulation
     assert "BTCUSD · 已跳过 · 仅限价或市价不可用" in simulation
+    assert "600001.SH · 已跳过 · 已有持仓" in simulation
+    assert "600002.SH · 已跳过 · 已有挂单" in simulation
+    assert "600003.SH · 已跳过 · 委托状态待核，需对账" in simulation
     hidden = ("private-id", "private-order", "<script>")
     assert all(value not in html for value in hidden)
     assert html.count("未接入") == 3
@@ -3255,7 +3266,8 @@ def test_daily_reader_displays_reconciled_orders(tmp_path):
     states = {row["code"]: row for row in paper["results"]}
     assert states["US.PART"]["filled"] == 7 and states["US.PART"]["active"] is True
     assert states["US.DONE"]["filled"] == 100 and states["US.DONE"]["active"] is False
-    assert states["US.DENY"]["reason"] == "not_approved"
+    assert states["US.DENY"]["state"] == "pending"
+    assert states["US.DENY"]["reason"] == "awaiting_late_confirmation"
     paper["report_version"] = paper["holdings"]["report_version"] = "v02"
     html = render(
         tmp_path,

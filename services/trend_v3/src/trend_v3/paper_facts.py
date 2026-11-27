@@ -192,7 +192,17 @@ def coverage_matches_projection(group):
     return all(members) and len(set(members)) == len(members) and covered == members
 
 
-def session_time(broker, code, quote_market, report_day, data_day, now, *, future=None):
+def session_time(
+    broker,
+    code,
+    quote_market,
+    report_day,
+    data_day,
+    now,
+    *,
+    future=None,
+    allow_late=False,
+):
     if future is None:
         timezone, currency, opens, closes, half_close = EQUITIES[quote_market]
     else:
@@ -232,7 +242,7 @@ def session_time(broker, code, quote_market, report_day, data_day, now, *, futur
         "timezone": timezone,
         "session": "regular",
     }
-    if now >= opening:
+    if now >= opening and (not allow_late or now.astimezone(zone).date() != report_day):
         raise FactsMissing("missed_open")
     return session, currency
 
@@ -255,6 +265,7 @@ def quotes(
     *,
     future=None,
     bridge=False,
+    live=False,
 ):
     kind = {"stock": "STOCK", "etf": "ETF", "future": "FUTURE"}[product]
     basic = exact_row(
@@ -267,7 +278,7 @@ def quotes(
         code,
         "product_unverified",
     )
-    if bridge and basic.get("suspension") is True:
+    if (bridge or live) and basic.get("suspension") is True:
         raise FactsMissing("market_halted")
     if (
         basic.get("stock_type") != kind
@@ -281,16 +292,21 @@ def quotes(
         code,
         "reference_price_unverified",
     )
-    if bridge and snapshot.get("suspension") is True:
+    if (bridge or live) and (
+        snapshot.get("suspension") is True or snapshot.get("sec_status") == "SUSPENDED"
+    ):
         raise FactsMissing("market_halted")
+    normal = {"NORMAL"}
+    if live:
+        normal.update({"AFTER_COMBINATION", "AFTER_TRANSACTION"})
     if (
         snapshot.get("suspension") is not False
-        or snapshot.get("sec_status") != "NORMAL"
+        or snapshot.get("sec_status") not in normal
     ):
         raise FactsMissing("market_status_unverified")
     try:
         stamped = datetime.fromisoformat(snapshot.get("update_time") or "")
-    except ValueError as error:
+    except (TypeError, ValueError) as error:
         raise FactsMissing("reference_price_unverified") from error
     local = (
         stamped.replace(tzinfo=zone)
@@ -316,6 +332,91 @@ def quotes(
         if snapshot.get("enable_short_sell") is not True or not borrow or borrow < lot:
             raise FactsMissing("short_capacity_unverified")
     return price, lot, expiry
+
+
+def late_execution_terms(broker, line, now):
+    """Recheck the frozen instrument and price the full approved quantity today."""
+    code, product = line["code"], line["product"]
+    market = code.split(".", 1)[0]
+    trade_date = day(line["session_date"])
+    zone = ZoneInfo(line["timezone"])
+    future = None
+    try:
+        if product == "future":
+            info = exact_row(
+                broker.planning_quote("get_future_info", code_list=[code]),
+                code,
+                "future_contract_unverified",
+            )
+            expected_owner = line.get("contract_owner") or (
+                "HK.800000" if market == "HK" else line["economic_instrument"]
+            )
+            size = decimal(info.get("size"))
+            if (
+                not isinstance(info.get("owner"), str)
+                or info["owner"].upper() != expected_owner.upper()
+                or size != decimal(line["multiplier"])
+            ):
+                raise FactsMissing("future_specification_unverified")
+            currency, zone_name, sittings, native_lot = future_session_terms(
+                info,
+                market,
+                "HSI" if market == "HK" and code.startswith("HK.HSI") else "",
+                size,
+            )
+            if currency != line["currency"] or zone_name != line["timezone"]:
+                raise FactsMissing("future_session_unverified")
+            future = {
+                "timezone": zone_name,
+                "currency": currency,
+                "sittings": sittings,
+                "native_lot": native_lot,
+                "last_trade_time": info.get("last_trade_time"),
+            }
+        session, currency = session_time(
+            broker,
+            code,
+            market,
+            trade_date,
+            day(line["signal_date"]),
+            now,
+            future=future,
+            allow_late=True,
+        )
+        price, lot, expiry = quotes(
+            broker,
+            code,
+            market,
+            product,
+            line["direction"],
+            trade_date,
+            zone,
+            now,
+            future=future,
+            live=True,
+        )
+        closes = instant(session["closes_at"])
+        if future and expiry == trade_date:
+            if market == "HK":
+                closes = min(closes, datetime.combine(trade_date, time(16), zone))
+            last = datetime.fromisoformat(future["last_trade_time"])
+            if now >= min(
+                closes, last.replace(tzinfo=zone) if last.tzinfo is None else last
+            ):
+                raise FactsMissing("future_expiry_unverified")
+        if (
+            currency != line["currency"]
+            or instant(session["opens_at"]) != instant(line["opens_at"])
+            or closes != instant(line["closes_at"])
+        ):
+            raise FactsMissing("opening_unverified")
+        if lot != line["lot"]:
+            raise FactsMissing("reference_price_or_lot_unverified")
+    except FactsMissing as error:
+        return None, str(error)
+    except (BrokerUnavailable, KeyError, OSError, TypeError, ValueError):
+        return None, "execution_conditions_unverified"
+    return line | {"reference_price": str(price)}, None
 
 
 def verify_future_quote(basic, snapshot, native_lot, future, report_day):
@@ -426,6 +527,7 @@ def actual_future(broker, raw, selected, asset, report_day):
         "last_trade_time": info.get("last_trade_time"),
         "route": {
             "contract_root": root,
+            "contract_owner": expected_owner,
             "delivery_month": month,
             "underlying_id": asset["instrument_id"],
             "tradable_contract_verified": True,
@@ -445,6 +547,7 @@ def build_route(
     now,
     *,
     bridge=False,
+    allow_late=False,
 ):
     market = asset["market"]
     symbol = asset["code"]
@@ -487,7 +590,10 @@ def build_route(
     if bridge and future is None:
         timezone, _, usual_open, _, _ = EQUITIES[quote_market]
         # Supported whole and half sessions share their opening time.
-        if now >= datetime.combine(report_day, usual_open, ZoneInfo(timezone)):
+        zone = ZoneInfo(timezone)
+        if now >= datetime.combine(report_day, usual_open, zone) and (
+            not allow_late or now.astimezone(zone).date() != report_day
+        ):
             raise FactsMissing("missed_open")
     session, currency = session_time(
         broker,
@@ -497,6 +603,7 @@ def build_route(
         when,
         now,
         future=future,
+        allow_late=allow_late,
     )
     session["market"] = market
     zone = ZoneInfo(session["timezone"])
@@ -536,7 +643,7 @@ def build_route(
     return route, session
 
 
-def produce(report, selection, info, evidence_root, broker, now):
+def produce(report, selection, info, evidence_root, broker, now, *, allow_late=False):
     """Only ask OpenD about assets with report, membership and raw signal evidence."""
     report = deepcopy(report)
     selection = normalize_field_sources(selection, report["date"])
@@ -559,8 +666,17 @@ def produce(report, selection, info, evidence_root, broker, now):
     if observations is not None:
         if now < instant(info["cutoff"]):
             raise ValueError("daily observation evidence unverified")
+        facts["report_context"] = {
+            "release": info["source"]["commit"], "cutoff": info["cutoff"],
+        }
         facts["daily_bridge_routes"] = preflight_observations(
-            observations, report, selection, evidence_root, broker, now
+            observations,
+            report,
+            selection,
+            evidence_root,
+            broker,
+            now,
+            allow_late=allow_late,
         )
         if all(row["state"] == "rejected" for row in observations):
             facts["daily_bridge_coverage_gap"] = bridge_coverage_gap(
@@ -621,7 +737,16 @@ def produce(report, selection, info, evidence_root, broker, now):
                 path = f"{group_path}/direct/{offset}"
                 try:
                     record_facts(
-                        report, facts, raw, broker, group, asset, path, direction, now
+                        report,
+                        facts,
+                        raw,
+                        broker,
+                        group,
+                        asset,
+                        path,
+                        direction,
+                        now,
+                        allow_late=allow_late,
                     )
                 except FactsMissing as error:
                     facts["gaps"][path] = str(error)
@@ -894,7 +1019,7 @@ class ObservationRouteFacts:
         return read_observation_source(self.row, field, sources, {path: original}, {})
 
 
-def preflight_observations(rows, report, selection, root, broker, now):
+def preflight_observations(rows, report, selection, root, broker, now, *, allow_late):
     result = {}
     stock_routes = {}
     report_day = day(report["date"])
@@ -948,6 +1073,7 @@ def preflight_observations(rows, report, selection, root, broker, now):
                 when,
                 now,
                 bridge=True,
+                allow_late=allow_late,
             )
         except FactsMissing as error:
             item["reason"] = str(error)
@@ -989,7 +1115,9 @@ def manual_crypto(item, asset, row):
     return "manual_crypto_preflight_required"
 
 
-def record_facts(report, facts, raw, broker, group, asset, path, direction, now):
+def record_facts(
+    report, facts, raw, broker, group, asset, path, direction, now, *, allow_late
+):
     collection, report_day = report["collection"], day(report["date"])
     evidence = collection["evidence"]
     verify_membership(report, asset, group, path.split("/direct/")[0])
@@ -1048,6 +1176,7 @@ def record_facts(report, facts, raw, broker, group, asset, path, direction, now)
         report_day,
         when,
         now,
+        allow_late=allow_late,
     )
     member = {
         "group": group["name"],

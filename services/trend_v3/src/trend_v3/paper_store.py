@@ -3,7 +3,11 @@
 import os
 import sqlite3
 import stat
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+from hashlib import sha256
+
+from .paper_authority import require_private_dir, strict_json
+from .paper_evidence import instant
 
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS position_history (identity TEXT, as_of TEXT,
@@ -43,7 +47,49 @@ SCHEMA = (
         event_id TEXT NOT NULL REFERENCES replies(event_id),
         quantity INTEGER NOT NULL, at TEXT NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS attempt_dispatches (
+        token TEXT PRIMARY KEY REFERENCES attempts(token) ON DELETE CASCADE,
+        mode TEXT NOT NULL CHECK(mode IN ('opening', 'late', 'retry')),
+        event_id TEXT NOT NULL REFERENCES replies(event_id),
+        submitted_at TEXT,
+        reference_price TEXT NOT NULL
+    )""",
 )
+
+
+def handoff_plan(path, scope, verification):
+    """Read the currently saved plan only when the owner and evidence still match."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None, None
+    require_private_dir(path.parent)
+    if (
+        path.resolve() != path or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+        or info.st_uid != os.geteuid() or info.st_mode & 0o077
+    ):
+        raise PermissionError("paper state must be owned by the caller and private")
+    with closing(
+        sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=1)
+    ) as database:
+        row = database.execute(
+            "SELECT body, created FROM plans "
+            "JOIN current_plan ON plans.id = current_plan.id "
+            "WHERE current_plan.report_day = ?", (scope["date"],),
+        ).fetchone()
+    if row is None:
+        return None, None
+    plan = strict_json(row[0])
+    digest = sha256(
+        (verification["projection_sha256"] + verification["selection_sha256"]).encode()
+    ).hexdigest()
+    if (
+        plan["date"] != scope["date"] or plan["owner"] != scope["owner"]
+        or plan["session"] != scope["id"] or plan["report_hash"] != digest
+        or plan["report_version"] != verification["revision"]
+    ):
+        return None, None
+    return plan, instant(row[1])
 
 
 @contextmanager

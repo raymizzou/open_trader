@@ -6,6 +6,7 @@ import subprocess
 import sys
 from contextlib import closing
 from copy import deepcopy
+from datetime import datetime, timedelta
 from hashlib import sha256
 
 from test_paper_entry import (
@@ -57,6 +58,7 @@ class Replay:
         holdings="active",
         ambiguous=False,
         hidden=False,
+        late=None,
     ):
         self.folder = tmp_path.resolve() / "private"
         self.folder.mkdir(mode=0o700, parents=True)
@@ -74,7 +76,11 @@ class Replay:
         }
         self.broker = ReceiptBroker()
         self.service = PaperEntry(
-            self.execution, self.broker, session(), verify_reply=offline_reply
+            self.execution,
+            self.broker,
+            session(),
+            verify_reply=offline_reply,
+            recheck_late=lambda line, now: (line, None),
         )
         projection, facts = report("FIXTURE" if submit else "UNROUTED")
         if not submit:
@@ -149,16 +155,27 @@ class Replay:
             now=PREOPEN,
         )
         if submit:
-            assert self.service.approve(
-                self.plan["id"], approval(self.plan), now=PREOPEN
-            )
+            if late is None:
+                assert self.service.approve(
+                    self.plan["id"], approval(self.plan), now=PREOPEN
+                )
+                dispatch = {"now": OPEN}
+            else:
+                reply = approval(
+                    self.plan,
+                    late,
+                    event_id="late-fixture-reply",
+                    late_timing_disclosed=True,
+                )
+                assert self.service.approve(self.plan["id"], reply, now=late)
+                dispatch = {"now": late + timedelta(seconds=1), "late_reply": reply}
             self.broker.reply = {
                 "state": holdings,
                 "id": "fixture-open-order",
                 "filled": filled,
                 "filled_notional": str(filled * 10),
             }
-            self.service.submit(self.plan["id"], now=OPEN)
+            self.service.submit(self.plan["id"], **dispatch)
             with closing(sqlite3.connect(self.execution)) as db:
                 (self.token,) = db.execute("SELECT token FROM attempts").fetchone()
 
@@ -411,6 +428,43 @@ def test_confirmed_fill_binds_opening_report(tmp_path):
     assert case.execution.read_bytes() == before_after_reconcile
 
 
+def test_late_first_entry_requires_matching_reply_and_submission_time(tmp_path):
+    reply_at = OPEN + timedelta(minutes=30)
+    sent_at = reply_at + timedelta(seconds=1)
+    case = Replay(tmp_path, 100, late=reply_at)
+    case.cli("init")
+    valid = opening(case, deals=[deal("late-deal", sent_at.isoformat(), 100, 10)])
+    assert case.sync([valid])["kelly"]["open_rounds"] == 1
+    early = opening(case, deals=[deal("too-early", reply_at.isoformat(), 100, 10)])
+    case.sync([early], success=False)
+    assert len(case.broker.orders) == 1
+
+    with closing(sqlite3.connect(case.execution)) as db:
+        matches = db.execute(
+            "SELECT mode, event_id, submitted_at FROM attempt_dispatches WHERE token=?",
+            (case.token,),
+        ).fetchone()
+        assert matches[0:2] == ("late", "late-fixture-reply")
+        assert datetime.fromisoformat(matches[2]) == sent_at
+        for field, bad, original in (
+            ("event_id", "another-reply", matches[1]),
+            ("submitted_at", None, matches[2]),
+            ("submitted_at", (reply_at + timedelta(hours=1)).isoformat(), matches[2]),
+        ):
+            with db:
+                db.execute(
+                    f"UPDATE attempt_dispatches SET {field}=? WHERE token=?",
+                    (bad, case.token),
+                )
+            case.sync([valid], success=False)
+            with db:
+                db.execute(
+                    f"UPDATE attempt_dispatches SET {field}=? WHERE token=?",
+                    (original, case.token),
+                )
+    assert case.sql("SELECT COUNT(*) FROM trade_events") == [(1,)]
+
+
 def test_cumulative_and_manual_replay(tmp_path):
     case = Replay(tmp_path, 60)
     case.cli("init")
@@ -566,9 +620,10 @@ def test_rejects_unverified_attribution(tmp_path):
 
 def test_legacy_execution_schema_read_only(tmp_path):
     case = Replay(tmp_path, 100)
-    # feab08de introduced only these two tables. The other seven retain their
-    # original SQL definitions and the real PaperEntry fixture rows.
+    # Recreate the schema before holdings and dispatch audit while retaining
+    # the original execution tables and the real PaperEntry fixture rows.
     with closing(sqlite3.connect(case.execution)) as db, db:
+        db.execute("DROP TABLE attempt_dispatches")
         db.execute("DROP TABLE position_history")
         db.execute("DROP TABLE positions")
     before = case.execution.read_bytes()

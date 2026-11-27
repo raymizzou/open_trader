@@ -1,4 +1,4 @@
-"""Trusted date-bound display sync. No agent dispatch, data API or order submission."""
+"""Trusted date-bound display sync and original-tab planning notifications."""
 
 import argparse
 import fcntl
@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from daily_handoff import check_handoff
 from daily_lifecycle import atomic_json
 from daily_paper import continuing, refresh_display
 from daily_support import SyncDenied, retry_sync, sync_allowed
@@ -129,6 +130,24 @@ def host_sync_once(home, day, launch, now=None):
                     timestamp=result["timestamp"],
                 ),
             )
+            if result["uploaded"] and (
+                datetime.fromtimestamp(result["timestamp"], TAIPEI).date().isoformat()
+                == day
+            ):
+                try:
+                    from trend_v3.paper_authority import scheduled_launch
+
+                    owner = scheduled_launch(home, root, day)
+                    if owner["launch"] == launch:
+                        check_handoff(
+                            home, root, owner, result, verification, authorize
+                        )
+                except (
+                    KeyError, OSError, TypeError, ValueError,
+                    subprocess.SubprocessError,
+                ):
+                    # Native notification and upload have independent outcomes.
+                    pass
             return result
         except Exception as error:
             stamp = time.time() if now is None else now

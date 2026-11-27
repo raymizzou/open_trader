@@ -777,6 +777,11 @@ def routed_candidate(
         "timezone": session["timezone"],
         "session_date": session["session_date"],
         "strength": strength,
+        **(
+            {"contract_owner": route["contract_owner"]}
+            if product == "future" and text(route.get("contract_owner"))
+            else {}
+        ),
     }, None
 
 
@@ -824,7 +829,7 @@ def bridge_candidates(report, facts):
         )
     return [
         item | {"observation_paths": sorted(paths)}
-        for key, (item, paths) in sorted(rows.items())
+        for key, (item, paths) in rows.items()
         if key not in conflicts
     ], skipped
 

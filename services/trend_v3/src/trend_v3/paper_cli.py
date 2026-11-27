@@ -13,8 +13,11 @@ from time import sleep as sleep_open
 
 from .paper_authority import (
     delivery_card,
+    handoff_identity,
     latest_report,
     message_text,
+    plan_display,
+    plan_was_delivered,
     read_json,
     release_pin,
     require_private_dir,
@@ -23,11 +26,12 @@ from .paper_authority import (
     transcript_replies,
     upload_receipt,
 )
-from .paper_entry import PaperEntry, encode
+from .paper_entry import LATE_DISPATCH_SLACK, PaperEntry, encode
 from .paper_evidence import TAIPEI, instant
-from .paper_facts import produce, retained_bridge
+from .paper_facts import late_execution_terms, produce, retained_bridge
 from .paper_futu import BrokerUnavailable, FutuPaperBroker
 from .paper_report import prepare_report_evidence, refresh_report
+from .paper_store import handoff_plan
 
 
 def utc_now():
@@ -97,6 +101,9 @@ def public_plan(plan):
             }
             for row in plan["manual"]
         ]
+    result["display"] = plan_display(plan)
+    if "observations" in plan:
+        result["observations"] = plan["observations"]
     if not plan["lines"]:
         reasons = {row["reason"] for row in plan["skipped"]}
         if reasons <= {"verified_no_signal"}:
@@ -126,10 +133,24 @@ class OfflineBroker:
         raise BrokerUnavailable("offline quote unavailable")
 
 
-def plan_report(service, artifacts, evidence_dir, now, *, clock=None):
+def plan_report(
+    service, artifacts, evidence_dir, now, *, clock=None, was_delivered=None
+):
     report, selection, info = artifacts
-    report, facts = produce(report, selection, info, evidence_dir, service.broker, now)
-    return public_plan(service.plan(report, facts, now=clock() if clock else now))
+    report, facts = produce(
+        report,
+        selection,
+        info,
+        evidence_dir,
+        service.broker,
+        now,
+        allow_late=service.session["kind"] == "scheduled",
+    )
+    return public_plan(
+        service.plan(
+            report, facts, now=clock() if clock else now, was_delivered=was_delivered
+        )
+    )
 
 
 def rehearse(args):
@@ -157,9 +178,10 @@ def parse_args(argv=None):
     parser.add_argument("--session", help="original scheduled Codex session UUID")
     parser.add_argument("--report-date", help="original scheduled Taipei report date")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser(
+    plan = commands.add_parser(
         "plan", help="plan from the scheduled tab's latest daily report"
     )
+    plan.add_argument("--handoff", help="pending trusted host planning notice")
     manual = commands.add_parser(
         "manual-holdings", help="record the original user crypto position snapshot"
     )
@@ -236,10 +258,12 @@ def main(argv=None):
 PUBLIC_ERRORS = {
     "original scheduled Codex session is unavailable",
     "original scheduled report date is unavailable",
+    "report date must match the current scheduled report",
     "scheduled launch receipt does not match this day and session",
     "native scheduled tab or original launch prompt is unverified",
     "paper code is outside the pinned daily skill release",
     "matching host report upload receipt is unavailable",
+    "matching host planning notice is unavailable",
     "latest daily report pointer does not match",
     "daily report revision does not match its verification",
     "daily report artifact digest does not match",
@@ -257,9 +281,7 @@ def run_daily(args):
     now = utc_now()
     today = now.astimezone(TAIPEI).date()
     allowed = {today.isoformat()}
-    if args.command in {"reconcile", "status", "cycle"} or (
-        args.command == "submit" and args.retry_item
-    ):
+    if args.command != "manual-holdings":
         allowed.add((today - timedelta(days=1)).isoformat())
     report_day = args.report_date or today.isoformat()
     if report_day not in allowed:
@@ -285,14 +307,36 @@ def run_daily(args):
             return False
 
     artifacts = None
+    state = root / "reports/_evidence/.paper-entry"
     if args.command == "plan":
         artifacts = latest_report(root, report_day, pin)
-        upload_receipt(home, scope, artifacts[2])
-    state = root / "reports/_evidence/.paper-entry"
+        upload = upload_receipt(home, scope, artifacts[2])
+        if args.handoff:
+            binding = handoff_identity(report_day, scope["launch"], artifacts[2])
+            path = home / ".config/trend-animals/daily-state" / (
+                f"{report_day}.paper-handoff.json"
+            )
+            notice = read_json(path)
+            if (
+                args.handoff != binding["token"]
+                or any(notice.get(key) != value for key, value in binding.items())
+                or notice.get("session") != scope["id"]
+                or notice.get("status") not in {"requested", "displayed"}
+                or upload.get("source") != "host Foundation"
+                or not 0 <= now.timestamp() - upload.get("timestamp", 0) <= 300
+            ):
+                raise ValueError("matching host planning notice is unavailable")
+            retained_bridge(*artifacts, root / "reports/_evidence")
+            plan, _ = handoff_plan(state / "state.sqlite3", scope, artifacts[2])
+            if plan is not None:
+                emit(public_plan(plan))
+                return 0
     if args.command == "status":
         database = state / "state.sqlite3"
         result = (
-            PaperEntry(database, OfflineBroker(), scope).status(now=now)
+            PaperEntry(database, OfflineBroker(), scope, check_plan=check_plan).status(
+                now=now
+            )
             if database.exists()
             else None
         )
@@ -357,10 +401,18 @@ def run_daily(args):
             clock=utc_now,
             verify_reply=lambda reply: reply is authorized,
             check_plan=check_plan,
+            recheck_late=lambda line, now: late_execution_terms(broker, line, now),
         )
         if args.command == "plan":
             plan = plan_report(
-                service, artifacts, root / "reports/_evidence", now, clock=utc_now
+                service,
+                artifacts,
+                root / "reports/_evidence",
+                now,
+                clock=utc_now,
+                was_delivered=lambda plan, created: plan_was_delivered(
+                    home, root, scope, plan, created, utc_now()
+                ),
             )
             refresh_needed = True
             emit(plan)
@@ -418,14 +470,28 @@ def run_action(args, service, plan, replies, record, refresh=lambda: None):
         records = replies()
         latest = records[-1] if records else None
         if args.command in {"approve", "cycle"}:
+            for reply in records[:-1]:
+                if reply and reply["decision"] == "deny":
+                    record(reply)
             decision = (
                 record(latest) if latest and latest["decision"] != "retry" else None
             )
             if decision is not None:
                 emit({"plan": plan["id"], **decision})
                 if args.command == "cycle":
-                    wait_for_open(service, plan, replies, record, refresh)
+                    wait_for_open(
+                        service,
+                        plan,
+                        replies,
+                        record,
+                        refresh,
+                        initial_late=(latest, decision)
+                        if decision.get("late_items")
+                        else None,
+                    )
                     follow_receipts(service, plan, refresh)
+                else:
+                    submit_late(service, plan, latest, decision)
                 return 0
             if args.command == "cycle" and service.has_approval(plan["id"]):
                 wait_for_open(service, plan, replies, record, refresh)
@@ -463,6 +529,23 @@ def run_action(args, service, plan, replies, record, refresh=lambda: None):
     return 0
 
 
+def submit_late(service, plan, reply, decision):
+    items = decision.get("late_items", ())
+    if items:
+        emit(
+            public_results(
+                plan["id"],
+                [
+                    row
+                    for item in items
+                    for row in service.submit(
+                        plan["id"], now=utc_now(), item=item, late_reply=reply
+                    )
+                ],
+            )
+        )
+
+
 class ReceiptObserver:
     """One read-only I/O round in flight; never join it on an opening deadline."""
 
@@ -495,25 +578,56 @@ class ReceiptObserver:
         self.thread.start()
 
 
-def wait_for_open(service, plan, replies, record, refresh=lambda: None):
+def wait_for_open(
+    service, plan, replies, record, refresh=lambda: None, *, initial_late=None
+):
     plan_id = plan["id"]
     started = utc_now()
     observer = ReceiptObserver(service, plan, refresh)
-    openings = service.openings(plan_id)
+    seen = set()
+    queued_late = [initial_late] if initial_late else []
+
+    def dispatch_late():
+        for reply, decision in queued_late:
+            submit_late(service, plan, reply, decision)
+        queued_late.clear()
+
+    def observe_replies():
+        observed = replies()
+        latest = observed[-1] if observed else None
+        for reply in observed:
+            if not reply or reply["event_id"] in seen:
+                continue
+            if reply["decision"] != "deny" and (
+                reply is not latest or reply["decision"] != "approve"
+            ):
+                continue
+            seen.add(reply["event_id"])
+            decision = record(reply)
+            if decision is not None and decision["recorded"]:
+                emit({"plan": plan_id, **decision})
+                if decision.get("late_items"):
+                    queued_late.append((reply, decision))
+
+    openings = [opening for opening in service.openings(plan_id) if opening > started]
+    if not openings:
+        observe_replies()
+        dispatch_late()
     for opening in openings:
-        if opening <= started:
-            continue
-        while (observed := utc_now()) < opening:
-            if not service.openings(plan_id):
-                break
-            observer.poll()
-            sleep_open(min(30, (opening - observed).total_seconds()))
         try:
-            for reply in replies():
-                if reply and reply["decision"] == "deny":
-                    decision = record(reply)
-                    if decision is not None and decision["recorded"]:
-                        emit({"plan": plan_id, **decision})
+            while (observed := utc_now()) < opening:
+                if not service.openings(plan_id):
+                    break
+                observe_replies()
+                # Prioritize the scheduled group when its dispatch window is
+                # imminent. Recheck the fresh reply's deadline after the group.
+                if opening - utc_now() > LATE_DISPATCH_SLACK:
+                    dispatch_late()
+                observer.poll()
+                remaining = (opening - utc_now()).total_seconds()
+                if remaining > 0:
+                    sleep_open(min(15, remaining))
+            observe_replies()
         except (OSError, ValueError):
             emit(
                 public_results(
@@ -533,6 +647,7 @@ def wait_for_open(service, plan, replies, record, refresh=lambda: None):
                 plan_id, service.submit(plan_id, now=observed, opening=opening)
             )
         )
+        dispatch_late()
         if opening != openings[-1]:
             observer.poll()
         else:
