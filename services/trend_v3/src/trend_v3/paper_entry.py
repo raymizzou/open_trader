@@ -160,6 +160,7 @@ class PaperEntry:
                 "owner": self.session["owner"],
                 "session": self.session["id"],
                 "account_scope": getattr(self.broker, "account_scope", dict)(),
+                "display_reason_version": 1,
             }
             if "daily_bridge_routes" in facts:
                 content["manual"] = self.manual_candidates(facts["daily_bridge_routes"])

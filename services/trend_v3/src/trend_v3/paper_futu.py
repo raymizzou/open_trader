@@ -445,8 +445,17 @@ class FutuPaperBroker:
     @classmethod
     def order(cls, row, account):
         total, filled = decimal(row.get("qty")), decimal(row.get("dealt_qty"))
+        broker_id, status = order_id(row.get("order_id")), row.get("order_status")
         outstanding = (
             total - filled if total is not None and filled is not None else None
+        )
+        working = (
+            broker_id is not None
+            and status in ACTIVE
+            and outstanding is not None
+            and outstanding > 0
+            and filled >= 0
+            and (status != "FILLED_PART" or filled > 0)
         )
         price = decimal(row.get("price"))
         multiplier = (
@@ -461,8 +470,9 @@ class FutuPaperBroker:
             "notional": price * outstanding * multiplier
             if price and outstanding and multiplier
             else None,
-            "id": order_id(row.get("order_id")),
+            "id": broker_id,
             "token": row.get("remark"),
+            "state": "active" if working else "unknown",
         }
 
     def capacity(self, line):

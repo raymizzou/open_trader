@@ -15,6 +15,7 @@ from .paper_evidence import (
     day,
     instant,
 )
+from .paper_public import reason_label
 
 HEX_SHA = re.compile(r"[0-9a-f]{40}")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -173,6 +174,18 @@ def original_prompt(home, session, root, launch, report_day):
     return False
 
 
+def observation_reason(plan, row):
+    reason = row["reason"]
+    # Previously displayed cards must reproduce the text bound to their replies.
+    if plan.get("display_reason_version") != 1:
+        return reason
+    if row.get("state") == "manual":
+        return "、".join(
+            reason_label(code) or "手工条件待核" for code in reason.split("、")
+        )
+    return reason_label(reason) or "开仓条件待核或不符"
+
+
 def delivery_card(plan, *, historical=False, include_observations=False):
     rows = [f"模拟开仓计划 {plan['id']} · 日报 {plan['report_version']}"]
     context = plan.get("report_context") if include_observations else None
@@ -198,9 +211,14 @@ def delivery_card(plan, *, historical=False, include_observations=False):
             elif row["state"] != "awaiting_approval":
                 subject = " ".join(row.get("code", "日报证据").split())
                 state = "加密手工" if row["state"] == "manual" else "暂不可确认"
-                detail = f"{subject} | {state} | {row['reason']}"
+                detail = f"{subject} | {state} | {observation_reason(plan, row)}"
                 if missing := row.get("missing_fields"):
-                    labels = (" ".join(field.split()) for field in missing)
+                    if plan.get("display_reason_version") == 1:
+                        labels = (
+                            reason_label(field) or "其他证据" for field in missing
+                        )
+                    else:
+                        labels = (" ".join(field.split()) for field in missing)
                     detail += " | 缺项 " + "、".join(labels)
                 rows.append(detail)
     rows.extend(approvals.values())
@@ -220,7 +238,7 @@ def plan_display(plan):
     if plan["lines"] or "observations" in plan:
         return delivery_card(plan, include_observations=True)
     header = f"模拟开仓状态 {plan['id']} · 日报 {plan['report_version']}"
-    reasons = [row["reason"] for row in plan["skipped"]]
+    reasons = [observation_reason(plan, row) for row in plan["skipped"]]
     return "\n".join([header, *reasons])
 
 

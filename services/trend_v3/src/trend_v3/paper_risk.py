@@ -7,6 +7,14 @@ from decimal import Decimal
 from .paper_evidence import decimal, instant, text
 
 ENTRY_FRACTION = Decimal("0.02")
+# Present unresolved orders before verified orders, then existing holdings.
+BUSY_REASONS = {
+    "orders": "instrument_order_reconciliation_pending",
+    "working_order": "instrument_working_order",
+    "positions": "instrument_position",
+    "confirmed_fill": "instrument_confirmed_fill",
+    "reserved": "instrument_reserved",
+}
 
 
 class PortfolioUnknown(ValueError):
@@ -70,7 +78,12 @@ class Portfolio:
             self.unpriced_orders[key] = (currency, amount)
         else:
             raise PortfolioUnknown("portfolio_exposure_unverified")
-        self.footprints[code].append((name, abs(amount), kind))
+        footprint = (
+            "working_order"
+            if kind == "orders" and item.get("state") == "active"
+            else kind
+        )
+        self.footprints[code].append((name, abs(amount), footprint))
         if kind == "orders" and order:
             self.order_ids.add((name, order, code))
 
@@ -110,10 +123,14 @@ class Portfolio:
                 for alias, _, kind in holdings
             )
             or position_size > previous_fills
+            or (holdings and previous_fills == 0)
         ):
-            return 0, "instrument_busy"
-        if holdings and previous_fills == 0:
-            return 0, "instrument_busy"
+            kinds = {kind for _, _, kind in holdings}
+            reason = next(
+                (label for kind, label in BUSY_REASONS.items() if kind in kinds),
+                "instrument_busy",
+            )
+            return 0, reason
         unit, lot = unit_notional(row), row["lot"]
         limits = (
             self.net[name] * ENTRY_FRACTION - previous_fills * unit,
@@ -176,7 +193,7 @@ def existing_reservations(store, portfolio, now):
             portfolio.reserve(row, amount, debit=False)
         if pending and not has_order:
             portfolio.reserve(
-                row, attempt["quantity"] - (filled if has_position else 0)
+                row, attempt["quantity"] - (filled if has_position else 0), "orders",
             )
         elif filled and not has_position and now < instant(row["closes_at"]):
             portfolio.reserve(row, filled, "confirmed_fill", debit=False)

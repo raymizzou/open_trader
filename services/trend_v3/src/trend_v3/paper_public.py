@@ -41,6 +41,11 @@ PAPER_REASONS = {
     "awaiting_broker_receipt": "等待原订单对账",
     "plan_superseded": "原计划已由新报告替代",
     "instrument_busy": "已有持仓、挂单或待对账委托",
+    "instrument_position": "已有持仓",
+    "instrument_working_order": "已有挂单",
+    "instrument_order_reconciliation_pending": "委托状态待核，需对账",
+    "instrument_confirmed_fill": "已有确认成交，等待持仓更新",
+    "instrument_reserved": "本计划已为该标的预留资金",
     "approved_size_unavailable": "已批准数量当前不可用",
     "approved_size_exceeds_entry_budget": "当前净资产 2% 的预算不足以覆盖批准数量",
     "approved_size_exceeds_available_funds": "当前可用资金不足以覆盖批准数量",
@@ -68,9 +73,47 @@ PAPER_REASONS = {
     "market_status_unverified": "券商快照未确认标的正常可交易",
     "a_share_etf_route_unverified": "A 股 ETF 的模拟市价路径待核",
     "etf_exposure_unverified": "ETF 的 1 倍敞口待核",
+    "daily_board_coverage_unverified": "日报母榜覆盖待核",
+    "daily_class_coverage_unverified": "日报大类范围待核",
+    "daily_member_coverage_unverified": "日报成员覆盖待核",
+    "daily_target_coverage_unverified": "日报适用行情日待核",
+    "observation_unverified": "开仓信号证据待核",
+    "observation_conflict": "开仓信号证据不一致",
+    "observation_withdrawn": "已移出本期名单",
+    "identity_conflict": "标的身份资料不一致",
+    "account_or_size_unverified": "模拟账户或可开仓数量待核",
+    "paper_account_unavailable": "模拟账户当前不可用",
+    "portfolio_exposure_unverified": "账户敞口待核",
+    "portfolio_account_unverified": "账户身份待核",
+    "market_capacity_unverified": "模拟账户可下单数量待核",
+    "route_unverified": "下单路径待核",
+    "route_source_unverified": "下单路径来源待核",
+    "product_unverified": "产品类型待核",
+    "currency_unverified": "标的币种待核",
+    "short_route_unsupported": "该品种暂无可用做空路径",
+    "raw_or_route_evidence_unavailable": "原始证据或下单路径待核",
+    "pending_verification": "手工条件待核",
+    "funds": "资金待核",
+    "exposure": "敞口待核",
+    "limit_price": "限价待核",
+    "quantity_precision": "数量精度待核",
+    "labels": "信号标签",
+    "current": "当期温度",
+    "previous": "前期温度",
+    "membership": "成员归属",
+    "eligibility": "开仓资格",
+    "data_date": "数据日期",
+    "target_day": "适用行情日",
+    "identity": "标的身份",
+    "market": "市场",
+    "instrument_type": "产品类型",
 }
 PAPER_CODE = re.compile(r"[A-Z0-9][A-Z0-9_.-]{0,39}", re.IGNORECASE | re.ASCII)
 PAPER_PLACEHOLDER = '        <p class="positions-note">未接入</p>'
+
+
+def reason_label(reason):
+    return PAPER_REASONS.get(reason) if isinstance(reason, str) else None
 
 
 def render_simulation(paper, report_day, report_revision):
@@ -102,9 +145,7 @@ def render_simulation(paper, report_day, report_revision):
             if isinstance(state_code, str)
             else "已跳过"
         )
-        reason = (
-            PAPER_REASONS.get(reason_code) if isinstance(reason_code, str) else None
-        )
+        reason = reason_label(reason_code)
         if not reason and state == "已跳过":
             reason = "开仓条件待核或不符"
         if (

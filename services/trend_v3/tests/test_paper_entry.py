@@ -521,7 +521,9 @@ def test_repeat_and_unknown_do_not_resubmit(tmp_path):
     revised = service.plan(data, facts, now=revised_at)
     assert revised["id"] != plan["id"]
     assert revised["lines"] == []
-    assert revised["skipped"] == [{"code": "US.ABC", "reason": "instrument_busy"}]
+    assert revised["skipped"] == [
+        {"code": "US.ABC", "reason": "instrument_order_reconciliation_pending"},
+    ]
     assert service.submit(revised["id"], now=revised_time) == []
     assert len(broker.orders) == 1
 
@@ -660,7 +662,9 @@ def test_notional_lot_and_portfolio_limits(tmp_path):
     assert [(line["code"], line["quantity"]) for line in plan["lines"]] == [
         ("US.XYZ", 2),
     ]
-    assert plan["skipped"] == [{"code": "US.ABC", "reason": "instrument_busy"}]
+    assert plan["skipped"] == [
+        {"code": "US.ABC", "reason": "instrument_order_reconciliation_pending"},
+    ]
     assert len(broker.orders) == 1
 
 
@@ -3164,7 +3168,7 @@ def test_unconfirmed_late_items_survive_restart_without_replay(
         ("funds", "approved_size_exceeds_available_funds"),
         ("price", "approved_size_exceeds_entry_budget"),
         ("halted", "market_halted"),
-        ("external", "instrument_busy"),
+        ("external", "instrument_order_reconciliation_pending"),
         ("timeout", "broker_timeout"),
     ],
 )
@@ -4858,7 +4862,7 @@ def test_delivered_rerun_hands_all_seven_to_paper_plan(
         (code, "blocked" if code == "600003.SH" else "awaiting_approval")
         for code in BRIDGE_CN_CODES
     ]
-    assert "600003.SH | 暂不可确认 | market_halted" in plan["display"]
+    assert "600003.SH | 暂不可确认 | 标的已停牌" in plan["display"]
     assert len(plan["lines"]) == 6
     assert sdk.writes == []
 
@@ -5033,6 +5037,141 @@ def test_daily_bridge_halted_item_does_not_block_other_six(
     }
     assert {"code": "600003.SH", "reason": "market_halted"} in plan["skipped"]
     assert sdk.writes == []
+
+
+@pytest.mark.parametrize("all_blocked", [False, True], ids=["mixed", "all-blocked"])
+def test_daily_card_explains_distinct_opening_blockers(
+    tmp_path, monkeypatch, capsys, all_blocked,
+):
+    _, live, now, _, _ = cn_bridge(tmp_path)
+
+    class ExistingExposure(BridgeOpenD):
+        def get_market_state(self, *, code_list):
+            return 0, [{"code": code_list[0], "market_state": "AFTER_HOURS_BEGIN"}]
+
+        def order_list_query(self, **params):
+            return self.query("orders", params, [
+                {"code": code, "currency": "CNY", "qty": 100,
+                 "dealt_qty": 40 if state == "FILLED_PART" else 0,
+                 "price": 20, "order_id": f"private-id-{index}", "order_status": state}
+                for index, (code, state) in enumerate((
+                    ("SH.600002", "SUBMITTED"),
+                    ("SH.600003", "UNRECOGNIZED"),
+                    ("SH.600004", "FILLED_PART"),
+                    ("SZ.000001", "SUBMITTED"),
+                    ("SZ.000001", "UNRECOGNIZED"),
+                ))
+            ])
+
+    sdk = ExistingExposure(halted="SZ.300001")
+    held = ["SH.600001", "SH.600004", "SZ.000001"]
+    if all_blocked:
+        held.append("SZ.000002")
+    sdk.positions = [
+        {"acc_id": 42, "code": code, "currency": "CNY", "qty": 100, "market_val": 2000}
+        for code in held
+    ]
+    clock, call = tab_cli(tmp_path, monkeypatch, sdk, live, start=now)
+    output = capsys.readouterr().out
+    plan = json.loads(output)
+    display = plan["display"]
+    skipped = {
+        "SH.600001": "instrument_position",
+        "SH.600002": "instrument_working_order",
+        "SH.600003": "instrument_order_reconciliation_pending",
+        "SH.600004": "instrument_working_order",
+        "SZ.000001": "instrument_order_reconciliation_pending",
+        "300001.SZ": "market_halted",
+        "600005.SH": "observation_unverified",
+    }
+    if all_blocked:
+        skipped["SZ.000002"] = "instrument_position"
+    assert {item["code"]: item["reason"] for item in plan["skipped"]} == skipped
+    for code, reason in {
+        "600001.SH": "已有持仓",
+        "600002.SH": "已有挂单",
+        "600003.SH": "委托状态待核，需对账",
+        "600004.SH": "已有挂单",
+        "000001.SZ": "委托状态待核，需对账",
+        "300001.SZ": "标的已停牌",
+    }.items():
+        assert f"{code} | 暂不可确认 | {reason}" in display.splitlines()
+    assert "private-id-" not in output
+    assert sdk.writes == []
+    assert [(line["code"], line["quantity"]) for line in plan["lines"]] == (
+        [] if all_blocked else [("SZ.000002", 100)]
+    )
+
+    clock.at += timedelta(seconds=1)
+    tab_record(tmp_path, "user", "确认全部", clock.at)
+    assert call("cycle", plan["id"]) == 2
+    assert sdk.writes == []
+    clock.at += timedelta(seconds=1)
+    tab_record(tmp_path, "assistant", display, clock.at, phase="final_answer")
+    clock.at = datetime.fromisoformat(f"{DAY}T15:05:00+08:00")
+    sdk.snapshot_time = f"{DAY} 15:00:00"
+    tab_record(tmp_path, "user", "确认全部", clock.at)
+    assert call("cycle", plan["id"]) == (2 if all_blocked else 0)
+    assert [(order["code"], order["qty"]) for order in sdk.writes] == (
+        [] if all_blocked else [("SZ.000002", 100)]
+    )
+    if all_blocked:
+        assert "000002.SZ | 暂不可确认 | 已有持仓" in display.splitlines()
+        assert "delivery" not in plan and "回复「" not in display
+
+
+def test_daily_card_keeps_already_displayed_legacy_reason_and_approval(
+    tmp_path, monkeypatch, capsys,
+):
+    root, live, now, _, _ = frozen_bridge(tmp_path, [
+        ("600001.SH", "CN", "qualified"), ("600002.SH", "CN", "qualified"),
+    ])
+
+    class AfterClose(BridgeOpenD):
+        def get_market_state(self, *, code_list):
+            return 0, [{"code": code_list[0], "market_state": "AFTER_HOURS_BEGIN"}]
+
+    sdk = AfterClose()
+    sdk.positions = [{
+        "acc_id": 42, "code": "SH.600001", "currency": "CNY", "qty": 100,
+        "market_val": 2000,
+    }]
+    clock, call = tab_cli(tmp_path, monkeypatch, sdk, live, start=now)
+    candidate = json.loads(capsys.readouterr().out)
+    plan_id = candidate["id"]
+    database = root / "reports/_evidence/.paper-entry/state.sqlite3"
+    with paper_entry.transaction(database) as store:
+        body = store.execute("SELECT body FROM plans WHERE id=?", (plan_id,)).fetchone()
+        legacy = json.loads(body["body"])
+        legacy.pop("display_reason_version", None)
+        legacy["observations"][0]["reason"] = "instrument_busy"
+        legacy["skipped"][0]["reason"] = "instrument_busy"
+        store.execute("UPDATE plans SET body=? WHERE id=?",
+                      (paper_entry.encode(legacy), plan_id))
+
+    header, approval_line, timing = candidate["delivery"].splitlines()
+    former_display = "\n".join([
+        header, f"trend_v3 / trend507-{DAY} | 来源 {RELEASE} | 截至 {now.isoformat()}",
+        "600001.SH | 暂不可确认 | instrument_busy", approval_line,
+        "回复「确认全部」「只确认第1项」或「确认第1、3项」。",
+        "若紧接此卡且期间没有其他对话，也可回复「同意」。", timing,
+    ])
+    assert call("plan") == 0
+    recovered = json.loads(capsys.readouterr().out)
+    assert recovered["id"] == plan_id and recovered["display"] == former_display
+    clock.at += timedelta(seconds=1)
+    tab_record(tmp_path, "assistant", former_display, clock.at, phase="final_answer")
+    clock.at = datetime.fromisoformat(f"{DAY}T15:05:00+08:00")
+    sdk.snapshot_time = f"{DAY} 15:00:00"
+    tab_record(tmp_path, "user", "同意", clock.at)
+    assert call("cycle", plan_id) == 0
+    assert [(order["code"], order["qty"]) for order in sdk.writes] == [
+        ("SH.600002", 100),
+    ]
+    capsys.readouterr()
+    assert call("status") == 0
+    [skipped] = json.loads(capsys.readouterr().out)["skipped"]
+    assert skipped["reason"] == "instrument_busy"
 
 
 @pytest.mark.parametrize(
