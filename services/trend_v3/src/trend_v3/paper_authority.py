@@ -231,33 +231,37 @@ def remove_code_indent(line, columns):
 
 def standalone_delivery_body(assistant):
     """Read either an unwrapped message or one literal Markdown code block."""
-    lines = assistant.split("\n")
+    lines = assistant.removesuffix("\n").split("\n")
     start, end = 0, len(lines)
     while start < end and not lines[start].strip(" \t"):
         start += 1
     while start < end and not lines[end - 1].strip(" \t"):
         end -= 1
-    lines = lines[start:end]
-    if not lines:
+    if start == end:
         return None
-    opening = CODE_FENCE.fullmatch(lines[0])
+    opening = CODE_FENCE.fullmatch(lines[start])
     if opening is not None:
         indent, fence, raw_info = opening.groups()
-        closing = CODE_FENCE.fullmatch(lines[-1])
         # Backtick fences forbid backticks in their info string. The info
         # otherwise has no role in matching the literal card.
-        if (
-            len(lines) < 2
-            or (fence[0] == "`" and "`" in raw_info)
-            or closing is None
-            or not closing[2].startswith(fence)
-            or closing[3].strip(" \t")
-        ):
+        if fence[0] == "`" and "`" in raw_info:
             return None
+        # A fenced block ends at its first valid close or the end of the
+        # message. With no close, even trailing blank content is literal.
+        body_end = len(lines)
+        for index in range(start + 1, end):
+            closing = CODE_FENCE.fullmatch(lines[index])
+            if closing and closing[2].startswith(fence) and not closing[3].strip(" \t"):
+                if index != end - 1:
+                    return None
+                body_end = index
+                break
         return "\n".join(
-            remove_code_indent(line, len(indent))[1] for line in lines[1:-1]
+            remove_code_indent(line, len(indent))[1]
+            for line in lines[start + 1 : body_end]
         )
 
+    lines = lines[start:end]
     if remove_code_indent(lines[0], 4)[0]:
         body = []
         for line in lines:

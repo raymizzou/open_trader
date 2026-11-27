@@ -2536,11 +2536,19 @@ def show_plan(home, plan, when):
         ("\n{tabs}\n\t", "同意", True),
         ("````text\n{card}\n```", "同意", False),
         ("```text\n{card}\n~~~", "同意", False),
-        ("```text\n{card}", "同意", False),
+        ("```text\n{card}", "同意", True),
         ("```text\n{card}\n```\n\n```\n别的话题\n```", "同意", False),
         ("```text\n{changed_card}\n```", "同意", False),
         ('```text title="`计划`"\n{card}\n```', "同意", False),
-        ('~~~text title="计划"\n{card}', "同意", False),
+        ('~~~text title="计划"\n{card}', "同意", True),
+        ("  ~~~text\r\n{crlf_indent}\r\n", "同意", True),
+        ("```text\n{truncated_card}", "同意", False),
+        ("```text\n{card}\n", "同意", True),
+        ("```text\n{card}\n\n", "同意", False),
+        ("```text\n{card}\n```text", "同意", False),
+        ("```text\n{card}\n换个字号？", "同意", False),
+        ("```text\n{card}\n```\n换个字号？\n```", "同意", False),
+        ("```text\n{changed_card}", "模拟批准 {plan_id} {item}", False),
         ('```text title="计划"\n{card}\n```\n换个字号？', "同意", False),
         ('```text title="计划"\n{changed_card}\n```', "同意", False),
         ('```text title="同意"\n{card}\n```', "查看状态", False),
@@ -2565,6 +2573,7 @@ def test_unambiguous_single_card_fence_preserves_same_day_agreement(
         display.format(
             card=card,
             changed_card=card.replace("数量 100", "数量 101"),
+            truncated_card=card[:-8],
             two_spaces=indent(card, "  "),
             four_spaces=indent(card, "    "),
             mixed_indent="\n".join(
@@ -2589,7 +2598,12 @@ def test_unambiguous_single_card_fence_preserves_same_day_agreement(
         sdk.lot = 1
     clock.at = OPEN + timedelta(minutes=30)
     sdk.snapshot_time = f"{DAY} 09:59:00"
-    tab_record(tmp_path, "user", reply, clock.at)
+    tab_record(
+        tmp_path,
+        "user",
+        reply.format(plan_id=plan["id"], item=plan["lines"][0]["item"]),
+        clock.at,
+    )
     assert invoke("approve", plan["id"]) == (0 if authorized else 2)
     expected = [("US.ABC", 100)] if authorized else []
     assert [(row["code"], row["qty"]) for row in sdk.writes] == expected
