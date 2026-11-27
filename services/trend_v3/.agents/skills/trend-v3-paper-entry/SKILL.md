@@ -11,15 +11,15 @@ description: Plan first paper entries from the verified Trend V3 daily report in
 
 加密模拟盘走下文「加密模拟盘手工开仓」，由 Ray 在 Futu App 操作并回原 tab 说明结果。以下自动计划、编号、批准、开盘提交与回执命令继续用于其他受支持市场，不用于加密手工项目。
 
-做空首次观察信号为前温度「凉」、当前「寒」或「冻」，并带当期精确「凉转寒」标签；两种初始仓位均为 2%。新版开仓资格由已认证的正式日报裁定。实际借券、合约、模拟账户及资金条件由盘前和开盘检查核验。
+做空首次观察信号为前温度「凉」、当前「寒」或「冻」，并带当期精确「凉转寒」标签；两种初始仓位均为 2%。新版开仓资格由已认证的正式日报裁定。规划和报单前均核验实际借券、合约、模拟账户及资金条件。
 
 ## 盘前计划
 
 1. 照日报流程验证当前 HTML 和主机上传回执。程序从原路径读当天最新报告及关联的 reader、selection、费用与报告核实文件，核对日期、版本、发布身份与摘要。给定原会话 UUID 即可，无需创建证据包或填写仓位、价格或订单内容。
-2. 新版读取日报冻结的全部「可开仓」，核对同版精确身份、适用日、截至时间及原件。旧版沿用原榜图、席位、直属及逐字段证据核验。没有可进入自动盘前检查的候选时不连接 OpenD。`verified_no_candidates` 表示冻结的母榜、适用范围及入选大类的成员覆盖均已核实，且无候选，`evidence_incomplete` 表示证据待核，`no_actionable_candidates` 表示本次无可操作项目；按 `skipped` 说明具体原因。只有 `lines` 有内容时才展示批准命令。有合格候选时读取交易日、产品、合约、参考价、整手和模拟账户的风险数据。每笔首次开仓按该账户的当前净资产 2% 计算，并受本币可用资金和账户敞口上限约束，向下取整手或整张。不设标的数量上限，不按名额或隐含计数限制首次开仓。持仓、挂单及待核委托仍用于同标的去重和风险核对；待执行项目按账户预留现金及名义敞口，同一账户的多个项目不能重复使用同一笔资金。各账户的资金及敞口各以本币计，无需跨币种汇率。
-3. 在原 tab 的可见最终回复中用代码块逐字展示 `plan` 输出的 `delivery` 正文，每行完整保留。在正文外说明错过开盘、产品或路由缺证、仅限价、资金不足、已有持仓、活动或状态不明的委托，以及已核实的手工候选。展示 `确认全部`、`只确认第1项` 或 `确认第1、3项` 等回复示例。程序按所展示的编号绑定当前报告版次和计划。多个计划导致简短回复含糊时暂停执行，请用户在原 tab 指明项目和计划，此时可用 `模拟批准 <计划编号> <项目编号1>,<项目编号2>`。没有可批准项目时直接说明。日报更新后，重新生成和展示新计划，由用户重新审批。
-4. 收到该 tab 的明确盘前回复后用该 tab 的受监督命令运行 `cycle "$plan"` 并保留其执行句柄。程序从原会话读取并记录精确回复；无有效回复时停止，绝不代为批准。已有批准仅恢复原计划，错过的开盘组不补发。此命令在本地等待各市场开盘，当前对话轮可结束。后续在原 tab 用同一执行句柄读回结果，必要时用 `status`，不启动守护进程或新 tab。用户可用 `withdraw_all` 或 `模拟撤回 <完整计划编号> <项目编号1>,<项目编号2>` 撤回计划项，收到时立即用 `approve` 记录决定。`items` 列出已撤回项目，`ignored_opened_items` 列出已开盘而未受影响的项目。全部已开盘时明确回报无变更。
-5. 每个开盘组核对原报告版次、累计占用、该账户净资产及可用资金、市场状态和券商可下数量。按原批准数量提交模拟市价单，信号沿用原报告。等待器在开盘后 2 秒内须已唤醒；已唤醒的组须在开盘后 30 秒以内发起每笔新报单。资金下降、交易条件未核实、进程迟到或券商读取超时均逐项回报。错过开盘不补发；重跑只读回已有状态。
+2. 新版读取日报冻结的全部「可开仓」，核对同版精确身份、适用日、截至时间及原件。旧版沿用原榜图、席位、直属及逐字段证据核验。没有可进入自动检查的候选时不连接 OpenD。`verified_no_candidates` 表示冻结的母榜、适用范围及入选大类的成员覆盖均已核实，且无候选，`evidence_incomplete` 表示证据待核，`no_actionable_candidates` 表示本次无可操作项目；按 `skipped` 说明具体原因。只有 `lines` 有内容时才展示批准命令。有合格候选时读取交易日、产品、合约、参考价、整手和模拟账户的风险数据。每笔首次开仓按该账户的当前净资产 2% 计算，并受本币可用资金和账户敞口上限约束，向下取整手或整张。不设标的数量上限。持仓、挂单及待核委托用于同标的去重和风险核对，各账户的资金及敞口均按本币预留。
+3. 在原 tab 的可见最终回复中用代码块逐字展示 `plan` 输出的 `delivery`，包括末行的报单时机说明。同版计划保留编号和数量。使用 `确认全部`、`只确认第1项` 或 `确认第1、3项` 明确范围。只有唯一计划只有一项、上一条可见回复单独展示交付卡、期间没有其他对话时，直接回复 `同意` 才算批准。混合话题或先看过状态时，请明确回复项目编号。也可回复 `模拟批准 <计划编号> <项目编号1>,<项目编号2>`。按 `skipped` 或手工清单回报产品、路由、资金、持仓及委托方面的缺项。旧卡需重新逐字展示含报单时机的交付卡，才能取得开盘后提交的批准。日报修订后生成和展示新计划并取得新批准。
+4. 收到原 tab 的明确回复后，以受监督命令运行带原日报日的 `cycle "$plan"`。盘前批准等各项目开盘。开盘后仍在该项已核实市场交易日的最新批准触发即时复核和提交，跨台北午夜仍用原日报日。同一句回复按项目分流。在已有等待句柄期间，可以用 `approve` 处理对其他项目的明确回复或撤回。保留受监督句柄并在原 tab 读回；无有效回复时继续等待用户。用户可回复 `withdraw_all` 所示命令或 `模拟撤回 <计划编号> <项目编号1>,<项目编号2>` 撤回仍可撤回的未报项目。读回 `items` 与 `ignored_opened_items` 并报告哪些决定生效。
+5. 报单前核对同版报告、上传回执、标的与合约、累计占用、该账户净资产 2% 及可用资金、市场状态、价格、整手和券商容量。按原批准数量提交，预计可用数量减少或规格变化时回报原因，请用户决定如何调整。盘前批准仍须在开盘后 2 秒内唤醒、30 秒内发起；错过后须在同一市场交易日取得新的明确回复。开盘后批准时以该回复起算 30 秒，重启或过期后不重播。支持的盘后请求仍用 DAY/RTH，按实际回执报告受理、拒绝、挂单或成交。交易日结束后旧回复失效，已报委托只按原委托对账或走独立重试批准。
 
 ## 加密模拟盘手工开仓
 
@@ -37,11 +37,11 @@ description: Plan first paper entries from the verified Trend V3 daily report in
 在原 tab 的受监督命令工具中直接运行下列 CLI，不另用 Python `subprocess` 包装器启动它。直接父进程关系由内核核对；更深的祖先进程关系仍须通过进程遍历证明。若遍历不可用或原会话、启动消息不匹配，入口会在读取券商前拒绝；保留错误交由 Main 核查，不更改权限或改到其他 tab 执行。
 
 ```sh
-PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" plan
-PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" approve "$plan"
-PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" cycle "$plan"
-PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" status
-PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" reconcile "$plan"
+PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" --report-date "$report_day" plan
+PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" --report-date "$report_day" approve "$plan"
+PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" --report-date "$report_day" cycle "$plan"
+PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" --report-date "$report_day" status
+PYTHONPATH="$service_dir/src" "$trend_python" -m trend_v3.paper_cli --session "$session_id" --report-date "$report_day" reconcile "$plan"
 ```
 
 `plan`、批准、执行与对账后自动刷新同一完整日报 HTML 的模拟盘部分。`cycle` 在每组开盘后读匹配回执并刷新，之后每 30 秒只对账已有委托，直至没有活动或待核委托或原交易时段结束；绝不因刷新重试。内部结果继续保留方向、申请/批准数量、实成、剩余、部分成交及原委托身份，供审批和核查；正常阅读件按 holdings.md 的四列真实持仓契约展示，不输出这些委托字段。

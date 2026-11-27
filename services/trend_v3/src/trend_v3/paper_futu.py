@@ -38,6 +38,13 @@ TERMINAL = {
     "FAILED": "rejected",
 }
 OPEN_STATES = {"MORNING", "AFTERNOON"}
+POST_CLOSE_STATES = {
+    "AFTER_HOURS_BEGIN",
+    "AFTER_HOURS_END",
+    "CLOSED",
+    "STIB_AFTER_HOURS_END",
+}
+FUTURE_POST_CLOSE_STATES = {"FUTURE_DAY_CLOSE", "FUTURE_CLOSE"}
 FUTURE_OPEN_STATES = {
     "FUTURE_DAY_OPEN",
     "FUTURE_AFTERNOON",
@@ -485,21 +492,26 @@ class FutuPaperBroker:
             field = "max_cash_and_margin_buy"
         return integer(rows[0].get(field))
 
-    def market_open(self, line):
+    def market_open(self, line, *, after_close=False):
         # Quote state is exchange-wide and takes no trading-environment parameter.
         rows = self.planning_quote("get_market_state", code_list=[line["code"]])
-        accepted = FUTURE_OPEN_STATES if line["product"] == "future" else OPEN_STATES
+        if line["product"] == "future":
+            accepted = FUTURE_POST_CLOSE_STATES if after_close else FUTURE_OPEN_STATES
+        else:
+            accepted = POST_CLOSE_STATES if after_close else OPEN_STATES
         return (
             len(rows) == 1
             and rows[0].get("code") == line["code"]
             and (rows[0].get("market_state") in accepted)
         )
 
-    def place_market(self, line, quantity, token, *, deadline=None):
+    def place_market(self, line, quantity, token, *, deadline=None, on_submit=None):
         ctx, account, _ = self.route(line)
         now = self.clock() if self.clock is not None else datetime.now(UTC)
         if deadline is not None and now >= deadline:
             raise MissedOpening
+        if on_submit is not None:
+            on_submit(now)
         rows = self.checked(
             ctx.place_order,
             **self.parameters(account),

@@ -11,7 +11,6 @@ from pathlib import Path
 from .paper_evidence import (
     BRIDGE_REPORT_SCHEMA,
     REPORT_SCHEMA,
-    TAIPEI,
     bridge_observations,
     day,
     instant,
@@ -171,7 +170,7 @@ def original_prompt(home, session, root, launch, report_day):
     return False
 
 
-def delivery_card(plan):
+def delivery_card(plan, *, historical=False):
     rows = [f"模拟开仓计划 {plan['id']} · 日报 {plan['report_version']}"]
     for number, line in enumerate(plan["lines"], 1):
         direction = "做多" if line["direction"] == "long" else "开空"
@@ -182,15 +181,24 @@ def delivery_card(plan):
             f"估算 {line['notional']} {line['currency']} | "
             f"市价 {line['opens_at']} {line['timezone']}"
         )
+    if not historical:
+        rows.append(
+            "开盘前确认，等开盘提交。开盘后在同一市场交易日内确认，通过即时复核后提交。"
+            "收盘后提交可能挂单或被拒。"
+        )
     return "\n".join(rows)
 
 
+def visible_message(item, role):
+    return (
+        item.get("type") == "message"
+        and item.get("role") == role
+        and item.get("recipient") in (None, "all")
+    )
+
+
 def message_text(item, role):
-    if (
-        item.get("type") != "message"
-        or item.get("role") != role
-        or item.get("recipient") not in (None, "all")
-    ):
+    if not visible_message(item, role):
         return None
     parts = item.get("content")
     if not isinstance(parts, list) or len(parts) != 1:
@@ -203,8 +211,37 @@ def message_text(item, role):
     return content if isinstance(content, str) else None
 
 
-def concise_approval(content, plan):
-    if content == "确认全部":
+def visible_delivery(item, card, historical_card):
+    if item.get("phase") != "final_answer":
+        return None, None
+    assistant = message_text(item, "assistant")
+    if assistant:
+        message = f"\n{assistant}\n"
+        if f"\n{card}\n" in message:
+            return assistant, True
+        if f"\n{historical_card}\n" in message:
+            return assistant, False
+    return assistant, None
+
+
+def plan_was_delivered(home, root, scope, plan, created, now):
+    card = delivery_card(plan)
+    historical_card = delivery_card(plan, historical=True)
+    for record in session_records(home, scope["id"], root):
+        at = instant(record.get("timestamp"))
+        if record.get("type") == "response_item" and at and created <= at <= now:
+            _, timing = visible_delivery(
+                record.get("payload", {}), card, historical_card
+            )
+            if timing is not None:
+                return True
+    return False
+
+
+def concise_approval(content, plan, *, bare_offer):
+    if content == "确认全部" or (
+        content == "同意" and bare_offer and len(plan["lines"]) == 1
+    ):
         return f"模拟批准 {plan['id']} 全部"
     matched = NUMBERED_APPROVAL.fullmatch(content)
     if not matched:
@@ -269,9 +306,13 @@ def reply_from_text(content, plan, scope, event_id, delivered, at):
 def transcript_replies(home, root, scope, plan, created, now):
     """Read only visible deliveries and actual user messages from this session."""
     card = delivery_card(plan)
+    historical_card = delivery_card(plan, historical=True)
+    standalone_cards = {card, f"```\n{card}\n```", f"```text\n{card}\n```"}
     identity = (plan["id"], plan["report_version"])
     displayed = set()
     delivered = None
+    late_timing_disclosed = False
+    bare_offer = False
     replies = []
     for record in session_records(home, scope["id"], root):
         if record.get("type") != "response_item":
@@ -280,19 +321,25 @@ def transcript_replies(home, root, scope, plan, created, now):
         if not at or at > now:
             continue
         item = record.get("payload", {})
-        visible = item.get("phase") == "final_answer" and item.get("recipient") in (
-            None,
-            "all",
-        )
-        assistant = message_text(item, "assistant") if visible else None
-        if assistant:
-            if at.astimezone(TAIPEI).date().isoformat() == plan["date"]:
+        if visible_message(item, "assistant"):
+            assistant, timing = visible_delivery(item, card, historical_card)
+            bare_offer = False
+            if assistant:
                 displayed.update(PLAN_HEADER.findall(assistant))
-            if created <= at and f"\n{card}\n" in f"\n{assistant}\n":
-                delivered = at
+                if created <= at and timing is not None:
+                    delivered, late_timing_disclosed = at, timing
+                    bare_offer = timing and assistant.strip() in standalone_cards
+            continue
+        if not delivered or at <= delivered or not visible_message(item, "user"):
             continue
         content = message_text(item, "user")
-        if not delivered or at <= delivered or not content:
+        if content and content.startswith(
+            ("# AGENTS.md instructions", "<environment_context>")
+        ):
+            continue
+        offered = bare_offer
+        bare_offer = False
+        if not content:
             continue
         meta = item.get("internal_chat_message_metadata_passthrough") or {}
         if meta and (
@@ -301,20 +348,18 @@ def transcript_replies(home, root, scope, plan, created, now):
             or meta.get("content_item_metadata") != [{"provenance": {"type": "user"}}]
         ):
             continue
-        if content.startswith(("# AGENTS.md instructions", "<environment_context>")):
-            continue
         # Native rollout messages can omit the optional message ID. The exact
         # recorded session, timestamp and text still identify a reply durably.
         event_id = sha256(
             json.dumps([scope["id"], item.get("id"), at.isoformat(), content]).encode()
         ).hexdigest()
         content = content.strip()
-        if (
-            displayed == {identity}
-            and at.astimezone(TAIPEI).date().isoformat() == plan["date"]
-        ):
-            content = concise_approval(content, plan)
-        replies.append(reply_from_text(content, plan, scope, event_id, delivered, at))
+        if displayed == {identity}:
+            content = concise_approval(content, plan, bare_offer=offered)
+        reply = reply_from_text(content, plan, scope, event_id, delivered, at)
+        if reply is not None and late_timing_disclosed:
+            reply["late_timing_disclosed"] = True
+        replies.append(reply)
     return replies
 
 

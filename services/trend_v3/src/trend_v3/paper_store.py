@@ -43,6 +43,13 @@ SCHEMA = (
         event_id TEXT NOT NULL REFERENCES replies(event_id),
         quantity INTEGER NOT NULL, at TEXT NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS attempt_dispatches (
+        token TEXT PRIMARY KEY REFERENCES attempts(token) ON DELETE CASCADE,
+        mode TEXT NOT NULL CHECK(mode IN ('opening', 'late', 'retry')),
+        event_id TEXT NOT NULL REFERENCES replies(event_id),
+        submitted_at TEXT,
+        reference_price TEXT NOT NULL
+    )""",
 )
 
 

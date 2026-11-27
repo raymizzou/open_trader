@@ -88,7 +88,7 @@ class Portfolio:
         self.gross[name] += value
         self.footprints[code].append((name, quantity, kind))
 
-    def quantity(self, row, *, previous_fills=0):
+    def quantity(self, row, *, previous_fills=0, approved_quantity=None):
         name, code = row["account"], row["code"]
         account = self.accounts.get(name, {})
         if (
@@ -115,11 +115,25 @@ class Portfolio:
         if holdings and previous_fills == 0:
             return 0, "instrument_busy"
         unit, lot = unit_notional(row), row["lot"]
-        budget = min(
+        limits = (
             self.net[name] * ENTRY_FRACTION - previous_fills * unit,
             self.cash[name],
             self.net[name] - self.gross[name],
         )
+        if approved_quantity is not None:
+            required = unit * approved_quantity
+            for limit, reason in zip(
+                limits,
+                (
+                    "approved_size_exceeds_entry_budget",
+                    "approved_size_exceeds_available_funds",
+                    "approved_size_exceeds_exposure",
+                ),
+                strict=True,
+            ):
+                if limit < required:
+                    return 0, reason
+        budget = min(limits)
         if budget < unit * lot:
             return 0, "account_or_size_unverified"
         return min(int(budget // (unit * lot)) * lot, (2**53 // lot) * lot), None
@@ -131,13 +145,17 @@ def unit_notional(row):
 
 def existing_reservations(store, portfolio, now):
     rows = store.execute(
-        """SELECT attempts.*, plans.body FROM attempts
+        """SELECT attempts.*, plans.body, attempt_dispatches.reference_price
+           FROM attempts
            JOIN plans ON plans.id = attempts.plan
+           LEFT JOIN attempt_dispatches ON attempt_dispatches.token = attempts.token
            WHERE attempts.state IN ('active', 'unknown') OR attempts.filled > 0"""
     )
     for attempt in rows:
         plan = json.loads(attempt["body"])
         row = next(line for line in plan["lines"] if line["item"] == attempt["item"])
+        if attempt["reference_price"] is not None:
+            row["reference_price"] = attempt["reference_price"]
         pending = attempt["state"] in {"active", "unknown"}
         positions = portfolio.footprints.get(row["code"], [])
         has_position = any(

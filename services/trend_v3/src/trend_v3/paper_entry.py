@@ -2,8 +2,9 @@
 
 import hashlib
 import json
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .paper_evidence import TAIPEI, candidate_gap, candidates, decimal, instant, text
 from .paper_futu import MissedOpening
@@ -17,8 +18,16 @@ from .paper_store import transaction
 
 OPEN_WAKE_SLACK = timedelta(seconds=2)
 OPEN_DISPATCH_SLACK = timedelta(seconds=30)
+LATE_DISPATCH_SLACK = timedelta(seconds=30)
 RETRY_EXPIRY = timedelta(minutes=1)
 RETRYABLE = {"rejected", "cancelled"}
+FIRST_NOT_SUBMITTED = {
+    "open_dispatch_deadline",
+    "late_dispatch_deadline",
+    "late_not_authorized",
+    "plan_superseded",
+    "report_revised_or_unverified",
+}
 
 
 def encode(value):
@@ -36,6 +45,21 @@ def fingerprint(value):
     return hashlib.sha256(encode(value).encode()).hexdigest()
 
 
+def late_trade_date(line, at):
+    return (
+        line["product"] in {"stock", "etf", "future"}
+        and at >= instant(line["opens_at"])
+        and at.astimezone(ZoneInfo(line["timezone"])).date().isoformat()
+        == line["session_date"]
+    )
+
+
+def late_deadline(line, at):
+    zone = ZoneInfo(line["timezone"])
+    tomorrow = at.astimezone(zone).date() + timedelta(days=1)
+    return min(at + LATE_DISPATCH_SLACK, datetime.combine(tomorrow, time(), zone))
+
+
 class PaperEntry:
     def __init__(
         self,
@@ -46,6 +70,7 @@ class PaperEntry:
         verify_reply=None,
         clock=None,
         check_plan=None,
+        recheck_late=None,
     ):
         if broker.environment != "SIMULATE":
             raise ValueError("paper entry requires a simulation broker")
@@ -55,17 +80,23 @@ class PaperEntry:
         self.verify_reply = verify_reply
         self.clock = clock
         self.check_plan = check_plan
+        self.recheck_late = recheck_late
+        self.late_authorizations = set()
 
-    def plan(self, report, facts, *, now):
+    def plan(self, report, facts, *, now, was_delivered=None):
         rows, skipped = candidates(report, facts)
-        if report.get("date") != self.session["date"] or (
-            now.astimezone(TAIPEI).date().isoformat() != self.session["date"]
-        ):
+        if report.get("date") != self.session["date"]:
             raise ValueError("report date must match the current scheduled report")
+        same_taipei_day = now.astimezone(TAIPEI).date().isoformat() == report["date"]
+        scheduled = self.session["kind"] == "scheduled"
+        eligible = []
         for row in rows:
-            if now >= instant(row["opens_at"]):
+            if (same_taipei_day and now < instant(row["opens_at"])) or (
+                scheduled and late_trade_date(row, now)
+            ):
+                eligible.append(row)
+            else:
                 skipped.append(candidate_gap(row, "missed_open"))
-        rows = [row for row in rows if now < instant(row["opens_at"])]
         with transaction(self.database) as store:
             previous = self.latest_plan(store)
             report_hash = facts.get("daily_evidence_hash") or fingerprint(
@@ -74,11 +105,20 @@ class PaperEntry:
             revision = facts.get("report_revision")
             if previous is not None:
                 self.check_revision(previous, revision, report_hash)
-                if previous["report_hash"] == report_hash and any(
-                    now >= instant(line["opens_at"]) for line in previous["lines"]
-                ):
-                    return previous
-            lines = self.size_candidates(store, rows, skipped, now)
+                if previous["report_hash"] == report_hash and previous["lines"]:
+                    still_open_to_confirmation = scheduled and any(
+                        late_trade_date(line, now) for line in previous["lines"]
+                    )
+                    _, created = self.stored_plan(store, previous["id"])
+                    if still_open_to_confirmation or (
+                        same_taipei_day
+                        and was_delivered is not None
+                        and was_delivered(previous, created)
+                    ):
+                        return previous
+            if not same_taipei_day and not eligible:
+                raise ValueError("report date must match the current scheduled report")
+            lines = self.size_candidates(store, eligible, skipped, now)
             content = {
                 "date": report.get("date"),
                 "report_version": facts.get("report_version"),
@@ -250,6 +290,15 @@ class PaperEntry:
         return bool(result and result["recorded"])
 
     def record_reply(self, plan_id, reply, *, now):
+        result = self._record_reply(plan_id, reply, now)
+        if result:
+            self.late_authorizations.update(
+                (plan_id, item, reply["event_id"])
+                for item in result.get("late_items", ())
+            )
+        return result
+
+    def _record_reply(self, plan_id, reply, now):
         if (
             not isinstance(reply, dict)
             or self.verify_reply is None
@@ -286,25 +335,53 @@ class PaperEntry:
             opened = [
                 item for item in selected if at >= instant(items[item]["opens_at"])
             ]
-            if decision == "approve" and opened:
-                return None
-            if decision == "deny":
-                settled = {
-                    row["item"]
-                    for row in store.execute(
-                        "SELECT item FROM attempts WHERE plan = ? "
-                        "AND reason IS NOT 'awaiting_broker_receipt' "
-                        "UNION SELECT item FROM decisions WHERE plan = ?",
-                        (plan_id, plan_id),
+            existing = self.approvals(store, plan_id)
+            if decision == "approve":
+                if opened and reply.get("late_timing_disclosed") is not True:
+                    return None
+                selected = [
+                    item
+                    for item in selected
+                    if (
+                        (attempt := self.attempt(store, items[item])) is None
+                        or item in opened
+                        and self.first_not_submitted(attempt)
                     )
-                }
-                opened = [
-                    item for item in selected if item in opened or item in settled
+                    and (item not in existing or existing[item]["quantity"] > 0)
+                    and (
+                        item not in opened
+                        or (
+                            late_trade_date(items[item], at)
+                            and late_trade_date(items[item], now)
+                            and now < late_deadline(items[item], at)
+                        )
+                    )
                 ]
+            if decision == "deny":
+
+                def withdrawable(item):
+                    line = items[item]
+                    if item in existing and existing[item]["quantity"] == 0:
+                        return False
+                    attempt = self.attempt(store, line)
+                    if (
+                        attempt
+                        and attempt["reason"] != "awaiting_broker_receipt"
+                        and not self.first_not_submitted(attempt)
+                    ):
+                        return False
+                    return item not in opened or (
+                        late_trade_date(line, at) and late_trade_date(line, now)
+                    )
+
+                opened = [item for item in selected if not withdrawable(item)]
                 selected = [item for item in selected if item not in opened]
                 result.update(items=selected, ignored_opened_items=opened)
                 if not selected:
-                    return result | {"recorded": False, "reason": "no_unopened_items"}
+                    return result | {
+                        "recorded": False,
+                        "reason": "no_withdrawable_items",
+                    }
             at = at.astimezone(UTC).isoformat()
             newer = {
                 row["item"]
@@ -337,7 +414,17 @@ class PaperEntry:
                     for item in selected
                 ),
             )
-            return result | {"items": selected}
+            result["items"] = selected
+            if decision == "approve" and (late := set(opened).intersection(selected)):
+                result["late_items"] = [item for item in selected if item in late]
+            return result
+
+    @staticmethod
+    def approvals(store, plan_id):
+        return {
+            row["item"]: row
+            for row in store.execute("SELECT * FROM approvals WHERE plan=?", (plan_id,))
+        }
 
     def valid_reply(self, reply, plan, created, now):
         at = instant(reply.get("at"))
@@ -406,7 +493,9 @@ class PaperEntry:
         )
         return True
 
-    def submit(self, plan_id, *, now, retry=False, item=None, opening=None):
+    def submit(
+        self, plan_id, *, now, retry=False, item=None, opening=None, late_reply=None
+    ):
         with transaction(self.database) as store:
             plan, _ = self.stored_plan(store, plan_id)
         if plan is None:
@@ -430,11 +519,11 @@ class PaperEntry:
             return self.portfolio(store, now, accounts)
 
         return [
-            self.submit_line(plan_id, line, now, retry, current_portfolio)
+            self.submit_line(plan_id, line, now, retry, current_portfolio, late_reply)
             for line in lines
         ]
 
-    def submit_line(self, plan_id, line, now, retry, current_portfolio):
+    def submit_line(self, plan_id, line, now, retry, current_portfolio, late_reply):
         with transaction(self.database) as store:
             plan, _ = self.current(store, plan_id)
             if plan is None:
@@ -444,6 +533,9 @@ class PaperEntry:
                     line, "skipped", reason="report_revised_or_unverified"
                 )
             attempt = self.attempt(store, line)
+            unsent = None
+            if late_reply is not None and self.first_not_submitted(attempt):
+                unsent, attempt = attempt, None
             if attempt:
                 pending_retry = self.authorized_retry(
                     store, plan, line, attempt, now, retry
@@ -456,21 +548,59 @@ class PaperEntry:
                     instant(pending_retry["at"]) + RETRY_EXPIRY,
                     instant(line["closes_at"]),
                 )
+                mode, event_id = "retry", pending_retry["event_id"]
             else:
                 if retry:
                     return self.outcome(line, "skipped", reason="retry_not_authorized")
                 opens = instant(line["opens_at"])
                 if now < opens:
                     return self.outcome(line, "pending", reason="waiting_for_open")
-                decision = self.decision(store, plan_id, line)
-                if decision:
-                    return decision
-                if now > opens + OPEN_WAKE_SLACK:
-                    return self.finalize(store, plan_id, line, "missed_open")
                 approved = store.execute(
-                    "SELECT quantity FROM approvals WHERE plan = ? AND item = ?",
+                    "SELECT quantity, at FROM approvals WHERE plan = ? AND item = ?",
                     (plan_id, line["item"]),
                 ).fetchone()
+                if late_reply is not None:
+                    authorization = (plan_id, line["item"], late_reply.get("event_id"))
+                    reply_at = instant(late_reply.get("at"))
+                    event = store.execute(
+                        "SELECT body FROM replies WHERE event_id=? AND plan=?",
+                        (late_reply.get("event_id"), plan_id),
+                    ).fetchone()
+                    if not (
+                        authorization in self.late_authorizations
+                        and approved
+                        and approved["quantity"] == line["quantity"]
+                        and reply_at == instant(approved["at"])
+                        and event
+                        and event["body"] == encode(late_reply)
+                        and late_reply.get("late_timing_disclosed") is True
+                        and late_reply.get("decision") == "approve"
+                        and any(
+                            self.valid_selection(item, line)
+                            and item["item"] == line["item"]
+                            for item in late_reply["items"]
+                        )
+                        and reply_at <= now < reply_at + LATE_DISPATCH_SLACK
+                        and late_trade_date(line, reply_at)
+                        and late_trade_date(line, now)
+                    ):
+                        return self.outcome(
+                            line, "skipped", reason="late_not_authorized"
+                        )
+                    self.late_authorizations.remove(authorization)
+                    deadline = late_deadline(line, reply_at)
+                    mode, event_id = "late", late_reply["event_id"]
+                else:
+                    decision = self.decision(store, plan_id, line)
+                    if decision:
+                        return decision
+                    if now > opens + OPEN_WAKE_SLACK:
+                        return self.finalize(store, plan_id, line, "missed_open")
+                    if approved and instant(approved["at"]) >= opens:
+                        return self.outcome(line, "pending", reason="waiting_for_ray")
+                    deadline = min(
+                        opens + OPEN_DISPATCH_SLACK, instant(line["closes_at"])
+                    )
                 if approved is None:
                     return self.finalize(store, plan_id, line, "not_approved")
                 quantity = approved["quantity"]
@@ -479,21 +609,46 @@ class PaperEntry:
                         store, plan_id, line, "ray_denied", state="denied"
                     )
                 number = 1
-                deadline = min(opens + OPEN_DISPATCH_SLACK, instant(line["closes_at"]))
+                if late_reply is None:
+                    mode = "opening"
+                    event_id = self.opening_event(store, plan_id, line, approved["at"])
+                    if event_id is None:
+                        return self.outcome(
+                            line, "skipped", reason="approval_evidence_unavailable"
+                        )
             expires = instant(self.session.get("expires_at"))
             if expires is not None:
                 deadline = min(deadline, expires)
             if self.clock is not None and self.clock() >= deadline:
                 if retry:
                     return self.outcome(line, "skipped", reason="retry_deadline")
-                return self.finalize(store, plan_id, line, "open_dispatch_deadline")
+                return self.finalize(
+                    store,
+                    plan_id,
+                    line,
+                    "late_dispatch_deadline"
+                    if late_reply
+                    else "open_dispatch_deadline",
+                )
             previous_fills = self.previous_fills(store, line) if attempt else 0
+            execution_line = line
+            if late_reply is not None:
+                execution_line, reason = (
+                    self.recheck_late(line, self.clock() if self.clock else now)
+                    if self.recheck_late is not None
+                    else (None, "execution_conditions_unverified")
+                )
+                if reason:
+                    return self.finalize(store, plan_id, line, reason)
             reason = self.execution_blocker(
                 store,
-                line,
+                execution_line,
                 quantity,
                 previous_fills,
                 current_portfolio,
+                late=late_reply is not None,
+                after_close=late_reply is not None
+                and now >= instant(line["closes_at"]),
             )
             if reason:
                 if retry:
@@ -501,26 +656,72 @@ class PaperEntry:
                 return self.finalize(store, plan_id, line, reason)
             economic_key = self.economic_key(line)
             token = "TV3" + fingerprint([economic_key, number])[:25]
+            if unsent is not None:
+                store.execute("DELETE FROM attempts WHERE token=?", (unsent["token"],))
             store.execute(
                 """INSERT INTO attempts
                    (token, economic_key, plan, item, quantity, number, state, reason)
                    VALUES (?, ?, ?, ?, ?, ?, 'unknown', 'awaiting_broker_receipt')""",
                 (token, economic_key, plan_id, line["item"], quantity, number),
             )
-        return self.send(plan_id, line, token, quantity, deadline, retry=retry)
+            store.execute(
+                "INSERT INTO attempt_dispatches VALUES (?, ?, ?, NULL, ?)",
+                (token, mode, event_id, execution_line["reference_price"]),
+            )
+        return self.send(
+            plan_id,
+            line,
+            token,
+            quantity,
+            deadline,
+            now=now,
+            mode=mode,
+            late_reply=late_reply,
+        )
+
+    def opening_event(self, store, plan_id, line, approved_at):
+        for row in store.execute("SELECT * FROM replies WHERE plan=?", (plan_id,)):
+            reply = json.loads(row["body"])
+            if (
+                reply["decision"] == "approve"
+                and instant(reply["at"]) == instant(approved_at)
+                and any(
+                    item["item"] == line["item"] and self.valid_selection(item, line)
+                    for item in reply["items"]
+                )
+            ):
+                return row["event_id"]
+        return None
 
     def execution_blocker(
-        self, store, line, quantity, previous_fills, current_portfolio
+        self,
+        store,
+        line,
+        quantity,
+        previous_fills,
+        current_portfolio,
+        *,
+        late,
+        after_close,
     ):
         try:
             portfolio = current_portfolio(store)
-            allowed, reason = portfolio.quantity(line, previous_fills=previous_fills)
+            allowed, reason = portfolio.quantity(
+                line,
+                previous_fills=previous_fills,
+                approved_quantity=quantity if late else None,
+            )
             if allowed < quantity:
                 return reason or "approved_size_unavailable"
             capacity = self.broker.capacity(line)
             if type(capacity) is not int or capacity < quantity:
                 return "approved_size_unavailable"
-            if not self.broker.market_open(line):
+            market_open = (
+                self.broker.market_open(line, after_close=True)
+                if after_close
+                else self.broker.market_open(line)
+            )
+            if not market_open:
                 return "market_not_open"
         except (PortfolioUnknown, OSError, RuntimeError):
             return "execution_conditions_unverified"
@@ -535,7 +736,7 @@ class PaperEntry:
 
     def finalize(self, store, plan_id, line, reason, *, state="skipped"):
         store.execute(
-            "INSERT INTO decisions VALUES (?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO decisions VALUES (?, ?, ?, ?)",
             (plan_id, line["item"], state, reason),
         )
         return self.outcome(line, state, reason=reason)
@@ -557,7 +758,7 @@ class PaperEntry:
                 return approved
         return None
 
-    def send(self, plan_id, line, token, quantity, deadline, *, retry):
+    def send(self, plan_id, line, token, quantity, deadline, *, now, mode, late_reply):
         # The committed reservation survives process death. The second transaction
         # serializes dispatch against plan withdrawal and broker reconciliation.
         with transaction(self.database) as store:
@@ -569,28 +770,50 @@ class PaperEntry:
             ):
                 return self.attempt_outcome(store, line, attempt)
             response = None
-            expired = "retry_deadline" if retry else "open_dispatch_deadline"
+            expired = {
+                "opening": "open_dispatch_deadline",
+                "late": "late_dispatch_deadline",
+                "retry": "retry_deadline",
+            }[mode]
+            retry = mode == "retry"
             approval = None
             if not retry:
                 approval = store.execute(
-                    "SELECT quantity FROM approvals WHERE plan = ? AND item = ?",
+                    "SELECT quantity, at FROM approvals WHERE plan = ? AND item = ?",
                     (plan_id, line["item"]),
                 ).fetchone()
             if current is None:
                 result = ("skipped", None, 0, "plan_superseded")
             elif not retry and (approval is None or approval["quantity"] != quantity):
                 result = ("denied", None, 0, "ray_denied")
+            elif late_reply is not None and (
+                instant(approval["at"]) != instant(late_reply["at"])
+                or self.clock is not None
+                and not late_trade_date(line, self.clock())
+            ):
+                result = ("skipped", None, 0, "late_not_authorized")
             elif self.check_plan is not None and not self.check_plan(current):
                 result = ("skipped", None, 0, "report_revised_or_unverified")
             elif self.clock is not None and self.clock() >= deadline:
                 result = ("skipped", None, 0, expired)
             else:
+
+                def mark_submission(at=None):
+                    store.execute(
+                        "UPDATE attempt_dispatches SET submitted_at=? WHERE token=?",
+                        (
+                            (at or (self.clock() if self.clock else now)).isoformat(),
+                            token,
+                        ),
+                    )
+
                 try:
                     response = self.broker.place_market(
                         line,
                         quantity,
                         token,
                         deadline=deadline if self.clock else None,
+                        on_submit=mark_submission,
                     )
                     result = self.broker_result(response, quantity)
                 except MissedOpening:
@@ -601,6 +824,11 @@ class PaperEntry:
                     result = ("unknown", None, None, "broker_disconnected")
                 except Exception:
                     result = ("unknown", None, None, "broker_receipt_unverified")
+            if not retry and result[0] in {"skipped", "denied"}:
+                # Reservation ended before the broker call. Preserve the reason
+                # as a decision without claiming that an order was attempted.
+                store.execute("DELETE FROM attempts WHERE token=?", (token,))
+                return self.finalize(store, plan_id, line, result[3], state=result[0])
             store.execute(
                 """UPDATE attempts SET state=?, order_id=?, filled=?, reason=?,
                    filled_notional=? WHERE token=?""",
@@ -740,6 +968,17 @@ class PaperEntry:
             (self.economic_key(line),),
         ).fetchone()
 
+    @staticmethod
+    def first_not_submitted(attempt):
+        return (
+            attempt is not None
+            and attempt["number"] == 1
+            and attempt["state"] == "skipped"
+            and attempt["order_id"] is None
+            and attempt["filled"] == 0
+            and attempt["reason"] in FIRST_NOT_SUBMITTED
+        )
+
     def attempt_outcome(self, store, line, attempt):
         previous_fills = self.previous_fills(store, line, before=attempt["number"])
         filled = attempt["filled"]
@@ -807,12 +1046,22 @@ class PaperEntry:
                 return None
             results = []
             pending_codes = set()
+            replaced = set()
+            verified = self.check_plan is None or self.check_plan(plan)
             for line in plan["lines"]:
                 attempt = self.attempt(store, line)
                 if attempt is not None:
-                    continue
+                    if not (
+                        self.first_not_submitted(attempt) and late_trade_date(line, now)
+                    ):
+                        continue
+                    replaced.add(attempt["token"])
                 result = self.decision(store, plan["id"], line)
-                if result is None:
+                if not verified:
+                    result = self.outcome(
+                        line, "skipped", reason="report_revised_or_unverified"
+                    )
+                elif result is None or late_trade_date(line, now):
                     result = self.unsubmitted_status(store, plan["id"], line, now)
                 approval = store.execute(
                     "SELECT quantity FROM approvals WHERE plan=? AND item=?",
@@ -828,6 +1077,8 @@ class PaperEntry:
                 (self.session["date"],),
             )
             for ordinal, attempt in enumerate(history, 1):
+                if attempt["token"] in replaced:
+                    continue
                 old_plan = json.loads(attempt["body"])
                 line = next(
                     line
@@ -1180,6 +1431,8 @@ class PaperEntry:
         if now < instant(line["opens_at"]):
             reason = "waiting_for_open" if approved else "waiting_for_ray"
             return self.outcome(line, "pending", reason=reason)
+        if late_trade_date(line, now):
+            return self.outcome(line, "pending", reason="awaiting_late_confirmation")
         reason = "missed_open" if approved else "not_approved"
         return self.outcome(line, "skipped", reason=reason)
 
