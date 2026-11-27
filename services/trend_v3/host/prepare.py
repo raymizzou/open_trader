@@ -2,11 +2,79 @@
 
 import argparse
 import ast
+import os
 import re
+import stat
 import subprocess
 from pathlib import Path
 
-SOURCES = ("daily_sync.py", "daily_host.py", "run-daily.py", "daily_paper.py")
+SOURCES = (
+    "daily_sync.py",
+    "daily_host.py",
+    "run-daily.py",
+    "daily_paper.py",
+    "daily_handoff.py",
+)
+
+
+def trusted_config_tree(path):
+    if path.resolve(strict=True) != path:
+        raise ValueError("existing host configuration path is not canonical")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022
+            or info.st_size > 100_000
+        ):
+            raise ValueError("existing host configuration is not owner controlled")
+        return ast.parse(stream.read()).body
+
+
+def space_assignments(tree):
+    return [
+        node.value.value if isinstance(node.value, ast.Constant) else None
+        for node in tree
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "SPACE_ID"
+            for target in node.targets
+        )
+    ]
+
+
+def installed_space(config):
+    launcher = trusted_config_tree(config / "run-daily.py")
+    assignments = space_assignments(launcher)
+    imports = [
+        node
+        for node in launcher
+        if isinstance(node, ast.ImportFrom)
+        and any((name.asname or name.name) == "SPACE_ID" for name in node.names)
+    ]
+    if not assignments and len(imports) == 1:
+        module = imports[0]
+        if (
+            module.level == 0
+            and module.module == "daily_release"
+            and any(
+                name.name == "SPACE_ID" and name.asname is None for name in module.names
+            )
+        ):
+            assignments = space_assignments(
+                trusted_config_tree(config / "daily_release.py")
+            )
+    elif imports:
+        assignments = []
+    if (
+        len(assignments) != 1
+        or not isinstance(assignments[0], str)
+        or not re.fullmatch(r"sp[0-9a-f]+", assignments[0])
+    ):
+        raise ValueError("existing host space authority is unavailable")
+    return assignments[0]
 
 
 def prepare(release, output):
@@ -27,27 +95,14 @@ def prepare(release, output):
     if actual != pin or dirty:
         raise ValueError("selected host release is not a clean exact-SHA checkout")
     service = release / "services/trend_v3"
-    existing = Path.home() / ".config/trend-animals/run-daily.py"
-    tree = ast.parse(existing.read_text())
-    matches = [
-        node.value.value
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and isinstance(node.value, ast.Constant)
-        and any(
-            isinstance(target, ast.Name) and target.id == "SPACE_ID"
-            for target in node.targets
-        )
-    ]
-    if len(matches) != 1 or not re.fullmatch(r"sp[0-9a-f]+", matches[0]):
-        raise ValueError("existing host space authority is unavailable")
+    space = installed_space(Path.home() / ".config/trend-animals")
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     for name in SOURCES:
         (output / name).write_bytes((service / "host" / name).read_bytes())
     (output / "daily_release.py").write_text(
         "from pathlib import Path\n"
         f"PIN = {pin!r}\nSERVICE_ROOT = Path({str(service)!r})\n"
-        f"SPACE_ID = {matches[0]!r}\n"
+        f"SPACE_ID = {space!r}\n"
     )
     # The candidate launcher refuses an old SOP pin. The separately authorized
     # installer must update/check that existing SOP and verify all helper pins.

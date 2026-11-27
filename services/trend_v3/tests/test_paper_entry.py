@@ -1,7 +1,10 @@
 """Observe the paper-entry service through its operator commands."""
 
+import importlib
 import json
 import os
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -4710,6 +4713,283 @@ def cn_bridge(home):
         [(code, "CN", "qualified") for code in BRIDGE_CN_CODES]
         + [("600005.SH", "CN", "unknown")],
     )
+
+
+@pytest.fixture
+def delivery_host(monkeypatch):
+    from trend_v3.paper_report import atomic_private
+
+    service = Path(__file__).resolve().parents[1]
+    monkeypatch.syspath_prepend(str(service / "host"))
+    monkeypatch.setitem(
+        sys.modules, "daily_release",
+        SimpleNamespace(PIN=RELEASE, SERVICE_ROOT=service, SPACE_ID="official-space"),
+    )
+    monkeypatch.setitem(
+        sys.modules, "daily_lifecycle",
+        SimpleNamespace(
+            atomic_json=lambda path, data: atomic_private(
+                path, paper_entry.encode(data).encode()
+            ),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules, "daily_support",
+        SimpleNamespace(
+            SyncDenied=type("SyncDenied", (ValueError,), {}),
+            sync_allowed=lambda identity, *_: identity["permission"] == "read-write",
+            retry_sync=lambda copier, **_: {
+                "sha256": (digest := copier.copy_verified()),
+                "bytes_verified": True,
+                "uploaded": copier.upload(digest),
+            },
+        ),
+    )
+    names = ("daily_host", "daily_sync", "daily_paper", "daily_handoff")
+    for name in names:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    try:
+        yield importlib.import_module("daily_host")
+    finally:
+        for name in names:
+            sys.modules.pop(name, None)
+
+
+def delivery_boundaries(home, root, live, host, monkeypatch):
+    state = home / ".config/trend-animals/daily-state"
+    (state / f"{DAY}.upload.json").unlink()
+    cloud = home / "Library/Mobile Documents/com~apple~CloudDocs/trend_v3"
+    cloud.mkdir(parents=True)
+
+    boundary = SimpleNamespace(cloud=cloud, wakes=[], uploaded=True, tab="official-tab")
+    monkeypatch.setattr(
+        "daily_sync.metadata",
+        lambda path: dict(
+            safe=True, icloud=True, shared=True, owner="rui xie", role="participant",
+            permission="read-write", uploaded=boundary.uploaded,
+            uploading=False, upload_error=False,
+        ),
+    )
+    monkeypatch.setattr(host, "metadata", sys.modules["daily_sync"].metadata)
+    transcript, = (home / ".codex/sessions").glob("*.jsonl")
+
+    def host_process(argv, **_):
+        if argv[0] == "/usr/sbin/lsof":
+            value = f"n{transcript}\n".encode()
+        elif argv[1:] == ["get", "t1", "--json"]:
+            value = paper_entry.encode(live | {"address": "t1", "turn": 1}).encode()
+        elif argv[1:] == ["ls"]:
+            value = paper_entry.encode({"spaces": [{
+                "id": "official-space", "name": "trend_v3", "machine": None,
+                "folder": str(root), "tabs": [{
+                    "id": boundary.tab, "name": f"trend507-{DAY}",
+                    "terminals": [{"pane": "official-pane", "terminal": "t1"}],
+                }],
+            }]}).encode()
+        else:
+            assert "send" in argv and argv[-2] == "t1"
+            boundary.wakes.append(argv[-1])
+            value = b"{}"
+        return subprocess.CompletedProcess(argv, 0, value, b"")
+
+    monkeypatch.setattr(subprocess, "run", host_process)
+    live["status"]["state"] = "done"
+    return boundary
+
+
+def test_delivered_rerun_hands_all_seven_to_paper_plan(
+    tmp_path, monkeypatch, capsys, delivery_host,
+):
+    home = tmp_path.resolve()
+    root, live, now, revision, _ = cn_bridge(home)
+    current_reader = root / "reports" / f"{DAY}.html"
+    newer = current_reader.read_bytes().replace(b"Fixed current", b"Revised")
+    verification = json.loads((revision / "report-verification.json").read_bytes())
+    verification["report_sha256"] = sha256(newer).hexdigest()
+    private_input(revision, "report-verification.json", verification)
+    staged = home / "independent-rerun-input"
+    revision.rename(staged)
+    first = revision.with_name("v01")
+    first.mkdir(mode=0o700)
+    first_cutoff = f"{DAY}T08:30:00+08:00"
+    current_reader.write_bytes(newer.replace(b"Revised", b"Initial"))
+    early_info = verification | {
+        "revision": "v01", "cutoff": first_cutoff,
+        "report_sha256": sha256(current_reader.read_bytes()).hexdigest(),
+    }
+    for key, name, data in (
+        ("projection_sha256", "reader-projection.json", {"date": DAY}),
+        ("selection_sha256", "selection-evidence.json", {"date": DAY}),
+        ("fees_sha256", "fees.json", {}),
+    ):
+        raw = private_input(first, name, data).read_bytes()
+        early_info[key] = sha256(raw).hexdigest()
+    private_input(first, "report-verification.json", early_info)
+    private_input(first.parent, "latest-revision.json", {"report_date": DAY,
+                                                        "revision": "v01"})
+    sdk = BridgeOpenD(halted="SH.600003")
+    boundary = delivery_boundaries(home, root, live, delivery_host, monkeypatch)
+    initial_at = datetime.fromisoformat(first_cutoff) + timedelta(seconds=1)
+    receipt = delivery_host.host_sync_once(
+        home, DAY, NATIVE_LAUNCH, initial_at.timestamp()
+    )
+    assert receipt["uploaded"] is True and receipt["revision"] == "v01"
+    with monkeypatch.context() as tab:
+        assert run_daily_plan(home, sdk, initial_at, live, tab) == 0
+    prior = json.loads(capsys.readouterr().out)
+    assert prior["lines"] == [] and prior["execution"] == "evidence_incomplete"
+    assert not sdk.quote_calls and not sdk.writes
+
+    staged.rename(revision)
+    current_reader.write_bytes(newer)
+    private_input(first.parent, "latest-revision.json", {"report_date": DAY,
+                                                        "revision": revision.name})
+    # The revision appears at the official boundary only after its own verified copy.
+    result = delivery_host.host_sync_once(home, DAY, NATIVE_LAUNCH, now.timestamp())
+    assert result["uploaded"] is True and result["revision"] == revision.name
+    assert (boundary.cloud / current_reader.name).read_bytes() == newer
+    [initial_wake, wake] = boundary.wakes
+    assert "v01" in initial_wake
+    assert DAY in wake and revision.name in wake and "plan" in wake
+    assert run_daily_plan(home, sdk, now, live, monkeypatch) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["report_version"] == revision.name
+    assert [(row["code"], row["state"]) for row in plan["observations"][:7]] == [
+        (code, "blocked" if code == "600003.SH" else "awaiting_approval")
+        for code in BRIDGE_CN_CODES
+    ]
+    assert "600003.SH | 暂不可确认 | market_halted" in plan["display"]
+    assert len(plan["lines"]) == 6
+    assert sdk.writes == []
+
+
+def test_revision_handoff_resumes_once_after_upload_and_restart(
+    tmp_path, monkeypatch, capsys, delivery_host,
+):
+    home = tmp_path.resolve()
+    root, live, now, revision, _ = cn_bridge(home)
+    boundary = delivery_boundaries(home, root, live, delivery_host, monkeypatch)
+    sdk = BridgeOpenD(halted="SH.600003")
+    handoff = home / f".config/trend-animals/daily-state/{DAY}.paper-handoff.json"
+
+    def sync(seconds):
+        return delivery_host.host_sync_once(
+            home, DAY, NATIVE_LAUNCH, now.timestamp() + seconds,
+        )
+
+    boundary.uploaded = False
+    assert sync(0)["uploaded"] is False
+    assert not handoff.exists() and not boundary.wakes
+    boundary.uploaded = True
+    boundary.tab = "unrelated-tab"
+    assert sync(1)["uploaded"] is True
+    assert json.loads(handoff.read_bytes())["status"] == "pending"
+    assert not boundary.wakes
+    boundary.tab = "official-tab"
+    assert sync(2)["uploaded"] is True
+    [wake] = boundary.wakes
+    pending = json.loads(handoff.read_bytes())
+    assert pending["status"] == "requested" and pending["revision"] == revision.name
+    assert sync(3)["uploaded"] is True and boundary.wakes == [wake]
+    args = ("plan", "--handoff", pending["token"])
+    upload = handoff.with_name(f"{DAY}.upload.json")
+    genuine = json.loads(upload.read_bytes())
+    for changed in ({"source_sha256": "f" * 64}, {"timestamp": now.timestamp() - 301}):
+        private_input(upload.parent, upload.name, genuine | changed)
+        with monkeypatch.context() as tab, pytest.raises(SystemExit) as blocked:
+            run_daily_plan(
+                home, sdk, now + timedelta(seconds=4), live, tab, command=args
+            )
+        assert blocked.value.code == 2
+    private_input(upload.parent, upload.name, genuine)
+    assert not sdk.quote_calls and not sdk.writes
+    capsys.readouterr()
+    with monkeypatch.context() as tab:
+        assert run_daily_plan(home, sdk, now + timedelta(seconds=4), live, tab,
+                              command=args) == 0
+    first = json.loads(capsys.readouterr().out)
+    tab_record(home, "assistant", first["display"], now + timedelta(seconds=5),
+               phase="commentary")
+    assert sync(6)["uploaded"] is True
+    assert json.loads(handoff.read_bytes())["status"] == "requested"
+    calls = list(sdk.quote_calls)
+    with monkeypatch.context() as tab:
+        assert run_daily_plan(home, sdk, now + timedelta(seconds=7), live, tab,
+                              command=args) == 0
+    assert json.loads(capsys.readouterr().out) == first
+    assert sdk.quote_calls == calls and sdk.writes == []
+    tab_record(home, "assistant", f"```text\n{first['display']}\n```",
+               now + timedelta(seconds=8), phase="final_answer")
+    assert sync(9)["uploaded"] is True and boundary.wakes == [wake]
+    delivered = json.loads(handoff.read_bytes())
+    assert (delivered["status"], delivered["plan"], delivered["session"]) == (
+        "displayed", first["id"], NATIVE_SESSION,
+    )
+
+
+def test_approved_item_from_delivered_rerun_submits_once(
+    tmp_path, monkeypatch, capsys, delivery_host,
+):
+    home = tmp_path.resolve()
+    root, live, now, _, _ = cn_bridge(home)
+    boundary = delivery_boundaries(home, root, live, delivery_host, monkeypatch)
+
+    class AfterClose(BridgeOpenD):
+        def get_market_state(self, *, code_list):
+            return 0, [{"code": code_list[0], "market_state": "AFTER_HOURS_BEGIN"}]
+
+        def order_list_query(self, **params):
+            return self.query("orders", params, [{
+                "code": "SH.600004", "currency": "CNY", "qty": 100,
+                "dealt_qty": 0, "price": 20, "order_id": "unrelated-existing-order",
+                "order_status": "SUBMITTED",
+            }])
+
+    sdk = AfterClose()
+    assert delivery_host.host_sync_once(home, DAY, NATIVE_LAUNCH, now.timestamp())[
+        "uploaded"
+    ] is True
+    [wake] = boundary.wakes
+    token = wake.split()[6].removesuffix(".")
+    clock = SimpleNamespace(at=now + timedelta(seconds=1))
+    assert run_daily_plan(home, sdk, clock.at, live, monkeypatch,
+                          command=("plan", "--handoff", token)) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["report_version"] == "v02"
+    assert "SH.600004" not in {line["code"] for line in plan["lines"]}
+    old_id = "1" * 64
+    before = plan["delivery"].replace(plan["id"], old_id)
+    tab_record(
+        home, "assistant", before.replace("日报 v02", "日报 v01"),
+        now - timedelta(seconds=2), phase="final_answer",
+    )
+    tab_record(home, "user", f"模拟批准 {old_id} 全部", now - timedelta(seconds=1))
+    monkeypatch.setattr(paper_cli, "utc_now", lambda: clock.at)
+
+    def invoke():
+        return paper_cli.main(["--session", NATIVE_SESSION, "cycle", plan["id"]])
+
+    assert invoke() == 2 and sdk.writes == []
+    capsys.readouterr()
+    clock.at += timedelta(seconds=1)
+    tab_record(home, "assistant", plan["display"], clock.at, phase="final_answer")
+    clock.at = datetime.fromisoformat(f"{DAY}T15:05:00+08:00")
+    sdk.snapshot_time = f"{DAY} 15:00:00"
+    tab_record(home, "user", "只确认第1项", clock.at)
+    assert invoke() == 0
+    output = [json.loads(row) for row in capsys.readouterr().out.splitlines()]
+    result = next(row["results"][0] for row in output if row.get("results"))
+    assert result["state"] == "active"
+    assert (result["filled"], result["remaining"]) == (0, 100)
+    (placed,) = sdk.writes
+    assert (placed["code"], placed["qty"], placed["trd_env"]) == (
+        "SH.600001", 100, "SIMULATE",
+    )
+    clock.at += timedelta(seconds=1)
+    tab_record(home, "user", "只确认第1项", clock.at)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert set(pool.map(lambda _: invoke(), range(2))) <= {0, 2}
+    assert sdk.writes == [placed]
 
 
 def test_daily_bridge_preflights_seven_qualified_items_outside_legacy_seats(

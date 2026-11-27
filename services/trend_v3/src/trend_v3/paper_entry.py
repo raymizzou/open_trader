@@ -60,6 +60,37 @@ def late_deadline(line, at):
     return min(at + LATE_DISPATCH_SLACK, datetime.combine(tomorrow, time(), zone))
 
 
+def observation_status(related, lines, skipped, manual):
+    by_path = {
+        path: {"state": "blocked", "reason": row["reason"]}
+        for row in skipped
+        for path in row.get("observation_paths", ())
+    }
+    for row in manual:
+        for path in row["observation_paths"]:
+            by_path[path] = {
+                "state": "manual", "reason": "、".join(row["missing"]) or row["state"],
+                "task_id": row["task_id"],
+            }
+    for number, row in enumerate(lines, 1):
+        for path in row["observation_paths"]:
+            by_path[path] = {
+                "state": "awaiting_approval", "item": row["item"], "number": number,
+            }
+    rows = []
+    for path, entry in related.items():
+        observation = entry["observation"]
+        status = by_path[path]
+        row = {"code": observation["code"], "market": observation["market"]} | status
+        if status.get("reason") == "observation_unverified":
+            row["missing_fields"] = observation["missing_fields"]
+        rows.append(row)
+    return rows + [
+        {"state": "blocked", "reason": row["reason"]}
+        for row in skipped if not row.get("observation_paths")
+    ]
+
+
 class PaperEntry:
     def __init__(
         self,
@@ -132,6 +163,10 @@ class PaperEntry:
             }
             if "daily_bridge_routes" in facts:
                 content["manual"] = self.manual_candidates(facts["daily_bridge_routes"])
+                content["report_context"] = facts["report_context"]
+                content["observations"] = observation_status(
+                    facts["daily_bridge_routes"], lines, skipped, content["manual"]
+                )
             content_hash = fingerprint(content)
             if previous and previous["content_hash"] == content_hash:
                 return previous

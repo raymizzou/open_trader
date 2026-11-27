@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 from hashlib import sha256
@@ -11,6 +13,69 @@ import pytest
 DAY = "2025-01-02"
 PIN = "a" * 40
 SPACE = "sp00000000"
+
+
+@pytest.mark.parametrize("launcher_form", ["literal", "imported"])
+def test_host_prepare_loads_the_installed_space_and_packages_handoff(
+    tmp_path, monkeypatch, launcher_form,
+):
+    host = Path(__file__).resolve().parents[1] / "host"
+    spec = importlib.util.spec_from_file_location(
+        "prepare_candidate", host / "prepare.py"
+    )
+    prepare = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(prepare)
+    home = tmp_path.resolve() / "synthetic-home"
+    config = home / ".config/trend-animals"
+    release = config / "skill-releases" / PIN
+    service = release / "services/trend_v3"
+    service.mkdir(parents=True)
+    shutil.copytree(host, service / "host")
+    os.symlink(host.parent / "src", service / "src")
+    existing = config / "run-daily.py"
+    existing.write_text(
+        f"SPACE_ID = {SPACE!r}\n" if launcher_form == "literal"
+        else "from daily_release import PIN, SERVICE_ROOT, SPACE_ID\n"
+    )
+    if launcher_form == "imported":
+        (config / "daily_release.py").write_text(f"SPACE_ID = {SPACE!r}\n")
+    initial = {p.name: p.read_bytes() for p in config.glob("*.py")}
+    output = tmp_path / "candidate"
+    monkeypatch.setattr(Path, "home", classmethod(lambda _: home))
+    monkeypatch.setattr(
+        subprocess, "check_output",
+        lambda command, **_: f"{PIN}\n" if "rev-parse" in command else "",
+    )
+    assert prepare.prepare(release, output) == PIN
+    assert {p.name for p in output.iterdir()} == {
+        "daily_host.py", "daily_sync.py", "daily_paper.py", "daily_handoff.py",
+        "daily_release.py", "run-daily.py",
+    }
+    assert {p.name: p.read_bytes() for p in config.glob("*.py")} == initial
+    assert f"SPACE_ID = {SPACE!r}" in (output / "daily_release.py").read_text()
+
+    # Only the prepared files and unchanged synthetic host dependencies are visible.
+    install_home = tmp_path.resolve() / "candidate-home"
+    install = install_home / ".config/trend-animals"
+    shutil.copytree(output, install)
+    (install / "daily_lifecycle.py").write_text(
+        "atomic_json = record_launch = cleanup_old_tabs = None\n"
+    )
+    (install / "daily_support.py").write_text(
+        "class SyncDenied(ValueError): pass\nretry_sync = sync_allowed = None\n"
+    )
+    environment = {"HOME": str(install_home), "PATH": os.defpath}
+    for script in ("daily_host.py", "run-daily.py"):
+        result = subprocess.run(
+            [sys.executable, "-B", str(install / script), "--help"],
+            capture_output=True, text=True, env=environment, timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", "import daily_handoff"], cwd=install,
+        capture_output=True, text=True, env=environment, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.fixture

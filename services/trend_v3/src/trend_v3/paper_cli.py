@@ -13,8 +13,10 @@ from time import sleep as sleep_open
 
 from .paper_authority import (
     delivery_card,
+    handoff_identity,
     latest_report,
     message_text,
+    plan_display,
     plan_was_delivered,
     read_json,
     release_pin,
@@ -29,6 +31,7 @@ from .paper_evidence import TAIPEI, instant
 from .paper_facts import late_execution_terms, produce, retained_bridge
 from .paper_futu import BrokerUnavailable, FutuPaperBroker
 from .paper_report import prepare_report_evidence, refresh_report
+from .paper_store import handoff_plan
 
 
 def utc_now():
@@ -98,6 +101,9 @@ def public_plan(plan):
             }
             for row in plan["manual"]
         ]
+    result["display"] = plan_display(plan)
+    if "observations" in plan:
+        result["observations"] = plan["observations"]
     if not plan["lines"]:
         reasons = {row["reason"] for row in plan["skipped"]}
         if reasons <= {"verified_no_signal"}:
@@ -172,9 +178,10 @@ def parse_args(argv=None):
     parser.add_argument("--session", help="original scheduled Codex session UUID")
     parser.add_argument("--report-date", help="original scheduled Taipei report date")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser(
+    plan = commands.add_parser(
         "plan", help="plan from the scheduled tab's latest daily report"
     )
+    plan.add_argument("--handoff", help="pending trusted host planning notice")
     manual = commands.add_parser(
         "manual-holdings", help="record the original user crypto position snapshot"
     )
@@ -256,6 +263,7 @@ PUBLIC_ERRORS = {
     "native scheduled tab or original launch prompt is unverified",
     "paper code is outside the pinned daily skill release",
     "matching host report upload receipt is unavailable",
+    "matching host planning notice is unavailable",
     "latest daily report pointer does not match",
     "daily report revision does not match its verification",
     "daily report artifact digest does not match",
@@ -299,10 +307,30 @@ def run_daily(args):
             return False
 
     artifacts = None
+    state = root / "reports/_evidence/.paper-entry"
     if args.command == "plan":
         artifacts = latest_report(root, report_day, pin)
-        upload_receipt(home, scope, artifacts[2])
-    state = root / "reports/_evidence/.paper-entry"
+        upload = upload_receipt(home, scope, artifacts[2])
+        if args.handoff:
+            binding = handoff_identity(report_day, scope["launch"], artifacts[2])
+            path = home / ".config/trend-animals/daily-state" / (
+                f"{report_day}.paper-handoff.json"
+            )
+            notice = read_json(path)
+            if (
+                args.handoff != binding["token"]
+                or any(notice.get(key) != value for key, value in binding.items())
+                or notice.get("session") != scope["id"]
+                or notice.get("status") not in {"requested", "displayed"}
+                or upload.get("source") != "host Foundation"
+                or not 0 <= now.timestamp() - upload.get("timestamp", 0) <= 300
+            ):
+                raise ValueError("matching host planning notice is unavailable")
+            retained_bridge(*artifacts, root / "reports/_evidence")
+            plan, _ = handoff_plan(state / "state.sqlite3", scope, artifacts[2])
+            if plan is not None:
+                emit(public_plan(plan))
+                return 0
     if args.command == "status":
         database = state / "state.sqlite3"
         result = (

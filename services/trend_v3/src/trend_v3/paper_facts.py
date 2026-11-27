@@ -666,6 +666,9 @@ def produce(report, selection, info, evidence_root, broker, now, *, allow_late=F
     if observations is not None:
         if now < instant(info["cutoff"]):
             raise ValueError("daily observation evidence unverified")
+        facts["report_context"] = {
+            "release": info["source"]["commit"], "cutoff": info["cutoff"],
+        }
         facts["daily_bridge_routes"] = preflight_observations(
             observations,
             report,
