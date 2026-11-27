@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from daily_lifecycle import cleanup_old_tabs, record_launch
+from daily_paper import latest_report
 from daily_release import PIN, SERVICE_ROOT, SPACE_ID
 from daily_support import sync_allowed
 from daily_sync import folder_identity
@@ -156,6 +158,7 @@ def dispatch(home, root, day, tab_name, attempted, smoke):
     codex = home / ".local/bin/codex"
     sop = home / ".config/trend-animals/daily-report-sop.md"
     report = root / ("rehearsal" if smoke else "reports") / f"{day}.html"
+    reuse_identity = None
     try:
         report_stat = report.lstat()
     except FileNotFoundError:
@@ -165,6 +168,11 @@ def dispatch(home, root, day, tab_name, attempted, smoke):
             raise DispatchError("report path is occupied by a non-regular file")
         if smoke:
             return "existing report; launch skipped"
+        try:
+            _, _, verification = latest_report(root, day, PIN, source_only=True)
+            reuse_identity = (verification["report_sha256"], verification["revision"])
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            pass
 
     inventory = inventory_with_startup(app)
     space = verified_space(inventory, home)
@@ -229,16 +237,39 @@ def dispatch(home, root, day, tab_name, attempted, smoke):
             "Keep the pinned data, evidence and reader rules. "
             f"This tab owns today's report at {report}. "
             "Start at 08:30 Asia/Taipei every calendar day, including weekends. "
-            "Run the authorized daily collection once and render one full HTML"
-            " from available evidence. "
+            "If a current verified skill-generated report for this date "
+            "already exists, "
+            "reuse it without opening WeChat, fetching data or regenerating it; "
+            "only the authorized iCloud copy may need recovery. "
+            "When fresh board data are needed, check the applicable permission "
+            "and use Computer Use in official WeChat to first "
+            "read a visible 趋势动物Pro mini-program page. If the main WeChat "
+            "window appears first, use Window → 趋势动物Pro. E17's bulk-history "
+            "stop does not block checking access for this single daily read. "
+            "Read within existing authorization and honor actual restrictions "
+            "on scheduled use. Stop for account warnings or login and security "
+            "prompts. Leave login to Ray. "
+            "Follow the pinned visual skill to 大类资产 → 金融资产. Use "
+            "overlapping scrolls to the group tail and record "
+            "every displayed class name and exact strength, including zero. "
+            "Keep the displayed update time, observation time and data date "
+            "separate. In private run evidence, record the actual attempt or "
+            "applicable prohibition, the specific blocking step if any, the "
+            "observed rows and scores, and whether coverage was complete, "
+            "partial or unavailable. "
+            "Before any board-data API fallback, preserve the verified visual "
+            "rows. Use fallback for only unreadable or missing board fields "
+            "after that attempt or prohibition. With a complete visual board, "
+            "make zero board-data API calls. Status and pricing metadata supply "
+            "no board rows. Check board fallback pricing only when needed after "
+            "the visual step. Paid or unknown-cost calls still require Ray's "
+            "approval. "
+            "If a fresh report is needed, run only one authorized daily pass "
+            "and render one full HTML from available evidence. "
             "Missing markets or data do not trigger a coverage check, delay, "
             "or hourly retry. "
             "If the start was missed, run the pending daily pass once. Follow "
             "the skill for per-instrument outcomes. "
-            "If a current verified skill-generated report for this date "
-            "already exists, "
-            "reuse it without fetching data or regenerating it; only the "
-            "authorized iCloud copy may need recovery. "
             "Keep the existing billing and no-replay safeguards. Release locks"
             " while waiting. "
             "Stay interactive for Ray. Read private inputs only as directed by"
@@ -261,6 +292,20 @@ def dispatch(home, root, day, tab_name, attempted, smoke):
             except (OSError, ValueError, ConnectionError, subprocess.SubprocessError):
                 pass
         helper = home / ".config/trend-animals/daily_sync.py"
+        evidence = report.parent / "_evidence" / day
+        launched_at = datetime.now(TAIPEI).isoformat()
+        closeout = [
+            sys.executable,
+            str(SERVICE_ROOT / ".agents/skills/trend-v3-daily-report/collection.py"),
+            "closeout", str(evidence / "closeout-context.json"),
+            "--day", day, "--launch", launch,
+            "--launched-at", launched_at,
+            "--state", str(evidence / "daily-completion.json"),
+            "--proof", str(evidence / "board-acquisition.json"),
+        ]
+        if reuse_identity:
+            digest, revision = reuse_identity
+            closeout.extend(("--reuse-sha256", digest, "--reuse-revision", revision))
         prompt += (
             f" Original immutable host launch ID: {launch}. Original host "
             f"folder proof JSON: " + json.dumps(proof, sort_keys=True) + ". "
@@ -286,9 +331,14 @@ def dispatch(home, root, day, tab_name, attempted, smoke):
             "local report; no alternate "
             "destinations, auxiliary cloud files or share links. No market "
             "completeness gate. "
-            f"When work completes save reports/_evidence/{day}/daily-"
-            f"completion.json with launch, "
-            "session=current real Codex UUID, revision, sha256, collection=complete, "
+            "For fresh acquisition, retain private board-acquisition.json using "
+            "the pinned skill's acquisition evidence contract. Prepare private "
+            "closeout-context.json with mode=fresh, or mode=verified_reuse "
+            "only when the verified reused report matches the host's pre-launch "
+            "source digest and revision. Record that original digest as "
+            "reused_sha256, separate from the current display digest. "
+            "Record independent lifecycle facts in the context: "
+            "session=current real Codex UUID, verified revision and sha256 if known, "
             "recheck=complete or not_scheduled, pending=false only if no "
             "tasks/timers remain, "
             "sync=uploaded only after matching trusted host receipt, "
@@ -297,6 +347,16 @@ def dispatch(home, root, day, tab_name, attempted, smoke):
             " working n as n+1, done/idle n as n), last_user_at=latest actual "
             "non-context role=user response_item (or legacy user_message) "
             "timestamp from this session, and completed_at=ISO timestamp. "
+            "Run the pinned closeout command when the acquisition outcome is "
+            "known, even if render or sync is blocked. Refresh the context "
+            "and run the same command with the same acquisition proof when "
+            "later lifecycle facts settle. Run this command:\n"
+            f"{shlex.join(closeout)}\n"
+            "Only this command writes the receipt. Report workflow_failed or "
+            "a command error explicitly to Ray in this tab. Report partial or "
+            "unavailable coverage as such and keep the available HTML. "
+            "Acquisition status does not report trading opportunities or set "
+            "render, sync or paper results. A failed closeout never starts a replay. "
             "Read your exact terminal ID from the trusted daily-state launch "
             "receipt before reading "
             "hc identity; do not infer it from inherited environment. Later "
